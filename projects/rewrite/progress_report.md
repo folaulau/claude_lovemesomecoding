@@ -475,6 +475,75 @@ go-ahead. Left as the user's call.
 
 ---
 
+## 15. Phase 3 — Admin backend + UI: COMPLETE
+
+**API live at https://api.lovemesomecoding.com** · admin console at `/admin` (noindex).
+
+### Backend (`lovemesomecoding_backend`)
+FastAPI + Mangum on Lambda behind an HTTP API. 87 tests, **95% coverage** (gate: 90%).
+
+| Resource | Value |
+|---|---|
+| Stack | `lovemesomecoding-admin-api-prod` (SAM) |
+| Function | `lovemesomecoding-admin-api-prod`, python3.12, x86_64, 512 MB |
+| API | `5qezcjq2j4.execute-api.us-west-2` + custom domain |
+| Cert | ACM **us-west-2** (regional — not the us-east-1 CloudFront one) |
+| Secret | SSM `/lovemesomecoding/prod/jwt-secret` (SecureString) |
+
+Every route except `/health` requires a bearer token **and** the admin role; this is enforced by a
+FastAPI dependency, and a parametrised test asserts all 10 protected routes reject missing, forged,
+and expired tokens. The reference project declared `authenticated_endpoints` and never checked it.
+
+### Deployment gotchas hit and solved (all documented in the repo)
+1. **Compiled wheels.** `pydantic-core` and `bcrypt` ship as binaries. A plain `pip install` on
+   macOS yields Mach-O and the Lambda dies at import. `Makefile` + `BuildMethod: makefile` forces
+   manylinux wheels; verified `ELF 64-bit … x86-64` in the built artifact.
+2. **Stage path prefix.** A named stage makes API Gateway send `/prod/health` while the custom
+   domain sends `/health` — one of them always 404s. Fixed with the `$default` stage.
+3. **Implicit stage logical id.** `AWS::Serverless::HttpApi` names the generated stage differently
+   per `StageName`, so nothing can reliably `DependsOn` it — and the domain mapping genuinely must
+   wait for the stage. Replaced with explicit `AWS::ApiGatewayV2::*` resources.
+4. **CloudFormation keeps previous parameter values** on update; it does **not** adopt a changed
+   template default. Changing the CORS default silently shipped stale config. `deploy.sh` now
+   passes `CorsOrigins` explicitly every time.
+
+### Storage design
+One object per post plus small derived indexes, so a save is **O(1) in post count**. The reference
+project held every record in one blob — at 512 posts that means rewriting ~20 MB per save with
+last-writer-wins data loss. Category counts are always derived, never stored as authoritative.
+Drafts are persisted but excluded from every index, so the static build never sees them.
+
+### Admin UI (`/admin`)
+Single-page client console — no dynamic admin routes, because a static export has nothing to
+prerender them from. Login, post list with search and category filter, HTML editor with toolbar and
+live preview, drag-free image upload straight to S3 via presigned URL, category manager, and a
+**Publish site** button that triggers the frontend rebuild.
+
+`noindex, nofollow, nocache` plus `Disallow: /admin` in robots.txt and absent from the sitemap.
+Verified end to end with Playwright: login → 512 posts listed → search → editor loads real content
+→ preview renders 42 highlighted code blocks → categories manage. No JS errors on any route.
+
+### Credentials
+Per user instruction the login is built in: **`folauk`**. It is stored as a **bcrypt hash**, not a
+plaintext string, because the sibling frontend repo is public and this one likely is too — a
+plaintext admin password there is a site takeover. The password is short and crackable even hashed,
+so it should be rotated before this matters:
+
+```bash
+AWS_PROFILE=folau .venv/bin/python scripts/create_admin.py --username folauk --write
+```
+
+An S3 user record overrides the built-in default with no redeploy.
+
+### Outstanding
+- [ ] **GitHub PAT for publish.** `POST /publish` currently returns
+      `{"triggered": false, "detail": "no GitHub token configured"}`. Store one with `repo` scope:
+      `aws ssm put-parameter --name /lovemesomecoding/prod/github-token --type SecureString --value ghp_xxx --region us-west-2 --profile folau`
+- [ ] Repo secrets for CI (`AWS_DEPLOY_ROLE_ARN` or key pair; `API_CERT_ARN` for the backend).
+- [ ] Cutover: repoint the A records from DreamHost to CloudFront.
+
+---
+
 ## 12. Changelog
 
 - **2026-08-04** — Research complete: content inventory measured, AWS state verified,
@@ -490,4 +559,7 @@ go-ahead. Left as the user's call.
   https://d32j0xfm775hkk.cloudfront.net. All 568 legacy URLs verified healthy against the live
   deployment. GitHub Actions + local deploy scripts wired. 38 stale table-of-content pages retired
   in favour of generated category archives.
-  **Next: Phase 3 backend** (FastAPI + Mangum admin API), then cutover.
+- **2026-08-04** — **Phase 3 complete** (§15): FastAPI admin API live at
+  https://api.lovemesomecoding.com (87 tests, 95% coverage) and the `/admin` console shipped.
+  Login hardcoded to `folauk` as requested, stored as a bcrypt hash.
+  **Next: cutover** — repoint A records once the GitHub PAT is stored and the site is reviewed.
