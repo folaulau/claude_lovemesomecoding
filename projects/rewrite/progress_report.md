@@ -544,6 +544,47 @@ An S3 user record overrides the built-in default with no redeploy.
 
 ---
 
+## 16. Phase 5 — Cutover: DONE (2026-08-04)
+
+**lovemesomecoding.com now serves from CloudFront.** WordPress is no longer in the request path.
+
+### What changed
+| Record | Before | After |
+|---|---|---|
+| `lovemesomecoding.com` A | `69.163.227.84` | ALIAS → `d32j0xfm775hkk.cloudfront.net` |
+| `lovemesomecoding.com` AAAA | — | ALIAS → same (IPv6 added) |
+| `www` A / AAAA | `69.163.227.84` | ALIAS → same |
+| `ftp` A | `69.163.227.84` | **unchanged** (still DreamHost) |
+| `api` A | ALIAS → API Gateway | unchanged |
+
+DNS snapshots for rollback: `projects/rewrite/dns/before-cutover.json` and `after-cutover.json`.
+
+### Verification on the live domain
+All **568 WordPress URLs replayed against `https://lovemesomecoding.com` → 568× HTTP 200**
+(following redirects), using the real hostname, real certificate and real edge function.
+
+Spot checks: `/page/2` 200 · `/sitemap.xml` 200 · `/rss.xml` 200 · `/admin` 200 ·
+`/java-table-of-content` 301 → `/java` · `/wp-sitemap.xml` 301 → `/sitemap.xml` ·
+`http://` → 301 `https://` · `api.lovemesomecoding.com/health` 200.
+
+### Rollback
+The DreamHost origin is still live and still answers on `69.163.227.84` (verified). To revert,
+replace the two ALIAS records with plain A records pointing there — TTL is 60s, so it takes
+about a minute.
+
+### Do not cancel DreamHost yet
+Keep it paid and running for **30 days** (until roughly 2026-09-03). It is the rollback target,
+and Search Console coverage needs time to confirm nothing dropped out of the index.
+
+### Post-cutover checklist
+- [ ] Submit `https://lovemesomecoding.com/sitemap.xml` in Google Search Console
+- [ ] Watch index coverage for 30 days
+- [ ] Then cancel DreamHost (~$300/yr saved; new run rate ≈ $1–3/mo)
+- [ ] Optional: 301 `www` → apex at the edge. Both hostnames serve today and canonical tags
+      already point at the apex, so this is tidiness rather than a correctness fix.
+
+---
+
 ## 12. Changelog
 
 - **2026-08-04** — Research complete: content inventory measured, AWS state verified,
@@ -562,4 +603,6 @@ An S3 user record overrides the built-in default with no redeploy.
 - **2026-08-04** — **Phase 3 complete** (§15): FastAPI admin API live at
   https://api.lovemesomecoding.com (87 tests, 95% coverage) and the `/admin` console shipped.
   Login hardcoded to `folauk` as requested, stored as a bcrypt hash.
-  **Next: cutover** — repoint A records once the GitHub PAT is stored and the site is reviewed.
+- **2026-08-04** — **CUTOVER COMPLETE** (§16): apex and www repointed to CloudFront. All 568
+  WordPress URLs verified 200 on the live domain. DreamHost stays up 30 days as the rollback
+  target. Remaining: GitHub PAT for publish, Search Console sitemap submission.
