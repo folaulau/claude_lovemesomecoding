@@ -352,15 +352,126 @@ Rollback if ever needed: point the registrar's NS back at ns1/ns2/ns3.dreamhost.
 covering `lovemesomecoding.com` + `www.lovemesomecoding.com`.
 **Status: ISSUED** — both domains validated SUCCESS.
 
-### Remaining in Phase 0
-- [ ] Site CloudFront distribution + OAC for the `lovemesomecoding.com` bucket (needs the cert)
-- [ ] CloudFront Function for `/path` → `/path/index.html` rewriting and trailing-slash
-      normalization (see §6 — WordPress serves `/a/b` with no trailing slash)
-- [ ] SSM SecureString parameter for the JWT secret
-- [ ] Custom 404 error response
+### Phase 0 complete
+| Resource | Identifier |
+|---|---|
+| Site distribution | `E30YUPLP37MY9U` → **`d32j0xfm775hkk.cloudfront.net`** |
+| Site OAC | `E1CVN571FYXRKX` |
+| Edge function | `lovemesomecoding-router` (LIVE, 2.8 KB of the 10 KB limit) |
+| Custom errors | 403/404 → `/404.html` with a real 404 status |
+
+Still outstanding: SSM SecureString for the JWT secret (Phase 3, backend).
 
 **Nothing is pointed at AWS yet.** The A records still resolve to DreamHost, so the live
 WordPress site is unaffected until we deliberately repoint them at cutover.
+
+---
+
+## 13. Phase 2 — Frontend: COMPLETE
+
+`lovemesomecoding_frontend` — Next.js 14 App Router, static export, Bootstrap-free custom CSS
+(Bootstrap was dropped; the w3schools layout is simpler hand-written than fought against a grid
+framework). See that repo's README for architecture.
+
+### Page policy change (2026-08-04, user directive: page links need not be preserved)
+Only the **512 post URLs** are frozen. The 56 WordPress page URLs were freed up, which let us fix
+a long-standing wart:
+
+- **38 `*-table-of-content` pages retired** → 301 to the real category archive. These were
+  hand-maintained lists that went stale whenever a post was added.
+- **7 pages that shadowed a category** (`java-8`, `java-advanced`, `java-interview`,
+  `data-structure-algorithm`, `swedesignpattern`, `brainteaser`, `algorithm-interview`) dropped so
+  the generated archive takes the URL. `/java-8` now lists all 36 Java posts instead of a stale
+  hand-written page. Same URL, live content, no redirect needed.
+- **`/brainteaser/brain-teaser`** existed as both a page and a post; the post now owns it.
+- **`sample-page`** (WordPress default) → 301 to `/`.
+- **12 pages kept**: about-me, contact, privacy/terms/cookie policies, interviews,
+  software-engineering, java-regex, swebestpractice, and the 3 TOC pages with no matching category
+  (datadog, jquery, test-driven-development).
+
+39 redirects total, served as real 301s by the edge function.
+
+### Build output
+| Metric | Value |
+|---|---|
+| HTML files | **569** (512 posts + 43 categories + 12 pages + home + 404) |
+| Sitemap URLs | 568 |
+| Largest page | 148 KB raw / **28 KB gzipped** |
+| Code blocks highlighted at build time | 5,152 |
+| Client JS | 87 KB shared |
+
+`npm run build` is gated by `verify-build.mjs`, which **fails the build** if any of the 512 indexed
+post URLs stops resolving, if a category archive is missing, if a retired page has no destination,
+or if a redirect points nowhere. Currently: 512/512 posts, 43/43 categories, all accounted for.
+
+### Verified in a real browser (Playwright, `projects/rewrite/screenshots/`)
+Home · category archive · post (light + dark) · mobile 390px · 404 · static page · search ·
+nav dropdown. No console or page errors on any route. Search returns correct hits.
+
+### Decisions worth remembering
+- **`trailingSlash: false` is load-bearing.** WordPress serves `/a/b` with no trailing slash and
+  that is what is indexed. Enabling it would change all 512 canonical URLs.
+- **Prism languages must be imported statically.** `prismjs/components/index.js` uses a dynamic
+  `require()` webpack can't follow — it builds fine and then throws `MODULE_NOT_FOUND` at
+  page-generation time.
+- **Next requires the same param name per dynamic level**, so the routes are `[slug]` and
+  `[slug]/[post]`, not `[category]/[slug]`.
+- Bootstrap 5 was dropped in favour of ~600 lines of CSS. The w3schools layout is mostly a fixed
+  sidebar + reading column; the framework was pure weight.
+
+---
+
+## 14. Deployed and verified live
+
+**Preview URL: https://d32j0xfm775hkk.cloudfront.net** — the full site, live now.
+The real domain still points at DreamHost; nothing has been cut over.
+
+### The definitive migration check
+`projects/rewrite/verify_live_urls.py` replays **every URL WordPress serves today** against the
+new deployment:
+
+```
+replaying 568 WordPress URLs against https://d32j0xfm775hkk.cloudfront.net
+ok               532
+redirect          36
+568/568 URLs healthy
+```
+
+532 serve a 200 directly (512 posts + 12 kept pages + 7 reclaimed category archives +
+brainteaser/brain-teaser); 36 return a 301 that resolves to a real page. **Zero 404s, zero
+broken redirects.**
+
+### Two deploy paths, one script
+Both run `scripts/deploy.sh`, so local and CI cannot drift.
+
+| Path | Command |
+|---|---|
+| Local | `AWS_PROFILE=folau npm run deploy` (or `deploy:no-sync` to skip the content sync) |
+| CI | `.github/workflows/deploy.yml` — push to `main`, manual dispatch, or `repository_dispatch` |
+
+The `repository_dispatch` trigger (`event_type: publish`) is the mechanism behind
+"static rebuild on publish": the admin API will POST to it after a post is saved, and the workflow
+syncs content → builds → deploys → smoke-tests. The smoke test asserts a retired page still
+returns 301, not 404.
+
+Secrets needed: `AWS_DEPLOY_ROLE_ARN` (OIDC, preferred) **or**
+`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`.
+
+### Repo hygiene issue found (2026-08-04)
+Commits `f16cf56` ("asd") and `851a2c8` ("asf") were pushed to GitHub carrying artifacts that
+should never have been tracked:
+
+- `node_modules/` — 176 files of Playwright bundles. Added in `f16cf56`; the `.gitignore` entry
+  arrived in `851a2c8`, which does **not** untrack files already in the index.
+- `projects/rewrite/migration/raw/` (12 MB) and `out/` (60 MB) — regenerable content and 336
+  images that already live in S3.
+
+Fixed going forward: `.gitignore` extended and all 1137 files removed from the index with
+`git rm -r --cached` (files intact on disk, history untouched, nothing force-pushed).
+
+**The blobs remain in pushed history**, so `.git` stays ~60 MB. Cleaning that requires a history
+rewrite (`git filter-repo`) plus a force-push — destructive, and not done without an explicit
+go-ahead. Left as the user's call.
 
 ---
 
@@ -373,7 +484,10 @@ WordPress site is unaffected until we deliberately repoint them at cutover.
   same AWS account, so cutover never leaves AWS.
 - **2026-08-04** — **Phase 1 complete** (§11): all 512 posts + 56 pages + 336 images migrated and
   verified. Code-block fidelity bug found and fixed.
-- **2026-08-04** — **Phase 0 mostly complete** (§12): media CloudFront live, content DB uploaded
-  (615 objects), DNS moved to Route 53 with zero downtime, ACM cert ISSUED. Remaining: site
-  CloudFront distribution, CloudFront Function for URL rewriting, SSM secret.
-  Next: Phase 2 frontend.
+- **2026-08-04** — **Phase 0 complete** (§12): media + site CloudFront distributions, edge routing
+  function, content DB uploaded, DNS moved to Route 53 with zero downtime, ACM cert ISSUED.
+- **2026-08-04** — **Phase 2 complete** (§13, §14): Next.js frontend built and deployed to
+  https://d32j0xfm775hkk.cloudfront.net. All 568 legacy URLs verified healthy against the live
+  deployment. GitHub Actions + local deploy scripts wired. 38 stale table-of-content pages retired
+  in favour of generated category archives.
+  **Next: Phase 3 backend** (FastAPI + Mangum admin API), then cutover.
