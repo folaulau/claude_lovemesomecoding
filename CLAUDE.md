@@ -4,123 +4,205 @@
 - Help aspiring developers understand what they need to know to start a career in programming
 - Provide practical solutions to real-world coding problems — clean, well-explained tutorials drawn from official documentation and hands-on experience, not just quick hacks
 
+---
+
+## Current state (updated 2026-08-04)
+
+**The WordPress → AWS migration is DONE and live.** lovemesomecoding.com serves from CloudFront;
+WordPress is no longer in the request path.
+
+| | |
+|---|---|
+| Site | https://lovemesomecoding.com (also `www`) |
+| Admin console | https://lovemesomecoding.com/admin — user `folauk` |
+| Admin API | https://api.lovemesomecoding.com |
+| Content | **512 posts**, 43 categories, 12 static pages, 336 images |
+| Cost | ≈ **$0.60/month** + $16/yr domain (was $25/mo on DreamHost) |
+
+### Architecture
+```
+Next.js 14 static export ──> S3 (lovemesomecoding.com) ──> CloudFront ──> visitors
+                                      ▲
+content DB (JSON in S3) ──────────────┘ read at BUILD time only
+        ▲
+FastAPI on Lambda (admin writes) ──> GitHub repository_dispatch ──> rebuild
+```
+
+Nothing is fetched at runtime. Saving a post writes JSON to S3 and changes nothing a visitor sees
+until **Publish** triggers a rebuild (~3–5 min).
+
+### ⚠️ DreamHost — do not cancel before ~2026-09-03
+It is the cutover rollback target and Search Console needs 30 days to confirm index coverage.
+Rollback = point the apex/www ALIAS records back to `69.163.227.84` (60s TTL).
+
+### Outstanding
+- [ ] Store GitHub PAT so **Publish** works: `aws ssm put-parameter --name /lovemesomecoding/prod/github-token --type SecureString --value ghp_xxx --region us-west-2 --profile folau`
+- [ ] Submit `https://lovemesomecoding.com/sitemap.xml` to Search Console
+- [ ] `lovemesomecoding_backend` repo does not exist on GitHub yet — its CI cannot run until created
+- [ ] Rotate the admin password: `python scripts/create_admin.py --username folauk --write`
+
+---
+
+## Repos
+
+Three separate git repos. Only `claude_lovemesomecoding` (this one) holds project docs.
+
+- `lovemesomecoding_frontend` — Next.js 14 static export. **Public repo.**
+- `lovemesomecoding_backend` — FastAPI + Mangum on Lambda. Remote not yet created.
+- `claude_lovemesomecoding` — parent; `projects/rewrite/` holds the migration scripts and
+  `progress_report.md` (full history and decisions live there, not here).
+
+## Local development
+
+```bash
+# terminal 1 — API against the isolated `local` content tree
+cd lovemesomecoding_backend
+./scripts/seed-local-data.sh          # once: copy prod content -> local tree
+AWS_PROFILE=folau ./scripts/run-local.sh        # :8099
+
+# terminal 2 — site + admin
+cd lovemesomecoding_frontend
+AWS_PROFILE=folau npm run dev                   # :3000, uses the local tree
+
+# production preview: the real built output with CloudFront's routing rules
+npm run build && npm run preview                # :4321, uses the LIVE API
+```
+
+`:3000` is safe to experiment in — writes go to `lovemesomecoding/local/` in S3, verified isolated
+from prod. `:4321` talks to the live API, so saves there are real.
+
+## Deploying
+
+```bash
+AWS_PROFILE=folau npm run deploy                 # frontend: build, S3, invalidate, verify
+AWS_PROFILE=folau ./scripts/deploy.sh            # backend: tests, sam build, deploy, smoke test
+```
+
+Or push to `main` — both repos have GitHub Actions using `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` secrets (frontend also has `CLOUDFRONT_DIST_ID`).
+
+The frontend build **fails** if any of the 512 indexed post URLs stops resolving
+(`scripts/verify-build.mjs`). That guard is the point — do not weaken it.
+
+---
+
+## Gotchas that already cost time — do not rediscover these
+
+### Content pipeline
+- **Extract `<pre>` blocks with regex BEFORE any HTML parsing.** Post bodies contain raw unescaped
+  `<script>`, `<button onclick=…>`, `<style>` *inside* code samples. An HTML parser turns those
+  into real elements and `get_text()` then deletes them — with almost no change in character count,
+  so length-based checks pass. Compare code-block sources byte-for-byte, not lengths.
+  (`migration/transform.py`, `app/services/content.py` — the ordering is load-bearing.)
+- Code blocks must end up as `<pre class="language-X"><code class="language-X">` — the build-time
+  Prism highlighter matches that exact shape.
+
+### Next.js
+- **`trailingSlash: false` is load-bearing.** WordPress serves `/java-8/foo` with no trailing slash
+  and that is what Google indexed on 512 pages. Turning it on rewrites every canonical URL.
+- **`output: 'export'` is scoped to production builds only.** Next 14's dev server rejects dynamic
+  routes under it with *"missing exported function generateStaticParams()"* even when it is exported.
+- **Import Prism languages statically.** `prismjs/components/index.js` uses a dynamic `require()`
+  webpack cannot follow — it builds fine, then throws `MODULE_NOT_FOUND` at page generation.
+- Next requires the **same param name per dynamic level**, hence `[slug]` and `[slug]/[post]`.
+
+### Deploys / AWS
+- **`aws s3 sync` skips unchanged files, so metadata never updates.** Changing `Cache-Control` in
+  the deploy script does not reach objects already in the bucket. Non-fingerprinted files upload
+  with `cp --recursive`.
+- **Never use `--metadata-directive REPLACE` without an explicit `--content-type`** — it rewrites
+  every object to `binary/octet-stream`.
+- **Republish the CloudFront Function on every deploy.** The redirect map is compiled into it, so
+  a redirect added in `postbuild.mjs` does nothing at the edge until the function is republished.
+- **CloudFormation keeps the PREVIOUS value for any parameter an update omits** — it does not adopt
+  a changed template default. Pass parameters explicitly or ship stale config silently.
+- **Lambda needs manylinux wheels.** `pydantic-core` and `bcrypt` are compiled; a plain `pip install`
+  on macOS produces a Lambda that dies at import. The `Makefile` + `BuildMethod: makefile` forces
+  the right platform. Verify: `file .aws-sam/build/ApiFunction/pydantic_core/*.so` → `ELF … x86-64`.
+- **API Gateway uses the `$default` stage.** A named stage prefixes paths with `/<stage>` while a
+  custom domain does not, so one of the two URLs always 404s.
+- An empty `API_CERT_ARN` makes CloudFormation **delete** the api custom domain. `deploy.sh` guards
+  against this.
+- Stop `next dev` before `next build` — they share `.next` and the build fails.
+- A local DNS cache can make it look like a change did not take. Check with
+  `dig +short A <host> @8.8.8.8`, not just `curl`.
+
+---
+
+## AWS
+
+Use the **`folau`** profile for all CLI/API access. Region **us-west-2** (certs for CloudFront are
+in **us-east-1**).
+
+### Resources for this project
+| Resource | Id / name |
+|---|---|
+| Site bucket | `lovemesomecoding.com` (private, OAC only) |
+| Site CloudFront | `E30YUPLP37MY9U` → `d32j0xfm775hkk.cloudfront.net` |
+| Media bucket | `lovemesomecoding-storage-329580012644-us-west-2-an` |
+| Media CloudFront | `EYALMP5J1OET3` → `d2q2snz6diubfd.cloudfront.net` (OriginPath `/lovemesomecoding/prod`) |
+| Content DB bucket | `lovemesomecoding-db-329580012644-us-west-2-an` (`prod/` and `local/` trees) |
+| Edge function | `lovemesomecoding-router` (URL rewriting + 41 legacy redirects) |
+| Lambda | `lovemesomecoding-admin-api-prod` (python3.12, x86_64, 512 MB) |
+| SAM stack | `lovemesomecoding-admin-api-prod` |
+| Route 53 zone | `Z000531818AC6P1IJ8LJL` |
+| Certs | apex+www in us-east-1; `api.` in us-west-2 |
+| Secrets | SSM `/lovemesomecoding/prod/jwt-secret`, `/lovemesomecoding/prod/github-token` |
+
+Content DB layout (`lovemesomecoding/{prod|local}/`): `posts/{slug}.json`, `index/posts.json`,
+`index/drafts.json`, `index/by-category/{cat}.json`, `index/categories.json`, `search/index.json`,
+`users/admin.json`. One object per post plus small derived indexes — a save is O(1) in post count.
+Never collapse this back into one blob.
+
+Media uploaded from **local** dev deliberately lands in the **prod** media tree
+(`media_env=prod`), because the CDN only serves `/lovemesomecoding/prod`. Uploads are uuid-prefixed
+and additive, so nothing is overwritten.
+
+### Route 53 — domains
+All registered via Amazon Registrar in this account, all `.com`, auto-renew, $16/yr each ($80/yr):
+folaukaveinga.com (2026-11-22) · folautech.com (2027-06-19) · learntongan.com (2027-07-20) ·
+lovemesomecoding.com (2027-05-31) · pitaconcrete.com (2027-08-30).
+Hosted zones exist for lovemesomecoding.com, pitaconcrete.com, folaukaveinga.com.
+
+Stay on `.com` — checked 2026-08-04, no cheaper TLD (.dev $17, .app $20, .co $38, .ai $137).
+Don't re-run that comparison.
+
+pocsoft.com is NOT in this account (Unstoppable Domains, DNS at Vercel, expires 2027-03-22). Its
+orphaned hosted zone was deleted 2026-08-04. Two resources it used may still bill and are
+unverified: API Gateway `d-slp5iqnci4.execute-api.us-west-2`, CloudFront `d1zmyros44lee`.
+
+---
+
 ## Projects
-- projects are stored in the projects folder. Each project has a name and README.MD which has the instructions about that project.
+Projects live in `projects/`. Each has its own folder with a `README.md` of instructions, and a
+`progress_report.md` tracking status and decisions. Also check the project folder for resources
+(screenshots, SQL, etc.).
 
 ## Standard Workflow
 
-projects are stored in the projects folder which is in the root directory. 
-Every project has its own folder. Each project folder contains a README.md file with project-specific instructions.
+1. **Clarify requirements** — analyse the criteria and ask until they are understood. Flag conflicts
+   before building, not after.
+2. **Create shared context** — `progress_report.md` in the project folder, tracking progress and
+   decisions.
+3. **Track solutions and responsibilities** — record the proposed solution and who owns each task.
+4. **Frontend first** — build UI with mock data, focusing on styling, layout and interactions.
+   Skip if there is no frontend work.
+5. **Then backend** — implement the endpoints the frontend needs; coordinate on database changes.
+   Use Lombok annotations wherever applicable in Java code.
+6. **Integrate** — wire the frontend to the real endpoints and verify.
+7. **QA** — run both apps and exercise the UI; validate backend logic by code review.
+8. **Iterate** until requirements are met and no bugs remain.
+9. **Final delivery check** — demonstrate with Playwright, write tests covering 90% of changes, and
+   run `spotless apply` on Java changes. Notify me for review.
+10. **Resume work** by reading `progress_report.md` first.
+11. **Documentation** — keep all related documents, files and Playwright scripts in the project
+    directory.
 
-also look at resources directory in the project folder for additional information/resources about the project like screen shots, SQL query scripts, etc
+Note: only these agent types exist here — `claude`, `general-purpose`, `Explore`, `Plan`,
+`claude-code-guide`, `statusline-setup`. Do not invoke agents unless I ask for them.
 
-When working on a project, please adhere to the following workflow:
-
-- Follow these instructions in order
-
-1. **Clarify Requirements**
-
-  * Analyze the criteria carefully.
-  * Ask clarifying questions until requirements are fully understood
-  * trading-coach subagent should validate the trading strategy and the approach.
-  * maket-analyst subagent should validate the trading strategy and the approach.
-  * tradestation-expert subagent should validate the trading strategy and the approach.
-
-2. **Create Shared Context**
-
-  * Create a file named `progress_report.md` in the project folder.
-  * This file will track progress, decisions, and assignments for all subagents (engineers).
-
-3. **Track Solutions & Responsibilities**
-
-  * Document the proposed solution in `progress_report.md`.
-  * Clearly record which subagent is responsible for each task.
-
-4. **Assign Work to Subagents**
-
-  * Use the appropriate subagent based on task type:
-
-    * `backend-engineer` → backend work
-    * `frontend-engineer` → frontend work
-    * `qa-engineer` → testing & QA
-
-5. **Report & Sync Progress**
-
-  * When a subagent finishes their task, they must update `progress_report.md` with what they did, any blockers, or next steps.
-  * This ensures everyone stays in sync and can continue the workflow smoothly.
-
-6. **Frontend First**
-
-  * Skip this if there is no frontend work to be done.
-  * Begin with the frontend engineer.
-  * Use **mock data** for API calls.
-  * Focus on styling, layout, and user interactions.
-
-7. **Frontend + Backend Collaboration**
-
-  * Once frontend UI is ready, the frontend engineer coordinates with the backend engineer.
-  * Backend engineer begins implementing required endpoints.
-
-8. **Backend + Database Collaboration**
-
-  * use Lombok anotation whenever possible
-  * If backend work requires database changes, the backend engineer coordinates with the database engineer.
-
-9. **Integration**
-
-  * After backend is complete, the frontend engineer integrates endpoints into the UI.
-  * Verify frontend correctly connects to the backend.
-
-10. **Quality Assurance**
-
-  * QA engineer runs both frontend (v1) and backend (v2) apps.
-  * QA focuses on UI/UX; backend logic is validated separately through code review.
-  * Issues found by QA are logged and sent back to the frontend engineer.
-  * If backend support is required, the frontend engineer coordinates with the backend engineer.
-
-11. **Iterative Fixes**
-
-  * Repeat the cycle (frontend ↔ backend ↔ QA) until all requirements are met and no bugs remain.
-
-12. **Final Delivery Check**
-
-  * Skip this if there is no frontend work to be verified
-  * Before delivery, use **Playwright** to demonstrate the final solution.
-  * Notify me when ready so I can review the final result.
-  * write tests to coverage 90% of code changes.
-  * run spotless apply to format code changes.
-
-13. **Resume work**
-  - When resuming work after a break, review `progress_report.md` to understand current status and next steps.
-
-14. **Documentation**
-
-  * Store all related documents, files, and Playwright scripts in the current project directory.
-
-15. When committing changes in git, do not add author. Don't add the following:
-
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
-
-You can add a nice commit message but don't add Co-Authored-By.
-
-Don't push to remove either, I will do that.
-
-make sure not to include debugging log files or any log files at all in the commit.
-
-log files should be deleted.
-
-## Backend
-- lovemesomecoding_backend is the backend project.
-
-## Frontend
-- lovemesomecoding_frontend is the frontend project.
-
-
-## AWS
-- Use folau profile to communicate with aws via aws cli or API.
-
-### AWS S3
-- s3 bucket for storing media assets like images, videos, etc is lovemesomecoding-storage-329580012644-us-west-2-an
-- s3 bucket for database is lovemesomecoding-db-329580012644-us-west-2-an
-- lovemesomecoding.com is the s3 bucket for the static website. lovemesomecoding_frontend should be deployed and synced with lovemesomecoding.com bucket.
-- in the backend code, specify the environment like local development should be local and in aws should be prod. This should be used in the database and the storage buckets to distinguish where things belong.
+## Git
+- Do **not** add `Co-Authored-By` or any author trailer to commits.
+- Do **not** push to remote — I do that.
+- Never commit log files, `node_modules`, build output, or migration artifacts. Delete stray logs.
+- Write a real commit message explaining *why*, not just what.
