@@ -16,7 +16,7 @@ WordPress is no longer in the request path.
 | Site | https://lovemesomecoding.com (also `www`) |
 | Admin console | https://lovemesomecoding.com/admin — user `folauk` |
 | Admin API | https://api.lovemesomecoding.com |
-| Content | **512 posts**, 43 categories, 12 static pages, 336 images |
+| Content | **525 posts**, 44 categories, 12 static pages, 336 images |
 | Cost | ≈ **$0.60/month** + $16/yr domain (was $25/mo on DreamHost) |
 
 ### Architecture
@@ -36,6 +36,8 @@ It is the cutover rollback target and Search Console needs 30 days to confirm in
 Rollback = point the apex/www ALIAS records back to `69.163.227.84` (60s TTL).
 
 ### Outstanding
+- [ ] Commit the Oracle track — three repos have uncommitted changes
+      (`projects/oracle/progress_report.md` lists them). The content itself is live.
 - [ ] Store GitHub PAT so **Publish** works: `aws ssm put-parameter --name /lovemesomecoding/prod/github-token --type SecureString --value ghp_xxx --region us-west-2 --profile folau`
 - [ ] Submit `https://lovemesomecoding.com/sitemap.xml` to Search Console
 - [ ] `lovemesomecoding_backend` repo does not exist on GitHub yet — its CI cannot run until created
@@ -81,8 +83,8 @@ AWS_PROFILE=folau ./scripts/deploy.sh            # backend: tests, sam build, de
 Or push to `main` — both repos have GitHub Actions using `AWS_ACCESS_KEY_ID` /
 `AWS_SECRET_ACCESS_KEY` secrets (frontend also has `CLOUDFRONT_DIST_ID`).
 
-The frontend build **fails** if any of the 512 indexed post URLs stops resolving
-(`scripts/verify-build.mjs`). That guard is the point — do not weaken it.
+The frontend build **fails** if any indexed post URL stops resolving — the 512 migrated ones above
+all (`scripts/verify-build.mjs`). That guard is the point — do not weaken it.
 
 ---
 
@@ -110,6 +112,12 @@ The frontend build **fails** if any of the 512 indexed post URLs stops resolving
 - **`aws s3 sync` skips unchanged files, so metadata never updates.** Changing `Cache-Control` in
   the deploy script does not reach objects already in the bucket. Non-fingerprinted files upload
   with `cp --recursive`.
+- **`sync-content.sh` needs `--exact-timestamps`, and it is load-bearing.** Downloading, `aws s3
+  sync` skips a same-sized object unless S3 is *newer* than the local file. The derived indexes beat
+  both halves: `"count":12` → `"count":13` is byte-identical in length, and S3's `LastModified` is
+  UTC while the local mtime was stamped at download time, so a fresh write can look older. This
+  shipped `/oracle` reading "12 tutorials" over a list of 13. `verify-build.mjs` check 6 now
+  cross-checks the indexes against each other, because every URL still resolved.
 - **Never use `--metadata-directive REPLACE` without an explicit `--content-type`** — it rewrites
   every object to `binary/octet-stream`.
 - **Republish the CloudFront Function on every deploy.** The redirect map is compiled into it, so

@@ -1,0 +1,158 @@
+<p>The fastest way to get a real Oracle Database on your laptop is a container. No installer, no
+listener configuration, no <code>ORACLE_HOME</code>, and you can throw it away when you are done.</p>
+
+<p>Oracle Database <strong>Free</strong> (23ai) is the edition to use. It is free for development
+<em>and</em> production, capped at 2 CPUs, 2 GB of SGA and 12 GB of user data — far more than a
+tutorial needs.</p>
+
+<h2>The image</h2>
+
+<p>Oracle publishes the official image on its own registry, not Docker Hub:</p>
+
+<pre class="language-bash"><code class="language-bash">docker pull container-registry.oracle.com/database/free:latest</code></pre>
+
+<p>No login is required for the Free image. It is large — roughly 9 GB — so start the pull and go get
+a coffee. There is a <code>:latest-lite</code> tag that drops the non-English locales and some
+components and is about half the size.</p>
+
+<p>There is also a well-maintained community image, <code>gvenzl/oracle-free</code>, which is
+smaller, starts faster and adds convenience environment variables. It is the same database
+underneath. Use whichever you prefer; the commands below work with both.</p>
+
+<h2>Run it</h2>
+
+<pre class="language-bash"><code class="language-bash">docker run -d \
+  --name oracle-free \
+  -p 1521:1521 \
+  -e ORACLE_PWD=Welcome1 \
+  -e ORACLE_CHARACTERSET=AL32UTF8 \
+  -v oracle-free-data:/opt/oracle/oradata \
+  container-registry.oracle.com/database/free:latest</code></pre>
+
+<p>Three of those flags matter more than they look:</p>
+
+<ul>
+  <li><code>ORACLE_PWD</code> sets the password for <code>SYS</code>, <code>SYSTEM</code> and
+      <code>PDBADMIN</code>. Omit it and the image generates a random one that you then have to dig
+      out of the logs.</li>
+  <li><code>ORACLE_CHARACTERSET=AL32UTF8</code> is Oracle's UTF-8. The character set is fixed at
+      database creation and changing it afterwards is a migration, not a setting.</li>
+  <li>The named volume is what makes the database survive <code>docker rm</code>. Without it, first
+      boot runs the ~10-minute database creation again every time.</li>
+</ul>
+
+<h2>Wait for it to actually be ready</h2>
+
+<p>First boot creates the database, which takes several minutes. The container is "up" long before
+the database accepts connections, so watch for the banner rather than guessing:</p>
+
+<pre class="language-bash"><code class="language-bash">docker logs -f oracle-free
+# ...
+# #####################################
+# DATABASE IS READY TO USE!
+# #####################################</code></pre>
+
+<p>In a script, poll the healthcheck instead:</p>
+
+<pre class="language-bash"><code class="language-bash">until [ "$(docker inspect -f '{{.State.Health.Status}}' oracle-free)" = "healthy" ]; do
+  sleep 5
+done
+echo "ready"</code></pre>
+
+<h2>Connect: the bit everyone gets wrong</h2>
+
+<p>The container runs a <strong>CDB called <code>FREE</code></strong> containing a
+<strong>PDB called <code>FREEPDB1</code></strong>. Your tables belong in the PDB. Connect to the CDB
+root by mistake and every <code>CREATE USER</code> fails with
+<code>ORA-65096: invalid common user or role name</code>.</p>
+
+<pre class="language-bash"><code class="language-bash"># Right: the PDB, via the Easy Connect service-name form
+sqlplus system/Welcome1@//localhost:1521/FREEPDB1
+
+# Wrong for app work: this lands you in the CDB root
+sqlplus system/Welcome1@//localhost:1521/FREE</code></pre>
+
+<p>If you do not have a local client, use the one inside the container:</p>
+
+<pre class="language-bash"><code class="language-bash">docker exec -it oracle-free sqlplus system/Welcome1@//localhost:1521/FREEPDB1</code></pre>
+
+<p>Confirm where you landed before doing anything else:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT sys_context('USERENV', 'CON_NAME')     AS container,
+       sys_context('USERENV', 'CURRENT_USER') AS username
+FROM   dual;
+
+-- CONTAINER   USERNAME
+-- ----------- ---------
+-- FREEPDB1    SYSTEM</code></pre>
+
+<h2>Use SQLcl, not SQL*Plus</h2>
+
+<p><code>sqlplus</code> is a 1980s teletype interface with no history, no editing and no completion.
+<strong>SQLcl</strong> is Oracle's modern replacement — a single Java download, same command syntax,
+plus arrow-key history, tab completion, and output formats that are actually readable:</p>
+
+<pre class="language-bash"><code class="language-bash">brew install --cask sqlcl      # or download the zip from Oracle
+sql system/Welcome1@//localhost:1521/FREEPDB1</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SET SQLFORMAT ansiconsole   -- columns sized to the data, no more COLUMN commands
+SET SERVEROUTPUT ON         -- so DBMS_OUTPUT.PUT_LINE is visible
+INFO orders                 -- columns, indexes and constraints in one shot
+DDL orders                  -- reconstruct the CREATE TABLE statement</code></pre>
+
+<p>Those last two commands alone justify the download.</p>
+
+<h2>docker-compose</h2>
+
+<p>Worth committing to the repo so the whole team gets the same database:</p>
+
+<pre class="language-yaml"><code class="language-yaml">services:
+  oracle:
+    image: container-registry.oracle.com/database/free:latest
+    container_name: oracle-free
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PWD: Welcome1
+      ORACLE_CHARACTERSET: AL32UTF8
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      # Every .sql/.sh in here runs once, after the database is created.
+      - ./db/init:/opt/oracle/scripts/startup
+    healthcheck:
+      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 10m
+
+volumes:
+  oracle-data:</code></pre>
+
+<p>The <code>startup</code> mount is the useful part: drop a <code>01-schema.sql</code> and a
+<code>02-seed.sql</code> in <code>./db/init</code> and a fresh volume comes up with your schema
+already in it.</p>
+
+<h2>Gotchas</h2>
+
+<ul>
+  <li><strong>Apple Silicon.</strong> Oracle publishes an arm64 variant of the Free image, so a
+      plain <code>docker pull</code> usually just works. If you land on an amd64-only manifest, add
+      <code>--platform linux/amd64</code> and accept the emulation penalty — startup goes from about
+      three minutes to ten, but it runs.</li>
+  <li><strong>Memory.</strong> Give Docker at least 4 GB. Less and database creation dies partway
+      through, leaving a volume you have to delete before retrying.</li>
+  <li><strong>Port 1521 already in use</strong> means an old container is still around. Map to
+      <code>-p 1522:1521</code> and adjust the connect string.</li>
+  <li><strong><code>ORA-12514</code></strong> — "listener does not currently know of service" — is
+      almost always a typo in the service name, or connecting before the database finished
+      creating.</li>
+  <li><strong>Re-running init scripts.</strong> They only execute when the database is created. If
+      you edited them, <code>docker rm -f oracle-free &amp;&amp; docker volume rm oracle-data</code>
+      and start over.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>You are connected as <code>SYSTEM</code>, which you should never build an application on. Next:
+users, schemas and the privileges an application account actually needs.</p>

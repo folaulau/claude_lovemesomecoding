@@ -1,0 +1,260 @@
+<p>Tuning an Oracle query is mostly one skill: getting the real execution plan, and comparing what the
+optimiser <em>estimated</em> against what actually happened. Everything else follows from that
+comparison. This post covers the index types, how to read a plan, and the handful of mistakes that
+account for most slow queries.</p>
+
+<h2>Index types you will actually use</h2>
+
+<table>
+  <thead><tr><th>Type</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td><strong>B-tree</strong></td><td>The default, and the answer 95% of the time. Balanced, good for equality and ranges.</td></tr>
+    <tr><td><strong>Unique</strong></td><td>Created automatically by <code>PRIMARY KEY</code> and <code>UNIQUE</code>.</td></tr>
+    <tr><td><strong>Composite</strong></td><td>Several columns. Column order is everything — see below.</td></tr>
+    <tr><td><strong>Function-based</strong></td><td>Indexes an expression, e.g. <code>UPPER(email)</code>.</td></tr>
+    <tr><td><strong>Bitmap</strong></td><td>Low-cardinality columns in a data warehouse. <strong>Never in OLTP</strong> — one row change locks a whole bitmap segment, so concurrent DML serialises.</td></tr>
+    <tr><td><strong>Reverse key</strong></td><td>Reverses the bytes to spread sequential inserts. A RAC-specific fix for index block contention; it makes range scans impossible.</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX orders_customer_ix   ON orders (customer_id);
+CREATE INDEX orders_cust_date_ix  ON orders (customer_id, order_date DESC);
+CREATE UNIQUE INDEX customers_email_uix ON customers (lower(email));
+CREATE INDEX customers_upper_name_ix ON customers (upper(last_name));
+
+-- Build without locking out DML, and gather stats while you are there
+CREATE INDEX orders_status_ix ON orders (status) ONLINE COMPUTE STATISTICS;</code></pre>
+
+<h2>Composite indexes: the leading-column rule</h2>
+
+<p>An index on <code>(a, b, c)</code> can be used for a predicate on <code>a</code>, on
+<code>(a, b)</code>, or on <code>(a, b, c)</code>. It is generally <em>not</em> usable for a predicate
+on <code>b</code> alone, because the entries are sorted by <code>a</code> first — like looking up
+someone in a phone book when you only know the first name.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX ix ON orders (customer_id, order_date, status);
+
+WHERE customer_id = 42                                  -- uses it
+WHERE customer_id = 42 AND order_date > sysdate - 7     -- uses it, both columns
+WHERE order_date > sysdate - 7                          -- generally cannot
+WHERE customer_id = 42 AND status = 'NEW'               -- uses customer_id, filters status</code></pre>
+
+<p>So order the columns by how they are queried: <strong>equality predicates first, then the range
+predicate, then columns you only want along for the ride.</strong></p>
+
+<p>The last of those is a covering index. If every column the query touches is in the index, Oracle
+never visits the table at all — the plan says <code>INDEX RANGE SCAN</code> with no
+<code>TABLE ACCESS BY INDEX ROWID</code> under it, and that is usually the single biggest win
+available:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Answered entirely from the index
+CREATE INDEX orders_cover_ix ON orders (customer_id, order_date, total);
+SELECT order_date, total FROM orders WHERE customer_id = 42;</code></pre>
+
+<p>Oracle can also do an <strong>index skip scan</strong>, which probes the index once per distinct
+leading value — so a predicate on <code>b</code> alone is not <em>impossible</em>, just only viable
+when <code>a</code> has very few distinct values. Don't design around it.</p>
+
+<h2>Why your index is being ignored</h2>
+
+<h3>1. A function on the indexed column</h3>
+
+<pre class="language-sql"><code class="language-sql">-- Index on last_name is unusable: the optimiser has no index on UPPER(last_name)
+SELECT * FROM customers WHERE upper(last_name) = 'SMITH';
+
+-- Index on order_date is unusable
+SELECT * FROM orders WHERE trunc(order_date) = DATE '2024-03-18';
+
+-- Fixes: rewrite so the column is bare...
+SELECT * FROM orders
+WHERE  order_date >= DATE '2024-03-18' AND order_date < DATE '2024-03-19';
+
+-- ...or index the expression instead
+CREATE INDEX customers_upper_ix ON customers (upper(last_name));</code></pre>
+
+<p>Implicit conversion counts as a function, and it is invisible. Comparing a
+<code>VARCHAR2</code> column to a number makes Oracle apply <code>TO_NUMBER</code> to
+<em>the column</em>, killing the index:</p>
+
+<pre class="language-sql"><code class="language-sql">-- account_no is VARCHAR2. This becomes TO_NUMBER(account_no) = 12345 → full scan
+SELECT * FROM accounts WHERE account_no = 12345;
+-- Quote it
+SELECT * FROM accounts WHERE account_no = '12345';</code></pre>
+
+<p>Look for <code>SYS_OP_C2C</code> or a <code>TO_NUMBER</code> around a column name in the plan's
+predicate section — that is the fingerprint.</p>
+
+<h3>2. NULLs are not in a single-column B-tree index</h3>
+
+<p>Oracle does not store entirely-null keys. Two consequences:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Cannot use an index on status: the rows it wants are the ones not in the index
+SELECT * FROM orders WHERE status IS NULL;
+
+-- Cannot use a single-column index on total either — it might miss null rows
+SELECT count(*) FROM orders;
+
+-- Both work if the index cannot be all-null. A NOT NULL column, or a constant:
+CREATE INDEX orders_status_ix ON orders (status, 1);</code></pre>
+
+<p>That <code>, 1</code> is a real trick, not a joke: the second key is never null, so every row gets
+an index entry, and <code>IS NULL</code> becomes an index range scan.</p>
+
+<h3>3. A full scan is genuinely cheaper</h3>
+
+<p>Reading 40% of a table through an index means roughly one random I/O per row plus the index
+traversal; a full scan reads it in large sequential multi-block reads. The optimiser knows this.
+<strong>A full table scan is not a bug.</strong> On a 500-row lookup table it is always the right
+answer.</p>
+
+<h3>4. The statistics are wrong</h3>
+
+<p>The optimiser is a cost model fed by statistics. Stale statistics mean a plan chosen for a table
+shape that no longer exists — the usual cause of "it was fast yesterday".</p>
+
+<pre class="language-sql"><code class="language-sql">-- When were these last gathered, and how far off is the row count?
+SELECT table_name, num_rows, last_analyzed, stale_stats
+FROM   user_tab_statistics WHERE table_name = 'ORDERS';
+
+BEGIN
+  dbms_stats.gather_table_stats(
+    ownname          => user,
+    tabname          => 'ORDERS',
+    cascade          => TRUE,                       -- indexes too
+    estimate_percent => dbms_stats.auto_sample_size,
+    method_opt       => 'FOR ALL COLUMNS SIZE AUTO' -- histograms where they help
+  );
+END;
+/</code></pre>
+
+<p>Histograms are what let the optimiser know that <code>status = 'NEW'</code> matches 200 rows while
+<code>status = 'CLOSED'</code> matches 40 million. Without one it assumes an even spread across
+distinct values and picks a single plan for both — which is wrong for one of them.</p>
+
+<h2>Getting the plan</h2>
+
+<h3>EXPLAIN PLAN — the estimate</h3>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN PLAN FOR
+SELECT c.last_name, sum(o.total)
+FROM   customers c JOIN orders o ON o.customer_id = c.id
+WHERE  o.order_date >= DATE '2024-01-01'
+GROUP  BY c.last_name;
+
+SELECT * FROM dbms_xplan.display(format => 'ALL +OUTLINE');</code></pre>
+
+<p>This is what the optimiser <em>would</em> do. It does not run the query, and — importantly — it does
+not peek at your bind values, so the plan it shows can differ from the plan you get.</p>
+
+<h3>DISPLAY_CURSOR — what actually happened</h3>
+
+<p>This is the one to use. Run the query with a hint that collects row counts, then ask for the plan
+with actuals beside the estimates:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS */ c.last_name, sum(o.total)
+FROM   customers c JOIN orders o ON o.customer_id = c.id
+WHERE  o.order_date >= DATE '2024-01-01'
+GROUP  BY c.last_name;
+
+SELECT * FROM dbms_xplan.display_cursor(format => 'ALLSTATS LAST');</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">--------------------------------------------------------------------------------------
+| Id | Operation                     | Name              | Starts | E-Rows | A-Rows |
+--------------------------------------------------------------------------------------
+|  0 | SELECT STATEMENT              |                   |      1 |        |    842 |
+|  1 |  HASH GROUP BY                |                   |      1 |    841 |    842 |
+|* 2 |   HASH JOIN                   |                   |      1 |   1200 | 121043 |
+|  3 |    TABLE ACCESS FULL          | CUSTOMERS         |      1 |    842 |    842 |
+|* 4 |    INDEX RANGE SCAN           | ORDERS_DATE_IX    |      1 |   1200 | 121043 |
+--------------------------------------------------------------------------------------</code></pre>
+
+<p><strong>Compare <code>E-Rows</code> with <code>A-Rows</code>. That comparison is the whole
+technique.</strong> Above, the optimiser expected 1,200 rows from the index and got 121,043 — off by
+100×. Every decision above that line was made on a bad number. Fix the estimate (statistics, a
+histogram, a rewritten predicate) and the plan usually fixes itself. Tuning by adding hints to a plan
+built on a wrong estimate is how you end up with SQL nobody can maintain.</p>
+
+<p>Also read:</p>
+<ul>
+  <li><code>Starts</code> — how many times the operation ran. A nested loop with
+      <code>Starts = 121043</code> is doing 121,043 index lookups.</li>
+  <li><code>A-Time</code> and <code>Buffers</code> (in <code>ALLSTATS</code>) — where the work went.
+      Buffer gets are a better signal than elapsed time because they don't vary with cache state.</li>
+  <li><code>OMem</code>/<code>1Mem</code>/<code>Used-Mem</code> and a <code>1</code> in the
+      <code>O/1/M</code> column — a sort or hash that spilled to <code>TEMP</code>.</li>
+  <li>The <code>Predicate Information</code> block below the table. <code>access</code> means the
+      predicate drove the index; <code>filter</code> means rows were fetched and then thrown away.
+      Turning a filter into an access predicate is often the whole fix.</li>
+</ul>
+
+<h3>In the client</h3>
+
+<pre class="language-sql"><code class="language-sql">SET AUTOTRACE ON EXPLAIN STATISTICS    -- SQL*Plus and SQLcl: plan + I/O per statement
+SET TIMING ON</code></pre>
+
+<h2>Bind variables</h2>
+
+<p>Every distinct SQL text gets parsed and stored in the shared pool. Literals make every execution a
+new statement:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Three statements, three hard parses, three plans in the shared pool
+SELECT * FROM orders WHERE customer_id = 1;
+SELECT * FROM orders WHERE customer_id = 2;
+SELECT * FROM orders WHERE customer_id = 3;
+
+-- One statement, parsed once, executed three times
+SELECT * FROM orders WHERE customer_id = :id;</code></pre>
+
+<p>On a busy OLTP system, literal SQL causes latch contention in the shared pool and a measurable
+throughput ceiling. It is also, not coincidentally, how SQL injection happens. JDBC
+<code>PreparedStatement</code> and JPA both bind by default, so this is mostly a problem in
+hand-built dynamic SQL and in reporting tools.</p>
+
+<p>The flip side: with one plan for all bind values, a skewed column can get a plan that suits
+<code>status = 'CLOSED'</code> and is disastrous for <code>status = 'NEW'</code>. Oracle mitigates this
+with bind peeking and adaptive cursor sharing, but if you have one genuinely skewed predicate, a
+literal there is a defensible choice.</p>
+
+<h2>Maintenance</h2>
+
+<pre class="language-sql"><code class="language-sql">-- Is anything using this index? Turn it invisible before you drop it.
+ALTER INDEX orders_status_ix INVISIBLE;    -- optimiser ignores it, still maintained
+ALTER INDEX orders_status_ix VISIBLE;      -- instant rollback if things get slower
+DROP INDEX orders_status_ix;
+
+-- Rebuild without blocking DML
+ALTER INDEX orders_customer_ix REBUILD ONLINE;
+
+-- Indexes on a table, and their selectivity
+SELECT index_name, uniqueness, distinct_keys, num_rows, last_analyzed
+FROM   user_indexes WHERE table_name = 'ORDERS';
+
+SELECT index_name, column_position, column_name
+FROM   user_ind_columns WHERE table_name = 'ORDERS'
+ORDER  BY index_name, column_position;</code></pre>
+
+<p><code>INVISIBLE</code> is the right way to retire an index: you get the performance effect of
+dropping it with a one-statement undo, and you never pay to rebuild a 40 GB index you dropped by
+mistake.</p>
+
+<p>Remember indexes are not free. Every one of them is extra work on every
+<code>INSERT</code>, <code>UPDATE</code> of its columns, and <code>DELETE</code>. A table with twelve
+indexes has a slow write path, and some of those twelve are redundant prefixes of the others.</p>
+
+<h2>A short checklist</h2>
+
+<ol>
+  <li>Get the real plan with <code>GATHER_PLAN_STATISTICS</code> and <code>ALLSTATS LAST</code>.</li>
+  <li>Find the first line where <code>E-Rows</code> and <code>A-Rows</code> diverge badly. That is
+      the problem.</li>
+  <li>Check the statistics on the objects involved before touching anything else.</li>
+  <li>Look for functions and implicit conversions wrapped around indexed columns.</li>
+  <li>Check that every foreign key you join on has an index.</li>
+  <li>Only then consider a new index — and check <code>USER_IND_COLUMNS</code> first, because it may
+      already exist with the columns in the wrong order.</li>
+</ol>
+
+<h2>Next</h2>
+
+<p>Transactions, isolation and locking — including the reason readers never block writers in Oracle,
+and the <code>SKIP LOCKED</code> trick that turns a table into a work queue.</p>

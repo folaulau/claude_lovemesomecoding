@@ -1,0 +1,164 @@
+<p>Joins in Oracle are the joins you already know. Two things are specific enough to be worth a post:
+the <code>(+)</code> outer-join operator you will meet in every codebase written before 2005, and the
+<code>NOT IN</code> null trap that returns zero rows without an error.</p>
+
+<h2>ANSI joins, which is what you should write</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT c.last_name, o.id, o.total
+FROM   customers c
+JOIN   orders    o ON o.customer_id = c.id;             -- INNER
+
+SELECT c.last_name, o.id
+FROM   customers c
+LEFT   JOIN orders o ON o.customer_id = c.id;           -- keep customers with no orders
+
+SELECT c.last_name, o.id
+FROM   customers c
+FULL   OUTER JOIN orders o ON o.customer_id = c.id;     -- unmatched from both sides
+
+SELECT c.last_name, r.region_name
+FROM   customers c CROSS JOIN regions r;                -- cartesian, on purpose</code></pre>
+
+<p>Oracle supports <code>USING</code> and <code>NATURAL JOIN</code> as well. Use <code>USING</code>
+sparingly and <code>NATURAL JOIN</code> never — it joins on every same-named column, so the day
+somebody adds a <code>created_at</code> to both tables the query silently changes meaning.</p>
+
+<p>One <code>USING</code> quirk: the joined column becomes unqualified, and prefixing it is a syntax
+error.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id           -- correct
+FROM   orders JOIN customers USING (customer_id);
+
+SELECT o.customer_id         -- ORA-25154: column part of USING clause cannot have qualifier
+FROM   orders o JOIN customers c USING (customer_id);</code></pre>
+
+<h2>The (+) operator</h2>
+
+<p>Before Oracle 9i there was no ANSI join syntax. Outer joins were written by marking the
+<em>optional</em> side of a predicate with <code>(+)</code>, in the <code>WHERE</code> clause:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Legacy: LEFT JOIN orders. The (+) goes on the side that may be missing.
+SELECT c.last_name, o.id
+FROM   customers c, orders o
+WHERE  o.customer_id(+) = c.id;
+
+-- Equivalent, and what you should write instead
+SELECT c.last_name, o.id
+FROM   customers c
+LEFT   JOIN orders o ON o.customer_id = c.id;</code></pre>
+
+<p>You need to be able to read it, and you need to know why not to write it:</p>
+
+<ul>
+  <li><strong>There is no full outer join.</strong> <code>(+)</code> on both sides is an error.</li>
+  <li><strong>Every predicate on the outer table needs its own <code>(+)</code>.</strong> Miss one and
+      the outer join collapses into an inner join, silently:
+      <code>WHERE o.customer_id(+) = c.id AND o.status = 'NEW'</code> drops every customer without an
+      order, because <code>NULL = 'NEW'</code> is not true. It has to be
+      <code>AND o.status(+) = 'NEW'</code>.</li>
+  <li>It cannot be combined with ANSI joins in the same <code>FROM</code> clause.</li>
+</ul>
+
+<p>That second bullet is the entire reason ANSI syntax exists: it puts the join condition somewhere
+structurally distinct from the filter, so the two cannot be confused.</p>
+
+<h2>Semi-joins: does a match exist?</h2>
+
+<p>When you want rows from one table based on the existence of a match, but no columns from the other
+table, don't join — Oracle can stop at the first match instead of building the whole result.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Customers who have ordered
+SELECT * FROM customers c
+WHERE  EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
+
+-- Same thing with IN
+SELECT * FROM customers
+WHERE  id IN (SELECT customer_id FROM orders);</code></pre>
+
+<p>A plain <code>JOIN</code> here would duplicate a customer once per order and then need a
+<code>DISTINCT</code> to clean up — slower and easy to forget.</p>
+
+<p>The optimiser treats <code>EXISTS</code> and <code>IN</code> as the same semi-join and usually
+produces an identical plan, so pick on readability. <code>EXISTS</code> is the safer habit because it
+never surprises you on the anti-join side, which is next.</p>
+
+<h2>The NOT IN trap</h2>
+
+<p>This is the one that costs an afternoon. These two queries look equivalent and are not:</p>
+
+<pre class="language-sql"><code class="language-sql">-- If ANY orders.customer_id is NULL, this returns ZERO rows. Always.
+SELECT * FROM customers
+WHERE  id NOT IN (SELECT customer_id FROM orders);
+
+-- Correct, and unaffected by NULLs
+SELECT * FROM customers c
+WHERE  NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);</code></pre>
+
+<p>The reason is three-valued logic. <code>x NOT IN (1, 2, NULL)</code> expands to
+<code>x &lt;&gt; 1 AND x &lt;&gt; 2 AND x &lt;&gt; NULL</code>. That last term is
+<code>UNKNOWN</code>, never <code>TRUE</code>, so the whole conjunction can never be true and no row
+qualifies. No error, no warning, just an empty result.</p>
+
+<p><strong>Use <code>NOT EXISTS</code> for anti-joins.</strong> It is null-safe by construction. If
+you must keep <code>NOT IN</code>, filter the subquery: <code>WHERE customer_id IS NOT NULL</code>.
+Interestingly, a <code>NOT NULL</code> constraint on the column also fixes it — the optimiser can then
+prove the null case away — which means the same query works in one environment and breaks in another
+where the constraint was never applied.</p>
+
+<h2>Self-joins</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT e.last_name AS employee, m.last_name AS manager
+FROM   employees e
+LEFT   JOIN employees m ON m.employee_id = e.manager_id;   -- LEFT so the CEO survives</code></pre>
+
+<p>For a whole hierarchy rather than one level, use <code>CONNECT BY</code> or a recursive CTE — see
+the previous post.</p>
+
+<h2>The correlated join a plain JOIN cannot do</h2>
+
+<p>Everything above joins on a condition. What none of it can do is let the right-hand side <em>see</em>
+the row it is being joined to — which is what you need for "the three most recent orders per
+customer", where the filter depends on the customer. From 12c, <code>CROSS APPLY</code> and
+<code>OUTER APPLY</code> allow exactly that:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT c.last_name, o.id, o.order_date
+FROM   customers c
+CROSS  APPLY (SELECT * FROM orders o
+              WHERE  o.customer_id = c.id      -- legal: c is in scope
+              ORDER  BY o.order_date DESC
+              FETCH  FIRST 3 ROWS ONLY) o;</code></pre>
+
+<p>That is a big enough subject to have its own post, which is the next one. The short version:
+<code>CROSS APPLY</code> behaves like an inner join and drops the outer row when the subquery is empty,
+<code>OUTER APPLY</code> behaves like a left join and keeps it.</p>
+
+<h2>How Oracle actually executes a join</h2>
+
+<p>Three algorithms, and recognising them in a plan tells you whether the plan is sensible.</p>
+
+<table>
+  <thead><tr><th>Method</th><th>Shape</th><th>Good when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Nested loops</strong></td><td>For each row of A, probe B by index.</td><td>A is small and B has a usable index. The right plan for OLTP lookups.</td></tr>
+    <tr><td><strong>Hash join</strong></td><td>Build a hash table on the smaller side, scan the larger.</td><td>Both sides are large. The right plan for reporting. Equality joins only.</td></tr>
+    <tr><td><strong>Sort-merge</strong></td><td>Sort both sides, walk them together.</td><td>Inputs already sorted, or the join is a range (<code>&lt;</code>, <code>BETWEEN</code>).</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN PLAN FOR
+SELECT c.last_name, sum(o.total)
+FROM   customers c JOIN orders o ON o.customer_id = c.id
+GROUP  BY c.last_name;
+
+SELECT * FROM dbms_xplan.display(format => 'BASIC +ROWS +COST');</code></pre>
+
+<p>The failure mode to look for: <strong>nested loops over a large row source</strong>. If the plan
+says <code>NESTED LOOPS</code> and the estimated row count on the outer side is 12 but the table holds
+five million rows, the optimiser's estimate is wrong — usually stale statistics or a predicate it
+cannot evaluate — and the query will take a hundred times longer than the plan suggests. That is the
+subject of the indexes and execution plans post.</p>
+
+<h2>Next</h2>
+
+<p><code>CROSS APPLY</code> and <code>OUTER APPLY</code> in full: top-N per group, several aggregates in
+one pass, and how to tell from the plan whether it is helping or hurting.</p>

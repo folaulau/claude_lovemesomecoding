@@ -1,0 +1,217 @@
+<p>Oracle's concurrency model is its best-engineered part, and it behaves differently from what you may
+expect if you learned databases on MySQL or SQL Server. Two sentences carry most of it:</p>
+
+<ul>
+  <li><strong>Readers never block writers, and writers never block readers.</strong></li>
+  <li><strong>A reader never sees uncommitted data, and never blocks waiting for it.</strong></li>
+</ul>
+
+<p>Both fall out of one mechanism: undo.</p>
+
+<h2>Read consistency via undo</h2>
+
+<p>When you change a row, Oracle writes the <em>previous</em> version into the undo tablespace before
+overwriting the block. Every query records the system change number (SCN) at which it started, and if
+it meets a block modified after that SCN it reconstructs the older version from undo.</p>
+
+<p>So a <code>SELECT</code> sees a consistent snapshot of the database as of the moment it began — no
+locks taken, nothing blocked, no dirty reads possible. This is Oracle's MVCC, and there is no
+"read uncommitted" mode because there is no need for one.</p>
+
+<p>The cost shows up as one specific error. If undo is overwritten before a long-running query
+finishes reconstructing what it needs:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ORA-01555: snapshot too old: rollback segment number 7 with name "_SYSSMU7$" too small</code></pre>
+
+<p>Almost always a long report running against a table under heavy DML. The fixes are a bigger
+<code>UNDO_RETENTION</code>, a bigger undo tablespace, or making the query faster.</p>
+
+<h2>Where a transaction begins and ends</h2>
+
+<p>There is no <code>BEGIN TRANSACTION</code>. The first DML statement starts one implicitly, and it
+runs until you end it.</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE accounts SET balance = balance - 100 WHERE id = 1;   -- transaction starts here
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+
+SAVEPOINT after_transfer;
+DELETE FROM audit_log WHERE logged_at < sysdate - 365;
+ROLLBACK TO SAVEPOINT after_transfer;   -- undoes the delete, keeps the transfer
+
+COMMIT;</code></pre>
+
+<p>Three things to know about ending one:</p>
+
+<ul>
+  <li><strong>SQL*Plus and SQLcl do not autocommit.</strong> Close the window without committing and
+      your work is gone. JDBC, by contrast, <em>does</em> autocommit by default — every statement is
+      its own transaction — which is the opposite mistake and quietly breaks multi-statement logic.
+      Spring's <code>@Transactional</code> turns it off for you.</li>
+  <li><strong>DDL commits.</strong> <code>CREATE</code>, <code>ALTER</code>, <code>DROP</code> and
+      <code>TRUNCATE</code> issue a commit before and after themselves. A <code>TRUNCATE</code> in the
+      middle of a transaction commits everything before it, and cannot be rolled back.</li>
+  <li><strong><code>ROLLBACK TO SAVEPOINT</code> does not end the transaction</strong>, and it releases
+      only the locks acquired after the savepoint.</li>
+</ul>
+
+<h2>Isolation levels</h2>
+
+<p>Oracle implements two of the four ANSI levels, and that is sufficient because its
+<code>READ COMMITTED</code> is stronger than the standard requires.</p>
+
+<table>
+  <thead><tr><th>Level</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td><code>READ COMMITTED</code> (default)</td><td>Each <em>statement</em> sees a snapshot as of its own start. Consistent within a statement, may differ between statements.</td></tr>
+    <tr><td><code>SERIALIZABLE</code></td><td>Every statement in the transaction sees the snapshot from the <em>transaction's</em> start.</td></tr>
+    <tr><td><code>READ ONLY</code></td><td>Like serializable, but no DML permitted. The right choice for a long report.</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-sql"><code class="language-sql">SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SET TRANSACTION READ ONLY;
+ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE;   -- for every subsequent transaction</code></pre>
+
+<p>Dirty reads are impossible at either level. Non-repeatable reads and phantoms are possible under
+<code>READ COMMITTED</code> and not under <code>SERIALIZABLE</code>.</p>
+
+<p>Oracle's serializable is <em>optimistic</em>: it does not lock ahead, it fails at the end. Update a
+row that changed since your transaction started and you get:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ORA-08177: can't serialize access for this transaction</code></pre>
+
+<p>which is not a bug — it is the level working. <strong>Anything running at
+<code>SERIALIZABLE</code> needs retry logic</strong>, because <code>ORA-08177</code> is expected under
+contention. Roll back the whole transaction and run it again; retrying just the statement is wrong,
+because the snapshot is fixed for the transaction.</p>
+
+<h2>Locking</h2>
+
+<p>Oracle locks rows, and only rows, and only for writes. There is no lock escalation to a page or
+table lock — a common source of surprise for people arriving from SQL Server. Row locks are stored in
+the data block itself, so there is no lock manager to run out of and no memory cost to locking a
+million rows.</p>
+
+<table>
+  <thead><tr><th>What</th><th>Taken by</th></tr></thead>
+  <tbody>
+    <tr><td>Row lock (TX)</td><td><code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>/<code>SELECT FOR UPDATE</code> — exclusive, until commit.</td></tr>
+    <tr><td>Table lock (TM)</td><td>Any DML, in <em>row share</em> mode. Stops another session dropping the table under you; does not block other DML.</td></tr>
+    <tr><td>Exclusive table lock</td><td>Most DDL, and <code>LOCK TABLE … IN EXCLUSIVE MODE</code>.</td></tr>
+  </tbody>
+</table>
+
+<h3>SELECT FOR UPDATE</h3>
+
+<p>Pessimistic locking, for read-then-write logic that must not race:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT balance INTO v_balance FROM accounts WHERE id = 1 FOR UPDATE;
+-- Nobody else can modify this row until we commit.
+UPDATE accounts SET balance = v_balance - 100 WHERE id = 1;
+COMMIT;
+
+SELECT ... FOR UPDATE NOWAIT;        -- ORA-00054 immediately if locked
+SELECT ... FOR UPDATE WAIT 5;        -- ORA-30006 after 5 seconds
+SELECT ... FOR UPDATE SKIP LOCKED;   -- silently omit rows somebody else holds</code></pre>
+
+<p>Plain <code>FOR UPDATE</code> waits forever, which in a web request means a thread hanging until
+somebody's session times out. <strong>Use <code>NOWAIT</code> or <code>WAIT n</code> in anything
+interactive</strong> and turn <code>ORA-00054</code> into a "please try again".</p>
+
+<h3>SKIP LOCKED as a work queue</h3>
+
+<p><code>SKIP LOCKED</code> is the feature worth remembering. It turns a table into a queue that many
+workers can drain concurrently without coordinating, because each worker skips rows another worker has
+claimed:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Every worker runs exactly this. No two ever get the same job.
+DECLARE
+  CURSOR c IS
+    SELECT id FROM job_queue
+    WHERE  status = 'PENDING'
+    ORDER  BY created_at
+    FOR UPDATE SKIP LOCKED;
+  v_id job_queue.id%TYPE;
+BEGIN
+  OPEN c;
+  FETCH c BULK COLLECT INTO ... LIMIT 10;   -- claim a batch
+  CLOSE c;
+  -- process, then mark done and COMMIT to release the locks
+END;
+/</code></pre>
+
+<p>Before reaching for a message broker, check whether this is enough. It very often is, and it comes
+with transactional semantics for free — the job and the work it produced commit together.</p>
+
+<h2>Deadlocks</h2>
+
+<p>Two sessions each holding what the other wants. Oracle detects the cycle in about three seconds and
+breaks it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ORA-00060: deadlock detected while waiting for resource</code></pre>
+
+<p>An important detail: <strong>Oracle rolls back only the <em>statement</em> that detected the
+deadlock, not the transaction.</strong> Your transaction is still open, still holding its other locks,
+and now in a partially-applied state. The application must catch <code>ORA-00060</code> and
+<code>ROLLBACK</code> explicitly. Code that logs it and carries on is corrupting data.</p>
+
+<p>Oracle also writes a trace file with both SQL statements and the rows involved — the fastest route
+to the cause:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT value FROM v$diag_info WHERE name = 'Default Trace File';</code></pre>
+
+<p>The usual cause is two code paths updating the same rows in different orders. Fix it by ordering
+consistently — always parent before child, always ascending id — rather than by retrying, though
+retrying is a reasonable belt-and-braces addition.</p>
+
+<h2>Finding a blocker</h2>
+
+<p>When something is hung, this is the query:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT s.sid, s.serial#, s.username, s.status,
+       s.blocking_session, s.event, s.seconds_in_wait,
+       q.sql_text
+FROM   v$session s
+LEFT   JOIN v$sql q ON q.sql_id = s.sql_id
+WHERE  s.blocking_session IS NOT NULL
+    OR s.sid IN (SELECT blocking_session FROM v$session WHERE blocking_session IS NOT NULL);</code></pre>
+
+<p>The whole waiting chain, with the head of it — the session that is blocking and not itself
+blocked — showing <code>blocking_session = NULL</code>. That session is the problem, and nine times out
+of ten it is <code>INACTIVE</code>: somebody ran an <code>UPDATE</code> in a SQL client, went to lunch,
+and never committed.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Which rows, specifically
+SELECT l.session_id, o.object_name, l.locked_mode
+FROM   v$locked_object l JOIN dba_objects o ON o.object_id = l.object_id;
+
+-- Last resort
+ALTER SYSTEM KILL SESSION '123,45678' IMMEDIATE;</code></pre>
+
+<p>Killing a session rolls its transaction back, which on a large uncommitted change can itself take a
+while. The session shows as <code>KILLED</code> and holds its locks until the rollback finishes; there
+is nothing to do but wait.</p>
+
+<h2>Optimistic locking instead</h2>
+
+<p>For a web application, pessimistic locks held across a user's think time are the wrong shape. Add a
+version column and check it on write:</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE orders
+SET    total = :new_total, version = version + 1
+WHERE  id = :id AND version = :expected_version;
+
+-- SQL%ROWCOUNT = 0 means somebody else changed the row: report a conflict.</code></pre>
+
+<p>This is exactly what JPA's <code>@Version</code> does, and it is the default for a reason: no locks
+are held between reading and writing, so a user who abandons a form costs nothing.</p>
+
+<p>Oracle also exposes <code>ORA_ROWSCN</code>, a per-row change number that can serve as a version
+column with no schema change — but it is block-granular unless the table was created with
+<code>ROWDEPENDENCIES</code>, so an unrelated row in the same block will produce a false conflict. A
+real version column is worth the four bytes.</p>
+
+<h2>Next</h2>
+
+<p>Last in the track: wiring all of this up from Spring Boot — driver, connection string, dialect,
+sequence allocation and the mistakes that only show up under load.</p>

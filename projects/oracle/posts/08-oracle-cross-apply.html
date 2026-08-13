@@ -1,0 +1,258 @@
+<p>An inline view normally cannot see the row it is being joined to. <code>CROSS APPLY</code> removes
+that restriction: the subquery in the <code>FROM</code> clause may reference columns from tables to its
+left, and it is evaluated once per outer row. Oracle added it in 12.1, borrowing the T-SQL spelling
+alongside the ANSI keyword <code>LATERAL</code>.</p>
+
+<p>It is the tool for three things a plain join handles badly: top-N per group, several aggregates over
+the same child table in one pass, and calling something row by row.</p>
+
+<h2>The problem it solves</h2>
+
+<p>Before 12c, this was simply illegal — <code>c.id</code> is not in scope inside the inline view:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT c.last_name, o.id, o.order_date
+FROM   customers c,
+       (SELECT * FROM orders o
+        WHERE  o.customer_id = c.id      -- ORA-00904: "C"."ID": invalid identifier
+        ORDER  BY o.order_date DESC
+        FETCH  FIRST 3 ROWS ONLY) o;</code></pre>
+
+<p>Add <code>CROSS APPLY</code> and the correlation is legal:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT c.last_name, o.id, o.order_date, o.total
+FROM   customers c
+CROSS  APPLY (SELECT * FROM orders o
+              WHERE  o.customer_id = c.id
+              ORDER  BY o.order_date DESC
+              FETCH  FIRST 3 ROWS ONLY) o;</code></pre>
+
+<p>Three rows per customer, chosen per customer. A correlated <em>scalar</em> subquery could never do
+this: it returns one value, not three rows and four columns.</p>
+
+<h2>Four spellings, two behaviours</h2>
+
+<p>Oracle accepts both the T-SQL and the ANSI syntax, and they compile to the same thing. What actually
+differs is only whether an empty subquery drops the outer row.</p>
+
+<table>
+  <thead><tr><th>Written as</th><th>Behaves like</th></tr></thead>
+  <tbody>
+    <tr><td><code>CROSS APPLY (…)</code></td><td><strong>Inner</strong> join — outer row disappears when the subquery returns nothing.</td></tr>
+    <tr><td><code>a, LATERAL (…)</code> / <code>a CROSS JOIN LATERAL (…)</code></td><td>Same as <code>CROSS APPLY</code>.</td></tr>
+    <tr><td><code>OUTER APPLY (…)</code></td><td><strong>Left</strong> join — outer row survives with nulls.</td></tr>
+    <tr><td><code>a LEFT JOIN LATERAL (…) ON 1 = 1</code></td><td>Same as <code>OUTER APPLY</code>. The <code>ON</code> is mandatory, hence the filler.</td></tr>
+  </tbody>
+</table>
+
+<p>That first row is the one that catches people. <code>CROSS APPLY</code> reads like "cross join, so
+nothing is lost", and it is the opposite:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Customers with no orders VANISH from this result
+SELECT c.last_name, o.id
+FROM   customers c
+CROSS  APPLY (SELECT * FROM orders o WHERE o.customer_id = c.id
+              ORDER BY o.order_date DESC FETCH FIRST 1 ROWS ONLY) o;
+
+-- Customers with no orders appear with o.id NULL
+SELECT c.last_name, o.id
+FROM   customers c
+OUTER  APPLY (SELECT * FROM orders o WHERE o.customer_id = c.id
+              ORDER BY o.order_date DESC FETCH FIRST 1 ROWS ONLY) o;</code></pre>
+
+<p><strong>Reach for <code>OUTER APPLY</code> by default</strong> unless you positively want the outer
+row filtered out. Silently losing rows is the harder bug to notice.</p>
+
+<p>Two structural limits: the lateral view can only reference tables that appear <em>before</em> it in
+the <code>FROM</code> clause, and it cannot sit on the right-hand side of a <code>RIGHT</code> or
+<code>FULL OUTER JOIN</code>.</p>
+
+<h2>Use 1: top-N per group</h2>
+
+<p>This is the headline case, and it is worth comparing against the analytic-function version from the
+previous post, because they perform very differently.</p>
+
+<pre class="language-sql"><code class="language-sql">-- (a) ROW_NUMBER: reads every order, numbers all of them, throws most away
+SELECT * FROM (
+  SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id
+                                 ORDER BY order_date DESC) rn
+  FROM   orders o
+) WHERE rn &lt;= 3;
+
+-- (b) OUTER APPLY: walks an index backwards per customer and stops after 3
+SELECT c.id, c.last_name, o.id AS order_id, o.order_date
+FROM   customers c
+OUTER  APPLY (SELECT o.id, o.order_date FROM orders o
+              WHERE  o.customer_id = c.id
+              ORDER  BY o.order_date DESC
+              FETCH  FIRST 3 ROWS ONLY) o;</code></pre>
+
+<p>With an index on <code>orders (customer_id, order_date DESC)</code>, (b) does three index reads per
+customer and never touches the rest of the table. (a) must scan and sort <em>all</em> orders before it
+can discard anything.</p>
+
+<p>The trade-off flips with the shape of the data:</p>
+
+<table>
+  <thead><tr><th>Situation</th><th>Faster</th></tr></thead>
+  <tbody>
+    <tr><td>Few outer rows, huge child table, index on <code>(fk, sort_col)</code></td><td><code>APPLY</code>, often by orders of magnitude</td></tr>
+    <tr><td>You want top-N for <em>every</em> group and are reading most of the child table anyway</td><td><code>ROW_NUMBER</code> — one pass beats millions of index probes</td></tr>
+    <tr><td>No usable index on the child sort column</td><td><code>ROW_NUMBER</code> — <code>APPLY</code> re-sorts the child set per outer row</td></tr>
+  </tbody>
+</table>
+
+<p>That last row is the trap. <code>FETCH FIRST 3</code> inside the lateral view only stops early if
+Oracle can produce the rows already ordered. Without the index it sorts the whole matching set, per
+outer row, and the query is far slower than the analytic version.</p>
+
+<h2>Use 2: several aggregates in one pass</h2>
+
+<p>The pattern <code>APPLY</code> improves most, and the one people miss. Suppose you want each
+customer with their order count, revenue and last order date. Scalar subqueries mean three separate
+correlated queries against <code>orders</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Three passes over orders per customer
+SELECT c.last_name,
+       (SELECT count(*)        FROM orders o WHERE o.customer_id = c.id) AS orders,
+       (SELECT sum(o.total)    FROM orders o WHERE o.customer_id = c.id) AS revenue,
+       (SELECT max(o.order_date) FROM orders o WHERE o.customer_id = c.id) AS last_order
+FROM   customers c;
+
+-- One pass, and the column list stays readable
+SELECT c.last_name, s.orders, s.revenue, s.last_order
+FROM   customers c
+OUTER  APPLY (SELECT count(*)             AS orders,
+                     sum(o.total)         AS revenue,
+                     max(o.order_date)    AS last_order
+              FROM   orders o
+              WHERE  o.customer_id = c.id) s;</code></pre>
+
+<p>Note a real semantic difference here, not just a speed one. An aggregate with no
+<code>GROUP BY</code> always returns exactly one row, so this subquery is never empty — which means
+<code>count(*)</code> comes back as <code>0</code> rather than <code>NULL</code> for a customer with no
+orders, and <code>CROSS APPLY</code> would <em>not</em> drop them. The difference between
+<code>CROSS</code> and <code>OUTER</code> only bites when the subquery can genuinely produce zero
+rows.</p>
+
+<p>The alternative shape — <code>LEFT JOIN</code> to a <code>GROUP BY</code> subquery — is fine and
+often produces a better plan when you are aggregating most of the child table. <code>APPLY</code> wins
+when you are filtering to a small slice of customers, because the aggregate is then only computed for
+the customers you asked about.</p>
+
+<h2>Use 3: per-row function calls</h2>
+
+<p>A table function returning a collection, invoked once per row:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE TYPE t_num_list AS TABLE OF NUMBER;
+/
+
+CREATE OR REPLACE FUNCTION split_ids (p_csv VARCHAR2) RETURN t_num_list PIPELINED IS
+BEGIN
+  FOR r IN (SELECT regexp_substr(p_csv, '[^,]+', 1, LEVEL) AS v
+            FROM   dual CONNECT BY LEVEL &lt;= regexp_count(p_csv, ',') + 1) LOOP
+    PIPE ROW (to_number(r.v));
+  END LOOP;
+  RETURN;
+END split_ids;
+/
+
+-- One row per id in each import row's CSV column
+SELECT i.batch_id, x.column_value AS product_id
+FROM   imports i
+CROSS  APPLY TABLE(split_ids(i.product_ids)) x;</code></pre>
+
+<p>Or without a function at all, splitting a delimited column into rows:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT i.batch_id, t.tag
+FROM   imports i
+CROSS  APPLY (SELECT regexp_substr(i.tags, '[^,]+', 1, LEVEL) AS tag
+              FROM   dual
+              CONNECT BY LEVEL &lt;= regexp_count(i.tags, ',') + 1) t;</code></pre>
+
+<p>One clarification that saves time: <strong><code>JSON_TABLE</code>, <code>XMLTABLE</code> and
+<code>TABLE()</code> are already implicitly lateral</strong> — they can reference an outer column with
+no <code>APPLY</code> at all. You only need <code>APPLY</code> when the thing on the right is an
+ordinary subquery.</p>
+
+<pre class="language-sql"><code class="language-sql">-- No APPLY needed: JSON_TABLE sees o.payload directly
+SELECT o.id, j.sku, j.qty
+FROM   orders o,
+       JSON_TABLE(o.payload, '$.items[*]'
+         COLUMNS (sku VARCHAR2(40) PATH '$.sku',
+                  qty NUMBER       PATH '$.qty')) j;</code></pre>
+
+<h2>Reading the plan</h2>
+
+<p>A lateral view executes as a nested loop, and the column to watch is <code>Starts</code> — how many
+times the inner side ran.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS */ c.id, o.order_date
+FROM   customers c
+OUTER  APPLY (SELECT o.order_date FROM orders o
+              WHERE  o.customer_id = c.id
+              ORDER  BY o.order_date DESC FETCH FIRST 3 ROWS ONLY) o
+WHERE  c.status = 'ACTIVE';
+
+SELECT * FROM dbms_xplan.display_cursor(format => 'ALLSTATS LAST');</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">------------------------------------------------------------------------------------------
+| Id | Operation                        | Name                | Starts | E-Rows | A-Rows |
+------------------------------------------------------------------------------------------
+|  0 | SELECT STATEMENT                 |                     |      1 |        |   2412 |
+|  1 |  NESTED LOOPS OUTER              |                     |      1 |    810 |   2412 |
+|* 2 |   TABLE ACCESS FULL              | CUSTOMERS           |      1 |    810 |    842 |
+|  3 |   VIEW                           | VW_LAT_A18161FF     |    842 |      3 |   2412 |
+|* 4 |    VIEW                          | VW_LAT_1BBF5C63     |    842 |      3 |   2412 |
+|  5 |     WINDOW NOSORT STOPKEY        |                     |    842 |      3 |   2412 |
+|  6 |      TABLE ACCESS BY INDEX ROWID | ORDERS              |    842 |        |   3254 |
+|* 7 |       INDEX RANGE SCAN DESCENDING| ORDERS_CUST_DATE_IX |    842 |        |   3254 |
+------------------------------------------------------------------------------------------</code></pre>
+
+<p>Everything good about that plan is visible in two places. <code>Starts = 842</code> on the inner
+side is one execution per active customer, as expected. And <code>WINDOW NOSORT STOPKEY</code> over an
+<code>INDEX RANGE SCAN DESCENDING</code> is the payoff — <em>NOSORT</em> means the index already
+supplied the order, <em>STOPKEY</em> means it stopped at three. 3,254 rows touched instead of the whole
+orders table.</p>
+
+<p>The <code>VW_LAT_…</code> names are Oracle's internal lateral views; seeing them just confirms the
+correlation was recognised. Two things to look for when an <code>APPLY</code> query is slow:</p>
+
+<ul>
+  <li><strong><code>SORT ORDER BY STOPKEY</code> instead of <code>WINDOW NOSORT STOPKEY</code></strong>
+      — no usable index, so it is sorting per outer row. Add the composite index or switch to
+      <code>ROW_NUMBER</code>.</li>
+  <li><strong><code>Starts</code> far higher than you expected</strong> — the outer row source is not
+      as filtered as you thought. Fix the outer predicate; a cheap inner query executed two million
+      times is still expensive.</li>
+</ul>
+
+<p>The optimiser may also <em>decorrelate</em> a lateral view — rewriting it into a hash join plus a
+window function, i.e. version (a) of the top-N query. That is usually a good decision on large row
+sources. If you need to compare both shapes, write both and time them rather than fighting the
+rewrite with hints.</p>
+
+<h2>On 11g, where none of this exists</h2>
+
+<p><code>APPLY</code> and <code>LATERAL</code> are 12.1 and later. The equivalents:</p>
+
+<ul>
+  <li>Top-N per group → <code>ROW_NUMBER()</code> in an inline view, filtered outside. Works
+      everywhere, and on 11g there is also no <code>FETCH FIRST</code>, so the inner
+      <code>APPLY</code> version would need <code>ROWNUM</code> anyway.</li>
+  <li>Multiple aggregates → <code>LEFT JOIN</code> to a <code>GROUP BY</code> subquery.</li>
+  <li>Table functions → <code>TABLE()</code> with the old <code>(+)</code> correlation, which already
+      worked: <code>FROM imports i, TABLE(split_ids(i.product_ids))</code>.</li>
+</ul>
+
+<h2>When not to use it</h2>
+
+<p><code>APPLY</code> is a nested loop by construction, so it is the wrong shape whenever you are
+processing most of both tables. A report aggregating every order for every customer wants a hash join
+and a <code>GROUP BY</code>, not 800,000 correlated executions. The rule of thumb: <strong>the outer
+row source should be small or well filtered, and the inner side should have an index that answers it
+directly.</strong> When both are true, nothing else in the language is close.</p>
+
+<h2>Next</h2>
+
+<p>Analytic functions — the other answer to top-N per group, and the feature that removes more
+self-joins than anything else in Oracle SQL.</p>

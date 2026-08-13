@@ -1,0 +1,207 @@
+<p>Oracle's type list is short, which is good, but several of the types behave differently from the
+same-named type in every other database. Getting these wrong is cheap to fix on day one and
+expensive to fix once there are 200 million rows in the table.</p>
+
+<h2>Strings</h2>
+
+<table>
+  <thead>
+    <tr><th>Type</th><th>Use it for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>VARCHAR2(n)</code></td><td>Everything. This is <em>the</em> Oracle string type.</td></tr>
+    <tr><td><code>CHAR(n)</code></td><td>Almost nothing. Blank-padded to <code>n</code>, and the padding takes part in comparisons.</td></tr>
+    <tr><td><code>NVARCHAR2(n)</code></td><td>Only when the database character set is not Unicode and you need Unicode in one column.</td></tr>
+    <tr><td><code>CLOB</code></td><td>Text over 4000 bytes — descriptions, documents, JSON payloads.</td></tr>
+  </tbody>
+</table>
+
+<p><code>VARCHAR</code> exists as a synonym for <code>VARCHAR2</code>, and Oracle's own
+documentation asks you not to use it because they reserve the right to change its semantics. Follow
+that advice; you will look like you know the platform.</p>
+
+<h3>CHAR is a trap</h3>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE t (a CHAR(10), b VARCHAR2(10));
+INSERT INTO t VALUES ('abc', 'abc');
+
+SELECT length(a), length(b) FROM t;    -- 10, 3   -- a was padded
+SELECT * FROM t WHERE b = 'abc';       -- 1 row
+SELECT * FROM t WHERE b = a;           -- 0 rows  -- 'abc       ' <> 'abc'</code></pre>
+
+<p>The last comparison is <code>VARCHAR2</code> vs <code>CHAR</code>, so Oracle uses non-padded
+semantics and the trailing spaces make it unequal. Two <code>CHAR</code> columns would have compared
+blank-padded and matched. Avoid the whole question: use <code>VARCHAR2</code>.</p>
+
+<h3>CHAR vs BYTE length</h3>
+
+<p>This one is genuinely important with UTF-8. <code>VARCHAR2(10)</code> means <em>10 bytes</em> by
+default, and in <code>AL32UTF8</code> a single emoji or CJK character can take four. So a 10-byte
+column holds two or three characters, and the insert fails with
+<code>ORA-12899: value too large for column</code> on data that looks well within the limit.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE t (
+  bytes_col VARCHAR2(10 BYTE),   -- 10 bytes  (the default)
+  chars_col VARCHAR2(10 CHAR)    -- 10 characters, whatever they cost
+);
+
+INSERT INTO t (chars_col) VALUES ('日本語テキストです');   -- 9 chars, 27 bytes: fine
+INSERT INTO t (bytes_col) VALUES ('日本語テキストです');   -- ORA-12899</code></pre>
+
+<p><strong>Always write <code>CHAR</code> explicitly on text columns.</strong> You can flip the
+session or database default with <code>NLS_LENGTH_SEMANTICS</code>, but relying on a session setting
+means the same DDL behaves differently depending on who ran it. Be explicit in the DDL.</p>
+
+<p>The ceiling is 4000 bytes, or 32767 if the DBA has set
+<code>MAX_STRING_SIZE = EXTENDED</code>. Past that, <code>CLOB</code>.</p>
+
+<h2>Numbers</h2>
+
+<p><code>NUMBER</code> is a variable-length decimal — exact, up to 38 significant digits, and the
+default for everything.</p>
+
+<pre class="language-sql"><code class="language-sql">NUMBER            -- whatever you give it, up to 38 digits
+NUMBER(10)        -- integer, 10 digits          -> Java int/long
+NUMBER(19)        -- big integer                 -> Java long
+NUMBER(12,2)      -- money: 10 before the point, 2 after
+NUMBER(*, 2)      -- max precision, scale 2
+NUMBER(3, -3)     -- rounds to thousands: 12345 stores as 12000</code></pre>
+
+<p>Because <code>NUMBER</code> is decimal, not binary, <code>0.1 + 0.2 = 0.3</code> is exactly true —
+unlike <code>FLOAT</code>, <code>BINARY_FLOAT</code> and <code>BINARY_DOUBLE</code>, which are IEEE
+754 and should be used only for scientific data where the speed matters more than the last digit.
+<strong>Never store money in a binary float.</strong></p>
+
+<p>There is no <code>INT</code> type, though <code>INTEGER</code> is accepted as an alias for
+<code>NUMBER(38)</code>. Prefer an explicit precision — it documents intent and it is what makes JDBC
+hand you an <code>int</code> or a <code>long</code> instead of a <code>BigDecimal</code>.</p>
+
+<h2>Dates and times</h2>
+
+<p>The single most surprising thing in Oracle: <strong><code>DATE</code> includes a time</strong>,
+down to the second. There is no date-only type.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT to_char(sysdate, 'YYYY-MM-DD HH24:MI:SS') FROM dual;
+-- 2024-02-05 14:22:47      <- a DATE, with a time in it</code></pre>
+
+<p>Which is why this comparison drops most of a day's rows:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Broken: matches only rows stamped exactly midnight
+SELECT * FROM orders WHERE order_date = DATE '2024-02-05';
+
+-- Correct: a half-open range, and it can still use an index
+SELECT * FROM orders
+WHERE  order_date >= DATE '2024-02-05'
+AND    order_date <  DATE '2024-02-06';
+
+-- Also correct, but TRUNC() disables a plain index on order_date
+SELECT * FROM orders WHERE trunc(order_date) = DATE '2024-02-05';</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Type</th><th>Holds</th><th>Java</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>DATE</code></td><td>Date + time to the second, no zone</td><td><code>LocalDateTime</code></td></tr>
+    <tr><td><code>TIMESTAMP(6)</code></td><td>Adds fractional seconds (microseconds by default)</td><td><code>LocalDateTime</code></td></tr>
+    <tr><td><code>TIMESTAMP WITH TIME ZONE</code></td><td>Stores the offset you supplied</td><td><code>OffsetDateTime</code></td></tr>
+    <tr><td><code>TIMESTAMP WITH LOCAL TIME ZONE</code></td><td>Normalises to database time, renders in the session zone</td><td><code>Instant</code>-ish</td></tr>
+    <tr><td><code>INTERVAL DAY TO SECOND</code></td><td>A duration</td><td><code>Duration</code></td></tr>
+    <tr><td><code>INTERVAL YEAR TO MONTH</code></td><td>Calendar-aware duration</td><td><code>Period</code></td></tr>
+  </tbody>
+</table>
+
+<p>For an audit column recording "when did this happen, globally", use
+<code>TIMESTAMP WITH TIME ZONE</code> and store UTC. It is unambiguous, it survives a server moving
+region, and it maps cleanly to <code>OffsetDateTime</code>.</p>
+
+<p>Useful functions, and note that two of them do <em>not</em> mean what the name suggests:</p>
+
+<pre class="language-sql"><code class="language-sql">SYSDATE          -- DATE, in the DATABASE SERVER's time zone
+SYSTIMESTAMP     -- TIMESTAMP WITH TIME ZONE, server zone
+CURRENT_DATE     -- DATE, in the SESSION's time zone
+CURRENT_TIMESTAMP-- TIMESTAMP WITH TIME ZONE, session zone
+
+SELECT sysdate + 1                          FROM dual;  -- tomorrow: DATE + n is n days
+SELECT sysdate + INTERVAL '90' MINUTE       FROM dual;
+SELECT add_months(sysdate, -3)              FROM dual;  -- handles month lengths
+SELECT months_between(sysdate, hire_date)   FROM dual;
+SELECT last_day(sysdate), trunc(sysdate, 'MM') FROM dual;
+SELECT extract(YEAR FROM sysdate)           FROM dual;</code></pre>
+
+<p>Subtracting two <code>DATE</code>s gives a <em>number of days</em> as a fraction — so
+<code>(end_date - start_date) * 24</code> is hours. Subtracting two <code>TIMESTAMP</code>s gives an
+<code>INTERVAL</code> instead. Different types, different arithmetic; mixing them is a common source
+of confusion.</p>
+
+<h2>Large objects</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE documents (
+  id        NUMBER(19) GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  body      CLOB,          -- character data, unlimited
+  thumbnail BLOB,          -- binary
+  meta      JSON           -- native JSON type, 21c and later
+);</code></pre>
+
+<p>LOBs are stored out of line once they get big, which means an extra I/O to read one. Do not put a
+<code>CLOB</code> in a table you scan constantly if you rarely need the column — or at least never
+write <code>SELECT *</code> against it. <code>LONG</code> and <code>LONG RAW</code> still exist for
+backward compatibility; treat them as removed.</p>
+
+<h2>Booleans</h2>
+
+<p>Oracle had no SQL <code>BOOLEAN</code> until 23ai. PL/SQL always had one, SQL did not, so
+everything before 23ai uses a stand-in:</p>
+
+<pre class="language-sql"><code class="language-sql">-- 23ai and later
+is_active BOOLEAN DEFAULT FALSE NOT NULL
+
+-- 19c and earlier — pick one and use it everywhere
+is_active NUMBER(1)  DEFAULT 0   NOT NULL CHECK (is_active IN (0, 1))
+is_active CHAR(1)    DEFAULT 'N' NOT NULL CHECK (is_active IN ('Y', 'N'))</code></pre>
+
+<p><code>NUMBER(1)</code> is the friendlier of the two for JDBC and JPA — Hibernate maps a
+<code>boolean</code> field onto it with no converter. The <code>CHECK</code> constraint is what stops
+the column quietly accumulating a third value.</p>
+
+<h2>The empty string</h2>
+
+<p>Not a type, but it belongs here because it surprises everyone:</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO t (b) VALUES ('');
+SELECT count(*) FROM t WHERE b = '';      -- 0
+SELECT count(*) FROM t WHERE b IS NULL;   -- 1</code></pre>
+
+<p><strong>An empty string is stored as <code>NULL</code>.</strong> There is no way to distinguish
+"present but blank" from "absent" in a <code>VARCHAR2</code>. Oracle documents this as behaviour
+that may change one day, so do not write code that depends on it either way — normalise blanks in the
+application, and remember that <code>NOT NULL</code> on a <code>VARCHAR2</code> also rejects
+<code>''</code>.</p>
+
+<h2>Mapping to Java</h2>
+
+<table>
+  <thead>
+    <tr><th>Oracle</th><th>JDBC / Java</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>VARCHAR2</code>, <code>CHAR</code>, <code>CLOB</code></td><td><code>String</code></td></tr>
+    <tr><td><code>NUMBER(1..9)</code></td><td><code>int</code> / <code>Integer</code></td></tr>
+    <tr><td><code>NUMBER(10..18)</code></td><td><code>long</code> / <code>Long</code></td></tr>
+    <tr><td><code>NUMBER(p,s)</code>, <code>NUMBER</code></td><td><code>BigDecimal</code></td></tr>
+    <tr><td><code>BINARY_DOUBLE</code></td><td><code>double</code></td></tr>
+    <tr><td><code>DATE</code>, <code>TIMESTAMP</code></td><td><code>LocalDateTime</code></td></tr>
+    <tr><td><code>TIMESTAMP WITH TIME ZONE</code></td><td><code>OffsetDateTime</code></td></tr>
+    <tr><td><code>BLOB</code>, <code>RAW</code></td><td><code>byte[]</code></td></tr>
+    <tr><td><code>NUMBER(1)</code> as a flag</td><td><code>boolean</code></td></tr>
+  </tbody>
+</table>
+
+<p>An unqualified <code>NUMBER</code> becomes a <code>BigDecimal</code> in Java, because the driver
+has no precision to work with. Declaring <code>NUMBER(19)</code> instead of <code>NUMBER</code> for
+an id is the difference between a <code>long</code> and a <code>BigDecimal</code> in every DTO the
+column touches.</p>
+
+<h2>Next</h2>
+
+<p>Types chosen, tables next: constraints, identity columns, and sequences.</p>

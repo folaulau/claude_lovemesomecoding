@@ -1,0 +1,154 @@
+<p>Oracle Database is the relational database you meet the moment you work on anything old and
+important — core banking, telecom billing, insurance, ERP, government systems. It has been shipping
+since 1979, and a surprising amount of the world's transactional data still lives in it.</p>
+
+<p>If you come from MySQL or Postgres, most of your SQL transfers directly. What trips people up is
+everything <em>around</em> the SQL: a schema is a user, there is no <code>USE database</code>, a
+<code>DATE</code> carries a time, an empty string is <code>NULL</code>, and nothing is committed
+until you say so. This post lays out the vocabulary so the rest of the track makes sense.</p>
+
+<h2>Instance vs database</h2>
+
+<p>Oracle draws a hard line between the two words, and error messages assume you know the
+difference.</p>
+
+<ul>
+  <li><strong>Database</strong> — the files on disk: datafiles, control files, redo logs.</li>
+  <li><strong>Instance</strong> — the memory and processes that open those files: the SGA plus a
+      set of background processes.</li>
+</ul>
+
+<p>You connect to an instance; the instance reads the database. One database with several instances
+in front of it is Real Application Clusters (RAC).</p>
+
+<p>The memory side is the <strong>SGA</strong> (System Global Area), shared by every session, plus a
+private <strong>PGA</strong> per session. Inside the SGA the two areas worth knowing early are the
+<strong>buffer cache</strong> (data blocks) and the <strong>shared pool</strong> (parsed SQL — the
+reason bind variables matter, see the indexes post).</p>
+
+<p>The background processes you will see named in logs and traces:</p>
+
+<table>
+  <thead>
+    <tr><th>Process</th><th>Job</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>DBWn</code></td><td>Writes dirty buffers from the cache to datafiles.</td></tr>
+    <tr><td><code>LGWR</code></td><td>Writes redo to the online redo logs. A <code>COMMIT</code> waits on this.</td></tr>
+    <tr><td><code>CKPT</code></td><td>Signals checkpoints and updates file headers.</td></tr>
+    <tr><td><code>SMON</code></td><td>Instance recovery, temp cleanup, coalescing free space.</td></tr>
+    <tr><td><code>PMON</code></td><td>Cleans up after failed sessions, releases their locks.</td></tr>
+    <tr><td><code>ARCn</code></td><td>Copies filled redo logs to the archive, if archivelog mode is on.</td></tr>
+  </tbody>
+</table>
+
+<h2>How storage is layered</h2>
+
+<p>Every object you create lands somewhere in this hierarchy, and the whole thing is worth memorising
+because <code>ORA-01653: unable to extend table</code> only makes sense once you have.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Database
+ └── Tablespace          logical storage, e.g. USERS, SYSTEM, TEMP, UNDOTBS1
+      └── Datafile       an actual file on disk (or ASM volume)
+           └── Segment   one per table, index, or LOB
+                └── Extent    a contiguous run of blocks
+                     └── Block    the smallest unit of I/O, usually 8 KB</code></pre>
+
+<p>Two tablespaces do special work:</p>
+
+<ul>
+  <li><strong><code>UNDO</code></strong> holds the previous version of every changed row. It powers
+      rollback <em>and</em> read consistency — this is Oracle's MVCC, and it is why readers never
+      block writers.</li>
+  <li><strong><code>TEMP</code></strong> holds sort and hash workareas that spill out of memory.</li>
+</ul>
+
+<h2>Multitenant: CDB and PDB</h2>
+
+<p>Since 12c an Oracle database is a <strong>container database (CDB)</strong> holding one or more
+<strong>pluggable databases (PDB)</strong>. The CDB root owns the Oracle-supplied metadata; your
+tables live in a PDB.</p>
+
+<p>This is the single most common reason a first connection fails. You connect to the root, run
+<code>CREATE USER app_user</code>, and get:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ORA-65096: invalid common user or role name</code></pre>
+
+<p>because in the root every user must be a <em>common</em> user named <code>C##something</code>.
+The fix is to connect to the PDB instead, which is what the connection examples in this track always
+do.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Where am I?
+SELECT sys_context('USERENV', 'CON_NAME') AS container FROM dual;
+
+-- List the pluggable databases (from the root)
+SELECT name, open_mode FROM v$pdbs;
+
+-- Switch container (needs elevated privilege)
+ALTER SESSION SET CONTAINER = freepdb1;</code></pre>
+
+<h2>Editions, and which one to install</h2>
+
+<table>
+  <thead>
+    <tr><th>Edition</th><th>What it is</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Free</strong></td><td>Free to use, including in production. Capped (a few CPUs, ~12 GB of user data). Replaced Express Edition (XE). <strong>Use this to learn.</strong></td></tr>
+    <tr><td><strong>Standard Edition 2</strong></td><td>Licensed, socket-capped, no partitioning, no parallel query.</td></tr>
+    <tr><td><strong>Enterprise Edition</strong></td><td>Everything, plus separately licensed options (Partitioning, RAC, Advanced Compression, Active Data Guard…). Assume nothing is included.</td></tr>
+    <tr><td><strong>Autonomous Database</strong></td><td>Managed Oracle on OCI. Patching, tuning and backups are handled; you get a wallet instead of a host and port.</td></tr>
+  </tbody>
+</table>
+
+<p>Version names have drifted over the years — 8i (internet), 9i, 10g/11g (grid), 12c/18c/19c/21c
+(cloud), and now 23ai. Two matter in practice: <strong>19c</strong> is the long-term-support release
+most enterprises are standardised on, and <strong>23ai</strong> is the current one, where you get
+real <code>BOOLEAN</code>, <code>VECTOR</code> columns and SQL that finally accepts
+<code>GROUP BY</code> aliases.</p>
+
+<h2>Coming from Postgres or MySQL</h2>
+
+<p>Read this table before you write your first statement. Each row has cost somebody a whole
+afternoon.</p>
+
+<table>
+  <thead>
+    <tr><th>Oracle</th><th>What you probably expected</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A user <em>is</em> a schema. <code>CREATE USER</code> creates the namespace.</td><td><code>CREATE DATABASE</code> / <code>CREATE SCHEMA</code></td></tr>
+    <tr><td>No <code>USE db</code>. You switch with <code>ALTER SESSION SET CURRENT_SCHEMA</code>, or qualify names.</td><td><code>USE mydb;</code></td></tr>
+    <tr><td><code>VARCHAR2</code> is the string type. <code>VARCHAR</code> is a synonym Oracle asks you not to use.</td><td><code>VARCHAR</code>/<code>TEXT</code></td></tr>
+    <tr><td><code>''</code> <strong>is</strong> <code>NULL</code>. <code>WHERE name = ''</code> matches nothing, ever.</td><td>Empty string ≠ NULL</td></tr>
+    <tr><td><code>DATE</code> includes hours, minutes and seconds. Use <code>TIMESTAMP</code> for sub-second.</td><td><code>DATE</code> = calendar day only</td></tr>
+    <tr><td><code>SELECT</code> needs a table, so scalar queries use <code>FROM dual</code>.</td><td><code>SELECT 1;</code></td></tr>
+    <tr><td>DDL commits your open transaction, silently.</td><td>Transactional DDL</td></tr>
+    <tr><td>No <code>LIMIT</code>. Use <code>FETCH FIRST n ROWS ONLY</code> (12c+) or <code>ROWNUM</code>.</td><td><code>LIMIT 10</code></td></tr>
+    <tr><td><code>PL/SQL</code> is a full procedural language compiled into the database.</td><td>Stored procedures as an afterthought</td></tr>
+  </tbody>
+</table>
+
+<h2>The data dictionary</h2>
+
+<p>Oracle has no <code>SHOW TABLES</code>. It has views, in three prefixes, and knowing the pattern
+replaces most of the documentation:</p>
+
+<ul>
+  <li><code>USER_*</code> — objects <em>you</em> own.</li>
+  <li><code>ALL_*</code> — objects you can access, whoever owns them.</li>
+  <li><code>DBA_*</code> — everything in the database. Needs privilege.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">SELECT table_name FROM user_tables ORDER BY table_name;
+SELECT column_name, data_type, nullable FROM user_tab_columns WHERE table_name = 'ORDERS';
+SELECT constraint_name, constraint_type FROM user_constraints WHERE table_name = 'ORDERS';
+SELECT * FROM v$version;</code></pre>
+
+<p>Note <code>'ORDERS'</code> in capitals. Unquoted identifiers are folded to uppercase, so that is
+how they are stored — and the dictionary is case-sensitive about it.</p>
+
+<h2>Next</h2>
+
+<p>Nothing above sinks in without a database to type into, and you can have one running in about ten
+minutes. That is the next post: Oracle Database Free in Docker.</p>

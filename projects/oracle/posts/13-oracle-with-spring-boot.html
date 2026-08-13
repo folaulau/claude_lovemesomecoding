@@ -1,0 +1,395 @@
+<p>Connecting Spring Boot to Oracle is four lines of configuration. Getting it right — so it performs
+under load, generates keys correctly, and does not surprise you in production — takes a bit more. This
+post is the checklist.</p>
+
+<h2>The driver</h2>
+
+<p>Oracle's JDBC driver has been on Maven Central since 2019, so no more manual installs into a local
+repository. Pick the artifact by JDK version:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;dependency&gt;
+  &lt;groupId&gt;com.oracle.database.jdbc&lt;/groupId&gt;
+  &lt;artifactId&gt;ojdbc11&lt;/artifactId&gt;   &lt;!-- JDK 11+. ojdbc17 for JDK 17+, ojdbc8 for JDK 8 --&gt;
+  &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>Better still, let Spring Boot's dependency management pick the version by using the bill of
+materials artifact, so the driver, its NLS data and any wallet support stay in step:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;dependency&gt;
+  &lt;groupId&gt;com.oracle.database.jdbc&lt;/groupId&gt;
+  &lt;artifactId&gt;ojdbc-bom&lt;/artifactId&gt;
+  &lt;version&gt;23.5.0.24.07&lt;/version&gt;
+  &lt;type&gt;pom&lt;/type&gt;
+  &lt;scope&gt;import&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p><code>runtime</code> scope is correct — nothing in your code should import an
+<code>oracle.*</code> class. If something does, that is a portability problem worth looking at.</p>
+
+<h2>The connection URL</h2>
+
+<p>Three forms exist and two of them are legacy. Use the service-name form:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">jdbc:oracle:thin:@//localhost:1521/FREEPDB1      <- service name. Use this.
+jdbc:oracle:thin:@localhost:1521/FREEPDB1        <- same thing, // optional
+jdbc:oracle:thin:@localhost:1521:ORCL            <- SID. Legacy; note the colon.
+jdbc:oracle:thin:@my_tns_alias                   <- TNS alias, needs tnsnames.ora</code></pre>
+
+<p>The difference between the colon and the slash is the difference between a SID and a service name,
+and it is the most common cause of <code>ORA-12505</code> / <code>ORA-12514</code> on a first
+connection. Service names are what the listener actually publishes and what RAC and Data Guard rely on
+— SIDs cannot address a cluster.</p>
+
+<p>Remember the container database point from earlier in this track: connect to the <strong>PDB
+service</strong> (<code>FREEPDB1</code>), never the CDB (<code>FREE</code>).</p>
+
+<h2>application.yml</h2>
+
+<pre class="language-yaml"><code class="language-yaml">spring:
+  datasource:
+    url: jdbc:oracle:thin:@//localhost:1521/FREEPDB1
+    username: shop_svc
+    password: ${DB_PASSWORD}
+    driver-class-name: oracle.jdbc.OracleDriver     # optional, inferred from the URL
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 10000                    # fail fast, don't hang the request thread
+      max-lifetime: 1200000                        # 20 min; stay under any firewall idle timeout
+      validation-timeout: 3000
+      connection-test-query: SELECT 1 FROM dual     # only needed for very old drivers
+      data-source-properties:
+        oracle.jdbc.implicitStatementCacheSize: 50  # cache prepared statements per connection
+        oracle.net.CONNECT_TIMEOUT: 10000
+        oracle.jdbc.ReadTimeout: 60000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+          fetch_size: 100
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        query.in_clause_parameter_padding: true</code></pre>
+
+<p>The settings that actually matter:</p>
+
+<ul>
+  <li><strong><code>implicitStatementCacheSize</code></strong> is Oracle-specific and one of the
+      highest-value settings on the list. It caches parsed statements per physical connection, so
+      repeated queries skip the parse entirely. It defaults to 0 — off.</li>
+  <li><strong><code>ddl-auto: validate</code></strong>, never <code>update</code> or
+      <code>create</code>. <code>validate</code> fails fast at startup when the entities and the schema
+      disagree, which is exactly what you want. Schema changes belong in Flyway or Liquibase.</li>
+  <li><strong><code>open-in-view: false</code></strong>. The default holds a database connection for
+      the whole request while the view renders. On Oracle, where connections are relatively expensive,
+      that is a throughput ceiling.</li>
+  <li><strong><code>max-lifetime</code> under any network idle timeout.</strong> Firewalls and Oracle's
+      own <code>SQLNET.EXPIRE_TIME</code> silently drop idle TCP connections, and the pool then hands
+      out a dead one — <code>ORA-03113: end-of-file on communication channel</code> on a query that
+      worked a minute ago.</li>
+  <li><strong><code>in_clause_parameter_padding</code></strong> rounds <code>IN</code> lists up to
+      powers of two, so a query with 3, 4 and 5 parameters shares one cursor instead of three. Real
+      shared-pool relief on Oracle.</li>
+  <li><strong><code>hibernate.jdbc.time_zone: UTC</code></strong>. Without it, timestamps are converted
+      using the JVM's default zone, and your data changes meaning when a container moves region.</li>
+</ul>
+
+<p>Hibernate 6 detects the Oracle dialect from the connection, so <strong>do not set
+<code>hibernate.dialect</code></strong>. Pinning it to <code>Oracle12cDialect</code> — a name you will
+find in a lot of old configuration — is now deprecated and loses features. If you must be explicit,
+it is <code>org.hibernate.dialect.OracleDialect</code>.</p>
+
+<h2>An entity</h2>
+
+<pre class="language-java"><code class="language-java">import jakarta.persistence.*;
+import lombok.*;
+
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
+
+@Entity
+@Table(name = "ORDERS")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+@ToString(onlyExplicitlyIncluded = true)
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+public class Order {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "order_seq_gen")
+    @SequenceGenerator(name = "order_seq_gen", sequenceName = "ORDER_SEQ", allocationSize = 50)
+    @EqualsAndHashCode.Include
+    @ToString.Include
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "CUSTOMER_ID", nullable = false)
+    private Long customerId;
+
+    @ToString.Include
+    @Column(name = "TOTAL", nullable = false, precision = 12, scale = 2)
+    private BigDecimal total;
+
+    @Column(name = "STATUS", length = 20, nullable = false)
+    @Enumerated(EnumType.STRING)
+    private OrderStatus status;
+
+    @Column(name = "IS_PAID", nullable = false)
+    private boolean paid;                       // maps to NUMBER(1)
+
+    @Column(name = "CREATED_AT", nullable = false)
+    private OffsetDateTime createdAt;           // TIMESTAMP WITH TIME ZONE
+
+    @Version
+    @Column(name = "VERSION", nullable = false)
+    private Long version;                       // optimistic locking
+}</code></pre>
+
+<p>Details in there that are deliberate:</p>
+
+<ul>
+  <li><strong><code>@EqualsAndHashCode(onlyExplicitlyIncluded = true)</code> on the id only.</strong>
+      Lombok's default generates equals over every field, which on an entity means loading lazy
+      associations inside <code>hashCode()</code> and breaking <code>Set</code> semantics as soon as
+      the entity is persisted and gains an id.</li>
+  <li><strong><code>@ToString(onlyExplicitlyIncluded = true)</code></strong> for the same reason: a
+      default <code>toString()</code> on an entity with a lazy collection triggers a
+      <code>LazyInitializationException</code> from a log statement.</li>
+  <li><strong><code>@Enumerated(EnumType.STRING)</code>.</strong> The default is
+      <code>ORDINAL</code>, which stores an array index — reorder the enum and the historical data
+      silently changes meaning.</li>
+  <li><strong>Uppercase names.</strong> Oracle folds unquoted identifiers to uppercase, so that is how
+      the dictionary holds them. Being explicit avoids a class of quoting problems.</li>
+</ul>
+
+<h2>allocationSize: the classic Oracle/JPA bug</h2>
+
+<p>This one bites nearly everyone once. <code>@SequenceGenerator</code>'s
+<code>allocationSize</code> tells Hibernate how many ids it may hand out per trip to the database.
+Hibernate assumes the sequence increments by that amount. <strong>It must equal the sequence's
+<code>INCREMENT BY</code>.</strong></p>
+
+<pre class="language-sql"><code class="language-sql">-- Matching pair: allocationSize = 50, INCREMENT BY 50
+CREATE SEQUENCE order_seq START WITH 1 INCREMENT BY 50 CACHE 50 NOCYCLE;</code></pre>
+
+<p>Get it wrong and you get <code>ORA-00001: unique constraint violated</code> under concurrency, on
+inserts that look perfectly correct:</p>
+
+<table>
+  <thead><tr><th>Sequence</th><th><code>allocationSize</code></th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td><code>INCREMENT BY 50</code></td><td>50</td><td>Correct. One round trip per 50 inserts.</td></tr>
+    <tr><td><code>INCREMENT BY 1</code></td><td>50 (JPA's default)</td><td><strong>Broken.</strong> Hibernate takes value 1 and assumes 1–50 are its own. Another instance takes 2 and assumes 2–51. Collision.</td></tr>
+    <tr><td><code>INCREMENT BY 1</code></td><td>1</td><td>Correct but slow — a round trip per insert.</td></tr>
+    <tr><td><code>INCREMENT BY 50</code></td><td>1</td><td>Correct, and wastes 98% of the id space.</td></tr>
+  </tbody>
+</table>
+
+<p>Note that <code>allocationSize</code> defaults to <strong>50</strong>, so writing
+<code>@SequenceGenerator(sequenceName = "ORDER_SEQ")</code> against an <code>INCREMENT BY 1</code>
+sequence — the most natural thing to write — is exactly the broken row. Set both numbers explicitly,
+in the same commit.</p>
+
+<h3>Or use IDENTITY, with one caveat</h3>
+
+<pre class="language-java"><code class="language-java">@Id
+@GeneratedValue(strategy = GenerationType.IDENTITY)
+private Long id;</code></pre>
+
+<p>Simpler, and it matches <code>GENERATED ALWAYS AS IDENTITY</code> in the DDL. The catch:
+<strong>Hibernate cannot batch inserts for an <code>IDENTITY</code> id</strong>, because it must
+execute each insert to learn the generated key. On a write-heavy path, <code>SEQUENCE</code> with a
+matched allocation size is meaningfully faster. For ordinary CRUD, <code>IDENTITY</code> is fine and
+one less thing to get wrong.</p>
+
+<h2>Batching writes</h2>
+
+<p><code>batch_size</code> alone is not enough. Hibernate can only batch consecutive statements against
+the same table, so without <code>order_inserts</code> an interleaved save of orders and order-items
+produces batches of one:</p>
+
+<pre class="language-yaml"><code class="language-yaml">spring:
+  jpa:
+    properties:
+      hibernate:
+        jdbc.batch_size: 50
+        order_inserts: true
+        order_updates: true
+        batch_versioned_data: true    # allow batching for @Version entities too</code></pre>
+
+<p>For a genuine bulk load — hundreds of thousands of rows — skip JPA. <code>JdbcTemplate</code> with
+<code>batchUpdate</code> is several times faster and uses flat memory:</p>
+
+<pre class="language-java"><code class="language-java">@RequiredArgsConstructor
+@Repository
+public class OrderBulkRepository {
+
+    private final JdbcTemplate jdbc;
+
+    public void insertAll(List&lt;Order&gt; orders) {
+        jdbc.batchUpdate("""
+                INSERT INTO orders (customer_id, total, status, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                orders,
+                500,                                  // batch size
+                (ps, o) -> {
+                    ps.setLong(1, o.getCustomerId());
+                    ps.setBigDecimal(2, o.getTotal());
+                    ps.setString(3, o.getStatus().name());
+                    ps.setObject(4, o.getCreatedAt());
+                });
+    }
+}</code></pre>
+
+<h2>Calling PL/SQL</h2>
+
+<p>Existing Oracle systems keep real logic in packages, and you will have to call it. For a function,
+a <code>SimpleJdbcCall</code> is the least ceremonial route:</p>
+
+<pre class="language-java"><code class="language-java">@RequiredArgsConstructor
+@Service
+public class OrderApiGateway {
+
+    private final JdbcTemplate jdbc;
+
+    public BigDecimal total(long orderId) {
+        return new SimpleJdbcCall(jdbc)
+                .withCatalogName("ORDER_API")          // the package
+                .withFunctionName("TOTAL")
+                .executeFunction(BigDecimal.class, orderId);
+    }
+}</code></pre>
+
+<p>For a procedure with <code>OUT</code> parameters, use
+<code>withProcedureName("CLOSE_IT")</code> and <code>execute(...)</code>, which returns a
+<code>Map</code> of the outputs. If the procedure returns a <code>SYS_REFCURSOR</code>, declare it with
+<code>declareParameters(new SqlOutParameter("P_CURSOR", OracleTypes.CURSOR, rowMapper))</code> — one of
+the rare cases where an <code>oracle.*</code> import is unavoidable.</p>
+
+<h2>Native queries and pagination</h2>
+
+<p>Spring Data's <code>Pageable</code> generates <code>OFFSET … FETCH NEXT</code> on Oracle 12c+, so
+paging works with no special handling. In a native query you write it yourself:</p>
+
+<pre class="language-java"><code class="language-java">@Query(value = """
+        SELECT o.* FROM orders o
+        WHERE  o.customer_id = :customerId
+        ORDER  BY o.order_date DESC, o.id DESC
+        OFFSET :offset ROWS FETCH NEXT :size ROWS ONLY
+        """, nativeQuery = true)
+List&lt;Order&gt; recentForCustomer(@Param("customerId") Long customerId,
+                              @Param("offset") int offset,
+                              @Param("size") int size);</code></pre>
+
+<p>The <code>, o.id DESC</code> tiebreaker is not decoration — without it, rows sharing an
+<code>order_date</code> have no defined order and can appear on two consecutive pages.</p>
+
+<h2>Testing against real Oracle</h2>
+
+<p>H2's Oracle compatibility mode is a trap: it accepts <code>VARCHAR2</code> and <code>DUAL</code>, and
+then diverges on exactly the things this track has been about — empty-string handling, date semantics,
+<code>MERGE</code>, sequences. Test against Oracle.</p>
+
+<pre class="language-java"><code class="language-java">@Testcontainers
+@SpringBootTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+class OrderRepositoryTest {
+
+    @Container
+    @ServiceConnection                       // Boot 3.1+: wires the datasource automatically
+    static final OracleContainer ORACLE =
+            new OracleContainer("gvenzl/oracle-free:23-slim-faststart")
+                    .withReuse(true);        // keep it between runs; startup is the slow part
+
+    @Autowired
+    private OrderRepository orders;
+
+    @Test
+    void persists_and_reads_back() {
+        Order saved = orders.save(Order.builder()
+                .customerId(1L)
+                .total(new BigDecimal("99.95"))
+                .status(OrderStatus.NEW)
+                .createdAt(OffsetDateTime.now())
+                .build());
+
+        assertThat(saved.getId()).isNotNull();
+        assertThat(orders.findById(saved.getId())).isPresent();
+    }
+}</code></pre>
+
+<p>Two things make this practical rather than painful: the <code>faststart</code> image variant ships a
+pre-created database so it comes up in seconds instead of minutes, and
+<code>withReuse(true)</code> (plus <code>testcontainers.reuse.enable=true</code> in
+<code>~/.testcontainers.properties</code>) keeps the container alive between test runs.</p>
+
+<h2>Transactions</h2>
+
+<pre class="language-java"><code class="language-java">@Transactional                                 // read-write, default propagation REQUIRED
+public void transfer(long from, long to, BigDecimal amount) { ... }
+
+@Transactional(readOnly = true)                 // skips dirty checking, flags the JDBC connection
+public List&lt;Order&gt; findRecent() { ... }
+
+@Transactional(isolation = Isolation.SERIALIZABLE)   // needs retry: expect ORA-08177
+public void reconcile() { ... }
+
+@Transactional(timeout = 10)                    // seconds; bounds a runaway statement
+public void report() { ... }</code></pre>
+
+<p>Reminders that bite in Oracle specifically:</p>
+
+<ul>
+  <li>Oracle supports only <code>READ_COMMITTED</code> and <code>SERIALIZABLE</code>. Asking for
+      <code>REPEATABLE_READ</code> throws at runtime, not at startup.</li>
+  <li><code>@Transactional</code> is a proxy, so a call from one method of a bean to another
+      <em>within the same bean</em> bypasses it entirely. Classic silent no-op.</li>
+  <li>Native DDL inside a transactional method commits it — see the transactions post. Migrations
+      belong in Flyway.</li>
+  <li>Catch <code>CannotAcquireLockException</code> (Spring's translation of
+      <code>ORA-00060</code>/<code>ORA-00054</code>) and
+      <code>OptimisticLockingFailureException</code> at the boundary and retry the whole unit of work,
+      not the statement.</li>
+</ul>
+
+<h2>Health check and connection troubleshooting</h2>
+
+<pre class="language-yaml"><code class="language-yaml">management:
+  endpoint.health.show-details: always
+  health.db.enabled: true</code></pre>
+
+<p>Boot's <code>DataSourceHealthIndicator</code> runs <code>SELECT 1 FROM DUAL</code> on Oracle, so
+<code>/actuator/health</code> tells you whether the pool can hand out a working connection. The errors
+you will see most, and what they mean:</p>
+
+<table>
+  <thead><tr><th>Error</th><th>Cause</th></tr></thead>
+  <tbody>
+    <tr><td><code>ORA-12514</code></td><td>Listener does not know that service. Wrong service name, or the database is still starting.</td></tr>
+    <tr><td><code>ORA-12505</code></td><td>Same, but you used the SID form against a service name.</td></tr>
+    <tr><td><code>ORA-01017</code></td><td>Invalid username/password. Also what you get when the password expired.</td></tr>
+    <tr><td><code>ORA-28000</code></td><td>Account locked — too many failed logins, often a stale password in one instance.</td></tr>
+    <tr><td><code>ORA-00942</code></td><td>Table does not exist <em>or you cannot see it</em>. Usually a missing schema prefix or grant.</td></tr>
+    <tr><td><code>ORA-01950</code></td><td>No tablespace quota. The user can create tables but not put rows in them.</td></tr>
+    <tr><td><code>ORA-03113</code></td><td>Connection died underneath the pool. Lower <code>max-lifetime</code>.</td></tr>
+    <tr><td><code>ORA-04068</code></td><td>Package state discarded — a package was recompiled while sessions held its state. Retry.</td></tr>
+  </tbody>
+</table>
+
+<h2>That's the track</h2>
+
+<p>Twelve posts, from the architecture down to a tested Spring Boot application. The through-line, if
+there is one: Oracle rewards being explicit. Name your constraints, declare
+<code>VARCHAR2(n CHAR)</code>, write the frame clause, quote the string, set the allocation size, pass
+the service name. Every one of the gotchas in this track is somewhere Oracle accepted a default and
+did something reasonable that was not what you meant.</p>

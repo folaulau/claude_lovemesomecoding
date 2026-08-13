@@ -1,0 +1,311 @@
+<p>PL/SQL is a full procedural language — variables, loops, exceptions, packages, its own type
+system — compiled and stored inside the database. It is the reason a lot of enterprise business logic
+lives in Oracle rather than in the application in front of it, and it is why "we'll just move off
+Oracle" is rarely a small project.</p>
+
+<p>You do not have to like that architecture to need to read it. And there is one thing PL/SQL is
+unambiguously the right tool for: moving a lot of rows without shipping them to the client and back.</p>
+
+<h2>The anonymous block</h2>
+
+<pre class="language-sql"><code class="language-sql">SET SERVEROUTPUT ON     -- otherwise DBMS_OUTPUT goes nowhere
+
+DECLARE
+  v_count   PLS_INTEGER := 0;
+  v_name    customers.last_name%TYPE;          -- same type as the column
+  v_row     customers%ROWTYPE;                 -- same shape as the row
+BEGIN
+  SELECT count(*) INTO v_count FROM customers;
+  dbms_output.put_line('customers: ' || v_count);
+
+  SELECT * INTO v_row FROM customers WHERE id = 1;
+  dbms_output.put_line('first: ' || v_row.last_name);
+EXCEPTION
+  WHEN no_data_found THEN
+    dbms_output.put_line('no customer with id 1');
+END;
+/</code></pre>
+
+<p>Three details that are easy to miss:</p>
+
+<ul>
+  <li>The trailing <code>/</code> on its own line is what tells the client to submit the block. Without
+      it, nothing happens and you sit there wondering why.</li>
+  <li><code>%TYPE</code> and <code>%ROWTYPE</code> anchor your variables to the table definition. Widen
+      the column and the code still compiles. Use them everywhere.</li>
+  <li><code>PLS_INTEGER</code> is a machine integer and is faster than <code>NUMBER</code> for loop
+      counters. Free performance.</li>
+</ul>
+
+<h2>SELECT INTO, and its two exceptions</h2>
+
+<p><code>SELECT INTO</code> demands <strong>exactly one row</strong>. Zero rows raises
+<code>NO_DATA_FOUND</code>; two or more raises <code>TOO_MANY_ROWS</code>. Both are common bugs, and
+both are silent in the sense that the query itself is perfectly valid.</p>
+
+<pre class="language-sql"><code class="language-sql">BEGIN
+  SELECT last_name INTO v_name FROM customers WHERE email = p_email;
+EXCEPTION
+  WHEN no_data_found  THEN v_name := NULL;
+  WHEN too_many_rows  THEN raise_application_error(-20001, 'duplicate email: ' || p_email);
+END;</code></pre>
+
+<p>An aggregate is a useful trick here: <code>SELECT max(id) INTO v_id …</code> always returns one row,
+so it returns <code>NULL</code> instead of raising. That is either exactly what you want or a bug that
+hides itself — decide deliberately.</p>
+
+<h2>Control flow</h2>
+
+<pre class="language-sql"><code class="language-sql">IF v_total > 1000 THEN
+  v_tier := 'GOLD';
+ELSIF v_total > 100 THEN
+  v_tier := 'SILVER';
+ELSE
+  v_tier := 'BRONZE';
+END IF;
+
+CASE v_status
+  WHEN 'A' THEN v_label := 'Active';
+  WHEN 'C' THEN v_label := 'Closed';
+  ELSE          v_label := 'Unknown';
+END CASE;
+
+FOR i IN 1 .. 10 LOOP  ... END LOOP;
+FOR i IN REVERSE 1 .. 10 LOOP ... END LOOP;
+
+WHILE v_count > 0 LOOP ... END LOOP;
+
+LOOP
+  ...
+  EXIT WHEN v_done;
+  CONTINUE WHEN v_skip;
+END LOOP;</code></pre>
+
+<p>Note <code>ELSIF</code>, one E. And a <code>CASE</code> with no <code>ELSE</code> that matches
+nothing raises <code>CASE_NOT_FOUND</code> rather than doing nothing — unlike SQL's
+<code>CASE</code>, which returns <code>NULL</code>.</p>
+
+<h2>Cursors</h2>
+
+<p>The implicit cursor <code>FOR</code> loop is the form to reach for. It declares the record, opens,
+fetches, closes and handles the end of data, and since 10g it array-fetches 100 rows at a time
+automatically:</p>
+
+<pre class="language-sql"><code class="language-sql">BEGIN
+  FOR r IN (SELECT id, total FROM orders WHERE status = 'NEW') LOOP
+    dbms_output.put_line(r.id || ': ' || r.total);
+  END LOOP;
+END;
+/</code></pre>
+
+<p>The explicit form is only needed when you must control fetching — passing a cursor around, or
+fetching in batches:</p>
+
+<pre class="language-sql"><code class="language-sql">DECLARE
+  CURSOR c_orders (p_status VARCHAR2) IS
+    SELECT id, total FROM orders WHERE status = p_status;
+  v_row c_orders%ROWTYPE;
+BEGIN
+  OPEN c_orders('NEW');
+  LOOP
+    FETCH c_orders INTO v_row;
+    EXIT WHEN c_orders%NOTFOUND;
+    ...
+  END LOOP;
+  CLOSE c_orders;
+END;
+/</code></pre>
+
+<p>Cursor attributes: <code>%FOUND</code>, <code>%NOTFOUND</code>, <code>%ROWCOUNT</code>,
+<code>%ISOPEN</code>. For the last DML statement, the implicit cursor <code>SQL</code> carries them —
+<code>SQL%ROWCOUNT</code> after an <code>UPDATE</code> is how you find out how many rows you changed.</p>
+
+<h2>Procedures, functions, packages</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE PROCEDURE close_order (p_order_id IN NUMBER,
+                                         p_closed   OUT BOOLEAN) IS
+BEGIN
+  UPDATE orders SET status = 'CLOSED' WHERE id = p_order_id AND status <> 'CLOSED';
+  p_closed := SQL%ROWCOUNT > 0;
+END close_order;
+/
+
+CREATE OR REPLACE FUNCTION order_total (p_order_id IN NUMBER) RETURN NUMBER IS
+  v_total NUMBER(12,2);
+BEGIN
+  SELECT sum(line_total) INTO v_total FROM order_items WHERE order_id = p_order_id;
+  RETURN nvl(v_total, 0);
+END order_total;
+/</code></pre>
+
+<p>Parameter modes are <code>IN</code> (default, read-only), <code>OUT</code> and
+<code>IN OUT</code>. There is also <code>NOCOPY</code>, a hint that passes large collections by
+reference instead of copying them — worth knowing when a procedure takes a big array.</p>
+
+<p><strong>Packages are the unit of organisation</strong>, and unlike standalone procedures they let
+you separate interface from implementation:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE PACKAGE order_api AS
+  -- Everything declared here is public.
+  e_already_closed EXCEPTION;
+  PRAGMA EXCEPTION_INIT(e_already_closed, -20010);
+
+  FUNCTION  total   (p_order_id NUMBER) RETURN NUMBER;
+  PROCEDURE close_it(p_order_id NUMBER);
+END order_api;
+/
+
+CREATE OR REPLACE PACKAGE BODY order_api AS
+
+  -- Private: not in the spec, so nothing outside can call it.
+  FUNCTION is_closed (p_order_id NUMBER) RETURN BOOLEAN IS
+    v_status orders.status%TYPE;
+  BEGIN
+    SELECT status INTO v_status FROM orders WHERE id = p_order_id;
+    RETURN v_status = 'CLOSED';
+  END is_closed;
+
+  FUNCTION total (p_order_id NUMBER) RETURN NUMBER IS
+    v_total NUMBER(12,2);
+  BEGIN
+    SELECT sum(line_total) INTO v_total FROM order_items WHERE order_id = p_order_id;
+    RETURN nvl(v_total, 0);
+  END total;
+
+  PROCEDURE close_it (p_order_id NUMBER) IS
+  BEGIN
+    IF is_closed(p_order_id) THEN
+      RAISE e_already_closed;
+    END IF;
+    UPDATE orders SET status = 'CLOSED' WHERE id = p_order_id;
+  END close_it;
+
+END order_api;
+/</code></pre>
+
+<p>Practical benefits: the body can be recompiled without invalidating anything that depends on the
+spec, package-level variables persist for the life of the session, and there is one namespace per
+subject area instead of four hundred loose procedures.</p>
+
+<h2>Exceptions</h2>
+
+<pre class="language-sql"><code class="language-sql">DECLARE
+  e_bad_input EXCEPTION;
+  e_dup       EXCEPTION;
+  PRAGMA EXCEPTION_INIT(e_dup, -1);    -- ORA-00001 unique constraint violated
+BEGIN
+  ...
+EXCEPTION
+  WHEN e_dup THEN
+    -- handle the duplicate specifically
+    NULL;
+  WHEN e_bad_input THEN
+    raise_application_error(-20002, 'bad input');
+  WHEN OTHERS THEN
+    -- Log with the full stack, then re-raise. NEVER swallow OTHERS silently.
+    dbms_output.put_line(dbms_utility.format_error_stack);
+    dbms_output.put_line(dbms_utility.format_error_backtrace);
+    RAISE;
+END;
+/</code></pre>
+
+<p>Rules worth internalising:</p>
+
+<ul>
+  <li><code>PRAGMA EXCEPTION_INIT</code> binds a named exception to an Oracle error number, so you can
+      catch <code>ORA-00001</code> by name instead of testing <code>SQLCODE</code>.</li>
+  <li><code>raise_application_error</code> takes <strong>-20000 to -20999</strong>. That range is
+      reserved for you; anything else is Oracle's.</li>
+  <li><strong><code>WHEN OTHERS THEN NULL</code> is the worst line of code in the Oracle
+      world.</strong> It converts every error into silent data corruption. If you catch
+      <code>OTHERS</code>, log and <code>RAISE</code>.</li>
+  <li><code>format_error_backtrace</code> gives you the line number where the error was raised.
+      <code>SQLERRM</code> alone does not, which is why so many PL/SQL error logs are useless.</li>
+</ul>
+
+<h2>Bulk operations — where PL/SQL earns its keep</h2>
+
+<p>Row-by-row PL/SQL is slower than SQL, because every statement inside the loop is a separate context
+switch between the PL/SQL engine and the SQL engine. <code>BULK COLLECT</code> and
+<code>FORALL</code> batch those switches, and the difference is not marginal — routinely 10× or
+more.</p>
+
+<pre class="language-sql"><code class="language-sql">DECLARE
+  TYPE t_ids IS TABLE OF orders.id%TYPE;
+  v_ids  t_ids;
+  CURSOR c IS SELECT id FROM orders WHERE status = 'NEW';
+BEGIN
+  OPEN c;
+  LOOP
+    -- Fetch 5000 at a time. LIMIT is what keeps this bounded in memory;
+    -- a bare BULK COLLECT of 50 million rows will run the PGA out of memory.
+    FETCH c BULK COLLECT INTO v_ids LIMIT 5000;
+    EXIT WHEN v_ids.COUNT = 0;
+
+    FORALL i IN 1 .. v_ids.COUNT SAVE EXCEPTIONS
+      UPDATE orders SET status = 'PROCESSING' WHERE id = v_ids(i);
+
+    COMMIT;
+  END LOOP;
+  CLOSE c;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLCODE = -24381 THEN     -- some rows in the FORALL failed
+      FOR j IN 1 .. SQL%BULK_EXCEPTIONS.COUNT LOOP
+        dbms_output.put_line('row ' || SQL%BULK_EXCEPTIONS(j).ERROR_INDEX ||
+                             ': '   || SQLERRM(-SQL%BULK_EXCEPTIONS(j).ERROR_CODE));
+      END LOOP;
+    ELSE
+      RAISE;
+    END IF;
+END;
+/</code></pre>
+
+<p><code>SAVE EXCEPTIONS</code> lets the whole batch run and collects the failures, instead of
+stopping on the first bad row. Without it, one constraint violation aborts 5000 updates.</p>
+
+<p>But the real lesson sits above all of that: <strong>if the work can be expressed as a single SQL
+statement, write the SQL statement.</strong> A <code>MERGE</code> or an
+<code>UPDATE … WHERE EXISTS</code> beats the best-tuned bulk loop, because it never leaves the SQL
+engine at all. Reach for PL/SQL when you need procedural logic per row, not as a way to write loops in
+a database.</p>
+
+<h2>Autonomous transactions</h2>
+
+<p>Occasionally you need something to commit even though the caller will roll back — audit logging is
+the canonical case:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE PROCEDURE log_event (p_msg VARCHAR2) IS
+  PRAGMA AUTONOMOUS_TRANSACTION;
+BEGIN
+  INSERT INTO event_log (logged_at, message) VALUES (systimestamp, p_msg);
+  COMMIT;    -- mandatory: an autonomous block must end committed or rolled back
+END;
+/</code></pre>
+
+<p>Use it sparingly and only for logging. It is a separate transaction, so it cannot see the caller's
+uncommitted changes, and a careless autonomous transaction that touches the same rows as its caller
+will deadlock with it.</p>
+
+<h2>Finding what is broken</h2>
+
+<pre class="language-sql"><code class="language-sql">-- Compile errors after CREATE OR REPLACE said "created with compilation errors"
+SHOW ERRORS
+SELECT line, position, text FROM user_errors WHERE name = 'ORDER_API' ORDER BY sequence;
+
+-- Objects that no longer compile
+SELECT object_name, object_type, status FROM user_objects WHERE status = 'INVALID';
+
+-- Source of something you did not write
+SELECT text FROM user_source WHERE name = 'ORDER_API' AND type = 'PACKAGE BODY' ORDER BY line;
+
+-- What depends on this table?
+SELECT name, type FROM user_dependencies WHERE referenced_name = 'ORDERS';
+
+-- Turn on warnings. It will find unreachable code and unhandled exceptions.
+ALTER SESSION SET plsql_warnings = 'ENABLE:ALL';</code></pre>
+
+<h2>Next</h2>
+
+<p>Indexes and execution plans: how to find out what Oracle is actually doing with your query, and why
+the plan the optimiser chose is usually a story about statistics.</p>

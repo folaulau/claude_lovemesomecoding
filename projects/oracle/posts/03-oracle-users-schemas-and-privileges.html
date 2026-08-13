@@ -1,0 +1,156 @@
+<p>In MySQL and Postgres a database holds schemas, and users are separate things you grant access to.
+In Oracle those two ideas are the same idea: <strong>a user is a schema</strong>. Create the user
+<code>SHOP</code> and you have created the namespace <code>SHOP.ORDERS</code>. There is nothing else
+to create, and nothing to <code>USE</code>.</p>
+
+<p>Once that clicks, the rest of Oracle's security model is straightforward. This post covers the
+account you should actually run an application as.</p>
+
+<h2>Create the schema owner</h2>
+
+<p>Connect to the <strong>PDB</strong>, not the CDB root:</p>
+
+<pre class="language-bash"><code class="language-bash">sql system/Welcome1@//localhost:1521/FREEPDB1</code></pre>
+
+<pre class="language-sql"><code class="language-sql">CREATE USER shop IDENTIFIED BY "Sh0p_dev_1"
+  DEFAULT TABLESPACE users
+  TEMPORARY TABLESPACE temp
+  QUOTA 500M ON users;
+
+GRANT CREATE SESSION TO shop;   -- without this the user cannot log in at all
+GRANT CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE PROCEDURE,
+      CREATE TRIGGER, CREATE TYPE, CREATE SYNONYM TO shop;</code></pre>
+
+<p>Two things bite here.</p>
+
+<p><strong>A quota is not optional.</strong> <code>CREATE TABLE</code> lets you create the table;
+putting a row in it needs space in the tablespace. Without a quota the first insert fails with:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ORA-01950: no privileges on tablespace 'USERS'</code></pre>
+
+<p>Grant a real number (<code>QUOTA 500M</code>) or <code>QUOTA UNLIMITED ON users</code>. Avoid the
+<code>UNLIMITED TABLESPACE</code> <em>system privilege</em> — it applies to every tablespace
+including <code>SYSTEM</code>, which is how application data ends up in the wrong place.</p>
+
+<p><strong>Password case.</strong> Unquoted passwords are folded to uppercase in older
+compatibility modes; quote them and they are taken literally. Quote always.</p>
+
+<h2>CONNECT and RESOURCE — convenient, and worse than they look</h2>
+
+<p>Every tutorial on the internet says this:</p>
+
+<pre class="language-sql"><code class="language-sql">GRANT CONNECT, RESOURCE TO shop;   -- fine for a sandbox</code></pre>
+
+<p><code>CONNECT</code> is now just <code>CREATE SESSION</code>, so that half is harmless.
+<code>RESOURCE</code> bundles the object-creation privileges <em>and</em> historically dragged
+<code>UNLIMITED TABLESPACE</code> along with it. It is fine on your laptop. In a real deployment,
+grant the specific <code>CREATE …</code> privileges the schema needs, as above, and nothing more.</p>
+
+<h2>Three kinds of privilege</h2>
+
+<table>
+  <thead>
+    <tr><th>Kind</th><th>Example</th><th>Means</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>System</td><td><code>CREATE TABLE</code>, <code>SELECT ANY TABLE</code></td><td>Do a kind of thing, anywhere you are allowed.</td></tr>
+    <tr><td>Object</td><td><code>SELECT ON shop.orders</code></td><td>Do one thing to one named object.</td></tr>
+    <tr><td>Role</td><td><code>GRANT app_reader TO analytics</code></td><td>A named bundle of the other two.</td></tr>
+  </tbody>
+</table>
+
+<p>Roles are how you keep grants manageable. The pattern that scales: <strong>the schema owner owns
+the objects and never logs in; applications connect as a separate account holding a role.</strong></p>
+
+<pre class="language-sql"><code class="language-sql">-- Owner of the tables. Locked so nobody can connect as it.
+ALTER USER shop ACCOUNT LOCK;
+
+-- A role describing what the application is allowed to do.
+CREATE ROLE shop_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.orders   TO shop_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.order_items TO shop_app;
+GRANT SELECT ON shop.order_seq TO shop_app;
+
+-- The account the connection pool actually uses. It owns nothing.
+CREATE USER shop_svc IDENTIFIED BY "Sv3_dev_1";
+GRANT CREATE SESSION TO shop_svc;
+GRANT shop_app TO shop_svc;</code></pre>
+
+<p>A compromised application account can then read and write rows but cannot drop a table, and the
+day you need a read-only reporting account it is one more role away.</p>
+
+<h2>Qualifying names, and how to stop</h2>
+
+<p><code>shop_svc</code> owns nothing, so <code>SELECT * FROM orders</code> fails with
+<code>ORA-00942: table or view does not exist</code> — Oracle looked in the
+<code>SHOP_SVC</code> schema and found nothing. Oracle's "table does not exist" also covers "exists
+but you cannot see it", which is deliberate: it refuses to confirm the object is there.</p>
+
+<p>Three ways out, in increasing order of tidiness:</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. Qualify every reference. Correct, verbose.
+SELECT * FROM shop.orders;
+
+-- 2. Change the default for this session only.
+ALTER SESSION SET CURRENT_SCHEMA = shop;
+SELECT * FROM orders;
+
+-- 3. Synonyms, so unqualified names resolve for everyone, permanently.
+CREATE SYNONYM shop_svc.orders FOR shop.orders;              -- private
+CREATE PUBLIC SYNONYM orders   FOR shop.orders;              -- every user</code></pre>
+
+<p>Option 2 is the one to reach for in JDBC: it is a single statement on connection setup and it
+means your SQL and your JPA entities carry no schema prefix, so the same code runs against
+<code>shop_dev</code> and <code>shop_prod</code>.</p>
+
+<h2>Inspecting what you granted</h2>
+
+<pre class="language-sql"><code class="language-sql">-- System privileges held directly
+SELECT privilege FROM user_sys_privs;
+
+-- Roles held, and what is inside them
+SELECT granted_role, admin_option FROM user_role_privs;
+SELECT role, privilege FROM role_sys_privs;
+
+-- Object privileges granted TO me, and BY me
+SELECT owner, table_name, privilege FROM user_tab_privs_recd;
+SELECT grantee, table_name, privilege FROM user_tab_privs_made;
+
+-- Quota actually in force
+SELECT tablespace_name, bytes, max_bytes FROM user_ts_quotas;
+
+-- Account state: OPEN, LOCKED, EXPIRED(GRACE)…
+SELECT username, account_status, default_tablespace
+FROM   dba_users WHERE username IN ('SHOP', 'SHOP_SVC');</code></pre>
+
+<h2>Passwords that expire on you</h2>
+
+<p>Oracle applies a password lifetime by default — 180 days on the <code>DEFAULT</code> profile — and
+a locked-out service account at 3 a.m. is a memorable way to learn this. For a development database:</p>
+
+<pre class="language-sql"><code class="language-sql">-- One account
+ALTER PROFILE default LIMIT PASSWORD_LIFE_TIME UNLIMITED;
+
+-- Or a dedicated profile, which is the better habit
+CREATE PROFILE app_service LIMIT
+  PASSWORD_LIFE_TIME UNLIMITED
+  FAILED_LOGIN_ATTEMPTS 10;
+ALTER USER shop_svc PROFILE app_service;
+
+-- Already expired? This clears it.
+ALTER USER shop_svc IDENTIFIED BY "Sv3_dev_1" ACCOUNT UNLOCK;</code></pre>
+
+<p>Watch for <code>ACCOUNT_STATUS = 'EXPIRED(GRACE)'</code> in <code>DBA_USERS</code> — that is the
+warning shot before connections start failing.</p>
+
+<h2>Never build on SYSTEM</h2>
+
+<p>It is tempting, because it is the account the container handed you. Don't:
+<code>SYS</code> and <code>SYSTEM</code> own the data dictionary, objects you create there are mixed
+in with Oracle's own, an export of your schema becomes impossible to separate, and every mistake runs
+with full privileges. Create the schema owner in the first five minutes.</p>
+
+<h2>Next</h2>
+
+<p>You have a schema to build in. Next up: Oracle's data types, and which ones to pick so you don't
+regret the column three years later.</p>

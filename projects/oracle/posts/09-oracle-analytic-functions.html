@@ -1,0 +1,231 @@
+<p>Analytic functions — window functions, in ANSI terms — are the feature that most changes how you
+write SQL. Oracle shipped them in 8i, long before most other databases, so Oracle codebases use them
+heavily and you will not get far in one without reading them fluently.</p>
+
+<p>The one-sentence version: <strong>an aggregate collapses rows, an analytic keeps every row and adds
+a computed column.</strong></p>
+
+<pre class="language-sql"><code class="language-sql">-- Aggregate: 1 row per customer
+SELECT customer_id, sum(total) FROM orders GROUP BY customer_id;
+
+-- Analytic: every order row, each carrying its customer's total
+SELECT id, customer_id, total,
+       sum(total) OVER (PARTITION BY customer_id) AS customer_total
+FROM   orders;</code></pre>
+
+<p>That second query answers "what fraction of this customer's spend was this order?" in one pass. The
+pre-analytic equivalent is a self-join to a grouped subquery — two scans and a lot more text.</p>
+
+<h2>Anatomy of OVER</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">function(args) OVER (
+    PARTITION BY expr, ...      -- restart per group. Omit = one window over all rows.
+    ORDER BY     expr, ...      -- order within the partition. Some functions require it.
+    ROWS | RANGE BETWEEN ... AND ...   -- the frame: which rows the function can see
+)</code></pre>
+
+<h2>Ranking</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id, id, total,
+       ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC) AS rn,
+       RANK()       OVER (PARTITION BY customer_id ORDER BY total DESC) AS rnk,
+       DENSE_RANK() OVER (PARTITION BY customer_id ORDER BY total DESC) AS drnk,
+       NTILE(4)     OVER (ORDER BY total)                              AS quartile,
+       PERCENT_RANK() OVER (ORDER BY total)                            AS pct
+FROM   orders;</code></pre>
+
+<p>The three ranking functions differ only in how they treat ties:</p>
+
+<table>
+  <thead><tr><th>total</th><th><code>ROW_NUMBER</code></th><th><code>RANK</code></th><th><code>DENSE_RANK</code></th></tr></thead>
+  <tbody>
+    <tr><td>500</td><td>1</td><td>1</td><td>1</td></tr>
+    <tr><td>300</td><td>2</td><td>2</td><td>2</td></tr>
+    <tr><td>300</td><td>3</td><td>2</td><td>2</td></tr>
+    <tr><td>100</td><td>4</td><td>4</td><td>3</td></tr>
+  </tbody>
+</table>
+
+<p><code>ROW_NUMBER</code> is arbitrary among ties, so add a tiebreaker to the <code>ORDER BY</code>
+if the result has to be reproducible.</p>
+
+<h3>Top-N per group</h3>
+
+<p>The single most useful pattern in the whole feature. Note the analytic has to be computed in an
+inner query — you cannot filter on an analytic in the same <code>WHERE</code>, because analytics run
+after <code>WHERE</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT * FROM (
+  SELECT o.*,
+         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date DESC) AS rn
+  FROM   orders o
+)
+WHERE rn <= 3;    -- three most recent orders per customer</code></pre>
+
+<p><code>OUTER APPLY</code> answers the same question, and which one is faster depends entirely on the
+data — the previous post has the comparison. In short: this version reads the whole child table once,
+so it wins when you want top-N for every group; <code>APPLY</code> wins when the outer row source is
+small and there is an index on <code>(fk, sort_column)</code> to stop early on.</p>
+
+<h3>Deduplication</h3>
+
+<p>Same shape, and it beats <code>DISTINCT</code> whenever "duplicate" means "same key, keep the
+newest":</p>
+
+<pre class="language-sql"><code class="language-sql">DELETE FROM customers WHERE rowid IN (
+  SELECT rid FROM (
+    SELECT rowid AS rid,
+           ROW_NUMBER() OVER (PARTITION BY lower(email) ORDER BY created_at DESC) AS rn
+    FROM   customers
+  ) WHERE rn > 1
+);</code></pre>
+
+<p><code>ROWID</code> is Oracle's physical row address and is the fastest possible way to identify a
+row for deletion. It is stable within a transaction, which is all this needs.</p>
+
+<h2>LAG and LEAD</h2>
+
+<p>Look at the previous or next row without a self-join. Month-over-month change, gaps between events,
+state transitions:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT mth, revenue,
+       LAG(revenue) OVER (ORDER BY mth)                  AS prev_month,
+       revenue - LAG(revenue) OVER (ORDER BY mth)        AS delta,
+       ROUND((revenue / LAG(revenue) OVER (ORDER BY mth) - 1) * 100, 1) AS pct_change,
+       LEAD(mth) OVER (ORDER BY mth)                     AS next_month
+FROM   monthly_revenue
+ORDER  BY mth;</code></pre>
+
+<p>The first row has no previous row, so <code>LAG</code> returns <code>NULL</code> and the delta is
+null too. Supply a default as the third argument when that matters:</p>
+
+<pre class="language-sql"><code class="language-sql">LAG(revenue, 1, 0) OVER (ORDER BY mth)    -- offset 1, default 0</code></pre>
+
+<h2>Running totals, and the frame clause</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT order_date, total,
+       SUM(total) OVER (ORDER BY order_date
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+       AVG(total) OVER (ORDER BY order_date
+                        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)         AS moving_avg_7,
+       SUM(total) OVER ()                                                 AS grand_total
+FROM   orders
+ORDER  BY order_date;</code></pre>
+
+<h3>ROWS vs RANGE — the gotcha</h3>
+
+<p>This is the subtlety that produces wrong numbers rather than errors.
+<strong><code>ROWS</code> counts physical rows. <code>RANGE</code> counts <em>value</em>
+ranges, so all rows with the same <code>ORDER BY</code> value are one unit.</strong></p>
+
+<p>And the default frame, when you write <code>ORDER BY</code> and no frame clause at all, is
+<code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. So with duplicate dates:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Two orders on 2024-03-01, for 100 and 200.
+-- Default RANGE: both rows show a running total of 300 — the whole day is "current".
+SELECT order_date, total,
+       SUM(total) OVER (ORDER BY order_date) AS rt_range,
+       SUM(total) OVER (ORDER BY order_date
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rt_rows
+FROM   orders;</code></pre>
+
+<p>Which one you want depends on the question — a genuine daily running total probably <em>should</em>
+include the whole day — but you should be choosing, not inheriting. Write the frame explicitly.</p>
+
+<p><code>RANGE</code> also accepts intervals, which is how you do a true time window rather than a
+row-count window:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Revenue in the trailing 30 days, regardless of how many orders that is
+SUM(total) OVER (ORDER BY order_date
+                 RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW)</code></pre>
+
+<h2>FIRST_VALUE and LAST_VALUE</h2>
+
+<p><code>LAST_VALUE</code> is the other classic trap. With the default frame ending at
+<code>CURRENT ROW</code>, "the last value" is the current row — which is useless and looks like a
+bug in Oracle:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id, order_date, total,
+       FIRST_VALUE(total) OVER (PARTITION BY customer_id ORDER BY order_date) AS first_order,
+       -- WRONG: frame ends at the current row, so this equals `total`
+       LAST_VALUE(total)  OVER (PARTITION BY customer_id ORDER BY order_date) AS last_wrong,
+       -- RIGHT: extend the frame to the end of the partition
+       LAST_VALUE(total)  OVER (PARTITION BY customer_id ORDER BY order_date
+                                ROWS BETWEEN UNBOUNDED PRECEDING
+                                         AND UNBOUNDED FOLLOWING)             AS last_order
+FROM   orders;</code></pre>
+
+<p>Oracle also has a compact alternative that avoids the whole question — the
+<code>KEEP (DENSE_RANK …)</code> aggregate, which works in a normal <code>GROUP BY</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id,
+       MIN(total) KEEP (DENSE_RANK FIRST ORDER BY order_date) AS first_order_total,
+       MAX(total) KEEP (DENSE_RANK LAST  ORDER BY order_date) AS last_order_total,
+       COUNT(*)                                              AS orders
+FROM   orders
+GROUP  BY customer_id;</code></pre>
+
+<p>Read it as "the total belonging to the row that sorts first by <code>order_date</code>". The
+<code>MIN</code>/<code>MAX</code> only breaks ties. This is very common in Oracle SQL and reads as
+gibberish until someone explains it once.</p>
+
+<h2>Gaps and islands</h2>
+
+<p>A pattern worth having in your pocket: group consecutive runs of something. The trick is that
+<em>position minus rank</em> is constant within a consecutive run.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Streaks of consecutive days on which a customer ordered
+WITH d AS (
+  SELECT DISTINCT customer_id, trunc(order_date) AS day FROM orders
+), g AS (
+  SELECT customer_id, day,
+         day - ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY day) AS grp
+  FROM   d
+)
+SELECT customer_id, min(day) AS streak_start, max(day) AS streak_end, count(*) AS days
+FROM   g
+GROUP  BY customer_id, grp
+HAVING count(*) >= 3
+ORDER  BY customer_id, streak_start;</code></pre>
+
+<h2>Reusing a window</h2>
+
+<p>Repeating a long <code>OVER</code> clause invites typos. Name it once:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id, order_date, total,
+       SUM(total) OVER w AS running_total,
+       AVG(total) OVER w AS running_avg,
+       COUNT(*)   OVER w AS orders_so_far
+FROM   orders
+WINDOW w AS (PARTITION BY customer_id ORDER BY order_date
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);</code></pre>
+
+<p>The <code>WINDOW</code> clause arrived in 21c. Before that, a <code>WITH</code> subquery is the
+usual workaround.</p>
+
+<h2>Where they can and cannot go</h2>
+
+<p>Analytics are evaluated after <code>WHERE</code>, <code>GROUP BY</code> and
+<code>HAVING</code>, and before <code>ORDER BY</code>. So:</p>
+
+<ul>
+  <li>You <strong>can</strong> use one in <code>SELECT</code> and <code>ORDER BY</code>.</li>
+  <li>You <strong>cannot</strong> use one in <code>WHERE</code>, <code>GROUP BY</code> or
+      <code>HAVING</code> — wrap the query and filter outside.</li>
+  <li>You <strong>can</strong> nest an aggregate inside an analytic:
+      <code>RANK() OVER (ORDER BY sum(total) DESC)</code> alongside a
+      <code>GROUP BY customer_id</code>. The analytic then operates on the grouped rows, which is
+      exactly what you want for "rank customers by revenue".</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id, sum(total) AS revenue,
+       RANK() OVER (ORDER BY sum(total) DESC) AS revenue_rank
+FROM   orders
+GROUP  BY customer_id
+ORDER  BY revenue_rank
+FETCH  FIRST 10 ROWS ONLY;</code></pre>
+
+<h2>Next</h2>
+
+<p>PL/SQL — Oracle's procedural language, and the reason a lot of business logic in enterprise systems
+lives inside the database rather than in front of it.</p>

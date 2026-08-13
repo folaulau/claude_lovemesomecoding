@@ -1,0 +1,218 @@
+<p>This is the DDL post: creating tables, the five constraint types, and how Oracle generates primary
+keys — which changed significantly in 12c and is still the subject of a lot of out-of-date advice.</p>
+
+<h2>A table worth copying</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE customers (
+  id            NUMBER(19)      GENERATED ALWAYS AS IDENTITY,
+  email         VARCHAR2(320 CHAR)  NOT NULL,
+  first_name    VARCHAR2(100 CHAR),
+  last_name     VARCHAR2(100 CHAR)  NOT NULL,
+  status        VARCHAR2(20 CHAR)   DEFAULT 'PENDING' NOT NULL,
+  credit_limit  NUMBER(12,2)        DEFAULT 0 NOT NULL,
+  created_at    TIMESTAMP WITH TIME ZONE DEFAULT systimestamp NOT NULL,
+  --
+  CONSTRAINT customers_pk        PRIMARY KEY (id),
+  CONSTRAINT customers_email_uq  UNIQUE (email),
+  CONSTRAINT customers_status_ck CHECK (status IN ('PENDING', 'ACTIVE', 'CLOSED')),
+  CONSTRAINT customers_credit_ck CHECK (credit_limit >= 0)
+);
+
+CREATE TABLE orders (
+  id           NUMBER(19) GENERATED ALWAYS AS IDENTITY,
+  customer_id  NUMBER(19) NOT NULL,
+  order_date   DATE       DEFAULT sysdate NOT NULL,
+  total        NUMBER(12,2) NOT NULL,
+  --
+  CONSTRAINT orders_pk PRIMARY KEY (id),
+  CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id)
+    REFERENCES customers (id) ON DELETE CASCADE
+);</code></pre>
+
+<p>Three habits in there that pay off later:</p>
+
+<ul>
+  <li><strong>Name every constraint.</strong> Left unnamed, Oracle calls it <code>SYS_C0011947</code>,
+      and that is the name in the error message your users see and in the migration script that has
+      to drop it. Names also differ between environments, so a script that drops
+      <code>SYS_C0011947</code> works on exactly one database.</li>
+  <li><strong><code>DEFAULT</code> before <code>NOT NULL</code></strong> — that is the required order,
+      and reversing it is a syntax error.</li>
+  <li><strong>Constraints at the end, not inline.</strong> Same effect, but every constraint is in one
+      place and it reads like a specification.</li>
+</ul>
+
+<h2>The five constraints</h2>
+
+<table>
+  <thead>
+    <tr><th>Type</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>PRIMARY KEY</code></td><td>Unique + not null. Creates a unique index automatically.</td></tr>
+    <tr><td><code>UNIQUE</code></td><td>Creates an index too. Allows multiple <code>NULL</code>s — see below.</td></tr>
+    <tr><td><code>FOREIGN KEY</code></td><td>Does <strong>not</strong> create an index. You must, or deletes on the parent will table-scan the child.</td></tr>
+    <tr><td><code>CHECK</code></td><td>Row-level boolean. Cannot reference another table or <code>sysdate</code>.</td></tr>
+    <tr><td><code>NOT NULL</code></td><td>Implemented as a check constraint under the covers.</td></tr>
+  </tbody>
+</table>
+
+<h3>UNIQUE and NULL</h3>
+
+<p>A single-column <code>UNIQUE</code> constraint permits any number of <code>NULL</code>s — two
+unknowns are not known to be equal. On a <em>composite</em> unique key Oracle rejects the row only
+when every column matches and none is null, so partly-null duplicates slip through:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE t (a NUMBER, b NUMBER, CONSTRAINT t_uq UNIQUE (a, b));
+INSERT INTO t VALUES (1, NULL);
+INSERT INTO t VALUES (1, NULL);   -- accepted. Both rows now exist.</code></pre>
+
+<p>If nullable columns must still be unique together, either make them <code>NOT NULL</code> or index
+a coalesced expression.</p>
+
+<h3>Always index your foreign keys</h3>
+
+<p>This is the most commonly skipped index in Oracle, and it has two distinct consequences. Deleting
+a parent row makes Oracle check the child table for orphans; with no index that is a full scan of the
+child per delete. Worse, on an <em>unindexed</em> foreign key Oracle takes a share lock on the whole
+child table for the duration — so a delete on <code>customers</code> blocks unrelated inserts into
+<code>orders</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX orders_customer_ix ON orders (customer_id);</code></pre>
+
+<p>Find the ones you missed:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT c.table_name, c.constraint_name, cc.column_name
+FROM   user_constraints c
+JOIN   user_cons_columns cc ON cc.constraint_name = c.constraint_name
+WHERE  c.constraint_type = 'R'
+AND    NOT EXISTS (
+         SELECT 1 FROM user_ind_columns ic
+         WHERE  ic.table_name  = cc.table_name
+         AND    ic.column_name = cc.column_name
+         AND    ic.column_position = cc.position)
+ORDER  BY 1, 2;</code></pre>
+
+<h3>ON DELETE, and the one Oracle does not have</h3>
+
+<p><code>ON DELETE CASCADE</code> and <code>ON DELETE SET NULL</code> both work.
+<strong>There is no <code>ON UPDATE CASCADE</code></strong> — Oracle's position is that a primary key
+you need to update is not a primary key. Use a surrogate key and you never want it.</p>
+
+<h3>Deferrable constraints</h3>
+
+<p>Occasionally you need a constraint checked at <code>COMMIT</code> rather than per statement — for
+example swapping two rows' unique values, or loading a circular reference:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE t ADD CONSTRAINT t_uq UNIQUE (code)
+  DEFERRABLE INITIALLY IMMEDIATE;
+
+SET CONSTRAINT t_uq DEFERRED;   -- for this transaction only
+UPDATE t SET code = 'B' WHERE id = 1;   -- transiently duplicates
+UPDATE t SET code = 'A' WHERE id = 2;
+COMMIT;                          -- checked here</code></pre>
+
+<p>One cost worth knowing: a deferrable unique or primary key is backed by a <em>non-unique</em>
+index, which is slightly less efficient. Don't make it the default.</p>
+
+<h2>Generated keys: identity columns</h2>
+
+<p>Since 12c, this is the answer:</p>
+
+<pre class="language-sql"><code class="language-sql">id NUMBER(19) GENERATED ALWAYS AS IDENTITY          -- you cannot supply a value
+id NUMBER(19) GENERATED BY DEFAULT AS IDENTITY      -- yours wins if supplied
+id NUMBER(19) GENERATED BY DEFAULT ON NULL AS IDENTITY  -- generate only when NULL</code></pre>
+
+<p><code>GENERATED ALWAYS</code> is the strictest and the best default — nothing can insert an id by
+accident. Use <code>BY DEFAULT ON NULL</code> when a data-migration script has to preserve existing
+ids.</p>
+
+<p>Under the covers Oracle creates a sequence and wires it in as the column default. You can tune it
+in place:</p>
+
+<pre class="language-sql"><code class="language-sql">id NUMBER(19) GENERATED ALWAYS AS IDENTITY (START WITH 1000 INCREMENT BY 1 CACHE 50)
+
+-- Which sequence is behind it?
+SELECT table_name, column_name, sequence_name
+FROM   user_tab_identity_cols;</code></pre>
+
+<h2>Generated keys: sequences</h2>
+
+<p>You still need explicit sequences when several tables share a number space, when the application
+wants the id before inserting, or when you are on 11g.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE SEQUENCE order_seq START WITH 1 INCREMENT BY 1 CACHE 100 NOCYCLE;
+
+INSERT INTO orders (id, customer_id, total)
+VALUES (order_seq.NEXTVAL, 42, 99.95);
+
+SELECT order_seq.CURRVAL FROM dual;   -- last value THIS session took</code></pre>
+
+<p>Notes that matter:</p>
+
+<ul>
+  <li><strong>Since 12c a sequence can be a column default</strong>
+      (<code>DEFAULT order_seq.NEXTVAL</code>). The old
+      <code>BEFORE INSERT FOR EACH ROW</code> trigger that every 11g schema carries is obsolete —
+      and it was measurably slow.</li>
+  <li><strong><code>CURRVAL</code> fails until <code>NEXTVAL</code> has been called</strong> in the
+      same session (<code>ORA-08002</code>). It is session-local, so it is safe, just not
+      predictable.</li>
+  <li><strong><code>CACHE n</code> preallocates <code>n</code> values in memory.</strong> Fast, and it
+      means an instance restart or a rolled-back transaction leaves a gap. Sequences guarantee
+      uniqueness, never contiguity. If you need gapless numbering — invoice numbers — that is a
+      different problem, solved with a counter table and accepted serialisation.</li>
+  <li><code>CACHE 20</code> is the default and is too small for a busy insert path. <code>100</code>
+      to <code>1000</code> is normal. This number must match Hibernate's
+      <code>allocationSize</code>; see the Spring Boot post for what happens when it doesn't.</li>
+</ul>
+
+<h2>Changing tables afterwards</h2>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE customers ADD phone VARCHAR2(30 CHAR);
+ALTER TABLE customers ADD (phone VARCHAR2(30 CHAR), country CHAR(2));   -- several at once
+ALTER TABLE customers MODIFY phone VARCHAR2(40 CHAR);                   -- widening: instant
+ALTER TABLE customers MODIFY last_name NULL;                            -- drop NOT NULL
+ALTER TABLE customers RENAME COLUMN phone TO mobile;
+ALTER TABLE customers DROP COLUMN mobile;                                -- expensive, rewrites rows
+ALTER TABLE customers SET UNUSED COLUMN mobile;                           -- instant; drop later
+ALTER TABLE customers ADD CONSTRAINT customers_phone_ck CHECK (mobile IS NOT NULL) ENABLE NOVALIDATE;</code></pre>
+
+<p>Two useful escape hatches. <code>SET UNUSED</code> hides a column immediately and defers the
+row-by-row work to a later <code>ALTER TABLE … DROP UNUSED COLUMNS</code>, which is how you drop a
+column on a large table during business hours. And <code>ENABLE NOVALIDATE</code> applies a new
+constraint to future rows without validating the existing ones — the way to start enforcing a rule on
+a table you know has historical violations.</p>
+
+<p>Adding a <code>NOT NULL</code> column <em>with a default</em> is metadata-only from 11g on: the
+default is recorded in the dictionary rather than written into every existing row. Instant on a
+billion rows. Adding a nullable column and then updating it is not.</p>
+
+<h2>Virtual columns</h2>
+
+<p>Computed on read, stored nowhere, and indexable — useful for exposing a derived value without
+letting it drift out of sync:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE customers ADD full_name
+  VARCHAR2(201 CHAR) GENERATED ALWAYS AS (first_name || ' ' || last_name) VIRTUAL;
+
+ALTER TABLE orders ADD order_month
+  VARCHAR2(7) GENERATED ALWAYS AS (to_char(order_date, 'YYYY-MM')) VIRTUAL;
+
+CREATE INDEX orders_month_ix ON orders (order_month);</code></pre>
+
+<h2>Dropping</h2>
+
+<pre class="language-sql"><code class="language-sql">DROP TABLE orders;                       -- goes to the recycle bin
+SELECT object_name, original_name FROM user_recyclebin;
+FLASHBACK TABLE orders TO BEFORE DROP;   -- undo, if you were quick
+
+DROP TABLE orders CASCADE CONSTRAINTS PURGE;   -- child FKs too, and no recycle bin</code></pre>
+
+<p>The recycle bin has saved careers. It also silently consumes tablespace, which is why an
+automated teardown script should always say <code>PURGE</code>.</p>
+
+<h2>Next</h2>
+
+<p>Tables full of data are next to useless without the querying idioms that are specific to Oracle:
+<code>DUAL</code>, <code>ROWNUM</code>, <code>NVL</code>, <code>MERGE</code> and friends.</p>

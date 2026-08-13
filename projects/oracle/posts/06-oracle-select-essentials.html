@@ -1,0 +1,264 @@
+<p>Your <code>SELECT</code> knowledge transfers to Oracle almost intact. This post is about the parts
+that don't: pagination, null handling, date formatting and the handful of idioms you will see in every
+Oracle codebase.</p>
+
+<h2>DUAL</h2>
+
+<p>Oracle requires a <code>FROM</code> clause, so scalar expressions select from
+<code>DUAL</code> — a built-in table with one column and exactly one row.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT 1 + 1                        FROM dual;
+SELECT sysdate                      FROM dual;
+SELECT order_seq.NEXTVAL            FROM dual;
+SELECT user, sys_context('USERENV','DB_NAME') FROM dual;</code></pre>
+
+<p>It is genuinely one row, which makes it useful as a row generator when combined with
+<code>CONNECT BY</code> — handy for filling a date range that has gaps in the data:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Every day in February 2024, whether or not an order exists
+SELECT DATE '2024-02-01' + LEVEL - 1 AS day
+FROM   dual
+CONNECT BY LEVEL <= 29;</code></pre>
+
+<h2>Pagination: FETCH FIRST, not ROWNUM</h2>
+
+<p>Oracle has no <code>LIMIT</code>. Since 12c there is standard row-limiting syntax, and it is what
+you should write:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Top 10
+SELECT * FROM orders ORDER BY total DESC FETCH FIRST 10 ROWS ONLY;
+
+-- Page 3, 20 per page
+SELECT * FROM orders ORDER BY id OFFSET 40 ROWS FETCH NEXT 20 ROWS ONLY;
+
+-- Include everyone tied at the boundary — may return more than 10 rows
+SELECT * FROM orders ORDER BY total DESC FETCH FIRST 10 ROWS WITH TIES;
+
+-- Percentage
+SELECT * FROM orders ORDER BY total DESC FETCH FIRST 5 PERCENT ROWS ONLY;</code></pre>
+
+<h3>Why ROWNUM catches people out</h3>
+
+<p>You will still meet <code>ROWNUM</code> constantly in older code, so you need to know how it
+behaves. <strong><code>ROWNUM</code> is assigned as rows are produced, before <code>ORDER BY</code>
+runs.</strong> So this looks like "the 10 biggest orders" and is not:</p>
+
+<pre class="language-sql"><code class="language-sql">-- WRONG: takes 10 arbitrary rows, THEN sorts those 10
+SELECT * FROM orders WHERE rownum <= 10 ORDER BY total DESC;
+
+-- RIGHT: sort first in an inline view, then filter
+SELECT * FROM (SELECT * FROM orders ORDER BY total DESC) WHERE rownum <= 10;</code></pre>
+
+<p>And the reason <code>OFFSET</code> needs the nested form is that <code>ROWNUM</code> only
+increments when a row is <em>returned</em>, so <code>rownum &gt; 40</code> is never true — row 1 is
+rejected, so no row ever becomes row 1. The classic three-level idiom, which is what
+<code>OFFSET … FETCH</code> replaced:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT * FROM (
+  SELECT t.*, rownum AS rn FROM (
+    SELECT * FROM orders ORDER BY id
+  ) t WHERE rownum <= 60          -- offset + pagesize
+) WHERE rn > 40;                   -- offset</code></pre>
+
+<p>One thing <code>ROWNUM</code> is still good for: <code>WHERE rownum = 1</code> as a cheap
+"does any row exist" probe, and capping a runaway ad-hoc query.</p>
+
+<p><strong>Always order by something unique when paginating.</strong> <code>ORDER BY total DESC</code>
+with ties gives Oracle no defined order within the tie, so the same row can appear on page 1 and page
+2. <code>ORDER BY total DESC, id</code> fixes it.</p>
+
+<h2>NULL handling</h2>
+
+<pre class="language-sql"><code class="language-sql">NVL(phone, 'none')                    -- 2 args, Oracle-specific, evaluates both
+NVL2(phone, 'has phone', 'no phone')  -- if-not-null / if-null
+COALESCE(mobile, phone, 'none')       -- ANSI, n args, short-circuits
+NULLIF(a, b)                          -- NULL when a = b, else a
+LNNVL(total > 100)                    -- TRUE when the condition is false OR null</code></pre>
+
+<p>Prefer <code>COALESCE</code>: it is standard, takes any number of arguments, and stops evaluating
+once it finds a non-null. <code>NVL</code> evaluates both arguments always, so
+<code>NVL(x, expensive_function(y))</code> pays for the function call even when <code>x</code> is not
+null.</p>
+
+<p>Sorting: <strong><code>NULL</code> sorts last in <code>ASC</code> and first in
+<code>DESC</code></strong>, which is the opposite of Postgres' default. Say what you mean:</p>
+
+<pre class="language-sql"><code class="language-sql">ORDER BY ship_date ASC NULLS FIRST      -- unshipped orders at the top
+ORDER BY total DESC NULLS LAST</code></pre>
+
+<h2>Conditional expressions</h2>
+
+<pre class="language-sql"><code class="language-sql">-- CASE: standard, readable, handles ranges. Use this.
+SELECT order_id,
+       CASE WHEN total >= 1000 THEN 'LARGE'
+            WHEN total >= 100  THEN 'MEDIUM'
+            ELSE 'SMALL'
+       END AS bucket
+FROM   orders;
+
+-- DECODE: Oracle-only, equality only. You will read it; don't write it.
+SELECT DECODE(status, 'A', 'Active', 'C', 'Closed', 'Unknown') FROM customers;</code></pre>
+
+<p>One quirk in <code>DECODE</code>'s favour: it treats two <code>NULL</code>s as equal, which
+<code>CASE</code> does not. That is the only situation where reaching for it is defensible.</p>
+
+<h2>Dates in and out</h2>
+
+<p>Never rely on <code>NLS_DATE_FORMAT</code>. It is a session setting, it differs between your
+machine and the server, and code that depends on it fails in production with
+<code>ORA-01861: literal does not match format string</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Explicit literals
+DATE '2024-02-19'
+TIMESTAMP '2024-02-19 14:30:00'
+
+-- Explicit conversion
+to_date('19/02/2024', 'DD/MM/YYYY')
+to_char(order_date, 'YYYY-MM-DD HH24:MI:SS')
+to_char(order_date, 'Day, DD Month YYYY', 'NLS_DATE_LANGUAGE=English')</code></pre>
+
+<p>Format mask details that cause real bugs:</p>
+
+<ul>
+  <li><code>MM</code> is month, <code>MI</code> is minute. <code>MM</code> where you meant
+      <code>MI</code> parses without complaint and gives nonsense.</li>
+  <li><code>HH</code> is 12-hour; <code>HH24</code> is what you want. <code>HH</code> without
+      <code>AM</code> silently loses the afternoon.</li>
+  <li><code>YYYY</code> vs <code>RRRR</code>: with a two-digit year, <code>RRRR</code> guesses the
+      century (55 → 1955, 15 → 2015) and <code>YYYY</code> uses the current one (55 → 2055).</li>
+  <li><code>to_number(str, '999.99')</code> exists too, and matters where the decimal separator is a
+      comma.</li>
+</ul>
+
+<h2>Strings</h2>
+
+<pre class="language-sql"><code class="language-sql">first_name || ' ' || last_name          -- concatenation, and it ignores NULLs
+SUBSTR(sku, 1, 3)                       -- 1-based, not 0-based
+INSTR(email, '@')                       -- position, 0 when absent
+LENGTH(name)                            -- characters; LENGTHB for bytes
+UPPER / LOWER / INITCAP
+TRIM(name) / LTRIM / RTRIM
+LPAD(id, 8, '0')                        -- '00000042'
+REPLACE(phone, '-', '')
+TRANSLATE(code, 'OI', '01')             -- character-by-character mapping
+REGEXP_LIKE(email, '^[^@]+@[^@]+\.[a-z]{2,}$', 'i')
+REGEXP_SUBSTR(log_line, 'user=(\w+)', 1, 1, NULL, 1)
+REGEXP_REPLACE(text, '\s+', ' ')</code></pre>
+
+<p><code>||</code> treating <code>NULL</code> as an empty string is a real convenience —
+<code>a || b</code> is never null unless both are — and it is a direct consequence of empty string
+being null.</p>
+
+<h2>Grouping, and LISTAGG</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id, count(*) AS orders, sum(total) AS revenue
+FROM   orders
+GROUP  BY customer_id
+HAVING sum(total) > 5000
+ORDER  BY revenue DESC;</code></pre>
+
+<p><code>LISTAGG</code> is Oracle's string aggregation, and it is used constantly:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id,
+       LISTAGG(status, ', ') WITHIN GROUP (ORDER BY order_date) AS statuses
+FROM   orders
+GROUP  BY customer_id;</code></pre>
+
+<p>It returns a <code>VARCHAR2</code>, so it overflows at 4000 bytes with
+<code>ORA-01489</code>. From 12.2 you can ask it to truncate instead of failing:</p>
+
+<pre class="language-sql"><code class="language-sql">LISTAGG(status, ', ' ON OVERFLOW TRUNCATE '…' WITH COUNT) WITHIN GROUP (ORDER BY order_date)</code></pre>
+
+<p><code>LISTAGG(DISTINCT …)</code> works from 19c. Before that, deduplicate in a subquery.</p>
+
+<p>Two grouping extensions worth knowing, because hand-writing the equivalent <code>UNION ALL</code>
+is a waste of an afternoon:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Subtotals per level plus a grand total
+SELECT region, product, sum(total)
+FROM   sales GROUP BY ROLLUP (region, product);
+
+-- Every combination
+SELECT region, product, sum(total)
+FROM   sales GROUP BY CUBE (region, product);
+
+-- GROUPING() tells you which rows are the subtotals
+SELECT region, GROUPING(region) AS is_total, sum(total)
+FROM   sales GROUP BY ROLLUP (region);</code></pre>
+
+<h2>MERGE</h2>
+
+<p>Oracle's upsert. There is no <code>INSERT … ON CONFLICT</code>; <code>MERGE</code> is the tool, and
+it does more than an upsert because it can also delete.</p>
+
+<pre class="language-sql"><code class="language-sql">MERGE INTO customers c
+USING (SELECT :email AS email, :name AS last_name FROM dual) src
+ON    (c.email = src.email)
+WHEN MATCHED THEN
+  UPDATE SET c.last_name = src.last_name
+WHEN NOT MATCHED THEN
+  INSERT (email, last_name) VALUES (src.email, src.last_name);</code></pre>
+
+<p>Merging one table into another is where it earns its keep:</p>
+
+<pre class="language-sql"><code class="language-sql">MERGE INTO customers c
+USING customers_staging s ON (c.email = s.email)
+WHEN MATCHED THEN
+  UPDATE SET c.last_name = s.last_name, c.status = s.status
+  WHERE  c.last_name <> s.last_name OR c.status <> s.status   -- skip no-op updates
+  DELETE WHERE s.status = 'PURGE'
+WHEN NOT MATCHED THEN
+  INSERT (email, last_name, status) VALUES (s.email, s.last_name, s.status);</code></pre>
+
+<p>That <code>WHERE</code> on the <code>UPDATE</code> is worth the two lines: without it, every
+matched row is rewritten and generates redo even when nothing changed.</p>
+
+<p><code>MERGE</code> needs the join key to be unique in the source. If two staging rows match the
+same target row you get <code>ORA-30926: unable to get a stable set of rows</code> — the fix is
+deduplicating the source, not retrying.</p>
+
+<h2>Bulk INSERT and RETURNING</h2>
+
+<pre class="language-sql"><code class="language-sql">-- Multi-row insert: not VALUES (...), (...) — use INSERT ALL
+INSERT ALL
+  INTO customers (email, last_name) VALUES ('a@x.com', 'Alpha')
+  INTO customers (email, last_name) VALUES ('b@x.com', 'Beta')
+SELECT * FROM dual;
+
+-- Or from a query
+INSERT INTO customers_archive SELECT * FROM customers WHERE status = 'CLOSED';
+
+-- Get the generated key back (PL/SQL and JDBC)
+INSERT INTO customers (email, last_name) VALUES ('c@x.com', 'Gamma')
+RETURNING id INTO :new_id;</code></pre>
+
+<p>Oracle does not accept the multi-row <code>VALUES</code> list that MySQL and Postgres do. That
+surprises people porting scripts; <code>INSERT ALL</code> is the equivalent.</p>
+
+<h2>WITH clauses</h2>
+
+<p>Common table expressions work as expected, and they matter for readability once queries grow:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH monthly AS (
+  SELECT to_char(order_date, 'YYYY-MM') AS mth, sum(total) AS revenue
+  FROM   orders GROUP BY to_char(order_date, 'YYYY-MM')
+), ranked AS (
+  SELECT mth, revenue, RANK() OVER (ORDER BY revenue DESC) AS rnk
+  FROM   monthly
+)
+SELECT * FROM ranked WHERE rnk <= 3;</code></pre>
+
+<p>Recursive CTEs also work from 11gR2, though a lot of Oracle code still uses the older
+<code>CONNECT BY</code> hierarchical syntax:</p>
+
+<pre class="language-sql"><code class="language-sql">-- CONNECT BY: Oracle's own, with LEVEL and SYS_CONNECT_BY_PATH for free
+SELECT LPAD(' ', 2 * (LEVEL - 1)) || last_name AS org,
+       SYS_CONNECT_BY_PATH(last_name, '/')     AS path
+FROM   employees
+START WITH manager_id IS NULL
+CONNECT BY PRIOR employee_id = manager_id;</code></pre>
+
+<h2>Next</h2>
+
+<p>Joins, including the <code>(+)</code> syntax you will find all over legacy Oracle SQL and the
+<code>NOT IN</code> trap that silently returns nothing.</p>
