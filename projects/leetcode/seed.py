@@ -19,6 +19,9 @@ build reads only the indexes.
     # a named batch, for posts published outside the round sequence
     python projects/leetcode/seed.py --env prod --batch interview-essentials --write
 
+    # change the published date of posts that already exist (content untouched)
+    python projects/leetcode/seed.py --env prod --redate --write
+
 Idempotent: re-running updates the posts in place. `date` is only applied when a
 post is new, so a re-run never reshuffles the archive.
 """
@@ -88,6 +91,61 @@ def select(round_no: int | None, batch: str | None) -> list[dict]:
     return chosen
 
 
+def redate(entries: list[dict], post_service, write: bool) -> int:
+    """Apply the manifest's `date` to posts that already exist.
+
+    `upsert_post` deliberately never re-applies `date` to an existing post, so
+    that re-seeding a track cannot reshuffle the archive. Changing a published
+    date therefore needs its own path: patch the one field on the stored record
+    and re-run the same index maintenance the admin API uses, which keeps the
+    post index, the category archive and the search index agreeing with it.
+
+    Nothing else on the record is touched -- wpId, body, excerpt and `modified`
+    all survive.
+
+    Refuses to touch entries with no `number`. Those are the legacy rewrites,
+    whose 2018/2019 dates are real publication dates rather than track ordering.
+    """
+    skipped = [e for e in entries if "number" not in e]
+    targets = [e for e in entries if "number" in e]
+    for entry in skipped:
+        print(f"  skip    {entry['slug']}  (legacy post, real date kept)")
+
+    changes, missing = [], []
+    for entry in targets:
+        existing = post_service.get_post(entry["slug"])
+        if not existing:
+            missing.append(entry["slug"])
+        elif existing.get("date") != entry["date"]:
+            changes.append((entry, existing))
+
+    for slug in missing:
+        print(f"  absent  {slug}  (not published yet, nothing to re-date)")
+
+    if not changes:
+        print("\nevery published post already carries its manifest date.")
+        return 0
+
+    for entry, existing in changes:
+        print(f"  redate  {entry['slug']:52} {existing.get('date')} -> {entry['date']}")
+
+    if not write:
+        print(f"\n{len(changes)} post(s) would be re-dated. Re-run with --write.")
+        return 0
+
+    for entry, existing in changes:
+        record = dict(existing)
+        record["date"] = entry["date"]
+        post_service.repo().put_json(post_service.post_key(entry["slug"]), record)
+        # Same reindex the admin API runs. The category does not change and the
+        # post was already published, so both flags describe the current state.
+        post_service._reindex(record, previous_category=record.get("category"),
+                              previously_published=True)
+
+    print(f"\n{len(changes)} post(s) re-dated.")
+    return 0
+
+
 def read_post_html(entry: dict) -> str:
     path = HERE / "posts" / entry["file"]
     if not path.exists():
@@ -102,6 +160,9 @@ def main() -> int:
                         help="publish only this round of ten LeetCode numbers")
     parser.add_argument("--batch", default=None,
                         help="publish only this named batch (posts outside the round sequence)")
+    parser.add_argument("--redate", action="store_true",
+                        help="apply the manifest's date to posts that already exist, "
+                             "instead of rewriting their content")
     parser.add_argument("--write", action="store_true",
                         help="actually write. Without it, only report what would happen.")
     parser.add_argument("--author", default="folauk")
@@ -123,6 +184,9 @@ def main() -> int:
 
     index_before = len(post_service.list_posts())
     print(f"published posts in this tree before: {index_before}")
+
+    if args.redate:
+        return redate(entries, post_service, write=args.write)
 
     # Fail early rather than half-seeding: every file must exist and no slug may
     # already belong to a different category.

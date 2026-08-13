@@ -12,6 +12,8 @@
 ## My goal
 - my goal is to be able to use these problems to prepare for coding interviews.
 
+- date these leetcode posts on a random date between 2022 and 2024
+
 ---
 
 ## How this is built
@@ -95,10 +97,30 @@ category index so ‹ prev / next › walks oldest-first. Dates therefore ascend
 number, which is what makes the pager read 1 → 2 → 5 → 7. Identical timestamps would leave that
 ordering up to sort stability.
 
-Rounds 1 and 2 are spaced an hour apart on 2026-08-12, after the 11 legacy 2019 posts in this
-category, so the track is one contiguous run. Round 3 moved to 2026-08-13 — **one day per round from
-here on**, since cramming further rounds into a single day gets silly. **Later rounds must take
-later dates.**
+The LeetCode dates are spread randomly across **2022–2024** — generated once with a fixed seed, then
+sorted — so the track reads as written over three years rather than bulk-published on one day. They
+are random but **strictly ascending with the LeetCode number**, because the pager ordering above
+depends on it. Shuffling them properly would scramble prev/next.
+
+They still sit after the 2018/2019 legacy posts, so the track remains one contiguous run at the top
+of the category. **Later rounds must take dates after 2024-12-28** (LeetCode 543, the current
+newest), or be slotted into a gap that keeps the manifest's number and date order consistent.
+
+### Changing a date after publication
+
+`upsert_post` deliberately never re-applies `date` to an existing post, so editing the manifest and
+re-seeding does **not** move anything. That is on purpose — it stops a routine content fix from
+reshuffling the archive. Use the dedicated path instead:
+
+```bash
+AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/leetcode/seed.py --env prod --redate
+AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/leetcode/seed.py --env prod --redate --write
+```
+
+It patches only `date` on the stored record and re-runs the same index maintenance the admin API
+uses, so `wpId`, the body, the excerpt and `modified` all survive. It refuses to touch entries with
+no `number` — the legacy rewrites' 2018/2019 dates are real, not track ordering. Idempotent: a
+second run reports that everything already matches.
 
 ## Commands
 

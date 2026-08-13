@@ -81,10 +81,18 @@ frontend change of any kind.** `seed.py` only fills in the `name` and `descripti
 left blank. The slug does not move, so no URL changes.
 
 ### Dates
-Round 1 is `2026-08-12T09:00` through `15:00` and round 2 continues at `16:00` through `21:00`, one
-hour apart, ascending with the LeetCode number. Round 3 moved to `2026-08-13`, round 4 to `2026-08-14`; from
-here on each round takes its own day, because stacking more rounds into 2026-08-12 would have run
-out of hours.
+Originally every round was dated on the day it was written (2026-08-12 onwards, an hour apart).
+Re-dated on request to a **random spread across 2022–2024**, so the track reads as written over three
+years instead of bulk-published in one afternoon.
+
+The dates are random but **strictly ascending with the LeetCode number**, which was a deliberate
+narrowing of "random": genuinely shuffled dates would scramble the ‹ prev / next › pager, which is
+the one thing the date scheme exists to control. Generated once with a fixed seed
+(`random.Random(20260812)`) so the manifest is reproducible rather than mystery data, and checked for
+ties — identical timestamps would leave ordering to sort stability.
+
+Range is `2022-03-04` (LeetCode 1) to `2024-12-28` (LeetCode 543). The legacy posts are 2018/2019, so
+the LeetCode block still sits contiguously above them.
 
 Ascending dates are what make the ‹ prev / next › pager read 1 → 2 → 5 → 7 → … → 40, because
 `siblings()` reverses the category index to walk oldest-first. The dates sit after the 2019 legacy
@@ -129,6 +137,12 @@ normaliser, every block comes out in the exact `<pre class="language-X"><code cl
 shape the highlighter matches, every heading has an anchor id, and no post links to a slug the track
 does not define. It also checks the manifest for duplicate slugs and non-ascending dates.
 
+**The re-date was verified separately**, since it touches every published record: all 27 URLs still
+return 200, the rendered `datePublished` matches the manifest, the category archive still lists the
+track newest-first with 543 at the top and the legacy posts below, the sidebar still reads
+oldest-first, prev/next on LeetCode 1 still points at LeetCode 2, and a second `--redate --write` run
+reports that everything already matches.
+
 **Rendered output** — round 1 was checked against the dev server on the `local` tree before it went
 out, rounds 2 through 4 against the live site after:
 
@@ -157,6 +171,7 @@ this machine. The checks above were done against the rendered HTML instead.
 - [x] ~~Round 4 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2026-08-14).
 - [x] ~~Interview-essentials batch (121, 200, 347, 543) seeded and deployed.~~ Done 2026-08-12.
 - [x] ~~Rewrite three legacy posts on request.~~ Done 2026-08-12.
+- [x] ~~Re-date the 27 LeetCode posts across 2022–2024.~~ Done 2026-08-12 via `seed.py --redate`.
 - [ ] **Finish round 5.** `041-first-missing-positive.html` is written and passing but NOT in the
       manifest and NOT seeded. Still to write: 42 Trapping Rain Water, 43 Multiply Strings,
       46 Permutations, 47 Permutations II, 49 Group Anagrams. Round 5 dates must fall between

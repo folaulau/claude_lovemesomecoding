@@ -10,6 +10,12 @@ prev/next walks oldest-first. The dates therefore ascend with the LeetCode
 number, which is what makes the ‹ prev / next › pager read 1 -> 2 -> 5 -> 7.
 Identical timestamps would leave that ordering up to sort stability.
 
+The LeetCode dates are randomly spread across 2022-2024 (generated once with a
+fixed seed, then sorted) rather than clustered on the day they were written.
+They are random but strictly ascending with the LeetCode number, because the
+ordering above depends on it. seed.py --redate is what applies a change here to
+posts that already exist -- upsert_post never re-applies `date` on its own.
+
 Posts land in the existing `fundamental-problem` category, so the URLs are
 /fundamental-problem/leetcode-{n}-{title}. That category already holds 11
 legacy posts from 2019; the LeetCode dates sit after them so the pager reaches
@@ -43,7 +49,7 @@ POSTS = [
         "slug": "leetcode-1-two-sum",
         "title": "LeetCode 1 – Two Sum",
         "file": "001-two-sum.html",
-        "date": "2026-08-12T09:00:00",
+        "date": "2022-03-04T16:30:56",
         "difficulty": "Easy",
         "tags": ["leetcode", "array", "hash-table"],
         "excerpt": (
@@ -59,7 +65,7 @@ POSTS = [
         "slug": "leetcode-2-add-two-numbers",
         "title": "LeetCode 2 – Add Two Numbers",
         "file": "002-add-two-numbers.html",
-        "date": "2026-08-12T10:00:00",
+        "date": "2022-03-12T15:27:05",
         "difficulty": "Medium",
         "tags": ["leetcode", "linked-list", "math"],
         "excerpt": (
@@ -75,7 +81,7 @@ POSTS = [
         "slug": "leetcode-5-longest-palindromic-substring",
         "title": "LeetCode 5 – Longest Palindromic Substring",
         "file": "005-longest-palindromic-substring.html",
-        "date": "2026-08-12T11:00:00",
+        "date": "2022-03-24T12:13:12",
         "difficulty": "Medium",
         "tags": ["leetcode", "string", "dynamic-programming"],
         "excerpt": (
@@ -91,7 +97,7 @@ POSTS = [
         "slug": "leetcode-7-reverse-integer",
         "title": "LeetCode 7 – Reverse Integer",
         "file": "007-reverse-integer.html",
-        "date": "2026-08-12T12:00:00",
+        "date": "2022-04-14T21:10:58",
         "difficulty": "Easy",
         "tags": ["leetcode", "math"],
         "excerpt": (
@@ -107,7 +113,7 @@ POSTS = [
         "slug": "leetcode-8-string-to-integer-atoi",
         "title": "LeetCode 8 – String to Integer (atoi)",
         "file": "008-string-to-integer-atoi.html",
-        "date": "2026-08-12T13:00:00",
+        "date": "2022-08-30T23:48:30",
         "difficulty": "Medium",
         "tags": ["leetcode", "string", "math"],
         "excerpt": (
@@ -123,7 +129,7 @@ POSTS = [
         "slug": "leetcode-9-palindrome-number",
         "title": "LeetCode 9 – Palindrome Number",
         "file": "009-palindrome-number.html",
-        "date": "2026-08-12T14:00:00",
+        "date": "2022-09-28T03:08:31",
         "difficulty": "Easy",
         "tags": ["leetcode", "math"],
         "excerpt": (
@@ -139,7 +145,7 @@ POSTS = [
         "slug": "leetcode-10-regular-expression-matching",
         "title": "LeetCode 10 – Regular Expression Matching",
         "file": "010-regular-expression-matching.html",
-        "date": "2026-08-12T15:00:00",
+        "date": "2022-10-03T18:55:13",
         "difficulty": "Hard",
         "tags": ["leetcode", "string", "dynamic-programming", "recursion"],
         "excerpt": (
@@ -156,7 +162,7 @@ POSTS = [
         "slug": "leetcode-12-integer-to-roman",
         "title": "LeetCode 12 – Integer to Roman",
         "file": "012-integer-to-roman.html",
-        "date": "2026-08-12T16:00:00",
+        "date": "2022-10-10T14:53:30",
         "difficulty": "Medium",
         "tags": ["leetcode", "math", "string", "greedy"],
         "excerpt": (
@@ -172,7 +178,7 @@ POSTS = [
         "slug": "leetcode-13-roman-to-integer",
         "title": "LeetCode 13 – Roman to Integer",
         "file": "013-roman-to-integer.html",
-        "date": "2026-08-12T17:00:00",
+        "date": "2022-11-11T13:41:51",
         "difficulty": "Easy",
         "tags": ["leetcode", "math", "string"],
         "excerpt": (
@@ -188,7 +194,7 @@ POSTS = [
         "slug": "leetcode-14-longest-common-prefix",
         "title": "LeetCode 14 – Longest Common Prefix",
         "file": "014-longest-common-prefix.html",
-        "date": "2026-08-12T18:00:00",
+        "date": "2023-01-09T12:21:34",
         "difficulty": "Easy",
         "tags": ["leetcode", "string"],
         "excerpt": (
@@ -204,7 +210,7 @@ POSTS = [
         "slug": "leetcode-15-3sum",
         "title": "LeetCode 15 – 3Sum",
         "file": "015-3sum.html",
-        "date": "2026-08-12T19:00:00",
+        "date": "2023-02-17T16:48:52",
         "difficulty": "Medium",
         "tags": ["leetcode", "array", "two-pointers", "sorting"],
         "excerpt": (
@@ -220,7 +226,7 @@ POSTS = [
         "slug": "leetcode-19-remove-nth-node-from-end-of-list",
         "title": "LeetCode 19 – Remove Nth Node From End of List",
         "file": "019-remove-nth-node-from-end-of-list.html",
-        "date": "2026-08-12T20:00:00",
+        "date": "2023-04-05T16:33:26",
         "difficulty": "Medium",
         "tags": ["leetcode", "linked-list", "two-pointers"],
         "excerpt": (
@@ -235,7 +241,7 @@ POSTS = [
         "slug": "leetcode-20-valid-parentheses",
         "title": "LeetCode 20 – Valid Parentheses",
         "file": "020-valid-parentheses.html",
-        "date": "2026-08-12T21:00:00",
+        "date": "2023-04-07T15:31:46",
         "difficulty": "Easy",
         "tags": ["leetcode", "string", "stack"],
         "excerpt": (
@@ -251,7 +257,7 @@ POSTS = [
         "slug": "leetcode-21-merge-two-sorted-lists",
         "title": "LeetCode 21 – Merge Two Sorted Lists",
         "file": "021-merge-two-sorted-lists.html",
-        "date": "2026-08-13T09:00:00",
+        "date": "2023-04-21T23:53:58",
         "difficulty": "Easy",
         "tags": ["leetcode", "linked-list", "two-pointers"],
         "excerpt": (
@@ -267,7 +273,7 @@ POSTS = [
         "slug": "leetcode-22-generate-parentheses",
         "title": "LeetCode 22 – Generate Parentheses",
         "file": "022-generate-parentheses.html",
-        "date": "2026-08-13T10:00:00",
+        "date": "2023-07-10T16:57:34",
         "difficulty": "Medium",
         "tags": ["leetcode", "backtracking", "recursion", "string"],
         "excerpt": (
@@ -283,7 +289,7 @@ POSTS = [
         "slug": "leetcode-23-merge-k-sorted-lists",
         "title": "LeetCode 23 – Merge k Sorted Lists",
         "file": "023-merge-k-sorted-lists.html",
-        "date": "2026-08-13T11:00:00",
+        "date": "2023-10-13T13:35:32",
         "difficulty": "Hard",
         "tags": ["leetcode", "linked-list", "divide-and-conquer", "heap"],
         "excerpt": (
@@ -299,7 +305,7 @@ POSTS = [
         "slug": "leetcode-28-implement-strstr",
         "title": "LeetCode 28 – Implement strStr()",
         "file": "028-implement-strstr.html",
-        "date": "2026-08-13T12:00:00",
+        "date": "2023-12-23T09:00:22",
         "difficulty": "Easy",
         "tags": ["leetcode", "string", "two-pointers"],
         "excerpt": (
@@ -316,7 +322,7 @@ POSTS = [
         "slug": "leetcode-31-next-permutation",
         "title": "LeetCode 31 – Next Permutation",
         "file": "031-next-permutation.html",
-        "date": "2026-08-14T09:00:00",
+        "date": "2023-12-28T03:29:48",
         "difficulty": "Medium",
         "tags": ["leetcode", "array", "two-pointers"],
         "excerpt": (
@@ -332,7 +338,7 @@ POSTS = [
         "slug": "leetcode-33-search-in-rotated-sorted-array",
         "title": "LeetCode 33 – Search in Rotated Sorted Array",
         "file": "033-search-in-rotated-sorted-array.html",
-        "date": "2026-08-14T10:00:00",
+        "date": "2024-01-19T01:31:30",
         "difficulty": "Medium",
         "tags": ["leetcode", "array", "binary-search"],
         "excerpt": (
@@ -347,7 +353,7 @@ POSTS = [
         "slug": "leetcode-34-find-first-and-last-position",
         "title": "LeetCode 34 – Find First and Last Position of Element in Sorted Array",
         "file": "034-find-first-and-last-position.html",
-        "date": "2026-08-14T11:00:00",
+        "date": "2024-06-25T02:07:34",
         "difficulty": "Medium",
         "tags": ["leetcode", "array", "binary-search"],
         "excerpt": (
@@ -363,7 +369,7 @@ POSTS = [
         "slug": "leetcode-36-valid-sudoku",
         "title": "LeetCode 36 – Valid Sudoku",
         "file": "036-valid-sudoku.html",
-        "date": "2026-08-14T12:00:00",
+        "date": "2024-07-03T08:06:22",
         "difficulty": "Medium",
         "tags": ["leetcode", "array", "hash-table", "matrix"],
         "excerpt": (
@@ -379,7 +385,7 @@ POSTS = [
         "slug": "leetcode-39-combination-sum",
         "title": "LeetCode 39 – Combination Sum",
         "file": "039-combination-sum.html",
-        "date": "2026-08-14T13:00:00",
+        "date": "2024-07-18T11:21:02",
         "difficulty": "Medium",
         "tags": ["leetcode", "backtracking", "array", "recursion"],
         "excerpt": (
@@ -395,7 +401,7 @@ POSTS = [
         "slug": "leetcode-40-combination-sum-ii",
         "title": "LeetCode 40 – Combination Sum II",
         "file": "040-combination-sum-ii.html",
-        "date": "2026-08-14T14:00:00",
+        "date": "2024-08-09T01:50:35",
         "difficulty": "Medium",
         "tags": ["leetcode", "backtracking", "array", "recursion"],
         "excerpt": (
@@ -416,7 +422,7 @@ POSTS = [
         "slug": "leetcode-121-best-time-to-buy-and-sell-stock",
         "title": "LeetCode 121 – Best Time to Buy and Sell Stock",
         "file": "121-best-time-to-buy-and-sell-stock.html",
-        "date": "2026-08-15T09:00:00",
+        "date": "2024-09-18T11:16:35",
         "difficulty": "Easy",
         "tags": ["leetcode", "array", "dynamic-programming"],
         "excerpt": (
@@ -433,7 +439,7 @@ POSTS = [
         "slug": "leetcode-200-number-of-islands",
         "title": "LeetCode 200 – Number of Islands",
         "file": "200-number-of-islands.html",
-        "date": "2026-08-15T10:00:00",
+        "date": "2024-11-19T07:23:20",
         "difficulty": "Medium",
         "tags": ["leetcode", "graph", "depth-first-search", "breadth-first-search", "matrix"],
         "excerpt": (
@@ -450,7 +456,7 @@ POSTS = [
         "slug": "leetcode-347-top-k-frequent-elements",
         "title": "LeetCode 347 – Top K Frequent Elements",
         "file": "347-top-k-frequent-elements.html",
-        "date": "2026-08-15T11:00:00",
+        "date": "2024-12-13T21:29:46",
         "difficulty": "Medium",
         "tags": ["leetcode", "hash-table", "heap", "sorting"],
         "excerpt": (
@@ -466,7 +472,7 @@ POSTS = [
         "slug": "leetcode-543-diameter-of-binary-tree",
         "title": "LeetCode 543 – Diameter of Binary Tree",
         "file": "543-diameter-of-binary-tree.html",
-        "date": "2026-08-15T12:00:00",
+        "date": "2024-12-28T03:27:23",
         "difficulty": "Easy",
         "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
         "excerpt": (
