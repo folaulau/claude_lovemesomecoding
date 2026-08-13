@@ -146,6 +146,22 @@ def redate(entries: list[dict], post_service, write: bool) -> int:
     return 0
 
 
+def tags_for(entry: dict) -> list[str]:
+    """The algorithm category, slugified, followed by the entry's own tags.
+
+    It goes first so the algorithm domain is the leading tag on every post, and
+    it is de-duplicated in case a free-form tag already says the same thing.
+    Nothing on the public site renders tags today, so this is metadata for a
+    future browse UI rather than something a reader sees.
+    """
+    algorithm = entry["algorithm"].lower().replace(" ", "-")
+    tags = [algorithm]
+    for tag in entry.get("tags", []):
+        if tag not in tags:
+            tags.append(tag)
+    return tags
+
+
 def read_post_html(entry: dict) -> str:
     path = HERE / "posts" / entry["file"]
     if not path.exists():
@@ -220,7 +236,7 @@ def main() -> int:
                 "title": entry["title"],
                 "category": manifest.CATEGORY["slug"],
                 "contentHtml": bodies[entry["slug"]],
-                "tags": entry.get("tags", []),
+                "tags": tags_for(entry),
                 "excerpt": entry.get("excerpt"),
                 "status": "published",
                 "date": entry["date"],

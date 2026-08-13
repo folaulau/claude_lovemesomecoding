@@ -42,11 +42,35 @@ CATEGORY = {
 # `fundamental-problem` under "Software Engineering" as "Fundamental Problems".
 NAV_GROUP = "Software Engineering"
 
+# The algorithm taxonomy every post is filed under, alphabetical. This is the
+# standard HackerRank algorithm-domain list; `algorithm` on each entry must be
+# one of these exactly, which check_content.py enforces.
+#
+# seed.py emits the slugified value as the FIRST tag on the post, ahead of the
+# free-form ones. Nothing on the public site renders tags today -- they are
+# stored and editable in /admin only -- so this is metadata waiting for a browse
+# UI, not something a reader sees.
+ALGORITHMS = (
+    "Bit Manipulation",
+    "Constructive Algorithms",
+    "Dynamic Programming",
+    "Game Theory",
+    "Graph Theory",
+    "Greedy",
+    "Implementation",
+    "Recursion",
+    "Searching",
+    "Sorting",
+    "Strings",
+    "Warmup",
+)
+
 # Round 1 - LeetCode 1-10. Missing from the source repo: 3, 4, 6.
 POSTS = [
     {
         "number": 1,
         "slug": "leetcode-1-two-sum",
+        "algorithm": "Searching",
         "title": "LeetCode 1 – Two Sum",
         "file": "001-two-sum.html",
         "date": "2022-03-04T16:30:56",
@@ -63,6 +87,7 @@ POSTS = [
     {
         "number": 2,
         "slug": "leetcode-2-add-two-numbers",
+        "algorithm": "Implementation",
         "title": "LeetCode 2 – Add Two Numbers",
         "file": "002-add-two-numbers.html",
         "date": "2022-03-12T15:27:05",
@@ -79,6 +104,7 @@ POSTS = [
     {
         "number": 5,
         "slug": "leetcode-5-longest-palindromic-substring",
+        "algorithm": "Strings",
         "title": "LeetCode 5 – Longest Palindromic Substring",
         "file": "005-longest-palindromic-substring.html",
         "date": "2022-03-24T12:13:12",
@@ -95,6 +121,7 @@ POSTS = [
     {
         "number": 7,
         "slug": "leetcode-7-reverse-integer",
+        "algorithm": "Implementation",
         "title": "LeetCode 7 – Reverse Integer",
         "file": "007-reverse-integer.html",
         "date": "2022-04-14T21:10:58",
@@ -111,6 +138,7 @@ POSTS = [
     {
         "number": 8,
         "slug": "leetcode-8-string-to-integer-atoi",
+        "algorithm": "Strings",
         "title": "LeetCode 8 – String to Integer (atoi)",
         "file": "008-string-to-integer-atoi.html",
         "date": "2022-08-30T23:48:30",
@@ -127,6 +155,7 @@ POSTS = [
     {
         "number": 9,
         "slug": "leetcode-9-palindrome-number",
+        "algorithm": "Implementation",
         "title": "LeetCode 9 – Palindrome Number",
         "file": "009-palindrome-number.html",
         "date": "2022-09-28T03:08:31",
@@ -143,6 +172,7 @@ POSTS = [
     {
         "number": 10,
         "slug": "leetcode-10-regular-expression-matching",
+        "algorithm": "Dynamic Programming",
         "title": "LeetCode 10 – Regular Expression Matching",
         "file": "010-regular-expression-matching.html",
         "date": "2022-10-03T18:55:13",
@@ -160,6 +190,7 @@ POSTS = [
     {
         "number": 12,
         "slug": "leetcode-12-integer-to-roman",
+        "algorithm": "Greedy",
         "title": "LeetCode 12 – Integer to Roman",
         "file": "012-integer-to-roman.html",
         "date": "2022-10-10T14:53:30",
@@ -176,6 +207,7 @@ POSTS = [
     {
         "number": 13,
         "slug": "leetcode-13-roman-to-integer",
+        "algorithm": "Strings",
         "title": "LeetCode 13 – Roman to Integer",
         "file": "013-roman-to-integer.html",
         "date": "2022-11-11T13:41:51",
@@ -192,6 +224,7 @@ POSTS = [
     {
         "number": 14,
         "slug": "leetcode-14-longest-common-prefix",
+        "algorithm": "Strings",
         "title": "LeetCode 14 – Longest Common Prefix",
         "file": "014-longest-common-prefix.html",
         "date": "2023-01-09T12:21:34",
@@ -208,6 +241,7 @@ POSTS = [
     {
         "number": 15,
         "slug": "leetcode-15-3sum",
+        "algorithm": "Sorting",
         "title": "LeetCode 15 – 3Sum",
         "file": "015-3sum.html",
         "date": "2023-02-17T16:48:52",
@@ -224,6 +258,7 @@ POSTS = [
     {
         "number": 19,
         "slug": "leetcode-19-remove-nth-node-from-end-of-list",
+        "algorithm": "Implementation",
         "title": "LeetCode 19 – Remove Nth Node From End of List",
         "file": "019-remove-nth-node-from-end-of-list.html",
         "date": "2023-04-05T16:33:26",
@@ -239,6 +274,7 @@ POSTS = [
     {
         "number": 20,
         "slug": "leetcode-20-valid-parentheses",
+        "algorithm": "Strings",
         "title": "LeetCode 20 – Valid Parentheses",
         "file": "020-valid-parentheses.html",
         "date": "2023-04-07T15:31:46",
@@ -255,6 +291,7 @@ POSTS = [
     {
         "number": 21,
         "slug": "leetcode-21-merge-two-sorted-lists",
+        "algorithm": "Sorting",
         "title": "LeetCode 21 – Merge Two Sorted Lists",
         "file": "021-merge-two-sorted-lists.html",
         "date": "2023-04-21T23:53:58",
@@ -271,6 +308,7 @@ POSTS = [
     {
         "number": 22,
         "slug": "leetcode-22-generate-parentheses",
+        "algorithm": "Recursion",
         "title": "LeetCode 22 – Generate Parentheses",
         "file": "022-generate-parentheses.html",
         "date": "2023-07-10T16:57:34",
@@ -287,6 +325,7 @@ POSTS = [
     {
         "number": 23,
         "slug": "leetcode-23-merge-k-sorted-lists",
+        "algorithm": "Sorting",
         "title": "LeetCode 23 – Merge k Sorted Lists",
         "file": "023-merge-k-sorted-lists.html",
         "date": "2023-10-13T13:35:32",
@@ -303,6 +342,7 @@ POSTS = [
     {
         "number": 28,
         "slug": "leetcode-28-implement-strstr",
+        "algorithm": "Strings",
         "title": "LeetCode 28 – Implement strStr()",
         "file": "028-implement-strstr.html",
         "date": "2023-12-23T09:00:22",
@@ -320,6 +360,7 @@ POSTS = [
     {
         "number": 31,
         "slug": "leetcode-31-next-permutation",
+        "algorithm": "Implementation",
         "title": "LeetCode 31 – Next Permutation",
         "file": "031-next-permutation.html",
         "date": "2023-12-28T03:29:48",
@@ -336,6 +377,7 @@ POSTS = [
     {
         "number": 33,
         "slug": "leetcode-33-search-in-rotated-sorted-array",
+        "algorithm": "Searching",
         "title": "LeetCode 33 – Search in Rotated Sorted Array",
         "file": "033-search-in-rotated-sorted-array.html",
         "date": "2024-01-19T01:31:30",
@@ -351,6 +393,7 @@ POSTS = [
     {
         "number": 34,
         "slug": "leetcode-34-find-first-and-last-position",
+        "algorithm": "Searching",
         "title": "LeetCode 34 – Find First and Last Position of Element in Sorted Array",
         "file": "034-find-first-and-last-position.html",
         "date": "2024-06-25T02:07:34",
@@ -367,6 +410,7 @@ POSTS = [
     {
         "number": 36,
         "slug": "leetcode-36-valid-sudoku",
+        "algorithm": "Implementation",
         "title": "LeetCode 36 – Valid Sudoku",
         "file": "036-valid-sudoku.html",
         "date": "2024-07-03T08:06:22",
@@ -383,6 +427,7 @@ POSTS = [
     {
         "number": 39,
         "slug": "leetcode-39-combination-sum",
+        "algorithm": "Recursion",
         "title": "LeetCode 39 – Combination Sum",
         "file": "039-combination-sum.html",
         "date": "2024-07-18T11:21:02",
@@ -399,6 +444,7 @@ POSTS = [
     {
         "number": 40,
         "slug": "leetcode-40-combination-sum-ii",
+        "algorithm": "Recursion",
         "title": "LeetCode 40 – Combination Sum II",
         "file": "040-combination-sum-ii.html",
         "date": "2024-08-09T01:50:35",
@@ -418,6 +464,7 @@ POSTS = [
     {
         "number": 41,
         "slug": "leetcode-41-first-missing-positive",
+        "algorithm": "Sorting",
         "title": "LeetCode 41 \u2013 First Missing Positive",
         "file": "041-first-missing-positive.html",
         "date": "2024-08-11T16:47:48",
@@ -433,6 +480,7 @@ POSTS = [
     {
         "number": 42,
         "slug": "leetcode-42-trapping-rain-water",
+        "algorithm": "Dynamic Programming",
         "title": "LeetCode 42 \u2013 Trapping Rain Water",
         "file": "042-trapping-rain-water.html",
         "date": "2024-08-18T06:40:16",
@@ -448,6 +496,7 @@ POSTS = [
     {
         "number": 43,
         "slug": "leetcode-43-multiply-strings",
+        "algorithm": "Strings",
         "title": "LeetCode 43 \u2013 Multiply Strings",
         "file": "043-multiply-strings.html",
         "date": "2024-08-18T11:21:32",
@@ -463,6 +512,7 @@ POSTS = [
     {
         "number": 46,
         "slug": "leetcode-46-permutations",
+        "algorithm": "Recursion",
         "title": "LeetCode 46 \u2013 Permutations",
         "file": "046-permutations.html",
         "date": "2024-08-23T17:28:38",
@@ -478,6 +528,7 @@ POSTS = [
     {
         "number": 47,
         "slug": "leetcode-47-permutations-ii",
+        "algorithm": "Recursion",
         "title": "LeetCode 47 \u2013 Permutations II",
         "file": "047-permutations-ii.html",
         "date": "2024-09-01T07:22:28",
@@ -493,6 +544,7 @@ POSTS = [
     {
         "number": 49,
         "slug": "leetcode-49-group-anagrams",
+        "algorithm": "Strings",
         "title": "LeetCode 49 \u2013 Group Anagrams",
         "file": "049-group-anagrams.html",
         "date": "2024-09-14T17:07:10",
@@ -513,6 +565,7 @@ POSTS = [
         "number": 121,
         "batch": "interview-essentials",
         "slug": "leetcode-121-best-time-to-buy-and-sell-stock",
+        "algorithm": "Dynamic Programming",
         "title": "LeetCode 121 – Best Time to Buy and Sell Stock",
         "file": "121-best-time-to-buy-and-sell-stock.html",
         "date": "2024-09-18T11:16:35",
@@ -530,6 +583,7 @@ POSTS = [
         "number": 200,
         "batch": "interview-essentials",
         "slug": "leetcode-200-number-of-islands",
+        "algorithm": "Graph Theory",
         "title": "LeetCode 200 – Number of Islands",
         "file": "200-number-of-islands.html",
         "date": "2024-11-19T07:23:20",
@@ -547,6 +601,7 @@ POSTS = [
         "number": 347,
         "batch": "interview-essentials",
         "slug": "leetcode-347-top-k-frequent-elements",
+        "algorithm": "Sorting",
         "title": "LeetCode 347 – Top K Frequent Elements",
         "file": "347-top-k-frequent-elements.html",
         "date": "2024-12-13T21:29:46",
@@ -563,6 +618,7 @@ POSTS = [
         "number": 543,
         "batch": "interview-essentials",
         "slug": "leetcode-543-diameter-of-binary-tree",
+        "algorithm": "Graph Theory",
         "title": "LeetCode 543 – Diameter of Binary Tree",
         "file": "543-diameter-of-binary-tree.html",
         "date": "2024-12-28T03:27:23",
@@ -586,6 +642,7 @@ POSTS = [
     {
         "batch": "legacy-rewrite",
         "slug": "fundamental-problem-two-number-sum",
+        "algorithm": "Searching",
         "title": "Two Number Sum",
         "file": "legacy-two-number-sum.html",
         "date": "2019-02-09T22:38:47",
@@ -602,6 +659,7 @@ POSTS = [
     {
         "batch": "legacy-rewrite",
         "slug": "fundamental-problem-three-number-sum",
+        "algorithm": "Sorting",
         "title": "Three Number Sum",
         "file": "legacy-three-number-sum.html",
         "date": "2019-02-10T05:47:15",
@@ -617,6 +675,7 @@ POSTS = [
     {
         "batch": "legacy-rewrite",
         "slug": "fundamental-problem-recursion",
+        "algorithm": "Recursion",
         "title": "Recursion in Coding Interviews",
         "file": "legacy-recursion.html",
         "date": "2018-02-07T07:48:22",

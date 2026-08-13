@@ -65,6 +65,15 @@ numbers = [e["number"] for e in tracked]
 if numbers != sorted(numbers):
     failures.append("LeetCode numbers are out of order in the manifest")
 
+# Every post is filed under exactly one algorithm domain, spelled as in the
+# taxonomy. A typo here would silently create a category of one.
+for entry in manifest.POSTS:
+    algorithm = entry.get("algorithm")
+    if algorithm is None:
+        failures.append(f"{entry['slug']}: no `algorithm` set")
+    elif algorithm not in manifest.ALGORITHMS:
+        failures.append(f"{entry['slug']}: algorithm {algorithm!r} is not in the taxonomy")
+
 for entry in manifest.POSTS:
     raw = (HERE / "posts" / entry["file"]).read_text(encoding="utf-8")
 

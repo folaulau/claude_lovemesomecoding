@@ -102,6 +102,18 @@ posts, so the LeetCode track is one contiguous run at the end of the category.
 Later rounds should take later dates for the same reason. `seed.py` only applies `date` when a post
 is new, so re-running never reshuffles the archive.
 
+### Algorithm categories are tags, not site categories
+Each post is filed under one algorithm domain from the HackerRank taxonomy (`ALGORITHMS` in
+`manifest.py`), emitted as the first tag. It deliberately is **not** the post's `category` — that is
+`fundamental-problem` and changing it would change 36 live URLs.
+
+Tags are invisible to readers: they live on the post record and in the derived indexes, and `/admin`
+can edit them, but no page component renders them and the search index does not include them. This
+was the explicit choice — metadata now, browse UI later if wanted.
+
+Eight of the twelve domains are in use. Bit Manipulation, Constructive Algorithms, Game Theory and
+Warmup have no posts yet.
+
 ### Slugs are frozen once published
 `leetcode-{n}-{title}`. Changing one changes a live URL.
 
@@ -180,6 +192,9 @@ this machine. The checks above were done against the rendered HTML instead.
 - [x] ~~Interview-essentials batch (121, 200, 347, 543) seeded and deployed.~~ Done 2026-08-12.
 - [x] ~~Rewrite three legacy posts on request.~~ Done 2026-08-12.
 - [x] ~~Re-date the 27 LeetCode posts across 2022–2024.~~ Done 2026-08-12 via `seed.py --redate`.
+- [x] ~~File every post under an algorithm category.~~ Done 2026-08-13; all 36 re-seeded.
+- [ ] Consider rendering tags on post pages, or a browse-by-algorithm section on
+      `/fundamental-problem`. The data is in place; this is purely a frontend change.
 - [x] ~~Round 5 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2024-08/09).
 - [ ] Round 6 (LeetCode 51–60 has seven: 51 N-Queens, 52 N-Queens II, 53 Maximum Subarray,
       55 Jump Game, 56 Merge Intervals, 57 Insert Interval, 58 Length of Last Word). Its dates must

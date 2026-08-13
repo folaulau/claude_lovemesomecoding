@@ -14,6 +14,8 @@
 
 - date these leetcode posts on a random date between 2022 and 2024
 
+- add a category to each post so I know what kind of algorithm being use like Dynamic Programming, String, Sorting, Searching, etc.
+
 ---
 
 ## How this is built
@@ -68,6 +70,39 @@ seed with `--batch` rather than `--round`:
 | 200 | Number of Islands | grid DFS/BFS |
 | 347 | Top K Frequent Elements | bucket sort / min-heap of size k |
 | 543 | Diameter of Binary Tree | return depth, record diameter |
+
+## Algorithm categories
+
+Every entry carries an `algorithm` from the `ALGORITHMS` taxonomy in `manifest.py` — the standard
+HackerRank algorithm-domain list. `check_content.py` fails the build if one is missing or misspelt,
+so a typo cannot quietly create a category of one.
+
+`seed.py` emits it slugified as the **first** tag on the post, ahead of the free-form ones:
+`leetcode-15-3sum` gets `["sorting", "leetcode", "array", "two-pointers"]`.
+
+**Nothing on the public site renders tags.** They are stored on the post record, carried in
+`index/posts.json` and the category index, and editable in `/admin` — but no page component reads
+them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
+a browse UI, not something a reader sees today.
+
+Current distribution across the 36 posts:
+
+| Algorithm | Posts |
+|---|---|
+| Strings | 8 |
+| Implementation | 6 |
+| Recursion | 6 |
+| Sorting | 6 |
+| Searching | 4 |
+| Dynamic Programming | 3 |
+| Graph Theory | 2 |
+| Greedy | 1 |
+
+Bit Manipulation, Constructive Algorithms, Game Theory and Warmup are in the taxonomy but unused so
+far — nothing published fits them.
+
+Changing an `algorithm` means re-seeding that post, which rewrites its content too. That is safe
+(the content files are the source of truth) but it does bump `modified`.
 
 `--round` and `--batch` are mutually exclusive. When these numbers come up in their real rounds
 (13, 20, 35, 55), drop the `batch` key rather than adding a duplicate entry.
