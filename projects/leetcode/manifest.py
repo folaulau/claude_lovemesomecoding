@@ -406,4 +406,75 @@ POSTS = [
             "notice."
         ),
     },
+    # Interview essentials - published out of round order, on request, because they
+    # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
+    # sort, and the return-one-record-another tree recursion. `batch` groups them for
+    # seed.py; their numbers put them far beyond the rounds published so far.
+    {
+        "number": 121,
+        "batch": "interview-essentials",
+        "slug": "leetcode-121-best-time-to-buy-and-sell-stock",
+        "title": "LeetCode 121 – Best Time to Buy and Sell Stock",
+        "file": "121-best-time-to-buy-and-sell-stock.html",
+        "date": "2026-08-15T09:00:00",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "dynamic-programming"],
+        "excerpt": (
+            "Worth more than its Easy tag, because the reframing it teaches is the one behind "
+            "Kadane's algorithm and most 1-D DP. The brute force asks which pair of days is best; "
+            "the linear solution asks what the best buy was if I sell today — and that has a "
+            "one-variable answer. Why a falling market returns 0, and why this is Maximum Subarray "
+            "in disguise."
+        ),
+    },
+    {
+        "number": 200,
+        "batch": "interview-essentials",
+        "slug": "leetcode-200-number-of-islands",
+        "title": "LeetCode 200 – Number of Islands",
+        "file": "200-number-of-islands.html",
+        "date": "2026-08-15T10:00:00",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "graph", "depth-first-search", "breadth-first-search", "matrix"],
+        "excerpt": (
+            "The most common graph question in interviews, and it does not look like one — "
+            "recognising that a grid is a graph is most of what is being tested. Count starts and "
+            "erase the island so it cannot be counted twice. Why you must mark visited before "
+            "recursing, the input-mutation trade to say out loud, and when the recursion depth "
+            "forces BFS."
+        ),
+    },
+    {
+        "number": 347,
+        "batch": "interview-essentials",
+        "slug": "leetcode-347-top-k-frequent-elements",
+        "title": "LeetCode 347 – Top K Frequent Elements",
+        "file": "347-top-k-frequent-elements.html",
+        "date": "2026-08-15T11:00:00",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "hash-table", "heap", "sorting"],
+        "excerpt": (
+            "The statement contains its own hint: better than O(n log n). That sentence exists to "
+            "rule out sorting and a max-heap of everything — and the defence that there are usually "
+            "few unique values is not a complexity argument. A min-heap capped at k works; bucket "
+            "sort gets it to O(n), because frequencies are small bounded integers you can index by."
+        ),
+    },
+    {
+        "number": 543,
+        "batch": "interview-essentials",
+        "slug": "leetcode-543-diameter-of-binary-tree",
+        "title": "LeetCode 543 – Diameter of Binary Tree",
+        "file": "543-diameter-of-binary-tree.html",
+        "date": "2026-08-15T12:00:00",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
+        "excerpt": (
+            "Tagged Easy, and the pattern carries most of the Hard tree problems: the recursion "
+            "returns one quantity to its caller while updating a different one globally. Depth goes "
+            "up, diameter gets recorded. Why left + right is already in edges despite counting "
+            "nodes, and why nonlocal in Python is the difference between working and silently "
+            "returning zero."
+        ),
+    },
 ]

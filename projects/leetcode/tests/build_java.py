@@ -63,6 +63,10 @@ solution("034-find-first-and-last-position.html", "S34")
 solution("036-valid-sudoku.html", "S36")
 solution("039-combination-sum.html", "S39")
 solution("040-combination-sum-ii.html", "S40")
+solution("121-best-time-to-buy-and-sell-stock.html", "S121")
+solution("200-number-of-islands.html", "S200")
+solution("347-top-k-frequent-elements.html", "S347")
+solution("543-diameter-of-binary-tree.html", "S543")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -100,7 +104,33 @@ parts.append("class S40Skip {\n  void f(int[] candidates, int start) {\n"
              + "    for (int i = start; i < candidates.length; i++) {\n"
              + skip + "\n    }\n  }\n}")
 
+# LeetCode 200: the BFS alternative, shown as a loose method.
+fragment("200-number-of-islands.html", -1, "S200Bfs",
+         "  int numIslands(char[][] g) {\n"
+         "    int n = 0;\n"
+         "    for (int r = 0; r < g.length; r++)\n"
+         "      for (int c = 0; c < g[0].length; c++)\n"
+         "        if (g[r][c] == '1') { n++; sinkBfs(g, r, c); }\n"
+         "    return n;\n  }")
+
+# LeetCode 347: the min-heap alternative is a bare fragment; wrap it.
+heapfrag = blocks("347-top-k-frequent-elements.html")[-1]
+parts.append("class S347Heap {\n"
+             "  int[] topKFrequent(int[] nums, int k) {\n"
+             "    Map<Integer, Integer> freq = new HashMap<>();\n"
+             "    for (int num : nums) freq.merge(num, 1, Integer::sum);\n"
+             + heapfrag + "\n"
+             "    int[] out = new int[heap.size()];\n"
+             "    for (int i = out.length - 1; i >= 0; i--) out[i] = heap.poll().getKey();\n"
+             "    return out;\n  }\n}")
+
 HEADER = """import java.util.*;
+
+class TreeNode {
+    int val; TreeNode left, right;
+    TreeNode() {}
+    TreeNode(int val) { this.val = val; }
+}
 
 class ListNode {
     int val; ListNode next;
@@ -119,6 +149,8 @@ public class Main {
         if (!ok) failures++;
         System.out.printf("  %s %s: %s%n", ok ? "ok  " : "FAIL", label, show(got));
     }
+
+    static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
 
     static String show(Object o) {
         if (o instanceof int[] a) return Arrays.toString(a);
@@ -147,6 +179,33 @@ public class Main {
         TreeSet<String> out = new TreeSet<>();
         for (List<Integer> c : r) { List<Integer> cc = new ArrayList<>(c); Collections.sort(cc); out.add(cc.toString()); }
         return out;
+    }
+
+    /** LeetCode level-order form; Integer null means a missing child. */
+    static TreeNode buildTree(Integer... xs) {
+        if (xs.length == 0 || xs[0] == null) return null;
+        TreeNode root = new TreeNode(xs[0]);
+        Deque<TreeNode> q = new ArrayDeque<>();
+        q.add(root);
+        int i = 1;
+        while (!q.isEmpty() && i < xs.length) {
+            TreeNode node = q.poll();
+            if (i < xs.length) {
+                Integer v = xs[i++];
+                if (v != null) { node.left = new TreeNode(v); q.add(node.left); }
+            }
+            if (i < xs.length) {
+                Integer v = xs[i++];
+                if (v != null) { node.right = new TreeNode(v); q.add(node.right); }
+            }
+        }
+        return root;
+    }
+
+    static char[][] toGrid(String... rows) {
+        char[][] g = new char[rows.length][];
+        for (int i = 0; i < rows.length; i++) g[i] = rows[i].toCharArray();
+        return g;
     }
 
     static ListNode toList(int... xs) {
@@ -563,6 +622,77 @@ public class Main {
             }
         }
         check("agrees with brute-force subset enumeration", comboBad, 0);
+
+        System.out.println("LeetCode 121 - Best Time to Buy and Sell Stock");
+        S121 s121 = new S121();
+        check("[7,1,5,3,6,4]", s121.maxProfit(new int[]{7,1,5,3,6,4}), 5);
+        check("[7,6,4,3,1] (falling -> 0)", s121.maxProfit(new int[]{7,6,4,3,1}), 0);
+        check("[1,2]", s121.maxProfit(new int[]{1,2}), 1);
+        check("[5] (single day)", s121.maxProfit(new int[]{5}), 0);
+        check("[] (empty)", s121.maxProfit(new int[]{}), 0);
+        check("[2,2,2] (flat)", s121.maxProfit(new int[]{2,2,2}), 0);
+        check("[3,2,6,5,0,3]", s121.maxProfit(new int[]{3,2,6,5,0,3}), 4);
+        int profitBad = 0;
+        for (int n = 0; n <= 6; n++) {
+            for (int mask = 0; mask < (int) Math.pow(4, n); mask++) {
+                int[] xs = new int[n];
+                int m = mask;
+                for (int i = 0; i < n; i++) { xs[i] = m % 4; m /= 4; }
+                int expect = 0;
+                for (int i = 0; i < n; i++)
+                    for (int j = i + 1; j < n; j++) expect = Math.max(expect, xs[j] - xs[i]);
+                if (s121.maxProfit(xs) != expect) profitBad++;
+            }
+        }
+        check("agrees with brute force on all sequences over 0..3 up to length 6", profitBad, 0);
+
+        System.out.println("LeetCode 200 - Number of Islands");
+        S200 s200 = new S200();
+        S200Bfs s200b = new S200Bfs();
+        check("one island", s200.numIslands(toGrid("11110","11010","11000","00000")), 1);
+        check("three islands", s200.numIslands(toGrid("11000","11000","00100","00011")), 3);
+        check("all water", s200.numIslands(toGrid("000","000")), 0);
+        check("all land", s200.numIslands(toGrid("111","111")), 1);
+        check("single cell land", s200.numIslands(toGrid("1")), 1);
+        check("null grid", s200.numIslands(null), 0);
+        check("diagonal is NOT connected", s200.numIslands(toGrid("10","01")), 2);
+        check("checkerboard", s200.numIslands(toGrid("101","010","101")), 5);
+        check("single column", s200.numIslands(toGrid("1","0","1")), 2);
+        check("snake (one long island)", s200.numIslands(toGrid("1111","0001","1111","1000")), 1);
+        // The BFS alternative must agree with the DFS one everywhere.
+        String[][] boards = {{"11110","11010","11000","00000"}, {"11000","11000","00100","00011"},
+                             {"101","010","101"}, {"1111","0001","1111","1000"}, {"1"}, {"000","000"}};
+        int bfsDisagree = 0;
+        for (String[] board : boards) {
+            if (s200.numIslands(toGrid(board)) != s200b.numIslands(toGrid(board))) bfsDisagree++;
+        }
+        check("[bfs] agrees with dfs on every board", bfsDisagree, 0);
+
+        System.out.println("LeetCode 347 - Top K Frequent Elements");
+        S347 s347 = new S347();
+        S347Heap s347h = new S347Heap();
+        check("[1,1,1,2,2,3] k=2", sortedInts(s347.topKFrequent(new int[]{1,1,1,2,2,3}, 2)), new int[]{1,2});
+        check("[1] k=1", s347.topKFrequent(new int[]{1}, 1), new int[]{1});
+        check("[1,2] k=2 (tie)", sortedInts(s347.topKFrequent(new int[]{1,2}, 2)), new int[]{1,2});
+        check("k=1 with a tie returns exactly 1", s347.topKFrequent(new int[]{1,1,2,2}, 1).length, 1);
+        check("all same value", s347.topKFrequent(new int[]{4,4,4,4}, 1), new int[]{4});
+        check("negatives", sortedInts(s347.topKFrequent(new int[]{-1,-1,-2,-2,-2,3}, 2)), new int[]{-2,-1});
+        check("[heap] [1,1,1,2,2,3] k=2", sortedInts(s347h.topKFrequent(new int[]{1,1,1,2,2,3}, 2)), new int[]{1,2});
+        check("[heap] negatives", sortedInts(s347h.topKFrequent(new int[]{-1,-1,-2,-2,-2,3}, 2)), new int[]{-2,-1});
+
+        System.out.println("LeetCode 543 - Diameter of Binary Tree");
+        S543 s543 = new S543();
+        check("[1,2,3,4,5]", s543.diameterOfBinaryTree(buildTree(1,2,3,4,5)), 3);
+        check("[1,2]", s543.diameterOfBinaryTree(buildTree(1,2)), 1);
+        check("[1] (single node)", s543.diameterOfBinaryTree(buildTree(1)), 0);
+        check("null (empty tree)", s543.diameterOfBinaryTree(null), 0);
+        TreeNode chain = new TreeNode(1), cur = chain;
+        for (int v = 2; v <= 5; v++) { cur.left = new TreeNode(v); cur = cur.left; }
+        check("left chain of 5", s543.diameterOfBinaryTree(chain), 4);
+        check("reused instance", s543.diameterOfBinaryTree(buildTree(1,2)), 1);
+        check("full tree of 7", s543.diameterOfBinaryTree(buildTree(1,2,3,4,5,6,7)), 4);
+        check("diameter buried in the left subtree, not through the root",
+              s543.diameterOfBinaryTree(buildTree(1,2,null,3,4,5,null,null,6)), 4);
 
         System.out.println();
         if (failures > 0) {

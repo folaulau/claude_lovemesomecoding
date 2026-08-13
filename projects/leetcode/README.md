@@ -52,6 +52,23 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 
 `seed.py --round N` publishes exactly one round.
 
+### Interview essentials (out of round order)
+
+Four posts published ahead of their rounds because they cover patterns rounds 1–4 leave out —
+one-pass scanning, grid BFS/DFS, bucket sort, and the return-one-record-another tree recursion.
+They carry `"batch": "interview-essentials"` in the manifest instead of belonging to a round, and
+seed with `--batch` rather than `--round`:
+
+| # | Problem | Pattern |
+|---|---|---|
+| 121 | Best Time to Buy and Sell Stock | one pass, running minimum |
+| 200 | Number of Islands | grid DFS/BFS |
+| 347 | Top K Frequent Elements | bucket sort / min-heap of size k |
+| 543 | Diameter of Binary Tree | return depth, record diameter |
+
+`--round` and `--batch` are mutually exclusive. When these numbers come up in their real rounds
+(13, 20, 35, 55), drop the `batch` key rather than adding a duplicate entry.
+
 ## Dates, and why they ascend
 
 Archives and the sitemap sort newest first, and `siblings()` in `src/lib/content.ts` reverses the
@@ -83,6 +100,9 @@ AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/leetcode/se
 
 AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/leetcode/seed.py --env local --round 1 --write
 AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/leetcode/seed.py --env prod  --round 1 --write
+
+# posts published outside the round sequence
+AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/leetcode/seed.py --env prod --batch interview-essentials --write
 ```
 
 `seed.py` is idempotent — a re-run updates the posts in place. `date` is only applied when a post is

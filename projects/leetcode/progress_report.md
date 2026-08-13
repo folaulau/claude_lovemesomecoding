@@ -3,7 +3,7 @@
 Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.com under
 **Software Engineering → Fundamental Problems**, published in rounds of ten LeetCode numbers.
 
-**Status: rounds 1–4 are LIVE on lovemesomecoding.com.**
+**Status: rounds 1–4 plus the interview-essentials batch are LIVE on lovemesomecoding.com.**
 
 ---
 
@@ -15,20 +15,30 @@ Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.
 | Round 2 (LeetCode 11–20) | 6 posts — **live** |
 | Round 3 (LeetCode 21–30) | 4 posts — **live** |
 | Round 4 (LeetCode 31–40) | 6 posts — **live** |
+| Interview essentials | 4 posts — **live** (121, 200, 347, 543, out of round order) |
 | Round 5 (LeetCode 41–50) | 6 in the repo — 41, 42, 43, 46, 47, 49. Not started. |
-| Site total | 525 → **548 posts** |
+| Site total | 525 → **552 posts** |
 | Category | `fundamental-problem`, already existed — no nav change needed |
 
-Live at https://lovemesomecoding.com/fundamental-problem, which now holds 34 posts: the 23 LeetCode
-ones leading the archive, above the 11 legacy 2019 posts. All 23 return 200, all 23 are in
+Live at https://lovemesomecoding.com/fundamental-problem, which now holds 38 posts: the 27 LeetCode
+ones leading the archive, above the 11 legacy 2019 posts. All 27 return 200, all 27 are in
 `sitemap.xml`, highlighting renders, cross-post links resolve, and the pre-existing URLs in this and
 other categories are unaffected.
 
-`projects/leetcode/` is committed as of `e4132b6`. Note the build hash was `394b0bd` on all four
-deploys, because it comes from the git commit and this work was uncommitted at the time.
-`deploy.sh`'s edge check compares that hash, so after round 1 it could no longer prove freshness —
-the live URLs were checked directly instead. **The next deploy will carry a new hash and the check
-will be meaningful again.**
+### `deploy.sh` cannot verify a content-only deploy
+
+The build id has read `394b0bd` on all five deploys. I first assumed that was because
+`projects/leetcode/` was uncommitted; that was wrong. `deploy.sh:22` derives it from
+`git rev-parse --short HEAD` **in the `lovemesomecoding_frontend` repo**, and content lives in S3,
+not in that repo — so a content-only publish can never change it, no matter what is committed here.
+
+The consequence: `deploy.sh`'s final step compares `version.txt` at the edge against that id, so on
+a content-only deploy it compares a value to itself and always reports a match. It verifies *code*
+deploys and silently proves nothing about *content* deploys. Every round in this track was therefore
+verified by fetching the new post URLs directly, which is what actually demonstrates freshness.
+
+Worth fixing properly at some point — hashing the content tree into the build id would make the
+check meaningful again — but that is a frontend change, out of scope here.
 
 ---
 
@@ -95,7 +105,7 @@ Everything below was run and passed on 2026-08-12, covering all four published r
 blocks *out of the published HTML* — so they test what a reader would copy, not a retyped copy — and
 exercise them against the LeetCode examples plus the edge cases each post claims to handle:
 overflow, `Integer.MIN_VALUE`, empty strings, duplicate values, even-length palindromes, `""` against
-`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **214 Python assertions and 238 Java
+`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **248 Python assertions and 273 Java
 assertions, all green.** Several of those are worth more than the rest put together: problems 12 and 13
 are inverses, so both suites round-trip every integer from 1 to 3999 through `intToRoman` and back
 through `romanToInt`; problem 22's output is checked against the Catalan numbers up to n = 8 (1430
@@ -113,7 +123,7 @@ That harness caught one real bug: the LeetCode 5 solution originally kept `start
 instance fields, so a second call on the same object returned a stale answer. It is now stateless,
 and both suites have a reuse assertion so it cannot regress.
 
-**`check_content.py`** proves all 92 code blocks round-trip byte-for-byte through the backend
+**`check_content.py`** proves all 108 code blocks round-trip byte-for-byte through the backend
 normaliser, every block comes out in the exact `<pre class="language-X"><code class="language-X">`
 shape the highlighter matches, every heading has an anchor id, and no post links to a slug the track
 does not define. It also checks the manifest for duplicate slugs and non-ascending dates.
@@ -128,10 +138,10 @@ out, rounds 2 through 4 against the live site after:
   in both.
 - Cross-post links resolve: 8 → 7, 12 ↔ 13, 15 → 1, 23 → 20/21, 39 → 22/40 and 40 → 39 all
   return 200.
-- All 23 post URLs return 200 and all 23 appear in `sitemap.xml`.
+- All 27 post URLs return 200 and all 27 appear in `sitemap.xml`.
 
-**`npm run build`** passes, including `verify-build.mjs`: 548/548 posts served, 44/44 category counts
-agree, 41 redirects intact, 716 HTML files emitted.
+**`npm run build`** passes, including `verify-build.mjs`: 552/552 posts served, 44/44 category counts
+agree, 41 redirects intact, 721 HTML files emitted.
 
 Browser QA with the Claude Chrome extension was **not** done — the extension was not connected on
 this machine. The checks above were done against the rendered HTML instead.
@@ -144,6 +154,7 @@ this machine. The checks above were done against the rendered HTML instead.
 - [x] ~~Round 2 seeded to prod and deployed.~~ Done 2026-08-12.
 - [x] ~~Round 3 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2026-08-13).
 - [x] ~~Round 4 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2026-08-14).
+- [x] ~~Interview-essentials batch (121, 200, 347, 543) seeded and deployed.~~ Done 2026-08-12.
 - [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.
 - [ ] Round 5 (LeetCode 41–50 has six: 41 First Missing Positive, 42 Trapping Rain Water,
       43 Multiply Strings, 46 Permutations, 47 Permutations II, 49 Group Anagrams).

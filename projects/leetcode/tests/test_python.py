@@ -412,6 +412,118 @@ for cand in ([1, 1, 2, 2, 3], [2, 3, 6, 7], [1, 1, 1, 1], [4, 4, 2, 1, 4, 2, 2, 
             bad.append((cand, t_))
 check("agrees with brute-force subset enumeration", bad, [])
 
+print("LeetCode 121 - Best Time to Buy and Sell Stock")
+s = load("121-best-time-to-buy-and-sell-stock.html")
+check("[7,1,5,3,6,4]", s.maxProfit([7, 1, 5, 3, 6, 4]), 5)
+check("[7,6,4,3,1] (falling -> 0)", s.maxProfit([7, 6, 4, 3, 1]), 0)
+check("[1,2]", s.maxProfit([1, 2]), 1)
+check("[5] (single day)", s.maxProfit([5]), 0)
+check("[] (empty)", s.maxProfit([]), 0)
+check("[2,2,2] (flat)", s.maxProfit([2, 2, 2]), 0)
+check("[3,2,6,5,0,3]", s.maxProfit([3, 2, 6, 5, 0, 3]), 4)
+# Cross-check against the O(n^2) definition on every short sequence over 0..3.
+bad = []
+for n in range(0, 7):
+    for combo in itertools.product(range(4), repeat=n):
+        xs = list(combo)
+        want = max([xs[j] - xs[i] for i in range(n) for j in range(i + 1, n)] + [0])
+        if s.maxProfit(xs) != want:
+            bad.append(xs)
+check("agrees with brute force on all sequences over 0..3 up to length 6", bad, [])
+
+print("LeetCode 200 - Number of Islands")
+s = load("200-number-of-islands.html")
+def g(rows):
+    return [list(r) for r in rows]
+check("one island", s.numIslands(g(["11110", "11010", "11000", "00000"])), 1)
+check("three islands", s.numIslands(g(["11000", "11000", "00100", "00011"])), 3)
+check("all water", s.numIslands(g(["000", "000"])), 0)
+check("all land", s.numIslands(g(["111", "111"])), 1)
+check("single cell land", s.numIslands(g(["1"])), 1)
+check("[] (empty grid)", s.numIslands([]), 0)
+check("diagonal is NOT connected", s.numIslands(g(["10", "01"])), 2)
+check("checkerboard", s.numIslands(g(["101", "010", "101"])), 5)
+check("single column", s.numIslands(g(["1", "0", "1"])), 2)
+check("snake (one long island)", s.numIslands(g(["1111", "0001", "1111", "1000"])), 1)
+
+print("LeetCode 347 - Top K Frequent Elements")
+s = load("347-top-k-frequent-elements.html")
+check("[1,1,1,2,2,3] k=2", sorted(s.topKFrequent([1, 1, 1, 2, 2, 3], 2)), [1, 2])
+check("[1] k=1", s.topKFrequent([1], 1), [1])
+check("[1,2] k=2 (tie)", sorted(s.topKFrequent([1, 2], 2)), [1, 2])
+check("all unique k=1", len(s.topKFrequent([1, 2, 3, 4, 5], 1)), 1)
+check("k=1 with a tie returns exactly 1", len(s.topKFrequent([1, 1, 2, 2], 1)), 1)
+check("all same value", sorted(s.topKFrequent([4, 4, 4, 4], 1)), [4])
+check("negatives", sorted(s.topKFrequent([-1, -1, -2, -2, -2, 3], 2)), [-2, -1])
+# The returned k values must be a valid top-k by frequency, for random-ish inputs.
+bad = []
+for xs in ([1,1,2,2,3], [5,5,5,4,4,3,2,1], [7], [0,0,1,1,2,2,3], list(range(10)) + [3, 3]):
+    freq = {}
+    for x in xs:
+        freq[x] = freq.get(x, 0) + 1
+    for k in range(1, len(freq) + 1):
+        got = s.topKFrequent(list(xs), k)
+        counts = sorted((freq[v] for v in got), reverse=True)
+        want = sorted(freq.values(), reverse=True)[:k]
+        if len(got) != k or len(set(got)) != k or counts != want:
+            bad.append((xs, k, got))
+check("returns exactly k distinct values with a valid top-k frequency profile", bad, [])
+
+print("LeetCode 543 - Diameter of Binary Tree")
+TREE = """
+class TreeNode:
+    def __init__(self, val=0, left=None, right=None):
+        self.val, self.left, self.right = val, left, right
+
+def build(xs):
+    '''LeetCode level-order list, None for a missing child.'''
+    if not xs or xs[0] is None:
+        return None
+    root = TreeNode(xs[0])
+    q, i = [root], 1
+    while q and i < len(xs):
+        node = q.pop(0)
+        if i < len(xs):
+            v = xs[i]; i += 1
+            if v is not None:
+                node.left = TreeNode(v); q.append(node.left)
+        if i < len(xs):
+            v = xs[i]; i += 1
+            if v is not None:
+                node.right = TreeNode(v); q.append(node.right)
+    return root
+"""
+ns = {}
+exec(compile(TREE + "\n" + "\n".join(blocks("543-diameter-of-binary-tree.html")), "543", "exec"), ns)
+s = ns["Solution"]()
+build = ns["build"]
+check("[1,2,3,4,5]", s.diameterOfBinaryTree(build([1, 2, 3, 4, 5])), 3)
+check("[1,2]", s.diameterOfBinaryTree(build([1, 2])), 1)
+check("[1] (single node)", s.diameterOfBinaryTree(build([1])), 0)
+check("None (empty tree)", s.diameterOfBinaryTree(None), 0)
+# A left-leaning chain of 5 nodes: diameter is 4 edges, and never touches a right child.
+chain = ns["TreeNode"](1)
+node = chain
+for v in range(2, 6):
+    node.left = ns["TreeNode"](v)
+    node = node.left
+check("left chain of 5 (diameter misses the root's right side)", s.diameterOfBinaryTree(chain), 4)
+check("reused instance", s.diameterOfBinaryTree(build([1, 2])), 1)
+# Balanced tree of 7 nodes: longest path is leaf-up-to-root-down-to-leaf = 4 edges.
+check("full tree of 7", s.diameterOfBinaryTree(build([1, 2, 3, 4, 5, 6, 7])), 4)
+# The diameter here is 5-3-2-4-6 (4 edges), entirely inside the left subtree.
+# Through the root it would only be 3, so this fails any root-only solution.
+#       1
+#      /
+#     2
+#    / \
+#   3   4
+#  /     \
+# 5       6
+deep = build([1, 2, None, 3, 4, 5, None, None, 6])
+check("diameter buried in the left subtree, not through the root",
+      s.diameterOfBinaryTree(deep), 4)
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

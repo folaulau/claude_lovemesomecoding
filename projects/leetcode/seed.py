@@ -16,6 +16,9 @@ build reads only the indexes.
     # one publishing round at a time (round 1 = LeetCode 1-10)
     python projects/leetcode/seed.py --env prod --round 1 --write
 
+    # a named batch, for posts published outside the round sequence
+    python projects/leetcode/seed.py --env prod --batch interview-essentials --write
+
 Idempotent: re-running updates the posts in place. `date` is only applied when a
 post is new, so a re-run never reshuffles the archive.
 """
@@ -58,11 +61,26 @@ def load_backend(data_env: str):
     return config, posts, categories
 
 
-def select(round_no: int | None) -> list[dict]:
+def select(round_no: int | None, batch: str | None) -> list[dict]:
     """Round N is LeetCode numbers (N-1)*10+1 .. N*10, minus the ones the source
-    repo does not have. Round 1 is seven posts, not ten."""
+    repo does not have. Round 1 is seven posts, not ten.
+
+    Posts published outside the round sequence carry a `batch` name instead, so
+    they can be seeded as a group without inventing a round they do not belong to.
+    """
+    if round_no is not None and batch is not None:
+        raise SystemExit("pass --round or --batch, not both")
+
+    if batch is not None:
+        chosen = [p for p in manifest.POSTS if p.get("batch") == batch]
+        if not chosen:
+            known = sorted({p["batch"] for p in manifest.POSTS if p.get("batch")})
+            raise SystemExit(f"no posts in batch '{batch}'. Known batches: {known or 'none'}")
+        return chosen
+
     if round_no is None:
         return list(manifest.POSTS)
+
     lo, hi = (round_no - 1) * 10 + 1, round_no * 10
     chosen = [p for p in manifest.POSTS if lo <= p["number"] <= hi]
     if not chosen:
@@ -82,18 +100,25 @@ def main() -> int:
     parser.add_argument("--env", choices=("local", "prod"), default="local")
     parser.add_argument("--round", type=int, default=None,
                         help="publish only this round of ten LeetCode numbers")
+    parser.add_argument("--batch", default=None,
+                        help="publish only this named batch (posts outside the round sequence)")
     parser.add_argument("--write", action="store_true",
                         help="actually write. Without it, only report what would happen.")
     parser.add_argument("--author", default="folauk")
     args = parser.parse_args()
 
-    entries = select(args.round)
+    entries = select(args.round, args.batch)
 
     config, post_service, category_service = load_backend(args.env)
     prefix = config.db_prefix()
     print(f"target  s3://{config.DB_BUCKET}/{prefix}/")
-    print(f"posts   {len(entries)}"
-          + (f"  (round {args.round})" if args.round else "  (whole manifest)"))
+    if args.round:
+        scope = f"  (round {args.round})"
+    elif args.batch:
+        scope = f"  (batch {args.batch})"
+    else:
+        scope = "  (whole manifest)"
+    print(f"posts   {len(entries)}{scope}")
     print(f"mode    {'WRITE' if args.write else 'dry run'}\n")
 
     index_before = len(post_service.list_posts())
