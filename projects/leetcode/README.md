@@ -50,7 +50,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 2 | 11–20 | 6 — missing 11, 16, 17, 18 | **live** since 2026-08-12 |
 | 3 | 21–30 | 4 — 21, 22, 23, 28 | **live** since 2026-08-13 |
 | 4 | 31–40 | 6 — 31, 33, 34, 36, 39, 40 | **live** since 2026-08-14 |
-| 5 | 41–50 | 6 — 41, 42, 43, 46, 47, 49 | not started |
+| 5 | 41–50 | 6 — 41, 42, 43, 46, 47, 49 | **live** since 2024-08/09 |
+| 6 | 51–60 | 7 — 51, 52, 53, 55, 56, 57, 58 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -103,8 +104,14 @@ are random but **strictly ascending with the LeetCode number**, because the page
 depends on it. Shuffling them properly would scramble prev/next.
 
 They still sit after the 2018/2019 legacy posts, so the track remains one contiguous run at the top
-of the category. **Later rounds must take dates after 2024-12-28** (LeetCode 543, the current
-newest), or be slotted into a gap that keeps the manifest's number and date order consistent.
+of the category.
+
+The manifest is ordered by LeetCode number and `check_content.py` enforces that **both** the numbers
+and the dates ascend. A new round therefore has to be slotted into the date gap left by its numeric
+neighbours, not simply appended. Round 5 (numbers 41–49) sits between LeetCode 40
+(`2024-08-09`) and LeetCode 121 (`2024-09-18`), so its dates run `2024-08-11` to `2024-09-14`. Round
+6 (51–58) has the same gap to work with. Once the numbered rounds pass 121 the constraint disappears
+and later rounds simply take dates after `2024-12-28`.
 
 ### Changing a date after publication
 

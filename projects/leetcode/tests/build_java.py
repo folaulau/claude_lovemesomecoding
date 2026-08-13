@@ -67,6 +67,12 @@ solution("121-best-time-to-buy-and-sell-stock.html", "S121")
 solution("200-number-of-islands.html", "S200")
 solution("347-top-k-frequent-elements.html", "S347")
 solution("543-diameter-of-binary-tree.html", "S543")
+solution("041-first-missing-positive.html", "S41")
+solution("042-trapping-rain-water.html", "S42")
+solution("043-multiply-strings.html", "S43")
+solution("046-permutations.html", "S46")
+solution("047-permutations-ii.html", "S47")
+solution("049-group-anagrams.html", "S49")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -124,6 +130,19 @@ parts.append("class S347Heap {\n"
              "    for (int i = out.length - 1; i >= 0; i--) out[i] = heap.poll().getKey();\n"
              "    return out;\n  }\n}")
 
+# LeetCode 42: the prefix/suffix-maxima alternative is a bare body.
+prefix = blocks("042-trapping-rain-water.html")[-1]
+parts.append("class S42Prefix {\n  int trap(int[] height) {\n" + prefix + "\n    return water;\n  }\n}")
+
+# LeetCode 46: the swap-based variant, presented as a loose method.
+swapvar = blocks("046-permutations.html")[-1]
+parts.append("class S46Swap {\n"
+             "  List<List<Integer>> permute(int[] nums) {\n"
+             "    List<List<Integer>> r = new ArrayList<>();\n"
+             "    permute(nums, 0, r);\n    return r;\n  }\n"
+             "  void swap(int[] a, int i, int j) { int t = a[i]; a[i] = a[j]; a[j] = t; }\n"
+             + swapvar + "\n}")
+
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
 parts.append("class L2Brute {\n" + two[0] + "\n}")
@@ -174,6 +193,22 @@ public class Main {
         boolean ok = Objects.deepEquals(got, want);
         if (!ok) failures++;
         System.out.printf("  %s %s: %s%n", ok ? "ok  " : "FAIL", label, show(got));
+    }
+
+    /** Order-PRESERVING set of results. norm() sorts each inner list, which is
+     *  right for combinations and destroys the distinction between permutations. */
+    static TreeSet<String> permSet(List<List<Integer>> r) {
+        TreeSet<String> out = new TreeSet<>();
+        for (List<Integer> p : r) out.add(p.toString());
+        return out;
+    }
+
+    /** Canonical, order-independent rendering of grouped strings. */
+    static String groups(List<List<String>> gs) {
+        List<String> out = new ArrayList<>();
+        for (List<String> g : gs) { List<String> c = new ArrayList<>(g); Collections.sort(c); out.add(c.toString()); }
+        Collections.sort(out);
+        return out.toString();
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -794,6 +829,135 @@ public class Main {
         check("memoised fib(0)", new RecFib().fib(0, new Long[1]), 0);
         check("memoised fib(1)", new RecFib().fib(1, new Long[2]), 1);
         check("naive fib(20) agrees with memoised", new RecFib().fib(20), new RecFib().fib(20, new Long[21]));
+
+        System.out.println("LeetCode 41 - First Missing Positive");
+        S41 s41 = new S41();
+        check("[1,2,0]", s41.firstMissingPositive(new int[]{1,2,0}), 3);
+        check("[3,4,-1,1]", s41.firstMissingPositive(new int[]{3,4,-1,1}), 2);
+        check("[7,8,9,11,12]", s41.firstMissingPositive(new int[]{7,8,9,11,12}), 1);
+        check("[1,2,3] (answer past the end)", s41.firstMissingPositive(new int[]{1,2,3}), 4);
+        check("[] (empty)", s41.firstMissingPositive(new int[]{}), 1);
+        check("[1,1] (duplicate guard, must terminate)", s41.firstMissingPositive(new int[]{1,1}), 2);
+        check("[2,2,2]", s41.firstMissingPositive(new int[]{2,2,2}), 1);
+        check("[-1,-2]", s41.firstMissingPositive(new int[]{-1,-2}), 1);
+        int fmpBad = 0;
+        for (int n = 0; n <= 6; n++) {
+            for (int mask = 0; mask < (int) Math.pow(8, n); mask++) {
+                int[] xs = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { xs[i] = (mm % 8) - 2; mm /= 8; }
+                Set<Integer> present = new HashSet<>();
+                for (int v : xs) present.add(v);
+                int expect = 1;
+                while (present.contains(expect)) expect++;
+                if (s41.firstMissingPositive(xs.clone()) != expect) fmpBad++;
+            }
+        }
+        check("exhaustive over values -2..5, lengths 0..6", fmpBad, 0);
+
+        System.out.println("LeetCode 42 - Trapping Rain Water");
+        S42 s42 = new S42();
+        S42Prefix s42p = new S42Prefix();
+        check("[0,1,0,2,1,0,1,3,2,1,2,1]", s42.trap(new int[]{0,1,0,2,1,0,1,3,2,1,2,1}), 6);
+        check("[4,2,0,3,2,5]", s42.trap(new int[]{4,2,0,3,2,5}), 9);
+        check("[] (empty)", s42.trap(new int[]{}), 0);
+        check("[3] (single)", s42.trap(new int[]{3}), 0);
+        check("[1,2,3,4] (increasing)", s42.trap(new int[]{1,2,3,4}), 0);
+        check("[5,0,5]", s42.trap(new int[]{5,0,5}), 5);
+        int trapBad = 0, trapPrefixBad = 0;
+        for (int n = 0; n <= 7; n++) {
+            for (int mask = 0; mask < (int) Math.pow(4, n); mask++) {
+                int[] xs = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { xs[i] = mm % 4; mm /= 4; }
+                int expect = 0;
+                for (int i = 0; i < n; i++) {
+                    int ml = 0, mr = 0;
+                    for (int k = 0; k <= i; k++) ml = Math.max(ml, xs[k]);
+                    for (int k = i; k < n; k++) mr = Math.max(mr, xs[k]);
+                    expect += Math.min(ml, mr) - xs[i];
+                }
+                if (s42.trap(xs.clone()) != expect) trapBad++;
+                if (s42p.trap(xs.clone()) != expect) trapPrefixBad++;
+            }
+        }
+        check("two pointers agree with the per-column formula, all profiles over 0..3", trapBad, 0);
+        check("[prefix] agrees too", trapPrefixBad, 0);
+
+        System.out.println("LeetCode 43 - Multiply Strings");
+        S43 s43 = new S43();
+        check("2 x 3", s43.multiply("2", "3"), "6");
+        check("123 x 456", s43.multiply("123", "456"), "56088");
+        check("0 x 52 (must be 0)", s43.multiply("0", "52"), "0");
+        check("0 x 0", s43.multiply("0", "0"), "0");
+        check("11 x 11 (m+n-1 digits)", s43.multiply("11", "11"), "121");
+        check("101 x 101 (interior zeros)", s43.multiply("101", "101"), "10201");
+        int mulBad = 0;
+        for (int x = 0; x < 60; x++)
+            for (int y = 0; y < 60; y++)
+                if (!s43.multiply(String.valueOf(x), String.valueOf(y)).equals(String.valueOf(x * y))) mulBad++;
+        check("agrees with integer multiplication for all a,b in 0..59", mulBad, 0);
+        check("60 digits x 60 digits", s43.multiply("9".repeat(60), "9".repeat(60)),
+              new java.math.BigInteger("9".repeat(60)).multiply(new java.math.BigInteger("9".repeat(60))).toString());
+
+        System.out.println("LeetCode 46 - Permutations");
+        S46 s46 = new S46();
+        S46Swap s46s = new S46Swap();
+        check("[1,2,3] count", s46.permute(new int[]{1,2,3}).size(), 6);
+        check("[1] (single)", s46.permute(new int[]{1}), List.of(List.of(1)));
+        check("[] (empty yields one empty permutation)", s46.permute(new int[]{}).size(), 1);
+        int fact = 1;
+        for (int n = 1; n <= 6; n++) {
+            fact *= n;
+            int[] xs = new int[n];
+            for (int i = 0; i < n; i++) xs[i] = i;
+            List<List<Integer>> got = s46.permute(xs.clone());
+            check("n=" + n + ": exactly " + fact + " permutations", got.size(), fact);
+            check("n=" + n + ": all distinct", new HashSet<>(got).size(), fact);
+            check("n=" + n + ": [swap] agrees",
+                  permSet(s46s.permute(xs.clone())).equals(permSet(got)), true);
+        }
+
+        System.out.println("LeetCode 47 - Permutations II");
+        S47 s47 = new S47();
+        check("[1,1,2] (order matters: must be 3 distinct orderings)",
+              permSet(s47.permuteUnique(new int[]{1,1,2})),
+              permSet(List.of(List.of(1,1,2), List.of(1,2,1), List.of(2,1,1))));
+        check("[1,2,3] (all distinct)", s47.permuteUnique(new int[]{1,2,3}).size(), 6);
+        check("[2,2,2] (exactly one)", s47.permuteUnique(new int[]{2,2,2}), List.of(List.of(2,2,2)));
+        check("[] (empty)", s47.permuteUnique(new int[]{}).size(), 1);
+        int uniqBad = 0;
+        for (int n = 1; n <= 6; n++) {
+            for (int mask = 0; mask < (int) Math.pow(4, n); mask++) {
+                int[] xs = new int[n];
+                int mm = mask;
+                int[] pool = {1, 1, 2, 3};
+                for (int i = 0; i < n; i++) { xs[i] = pool[mm % 4]; mm /= 4; }
+                List<List<Integer>> got = s47.permuteUnique(xs.clone());
+                if (got.size() != new HashSet<>(got).size()) uniqBad++;     // no duplicates
+                // every result is a rearrangement of the input multiset
+                int[] sortedIn = xs.clone(); Arrays.sort(sortedIn);
+                for (List<Integer> perm : got) {
+                    int[] out = perm.stream().mapToInt(Integer::intValue).toArray();
+                    Arrays.sort(out);
+                    if (!Arrays.equals(out, sortedIn)) uniqBad++;
+                }
+            }
+        }
+        check("results are distinct rearrangements of the input multiset", uniqBad, 0);
+
+        System.out.println("LeetCode 49 - Group Anagrams");
+        S49 s49 = new S49();
+        check("eat/tea/tan/ate/nat/bat", groups(s49.groupAnagrams(
+                new String[]{"eat","tea","tan","ate","nat","bat"})),
+              "[[ate, eat, tea], [bat], [nat, tan]]");
+        check("empty string", groups(s49.groupAnagrams(new String[]{""})), "[[]]");
+        check("[] (empty input)", s49.groupAnagrams(new String[]{}).size(), 0);
+        check("no anagrams at all", s49.groupAnagrams(new String[]{"abc","def","ghi"}).size(), 3);
+        String w1 = "a" + "b".repeat(11), w2 = "a".repeat(11) + "b";
+        check("1a+11b must NOT group with 11a+1b", s49.groupAnagrams(new String[]{w1, w2}).size(), 2);
+        check("genuine anagrams still group",
+              s49.groupAnagrams(new String[]{w1, new StringBuilder(w1).reverse().toString()}).size(), 1);
 
         System.out.println();
         if (failures > 0) {

@@ -574,6 +574,127 @@ for n in range(0, 8):
                 bad.append((xs, t_, got, want))
 check("agrees with brute force, in ascending order, on all distinct arrays over -4..4", bad, [])
 
+print("LeetCode 41 - First Missing Positive")
+s = load("041-first-missing-positive.html")
+def fmp(xs):
+    return s.firstMissingPositive(list(xs))
+check("[1,2,0]", fmp([1, 2, 0]), 3)
+check("[3,4,-1,1]", fmp([3, 4, -1, 1]), 2)
+check("[7,8,9,11,12]", fmp([7, 8, 9, 11, 12]), 1)
+check("[1,2,3] (answer past the end)", fmp([1, 2, 3]), 4)
+check("[] (empty)", fmp([]), 1)
+check("[1,1] (duplicate guard, must terminate)", fmp([1, 1]), 2)
+check("[2,2,2]", fmp([2, 2, 2]), 1)
+check("[-1,-2]", fmp([-1, -2]), 1)
+check("[1]", fmp([1]), 2)
+bad = []
+for n in range(0, 7):
+    for combo in itertools.product(range(-2, 6), repeat=n):
+        xs = list(combo)
+        want = next(v for v in itertools.count(1) if v not in xs)
+        if fmp(xs) != want:
+            bad.append((xs, fmp(xs), want))
+            break
+    if bad:
+        break
+check("exhaustive over values -2..5, lengths 0..6", bad, [])
+
+print("LeetCode 42 - Trapping Rain Water")
+s = load("042-trapping-rain-water.html")
+check("[0,1,0,2,1,0,1,3,2,1,2,1]", s.trap([0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1]), 6)
+check("[4,2,0,3,2,5]", s.trap([4, 2, 0, 3, 2, 5]), 9)
+check("[] (empty)", s.trap([]), 0)
+check("[3] (single)", s.trap([3]), 0)
+check("[1,2,3,4] (increasing)", s.trap([1, 2, 3, 4]), 0)
+check("[4,3,2,1] (decreasing)", s.trap([4, 3, 2, 1]), 0)
+check("[2,2,2] (flat)", s.trap([2, 2, 2]), 0)
+check("[5,0,5]", s.trap([5, 0, 5]), 5)
+# Cross-check against the min(maxLeft, maxRight) definition on every short profile.
+bad = []
+for n in range(0, 8):
+    for combo in itertools.product(range(4), repeat=n):
+        xs = list(combo)
+        want = sum(min(max(xs[:i + 1]), max(xs[i:])) - xs[i] for i in range(n))
+        if s.trap(xs) != want:
+            bad.append((xs, want))
+check("agrees with the per-column formula on all profiles over 0..3 up to length 7", bad, [])
+
+print("LeetCode 43 - Multiply Strings")
+s = load("043-multiply-strings.html")
+check('"2" x "3"', s.multiply("2", "3"), "6")
+check('"123" x "456"', s.multiply("123", "456"), "56088")
+check('"0" x "52" (must be "0")', s.multiply("0", "52"), "0")
+check('"52" x "0"', s.multiply("52", "0"), "0")
+check('"0" x "0"', s.multiply("0", "0"), "0")
+check('"11" x "11" (m+n-1 digits)', s.multiply("11", "11"), "121")
+check('"99" x "99"', s.multiply("99", "99"), "9801")
+check('"101" x "101" (interior zeros)', s.multiply("101", "101"), "10201")
+big1, big2 = "9" * 60, "9" * 60
+check("60 digits x 60 digits", s.multiply(big1, big2), str(int(big1) * int(big2)))
+bad = [(a, b) for a in range(0, 60) for b in range(0, 60)
+       if s.multiply(str(a), str(b)) != str(a * b)]
+check("agrees with integer multiplication for all a,b in 0..59", bad, [])
+
+print("LeetCode 46 - Permutations")
+s = load("046-permutations.html")
+def nrm2(r):
+    return sorted(tuple(x) for x in r)
+check("[1,2,3]", nrm2(s.permute([1, 2, 3])),
+      nrm2([[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]]))
+check("[0,1]", nrm2(s.permute([0, 1])), nrm2([[0,1],[1,0]]))
+check("[1] (single)", s.permute([1]), [[1]])
+check("[] (empty yields one empty permutation)", s.permute([]), [[]])
+for n in range(1, 7):
+    got = s.permute(list(range(n)))
+    fact = 1
+    for k in range(2, n + 1):
+        fact *= k
+    check(f"n={n}: exactly {fact} distinct permutations", (len(got), len(set(map(tuple, got)))), (fact, fact))
+    check(f"n={n}: matches itertools.permutations",
+          nrm2(got) == sorted(itertools.permutations(range(n))), True)
+
+print("LeetCode 47 - Permutations II")
+s = load("047-permutations-ii.html")
+check("[1,1,2]", nrm2(s.permuteUnique([1, 1, 2])), nrm2([[1,1,2],[1,2,1],[2,1,1]]))
+check("[1,2,3] (all distinct)", len(s.permuteUnique([1, 2, 3])), 6)
+check("[2,2,2] (exactly one)", s.permuteUnique([2, 2, 2]), [[2, 2, 2]])
+check("[1] (single)", s.permuteUnique([1]), [[1]])
+check("[] (empty)", s.permuteUnique([]), [[]])
+bad = []
+for n in range(0, 7):
+    for combo in itertools.product([1, 1, 2, 3], repeat=n):
+        xs = list(combo)
+        want = sorted(set(itertools.permutations(xs)))
+        got = s.permuteUnique(list(xs))
+        if nrm2(got) != want or len(got) != len(want):
+            bad.append((xs, got))
+check("matches set(itertools.permutations) on every multiset over {1,1,2,3}", bad, [])
+
+print("LeetCode 49 - Group Anagrams")
+s = load("049-group-anagrams.html")
+def grp(r):
+    return sorted(sorted(g) for g in r)
+check("eat/tea/tan/ate/nat/bat", grp(s.groupAnagrams(["eat","tea","tan","ate","nat","bat"])),
+      grp([["eat","tea","ate"], ["tan","nat"], ["bat"]]))
+check('[""] (empty string)', s.groupAnagrams([""]), [[""]])
+check('["a"]', s.groupAnagrams(["a"]), [["a"]])
+check("[] (empty input)", s.groupAnagrams([]), [])
+check("no anagrams at all", grp(s.groupAnagrams(["abc","def","ghi"])),
+      grp([["abc"],["def"],["ghi"]]))
+# The double-digit-count collision the post warns about: 1 a + 11 b vs 11 a + 1 b.
+w1, w2 = "a" + "b" * 11, "a" * 11 + "b"
+check("1a+11b must NOT group with 11a+1b", grp(s.groupAnagrams([w1, w2])), grp([[w1], [w2]]))
+check("genuine anagrams of those still group", len(s.groupAnagrams([w1, w1[::-1]])), 1)
+# Cross-check grouping against sorted-string equivalence.
+bad = []
+for words in (["ab","ba","abc","cab","bca","x"], ["", "", "a"], ["aa","aa","a"]):
+    want = {}
+    for w in words:
+        want.setdefault("".join(sorted(w)), []).append(w)
+    if grp(s.groupAnagrams(list(words))) != grp(want.values()):
+        bad.append(words)
+check("grouping agrees with sorted-string equivalence", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

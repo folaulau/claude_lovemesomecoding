@@ -3,7 +3,7 @@
 Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.com under
 **Software Engineering → Fundamental Problems**, published in rounds of ten LeetCode numbers.
 
-**Status: rounds 1–4, the interview-essentials batch and three legacy rewrites are LIVE. Round 5 is part-written.**
+**Status: rounds 1–5, the interview-essentials batch and three legacy rewrites are all LIVE.**
 
 ---
 
@@ -17,12 +17,13 @@ Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.
 | Round 4 (LeetCode 31–40) | 6 posts — **live** |
 | Interview essentials | 4 posts — **live** (121, 200, 347, 543, out of round order) |
 | Legacy rewrites | 3 posts — **live** (two/three number sum, recursion) |
-| Round 5 (LeetCode 41–50) | **in progress** — 41 written, 42/43/46/47/49 not started |
-| Site total | 525 → **552 posts** |
+| Round 5 (LeetCode 41–50) | 6 posts — **live** |
+| Round 6 (LeetCode 51–60) | 7 in the repo — 51, 52, 53, 55, 56, 57, 58. Not started. |
+| Site total | 525 → **558 posts** |
 | Category | `fundamental-problem`, already existed — no nav change needed |
 
-Live at https://lovemesomecoding.com/fundamental-problem, which now holds 38 posts: the 27 LeetCode
-ones leading the archive, above the 11 legacy 2019 posts. All 27 return 200, all 27 are in
+Live at https://lovemesomecoding.com/fundamental-problem, which now holds 44 posts: the 33 LeetCode
+ones leading the archive, above the 11 legacy 2019 posts. All 33 return 200, all 33 are in
 `sitemap.xml`, highlighting renders, cross-post links resolve, and the pre-existing URLs in this and
 other categories are unaffected.
 
@@ -114,7 +115,7 @@ Everything below was run and passed on 2026-08-12, covering all four published r
 blocks *out of the published HTML* — so they test what a reader would copy, not a retyped copy — and
 exercise them against the LeetCode examples plus the edge cases each post claims to handle:
 overflow, `Integer.MIN_VALUE`, empty strings, duplicate values, even-length palindromes, `""` against
-`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **263 Python assertions and 308 Java
+`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **322 Python assertions and 365 Java
 assertions, all green.** Several of those are worth more than the rest put together: problems 12 and 13
 are inverses, so both suites round-trip every integer from 1 to 3999 through `intToRoman` and back
 through `romanToInt`; problem 22's output is checked against the Catalan numbers up to n = 8 (1430
@@ -132,7 +133,14 @@ That harness caught one real bug: the LeetCode 5 solution originally kept `start
 instance fields, so a second call on the same object returned a stale answer. It is now stateless,
 and both suites have a reuse assertion so it cannot regress.
 
-**`check_content.py`** proves all 122 code blocks round-trip byte-for-byte through the backend
+It has also caught two bad *tests*, which is worth recording because a test that passes vacuously is
+worse than no test. A tree case for LeetCode 543 asserted the wrong diameter *and* used a tree whose
+longest path went through the root, so it did not exercise what its name claimed. And the Java check
+for LeetCode 47 ran results through `norm()`, which sorts each inner list — correct for combinations,
+but it collapsed all three permutations of `[1,1,2]` into one and proved nothing about ordering.
+Permutation results now go through an order-preserving `permSet()`.
+
+**`check_content.py`** proves all 148 code blocks round-trip byte-for-byte through the backend
 normaliser, every block comes out in the exact `<pre class="language-X"><code class="language-X">`
 shape the highlighter matches, every heading has an anchor id, and no post links to a slug the track
 does not define. It also checks the manifest for duplicate slugs and non-ascending dates.
@@ -153,9 +161,9 @@ out, rounds 2 through 4 against the live site after:
   in both.
 - Cross-post links resolve: 8 → 7, 12 ↔ 13, 15 → 1, 23 → 20/21, 39 → 22/40 and 40 → 39 all
   return 200.
-- All 27 post URLs return 200 and all 27 appear in `sitemap.xml`.
+- All 33 post URLs return 200 and all 33 appear in `sitemap.xml`.
 
-**`npm run build`** passes, including `verify-build.mjs`: 552/552 posts served, 44/44 category counts
+**`npm run build`** passes, including `verify-build.mjs`: 558/558 posts served, 44/44 category counts
 agree, 41 redirects intact, 721 HTML files emitted.
 
 Browser QA with the Claude Chrome extension was **not** done — the extension was not connected on
@@ -172,11 +180,11 @@ this machine. The checks above were done against the rendered HTML instead.
 - [x] ~~Interview-essentials batch (121, 200, 347, 543) seeded and deployed.~~ Done 2026-08-12.
 - [x] ~~Rewrite three legacy posts on request.~~ Done 2026-08-12.
 - [x] ~~Re-date the 27 LeetCode posts across 2022–2024.~~ Done 2026-08-12 via `seed.py --redate`.
-- [ ] **Finish round 5.** `041-first-missing-positive.html` is written and passing but NOT in the
-      manifest and NOT seeded. Still to write: 42 Trapping Rain Water, 43 Multiply Strings,
-      46 Permutations, 47 Permutations II, 49 Group Anagrams. Round 5 dates must fall between
-      LeetCode 40 (`2026-08-14T14:00`) and LeetCode 121 (`2026-08-15T09:00`) to keep the manifest's
-      number and date ordering consistent — `2026-08-14T15:00`–`20:00` works.
+- [x] ~~Round 5 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2024-08/09).
+- [ ] Round 6 (LeetCode 51–60 has seven: 51 N-Queens, 52 N-Queens II, 53 Maximum Subarray,
+      55 Jump Game, 56 Merge Intervals, 57 Insert Interval, 58 Length of Last Word). Its dates must
+      slot into the same 2024-08-09 → 2024-09-18 gap that round 5 used, since 51–58 still sort
+      before 121 in the manifest.
 - [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.
 - [ ] Decide whether the 305 unnumbered LintCode-titled files are ever in scope.
 - [ ] Consider whether `fundamental-problem` should get a landing blurb explaining the track, now

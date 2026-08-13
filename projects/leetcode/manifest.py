@@ -412,6 +412,99 @@ POSTS = [
             "notice."
         ),
     },
+    # Round 5 - LeetCode 41-50. Missing from the source repo: 44, 45, 48, 50.
+    # Dated inside the gap between LeetCode 40 and 121 so the manifest's number
+    # and date ordering stay consistent.
+    {
+        "number": 41,
+        "slug": "leetcode-41-first-missing-positive",
+        "title": "LeetCode 41 \u2013 First Missing Positive",
+        "file": "041-first-missing-positive.html",
+        "date": "2024-08-11T16:47:48",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "array", "hash-table"],
+        "excerpt": (
+            "Hard because of its constraints, not its question — a hash set solves it instantly, and "
+            "O(1) space forbids one. Everything follows from a single observation: with n elements "
+            "the answer is always in [1, n + 1], so every other value is noise. Cyclic sort uses the "
+            "array as its own hash table, and the nested loop really is O(n)."
+        ),
+    },
+    {
+        "number": 42,
+        "slug": "leetcode-42-trapping-rain-water",
+        "title": "LeetCode 42 \u2013 Trapping Rain Water",
+        "file": "042-trapping-rain-water.html",
+        "date": "2024-08-18T06:40:16",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "array", "two-pointers", "stack"],
+        "excerpt": (
+            "One of the most-asked Hard problems, and it defeats people because they try to find the "
+            "puddles. Do not. Ask how deep the water is above one column and the answer is one line: "
+            "min(maxLeft, maxRight) − height. Why two pointers can decide with half the information, "
+            "and the line ordering that silently returns a number slightly too small."
+        ),
+    },
+    {
+        "number": 43,
+        "slug": "leetcode-43-multiply-strings",
+        "title": "LeetCode 43 \u2013 Multiply Strings",
+        "file": "043-multiply-strings.html",
+        "date": "2024-08-18T11:21:32",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "string", "math", "simulation"],
+        "excerpt": (
+            "Long multiplication as you learned it at school and then forgot. It hinges on one piece "
+            "of index arithmetic — the product of digits i and j lands at i + j + 1, carrying into "
+            "i + j — which is worth deriving rather than memorising. Why the result needs exactly "
+            "m + n slots, and why an intermediate slot going above 9 is harmless."
+        ),
+    },
+    {
+        "number": 46,
+        "slug": "leetcode-46-permutations",
+        "title": "LeetCode 46 \u2013 Permutations",
+        "file": "046-permutations.html",
+        "date": "2024-08-23T17:28:38",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "backtracking", "recursion", "array"],
+        "excerpt": (
+            "The reference implementation of backtracking, and its value is the contrast with the "
+            "combination problems. There a start index stops the same set appearing in different "
+            "orders; here the different orders are the answer, so start disappears and used[] takes "
+            "its job. Undo both pieces of state, or you get one permutation and then nothing."
+        ),
+    },
+    {
+        "number": 47,
+        "slug": "leetcode-47-permutations-ii",
+        "title": "LeetCode 47 \u2013 Permutations II",
+        "file": "047-permutations-ii.html",
+        "date": "2024-09-01T07:22:28",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "backtracking", "recursion", "array"],
+        "excerpt": (
+            "Permutations with duplicates, and the extra line is a different extra line from the one "
+            "Combination Sum II uses — which catches people who think they already learned this "
+            "trick. With no start index, used[] is the only signal of depth, so the rule becomes "
+            "!used[i-1]. All three de-duplication rules compared side by side."
+        ),
+    },
+    {
+        "number": 49,
+        "slug": "leetcode-49-group-anagrams",
+        "title": "LeetCode 49 \u2013 Group Anagrams",
+        "file": "049-group-anagrams.html",
+        "date": "2024-09-14T17:07:10",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "hash-table", "string", "sorting"],
+        "excerpt": (
+            "A hashing problem wearing a string problem's clothes. Find something identical for "
+            "anagrams and different for everything else, then group by it. Sorting each word works; "
+            "counting letters is better. And the separator everyone forgets — without it a word with "
+            "1 a and 11 b's collides with one that has 11 a's and 1 b."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for
