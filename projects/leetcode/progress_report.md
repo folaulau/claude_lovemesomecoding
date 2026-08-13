@@ -24,10 +24,11 @@ ones leading the archive, above the 11 legacy 2019 posts. All 23 return 200, all
 `sitemap.xml`, highlighting renders, cross-post links resolve, and the pre-existing URLs in this and
 other categories are unaffected.
 
-Note the build hash has not changed across any of the four deploys (`394b0bd` each time) because it comes
-from the git commit and this work is uncommitted. `deploy.sh`'s edge check compares that hash, so
-after round 1 it could no longer prove freshness — the live URLs were checked directly instead. This
-resolves itself once `projects/leetcode/` is committed.
+`projects/leetcode/` is committed as of `e4132b6`. Note the build hash was `394b0bd` on all four
+deploys, because it comes from the git commit and this work was uncommitted at the time.
+`deploy.sh`'s edge check compares that hash, so after round 1 it could no longer prove freshness —
+the live URLs were checked directly instead. **The next deploy will carry a new hash and the check
+will be meaningful again.**
 
 ---
 
@@ -143,8 +144,7 @@ this machine. The checks above were done against the rendered HTML instead.
 - [x] ~~Round 2 seeded to prod and deployed.~~ Done 2026-08-12.
 - [x] ~~Round 3 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2026-08-13).
 - [x] ~~Round 4 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2026-08-14).
-- [ ] Commit `projects/leetcode/` — it is still untracked, and until it is, `deploy.sh` cannot
-      verify the edge is serving fresh content.
+- [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.
 - [ ] Round 5 (LeetCode 41–50 has six: 41 First Missing Positive, 42 Trapping Rain Water,
       43 Multiply Strings, 46 Permutations, 47 Permutations II, 49 Group Anagrams).
 - [ ] Decide whether the 305 unnumbered LintCode-titled files are ever in scope.
