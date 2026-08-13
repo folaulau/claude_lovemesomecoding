@@ -17,6 +17,13 @@ def blocks(name):
     return [html.unescape(b) for b in PY.findall(raw)]
 
 
+def load_fn(name, fn):
+    """Legacy posts expose module-level functions, not a Solution class."""
+    ns = {}
+    exec(compile("\n".join(blocks(name)), name, "exec"), ns)
+    return ns[fn]
+
+
 def load(name, extra=""):
     ns = {}
     src = extra + "\n" + "\n".join(blocks(name))
@@ -523,6 +530,49 @@ check("full tree of 7", s.diameterOfBinaryTree(build([1, 2, 3, 4, 5, 6, 7])), 4)
 deep = build([1, 2, None, 3, 4, 5, None, None, 6])
 check("diameter buried in the left subtree, not through the root",
       s.diameterOfBinaryTree(deep), 4)
+
+print("Legacy - Two Number Sum")
+f = load_fn("legacy-two-number-sum.html", "two_number_sum")
+check("[3,5,-4,8,11,1,-1,6] t=10", sorted(f([3, 5, -4, 8, 11, 1, -1, 6], 10)), [-1, 11])
+check("[4,6] t=10", sorted(f([4, 6], 10)), [4, 6])
+check("[4,6] t=11 (no pair)", f([4, 6], 11), [])
+check("[3] t=6 (cannot pair with itself)", f([3], 6), [])
+check("[] (empty)", f([], 0), [])
+check("[5,1] t=10 (5+5 must NOT match)", f([5, 1], 10), [])
+check("negatives only", sorted(f([-3, -7, -2], -9)), [-7, -2])
+# Cross-check against brute force over every distinct-value array up to length 6.
+bad = []
+for n in range(0, 7):
+    for combo in itertools.combinations(range(-3, 4), n):
+        xs = list(combo)
+        for t_ in range(-6, 7):
+            want = any(xs[i] + xs[j] == t_ for i in range(n) for j in range(i + 1, n))
+            got = f(list(xs), t_)
+            ok = (len(got) == 2 and got[0] + got[1] == t_ and sorted(got) != []) if want else got == []
+            if not ok:
+                bad.append((xs, t_, got))
+check("agrees with brute force on all distinct arrays over -3..3", bad, [])
+
+print("Legacy - Three Number Sum")
+f3 = load_fn("legacy-three-number-sum.html", "three_number_sum")
+check("[12,3,1,2,-6,5,-8,6] t=0", f3([12, 3, 1, 2, -6, 5, -8, 6], 0),
+      [[-8, 2, 6], [-8, 3, 5], [-6, 1, 5]])
+check("[1,2,3] t=100 (none)", f3([1, 2, 3], 100), [])
+check("[1,2] t=3 (too short)", f3([1, 2], 3), [])
+check("[] (empty)", f3([], 0), [])
+check("[1,2,3] t=6", f3([1, 2, 3], 6), [[1, 2, 3]])
+check("output triplets are ascending", f3([5, 1, 3], 9), [[1, 3, 5]])
+# Cross-check against brute force, and confirm the documented ordering guarantees.
+bad = []
+for n in range(0, 8):
+    for combo in itertools.combinations(range(-4, 5), n):
+        xs = list(combo)
+        for t_ in (-3, 0, 3):
+            want = sorted([sorted(c) for c in itertools.combinations(xs, 3) if sum(c) == t_])
+            got = f3(list(xs), t_)
+            if got != want:
+                bad.append((xs, t_, got, want))
+check("agrees with brute force, in ascending order, on all distinct arrays over -4..4", bad, [])
 
 print()
 if fails:

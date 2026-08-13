@@ -69,6 +69,25 @@ seed with `--batch` rather than `--round`:
 `--round` and `--batch` are mutually exclusive. When these numbers come up in their real rounds
 (13, 20, 35, 55), drop the `batch` key rather than adding a duplicate entry.
 
+### Legacy rewrites (`--batch legacy-rewrite`)
+
+Three posts migrated from WordPress in 2019 that already own their URLs, rewritten in place. They
+have **no `number`**, so `check_content.py` exempts them from the manifest's number/date ordering
+checks, and `seed.py --round` skips them.
+
+| Slug | Was | Now |
+|---|---|---|
+| `fundamental-problem-two-number-sum` | 3 solutions, all `language-plaintext`, hash-set version did not compile | highlighted, compiling, Java + Python, indices variant |
+| `fundamental-problem-three-number-sum` | 1 solution, `language-plaintext` | highlighted, Java + Python, duplicates contrast with LeetCode 15 |
+| `fundamental-problem-recursion` | **empty** — `wordCount: 0` | recursion as an interview technique |
+
+`upsert_post` keeps an existing post's `date`, so re-seeding these never moves them in the archive
+and the manifest `date` is documentation only. **Their slugs are live — do not change them.**
+
+`fundamental-problem-recursion` deliberately does *not* re-explain what recursion is;
+`/data-structure-algorithm/data-structure-algorithm-recursion` already does that, and two posts
+competing for the same query would cannibalise each other. The two cross-link.
+
 ## Dates, and why they ascend
 
 Archives and the sitemap sort newest first, and `siblings()` in `src/lib/content.ts` reverses the

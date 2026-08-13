@@ -51,11 +51,17 @@ total_blocks = 0
 if len(KNOWN_SLUGS) != len(manifest.POSTS):
     failures.append("duplicate slug in the manifest")
 
-dates = [e["date"] for e in manifest.POSTS]
+# Ordering only applies to the LeetCode track itself. Legacy rewrites have no
+# number and keep their original 2018/2019 dates, so they are exempt: upsert_post
+# never reapplies `date` to an existing post, and their position in the archive is
+# already fixed.
+tracked = [e for e in manifest.POSTS if "number" in e]
+
+dates = [e["date"] for e in tracked]
 if dates != sorted(dates):
     failures.append("dates do not ascend with the manifest order; prev/next would zig-zag")
 
-numbers = [e["number"] for e in manifest.POSTS]
+numbers = [e["number"] for e in tracked]
 if numbers != sorted(numbers):
     failures.append("LeetCode numbers are out of order in the manifest")
 

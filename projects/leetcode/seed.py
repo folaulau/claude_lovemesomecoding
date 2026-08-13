@@ -82,7 +82,7 @@ def select(round_no: int | None, batch: str | None) -> list[dict]:
         return list(manifest.POSTS)
 
     lo, hi = (round_no - 1) * 10 + 1, round_no * 10
-    chosen = [p for p in manifest.POSTS if lo <= p["number"] <= hi]
+    chosen = [p for p in manifest.POSTS if lo <= p.get("number", -1) <= hi]
     if not chosen:
         raise SystemExit(f"round {round_no} (LeetCode {lo}-{hi}) has no posts in the manifest")
     return chosen

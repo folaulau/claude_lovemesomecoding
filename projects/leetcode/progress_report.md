@@ -3,7 +3,7 @@
 Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.com under
 **Software Engineering → Fundamental Problems**, published in rounds of ten LeetCode numbers.
 
-**Status: rounds 1–4 plus the interview-essentials batch are LIVE on lovemesomecoding.com.**
+**Status: rounds 1–4, the interview-essentials batch and three legacy rewrites are LIVE. Round 5 is part-written.**
 
 ---
 
@@ -16,7 +16,8 @@ Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.
 | Round 3 (LeetCode 21–30) | 4 posts — **live** |
 | Round 4 (LeetCode 31–40) | 6 posts — **live** |
 | Interview essentials | 4 posts — **live** (121, 200, 347, 543, out of round order) |
-| Round 5 (LeetCode 41–50) | 6 in the repo — 41, 42, 43, 46, 47, 49. Not started. |
+| Legacy rewrites | 3 posts — **live** (two/three number sum, recursion) |
+| Round 5 (LeetCode 41–50) | **in progress** — 41 written, 42/43/46/47/49 not started |
 | Site total | 525 → **552 posts** |
 | Category | `fundamental-problem`, already existed — no nav change needed |
 
@@ -105,7 +106,7 @@ Everything below was run and passed on 2026-08-12, covering all four published r
 blocks *out of the published HTML* — so they test what a reader would copy, not a retyped copy — and
 exercise them against the LeetCode examples plus the edge cases each post claims to handle:
 overflow, `Integer.MIN_VALUE`, empty strings, duplicate values, even-length palindromes, `""` against
-`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **248 Python assertions and 273 Java
+`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **263 Python assertions and 308 Java
 assertions, all green.** Several of those are worth more than the rest put together: problems 12 and 13
 are inverses, so both suites round-trip every integer from 1 to 3999 through `intToRoman` and back
 through `romanToInt`; problem 22's output is checked against the Catalan numbers up to n = 8 (1430
@@ -123,7 +124,7 @@ That harness caught one real bug: the LeetCode 5 solution originally kept `start
 instance fields, so a second call on the same object returned a stale answer. It is now stateless,
 and both suites have a reuse assertion so it cannot regress.
 
-**`check_content.py`** proves all 108 code blocks round-trip byte-for-byte through the backend
+**`check_content.py`** proves all 122 code blocks round-trip byte-for-byte through the backend
 normaliser, every block comes out in the exact `<pre class="language-X"><code class="language-X">`
 shape the highlighter matches, every heading has an anchor id, and no post links to a slug the track
 does not define. It also checks the manifest for duplicate slugs and non-ascending dates.
@@ -155,9 +156,13 @@ this machine. The checks above were done against the rendered HTML instead.
 - [x] ~~Round 3 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2026-08-13).
 - [x] ~~Round 4 seeded to prod and deployed.~~ Done 2026-08-12 (dated 2026-08-14).
 - [x] ~~Interview-essentials batch (121, 200, 347, 543) seeded and deployed.~~ Done 2026-08-12.
+- [x] ~~Rewrite three legacy posts on request.~~ Done 2026-08-12.
+- [ ] **Finish round 5.** `041-first-missing-positive.html` is written and passing but NOT in the
+      manifest and NOT seeded. Still to write: 42 Trapping Rain Water, 43 Multiply Strings,
+      46 Permutations, 47 Permutations II, 49 Group Anagrams. Round 5 dates must fall between
+      LeetCode 40 (`2026-08-14T14:00`) and LeetCode 121 (`2026-08-15T09:00`) to keep the manifest's
+      number and date ordering consistent — `2026-08-14T15:00`–`20:00` works.
 - [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.
-- [ ] Round 5 (LeetCode 41–50 has six: 41 First Missing Positive, 42 Trapping Rain Water,
-      43 Multiply Strings, 46 Permutations, 47 Permutations II, 49 Group Anagrams).
 - [ ] Decide whether the 305 unnumbered LintCode-titled files are ever in scope.
 - [ ] Consider whether `fundamental-problem` should get a landing blurb explaining the track, now
       that it holds two eras of content with very different formats.

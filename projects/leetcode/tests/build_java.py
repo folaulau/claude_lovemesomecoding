@@ -124,6 +124,32 @@ parts.append("class S347Heap {\n"
              "    for (int i = out.length - 1; i >= 0; i--) out[i] = heap.poll().getKey();\n"
              "    return out;\n  }\n}")
 
+# --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
+two = blocks("legacy-two-number-sum.html")
+parts.append("class L2Brute {\n" + two[0] + "\n}")
+parts.append("class L2Sort {\n" + two[1] + "\n}")
+parts.append("class L2Set {\n" + two[2] + "\n}")
+parts.append("class L2Idx {\n" + two[3] + "\n}")
+
+three = blocks("legacy-three-number-sum.html")
+parts.append("class L3 {\n" + three[0] + "\n}")
+# The duplicate-skip snippet references loop variables; give it some.
+parts.append("class L3Skip {\n  void f(int[] array, int i, int left, int right) {\n"
+             "    while (true) {\n" + three[1] + "\n    break; }\n  }\n}")
+
+rec = blocks("legacy-recursion.html")
+parts.append("class RecDepth {\n  int call(TreeNode n) { return depth(n); }\n" + rec[0] + "\n}")
+parts.append("class RecDiameter {\n  int best = 0;\n  int call(TreeNode n) { return depth(n); }\n" + rec[1] + "\n}")
+parts.append("class RecFib {\n" + rec[2] + "\n}")
+parts.append("class RecBacktrack {\n"
+             "  java.util.List<java.util.List<Integer>> result = new ArrayList<>();\n"
+             "  java.util.List<Integer> path = new ArrayList<>();\n"
+             "  void backtrack(java.util.List<java.util.List<Integer>> result,\n"
+             "                 java.util.List<Integer> path, int[] candidates,\n"
+             "                 int start, int remaining) {}\n"
+             "  void f(int[] candidates, int start, int remaining) {\n"
+             + rec[3] + "\n  }\n}")
+
 HEADER = """import java.util.*;
 
 class TreeNode {
@@ -693,6 +719,81 @@ public class Main {
         check("full tree of 7", s543.diameterOfBinaryTree(buildTree(1,2,3,4,5,6,7)), 4);
         check("diameter buried in the left subtree, not through the root",
               s543.diameterOfBinaryTree(buildTree(1,2,null,3,4,5,null,null,6)), 4);
+
+        System.out.println("Legacy - Two Number Sum");
+        int[][] pairCases = {{3,5,-4,8,11,1,-1,6}, {4,6}, {3}, {}, {5,1}, {-3,-7,-2}};
+        int[] pairTargets = {10, 10, 6, 0, 10, -9};
+        int[][] pairWant = {{-1,11}, {4,6}, {}, {}, {}, {-7,-2}};
+        for (int i = 0; i < pairCases.length; i++) {
+            check("[brute] case " + i, sortedInts(new L2Brute().twoNumberSum(pairCases[i].clone(), pairTargets[i])), pairWant[i]);
+            check("[sort]  case " + i, sortedInts(new L2Sort().twoNumberSum(pairCases[i].clone(), pairTargets[i])), pairWant[i]);
+            check("[set]   case " + i, sortedInts(new L2Set().twoNumberSum(pairCases[i].clone(), pairTargets[i])), pairWant[i]);
+        }
+        check("indices variant [2,7,11,15] t=9", new L2Idx().twoNumberSumIndices(new int[]{2,7,11,15}, 9), new int[]{0,1});
+        check("indices variant, no pair", new L2Idx().twoNumberSumIndices(new int[]{1,2}, 99), new int[]{});
+        // All three approaches must agree on every distinct-value array over -3..3.
+        int agreeBad = 0;
+        for (int mask = 0; mask < (1 << 7); mask++) {
+            List<Integer> pick = new ArrayList<>();
+            for (int bit = 0; bit < 7; bit++) if ((mask & (1 << bit)) != 0) pick.add(bit - 3);
+            int[] xs = pick.stream().mapToInt(Integer::intValue).toArray();
+            for (int t2 = -6; t2 <= 6; t2++) {
+                boolean hasPair = false;
+                for (int i = 0; i < xs.length; i++)
+                    for (int j = i + 1; j < xs.length; j++) if (xs[i] + xs[j] == t2) hasPair = true;
+                int[] byBrute = new L2Brute().twoNumberSum(xs.clone(), t2);
+                int[] bySort = new L2Sort().twoNumberSum(xs.clone(), t2);
+                int[] bySet = new L2Set().twoNumberSum(xs.clone(), t2);
+                for (int[] got : new int[][]{byBrute, bySort, bySet}) {
+                    boolean ok = hasPair ? (got.length == 2 && got[0] + got[1] == t2) : got.length == 0;
+                    if (!ok) agreeBad++;
+                }
+            }
+        }
+        check("all three approaches agree with brute force over -3..3", agreeBad, 0);
+
+        System.out.println("Legacy - Three Number Sum");
+        L3 l3 = new L3();
+        check("[12,3,1,2,-6,5,-8,6] t=0",
+              l3.threeNumberSum(new int[]{12,3,1,2,-6,5,-8,6}, 0).toString(),
+              "[[-8, 2, 6], [-8, 3, 5], [-6, 1, 5]]");
+        check("[1,2,3] t=100 (none)", l3.threeNumberSum(new int[]{1,2,3}, 100), List.of());
+        check("[1,2] t=3 (too short)", l3.threeNumberSum(new int[]{1,2}, 3), List.of());
+        check("[] (empty)", l3.threeNumberSum(new int[]{}, 0), List.of());
+        check("[1,2,3] t=6", l3.threeNumberSum(new int[]{1,2,3}, 6), List.of(List.of(1,2,3)));
+        check("triplets come out ascending", l3.threeNumberSum(new int[]{5,1,3}, 9), List.of(List.of(1,3,5)));
+        int tripleBad = 0;
+        for (int mask = 0; mask < (1 << 9); mask++) {
+            List<Integer> pick = new ArrayList<>();
+            for (int bit = 0; bit < 9; bit++) if ((mask & (1 << bit)) != 0) pick.add(bit - 4);
+            int[] xs = pick.stream().mapToInt(Integer::intValue).toArray();
+            for (int t2 : new int[]{-3, 0, 3}) {
+                TreeSet<String> expect = new TreeSet<>();
+                for (int i = 0; i < xs.length; i++)
+                    for (int j = i + 1; j < xs.length; j++)
+                        for (int k = j + 1; k < xs.length; k++)
+                            if (xs[i] + xs[j] + xs[k] == t2) {
+                                List<Integer> tri = new ArrayList<>(List.of(xs[i], xs[j], xs[k]));
+                                Collections.sort(tri);
+                                expect.add(tri.toString());
+                            }
+                TreeSet<String> got = new TreeSet<>();
+                for (List<Integer> tri : l3.threeNumberSum(xs.clone(), t2)) got.add(tri.toString());
+                if (!got.equals(expect)) tripleBad++;
+            }
+        }
+        check("agrees with brute force on all distinct arrays over -4..4", tripleBad, 0);
+
+        System.out.println("Legacy - Recursion");
+        check("depth of a 3-level tree", new RecDepth().call(buildTree(1,2,3,4,5)), 3);
+        check("depth of null", new RecDepth().call(null), 0);
+        RecDiameter rd = new RecDiameter();
+        rd.call(buildTree(1,2,3,4,5));
+        check("diameter snippet records 3", rd.best, 3);
+        check("memoised fib(30)", new RecFib().fib(30, new Long[31]), 832040);
+        check("memoised fib(0)", new RecFib().fib(0, new Long[1]), 0);
+        check("memoised fib(1)", new RecFib().fib(1, new Long[2]), 1);
+        check("naive fib(20) agrees with memoised", new RecFib().fib(20), new RecFib().fib(20, new Long[21]));
 
         System.out.println();
         if (failures > 0) {

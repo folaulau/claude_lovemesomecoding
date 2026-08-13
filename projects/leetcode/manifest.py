@@ -477,4 +477,57 @@ POSTS = [
             "returning zero."
         ),
     },
+    # Legacy rewrites - posts migrated from WordPress in 2019 that already own
+    # their URLs. They have no LeetCode number, so they are excluded from the
+    # manifest's number/date ordering checks (see check_content.py).
+    #
+    # upsert_post keeps an existing post's `date`, so the dates below are only
+    # documentation -- re-seeding will NOT move these in the archive. Their slugs
+    # are live and must not change.
+    {
+        "batch": "legacy-rewrite",
+        "slug": "fundamental-problem-two-number-sum",
+        "title": "Two Number Sum",
+        "file": "legacy-two-number-sum.html",
+        "date": "2019-02-09T22:38:47",
+        "difficulty": "Easy",
+        "tags": ["array", "hash-table", "two-pointers"],
+        "excerpt": (
+            "Three reasonable answers with genuinely different trade-offs, and laying all three out "
+            "before choosing is the actual skill being tested. Why the inner loop starts at x + 1 "
+            "rather than 0, why you must check the set before inserting or an element pairs with "
+            "itself, and why sorting quietly reorders the caller's array. Java and Python, plus the "
+            "indices variant."
+        ),
+    },
+    {
+        "batch": "legacy-rewrite",
+        "slug": "fundamental-problem-three-number-sum",
+        "title": "Three Number Sum",
+        "file": "legacy-three-number-sum.html",
+        "date": "2019-02-10T05:47:15",
+        "difficulty": "Medium",
+        "tags": ["array", "two-pointers", "sorting"],
+        "excerpt": (
+            "Where the two-pointer technique stops being a curiosity and becomes the tool — sorting "
+            "buys three separate things at once and no hash-based approach gets all three. Why both "
+            "pointers move after a hit, why the result should be List<List<Integer>> rather than "
+            "List<Integer[]>, and exactly what changes when duplicates are allowed."
+        ),
+    },
+    {
+        "batch": "legacy-rewrite",
+        "slug": "fundamental-problem-recursion",
+        "title": "Recursion in Coding Interviews",
+        "file": "legacy-recursion.html",
+        "date": "2018-02-07T07:48:22",
+        "difficulty": None,
+        "tags": ["recursion", "backtracking", "interview"],
+        "excerpt": (
+            "Most people can explain what recursion is and still freeze when a problem needs it "
+            "under time pressure. The three questions that turn a blank page into a fill-in-the-"
+            "blanks exercise, the leap of faith that stops you tracing calls in your head, when "
+            "recursion is the wrong tool, and how to reason about the cost of a branching search."
+        ),
+    },
 ]
