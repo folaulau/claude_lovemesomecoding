@@ -1,0 +1,187 @@
+<p>Regular Expression Matching is the first genuinely Hard problem on the list, and it earns it. The
+difficulty is not the code — the finished solution is twenty lines — it is that <code>*</code> does
+not mean what it looks like it means, and getting that wrong makes every subsequent decision
+wrong.</p>
+
+<h2>The problem</h2>
+
+<p>Implement matching for two metacharacters, over the <strong>entire</strong> input string, not a
+partial match:</p>
+
+<ul>
+  <li><code>.</code> matches any single character.</li>
+  <li><code>*</code> matches <strong>zero or more of the character immediately before it</strong>.</li>
+</ul>
+
+<pre class="language-plaintext"><code class="language-plaintext">s = "aa",  p = "a"      -&gt; false    the pattern must cover all of s
+s = "aa",  p = "a*"     -&gt; true     one 'a' repeated twice
+s = "ab",  p = ".*"     -&gt; true     any character, repeated
+s = "aab", p = "c*a*b"  -&gt; true     c* matches zero c's, a* matches "aa"
+s = "",    p = "a*"     -&gt; true     zero occurrences, so the pattern matches nothing</code></pre>
+
+<h2>The one insight that unlocks it</h2>
+
+<p><strong><code>*</code> is not a character. It is a modifier on the character to its left</strong>,
+and the two of them are one indivisible unit: <code>a*</code>, <code>.*</code>, <code>c*</code>.
+This is not shell globbing, where <code>*</code> means "any run of anything" — <code>a*</code>
+matches <code>"aaaa"</code> and never matches <code>"b"</code>.</p>
+
+<p>Which means you never scan the pattern left to right one character at a time. At every position
+you must first <strong>look ahead one character</strong> to see whether a <code>*</code> follows,
+because that decides which of two completely different rules applies.</p>
+
+<p>When <code>p[j]</code> is followed by a <code>*</code>, that unit can do one of two things, and
+you have to try both:</p>
+
+<ul>
+  <li><strong>Zero occurrences.</strong> Skip the whole <code>x*</code> unit — jump the pattern
+      forward by two, leave the string where it is.</li>
+  <li><strong>One or more.</strong> Only possible if the current character matches
+      (<code>s[i] == p[j]</code> or <code>p[j] == '.'</code>). Consume one character of the string
+      and <em>stay on the same pattern position</em>, so the unit can be used again.</li>
+</ul>
+
+<p>That "consume the string but not the pattern" step is what lets one <code>a*</code> absorb an
+arbitrarily long run. When there is no <code>*</code>, the rule is the simple one: the characters
+must match, and both indices advance by one.</p>
+
+<h2>Top-down: recursion, then a memo</h2>
+
+<p>Write the recursion first — it is a direct transcription of the rules above, and it is what you
+should put on the board before optimising anything.</p>
+
+<pre class="language-java"><code class="language-java">private boolean dfs(String s, int i, String p, int j) {
+    if (j == p.length()) return i == s.length();   // pattern spent: string must be too
+
+    boolean firstMatches = i &lt; s.length()
+            &amp;&amp; (p.charAt(j) == '.' || p.charAt(j) == s.charAt(i));
+
+    if (j + 1 &lt; p.length() &amp;&amp; p.charAt(j + 1) == '*') {
+        return dfs(s, i, p, j + 2)                       // x* used zero times
+            || (firstMatches &amp;&amp; dfs(s, i + 1, p, j));   // x* used once more
+    }
+    return firstMatches &amp;&amp; dfs(s, i + 1, p, j + 1);
+}</code></pre>
+
+<p>Note the base case: reaching the end of the <em>pattern</em> is only a success if the string is
+also exhausted. Reaching the end of the string is <em>not</em> a failure — <code>s = ""</code> with
+<code>p = "a*b*"</code> still has to walk the pattern to prove every unit can match zero times.</p>
+
+<p>This is exponential on inputs like <code>s = "aaaaaaaaaaaaaaaaaaab"</code>,
+<code>p = "a*a*a*a*a*b"</code>, because the same <code>(i, j)</code> pair is recomputed through many
+different paths. There are only <code>m × n</code> distinct pairs, so cache them. Use
+<code>Boolean</code>, not <code>boolean</code>, so <code>null</code> can mean "not computed yet" —
+with a primitive there is no way to distinguish an uncomputed cell from a computed
+<code>false</code>.</p>
+
+<h2>Bottom-up DP: the version to write</h2>
+
+<p>Same recurrence, no recursion. Let <code>dp[i][j]</code> mean <em>"the first <code>i</code>
+characters of <code>s</code> match the first <code>j</code> characters of <code>p</code>"</em>. The
+offset-by-one indexing is deliberate: <code>dp[0][0]</code> is "empty matches empty", which is
+<code>true</code>, and it gives the empty-string cases somewhere to live.</p>
+
+<p>The first row is the one people get wrong. <code>dp[0][j]</code> is <strong>not</strong> all
+<code>false</code> — an empty string genuinely matches <code>"a*"</code>, <code>"a*b*"</code>,
+<code>".*"</code>, and any other pattern made only of <code>x*</code> units. Seed it explicitly.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution {
+    public boolean isMatch(String s, String p) {
+        int m = s.length(), n = p.length();
+        boolean[][] dp = new boolean[m + 1][n + 1];
+        dp[0][0] = true;   // empty matches empty
+
+        // Empty string vs a pattern of x* units — each must take its zero-occurrence branch.
+        for (int j = 2; j &lt;= n; j++) {
+            dp[0][j] = p.charAt(j - 1) == '*' &amp;&amp; dp[0][j - 2];
+        }
+
+        for (int i = 1; i &lt;= m; i++) {
+            for (int j = 1; j &lt;= n; j++) {
+                char pc = p.charAt(j - 1);
+
+                if (pc == '*') {
+                    char prev = p.charAt(j - 2);                 // the char the * modifies
+                    boolean zero = dp[i][j - 2];                 // drop the whole x* unit
+                    boolean more = (prev == '.' || prev == s.charAt(i - 1))
+                                 &amp;&amp; dp[i - 1][j];                // consume s, reuse x*
+                    dp[i][j] = zero || more;
+                } else if (pc == '.' || pc == s.charAt(i - 1)) {
+                    dp[i][j] = dp[i - 1][j - 1];
+                }
+                // otherwise dp[i][j] stays false
+            }
+        }
+
+        return dp[m][n];
+    }
+}</code></pre>
+
+<p><code>p.charAt(j - 2)</code> is safe without a bounds check because a well-formed pattern never
+begins with <code>*</code> — the problem guarantees every <code>*</code> has a preceding character.
+Say that out loud; an interviewer who was about to ask "what if the pattern is <code>\"*a\"</code>?"
+will be satisfied, and if they say the input is untrusted, add the guard.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">class Solution:
+    def isMatch(self, s: str, p: str) -&gt; bool:
+        m, n = len(s), len(p)
+        dp = [[False] * (n + 1) for _ in range(m + 1)]
+        dp[0][0] = True
+
+        for j in range(2, n + 1):                       # empty string vs x* units
+            dp[0][j] = p[j - 1] == '*' and dp[0][j - 2]
+
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                pc = p[j - 1]
+                if pc == '*':
+                    prev = p[j - 2]
+                    dp[i][j] = dp[i][j - 2] or (              # x* used zero times
+                        (prev == '.' or prev == s[i - 1])     # x* used once more
+                        and dp[i - 1][j]
+                    )
+                elif pc == '.' or pc == s[i - 1]:
+                    dp[i][j] = dp[i - 1][j - 1]
+
+        return dp[m][n]</code></pre>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th>Approach</th><th>Time</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Plain recursion</td><td>exponential</td><td><code>O(m + n)</code> stack</td></tr>
+    <tr><td>Recursion + memo</td><td><code>O(m·n)</code></td><td><code>O(m·n)</code></td></tr>
+    <tr><td>Bottom-up DP</td><td><code>O(m·n)</code></td><td><code>O(m·n)</code></td></tr>
+  </tbody>
+</table>
+
+<p>The DP only ever reads row <code>i - 1</code>, so it rolls down to two rows and
+<code>O(n)</code> space. Offer that as the follow-up; do not write it first, because the two-row
+version is much harder to debug on a whiteboard.</p>
+
+<h2>How this differs from Wildcard Matching</h2>
+
+<p><strong>Wildcard Matching</strong> (LeetCode 44) looks like the same problem and is not. There,
+<code>*</code> stands alone and matches any sequence of any characters, and <code>?</code> matches
+exactly one. The DP table has the same shape, but the <code>*</code> branch changes: <code>zero</code>
+becomes <code>dp[i][j - 1]</code> (skip just the star, not a two-character unit) and the "consume
+one" branch has no preceding character to check against. Knowing which is which — and saying so —
+is a strong signal.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That you treat <code>x*</code> as one unit and look ahead for the <code>*</code>, rather than
+      walking the pattern one character at a time.</li>
+  <li>That you try <em>both</em> the zero-occurrence and the one-or-more branch.</li>
+  <li>That <code>s = ""</code> against <code>p = "a*b*"</code> returns <code>true</code> — the first
+      row of the table is the whole test.</li>
+  <li>That you spot the overlapping subproblems and memoise, instead of shipping the exponential
+      recursion.</li>
+  <li>That you know the match must cover the entire string, not a prefix.</li>
+</ul>
