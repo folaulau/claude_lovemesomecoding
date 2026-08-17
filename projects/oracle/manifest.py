@@ -2,7 +2,7 @@
 
 `file` is relative to `posts/`. `date` drives ordering everywhere on the site —
 archives and the sitemap sort newest first, and prev/next walks the category
-oldest-first — so the dates ascend with the track and lesson 13 is the newest.
+oldest-first — so the dates ascend with the track and lesson 14 is the newest.
 
 Slugs are frozen the moment this is published. Changing one changes a URL.
 """
@@ -141,9 +141,23 @@ POSTS = [
         ),
     },
     {
+        "slug": "oracle-pivot",
+        "title": "Oracle Database – PIVOT and UNPIVOT",
+        "file": "10-oracle-pivot.html",
+        "date": "2024-03-01T09:00:00",
+        "tags": ["oracle", "sql"],
+        "excerpt": (
+            "Rows into columns and back again. The implicit GROUP BY over every column you did not "
+            "mention — the one fact behind almost every surprising PIVOT result — plus why values "
+            "missing from the IN list vanish silently, why an empty cell is NULL from sum but 0 "
+            "from count, the three errors you get for a non-constant IN list and what to do "
+            "instead, and UNPIVOT's habit of dropping NULLs by default."
+        ),
+    },
+    {
         "slug": "oracle-pl-sql",
         "title": "Oracle Database – PL/SQL",
-        "file": "10-oracle-pl-sql.html",
+        "file": "11-oracle-pl-sql.html",
         "date": "2024-03-04T09:00:00",
         "tags": ["oracle", "plsql"],
         "excerpt": (
@@ -156,7 +170,7 @@ POSTS = [
     {
         "slug": "oracle-indexes-and-execution-plans",
         "title": "Oracle Database – Indexes and Execution Plans",
-        "file": "11-oracle-indexes-and-execution-plans.html",
+        "file": "12-oracle-indexes-and-execution-plans.html",
         "date": "2024-03-11T09:00:00",
         "tags": ["oracle", "performance"],
         "excerpt": (
@@ -169,7 +183,7 @@ POSTS = [
     {
         "slug": "oracle-transactions-and-locking",
         "title": "Oracle Database – Transactions and Locking",
-        "file": "12-oracle-transactions-and-locking.html",
+        "file": "13-oracle-transactions-and-locking.html",
         "date": "2024-03-18T09:00:00",
         "tags": ["oracle", "concurrency"],
         "excerpt": (
@@ -182,7 +196,7 @@ POSTS = [
     {
         "slug": "oracle-with-spring-boot",
         "title": "Oracle Database – With Spring Boot",
-        "file": "13-oracle-with-spring-boot.html",
+        "file": "14-oracle-with-spring-boot.html",
         "date": "2024-03-25T09:00:00",
         "tags": ["oracle", "spring-boot", "java"],
         "excerpt": (

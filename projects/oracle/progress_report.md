@@ -1,12 +1,13 @@
 # Oracle Database track — progress report
 
-**Status: DONE and live.** 13 posts under `/oracle` on https://lovemesomecoding.com.
+**Status: DONE and live.** 14 posts under `/oracle` on https://lovemesomecoding.com — the 14th
+(PIVOT, step 10) is seeded and built but **not yet deployed**.
 Two follow-ups left — see *Outstanding*.
 
 Step 9 records a real bug this work exposed in `sync-content.sh`, which briefly shipped a wrong
 category count. Fixed, and the build now rejects it.
 
-Started and completed 2026-08-04.
+Started and completed 2026-08-04. Extended 2026-08-13 with the PIVOT post — see step 10.
 
 ## Requirement
 
@@ -23,7 +24,7 @@ Followed the same day by: *"create a post for CROSS APPLY in oracle"* — see st
 | | |
 |---|---|
 | Category | `oracle`, display name **Oracle**, `/oracle` |
-| Posts | **13**, ~19,000 words, 143 code blocks |
+| Posts | **14**, ~22,000 words, 167 code blocks |
 | Trees | `local` and `prod`, both 512 → **525** posts, 43 → **44** categories |
 | Nav | `Data Store` group, second position, after SQL |
 
@@ -180,6 +181,46 @@ BUILD REJECTED:
 Then rebuilt and redeployed. Live now: `/oracle` says "13 tutorials", the Data Store dropdown reads
 SQL 42 · **Oracle 13** · Postgres 2 · Elasticsearch 13 · Hasura 11 · MongoDB 3 · Snowflake 1, and the
 homepage says 525.
+
+### 10. PIVOT added (2026-08-13)
+
+Requested separately: *"add pivot to the oracle tutorial. add a post describing how pivot works in
+oracle"*. It became lesson **10**, `/oracle/oracle-pivot`, dated 2024-03-01 so it sits between
+analytic functions (02-26) and PL/SQL (03-04). File prefixes 10–13 renumbered to 11–14.
+
+Placed there because it is the other half of "reshaping a result set": an analytic adds a column to
+every row, a pivot turns the values of a column into columns. Both cross-references were written:
+the analytic-functions post's *Next* now hands off to it, and the `ROLLUP`/`CUBE` block in *SELECT
+Essentials* points forward to it, since those add subtotal rows where `PIVOT` adds columns.
+
+**Every SQL sample was executed** against Oracle Database 23ai Free 23.6 in a container before the
+post was written up, and that caught five things the draft had wrong:
+
+| Drafted | Actual |
+|---|---|
+| `ORA-56902: expect aggregate function inside pivot operation` | `ORA-56902: non-aggregate expressions inside the PIVOT clause` |
+| Subquery in the `IN` list → `ORA-56901` | `ORA-00936: missing expression`. `ORA-56901` is for a *column* reference; a bind variable gets its own `ORA-56900` |
+| Non-literal values are rejected | Constant *expressions* are fine — `IN (upper('q1') AS q1)` compiles and runs |
+| Over-long generated column name → `ORA-00972` | Silently **truncated** to 128 bytes, no error |
+| `PIVOT` and the `CASE` equivalent have identical plans | Same shape and same work (full scan + hash group by) but distinct plan hashes; `PIVOT` shows `HASH GROUP BY PIVOT` |
+
+Three claims worth keeping were confirmed the same way rather than assumed: an empty cell is `NULL`
+from `sum` but `0` from `count`; `PIVOT XML` is genuinely the one place a subquery in the `IN` list
+is legal; and paired `UNPIVOT` drops a row only when *every* folded column in it is null.
+
+The demo table uses explicit ids rather than `GENERATED ALWAYS AS IDENTITY`, because a multi-table
+insert evaluates the identity sequence once for the whole statement — `INSERT ALL` with an identity
+column hands every row the same id and dies on `ORA-00001`. That is now a note in the post.
+
+Verified: `check_content.py` passes 14 posts / **167 code blocks** byte-for-byte. Both trees seeded
+(`local` 533 posts, `prod` 559 — the site has grown past the 525 recorded above). Full build clean —
+559/559 posts, 44/44 categories, index cross-check agrees, 729 HTML files. In `npm run preview`:
+`/oracle` reads *14 tutorials* and lists it, `/oracle/oracle-pivot` → 200 with 676 Prism token spans
+and zero `fetch()`/API references, `/oracle/oracle-pivot/` → 301, and the pager reads analytic
+functions ‹ **pivot** › PL/SQL. Sitemap and search index each carry 14 Oracle entries.
+
+**Not deployed** — the build is verified locally but `npm run deploy` has not been run, so the live
+site still shows 13.
 
 ## Decisions
 

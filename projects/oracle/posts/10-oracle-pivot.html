@@ -1,0 +1,409 @@
+<p><code>PIVOT</code> rotates rows into columns. You hand it an aggregate, name the column whose values
+become the new column <em>headings</em>, and list which of those values you want. Oracle added it in
+11.1, along with its inverse, <code>UNPIVOT</code>.</p>
+
+<p>It is a reporting feature, and the reason to learn it properly is that the thing it replaces — a
+hand-written pile of <code>CASE</code> expressions — is what most codebases contain, and it is longer
+and noisier. The reason to be careful with it is that <code>PIVOT</code> performs a <strong>GROUP BY
+you never wrote</strong>, over every column you did not mention. That one fact explains almost every
+surprising result people get out of it.</p>
+
+<h2>The data</h2>
+
+<p>One narrow table of sales — three products, two regions, four quarters:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE sales (
+  id       NUMBER(6)         PRIMARY KEY,
+  product  VARCHAR2(40 CHAR) NOT NULL,
+  region   VARCHAR2(10 CHAR) NOT NULL,
+  quarter  VARCHAR2(2 CHAR)  NOT NULL,
+  amount   NUMBER(12,2)      NOT NULL
+);
+
+INSERT ALL
+  INTO sales VALUES (1, 'Laptop',   'EAST', 'Q1', 1200)
+  INTO sales VALUES (2, 'Laptop',   'EAST', 'Q2', 1500)
+  INTO sales VALUES (3, 'Laptop',   'WEST', 'Q1',  900)
+  INTO sales VALUES (4, 'Laptop',   'WEST', 'Q3', 1100)
+  INTO sales VALUES (5, 'Monitor',  'EAST', 'Q1',  400)
+  INTO sales VALUES (6, 'Monitor',  'WEST', 'Q2',  650)
+  INTO sales VALUES (7, 'Monitor',  'WEST', 'Q4',  300)
+  INTO sales VALUES (8, 'Keyboard', 'EAST', 'Q2',  120)
+SELECT * FROM dual;
+
+COMMIT;</code></pre>
+
+<p>Oracle rejects a multi-row <code>VALUES</code> list, hence <code>INSERT ALL … SELECT * FROM
+dual</code> — see the <em>SELECT Essentials</em> post. The ids are explicit for a reason worth
+knowing: a multi-table insert evaluates an identity column's sequence <strong>once for the whole
+statement</strong>, so <code>GENERATED ALWAYS AS IDENTITY</code> plus <code>INSERT ALL</code> hands
+every row the same id and dies on the primary key.</p>
+
+<h2>The first pivot</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT *
+FROM   (SELECT product, quarter, amount FROM sales)
+PIVOT  (sum(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2, 'Q3' AS q3, 'Q4' AS q4))
+ORDER  BY product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">PRODUCT            Q1       Q2       Q3       Q4
+---------- ---------- -------- -------- --------
+Keyboard                   120
+Laptop           2100     1500     1100
+Monitor           400      650              300</code></pre>
+
+<p>Three clauses, each doing exactly one thing:</p>
+
+<table>
+  <thead><tr><th>Clause</th><th>What it decides</th></tr></thead>
+  <tbody>
+    <tr><td><code>sum(amount)</code></td><td>What goes in the cells. An aggregate is <strong>mandatory</strong> — a bare column gives <code>ORA-56902: non-aggregate expressions inside the PIVOT clause</code>.</td></tr>
+    <tr><td><code>FOR quarter</code></td><td>Which column's values become column headings.</td></tr>
+    <tr><td><code>IN ('Q1' AS q1, …)</code></td><td>Which of those values you want. Anything not listed is silently dropped.</td></tr>
+  </tbody>
+</table>
+
+<p>That last point deserves repeating, because there is no error and no warning. Pivot the same data
+on <code>IN ('Q1' AS q1, 'Q2' AS q2)</code> and the Laptop row reads 2100 and 1500 — the 1100 of Q3
+is simply gone, and any total you compute from the result is wrong. <strong>The <code>IN</code> list
+is a filter as much as it is a column list.</strong></p>
+
+<h2>The GROUP BY you did not write</h2>
+
+<p>Here is the whole trick, and the whole trap. <code>PIVOT</code> groups by <strong>every column of
+its input that appears in neither the aggregate nor the <code>FOR</code> clause</strong>. Above, the
+input was an inline view of exactly three columns: <code>amount</code> went to the aggregate,
+<code>quarter</code> to the <code>FOR</code>, so the grouping key was <code>product</code> alone —
+which is the report we wanted.</p>
+
+<p>Now pivot the table directly instead:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT *
+FROM   sales                                   -- not an inline view
+PIVOT  (sum(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2, 'Q3' AS q3, 'Q4' AS q4))
+ORDER  BY product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">        ID PRODUCT    REGION         Q1       Q2       Q3       Q4
+---------- ---------- ------ ---------- -------- -------- --------
+         8 Keyboard   EAST                    120
+         1 Laptop     EAST         1200
+         2 Laptop     EAST                   1500
+         3 Laptop     WEST          900
+         4 Laptop     WEST                            1100
+         5 Monitor    EAST          400
+         6 Monitor    WEST                    650
+         7 Monitor    WEST                                     300</code></pre>
+
+<p>Eight rows in, eight rows out, nothing aggregated at all. <code>id</code> and <code>region</code>
+came along, joined the grouping key, and <code>id</code> is unique — so every group holds exactly one
+row. No error, no warning: just a report that looks plausible on eight rows and is catastrophic on
+eight million.</p>
+
+<p><strong>Rule: always pivot an inline view selecting exactly the columns you want, and no
+others.</strong> Never pivot a table or a <code>SELECT *</code> directly. That also protects the
+query from the future — someone adds an audit column to <code>sales</code> next year and, with
+<code>SELECT *</code>, your report quietly changes shape.</p>
+
+<p>The corollary is the useful half. To report by region as well, put region back in the inline
+view:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT *
+FROM   (SELECT product, region, quarter, amount FROM sales)
+PIVOT  (sum(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2, 'Q3' AS q3, 'Q4' AS q4))
+ORDER  BY product, region;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">PRODUCT    REGION         Q1       Q2       Q3       Q4
+---------- ------ ---------- -------- -------- --------
+Keyboard   EAST                   120
+Laptop     EAST         1200     1500
+Laptop     WEST          900              1100
+Monitor    EAST          400
+Monitor    WEST                   650                300</code></pre>
+
+<p>The grain of the report is controlled entirely from the inline view's select list. Nothing inside
+the <code>PIVOT</code> clause changed.</p>
+
+<h2>Naming the output columns</h2>
+
+<p>Alias every value in the <code>IN</code> list. Without an alias Oracle names the column after the
+literal — <em>including its quotes</em> — leaving you a column you can only reference as a quoted
+identifier:</p>
+
+<pre class="language-sql"><code class="language-sql">-- The columns are literally named 'Q1' and 'Q2', apostrophes and all
+SELECT product, "'Q1'" AS q1
+FROM   (SELECT product, quarter, amount FROM sales)
+PIVOT  (sum(amount) FOR quarter IN ('Q1', 'Q2'))
+ORDER  BY product;</code></pre>
+
+<p>Numbers are worse: <code>FOR year IN (2023, 2024)</code> gives columns named <code>2023</code> and
+<code>2024</code>, which are not legal unquoted identifiers either.</p>
+
+<p>Three rules once you do alias:</p>
+
+<ul>
+  <li>The alias is an <strong>identifier</strong>, so it folds to upper case unless double-quoted.
+      <code>AS q1</code> produces a column named <code>Q1</code>; <code>AS "q1"</code> keeps the
+      lower case and forces every reference to quote it.</li>
+  <li>With one aggregate the value alias <em>is</em> the column name. With more than one, Oracle
+      concatenates <code>&lt;value alias&gt;_&lt;aggregate alias&gt;</code>.</li>
+  <li>That concatenation is subject to the identifier length limit — 128 bytes from 12.2, 30 before
+      it — and Oracle <strong>truncates silently rather than raising an error</strong>. Two long
+      aliases and you get a column named something you did not choose and cannot easily predict.</li>
+</ul>
+
+<h2>Several aggregates, several pivot columns</h2>
+
+<p>Both lists can hold more than one item. Multiple aggregates:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT *
+FROM   (SELECT product, quarter, amount FROM sales)
+PIVOT  (sum(amount) AS amt, count(*) AS cnt
+        FOR quarter IN ('Q1' AS q1, 'Q2' AS q2))
+ORDER  BY product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">PRODUCT        Q1_AMT     Q1_CNT     Q2_AMT     Q2_CNT
+---------- ---------- ---------- ---------- ----------
+Keyboard                        0        120          1
+Laptop           2100          2       1500          1
+Monitor           400          1        650          1</code></pre>
+
+<p>Look at the two empty cells on the Keyboard row, which differ. Each pivot cell is its aggregate
+applied to the rows behind it, so an empty cell follows the aggregate's own rule for an empty set:
+<code>sum</code> gives <code>NULL</code>, <code>count</code> gives <code>0</code>. A blank cell is
+not a zero unless the aggregate says so — use <code>NVL</code> when a report needs zeros:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT product, nvl(q1, 0) AS q1, nvl(q2, 0) AS q2
+FROM   (SELECT product, quarter, amount FROM sales)
+PIVOT  (sum(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2))
+ORDER  BY product;</code></pre>
+
+<p>Pivoting on a <em>combination</em> of columns means parenthesising both sides:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT *
+FROM   (SELECT product, region, quarter, amount FROM sales)
+PIVOT  (sum(amount) FOR (quarter, region) IN (('Q1','EAST') AS q1_east,
+                                              ('Q1','WEST') AS q1_west,
+                                              ('Q2','EAST') AS q2_east,
+                                              ('Q2','WEST') AS q2_west))
+ORDER  BY product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">PRODUCT       Q1_EAST    Q1_WEST    Q2_EAST    Q2_WEST
+---------- ---------- ---------- ---------- ----------
+Keyboard                                           120
+Laptop           1200        900       1500
+Monitor           400                              650</code></pre>
+
+<p>Which exposes the cost of the feature immediately: the <code>IN</code> list is the cross product
+of everything you want, written out by hand. Four quarters by two regions is eight entries; add a
+third region and you edit the query.</p>
+
+<h2>The IN list must be constant</h2>
+
+<p>This is the hard limitation, and the one that sends people looking for workarounds. The values
+have to be known at parse time, and Oracle has a distinct error for each way of getting that
+wrong:</p>
+
+<pre class="language-sql"><code class="language-sql">-- A subquery: rejected by the parser itself
+… PIVOT (sum(amount) FOR quarter IN (SELECT DISTINCT quarter FROM sales));
+-- ORA-00936: missing expression
+
+-- A bind variable: recognised, and specifically refused
+… PIVOT (sum(amount) FOR quarter IN (:q AS q1));
+-- ORA-56900: The bind variable is not supported inside a pivot or unpivot operation.
+
+-- A column reference
+… PIVOT (sum(amount) FOR quarter IN (product AS q1));
+-- ORA-56901: non-constant expression in pivot or unpivot values clause</code></pre>
+
+<p>Constant <em>expressions</em> are fine, though — the restriction is on values Oracle cannot fold
+before the plan exists, not on literals specifically. <code>IN (upper('q1') AS q1)</code> compiles and
+works.</p>
+
+<p>The reason is structural rather than an Oracle quirk: a result set's column list is fixed when the
+cursor is parsed, and a query whose columns depend on its own data cannot be parsed. Every other
+database with a pivot operator has the same restriction. Three ways out, in the order they are usually
+the right answer:</p>
+
+<p><strong>1. Generate the SQL.</strong> Query the distinct values, build the <code>IN</code> list as
+a string, execute it. Honest and debuggable, and the usual answer:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT listagg('''' || quarter || ''' AS ' || quarter, ', ')
+         WITHIN GROUP (ORDER BY quarter) AS in_list
+FROM   (SELECT DISTINCT quarter FROM sales);
+
+-- 'Q1' AS Q1, 'Q2' AS Q2, 'Q3' AS Q3, 'Q4' AS Q4</code></pre>
+
+<p>Paste that into the query, or concatenate it in PL/SQL and <code>OPEN … FOR</code> a ref cursor.
+Bind the filter values; only the column list should ever be concatenated, or you have written an SQL
+injection. If the pivot values come from user input rather than from a controlled column, check them
+against the real distinct values before they reach the string.</p>
+
+<p><strong>2. <code>PIVOT XML</code> with <code>ANY</code>.</strong> Oracle's own answer to the
+dynamic case, and the one place a subquery in the <code>IN</code> list is legal. It sidesteps the
+problem by returning a single <code>XMLType</code> column, so the shape is fixed after all:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT *
+FROM   (SELECT product, quarter, amount FROM sales)
+PIVOT  XML (sum(amount) FOR quarter IN (ANY));</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">PRODUCT    QUARTER_XML
+---------- --------------------------------------------------------------------------
+Keyboard   &lt;PivotSet&gt;&lt;item&gt;&lt;column name = "QUARTER"&gt;Q2&lt;/column&gt;&lt;column name = "SUM(AM
+           OUNT)"&gt;120&lt;/column&gt;&lt;/item&gt;&lt;/PivotSet&gt;
+Laptop     &lt;PivotSet&gt;&lt;item&gt;&lt;column name = "QUARTER"&gt;Q1&lt;/column&gt;&lt;column name = "SUM(AM
+           OUNT)"&gt;2100&lt;/column&gt;&lt;item&gt;…</code></pre>
+
+<p>Now the client has to parse XML, which is usually a worse problem than the one you started with.
+It is worth knowing it exists and rarely worth using.</p>
+
+<p><strong>3. Do not pivot in SQL at all.</strong> Return the narrow rows and let the report layer —
+the spreadsheet, the BI tool, the grid component — do the rotation. Pivoting is a presentation
+concern, and those tools do it dynamically without being asked twice.</p>
+
+<h2>UNPIVOT: columns back into rows</h2>
+
+<p>The inverse, and in practice the more useful of the two, because it is how you rescue a
+spreadsheet-shaped table into something you can actually query. Take the pivoted output as a
+table:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE quarterly_sales AS
+SELECT *
+FROM   (SELECT product, quarter, amount FROM sales)
+PIVOT  (sum(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2, 'Q3' AS q3, 'Q4' AS q4));
+
+SELECT * FROM quarterly_sales
+UNPIVOT (amount FOR quarter IN (q1 AS 'Q1', q2 AS 'Q2', q3 AS 'Q3', q4 AS 'Q4'))
+ORDER   BY product, quarter;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">PRODUCT    QU     AMOUNT
+---------- -- ----------
+Keyboard   Q2        120
+Laptop     Q1       2100
+Laptop     Q2       1500
+Laptop     Q3       1100
+Monitor    Q1        400
+Monitor    Q2        650
+Monitor    Q4        300</code></pre>
+
+<p>The clause reads in the opposite direction to <code>PIVOT</code>, and keeping that straight is most
+of the battle: <code>amount</code> is the <strong>new</strong> value column, <code>quarter</code> is
+the <strong>new</strong> label column, and the <code>IN</code> list names the <strong>existing</strong>
+columns to fold in, each aliased to the label it should carry. Drop the aliases and the labels are the
+column names, upper-cased.</p>
+
+<p>Three things to know:</p>
+
+<ul>
+  <li><strong>NULLs are dropped by default.</strong> Seven rows above, not twelve — Keyboard has no
+      Q1, Q3 or Q4. <code>UNPIVOT INCLUDE NULLS</code> gives the full 12-row grid. This is the
+      opposite of the default everywhere else in SQL, so it catches people in both directions.</li>
+  <li><strong>The folded columns must share a datatype.</strong> Mix a <code>NUMBER</code> column with
+      a <code>VARCHAR2</code> one and you get <code>ORA-01790: expression must have same datatype as
+      corresponding expression</code>. Cast them in an inline view first.</li>
+  <li><strong>No aggregate is involved.</strong> <code>UNPIVOT</code> is a row generator, not a
+      grouping operation, so none of the <code>GROUP BY</code> subtleties above apply to it. It is
+      the safe half of the pair.</li>
+</ul>
+
+<p>Parenthesise to fold several columns into one output row, which is how you unpivot a table with
+paired columns — the multi-aggregate pivot from earlier, run backwards:</p>
+
+<pre class="language-sql"><code class="language-sql">-- quarterly_detail is (product, q1_amt, q1_cnt, q2_amt, q2_cnt)
+SELECT * FROM quarterly_detail
+UNPIVOT ((amt, cnt) FOR quarter IN ((q1_amt, q1_cnt) AS 'Q1',
+                                    (q2_amt, q2_cnt) AS 'Q2'))
+ORDER   BY product, quarter;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">PRODUCT    QU        AMT        CNT
+---------- -- ---------- ----------
+Keyboard   Q1                     0
+Keyboard   Q2        120          1
+Laptop     Q1       2100          2
+Laptop     Q2       1500          1
+Monitor    Q1        400          1
+Monitor    Q2        650          1</code></pre>
+
+<p>Keyboard's Q1 row survives here, despite a null <code>amt</code>, because the pair's
+<code>cnt</code> is <code>0</code> and not null — <code>EXCLUDE NULLS</code> drops a row only when
+every folded column in it is null.</p>
+
+<h2>The CASE alternative, and when it is better</h2>
+
+<p>Every <code>PIVOT</code> is a <code>GROUP BY</code> with conditional aggregates. This is what the
+feature replaced, it works on any version and any database, and it is what <code>PIVOT</code> becomes
+internally:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT product,
+       sum(CASE WHEN quarter = 'Q1' THEN amount END) AS q1,
+       sum(CASE WHEN quarter = 'Q2' THEN amount END) AS q2,
+       sum(CASE WHEN quarter = 'Q3' THEN amount END) AS q3,
+       sum(CASE WHEN quarter = 'Q4' THEN amount END) AS q4
+FROM   sales
+GROUP  BY product
+ORDER  BY product;</code></pre>
+
+<p>Same result, same work — a full scan and a hash group by, in both cases. Written out this way the
+implicit grouping stops being implicit, which is exactly why the manual form is harder to get wrong,
+and why it is worth knowing even if you prefer <code>PIVOT</code>'s brevity.</p>
+
+<table>
+  <thead><tr><th>Prefer</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td><code>PIVOT</code></td><td>Many columns under the same aggregate — twelve months across stays readable where twelve <code>CASE</code> expressions do not.</td></tr>
+    <tr><td><code>CASE</code></td><td>A different aggregate or condition per column: <code>sum</code> here, <code>max</code> there, a condition on a second column. <code>PIVOT</code> applies the same aggregate list to every value.</td></tr>
+    <tr><td><code>CASE</code></td><td>The query must also run on 10g, or on another database.</td></tr>
+    <tr><td><code>CASE</code></td><td>You want the grouping key visible in the query text, because someone will edit this later.</td></tr>
+  </tbody>
+</table>
+
+<h2>What the plan looks like</h2>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN PLAN FOR
+SELECT * FROM (SELECT product, quarter, amount FROM sales)
+PIVOT (sum(amount) FOR quarter IN ('Q1' AS q1, 'Q2' AS q2, 'Q3' AS q3, 'Q4' AS q4));
+
+SELECT * FROM table(dbms_xplan.display(format => 'BASIC'));</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">-------------------------------------
+| Id  | Operation           | Name  |
+-------------------------------------
+|   0 | SELECT STATEMENT    |       |
+|   1 |  HASH GROUP BY PIVOT|       |
+|   2 |   TABLE ACCESS FULL | SALES |
+-------------------------------------</code></pre>
+
+<p>One line tells you everything: <code>HASH GROUP BY PIVOT</code>. There is no pivot
+<em>algorithm</em> — it is an ordinary group-by whose aggregates happen to be conditional. So the
+performance question is never "is <code>PIVOT</code> slow"; it is the same question as for any
+aggregate — how much of the table must be read, and can an index cover it.</p>
+
+<p>Two practical consequences:</p>
+
+<ul>
+  <li>Filter <strong>inside</strong> the inline view. A <code>WHERE</code> on the pivot's output runs
+      after aggregation; the same predicate in the inline view eliminates rows before it, and can use
+      an index.</li>
+  <li>The source is read <strong>once</strong>. That is <code>PIVOT</code>'s real advantage over the
+      shape it usually replaces in older code — four correlated scalar subqueries, or four self-joins,
+      one per quarter.</li>
+</ul>
+
+<h2>The checklist</h2>
+
+<ul>
+  <li>Pivot an <strong>inline view</strong> listing exactly the columns you want, never a table.</li>
+  <li>Everything not in the aggregate or the <code>FOR</code> clause becomes the grouping key.</li>
+  <li>Alias every value in the <code>IN</code> list, and keep the aliases short.</li>
+  <li>Values missing from the <code>IN</code> list are dropped without a word.</li>
+  <li>An empty cell is whatever the aggregate returns for no rows: <code>NULL</code> from
+      <code>sum</code>, <code>0</code> from <code>count</code>.</li>
+  <li>The <code>IN</code> list must be constant. Generate the SQL, or pivot in the report layer.</li>
+  <li><code>UNPIVOT</code> excludes NULLs by default and needs one datatype across the folded
+      columns.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>PL/SQL — Oracle's procedural language, and the reason a lot of business logic in enterprise systems
+lives inside the database rather than in front of it. It is also where a dynamically generated pivot
+ends up living.</p>

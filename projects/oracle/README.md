@@ -1,6 +1,6 @@
 # Oracle Database track
 
-Adds **Oracle** as a category under the *Data Store* nav group and publishes a 13-post tutorial
+Adds **Oracle** as a category under the *Data Store* nav group and publishes a 14-post tutorial
 track into it.
 
 ```
@@ -25,16 +25,17 @@ projects/oracle/
 | 7 | `oracle-joins` | 2024-02-19 |
 | 8 | `oracle-cross-apply` | 2024-02-22 |
 | 9 | `oracle-analytic-functions` | 2024-02-26 |
-| 10 | `oracle-pl-sql` | 2024-03-04 |
-| 11 | `oracle-indexes-and-execution-plans` | 2024-03-11 |
-| 12 | `oracle-transactions-and-locking` | 2024-03-18 |
-| 13 | `oracle-with-spring-boot` | 2024-03-25 |
+| 10 | `oracle-pivot` | 2024-03-01 |
+| 11 | `oracle-pl-sql` | 2024-03-04 |
+| 12 | `oracle-indexes-and-execution-plans` | 2024-03-11 |
+| 13 | `oracle-transactions-and-locking` | 2024-03-18 |
+| 14 | `oracle-with-spring-boot` | 2024-03-25 |
 
 URLs are `/oracle/{slug}`. **The slugs are now live — changing one changes a URL.**
 
 The dates ascend with the track on purpose. Archives and the sitemap sort newest first (so the
 archive leads with Spring Boot), and `siblings()` in `src/lib/content.ts` reverses the category index
-to walk oldest-first, which is what makes the ‹ prev / next › pager read as lesson 1 → lesson 13.
+to walk oldest-first, which is what makes the ‹ prev / next › pager read as lesson 1 → lesson 14.
 Identical timestamps would leave that ordering up to sort stability.
 
 To insert a post mid-track, give it a date between its neighbours (`oracle-cross-apply` is

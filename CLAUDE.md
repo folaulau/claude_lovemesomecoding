@@ -214,3 +214,7 @@ Note: only these agent types exist here — `claude`, `general-purpose`, `Explor
 - Do **not** push to remote — I do that.
 - Never commit log files, `node_modules`, build output, or migration artifacts. Delete stray logs.
 - Write a real commit message explaining *why*, not just what.
+
+## Demo projects
+- lovemesomecoding_demo_project directory has apps that we must use to reference and create snippets from for examples.
+- pizza in lovemesomecoding_demo_project is an app like https://www.pizzahut.com or https://www.dominos.com
