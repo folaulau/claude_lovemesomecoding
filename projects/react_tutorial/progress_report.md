@@ -1,6 +1,6 @@
 # React tutorial track — progress report
 
-**Status:** planning complete, authoring in progress
+**Status:** PUBLISHED — live on prod, 2026-08-17
 **Started:** 2026-08-17
 **Where it lands:** https://lovemesomecoding.com/react
 
@@ -16,14 +16,17 @@ This project rewrites all 17 **in place** — same slugs, so no URL is lost — 
 (function components, hooks, TypeScript) and adds 8 new posts for the topics that hooks-era React
 needs and no existing slug covers.
 
-**Result: a 25-post track.**
+**Result: a 26-post track**, after a `react-get-started` landing page was added at the front.
 
 ## Decisions
 
 | Decision | Choice | Why |
 |---|---|---|
 | Existing 17 posts | Rewrite in place, keep every slug | They are indexed URLs. Rewriting keeps the ranking and kills the stale content in one move. |
-| Track size | 25 posts (17 rewritten + 8 new) | Comparable to the Oracle track's 14; deep enough to be a real tutorial, finite enough to maintain. |
+| Track size | 26 posts (17 rewritten + 9 new) | Comparable to the Oracle track's 14; deep enough to be a real tutorial, finite enough to maintain. |
+| Dates | Restamped to 2026-06-03 … 2026-08-17, 3 days apart | The old posts carried 2019 dates, which `upsert_post` never overwrites — hence `seed.py --force-dates`. Without it the pager reads in the wrong order. |
+| Redux example | Redux Toolkit for the admin area only | Folau built it: four slices, `<Provider>` inside `AdminLayout`. Storefront keeps its four contexts, so `pizza/CLAUDE.md` still holds — and Redux lands in the lazy admin chunk. |
+| Sass example | `theme.css` converted to `theme.scss` + `_tokens.scss` | Compiled output diffed against the original: identical bar Sass normalising `rgb()`, a computed `--pizza-red-dark`, and `prefers-reduced-motion` inverted to `no-preference`. |
 | Snippet language | TypeScript | Copied verbatim from `pizza-react-frontend`, so every snippet is provably real, runnable code. |
 | Example source | `pizza-react-frontend` | Per the README. Where the app lacks an example, add it to the app first, then snippet from it. |
 | Seeding | Backend service layer, as `projects/oracle/seed.py` does | The static build reads only the derived indexes; reusing the admin API's own code is the only way to be sure indexes and posts agree. |
@@ -88,15 +91,29 @@ lesson 1 → lesson 25 (see `projects/oracle/README.md` for why).
 | 24 | `react-with-bootstrap` | React with Bootstrap | rewrite (13w) | the whole app — `react-bootstrap` |
 | 25 | `react-sass` | Sass | rewrite (41w) | **Gap: pizza uses plain CSS.** |
 
-## Known gaps in the demo app
+## Demo-app changes this required
 
-Two posts have no example in `pizza-react-frontend` yet. Per the README these need the app
-extended first:
+Both gaps are closed; every one of the 26 posts now snippets from running code.
 
-- **`react-redux`** — the app deliberately uses Context + `useReducer` (`pizza/CLAUDE.md` asks for
-  a React context use case). Bolting Redux onto it would contradict that. Resolution pending.
-- **`react-sass`** — the app styles with `bootstrap.min.css` + `src/styles/theme.css`, no Sass.
-  Resolution pending.
+| Change | Owner | State |
+|---|---|---|
+| Redux Toolkit for `/admin` — `catalogSlice`, `ordersSlice`, `reportsSlice`, `usersSlice`, `apiFailure.ts`, `<Provider>` in `AdminLayout` | Folau | done, `npm run build` passes |
+| `theme.css` → `theme.scss` + `_tokens.scss`, `sass` devDependency, import swapped in `main.tsx` | Claude | done, compiled output diffed against the original |
+
+## Site changes this required
+
+The track is written in TypeScript, and neither end of the pipeline knew those language names.
+
+- `lovemesomecoding_backend/app/services/content.py` — added `typescript`, `jsx`, `tsx` to
+  `SUPPORTED_LANGUAGES`. The `"ts": "javascript"` alias was deliberately **left alone**: it is what
+  the 512 migrated posts used, and remapping it would change how they highlight on their next save.
+- `lovemesomecoding_frontend/src/lib/content.ts` — static-imported `prism-typescript`,
+  `prism-jsx`, `prism-tsx`. Order matters: `tsx` depends on the other two.
+
+⚠️ **The backend Lambda has not been redeployed.** Seeding ran the local service layer, so what is
+in S3 is correct — but until `lovemesomecoding_backend/scripts/deploy.sh` runs, editing one of these
+posts through `/admin` would normalise its `tsx` blocks down to `plaintext` and silently lose the
+highlighting.
 
 ## Files
 
