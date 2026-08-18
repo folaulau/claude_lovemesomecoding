@@ -1,4 +1,4 @@
-<p>Twenty questions pitched at senior level — the ones that separate someone who has used React from
+<p>Twenty-four questions pitched at senior level — the ones that separate someone who has used React from
 someone who understands why it behaves the way it does. Most of them are not really about API
 surface; they are about rendering, identity and when <em>not</em> to reach for a feature.</p>
 
@@ -317,9 +317,145 @@ narrowing <code>CartContextValue | undefined</code> to <code>CartContextValue</c
 needs a null check, and turning a missing provider into a sentence instead of <em>"cannot read
 properties of undefined"</em>.</p>
 
-<h2>Architecture</h2>
+<h2>Context</h2>
 
-<h3>13. Why do people say "context causes performance problems", and are they right?</h3>
+<h3>13. How does Context actually work, and what problem does it solve?</h3>
+
+<p>It solves prop drilling — threading a value through five components that do not use it, to reach
+the sixth that does. The cart is needed by the navbar badge, the menu page, the drawer and checkout,
+and those sit in four different branches of the tree.</p>
+
+<p>Three pieces, always:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// 1. Create — outside any component.
+const CartContext = createContext&lt;CartContextValue | undefined&gt;(undefined);
+
+// 2. Provide — a component that owns the state and publishes it.
+export function CartProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(cartReducer, initialState);
+  const value = useMemo(() =&gt; ({ /* … */ }), [/* … */]);
+  return &lt;CartContext.Provider value={value}&gt;{children}&lt;/CartContext.Provider&gt;;
+}
+
+// 3. Consume — anywhere below the provider.
+const { totals } = useContext(CartContext);</code></pre>
+
+<p>Two things a senior answer gets right about the mechanism.</p>
+
+<p><strong>Context does not hold state — it distributes it.</strong> The provider component owns the
+state, with ordinary <code>useState</code> or <code>useReducer</code>; context is only the delivery
+mechanism. People describe it as "global state" and that framing causes most of the confusion around
+it.</p>
+
+<p><strong>It is a lookup <em>up</em> the tree, not a global registry.</strong> <code>useContext</code>
+walks up from the calling component and takes the value from the nearest matching provider above it.
+That is what makes nested providers work — you can wrap a subtree in a second provider to override
+the value for just that branch, which is how theming works.</p>
+
+<h3>14. What should you pass as <code>createContext</code>'s default value?</h3>
+
+<p>Two misconceptions to clear up. It is <strong>not</strong> the initial value — the provider's
+<code>value</code> prop is that. The default is used only when a component reads the context with
+<strong>no provider above it at all</strong>, which in a correctly assembled app never happens.</p>
+
+<p>So the temptation is to pass something plausible-looking, and that is the trap:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Tempting, and wrong: a component rendered outside the provider silently gets an empty cart that
+// never updates, and you debug the symptom for an hour instead of the cause.
+const CartContext = createContext&lt;CartContextValue&gt;({ items: [], totals: emptyTotals, /* … */ });
+
+// `undefined` as the default is deliberate — it makes the mistake detectable.
+const CartContext = createContext&lt;CartContextValue | undefined&gt;(undefined);</code></pre>
+
+<p>Pass <code>undefined</code>, and put the guard in the custom hook that wraps it — which is also
+what removes <code>| undefined</code> from the type so no consumer needs a null check:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function useCart(): CartContextValue {
+  const context = useContext(CartContext);
+  if (context === undefined) {
+    throw new Error('useCart must be used inside a &lt;CartProvider&gt;');
+  }
+  return context;
+}</code></pre>
+
+<p>The failure this catches is a real one: a provider accidentally mounted <em>below</em> the
+component that needs it, or a component moved outside the tree during a refactor. Without the guard
+you get an inert value that never updates, which looks like a state bug anywhere except where it
+is.</p>
+
+<h3>15. When is composition the better answer than context?</h3>
+
+<p>More often than people expect, and this is a strong differentiator. Context is not the only way to
+avoid passing a prop through the middle — you can also pass the <em>rendered element</em> down
+instead of the data it needs:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Drilling: Layout does not use `user`, it just carries it.
+&lt;Layout user={user}&gt;
+  &lt;Dashboard /&gt;
+&lt;/Layout&gt;
+
+// Composition: Layout takes finished markup and never learns about `user` at all.
+&lt;Layout sidebar={&lt;UserPanel user={user} /&gt;}&gt;
+  &lt;Dashboard /&gt;
+&lt;/Layout&gt;</code></pre>
+
+<p>The second version has no provider, no context, no re-render fan-out — and the value is resolved
+where it is already in scope. When the "drilling" is one or two intermediate layout components,
+this is almost always the better tool.</p>
+
+<p>Context earns its place when the consumers are <strong>many, scattered and unknown to the
+parent</strong>. Nobody can pass the cart down to the navbar badge as an element, because the navbar
+is a sibling of the routes, not a child of the menu page.</p>
+
+<p>The other half of the answer: <strong>two levels is not prop drilling, it is just props.</strong>
+This app deliberately does both — the cart <em>contents</em> are in context, but whether the drawer
+is open is plain lifted state, because exactly two components care:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// The drawer's open/closed state lives here because both the navbar (which opens it) and the
+// drawer itself need it. The cart CONTENTS are in context; this piece of purely-visual state
+// is not worth putting there.
+const [cartOpen, setCartOpen] = useState(false);</code></pre>
+
+<h3>16. What belongs in context, and does provider nesting order matter?</h3>
+
+<p>Good candidates share a shape: read by many components, written by few, and changing at a rate the
+consumers can live with. The signed-in user, a theme, a locale, a design-system config, a shopping
+cart. Bad candidates: transient UI state that two components share (lift it), form field values
+(local), and — the big one — <strong>server data</strong>, which wants caching, deduplication,
+retries and revalidation, i.e. a query library rather than a provider.</p>
+
+<p><strong>Order matters as soon as one provider consumes another.</strong> In this app
+<code>CartProvider</code> calls <code>useMenu()</code>, because a saved cart line stores only ids and
+re-pricing it needs the catalogue:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function CartProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(cartReducer, initialState);
+
+  // The catalogue is needed to rebuild a saved line's base price and crust surcharge.
+  const { products, crusts, loading: menuLoading } = useMenu();
+  /* … */
+}</code></pre>
+<pre class="language-tsx"><code class="language-tsx">&lt;AuthProvider&gt;
+  &lt;MenuProvider&gt;
+    &lt;CartProvider&gt;        {/* must be INSIDE MenuProvider */}
+      &lt;ToastProvider&gt;
+        &lt;App /&gt;
+      &lt;/ToastProvider&gt;
+    &lt;/CartProvider&gt;
+  &lt;/MenuProvider&gt;
+&lt;/AuthProvider&gt;</code></pre>
+
+<p>Swap those two and the app throws <em>"useMenu must be used inside a &lt;MenuProvider&gt;"</em> at
+startup — which, thanks to the guard from question 14, names the problem instead of surfacing as
+<code>undefined</code> somewhere unrelated. Where there is no such dependency, nest for readability:
+longest-lived outermost.</p>
+
+<p>One more thing worth volunteering: <strong>where you mount a provider is a bundling decision
+too.</strong> This app's Redux <code>&lt;Provider&gt;</code> sits inside the lazily-loaded
+<code>AdminLayout</code> rather than in <code>main.tsx</code>, which keeps all 37 kB of store and
+slices out of the bundle every customer downloads.</p>
+
+<h3>17. Why do people say "context causes performance problems", and are they right?</h3>
 
 <p>Partly. Every component consuming a context re-renders when that context's value changes, and
 context compares the value by <strong>reference</strong>. So the actual problem is almost always
@@ -348,7 +484,9 @@ everything that only cares who is signed in.</p>
 <p>The honest caveat: context has no selector API, so a consumer cannot subscribe to one field of a
 value. That is a genuine limitation, and it is one of the reasons stores exist.</p>
 
-<h3>14. When would you add Redux to an app that already has context and reducers?</h3>
+<h2>Architecture</h2>
+
+<h3>18. When would you add Redux to an app that already has context and reducers?</h3>
 
 <p>A reducer inside a context provider is already Redux's architecture, so the answer has to be about
 what the library adds beyond that:</p>
@@ -376,7 +514,7 @@ needed.</p>
 <em>server</em> data, and server data has better tools now. Reach for a store for genuinely shared,
 long-lived, client-side state — not because the app is "big".</p>
 
-<h3>15. What do error boundaries not catch?</h3>
+<h3>19. What do error boundaries not catch?</h3>
 
 <p>Event handlers, async code, errors thrown inside the boundary itself, and server rendering. Which
 is most of what actually goes wrong — a failed request is far more common than a component throwing
@@ -392,7 +530,7 @@ codebase keeps one. And <strong>placement is the whole benefit</strong>: a bound
 content leaves the navbar, cart drawer and footer alive when a page crashes, whereas one at the root
 catches everything and therefore loses everything.</p>
 
-<h3>16. Where do you split your bundle, and what goes wrong if you overdo it?</h3>
+<h3>20. Where do you split your bundle, and what goes wrong if you overdo it?</h3>
 
 <p>At route boundaries, and specifically routes a given visitor is unlikely to visit — plus heavy
 single-screen libraries (charts, editors, maps) and anything behind a permission most users lack.</p>
@@ -416,7 +554,7 @@ a chunk 404 after a deploy while someone has the old page open, which is why the
 
 <h2>Performance</h2>
 
-<h3>17. When does <code>memo</code> do nothing?</h3>
+<h3>21. When does <code>memo</code> do nothing?</h3>
 
 <p>Whenever a prop is a new reference on every render, which is three cases and one underlying
 cause:</p>
@@ -438,7 +576,7 @@ is pure waste, because nothing downstream compares it. And composition is often 
 memoisation — moving state down, or passing the expensive subtree as <code>children</code> so it is
 not re-created, solves the same problem structurally.</p>
 
-<h3>18. A page feels slow. How do you find out why?</h3>
+<h3>22. A page feels slow. How do you find out why?</h3>
 
 <p>The answer should be a method, not a list of hooks.</p>
 
@@ -463,7 +601,7 @@ bundle that should be split.</p>
 
 <h2>Modern React</h2>
 
-<h3>19. What changed in React 19 that affects how you write code?</h3>
+<h3>23. What changed in React 19 that affects how you write code?</h3>
 
 <p>The ones that come up:</p>
 
@@ -485,7 +623,7 @@ bundle that should be split.</p>
       those rules matter more rather than less.</li>
 </ul>
 
-<h3>20. Explain Server Components, and the concurrent features you have actually used.</h3>
+<h3>24. Explain Server Components, and the concurrent features you have actually used.</h3>
 
 <p><strong>Server Components</strong> render on the server and send a description of the UI rather
 than JavaScript. They can read a database or the filesystem directly, and they ship zero bundle. The
@@ -512,7 +650,7 @@ solves is the point.</p>
 <h2>How to use this list</h2>
 
 <p>If you are preparing, the highest-value work is not memorising these — it is being able to point at
-code you have written and say why. Questions 1, 4, 5 and 8 are the load-bearing ones; nearly every
+code you have written and say why. Questions 1, 4, 5, 8 and 13 are the load-bearing ones; nearly every
 other React question reduces to one of them.</p>
 
 <p>If you are interviewing someone, the follow-up is where the signal is. "Why is that a problem?" and

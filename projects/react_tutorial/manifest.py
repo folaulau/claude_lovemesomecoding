@@ -384,10 +384,10 @@ POSTS = [
         "date": "2026-08-20T09:00:00",
         "tags": ["react", "interview"],
         "excerpt": (
-            "Twenty senior-level questions and answers — what actually triggers a re-render, why "
-            "three setState calls only count once, what breaks when you lie to a dependency array, "
-            "when memo silently does nothing, what error boundaries do not catch, and how to "
-            "diagnose a slow page without reaching for useMemo first. Grounded in real code."
+            "Twenty-four senior-level questions and answers — what actually triggers a re-render, "
+            "why three setState calls only count once, what breaks when you lie to a dependency "
+            "array, a five-question section on Context, when memo silently does nothing, what "
+            "error boundaries do not catch, and how to diagnose a slow page. Grounded in real code."
         ),
     },
 ]

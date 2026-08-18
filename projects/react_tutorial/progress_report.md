@@ -96,7 +96,7 @@ lesson 1 → lesson 27 (see `projects/oracle/README.md` for why).
 
 | # | Slug | Title | State | Source in the demo app |
 |---|------|-------|-------|------------------------|
-| 27 | `react-interview-questions` | Interview Questions | **new** | draws on the whole app + the real build output |
+| 27 | `react-interview-questions` | Interview Questions — 24 senior Q&A in 7 sections | **new** | draws on the whole app + the real build output |
 
 ## Demo-app changes this required
 
@@ -141,10 +141,26 @@ projects/react_tutorial/
 | 2026-08-17 | Audit the 17 live posts, read react.dev + w3schools curricula | Claude | done |
 | 2026-08-17 | Inventory `pizza-react-frontend` React feature coverage | Claude | done |
 | 2026-08-17 | Agree scope, snippet language, fate of the old posts | Folau | done |
-| 2026-08-17 | Topic list above | Claude | done |
-| 2026-08-17 | Scaffold `manifest.py` / `seed.py` / `check_content.py` | Claude | in progress |
-| | Author the 25 post bodies | Claude | not started |
-| | Close the Redux and Sass example gaps in the pizza app | Claude | not started |
-| | Run the pizza app + its Playwright suite, confirm nothing broke | Claude | not started |
-| | `check_content.py`, then seed `--env local`, review at :3000 | Claude | not started |
-| | Seed `--env prod --write`, deploy | Folau | not started |
+| 2026-08-17 | Scaffold `manifest.py` / `seed.py` (+ `--force-dates`) / `check_content.py` | Claude | done |
+| 2026-08-17 | Teach both ends of the pipeline about `tsx` / `typescript` | Claude | done |
+| 2026-08-17 | Convert the pizza theme to Sass (`_tokens.scss` + `theme.scss`) | Claude | done |
+| 2026-08-17 | Add Redux Toolkit to the admin area — four slices, `<Provider>` in `AdminLayout` | Folau | done |
+| 2026-08-17 | Add `react-get-started` at the front, restamp all dates | Claude | done |
+| 2026-08-17 | Author 26 post bodies — 30,238 words, 266 code blocks | Claude | done |
+| 2026-08-17 | `check_content.py` — every sample round-trips byte-for-byte | Claude | done |
+| 2026-08-17 | Seed local, sync, build — `verify-build` 542/542 | Claude | done |
+| 2026-08-17 | Seed prod `--force-dates --write`, `npm run deploy` — edge serving `394b0bd` | Claude | done |
+| 2026-08-17 | Add `react-interview-questions` — 20 senior questions, 3,842 words | Claude | done |
+| 2026-08-17 | Add a dedicated **Context** section — 4 new questions + the perf one moved in; 24 total, 4,852 words | Claude | done |
+| 2026-08-17 | Re-seed prod + deploy — 569/569 posts, 27 in `/react` | Claude | done |
+| | Redeploy the backend Lambda so `/admin` edits keep `tsx` highlighting | Folau | **outstanding** |
+| | Run the pizza Playwright suite against the Sass + Redux + `/interview-questions` changes | Folau | **outstanding** |
+
+## Outstanding
+
+1. **Backend Lambda not redeployed.** Seeding ran the local service layer, so what is in S3 is
+   correct — but until `lovemesomecoding_backend/scripts/deploy.sh` runs, editing one of these 27
+   posts through `/admin` would normalise its `tsx` blocks down to `plaintext` and silently lose the
+   highlighting. This is the only thing that can quietly undo the work.
+2. **Pizza Playwright suite has not run** against the combined Sass, Redux and
+   `/interview-questions` changes. `npm run build` and `npm run typecheck` both pass.
