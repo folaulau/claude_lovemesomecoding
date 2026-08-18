@@ -1,0 +1,221 @@
+<p>Spring Security has a reputation for being impenetrable, and most of that comes from trying to
+configure it before understanding what it is doing. There are really only four pieces, and everything
+else is arrangement.</p>
+
+<h2>The four pieces</h2>
+
+<table>
+  <thead>
+    <tr><th>Piece</th><th>Job</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Filter chain</strong></td><td>a list of servlet filters that runs before your
+    controller</td></tr>
+    <tr><td><strong><code>Authentication</code></strong></td><td>who the caller is, and what they may
+    do</td></tr>
+    <tr><td><strong><code>SecurityContext</code></strong></td><td>where that lives for the duration of
+    the request</td></tr>
+    <tr><td><strong><code>AuthenticationManager</code></strong></td><td>the thing that turns
+    credentials into an <code>Authentication</code></td></tr>
+  </tbody>
+</table>
+
+<p>Note where the filter chain sits: <strong>before the DispatcherServlet</strong> (lesson 10). Spring
+Security can therefore answer a request entirely on its own, which is why you can get a 403 for a URL
+that has no controller.</p>
+
+<h2>Authentication is not authorization</h2>
+
+<p>This distinction is the key to reading any Spring Security configuration:</p>
+
+<ul>
+  <li><strong>Authentication</strong> — who are you? Produces an <code>Authentication</code>, or
+  nothing.</li>
+  <li><strong>Authorization</strong> — may you do this? Consults that <code>Authentication</code>.</li>
+</ul>
+
+<p>Keeping them separate is what makes the pizza API's guest checkout possible, and its JWT filter
+says so explicitly:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Note what this filter does NOT do: it never rejects a request. A missing or bad token simply
+ * leaves the context anonymous, and the authorization rules in SecurityConfig then decide whether
+ * that is acceptable. Keeping authentication and authorization separate is what allows guest
+ * checkout to share an endpoint with authenticated ordering.
+ */</code></pre>
+
+<p>One endpoint, <code>POST /api/orders</code>, serves both a signed-in customer and a guest. The
+filter attaches an identity if there is one; the endpoint works either way. A filter that rejected
+unauthenticated requests would need two endpoints.</p>
+
+<h2>Storing passwords</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * BCrypt deliberately makes hashing slow, which is the point: it makes brute-forcing a stolen
+ * password table expensive. Never store a password with a fast hash such as MD5 or SHA-256.
+ */
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}</code></pre>
+
+<p>That comment contains the whole lesson. SHA-256 is designed to be fast, so an attacker with a
+stolen table can try billions of candidates per second. BCrypt is designed to be slow and has a work
+factor you can raise as hardware improves. It also salts each hash automatically, so two users with
+the same password get different hashes and one rainbow table cannot crack both.</p>
+
+<p><strong>Never write your own.</strong> Use <code>BCryptPasswordEncoder</code>, or
+<code>Argon2PasswordEncoder</code> if you want the current best practice.</p>
+
+<h2>Registration</h2>
+
+<pre class="language-java"><code class="language-java">@Override
+@Transactional
+public AuthenticationResponseDTO register(RegisterDTO dto) {
+    if (userDAO.existsByEmail(dto.email())) {
+        throw ApiException.badRequest("That email is already registered");
+    }
+
+    User user = User.builder()
+            .email(dto.email().trim().toLowerCase())
+            // Hash immediately. The plaintext password must never be stored, logged, or
+            // returned — from here on only the hash exists.
+            .passwordHash(passwordEncoder.encode(dto.password()))
+            .fullName(dto.fullName())
+            // Registration ALWAYS creates a CUSTOMER. If the role came from the request body,
+            // anyone could sign up as an admin by adding one field to the JSON.
+            .role(UserRole.CUSTOMER)
+            .build();
+
+    return buildAuthResponse(userDAO.save(user));
+}</code></pre>
+
+<p>Three deliberate decisions:</p>
+
+<ul>
+  <li><strong>Hash immediately.</strong> The plaintext exists only as a method parameter, and never
+  reaches a field, a log or a response.</li>
+  <li><strong>Normalise the email</strong> — trimmed and lower-cased — so
+  <code>Folau@Example.com</code> and <code>folau@example.com</code> cannot become two accounts.</li>
+  <li><strong>The role is hard-coded.</strong> This is the mass-assignment guard from lesson 11 in its
+  sharpest form: <code>RegisterDTO</code> has no <code>role</code> field, so a role cannot arrive from
+  a request body even if someone later adds mapping for it.</li>
+</ul>
+
+<h2>Login, and account enumeration</h2>
+
+<pre class="language-java"><code class="language-java">@Override
+@Transactional(readOnly = true)
+public AuthenticationResponseDTO login(LoginDTO dto) {
+    User user = userDAO.findByEmail(dto.email())
+            // Same exception whether the user is unknown or the password is wrong, so the
+            // response cannot be used to discover which emails have accounts.
+            .orElseThrow(() -&gt; new BadCredentialsException("Invalid email or password"));
+
+    if (!passwordEncoder.matches(dto.password(), user.getPasswordHash())) {
+        throw new BadCredentialsException("Invalid email or password");
+    }
+
+    return buildAuthResponse(user);
+}</code></pre>
+
+<p><strong>Both failures produce the identical exception and message.</strong> "No account with that
+email" is friendlier and it is an oracle: an attacker submits a list of addresses and learns which
+ones are registered. That is valuable on its own, and doubly so combined with a password dump from
+somewhere else.</p>
+
+<p>Note also <code>passwordEncoder.matches(raw, hash)</code> — you never decrypt a BCrypt hash. It
+hashes the candidate with the stored salt and compares, in constant time.</p>
+
+<p>The same reasoning drives the exception handler (lesson 12), which flattens every authentication
+failure to one message.</p>
+
+<h2>Populating the SecurityContext</h2>
+
+<pre class="language-java"><code class="language-java">@Component
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(
+            HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+            throws ServletException, IOException {
+
+        String token = extractToken(request);
+
+        if (token != null &amp;&amp; SecurityContextHolder.getContext().getAuthentication() == null) {
+            Claims claims = jwtService.parse(token);
+
+            if (claims != null) {
+                String email = claims.getSubject();
+                String role = claims.get("role", String.class);
+
+                // Spring Security matches hasRole("ADMIN") against the authority "ROLE_ADMIN".
+                // The prefix is added here rather than stored in the database.
+                var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
+
+                var authentication =
+                        new UsernamePasswordAuthenticationToken(email, null, authorities);
+                authentication.setDetails(
+                        new WebAuthenticationDetailsSource().buildDetails(request));
+
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            }
+        }
+
+        filterChain.doFilter(request, response);
+    }
+}</code></pre>
+
+<p>⚠️ <strong>The <code>ROLE_</code> prefix.</strong> <code>hasRole("ADMIN")</code> checks for an
+authority literally called <code>ROLE_ADMIN</code>; <code>hasAuthority("ADMIN")</code> checks for
+<code>ADMIN</code>. Mixing them up gives you a 403 with everything apparently configured correctly.
+Adding the prefix in one place, as above, keeps the database clean and the confusion contained.</p>
+
+<p><code>OncePerRequestFilter</code> matters too: a plain <code>Filter</code> can run more than once
+per request on forwards and error dispatches, and re-authenticating each time is wasted work.</p>
+
+<h2>Reading the current user</h2>
+
+<pre class="language-java"><code class="language-java">@GetMapping("/me")
+public ResponseEntity&lt;UserDTO&gt; me(Authentication authentication) {
+    String email = authentication.getName();
+    return ResponseEntity.ok(userService.getUserByEmail(email));
+}</code></pre>
+
+<p>Spring injects the <code>Authentication</code> as a method parameter — no static lookup needed.
+<code>@AuthenticationPrincipal</code> works too. The static
+<code>SecurityContextHolder.getContext().getAuthentication()</code> is available anywhere, and is
+worth avoiding in controllers because it makes the method's dependencies invisible.</p>
+
+<p>Note the pattern the pizza API builds on this: <code>/api/me/**</code> resolves the owner from the
+token, so there is <strong>no user id in the path</strong> that could be swapped for someone else's.
+That removes an entire class of authorization bug rather than defending against it.</p>
+
+<h2>Where the SecurityContext lives</h2>
+
+<p>It is stored in a <code>ThreadLocal</code>. Two consequences:</p>
+
+<ul>
+  <li><strong>It is cleared at the end of each request</strong>, which is what makes a stateless API
+  stateless.</li>
+  <li><strong>It does not propagate to a new thread.</strong> An <code>@Async</code> method starts with
+  an empty context, so a <code>@PreAuthorize</code> in there sees an anonymous caller. If you need the
+  identity on another thread, pass it explicitly — which is another argument for events carrying
+  values (lesson 9).</li>
+</ul>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Four pieces:</strong> filter chain, <code>Authentication</code>,
+  <code>SecurityContext</code>, <code>AuthenticationManager</code>.</li>
+  <li><strong>Authenticate in the filter, authorize in the rules.</strong> That separation is what
+  lets one endpoint serve guests and members.</li>
+  <li><strong>BCrypt, hashed immediately</strong>, and never a fast hash.</li>
+  <li><strong>Identical failure for unknown user and wrong password.</strong></li>
+  <li><strong><code>hasRole("ADMIN")</code> means the authority <code>ROLE_ADMIN</code>.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-security-config">configuring the filter chain</a> — the
+lambda DSL, and why rule order decides whether an endpoint is protected.</p>

@@ -1,0 +1,230 @@
+<p>JPA is the specification, Hibernate is the implementation, and Spring Data JPA is the layer that
+removes the boilerplate on top of both. This lesson is about the middle one — what Hibernate is
+actually doing — because that is where the surprises live.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-data-jpa&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;com.mysql&lt;/groupId&gt;
+    &lt;artifactId&gt;mysql-connector-j&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre class="language-properties"><code class="language-properties">spring.datasource.url=jdbc:mysql://127.0.0.1:3306/pizza
+spring.datasource.username=root
+spring.datasource.password=
+
+# Liquibase owns the schema. `validate` makes Hibernate refuse to start if the
+# entities and the tables have drifted apart, which is exactly what we want:
+# a loud failure at boot beats a silent mismatch discovered in production.
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false</code></pre>
+
+<h2><code>ddl-auto</code> — get this right once</h2>
+
+<table>
+  <thead>
+    <tr><th>Value</th><th>Does</th><th>Use</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>none</code></td><td>nothing</td><td>when something else owns the schema</td></tr>
+    <tr><td><code>validate</code></td><td>compares entities to tables, fails on
+    mismatch</td><td><strong>this one</strong></td></tr>
+    <tr><td><code>update</code></td><td>alters tables to match entities</td><td>never</td></tr>
+    <tr><td><code>create-drop</code></td><td>drops everything on shutdown</td><td>throwaway
+    tests</td></tr>
+  </tbody>
+</table>
+
+<p><strong><code>update</code> is the trap.</strong> It is convenient and it never removes anything,
+so your schema slowly accumulates columns nobody uses; it makes changes in an order it chooses; and
+it gives you no migration history and no way to review what it did before it does it in production.
+Let a migration tool own the schema (lesson 18) and set <code>validate</code>, so a drift between
+code and database fails at startup with a message naming the table.</p>
+
+<h2>An entity</h2>
+
+<pre class="language-java"><code class="language-java">@Entity
+@DynamicUpdate
+@SQLRestriction("deleted = false")
+@Table(
+        name = DatabaseTableNames.PRODUCT,
+        indexes = {
+            @Index(name = "idx_product_type_active", columnList = "type, active"),
+            @Index(name = "idx_product_deleted", columnList = "deleted")
+        })
+public class Product implements Serializable {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "id", nullable = false, updatable = false, unique = true)
+    private Long id;
+
+    /**
+     * {@code @JdbcTypeCode(SqlTypes.CHAR)} is load-bearing: without it Hibernate stores a
+     * {@code java.util.UUID} as BINARY(16), which would not match the CHAR(36) column and
+     * {@code ddl-auto=validate} would refuse to start.
+     */
+    @JdbcTypeCode(SqlTypes.CHAR)
+    @Column(name = "public_id", nullable = false, updatable = false, unique = true, length = 36)
+    private UUID publicId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "type", nullable = false, length = 20)
+    private ProductType type;
+
+    @CreationTimestamp
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "updated_at", nullable = false)
+    private LocalDateTime updatedAt;
+}</code></pre>
+
+<p>Three details that are each worth a bug report:</p>
+
+<ul>
+  <li><strong><code>@Enumerated(EnumType.STRING)</code>, always.</strong> The default is
+  <code>ORDINAL</code>, which stores the enum's <em>position</em>. Insert a new constant in the middle
+  of the enum and every existing row silently means something else. This is unrecoverable without
+  backups.</li>
+  <li><strong><code>@JdbcTypeCode(SqlTypes.CHAR)</code> for UUIDs</strong> on MySQL, or Hibernate
+  picks <code>BINARY(16)</code> and <code>validate</code> refuses to start.</li>
+  <li><strong><code>@DynamicUpdate</code></strong> makes Hibernate emit only the changed columns in an
+  <code>UPDATE</code> instead of all of them.</li>
+</ul>
+
+<h2>Relationships, and keeping both sides in sync</h2>
+
+<pre class="language-java"><code class="language-java">@ToString.Exclude
+@EqualsAndHashCode.Exclude
+@OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true,
+           fetch = FetchType.LAZY)
+@OrderBy("price ASC")
+private List&lt;ProductSize&gt; sizes = new ArrayList&lt;&gt;();
+
+/** Keeps both sides of the relationship in sync — forgetting this is a classic JPA bug. */
+public void addSize(ProductSize size) {
+    sizes.add(size);
+    size.setProduct(this);
+}
+
+public void removeSize(ProductSize size) {
+    sizes.remove(size);
+    size.setProduct(null);
+}</code></pre>
+
+<p><code>mappedBy</code> says the <em>other</em> side owns the foreign key. Hibernate only writes the
+owning side, so <code>product.getSizes().add(size)</code> without
+<code>size.setProduct(product)</code> saves a row with a null FK — or saves nothing at all. Helper
+methods that set both are the standard fix.</p>
+
+<p><code>orphanRemoval = true</code> means removing a size from the list deletes the row.
+<code>cascade = ALL</code> means saving the product saves its sizes.</p>
+
+<p>⚠️ <strong>Never put a collection in <code>equals</code>, <code>hashCode</code> or
+<code>toString</code></strong>, which is why those two Lombok exclusions are there. The entity's own
+comment says it best: <code>@Data</code> would walk the collection, forcing a lazy load on every
+<code>toString</code> and recursing forever through the child's parent reference. Lesson 20 covers
+this.</p>
+
+<h2>Lazy loading and the N+1 problem</h2>
+
+<p><code>@OneToMany</code> is lazy by default: the collection is a proxy, and the query runs when you
+first touch it. That is usually right, and it produces the most common performance bug in JPA:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;Product&gt; products = productRepository.findAll();   // 1 query
+
+for (Product product : products) {
+    product.getSizes().size();                          // 1 query EACH
+}
+// 14 products = 15 queries</code></pre>
+
+<p>It never shows up in development with fourteen rows and is catastrophic with fourteen thousand.
+The fix is to fetch what you need in one query:</p>
+
+<pre class="language-java"><code class="language-java">@Query("SELECT DISTINCT p FROM Product p LEFT JOIN FETCH p.sizes WHERE p.publicId = :publicId")
+Optional&lt;Product&gt; findByPublicIdWithSizes(@Param("publicId") UUID publicId);</code></pre>
+
+<p><code>JOIN FETCH</code> loads the association in the same statement. <code>DISTINCT</code> is
+needed because joining a collection multiplies the parent rows.</p>
+
+<p>To see the queries while developing:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+logging.level.org.hibernate.orm.jdbc.bind=TRACE</code></pre>
+
+<p>⚠️ <strong><code>@ManyToOne</code> is EAGER by default</strong> — the opposite of
+<code>@OneToMany</code>. That default is almost always wrong, because loading one order then drags in
+its user, and the user's everything. Set <code>fetch = FetchType.LAZY</code> explicitly on every
+<code>@ManyToOne</code>.</p>
+
+<h2><code>open-in-view</code></h2>
+
+<pre class="language-properties"><code class="language-properties">spring.jpa.open-in-view=false</code></pre>
+
+<p>Boot defaults this to <code>true</code> and logs a warning about it. It keeps the persistence
+context open for the whole request, so lazy loading still works in the view or the serialiser. That
+sounds helpful and it means <strong>your database session is held open while JSON is being written</strong>,
+and that lazy loads fire from places you cannot see.</p>
+
+<p>Turning it off means <code>LazyInitializationException</code> when you touch an unloaded
+association outside a transaction — which is the point. It surfaces the N+1 at development time
+instead of hiding it until production. Load what you need in the service layer, map to a DTO, and
+return that.</p>
+
+<h2>Soft deletes</h2>
+
+<pre class="language-java"><code class="language-java">/** Gone for good. @SQLRestriction filters these out of every query automatically. */
+@Column(name = "deleted", nullable = false)
+private boolean deleted = false;</code></pre>
+
+<p>With <code>@SQLRestriction("deleted = false")</code> on the class, Hibernate adds that predicate to
+every query it builds. Deletes become updates, and order history keeps working because the product
+row still exists.</p>
+
+<p>⚠️ <strong>Hand-written SQL never sees <code>@SQLRestriction</code>.</strong> Hibernate applies it
+when it builds a query from the entity model; SQL you wrote yourself does not go near the entity
+model. In the pizza API this silently counted deleted orders as revenue — the reports stayed entirely
+plausible, just wrong. Lesson 17 covers it, and it is the single most expensive gotcha in this
+codebase.</p>
+
+<h2>Transactions</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * {@code readOnly = true} lets Hibernate skip dirty checking and tells the driver this will not
+ * write — cheaper, and it makes an accidental write fail loudly.
+ */
+@Override
+@Transactional(readOnly = true)
+public List&lt;ProductDTO&gt; getMenu() {
+    return mapper.mapProductsToProductDTOs(productDAO.findActiveMenu());
+}</code></pre>
+
+<p>Inside a transaction, entities are <em>managed</em>: Hibernate tracks changes and flushes them at
+commit. You do not need to call <code>save()</code> on a loaded entity you modified — dirty checking
+writes it anyway. That surprises people in both directions.</p>
+
+<p>Three rules: put <code>@Transactional</code> on the <strong>service</strong>, not the repository,
+because the business operation is the unit of work; use <code>readOnly = true</code> for reads; and
+remember it is proxy-based, so a self-invocation gets no transaction at all (lesson 8).</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong><code>ddl-auto=validate</code></strong>, and let a migration tool own the schema.</li>
+  <li><strong><code>@Enumerated(EnumType.STRING)</code></strong> — the ordinal default corrupts data
+  silently.</li>
+  <li><strong>Sync both sides of a relationship</strong> with helper methods.</li>
+  <li><strong><code>open-in-view=false</code></strong> so N+1 surfaces in development.</li>
+  <li><strong>Soft deletes are invisible to hand-written SQL.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-jdbc">JdbcTemplate</a> — for the queries JPA has nothing to
+offer.</p>

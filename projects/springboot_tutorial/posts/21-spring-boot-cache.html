@@ -1,0 +1,228 @@
+<p>Caching is the cheapest performance win available and the easiest way to serve confidently wrong
+data. The annotations are three lines; deciding <em>what</em> to cache and <em>when to throw it
+away</em> is the actual work.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- Spring Boot 4 modularized autoconfiguration: depending on the cache
+     abstraction alone gives you the annotations with NO CacheManager, and
+     @Cacheable then silently does nothing. --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-cache&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre class="language-java"><code class="language-java">@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    /** The active, customer-facing menu. */
+    public static final String MENU_CACHE = "menu";
+
+    /** The active menu filtered to one product type. */
+    public static final String MENU_BY_TYPE_CACHE = "menuByType";
+
+    @Bean
+    public ConcurrentMapCacheManager cacheManager() {
+        ConcurrentMapCacheManager manager =
+                new ConcurrentMapCacheManager(MENU_CACHE, MENU_BY_TYPE_CACHE);
+        // Refuse to create caches that were never declared above. Without this, a typo in a
+        // @Cacheable name quietly creates a brand new cache that no @CacheEvict ever clears.
+        manager.setAllowNullValues(false);
+        return manager;
+    }
+}</code></pre>
+
+<p><strong>Without <code>@EnableCaching</code>, every annotation is inert.</strong> No error, no
+warning — the methods simply run every time. It is the first thing to check when caching "isn't
+working".</p>
+
+<h2>Decide what to cache before you cache it</h2>
+
+<p>The pizza API caches the menu and nothing else, and the comment says why:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;The menu is the right thing to cache and almost the only one here: every visitor loads it, it
+ * is identical for all of them, and it changes only when an administrator edits the catalogue. The
+ * cart and the orders are cached nowhere — they are per-user and change constantly, and caching
+ * them would be a correctness bug dressed as an optimisation.
+ */</code></pre>
+
+<p>Three properties make something a good candidate: <strong>read often, identical for every caller,
+changes rarely.</strong> The menu has all three. A cart has none of them.</p>
+
+<p>Per-user data is the dangerous case, because caching it usually works in testing — where one person
+is logged in — and leaks one customer's data to another under load.</p>
+
+<h2>The annotations</h2>
+
+<pre class="language-java"><code class="language-java">@Override
+@Cacheable(value = CacheConfig.MENU_CACHE, keyGenerator = "methodAwareKeyGenerator")
+@Transactional(readOnly = true)
+public List&lt;ProductDTO&gt; getMenu() {
+    log.debug("Getting the active menu");
+    return mapper.mapProductsToProductDTOs(productDAO.findActiveMenu());
+}
+
+@Override
+@Cacheable(value = CacheConfig.MENU_BY_TYPE_CACHE, key = "#type")
+@Transactional(readOnly = true)
+public List&lt;ProductDTO&gt; getByType(ProductType type) {
+    return mapper.mapProductsToProductDTOs(productDAO.findActiveByType(type));
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Annotation</th><th>Does</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>@Cacheable</code></td><td>return the cached value if present, otherwise run and
+    store</td></tr>
+    <tr><td><code>@CacheEvict</code></td><td>remove entries</td></tr>
+    <tr><td><code>@CachePut</code></td><td>always run, and update the cache with the result</td></tr>
+    <tr><td><code>@Caching</code></td><td>combine several of the above</td></tr>
+  </tbody>
+</table>
+
+<h2>Keys</h2>
+
+<p>The default key is built from all the method arguments. <code>key = "#type"</code> names one
+explicitly using SpEL — <code>#root.methodName</code>, <code>#result</code> and property paths like
+<code>#dto.id</code> are all available.</p>
+
+<p>The no-argument case has a trap the pizza API's key generator exists to fix:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * The default key generator hashes every method argument together. That is reasonable until a
+ * no-argument method appears: {@code getMenu()} and any other no-argument method on the same
+ * cache both key to {@link SimpleKey#EMPTY}. Naming the method removes the collision.
+ */
+@Bean
+public KeyGenerator methodAwareKeyGenerator() {
+    return (target, method, params) ->
+            params.length == 0 ? method.getName() : method.getName() + "-" + List.of(params);
+}</code></pre>
+
+<p>Two no-argument methods sharing a cache both key to <code>SimpleKey.EMPTY</code>, so the second one
+serves the first one's data. Everything type-checks and the wrong list comes back.</p>
+
+<p>⚠️ <strong>Cache names must match exactly.</strong> This is why they are constants:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;{@code @Cacheable} and {@code @CacheEvict} refer to a cache by a string. Spelling it
+ * differently in the two places is the classic caching bug: reads populate {@code "menu"}, writes
+ * evict {@code "menus"}, and stale data is served forever with nothing failing.
+ */</code></pre>
+
+<h2>Eviction is the hard part</h2>
+
+<p><strong>Every write path that could invalidate the cache must evict it.</strong> Miss one and the
+system serves stale data indefinitely — and nothing fails, which is what makes it a support ticket
+rather than an alert.</p>
+
+<p>The pizza API has five methods that can change the menu, and all five carry the same block:</p>
+
+<pre class="language-java"><code class="language-java">@Override
+@Caching(
+        evict = {
+            @CacheEvict(value = CacheConfig.MENU_CACHE, allEntries = true),
+            @CacheEvict(value = CacheConfig.MENU_BY_TYPE_CACHE, allEntries = true)
+        })
+@Transactional
+public ProductDTO updateProduct(UUID id, ProductCreateDTO dto) { /* … */ }</code></pre>
+
+<p>Applied to <code>createProduct</code>, <code>updateProduct</code>,
+<code>deactivateProduct</code>, <code>deleteProduct</code> and <code>setProductImage</code>. That last
+one is easy to forget, and its comment explains the consequence:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;The eviction matters as much as the write. Without it the menu cache keeps serving the
+ * old image URL and the admin reasonably concludes the upload silently failed.
+ */</code></pre>
+
+<p><code>allEntries = true</code> clears the whole cache rather than one key. Here that is correct:
+changing one product changes the menu list, and the by-type cache has an entry per type that may
+contain it. Evicting precisely would mean working out which entries could reference the product — more
+code, more ways to be wrong, for a cache with a handful of entries.</p>
+
+<h2>⚠️ The proxy rule applies here too</h2>
+
+<pre class="language-java"><code class="language-java">@Service
+public class ProductServiceImpl {
+
+    public List&lt;ProductDTO&gt; getMenuTwice() {
+        getMenu();      // NOT cached — internal call, the proxy is not involved
+        return getMenu();
+    }
+
+    @Cacheable("menu")
+    public List&lt;ProductDTO&gt; getMenu() { /* … */ }
+}</code></pre>
+
+<p>Same mechanism as <code>@Transactional</code> and <code>@Async</code> — lesson 8. A self-invocation
+bypasses the proxy, so nothing is cached and nothing tells you.</p>
+
+<h2>⚠️ <code>ConcurrentMapCacheManager</code> is a single-JVM cache</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;It is an in-memory {@code ConcurrentHashMap}: nothing evicts by time, nothing bounds its size,
+ * and each instance has its own copy. That is fine for one process and wrong the moment there are
+ * two — instance A evicts on a write and instance B keeps serving the old menu until it restarts.
+ */</code></pre>
+
+<p>Three separate limitations, and the third is the one that surprises people in production. With two
+replicas behind a load balancer, an admin's edit evicts the cache on whichever instance handled the
+request. The other one carries on serving the old menu.</p>
+
+<p>The fixes:</p>
+
+<table>
+  <thead>
+    <tr><th>Cache</th><th>Gives you</th><th>Cost</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Caffeine</td><td>TTL and size bounds</td><td>still per-instance</td></tr>
+    <tr><td>Redis</td><td>shared across instances, TTL</td><td>infrastructure, network hop</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-properties"><code class="language-properties"># Caffeine: bounded and time-limited, still local
+spring.cache.type=caffeine
+spring.cache.caffeine.spec=maximumSize=500,expireAfterWrite=10m
+
+# Redis: shared
+spring.cache.type=redis
+spring.data.redis.host=localhost
+spring.cache.redis.time-to-live=600000</code></pre>
+
+<p><strong>A TTL is worth having even when your eviction is correct.</strong> It bounds how long a
+missed eviction can hurt you: ten minutes of stale data instead of forever.</p>
+
+<h2>Verifying it works</h2>
+
+<pre class="language-bash"><code class="language-bash">for i in 1 2 3; do curl -s -o /dev/null -w "call $i: %{time_total}s\n" \
+  http://localhost:8085/api/products; done
+
+# call 1: 0.003512s   ← populates the cache
+# call 2: 0.001593s
+# call 3: 0.001646s</code></pre>
+
+<p>Better still, turn on <code>logging.level.org.springframework.cache=TRACE</code> and watch the hits
+and misses directly. Then test the eviction, which is the part that actually breaks: change a product
+through the admin API and confirm the menu reflects it immediately.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong><code>@EnableCaching</code></strong>, or every annotation is silently inert.</li>
+  <li><strong>Cache what is read often, shared, and rarely changed.</strong> Never per-user
+  data.</li>
+  <li><strong>Cache names as constants</strong>, and a key generator that includes the method
+  name.</li>
+  <li><strong>Every write path evicts.</strong> Missing one fails silently and forever.</li>
+  <li><strong>The default cache is per-JVM.</strong> Add a TTL, and use Redis if you run more than one
+  instance.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-elasticsearch">Elasticsearch</a> — search a
+<code>LIKE</code> query cannot do, and the cost of a second copy of your data.</p>

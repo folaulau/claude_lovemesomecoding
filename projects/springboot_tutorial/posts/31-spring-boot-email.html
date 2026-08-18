@@ -1,0 +1,247 @@
+<p>Order confirmations, password resets, receipts — most applications send email eventually. Spring
+Boot's mail support is small, and the interesting decisions are about failure and testing rather than
+about SMTP.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- Adding this starter alone changes nothing at runtime: Boot's mail
+     autoconfiguration only builds a JavaMailSender when spring.mail.host is set,
+     which it is not by default. See MailService for how that is handled. --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-mail&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>That conditional behaviour is the switch. No <code>spring.mail.host</code>, no
+<code>JavaMailSender</code> bean, nothing sent.</p>
+
+<pre class="language-properties"><code class="language-properties"># NO spring.mail.host by default, and that is the switch: without it Boot builds no
+# JavaMailSender at all and MailService quietly does nothing. To actually send, run a
+# local sink and point at it - MailHog or Mailpit both work:
+#   docker run -p 1025:1025 -p 8025:8025 axllent/mailpit
+#   ./mvnw spring-boot:run -Dspring-boot.run.arguments=--spring.mail.host=localhost,--spring.mail.port=1025
+# then read what was "sent" at http://localhost:8025. Never point a demo at a real
+# SMTP relay - the first bad test address is a bounce on somebody's real domain.
+pizza.mail.from=orders@pizza.test</code></pre>
+
+<p><strong>A local SMTP sink is the right development setup.</strong> Mailpit accepts everything,
+sends nothing onward, and gives you a web inbox to read. You get realistic behaviour with no risk of
+emailing a real person during a test run.</p>
+
+<p>Only the envelope sender is bound as an application property:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Outgoing mail.
+ *
+ * &lt;p&gt;Only the envelope sender lives here — the SMTP host, port and credentials are Boot's own
+ * {@code spring.mail.*} properties, and duplicating them under {@code pizza.*} would just give
+ * the two copies a chance to disagree. Bind your own settings, not the framework's.
+ */
+public record Mail(@NotBlank String from) {}</code></pre>
+
+<h2>Optional by construction</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;h2&gt;Why {@link ObjectProvider} instead of injecting {@link JavaMailSender} directly&lt;/h2&gt;
+ *
+ * &lt;p&gt;Boot only creates a {@code JavaMailSender} when {@code spring.mail.host} is set. Injecting it
+ * as a normal required dependency would therefore make the entire application fail to start on any
+ * machine without mail configured — which, for a demo somebody just cloned, is a terrible first
+ * experience.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class MailServiceImpl implements MailService {
+
+    private final ObjectProvider&lt;JavaMailSender&gt; mailSenderProvider;
+    private final TemplateEngine templateEngine;
+    private final PizzaProperties properties;
+
+    @Override
+    public boolean isConfigured() {
+        return mailSenderProvider.getIfAvailable() != null;
+    }
+}</code></pre>
+
+<p>Lesson 6 covers the pattern. <code>@Autowired(required = false)</code> does the same job less
+explicitly and does not work with constructor injection.</p>
+
+<h2>Sending HTML</h2>
+
+<pre class="language-java"><code class="language-java">@Override
+public void sendOrderConfirmation(OrderDTO order) {
+    JavaMailSender sender = mailSenderProvider.getIfAvailable();
+    if (sender == null) {
+        log.debug("No mail server configured — skipping the confirmation for order {}", order.id());
+        return;
+    }
+    if (order.email() == null || order.email().isBlank()) {
+        log.warn("Order {} has no email address — nothing to send to", order.id());
+        return;
+    }
+
+    try {
+        Context context = new Context();
+        context.setVariable("order", order);
+        String html = templateEngine.process("receipt", context);
+
+        MimeMessage message = sender.createMimeMessage();
+        // multipart=true is required to attach anything; the charset must be stated or a
+        // customer named Zoë gets mojibake in the subject line.
+        MimeMessageHelper helper =
+                new MimeMessageHelper(message, true, StandardCharsets.UTF_8.name());
+
+        helper.setFrom(properties.mail().from());
+        helper.setTo(order.email());
+        helper.setSubject("Your Pizza order " + order.id());
+        // The second argument is what makes this HTML rather than a wall of angle brackets.
+        // A production sender would pass a plain-text alternative as the first argument, for
+        // clients that refuse HTML.
+        helper.setText(html, true);
+
+        sender.send(message);
+        log.info("Confirmation for order {} sent to {}", order.id(), order.email());
+
+    } catch (Exception ex) {
+        log.error("Could not send the confirmation for order {} — the order is unaffected",
+                order.id(), ex);
+    }
+}</code></pre>
+
+<p>Three details that each cause a bug if missed:</p>
+
+<ul>
+  <li><strong><code>multipart = true</code></strong> in the <code>MimeMessageHelper</code>
+  constructor, or attachments and inline images are impossible.</li>
+  <li><strong>The charset.</strong> Omit it and non-ASCII characters arrive as mojibake — always for
+  someone else, never in your testing.</li>
+  <li><strong><code>setText(html, true)</code></strong> — the boolean is what marks the body as HTML.
+  <code>false</code> shows the customer your markup.</li>
+</ul>
+
+<p>For a simple message with no HTML, <code>SimpleMailMessage</code> is less ceremony:</p>
+
+<pre class="language-java"><code class="language-java">SimpleMailMessage message = new SimpleMailMessage();
+message.setFrom(properties.mail().from());
+message.setTo(order.email());
+message.setSubject("Your order is on its way");
+message.setText("Order " + order.id() + " has left the kitchen.");
+sender.send(message);</code></pre>
+
+<h2>The body is a Thymeleaf template</h2>
+
+<pre class="language-java"><code class="language-java">// The Context is the model. Thymeleaf has no idea it is producing an email; it sees the
+// same variable name the receipt page sets, which is why one template serves both.
+Context context = new Context();
+context.setVariable("order", order);
+String html = templateEngine.process("receipt", context);</code></pre>
+
+<p>The same <code>templates/receipt.html</code> that lesson 15 renders as a web page. No HTTP request
+is involved, so there is no view resolution — <code>process()</code> just returns the HTML.</p>
+
+<p>One caveat that catches people building email templates: <strong>email clients are not
+browsers.</strong> Many ignore <code>&lt;style&gt;</code> blocks, most ignore external stylesheets,
+and support for flexbox and grid is poor. Serious HTML email uses tables and inline styles. The pizza
+API's receipt uses a <code>&lt;style&gt;</code> block because it is primarily a web page; a
+production email pipeline would run it through a CSS inliner first.</p>
+
+<h2>⚠️ Send it off the request thread, and never let it fail the operation</h2>
+
+<pre class="language-java"><code class="language-java">@Async
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void sendConfirmation(OrderPlacedEvent event) {
+    try {
+        mailService.sendOrderConfirmation(
+                orderService.getOrderByPublicId(event.orderPublicId()));
+    } catch (Exception ex) {
+        log.error("Confirmation for order {} failed — the order itself is unaffected",
+                event.orderPublicId(), ex);
+    }
+}</code></pre>
+
+<p>Three separate decisions, each from an earlier lesson:</p>
+
+<ul>
+  <li><strong><code>AFTER_COMMIT</code></strong> (lesson 9) — never email a customer about an order
+  that is about to roll back.</li>
+  <li><strong><code>@Async</code></strong> (lesson 28) — SMTP can take seconds, and the customer should
+  not wait for it.</li>
+  <li><strong>Catch everything</strong> — and the <code>MailServiceImpl</code> catch block explains
+  why it swallows too:</li>
+</ul>
+
+<pre class="language-java"><code class="language-java">// Swallowed on purpose, and logged loudly. This is called from an AFTER_COMMIT
+// listener: the order exists and is paid for. Letting a mail failure propagate would
+// achieve nothing except noise, since there is no transaction left to roll back.</code></pre>
+
+<p><strong>A failed email must never fail the order.</strong> The order is committed and paid for; the
+email is a courtesy. Getting this backwards means a mail outage stops customers buying pizza.</p>
+
+<h2>Production is a different problem</h2>
+
+<p>Sending from your own server means fighting deliverability: SPF, DKIM and DMARC records, IP
+reputation, bounce and complaint handling. It is a specialist job, and doing it badly means your mail
+goes to spam.</p>
+
+<p>Use a provider — SES, SendGrid, Postmark, Mailgun. Two ways to integrate:</p>
+
+<pre class="language-properties"><code class="language-properties"># 1. As plain SMTP — no code changes at all
+spring.mail.host=email-smtp.us-west-2.amazonaws.com
+spring.mail.port=587
+spring.mail.username=${SMTP_USERNAME}
+spring.mail.password=${SMTP_PASSWORD}
+spring.mail.properties.mail.smtp.auth=true
+spring.mail.properties.mail.smtp.starttls.enable=true</code></pre>
+
+<p>Or via their API/SDK, which gives you delivery events, bounce webhooks and templates at the cost of
+provider coupling. SMTP first is the reasonable default — it is portable, and the code above does not
+change.</p>
+
+<p>Two operational habits worth building in early: <strong>put sending behind a queue</strong>
+(lesson 30) so a provider outage delays mail rather than losing it, and <strong>handle bounces</strong>
+so you stop mailing addresses that do not exist.</p>
+
+<h2>Testing</h2>
+
+<p>Assert against a sink or a mock, never a real inbox:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest
+class MailServiceTest {
+
+    @MockitoBean
+    private JavaMailSender mailSender;
+
+    @Autowired
+    private MailService mailService;
+
+    @Test
+    void sendsHtmlConfirmationToTheCustomer() {
+        given(mailSender.createMimeMessage())
+                .willReturn(new JavaMailSenderImpl().createMimeMessage());
+
+        mailService.sendOrderConfirmation(anOrder("customer@pizza.test"));
+
+        then(mailSender).should().send(any(MimeMessage.class));
+    }
+}</code></pre>
+
+<p>For a real end-to-end check, GreenMail starts an in-process SMTP server and lets you assert on what
+actually arrived — subject, recipients and body — which catches the charset and HTML-flag mistakes a
+mock cannot.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>No <code>spring.mail.host</code>, no sender.</strong> Use
+  <code>ObjectProvider</code> so the app still starts.</li>
+  <li><strong><code>MimeMessageHelper</code> with multipart, charset and
+  <code>setText(html, true)</code>.</strong></li>
+  <li><strong>Render the body from a template</strong>, shared with the web page.</li>
+  <li><strong><code>AFTER_COMMIT</code> + <code>@Async</code> + catch everything.</strong> Email must
+  never fail the order.</li>
+  <li><strong>A local sink for development</strong>, a provider for production.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-testing">testing</a> — the slice you should reach for
+first.</p>

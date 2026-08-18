@@ -1,0 +1,218 @@
+<p>"Sign in with Google" spares your users another password and spares you storing one. Spring Security
+handles the protocol; what it cannot decide for you is <strong>who this person is in your
+database</strong> — and that is where the bugs and the vulnerabilities live.</p>
+
+<h2>The flow, in the terms Spring names things</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">1. Browser hits  /oauth2/authorization/google
+2. Spring redirects to Google with client_id, scope, redirect_uri and state
+3. User signs in at Google and consents
+4. Google redirects back to /login/oauth2/code/google?code=…&state=…
+5. Spring exchanges the code for an access token   ← server-to-server, uses the secret
+6. Spring fetches the profile from Google's userinfo endpoint
+7. YOUR success handler runs                        ← the only interesting part</code></pre>
+
+<p>Steps 1–6 are the <strong>authorization code flow</strong> and Spring implements all of them. Note
+that the code is exchanged server-to-server: the client secret never reaches the browser, which is
+what distinguishes this from the implicit flow it replaced.</p>
+
+<p><code>state</code> is CSRF protection for the handshake — Spring generates and verifies it, so it
+is one thing you do not have to think about.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-oauth2-client&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre class="language-properties"><code class="language-properties"># Get the two values from https://console.cloud.google.com/apis/credentials
+# (OAuth 2.0 Client ID, type "Web application"), and register this exact redirect URI:
+#
+#   http://localhost:8085/login/oauth2/code/google
+#
+# That path is not arbitrary - it is Spring Security's default
+# {baseUrl}/login/oauth2/code/{registrationId}, and Google requires an EXACT match. A
+# redirect_uri_mismatch error means these two strings differ, usually by a trailing
+# slash or by http vs https.
+#
+# `google` is a well-known provider: Spring Security already knows its authorization,
+# token and user-info URLs, so only the credentials and scopes are needed here.
+spring.security.oauth2.client.registration.google.client-id=${GOOGLE_CLIENT_ID:}
+spring.security.oauth2.client.registration.google.client-secret=${GOOGLE_CLIENT_SECRET:}
+spring.security.oauth2.client.registration.google.scope=openid,profile,email</code></pre>
+
+<p><code>redirect_uri_mismatch</code> is the error everyone hits first, and it is always a literal
+string difference — a trailing slash, <code>http</code> against <code>https</code>, or
+<code>127.0.0.1</code> against <code>localhost</code>.</p>
+
+<p>For a provider Spring does not know, you supply the endpoints yourself:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.security.oauth2.client.provider.acme.authorization-uri=https://acme.example/oauth/authorize
+spring.security.oauth2.client.provider.acme.token-uri=https://acme.example/oauth/token
+spring.security.oauth2.client.provider.acme.user-info-uri=https://acme.example/userinfo
+spring.security.oauth2.client.provider.acme.user-name-attribute=sub</code></pre>
+
+<h2>Wiring it into the filter chain</h2>
+
+<pre class="language-java"><code class="language-java">// The OAuth2 handshake endpoints. /oauth2/authorization/** starts the flow
+// and /login/oauth2/code/** receives the provider's callback; both must be
+// reachable by an unauthenticated browser, which is the whole point.
+.requestMatchers("/oauth2/**", "/login/oauth2/**")
+.permitAll()</code></pre>
+
+<pre class="language-java"><code class="language-java">// Enabled only when a provider is actually configured. Calling oauth2Login() without a
+// ClientRegistrationRepository fails the context at startup, so this is not merely tidy —
+// it is what keeps the default profile bootable.
+if (clientRegistrationRepository.getIfAvailable() != null) {
+    OAuth2LoginSuccessHandler successHandler = oauth2SuccessHandler.getObject();
+    http.oauth2Login(oauth2 -&gt; oauth2.successHandler(successHandler));
+}</code></pre>
+
+<p>Boot only builds a <code>ClientRegistrationRepository</code> when the registration properties are
+present. Injecting it through an <code>ObjectProvider</code> (lesson 6) means one filter chain covers
+both cases, instead of two profile-specific <code>SecurityConfig</code> classes that then drift
+apart.</p>
+
+<h2>The part that matters: reconciliation</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Everything up to this point is boilerplate Spring Security handles: the redirect to Google,
+ * the code exchange, fetching the profile. What no framework can decide for you is &lt;b&gt;who this
+ * person is in YOUR database&lt;/b&gt; — and getting that wrong is how one human ends up with two
+ * accounts and loses their order history.
+ */
+@Override
+@Transactional
+public void onAuthenticationSuccess(
+        HttpServletRequest request, HttpServletResponse response, Authentication authentication)
+        throws IOException {
+
+    OAuth2User oauthUser = (OAuth2User) authentication.getPrincipal();
+
+    String email = oauthUser.getAttribute("email");
+    Boolean emailVerified = oauthUser.getAttribute("email_verified");
+    String name = oauthUser.getAttribute("name");
+
+    if (email == null || email.isBlank()) {
+        throw ApiException.unauthorized("The identity provider returned no email address");
+    }
+    if (!Boolean.TRUE.equals(emailVerified)) {
+        log.warn("Refused an OAuth2 login for unverified address {}", email);
+        throw ApiException.unauthorized("Your email address is not verified with the provider");
+    }
+
+    User user = userDAO.findByEmail(email).orElseGet(() -&gt; createFromOAuth(email, name));
+
+    String token = jwtService.generateToken(user);
+
+    String target = successRedirect + "#token=" + URLEncoder.encode(token, StandardCharsets.UTF_8);
+    getRedirectStrategy().sendRedirect(request, response, target);
+}</code></pre>
+
+<h3>⚠️ Match on <em>verified</em> email, or you have built account takeover</h3>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;⚠️ &lt;b&gt;The email must be verified by the provider.&lt;/b&gt; Matching on an unverified address is an
+ * account-takeover vulnerability: an attacker signs up to the identity provider claiming
+ * {@code someone@example.com}, and if we trust that claim we hand them the existing account.
+ */</code></pre>
+
+<p>This is the single most important paragraph in the lesson. The attack is not subtle: create an
+account at a provider that does not verify addresses, claim the victim's email, sign in to your app,
+and the reconciliation step hands over an existing account. Google sets
+<code>email_verified</code>; a provider that does not is a provider you cannot match on email at
+all.</p>
+
+<h3>Creating the account</h3>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;{@code passwordHash} is left null on purpose, and every password-checking path must treat
+ * null as "no password login available" rather than as an empty password. The role is always
+ * CUSTOMER — exactly as in {@code /api/auth/register}, because a role that can be influenced
+ * from outside is a privilege-escalation bug waiting to happen.
+ */
+private User createFromOAuth(String email, String name) {
+    return userDAO.save(User.builder()
+            .email(email)
+            .fullName(name == null || name.isBlank() ? email : name)
+            .passwordHash(null)
+            .role(UserRole.CUSTOMER)
+            .build());
+}</code></pre>
+
+<p>The null <code>passwordHash</code> is a contract with the rest of the application. Any code path
+that would treat null as an empty password, or that calls
+<code>passwordEncoder.matches(candidate, null)</code> without checking, is a way in. Worth a test.</p>
+
+<h2>Ending in your own token</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;The rest of this API is stateless and token-based. Ending an OAuth2 login with a session
+ * cookie would mean two different authentication mechanisms and two sets of rules. Instead the
+ * OAuth2 flow is treated as one more way to prove identity, and the result is the same token
+ * {@code /api/auth/login} issues.
+ */</code></pre>
+
+<p>OAuth2 is <em>a way of proving who you are</em>, not a replacement for your session model. Once
+identity is established, issue the same JWT a password login would (lesson 25) and everything
+downstream is unchanged.</p>
+
+<p>Note where the token goes:</p>
+
+<pre class="language-java"><code class="language-java">// The token goes in the URL fragment, NOT the query string: a fragment is never sent to the
+// server, never lands in an access log and is not sent as a Referer. A query parameter
+// would leak the token into every one of those.
+String target = successRedirect + "#token=" + URLEncoder.encode(token, StandardCharsets.UTF_8);</code></pre>
+
+<p>The browser keeps a fragment client-side. A query parameter would be written to the web server's
+access log, the CDN's log, and any <code>Referer</code> header the page later sends — three places a
+credential should never be.</p>
+
+<h2>OAuth2 is not OpenID Connect</h2>
+
+<p>Worth being precise, because the two are constantly conflated:</p>
+
+<ul>
+  <li><strong>OAuth2 is authorization.</strong> "This app may read your calendar." It says nothing
+  about who you are.</li>
+  <li><strong>OpenID Connect is a thin layer on top of OAuth2 that adds authentication</strong> — an
+  <code>id_token</code> and a standard set of claims including <code>email</code> and
+  <code>email_verified</code>.</li>
+</ul>
+
+<p>That is why the scope above is <code>openid,profile,email</code>. The <code>openid</code> scope is
+what turns an authorization flow into a login. Without it you get an access token and no reliable
+identity.</p>
+
+<h2>Client, resource server, or both?</h2>
+
+<table>
+  <thead>
+    <tr><th>Starter</th><th>Your app is…</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>oauth2-client</code></td><td>logging users in via a provider — this lesson</td></tr>
+    <tr><td><code>oauth2-resource-server</code></td><td>validating tokens issued by someone else
+    (Auth0, Keycloak, Cognito)</td></tr>
+    <tr><td><code>oauth2-authorization-server</code></td><td>issuing tokens to other apps</td></tr>
+  </tbody>
+</table>
+
+<p>If you are adopting a managed identity provider, <strong>resource server is usually what you
+want</strong> — the provider handles login and you validate its JWTs, which removes the reconciliation
+problem and your own token issuance in one move.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Spring does the protocol; you do the reconciliation.</strong></li>
+  <li><strong>Match on verified email only.</strong> Anything else is account takeover.</li>
+  <li><strong>Never let a role come from the provider.</strong></li>
+  <li><strong>Issue your own token</strong> so there is one session model, and return it in the URL
+  fragment.</li>
+  <li><strong><code>openid</code> scope</strong> is what makes it a login rather than an
+  authorization.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-thread-pool">async work and thread pools</a>.</p>

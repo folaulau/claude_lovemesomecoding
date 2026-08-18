@@ -1,0 +1,246 @@
+<p>A <code>LIKE '%pepperoni%'</code> query can tell you whether a row matched. It cannot tell you how
+well, it cannot cope with a typo, it cannot know that "pizzas" and "pizza" are the same word, and it
+scans the whole table to find out. Elasticsearch does all of that.</p>
+
+<p>It also means running a second database and keeping it in step with your first one, which is the
+part worth thinking about before you start.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-data-elasticsearch&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre class="language-bash"><code class="language-bash">docker run -p 9200:9200 -e discovery.type=single-node \
+  -e xpack.security.enabled=false \
+  docker.elastic.co/elasticsearch/elasticsearch:9.1.0</code></pre>
+
+<p>The pizza API keeps this switched off by default, because a demo that will not start without an
+Elasticsearch node is a bad demo:</p>
+
+<pre class="language-properties"><code class="language-properties"># OFF by default. Without this, Spring Data would scan and register ProductSearchRepository,
+# which then requires an ElasticsearchOperations bean and a reachable node at startup - so a
+# plain `./mvnw spring-boot:run` would fail on any machine without Elasticsearch running.
+spring.data.elasticsearch.repositories.enabled=false
+spring.elasticsearch.uris=http://localhost:9200</code></pre>
+
+<pre class="language-properties"><code class="language-properties"># application-search.properties — activated with --spring.profiles.active=local,search
+spring.data.elasticsearch.repositories.enabled=true
+spring.elasticsearch.uris=http://localhost:9200
+spring.elasticsearch.connection-timeout=2s
+spring.elasticsearch.socket-timeout=10s</code></pre>
+
+<h2>The document is not the entity</h2>
+
+<pre class="language-java"><code class="language-java">@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@Document(indexName = "products")
+public class ProductDocument {
+
+    /** The product's public UUID as a string — the API never exposes the numeric key. */
+    @Id
+    private String id;
+
+    @Field(type = FieldType.Text)
+    private String name;
+
+    @Field(type = FieldType.Text)
+    private String description;
+
+    /** Filtered on, never searched as prose. */
+    @Field(type = FieldType.Keyword)
+    private String type;
+
+    @Field(type = FieldType.Boolean)
+    private boolean active;
+
+    @Field(type = FieldType.Double)
+    private BigDecimal fromPrice;
+}</code></pre>
+
+<p><strong>A separate class from the JPA entity, on purpose.</strong> The two model different things:
+the entity is normalised for correctness and transactions, the document is denormalised for search.
+Annotating one class with both <code>@Entity</code> and <code>@Document</code> is possible and is a
+trap — the field types you want in a search index have nothing to do with the column types you want in
+MySQL, and you end up compromising both.</p>
+
+<h3>⚠️ Text versus Keyword</h3>
+
+<p>This is the single most common Elasticsearch mistake:</p>
+
+<ul>
+  <li><strong><code>Text</code> is analysed</strong> — broken into lowercase tokens, so "Pepperoni
+  Feast" matches a search for "pepperoni". This is what makes full-text search work.</li>
+  <li><strong><code>Keyword</code> is stored whole</strong> and matched exactly. Right for filtering,
+  sorting and aggregating, and useless for free-text search.</li>
+</ul>
+
+<p>Map <code>name</code> as <code>Keyword</code> and you get a search box that only matches exact
+titles. Map <code>type</code> as <code>Text</code> and "filter by DRINK" starts returning pizzas,
+because the analyser has tokenised your enum.</p>
+
+<h2>The repository</h2>
+
+<pre class="language-java"><code class="language-java">public interface ProductSearchRepository
+        extends ElasticsearchRepository&lt;ProductDocument, String&gt; {
+
+    /** Derived query: matches the analysed name field, filtered to active products. */
+    List&lt;ProductDocument&gt; findByNameAndActiveTrue(String name);
+
+    @Query("""
+            {
+              "bool": {
+                "must": [
+                  { "multi_match": {
+                      "query": "?0",
+                      "fields": ["name^3", "description"],
+                      "fuzziness": "AUTO" } }
+                ],
+                "filter": [ { "term": { "active": true } } ]
+              }
+            }
+            """)
+    List&lt;ProductDocument&gt; search(String term);
+}</code></pre>
+
+<p>The derived-query style is the same one Spring Data JPA uses — the method name is parsed into a
+query. That is the point: the programming model transfers, only the store changes.</p>
+
+<p>When a method name stops being able to express the query, drop to the real thing. That
+<code>multi_match</code> is doing three things a SQL query cannot:</p>
+
+<ul>
+  <li><strong><code>"name^3"</code></strong> boosts the title, so a match in the name outranks one
+  buried in a description.</li>
+  <li><strong><code>fuzziness: "AUTO"</code></strong> tolerates typos — "peperoni" finds
+  "pepperoni".</li>
+  <li><strong>Results come back ranked</strong> by relevance. <code>LIKE</code> can tell you whether a
+  row matched, never how well.</li>
+</ul>
+
+<p>Note also the <code>must</code>/<code>filter</code> split: <code>must</code> clauses contribute to
+the score, <code>filter</code> clauses only include or exclude. Putting
+<code>active = true</code> in <code>filter</code> is both faster and more correct — being active
+should not make a product more relevant.</p>
+
+<h2>The hard part is staying in step</h2>
+
+<p>Elasticsearch is a second copy of data that MySQL owns. Every write has to reach the index too, and
+there is no transaction spanning both:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;The three ways to keep them in step, worst to best:
+ *
+ * &lt;ol&gt;
+ *   &lt;li&gt;&lt;b&gt;Index inside the write transaction.&lt;/b&gt; Simple, and wrong: the write now fails when
+ *       Elasticsearch is down, and a rollback cannot un-index.
+ *   &lt;li&gt;&lt;b&gt;Index after commit&lt;/b&gt; (an {@code AFTER_COMMIT} listener, as this app does for email).
+ *       Good, but a crash between commit and index loses the update silently.
+ *   &lt;li&gt;&lt;b&gt;Rebuild periodically as well&lt;/b&gt; — a scheduled full reindex that repairs whatever the
+ *       incremental path missed. Belt and braces, and the only version that self-heals.
+ * &lt;/ol&gt;
+ */</code></pre>
+
+<p>The repair path:</p>
+
+<pre class="language-java"><code class="language-java">@Override
+@Transactional(readOnly = true)
+public long reindexAll() {
+    List&lt;Product&gt; products = productDAO.getAll();
+
+    List&lt;ProductDocument&gt; documents = products.stream()
+            .map(product -&gt; ProductDocument.from(product, cheapestSize(product)))
+            .toList();
+
+    // saveAll is a bulk request, not N round trips. Indexing one document per HTTP call is the
+    // classic reason a reindex takes twenty minutes instead of twenty seconds.
+    searchRepository.saveAll(documents);
+
+    log.info("Reindexed {} products", documents.size());
+    return documents.size();
+}</code></pre>
+
+<p><strong>Accept that the index is eventually consistent</strong> and design around it, rather than
+pretending otherwise. Which leads to the most important rule here:</p>
+
+<h2>The index ranks; the database is the truth</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;ProductDocument&gt; hits = searchRepository.search(term.trim());
+
+// The index holds a denormalised copy, which is right for matching and ranking but is NOT
+// the source of truth for price or availability. Read the ids from Elasticsearch, then load
+// the real rows from MySQL — so a stale document can affect the ORDER of results but never
+// the prices a customer is shown.
+Map&lt;String, Integer&gt; rank = new HashMap&lt;&gt;();
+for (int i = 0; i &lt; hits.size(); i++) {
+    rank.put(hits.get(i).getId(), i);
+}
+
+return hits.stream()
+        .map(hit -&gt; productDAO.findByPublicIdWithSizes(UUID.fromString(hit.getId())))
+        .flatMap(Optional::stream)
+        .filter(Product::isActive)
+        .sorted(Comparator.comparingInt(
+                p -&gt; rank.getOrDefault(String.valueOf(p.getPublicId()), Integer.MAX_VALUE)))
+        .map(mapper::mapProductToProductDTO)
+        .toList();</code></pre>
+
+<p>Elasticsearch decides <em>which</em> products and <em>in what order</em>. MySQL supplies what they
+cost and whether they are still available. A stale document then costs you a slightly odd ordering
+rather than a wrong price on a checkout page.</p>
+
+<h2>Degrade, do not disappear</h2>
+
+<pre class="language-java"><code class="language-java">private final ObjectProvider&lt;ProductSearchService&gt; searchServiceProvider;
+
+@GetMapping("/products")
+public ResponseEntity&lt;List&lt;ProductDTO&gt;&gt; search(@RequestParam("q") String term) {
+    ProductSearchService searchService = searchServiceProvider.getIfAvailable();
+
+    if (searchService != null) {
+        return ResponseEntity.ok(searchService.search(term));
+    }
+    return ResponseEntity.ok(databaseSearch(term));
+}</code></pre>
+
+<p>With the profile off there is no search service, so the endpoint falls back to a database scan. The
+API always answers — better results with Elasticsearch, adequate ones without.</p>
+
+<p>That fallback is also the honest comparison. The database version is a case-insensitive substring
+scan: no ranking, no fuzziness, no stemming, and slower as the catalogue grows. Everything
+Elasticsearch is <em>for</em> is visible in the difference between the two branches.</p>
+
+<h2>Do you actually need it?</h2>
+
+<p>Be honest about the cost: a cluster to run, monitor, secure and upgrade; a second copy of your data
+that can silently drift; and a whole query language to learn.</p>
+
+<p><strong>You probably do not need it if</strong> your dataset is small, exact matching is enough, or
+your database's own full-text search would do. MySQL and PostgreSQL both have one, and PostgreSQL's
+is genuinely good — <code>tsvector</code> with a GIN index handles stemming and ranking without
+another server.</p>
+
+<p><strong>You probably do if</strong> you have millions of documents, users expect typo tolerance and
+relevance ranking, you need faceted search or aggregations over text, or you are searching across
+several sources at once.</p>
+
+<p>For a fourteen-product pizza menu, the database fallback above is the correct engineering answer.
+It is in this track because the pattern matters at scale, and because the two implementations sitting
+side by side make the trade-off concrete.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Separate document class</strong> from the JPA entity.</li>
+  <li><strong><code>Text</code> for searching, <code>Keyword</code> for filtering.</strong> Getting
+  this backwards is the classic mistake.</li>
+  <li><strong>Index after commit, and reindex periodically</strong> to self-heal.</li>
+  <li><strong>Search for ids and ranking; load the truth from your database.</strong></li>
+  <li><strong>Gate it off by default</strong> so the app runs without a node.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-security-authentication">how Spring Security authenticates</a> — the filter
+chain and the four pieces everything else is built on.</p>

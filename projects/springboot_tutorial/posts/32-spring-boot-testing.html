@@ -1,0 +1,288 @@
+<p>Spring Boot gives you several ways to test, and choosing between them is most of the skill. The rule
+worth internalising: <strong>reach for the smallest test that can fail honestly.</strong></p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-webmvc-test&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.security&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-security-test&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>⚠️ In Boot 3 this was <code>spring-boot-starter-test</code>. Boot 4's split into per-technology
+modules reaches the test starters too. It brings JUnit 5, AssertJ, Mockito, Hamcrest and
+<code>MockMvc</code>.</p>
+
+<h2>The options, smallest first</h2>
+
+<table>
+  <thead>
+    <tr><th>Kind</th><th>Starts</th><th>Speed</th><th>Use for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Plain unit test</td><td>nothing</td><td>milliseconds</td><td>logic with no Spring in
+    it</td></tr>
+    <tr><td><code>@WebMvcTest</code></td><td>the web layer only</td><td>fast</td><td>controllers,
+    validation, security rules</td></tr>
+    <tr><td><code>@DataJpaTest</code></td><td>JPA + a database</td><td>fast</td><td>repositories and
+    queries</td></tr>
+    <tr><td><code>@SpringBootTest</code></td><td>everything</td><td>slow</td><td>wiring, and flows
+    that cross layers</td></tr>
+  </tbody>
+</table>
+
+<h2>Plain unit tests</h2>
+
+<p>If a class has no Spring in it, do not start Spring:</p>
+
+<pre class="language-java"><code class="language-java">class PriceRoundingTest {
+
+    @Test
+    void roundsHalfUpToTwoDecimals() {
+        assertThat(Money.scale(new BigDecimal("1.005")))
+                .isEqualByComparingTo("1.01");
+    }
+}</code></pre>
+
+<p>Milliseconds, no context, no database. Most of your tests should look like this, and the fact that
+they can is a sign the design is good — logic that needs the whole framework to be exercised is logic
+that is tangled up in it.</p>
+
+<h2>Slice tests</h2>
+
+<pre class="language-java"><code class="language-java">@WebMvcTest(ProductRestController.class)
+class ProductRestControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockitoBean                       // was @MockBean before Boot 3.4
+    private ProductService productService;
+
+    @Test
+    void returnsTheMenu() throws Exception {
+        given(productService.getMenu()).willReturn(List.of(aProduct("Pepperoni")));
+
+        mockMvc.perform(get("/api/products"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].name").value("Pepperoni"));
+    }
+
+    @Test
+    void rejectsAProductWithNoSizes() throws Exception {
+        mockMvc.perform(post("/api/admin/products")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"name":"Test","type":"PIZZA","sizes":[]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors[0].field").value("sizes"));
+    }
+}</code></pre>
+
+<p>Only the web layer starts — no database, no services. Everything below is mocked with
+<code>@MockitoBean</code>.</p>
+
+<p>That second test is the kind a slice does best: it proves the validation annotation, the exception
+handler and the error shape all agree, which no unit test can, and it does not need a database to do
+it.</p>
+
+<pre class="language-java"><code class="language-java">@DataJpaTest
+class ProductRepositoryTest {
+
+    @Autowired
+    private ProductRepository repository;
+
+    @Test
+    void findByPublicIdWithSizesFetchesTheSizes() {
+        var found = repository.findByPublicIdWithSizes(TestIds.PEPPERONI_PIZZA);
+        assertThat(found).isPresent();
+        assertThat(found.get().getSizes()).hasSize(3);
+    }
+}</code></pre>
+
+<p><code>@DataJpaTest</code> starts JPA and rolls back after each test. By default it replaces your
+datasource with an in-memory one — which is convenient and dishonest if you use vendor-specific SQL.
+The pizza API's reporting queries are MySQL, so testing them against H2 would prove nothing.
+<code>@AutoConfigureTestDatabase(replace = NONE)</code> keeps the real database.</p>
+
+<h2>Full integration tests</h2>
+
+<pre class="language-java"><code class="language-java">/** Proves the authorization rules actually hold at the HTTP layer. */
+@SpringBootTest
+@AutoConfigureMockMvc
+@Transactional
+@DisplayName("API security")
+class ApiSecurityIntegrationTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    // Constructed rather than @Autowired: Spring Boot 4 does not expose a plain ObjectMapper
+    // bean in this context, and the test only needs to pluck one field out of a response.
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    private String tokenFor(String email, String password) throws Exception {
+        String body = mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"%s","password":"%s"}"""
+                                .formatted(email, password)))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        return objectMapper.readTree(body).get("token").asText();
+    }
+}</code></pre>
+
+<p>This one earns the cost. Authorization rules involve the filter chain, the JWT filter, the rule
+ordering and the controllers — a slice test with a mocked security context would prove that the
+mock works. Getting a real token by logging in, then using it, tests the thing that actually
+matters.</p>
+
+<h3><code>@Transactional</code> on tests</h3>
+
+<p>Each test runs in a transaction that is rolled back afterwards, so tests do not pollute each other.
+<strong>Two caveats:</strong> it does not roll back anything outside the database (files, emails,
+queue messages), and it hides bugs that only appear on commit — a constraint violation deferred to
+commit time never fires. Occasionally worth a test without it.</p>
+
+<h3>Testing secured endpoints</h3>
+
+<pre class="language-java"><code class="language-java">@Test
+@WithMockUser(roles = "ADMIN")
+void adminCanListUsers() throws Exception {
+    mockMvc.perform(get("/api/admin/users")).andExpect(status().isOk());
+}
+
+@Test
+void anonymousCannotListUsers() throws Exception {
+    mockMvc.perform(get("/api/admin/users")).andExpect(status().isForbidden());
+}</code></pre>
+
+<p><code>@WithMockUser</code> populates the SecurityContext directly. It is quick, and it skips the
+JWT filter entirely — so it tests your authorization rules, not your authentication. Both are worth
+testing; do not mistake one for the other.</p>
+
+<h2>Naming and structure</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * Pricing is where the money is, so it gets the most direct tests.
+ *
+ * &lt;p&gt;Every expected figure below is written out by hand from the seeded menu prices — if the
+ * implementation and the test ever agree on a wrong number, it will be because both were changed
+ * deliberately.
+ */
+@SpringBootTest
+@Transactional
+@DisplayName("PricingService")
+class PricingServiceTest {
+
+    @Test
+    @DisplayName("prices a plain large pizza with delivery")
+    void pricesSimpleOrder() {
+        // Large Pepperoni = 16.99. Tax 16.99 * 0.085 = 1.44415 -> 1.44. Delivery 3.99.
+        var priced = pricingService.price(requestWith(
+                OrderType.DELIVERY,
+                new OrderCreateDTO.ItemDTO(TestIds.PEPPERONI_PIZZA, SizeName.LARGE, null, null, 1)));
+
+        assertThat(priced.subtotal()).isEqualByComparingTo("16.99");
+        assertThat(priced.tax()).isEqualByComparingTo("1.44");
+        assertThat(priced.deliveryFee()).isEqualByComparingTo("3.99");
+        assertThat(priced.total()).isEqualByComparingTo("22.42");
+    }
+}</code></pre>
+
+<p>That class comment states the most valuable testing principle on this page: <strong>expected values
+are computed by hand, not by the code under test.</strong> A test that asserts
+<code>total == subtotal + tax + fee</code> passes when the formula is wrong. Writing
+<code>22.42</code> out, with the arithmetic in a comment, means the test can catch the implementation
+being wrong.</p>
+
+<p>Note also <code>isEqualByComparingTo</code> rather than <code>isEqualTo</code> for
+<code>BigDecimal</code>: <code>equals</code> compares scale too, so <code>1.44</code> and
+<code>1.4400</code> are unequal. This trips people up constantly.</p>
+
+<h2>What is worth testing</h2>
+
+<p>The pizza API's 60 tests concentrate where mistakes are expensive:</p>
+
+<ul>
+  <li><strong>Pricing</strong> — it is the money, and it is the security boundary.</li>
+  <li><strong>Authorization</strong> — proving the rules hold at the HTTP layer.</li>
+  <li><strong>Anything a comment calls a gotcha.</strong> The soft-delete filtering in the reports is
+  guarded by <code>ReportServiceImplTest#softDeletedOrdersAreExcluded</code>, and the DAO comment
+  names that test. That cross-reference is worth copying: it tells the next person that removing the
+  predicate has a specific, already-discovered consequence.</li>
+</ul>
+
+<p>Aim for coverage of <em>behaviour</em>, not lines. A test asserting that a getter returns what was
+set raises the number and finds nothing.</p>
+
+<h2>⚠️ Two things that will waste your afternoon</h2>
+
+<h3>Stale classes</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">java.lang.NoClassDefFoundError: CustomerOrderService
+Caused by: java.lang.ClassNotFoundException: CustomerOrderService</code></pre>
+
+<p>An <em>unqualified</em> class name in that error is the signature. Nothing is wrong with your code;
+the build output is inconsistent. <code>./mvnw clean compile</code> fixes it, and the pizza API's own
+documentation warns about it because it has cost several debugging sessions. If behaviour does not
+match the source, suspect this before you suspect the source.</p>
+
+<h3>Tests that assert seeded counts</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">Several tests assert absolute seeded counts (14 products, 6 drinks). Hiding or deleting a
+seeded row through the admin UI while demoing will therefore break the suite, and the failure
+points at the test rather than at what you clicked.</code></pre>
+
+<p>An honest trade-off, recorded rather than hidden. Absolute counts are simple and precise; they
+couple the suite to the seed data. If you take this approach, write that warning down, because the
+failure is genuinely misleading.</p>
+
+<p>The related rule: <strong>tests must clean up what they create</strong>, or one failure poisons
+every later run.</p>
+
+<h2>Testcontainers</h2>
+
+<p>When you need the real database and do not want a shared one:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest
+@Testcontainers
+class OrderIntegrationTest {
+
+    @Container
+    @ServiceConnection                 // Boot wires spring.datasource.* automatically
+    static MySQLContainer&lt;?&gt; mysql = new MySQLContainer&lt;&gt;("mysql:8.4");
+}</code></pre>
+
+<p><code>@ServiceConnection</code> removes the <code>@DynamicPropertySource</code> boilerplate older
+examples show. You get a real MySQL, isolated per run, at the cost of Docker and a few seconds of
+startup — usually a good trade for anything touching vendor-specific SQL.</p>
+
+<h2>Running them</h2>
+
+<pre class="language-bash"><code class="language-bash">./mvnw test                                  # all 60
+./mvnw test -Dtest=PricingServiceTest        # one class
+./mvnw test -Dtest='*ServiceImplTest'        # a pattern
+./mvnw clean test                            # when something looks impossible</code></pre>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Smallest honest test.</strong> Unit &gt; slice &gt; <code>@SpringBootTest</code>.</li>
+  <li><strong>Boot 4:</strong> <code>spring-boot-starter-webmvc-test</code>, and
+  <code>@MockitoBean</code>.</li>
+  <li><strong>Compute expected values by hand</strong>, never with the code under test.</li>
+  <li><strong><code>isEqualByComparingTo</code> for <code>BigDecimal</code>.</strong></li>
+  <li><strong>Test the gotchas</strong>, and name the test in the comment that describes them.</li>
+  <li><strong><code>clean</code> before believing anything impossible.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-gradle">building with Gradle</a>.</p>

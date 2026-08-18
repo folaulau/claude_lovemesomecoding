@@ -1,0 +1,334 @@
+<p>Questions a senior Spring Boot candidate should be able to answer, every one drawn from a real
+decision or a real bug in the pizza codebase this track is built on rather than from a list of
+definitions.</p>
+
+<p>The pattern in most of them: the definition is the easy half, and the interviewer is listening for
+the trade-off.</p>
+
+<h2>The container</h2>
+
+<h3>1. What does <code>@SpringBootApplication</code> actually do?</h3>
+
+<p>It combines <code>@SpringBootConfiguration</code>, <code>@EnableAutoConfiguration</code> and
+<code>@ComponentScan</code>.</p>
+
+<p>The part worth saying out loud: <strong>component scanning starts at that class's package and goes
+down</strong>. A bean in a sibling package is invisible, and the error is
+<em>"required a bean of type X that could not be found"</em> — which sends you looking for a missing
+annotation rather than a misplaced package. Keeping the application class in the root package makes
+the problem impossible.</p>
+
+<h3>2. How does auto-configuration decide what to create?</h3>
+
+<p>Boot reads candidate configuration classes from its jars and evaluates each one's conditions:
+<code>@ConditionalOnClass</code>, <code>@ConditionalOnProperty</code>,
+<code>@ConditionalOnMissingBean</code>.</p>
+
+<p><strong><code>@ConditionalOnMissingBean</code> is the philosophy</strong> — auto-configuration is a
+default that steps aside the moment you define your own bean. You never disable Boot to take control;
+you just define the bean.</p>
+
+<p>Follow-up: <code>--debug</code> prints the condition evaluation report, which answers both "why is
+this bean here" and "why is it missing".</p>
+
+<h3>3. Why is constructor injection preferred?</h3>
+
+<p>Three reasons: fields can be <code>final</code> so the object is never half-built; the class is
+constructible in a test with a plain <code>new</code>; and <strong>a nine-parameter constructor is
+visibly embarrassing</strong>, which is useful pressure that field injection removes.</p>
+
+<p>Since Spring 4.3 a single constructor needs no <code>@Autowired</code>, and
+<code>@RequiredArgsConstructor</code> removes the boilerplate that made people reach for field
+injection in the first place.</p>
+
+<h3>4. What is the default bean scope, and what does that imply?</h3>
+
+<p>Singleton — one instance shared by every concurrent request. The implication is the answer:
+<strong>a singleton must be stateless.</strong> A mutable field is shared across threads, so two
+customers checking out simultaneously overwrite each other.</p>
+
+<p>Strong follow-up: a prototype injected into a singleton is resolved once, so you get one instance
+for the application's life. Use <code>ObjectProvider</code> if you need a genuinely fresh one.</p>
+
+<h3>5. How would you break a circular dependency?</h3>
+
+<p>Boot 4 refuses to start on one, correctly — it is a design problem. Extract the shared logic into a
+third bean; or publish an event, if one service only needs the other to <em>react</em>; or inject an
+<code>ObjectProvider</code> to defer resolution.</p>
+
+<p><code>spring.main.allow-circular-references=true</code> is the answer that ends the interview
+early. It injects a half-initialised proxy and keeps the design problem.</p>
+
+<h2>The proxy rule</h2>
+
+<h3>6. Why might <code>@Transactional</code> not work?</h3>
+
+<p><strong>The single most valuable question here.</strong> Spring wraps the bean in a proxy, and
+advice only runs for calls arriving through it. A method calling a sibling on <code>this</code>
+bypasses the proxy entirely:</p>
+
+<pre class="language-java"><code class="language-java">public void a() { b(); }              // no transaction
+@Transactional public void b() { }</code></pre>
+
+<p>What makes this a senior answer is generalising it: <strong>the same applies to
+<code>@Cacheable</code>, <code>@Async</code>, <code>@Retryable</code>, <code>@PreAuthorize</code> and
+every <code>@Aspect</code></strong>, and every one fails silently. With
+<code>@PreAuthorize</code> it means no authorization check runs at all.</p>
+
+<p>Also: <code>private</code> and <code>final</code> methods are never advised.</p>
+
+<h3>7. When does a transaction roll back?</h3>
+
+<p>Automatically for unchecked exceptions, <strong>not</strong> for checked ones — which is why
+application exceptions should extend <code>RuntimeException</code>. A checked exception thrown
+mid-transaction commits the partial work.</p>
+
+<p><code>@Transactional(rollbackFor = Exception.class)</code> overrides it.</p>
+
+<h2>Data</h2>
+
+<h3>8. What is the N+1 problem and how do you find it?</h3>
+
+<p>Loading N parents then querying once per parent for a lazy association: 14 products becomes 15
+queries. Invisible with test data, fatal with real data.</p>
+
+<p>Fix with <code>JOIN FETCH</code>, an entity graph, or batch fetching. <strong>Find it</strong> by
+setting <code>spring.jpa.show-sql=true</code> — and prevent it by setting
+<code>spring.jpa.open-in-view=false</code>, which turns the hidden lazy load into a loud
+<code>LazyInitializationException</code> during development instead of a silent query storm in
+production.</p>
+
+<h3>9. Why not return JPA entities from a controller?</h3>
+
+<p>Three reasons, and a good candidate gives all three: lazy collections throw or trigger a query
+cascade when Jackson serialises them outside a transaction; the entity's shape is a database concern
+that should be free to change; and <strong>it leaks</strong> — one <code>return user;</code> publishes
+<code>passwordHash</code>.</p>
+
+<p>Follow-up worth volunteering: separate request and response DTOs, because reusing one class lets a
+client set fields it should not — mass assignment. The strongest version is designing the field out
+entirely: a DTO with no <code>role</code> field cannot carry a role.</p>
+
+<h3>10. <code>ddl-auto=update</code> — why not?</h3>
+
+<p>It never removes anything, so schemas accumulate dead columns; it applies changes in an order it
+chooses; and it gives you no history and no chance to review the SQL before it runs in production.</p>
+
+<p>The answer that shows experience: let a migration tool own the schema and set
+<code>validate</code>, so drift between entities and tables <strong>fails at startup</strong> with a
+message naming the table.</p>
+
+<h3>11. A soft-delete trap — what is it?</h3>
+
+<p><code>@SQLRestriction("deleted = false")</code> is applied by Hibernate when it builds a query
+<em>from the entity model</em>. SQL you write yourself never goes near the entity model, so a
+hand-written report query silently counts deleted rows.</p>
+
+<p>This one is from a real bug: deleted orders were counted as revenue. Nothing threw, nothing logged,
+and the numbers looked plausible — which is why it survived. The lesson is that the failure mode of a
+correctness bug is usually <em>plausible output</em>, not an exception.</p>
+
+<h3>12. When would you use <code>JdbcTemplate</code> over JPA?</h3>
+
+<p>When the result is not an entity — aggregates, reports, projections. JPA's value is mapping rows to
+an object graph and tracking changes to it; a <code>SUM</code> needs neither.</p>
+
+<p>Corollary worth stating: <strong>aggregate in the database.</strong> Loading every order to sum
+totals in Java works on 18 rows and fails on a real table.</p>
+
+<h2>Web and API design</h2>
+
+<h3>13. Should bad input ever produce a 500?</h3>
+
+<p>No. A malformed UUID in a request body throws <code>HttpMessageNotReadableException</code>, and
+without an explicit handler the catch-all turns it into a 500 — <strong>which makes your error rate
+meaningless</strong>, because it now measures how often someone typed a bad URL. Real outages hide in
+that noise.</p>
+
+<p>Handle <code>HttpMessageNotReadableException</code> and
+<code>MethodArgumentTypeMismatchException</code> explicitly as 400s.</p>
+
+<h3>14. 403 or 404 for a resource that exists but is not the caller's?</h3>
+
+<p><strong>404.</strong> 403 confirms the resource exists, so an attacker can enumerate ids by
+collecting them.</p>
+
+<p>The stronger design removes the question: resolve ownership from the token and put no id in the
+path at all — <code>/api/me/orders</code> rather than <code>/api/users/{id}/orders</code>.</p>
+
+<h3>15. Why do login failures give one vague message?</h3>
+
+<p>Account enumeration. "No account with that email" lets an attacker submit a list and learn which
+addresses are registered — valuable on its own, and more so combined with a password dump from
+elsewhere.</p>
+
+<p>Same reasoning applies to token parsing: distinguishing "expired" from "forged" tells an attacker
+whether their forgery was structurally correct.</p>
+
+<h2>Security</h2>
+
+<h3>16. What are the trade-offs of JWTs?</h3>
+
+<p>The benefit and the cost are the same property. <strong>Stateless means no session store and any
+instance can serve any request; it also means a token cannot be revoked.</strong></p>
+
+<p>So: no working "log out everywhere", a fired employee's token stays valid, and demoting an admin
+does not take effect until expiry. Mitigations, in order of cost: short-lived access tokens plus a
+revocable refresh token; a denylist in Redis; a per-user token version as a claim.</p>
+
+<p>A candidate who says "JWTs are stateless and scalable" without the second half has not run one in
+production.</p>
+
+<h3>17. Is a JWT encrypted?</h3>
+
+<p>No — signed. Anyone holding one can decode the payload. The signature guarantees <em>we</em> issued
+it and nobody edited it, nothing more. Never put anything secret in the claims.</p>
+
+<p>Follow-up: always verify the signature. An unverified token is a string the client wrote, and the
+classic attack is setting <code>alg</code> to <code>none</code>.</p>
+
+<h3>18. When is disabling CSRF safe?</h3>
+
+<p>When authentication is <strong>not</strong> cookie-based. CSRF works because browsers attach
+cookies automatically; a JWT in an <code>Authorization</code> header is not attached automatically, so
+there is nothing to exploit.</p>
+
+<p>The critical caveat: that reasoning collapses if you store the token in a cookie. Then
+<code>csrf.disable()</code> is a real vulnerability.</p>
+
+<h3>19. What is the hard part of "sign in with Google"?</h3>
+
+<p>Not the protocol — Spring handles it. It is <strong>reconciling the provider's identity with your
+user table</strong>.</p>
+
+<p>The security answer: match only on a <strong>verified</strong> email. Matching an unverified address
+is account takeover — an attacker registers at a provider claiming the victim's address and is handed
+the existing account. And the role must never come from the provider.</p>
+
+<h2>Concurrency and integration</h2>
+
+<h3>20. How does a <code>ThreadPoolTaskExecutor</code> grow?</h3>
+
+<p>Most people say "when threads are busy". It actually grows <strong>when the queue is full</strong>:
+core threads first, then queue, then up to max, then the rejection policy.</p>
+
+<p>So a large queue means <code>maxPoolSize</code> is almost never reached, and an
+<em>unbounded</em> queue means it is never reached at all — the queue simply grows until you run out
+of memory.</p>
+
+<p><code>CallerRunsPolicy</code> is usually right: the submitter runs the task, which applies natural
+backpressure and loses nothing.</p>
+
+<h3>21. What happens to an exception in an <code>@Async void</code> method?</h3>
+
+<p>It disappears. Nothing is watching the return value, so it goes to the
+<code>AsyncUncaughtExceptionHandler</code> — which you must configure, or async failures are entirely
+invisible. Returning <code>CompletableFuture</code> surfaces it on <code>get()</code> instead.</p>
+
+<p>Related: a new thread has no <code>SecurityContext</code>, no transaction and no persistence
+context.</p>
+
+<h3>22. Why <code>@TransactionalEventListener(AFTER_COMMIT)</code>?</h3>
+
+<p>A plain <code>@EventListener</code> runs inside the publisher's transaction, before commit. So a
+confirmation email fires and <em>then</em> the transaction rolls back, leaving the customer holding an
+email about an order that does not exist.</p>
+
+<p>The rule: if the work must be undone on rollback, use a plain listener; if it cannot be undone, use
+<code>AFTER_COMMIT</code>.</p>
+
+<h3>23. When is it safe to retry?</h3>
+
+<p>Only when the operation is idempotent, or you supply an idempotency key. Retrying a payment write
+after a lost response creates a second charge.</p>
+
+<p>Also retry only what could succeed unchanged — a timeout or a 429, never a 400. And use backoff
+<strong>with jitter</strong>, or every client retries in synchronised waves and knocks the recovering
+service over again.</p>
+
+<h3>24. What delivery guarantee does a message broker give you?</h3>
+
+<p><strong>At-least-once</strong>, not exactly-once. A restart or a slow acknowledgement can redeliver.
+So consumers must be idempotent — which is the same conclusion as the retry question, reached from
+the other side.</p>
+
+<p>Also expect: a dead-letter queue, or a poison message is redelivered forever; and publish after
+commit, because the broker knows nothing about your transaction.</p>
+
+<h3>25. What is the dual-write problem?</h3>
+
+<p>The database commits, then the broker call fails — so the message is never sent, and the two
+systems disagree. No amount of ordering fixes it, because there is no transaction across both.</p>
+
+<p>The standard answer is the <strong>transactional outbox</strong>: write the message to a table in
+the same transaction, and publish from that table separately. Naming it is what separates a candidate
+who has read about messaging from one who has run it.</p>
+
+<h2>Caching and correctness</h2>
+
+<h3>26. What is hard about caching?</h3>
+
+<p>Not the annotations — <strong>eviction</strong>. Every write path that could invalidate an entry
+must evict, and missing one serves stale data indefinitely with nothing failing.</p>
+
+<p>Volunteer the rest: cache only what is read often, identical for every caller and rarely changed —
+never per-user data, which usually works in testing and leaks between customers under load. And the
+default <code>ConcurrentMapCacheManager</code> is per-JVM, so with two replicas one evicts and the
+other keeps serving the old value. A TTL bounds the damage of a missed eviction.</p>
+
+<h3>27. Why does the server recompute every price?</h3>
+
+<p>Because a field the client can set is a field the client can set to anything. Trusting a client-sent
+price is the most exploitable e-commerce bug there is, and it takes one HTTP client to exploit.</p>
+
+<p>The pizza API's request DTO carries no prices at all — it chooses <em>which</em> products, and every
+figure is read from the database.</p>
+
+<h2>Build and operations</h2>
+
+<h3>28. What changed in Spring Boot 4 that breaks a Boot 3 build?</h3>
+
+<p>Java 21 is the floor. Artifacts were renamed — <code>spring-boot-starter-aop</code> is now
+<code>-aspectj</code>, <code>-web</code> is now <code>-webmvc</code> — and the old names are absent
+from the BOM, so the error is <em>"version is missing"</em> rather than anything mentioning a rename.
+Autoconfiguration classes moved into per-technology packages. And Framework 7 brings retry into the
+core container and deprecates the Jackson 2 types.</p>
+
+<p>The subtle one: <strong>depending on a library no longer implies its autoconfiguration.</strong>
+Plain <code>liquibase-core</code> gives you Liquibase that never runs, and the error surfaces as a
+Hibernate "missing table" complaint several layers away.</p>
+
+<h3>29. Which test would you write first?</h3>
+
+<p>The smallest one that can fail honestly. A plain unit test if there is no Spring involved; a
+<code>@WebMvcTest</code> slice for a controller; <code>@SpringBootTest</code> only when the thing you
+are testing genuinely crosses layers — authorization rules being the good example, because mocking
+the security context would only prove the mock works.</p>
+
+<p>The principle worth stating: <strong>compute expected values by hand.</strong> A test asserting
+<code>total == subtotal + tax</code> passes when the formula is wrong.</p>
+
+<h3>30. Behaviour does not match the source. What do you check first?</h3>
+
+<p>Stale build output. A <code>NoClassDefFoundError</code> naming an <em>unqualified</em> class is the
+signature, and <code>./mvnw clean compile</code> fixes it.</p>
+
+<p>It is a good closing question because the honest answer is not clever — it is knowing that
+"impossible" behaviour usually means the build, and checking that before spending an afternoon
+debugging code that is already correct.</p>
+
+<h2>What interviewers are listening for</h2>
+
+<p>Across all thirty, the same three things separate a strong answer:</p>
+
+<ul>
+  <li><strong>The trade-off, not the definition.</strong> "JWTs are stateless" is half an answer;
+  "and therefore unrevocable" is the other half.</li>
+  <li><strong>The silent failure.</strong> The valuable knowledge is which mistakes throw and which
+  ones quietly produce plausible, wrong output.</li>
+  <li><strong>What you would do differently in production</strong> — and knowing when the simple
+  version is genuinely fine.</li>
+</ul>
+
+<p>Back to <a href="/spring-boot/spring-boot-get-started">the start of the track</a>, or the
+<a href="/spring-boot/spring-boot-code-snippets">cheat sheet</a>.</p>

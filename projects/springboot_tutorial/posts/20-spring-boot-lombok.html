@@ -1,0 +1,203 @@
+<p>Java's boilerplate is real: a class with eight fields needs eight getters, eight setters, a
+constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code>, none of which
+carry information. Lombok generates them from annotations at compile time.</p>
+
+<p>It is also the library most likely to cause a subtle bug in a Spring Boot application, and this
+lesson spends as much time on that as on the convenience.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+    &lt;artifactId&gt;lombok&lt;/artifactId&gt;
+    &lt;optional&gt;true&lt;/optional&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p><code>&lt;optional&gt;true&lt;/optional&gt;</code> keeps Lombok off your consumers' classpath — it
+is a compile-time tool and nothing needs it at runtime. The Boot plugin also excludes it from the
+executable jar:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;plugin&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-maven-plugin&lt;/artifactId&gt;
+    &lt;configuration&gt;
+        &lt;excludes&gt;
+            &lt;exclude&gt;
+                &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+                &lt;artifactId&gt;lombok&lt;/artifactId&gt;
+            &lt;/exclude&gt;
+        &lt;/excludes&gt;
+    &lt;/configuration&gt;
+&lt;/plugin&gt;</code></pre>
+
+<p>If you also use MapStruct, the annotation-processor order is load-bearing — see lesson 19.</p>
+
+<h2>The annotations worth using</h2>
+
+<h3><code>@Slf4j</code> — the one with no downside</h3>
+
+<pre class="language-java"><code class="language-java">@Slf4j
+@Service
+public class ProductServiceImpl implements ProductService {
+
+    public ProductDTO createProduct(ProductCreateDTO dto) {
+        log.info("Creating product {}", dto.name());
+    }
+}</code></pre>
+
+<p>It replaces
+<code>private static final Logger log = LoggerFactory.getLogger(ProductServiceImpl.class);</code> —
+a line whose only failure mode is naming the wrong class after a copy-paste. 28 files in the pizza API
+use it.</p>
+
+<p>Note the <code>{}</code> placeholder rather than string concatenation: the arguments are only
+formatted if the level is enabled, so a disabled <code>log.debug</code> costs nothing.</p>
+
+<h3><code>@RequiredArgsConstructor</code> — the one that fixes injection</h3>
+
+<pre class="language-java"><code class="language-java">@Service
+@RequiredArgsConstructor
+public class MailServiceImpl implements MailService {
+
+    private final ObjectProvider&lt;JavaMailSender&gt; mailSenderProvider;
+    private final TemplateEngine templateEngine;
+    private final PizzaProperties properties;
+}</code></pre>
+
+<p>It generates a constructor taking every <code>final</code> field. Spring uses it automatically, so
+you get constructor injection with less code than field injection — which removes the only real
+argument people had for <code>@Autowired</code> on fields (lesson 6).</p>
+
+<h3><code>@Builder</code> — for objects with many fields</h3>
+
+<pre class="language-java"><code class="language-java">return userDAO.save(User.builder()
+        .email(email)
+        .fullName(name == null || name.isBlank() ? email : name)
+        .passwordHash(null)
+        .role(UserRole.CUSTOMER)
+        .build());</code></pre>
+
+<p>Readable, and immune to the classic bug where two adjacent <code>String</code> constructor
+parameters get swapped and everything still compiles.</p>
+
+<p>⚠️ <strong><code>@Builder</code> ignores field initialisers</strong> unless you add
+<code>@Builder.Default</code>. Without it, a field declared <code>= true</code> comes out of the
+builder as <code>false</code>:</p>
+
+<pre class="language-java"><code class="language-java">@Builder.Default
+@Column(name = "active", nullable = false)
+private boolean active = true;
+
+@Builder.Default
+@Column(name = "deleted", nullable = false)
+private boolean deleted = false;</code></pre>
+
+<p>Lombok warns about this. Do not ignore the warning — a product silently created inactive is not
+obvious from the calling code.</p>
+
+<h3><code>@Getter</code> and <code>@Setter</code></h3>
+
+<p>Per field or per class. Prefer them over <code>@Data</code> on entities, for the reason
+below.</p>
+
+<h2>⚠️ <code>@Data</code> on a JPA entity</h2>
+
+<p><code>@Data</code> bundles <code>@Getter</code>, <code>@Setter</code>,
+<code>@ToString</code>, <code>@EqualsAndHashCode</code> and <code>@RequiredArgsConstructor</code>. On
+a plain DTO it is fine. On a JPA entity it causes two genuinely nasty problems, and the pizza API's
+<code>Product</code> documents them:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Excluded from equals/hashCode/toString. {@code @Data} would otherwise walk the collection
+ * — forcing a lazy load on every toString, and recursing forever through the child's parent
+ * reference. This is the single most common way @Data and JPA go wrong together.
+ */
+@ToString.Exclude
+@EqualsAndHashCode.Exclude
+@OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true,
+           fetch = FetchType.LAZY)
+private List&lt;ProductSize&gt; sizes = new ArrayList&lt;&gt;();</code></pre>
+
+<h3>Problem one: collections in <code>toString</code></h3>
+
+<p>A generated <code>toString</code> includes every field, including lazy collections. So a debug log
+line triggers a database query — or, if <code>Product</code> prints its <code>sizes</code> and each
+<code>ProductSize</code> prints its <code>product</code>, a <code>StackOverflowError</code>. A
+logging statement that crashes the application is a memorable afternoon.</p>
+
+<h3>Problem two: <code>equals</code> and <code>hashCode</code></h3>
+
+<p>Generated <code>equals</code> and <code>hashCode</code> use all fields, including the generated
+<code>id</code>. Which breaks in a way JPA makes easy to hit:</p>
+
+<pre class="language-java"><code class="language-java">Product product = new Product();       // id is null
+Set&lt;Product&gt; set = new HashSet&lt;&gt;();
+set.add(product);                       // hashed with id == null
+
+productRepository.save(product);        // JPA assigns id = 42 — the hash changes
+
+set.contains(product);                  // false. It is in the set and cannot be found.</code></pre>
+
+<p>The object's hash changed while it was in a hash-based collection. The safe pattern is to exclude
+collections and base equality on the business key — here, <code>publicId</code>, which is assigned in
+<code>@PrePersist</code> and never changes.</p>
+
+<h2><code>@ToString</code> and secrets</h2>
+
+<p><code>User</code> has a <code>passwordHash</code>. A generated <code>toString</code> includes it,
+and one <code>log.debug("Loaded {}", user)</code> puts a password hash in your logs — where it is
+retained, shipped to a log aggregator, and visible to everyone with access to it.</p>
+
+<pre class="language-java"><code class="language-java">@ToString.Exclude
+private String passwordHash;</code></pre>
+
+<p>The same applies to tokens, API keys and card details. The pizza API's <code>ApiSubError</code>
+takes the same care in prose: <em>"The rejected value. Never populated for passwords or other
+secrets."</em></p>
+
+<h2>Records instead, where you can</h2>
+
+<p>Java records give you immutability, <code>equals</code>, <code>hashCode</code>,
+<code>toString</code> and a constructor with no library at all:</p>
+
+<pre class="language-java"><code class="language-java">public record ProductDTO(
+        UUID id,
+        String name,
+        String description,
+        ProductType type,
+        List&lt;ProductSizeDTO&gt; sizes) {}</code></pre>
+
+<p>The pizza API uses <strong>records for every DTO and Lombok for entities</strong>. That split is
+principled rather than arbitrary: DTOs are immutable value objects, which is exactly what a record is;
+JPA entities need a no-arg constructor and mutable fields, which is exactly what a record is not.</p>
+
+<h2>The honest downsides</h2>
+
+<ul>
+  <li><strong>Your IDE needs a plugin.</strong> Without it, code referencing generated methods is a
+  sea of red.</li>
+  <li><strong>Debugging steps into generated code</strong> you cannot see in the file.</li>
+  <li><strong>It is a compile-time hack.</strong> Lombok modifies the AST through internal compiler
+  APIs, which is why each new JDK occasionally needs a new Lombok.</li>
+  <li><strong>It hides cost.</strong> <code>@Data</code> on an entity looks like tidiness and is a
+  behavioural change.</li>
+</ul>
+
+<p>Those are real, and the boilerplate it removes is real too. The pizza API's position — records for
+DTOs, targeted Lombok annotations on entities, never bare <code>@Data</code> — gets most of the
+benefit and avoids the traps.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong><code>@Slf4j</code> and <code>@RequiredArgsConstructor</code> everywhere.</strong> Both
+  are pure win.</li>
+  <li><strong><code>@Builder.Default</code></strong> or your field initialisers are ignored.</li>
+  <li><strong>Never <code>@Data</code> on a JPA entity.</strong> Use targeted annotations and exclude
+  collections from <code>toString</code> and <code>equals</code>.</li>
+  <li><strong><code>@ToString.Exclude</code> on every secret.</strong></li>
+  <li><strong>Records for DTOs</strong> — no library needed.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-cache">caching</a> — and the eviction that has to be wired
+to every write path.</p>

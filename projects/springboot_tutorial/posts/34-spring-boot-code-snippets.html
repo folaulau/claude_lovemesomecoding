@@ -1,0 +1,324 @@
+<p>Everything from this track on one page, grouped by what you are trying to do rather than by topic.
+Written to be scanned. Each section links to the lesson behind it.</p>
+
+<p>All of it is Spring Boot 4.1 on Java 21. Where Boot 3 differs, it is marked ⚠️.</p>
+
+<h2>Start a project</h2>
+
+<pre class="language-bash"><code class="language-bash">curl https://start.spring.io/starter.zip \
+  -d type=maven-project -d language=java \
+  -d bootVersion=4.1.0 -d javaVersion=21 \
+  -d dependencies=web,data-jpa,validation,lombok \
+  -o demo.zip &amp;&amp; unzip demo.zip -d demo</code></pre>
+
+<pre class="language-bash"><code class="language-bash">./mvnw spring-boot:run                        # run
+./mvnw spring-boot:run -Dspring-boot.run.arguments=--debug   # + condition report
+./mvnw test                                   # test
+./mvnw clean compile                          # when behaviour ≠ source
+./mvnw spotless:apply                         # format</code></pre>
+
+<h2>⚠️ Boot 3 → Boot 4 renames</h2>
+
+<p><a href="/spring-boot/spring-boot-migration-from-spring">Lesson 3</a></p>
+
+<table>
+  <thead>
+    <tr><th>Boot 3</th><th>Boot 4 / Framework 7</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>spring-boot-starter-web</code></td><td><code>spring-boot-starter-webmvc</code></td></tr>
+    <tr><td><code>spring-boot-starter-aop</code></td><td><code>spring-boot-starter-aspectj</code></td></tr>
+    <tr><td><code>spring-boot-starter-test</code></td><td><code>spring-boot-starter-webmvc-test</code></td></tr>
+    <tr><td><code>liquibase-core</code></td><td><code>spring-boot-starter-liquibase</code></td></tr>
+    <tr><td><code>boot.autoconfigure.jms.*</code></td><td><code>boot.jms.autoconfigure.*</code></td></tr>
+    <tr><td><code>MappingJackson2MessageConverter</code></td><td><code>JacksonJsonMessageConverter</code></td></tr>
+    <tr><td><code>spring-retry</code> + <code>@EnableRetry</code></td><td>built in +
+    <code>@EnableResilientMethods</code></td></tr>
+    <tr><td><code>@MockBean</code></td><td><code>@MockitoBean</code></td></tr>
+    <tr><td>Java 17</td><td><strong>Java 21</strong></td></tr>
+  </tbody>
+</table>
+
+<h2>Wire a bean</h2>
+
+<p><a href="/spring-boot/spring-boot-bean">Lesson 5</a> ·
+<a href="/spring-boot/spring-boot-dependency-injection">6</a></p>
+
+<pre class="language-java"><code class="language-java">@Service @Repository @RestController @Component   // your classes
+@Configuration + @Bean                            // someone else's classes
+
+// Constructor injection — the default. No @Autowired needed.
+@Service
+@RequiredArgsConstructor
+public class OrderServiceImpl implements OrderService {
+    private final ProductDAO productDAO;
+    private final PizzaProperties properties;
+}
+
+// Optional dependency — degrades instead of failing startup
+private final ObjectProvider&lt;JavaMailSender&gt; senderProvider;
+JavaMailSender sender = senderProvider.getIfAvailable();   // null if absent
+
+@Primary            // the default when two beans fit
+@Qualifier("name")  // pick one explicitly; beats @Primary
+@Scope("prototype") // new instance per injection point
+
+@PostConstruct void init() { }      // after injection — validate config here
+@PreDestroy   void close() { }      // on graceful shutdown</code></pre>
+
+<h2>Configure it</h2>
+
+<p><a href="/spring-boot/spring-boot-configuration-properties">Lesson 7</a></p>
+
+<pre class="language-java"><code class="language-java">@Validated
+@ConfigurationProperties(prefix = "pizza")
+public record PizzaProperties(@Valid Jwt jwt, @Valid Pricing pricing) {
+    public record Jwt(@NotBlank @Size(min = 32) String secret, @Positive long expirationMinutes) {}
+    public record Pricing(@DecimalMin("0.0") @DecimalMax("1.0") BigDecimal taxRate) {}
+}
+
+@SpringBootApplication
+@ConfigurationPropertiesScan          // finds them all
+public class Application { }</code></pre>
+
+<pre class="language-properties"><code class="language-properties">pizza.jwt.secret=${JWT_SECRET:}       # env var with a default after the colon
+spring.profiles.active=local          # profile → application-local.properties</code></pre>
+
+<p>Precedence, lowest first: jar properties → profile → env vars → <code>-D</code> → command line.</p>
+
+<h2>Expose an endpoint</h2>
+
+<p><a href="/spring-boot/spring-boot-rest">Lesson 11</a> ·
+<a href="/spring-boot/spring-boot-web-mvc">10</a></p>
+
+<pre class="language-java"><code class="language-java">@RestController
+@RequestMapping("/api/products")
+public class ProductRestController {
+
+    @GetMapping                       public List&lt;ProductDTO&gt; list(
+            @RequestParam(required = false) ProductType type) { }
+    @GetMapping("/{id}")              public ProductDTO get(@PathVariable UUID id) { }
+    @PostMapping                      public ResponseEntity&lt;ProductDTO&gt; create(
+            @Valid @RequestBody ProductCreateDTO dto) { }
+    @PutMapping("/{id}")              // replace
+    @PatchMapping("/{id}/deactivate") // partial state change
+    @DeleteMapping("/{id}")           public ResponseEntity&lt;Void&gt; delete(@PathVariable UUID id) {
+        return ResponseEntity.noContent().build();       // 204
+    }
+}</code></pre>
+
+<pre class="language-java"><code class="language-java">@RequestParam(defaultValue = "0") int page
+@RequestHeader("Stripe-Signature") String signature
+@RequestPart("file") MultipartFile file          // + consumes = MULTIPART_FORM_DATA_VALUE
+Authentication authentication                     // the current caller</code></pre>
+
+<p><strong>200</strong> ok · <strong>201</strong> created · <strong>204</strong> no content ·
+<strong>400</strong> your fault · <strong>401</strong> who are you · <strong>403</strong> no ·
+<strong>404</strong> not there · <strong>409</strong> conflict · <strong>500</strong> our fault.</p>
+
+<h2>Handle errors</h2>
+
+<p><a href="/spring-boot/spring-boot-exception-handling">Lesson 12</a></p>
+
+<pre class="language-java"><code class="language-java">@RestControllerAdvice
+public class RestExceptionHandler {
+
+    @ExceptionHandler(ApiException.class)                     // yours
+    @ExceptionHandler(MethodArgumentNotValidException.class)  // @Valid failed
+    @ExceptionHandler(HttpMessageNotReadableException.class)  // unparseable body → 400
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class) // bad path var → 400
+    @ExceptionHandler(AccessDeniedException.class)            // → 403
+    @ExceptionHandler(Exception.class)                        // catch-all → 500, log only
+}
+
+throw ApiException.notFound("Product", id);
+throw ApiException.badRequest("An email address is required");</code></pre>
+
+<p>⚠️ Filter-level security errors bypass this — configure
+<code>authenticationEntryPoint</code> / <code>accessDeniedHandler</code> instead.</p>
+
+<h2>Query a database</h2>
+
+<p><a href="/spring-boot/spring-boot-hibernate">Lesson 16</a> ·
+<a href="/spring-boot/spring-boot-jdbc">17</a></p>
+
+<pre class="language-java"><code class="language-java">@Entity
+@SQLRestriction("deleted = false")                    // soft delete, JPA reads only
+public class Product {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY) private Long id;
+    @JdbcTypeCode(SqlTypes.CHAR) private UUID publicId;   // MySQL: else BINARY(16)
+    @Enumerated(EnumType.STRING) private ProductType type; // NEVER ordinal
+    @CreationTimestamp private LocalDateTime createdAt;
+    @UpdateTimestamp   private LocalDateTime updatedAt;
+
+    @ToString.Exclude @EqualsAndHashCode.Exclude
+    @OneToMany(mappedBy = "product", cascade = ALL, orphanRemoval = true, fetch = LAZY)
+    private List&lt;ProductSize&gt; sizes = new ArrayList&lt;&gt;();
+}</code></pre>
+
+<pre class="language-java"><code class="language-java">// Derived query
+Optional&lt;User&gt; findByEmailIgnoreCase(String email);
+boolean existsByEmail(String email);
+
+// JOIN FETCH kills N+1
+@Query("SELECT DISTINCT p FROM Product p LEFT JOIN FETCH p.sizes WHERE p.publicId = :id")
+Optional&lt;Product&gt; findByPublicIdWithSizes(@Param("id") UUID id);
+
+// JdbcTemplate for aggregates
+String query = """
+        SELECT COUNT(*) AS total_orders, COALESCE(SUM(o.total), 0) AS total_revenue
+        FROM customer_order o
+        WHERE o.deleted = 0 AND o.created_at &gt;= :from
+        """;
+jdbcTemplate.queryForObject(query, Map.of("from", from), summaryRowMapper);</code></pre>
+
+<pre class="language-properties"><code class="language-properties">spring.jpa.hibernate.ddl-auto=validate    # never `update`
+spring.jpa.open-in-view=false             # surfaces N+1 in development
+spring.jpa.show-sql=true</code></pre>
+
+<p>⚠️ <strong>Hand-written SQL must filter <code>deleted = 0</code> itself.</strong>
+<code>@SQLRestriction</code> only applies to queries Hibernate builds.</p>
+
+<h2>Secure it</h2>
+
+<p><a href="/spring-boot/spring-boot-security-config">Lesson 24</a> ·
+<a href="/spring-boot/spring-boot-security-secured-on-method-level">26</a></p>
+
+<pre class="language-java"><code class="language-java">@Configuration @EnableWebSecurity @EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.cors(Customizer.withDefaults())
+            .csrf(csrf -&gt; csrf.disable())      // ONLY safe for header-based tokens
+            .sessionManagement(s -&gt; s.sessionCreationPolicy(STATELESS))
+            .authorizeHttpRequests(auth -&gt; auth
+                .requestMatchers("/api/auth/login").permitAll()
+                .requestMatchers(HttpMethod.GET, "/api/orders/mine").authenticated()  // specific
+                .requestMatchers(HttpMethod.GET, "/api/orders/*").permitAll()         // general
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated())                                        // default deny
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean public PasswordEncoder passwordEncoder() { return new BCryptPasswordEncoder(); }
+}</code></pre>
+
+<pre class="language-java"><code class="language-java">@PreAuthorize("hasRole('ADMIN')")                          // = authority ROLE_ADMIN
+@PreAuthorize("#email == authentication.name")
+@PreAuthorize("@orderSecurity.isOwner(#id, authentication.name)")</code></pre>
+
+<p><strong>First match wins</strong> — specific rules before general ones.</p>
+
+<h2>Cross-cutting concerns</h2>
+
+<p><a href="/spring-boot/spring-boot-aop">Lesson 8</a> ·
+<a href="/spring-boot/spring-boot-event-handling">9</a> ·
+<a href="/spring-boot/spring-boot-cache">21</a> ·
+<a href="/spring-boot/spring-boot-thread-pool">28</a> ·
+<a href="/spring-boot/spring-boot-retry">29</a></p>
+
+<pre class="language-java"><code class="language-java">// AOP
+@Aspect @Component
+@Pointcut("execution(* com.pizza.api.entity..*ServiceImpl.*(..))")
+@Around("serviceLayer()") public Object time(ProceedingJoinPoint jp) throws Throwable {
+    try { return jp.proceed(); } finally { /* … */ }
+}
+
+// Events
+events.publishEvent(OrderPlacedEvent.from(saved));
+@EventListener                                              // inside the transaction
+@TransactionalEventListener(phase = AFTER_COMMIT)           // after commit — use this
+@Order(10)                                                  // sequence listeners
+
+// Caching
+@EnableCaching
+@Cacheable(value = "menu", key = "#type")
+@Caching(evict = { @CacheEvict(value = "menu", allEntries = true) })   // EVERY write path
+
+// Async + scheduling
+@EnableAsync @EnableScheduling
+@Bean(name = "taskExecutor")     // the name matters
+@Async  @Scheduled(cron = "0 0 3 * * *")  @Scheduled(fixedDelay = 60000)
+
+// Retry — Framework 7, no dependency
+@EnableResilientMethods
+@Retryable(includes = {ApiConnectionException.class}, maxRetries = 3,
+           delay = 200, multiplier = 2.0, maxDelay = 2000, jitter = 100)</code></pre>
+
+<h2>⚠️ The proxy rule</h2>
+
+<p><a href="/spring-boot/spring-boot-aop">Lesson 8</a> — the most useful thing on this page.</p>
+
+<pre class="language-java"><code class="language-java">public void a() { b(); }   // b()'s annotations DO NOT RUN — self-invocation, no proxy
+@Transactional public void b() { }</code></pre>
+
+<p>Applies identically to <code>@Transactional</code>, <code>@Cacheable</code>,
+<code>@Async</code>, <code>@Retryable</code>, <code>@PreAuthorize</code> and every
+<code>@Aspect</code>. All fail <strong>silently</strong>. Also: <code>private</code> and
+<code>final</code> methods are never advised.</p>
+
+<h2>Map and reduce boilerplate</h2>
+
+<p><a href="/spring-boot/spring-boot-mapstruct">Lesson 19</a> ·
+<a href="/spring-boot/spring-boot-lombok">20</a></p>
+
+<pre class="language-java"><code class="language-java">@Mapper(componentModel = "spring", unmappedTargetPolicy = ReportingPolicy.IGNORE)
+public interface EntityDTOMapper {
+    @Mapping(target = "id", source = "publicId")     // never expose the BIGINT
+    ProductDTO mapProductToProductDTO(Product product);
+
+    @Mapping(target = "id", ignore = true)           // mass-assignment guard
+    @Mapping(target = "deleted", ignore = true)
+    Product mapProductCreateDTOToProduct(ProductCreateDTO dto);
+}</code></pre>
+
+<p>⚠️ Processor order: <strong>lombok → lombok-mapstruct-binding → mapstruct-processor</strong>. Wrong
+order compiles and maps nothing.</p>
+
+<pre class="language-java"><code class="language-java">@Slf4j                      // log.info("Created {}", id)
+@RequiredArgsConstructor    // constructor from final fields
+@Builder @Builder.Default   // Default or initialisers are IGNORED
+@Getter @Setter
+@ToString.Exclude           // on every secret and every collection
+// NEVER @Data on a JPA entity</code></pre>
+
+<h2>Test it</h2>
+
+<p><a href="/spring-boot/spring-boot-testing">Lesson 32</a></p>
+
+<pre class="language-java"><code class="language-java">@WebMvcTest(ProductRestController.class)   // web layer only
+@DataJpaTest                                // JPA only, rolled back
+@SpringBootTest @AutoConfigureMockMvc       // everything
+@Transactional                              // roll back after each test
+@MockitoBean private ProductService service;
+@WithMockUser(roles = "ADMIN")
+
+mockMvc.perform(get("/api/products"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$[0].name").value("Pepperoni"));
+
+assertThat(priced.total()).isEqualByComparingTo("22.42");   // NOT isEqualTo for BigDecimal</code></pre>
+
+<h2>Ten things that fail silently</h2>
+
+<ol>
+  <li><strong>Self-invocation</strong> — every proxy annotation stops working.</li>
+  <li><strong>Missing <code>@EnableCaching</code> / <code>@EnableAsync</code> /
+  <code>@EnableMethodSecurity</code></strong> — annotations inert.</li>
+  <li><strong><code>@Valid</code> missing on the parameter</strong> — no validation runs.</li>
+  <li><strong>MapStruct processor order</strong> — mappers map nothing.</li>
+  <li><strong>Hand-written SQL and soft deletes</strong> — deleted rows counted.</li>
+  <li><strong>A cache name typo</strong> — reads and evictions use different caches.</li>
+  <li><strong>Executor bean not named <code>taskExecutor</code></strong> — unbounded default
+  pool.</li>
+  <li><strong><code>@EnumType.ORDINAL</code></strong> (the default) — reordering the enum corrupts
+  every row.</li>
+  <li><strong><code>@Builder</code> without <code>@Builder.Default</code></strong> — initialisers
+  ignored.</li>
+  <li><strong>Missing autoconfiguration in Boot 4</strong> — fails far from the cause. Use
+  <code>--debug</code>.</li>
+</ol>
+
+<p>Next: <a href="/spring-boot/springboot-interview-questions">interview questions</a>.</p>

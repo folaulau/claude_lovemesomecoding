@@ -1,0 +1,170 @@
+<p>Spring Boot is not a new framework. It is Spring, plus a set of decisions made for you. Knowing
+which decisions, and how to see them, is the difference between using Boot and fighting it.</p>
+
+<h2>Starters</h2>
+
+<p>A starter is a dependency that contains no code. Its entire job is to depend on other things.</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-webmvc&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>That one line brings in Spring MVC, Jackson for JSON, an embedded Tomcat, validation glue and
+their transitive dependencies — at versions that are known to work together. See for yourself:</p>
+
+<pre class="language-bash"><code class="language-bash">./mvnw dependency:tree</code></pre>
+
+<p>Notice what is missing above: a <code>&lt;version&gt;</code>. It comes from the parent:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;parent&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-parent&lt;/artifactId&gt;
+    &lt;version&gt;4.1.0&lt;/version&gt;
+    &lt;relativePath/&gt;
+&lt;/parent&gt;</code></pre>
+
+<p>The parent imports a bill of materials — a long list of managed versions. Choosing Boot 4.1.0
+therefore chooses a Jackson version, a Hibernate version, a Tomcat version and a few hundred others,
+all tested together. This is the dependency-hell problem solved by someone else having already had
+the argument.</p>
+
+<p><strong>Not everything is managed.</strong> The pizza API pins springdoc by hand, and the comment
+explains why:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;properties&gt;
+    &lt;java.version&gt;21&lt;/java.version&gt;
+    &lt;!-- Boot 4.1 does not manage springdoc, so the version is pinned here.
+         2.8.6 is verified working against Spring Framework 7.0.8. --&gt;
+    &lt;springdoc.version&gt;2.8.6&lt;/springdoc.version&gt;
+&lt;/properties&gt;</code></pre>
+
+<p>If a dependency is not in the BOM, Maven tells you so in the least helpful way available:
+<code>'dependencies.dependency.version' for … is missing</code>. That message means "not managed",
+not "does not exist".</p>
+
+<h2>Auto-configuration</h2>
+
+<p>This is the part that feels like magic, and it is worth removing the magic early.</p>
+
+<p><code>@EnableAutoConfiguration</code> — inside <code>@SpringBootApplication</code> — makes Boot
+read a list of candidate configuration classes shipped inside its own jars, then evaluate each
+one's conditions against your application. A condition is usually "is this class on the classpath"
+or "has the user already defined this bean".</p>
+
+<p>Roughly, the JDBC one says: if a <code>DataSource</code> class is on the classpath, and a
+connection pool is available, and the user has <em>not</em> defined their own <code>DataSource</code>
+bean, then create one from the <code>spring.datasource.*</code> properties.</p>
+
+<pre class="language-java"><code class="language-java">// The shape of a Boot auto-configuration, paraphrased.
+@AutoConfiguration
+@ConditionalOnClass(DataSource.class)
+@EnableConfigurationProperties(DataSourceProperties.class)
+public class DataSourceAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean          // &lt;- backs off if you defined your own
+    public DataSource dataSource(DataSourceProperties properties) {
+        return properties.initializeDataSourceBuilder().build();
+    }
+}</code></pre>
+
+<p><code>@ConditionalOnMissingBean</code> is the whole philosophy in one annotation. Auto-configuration
+is a default, never an imposition: define your own bean of that type and Boot silently steps aside.
+You never have to "turn off" Boot to take control of something — you just do it.</p>
+
+<h2>Seeing every decision it made</h2>
+
+<p>When something is configured and you cannot find where, do not guess. Ask:</p>
+
+<pre class="language-bash"><code class="language-bash">./mvnw spring-boot:run -Dspring-boot.run.arguments=--debug</code></pre>
+
+<p>That prints the <strong>condition evaluation report</strong>: every auto-configuration class,
+split into the ones that matched and the ones that did not, each with the reason.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Positive matches:
+-----------------
+   DataSourceAutoConfiguration matched:
+      - @ConditionalOnClass found required class 'javax.sql.DataSource' (OnClassCondition)
+
+Negative matches:
+-----------------
+   RabbitAutoConfiguration:
+      Did not match:
+         - @ConditionalOnClass did not find required class
+           'com.rabbitmq.client.Channel' (OnClassCondition)</code></pre>
+
+<p>Two questions this answers immediately, both of which otherwise cost an afternoon: <em>why is
+this bean here?</em> and <em>why is this bean NOT here?</em> The second is the more common one, and
+the answer is almost always a missing dependency rather than anything you did wrong.</p>
+
+<p>To switch a specific auto-configuration off:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration</code></pre>
+
+<h2>⚠️ Boot 4 split autoconfiguration into modules</h2>
+
+<p>This is the change most likely to bite you when following an older tutorial. In Boot 3, adding a
+library often brought its autoconfiguration along. In Boot 4 the autoconfiguration frequently lives
+in a separate module, and depending on the plain library gives you the API with <em>no</em>
+autoconfiguration at all — which fails silently.</p>
+
+<p>The pizza API's <code>pom.xml</code> carries a scar from exactly this:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- Spring Boot 4 modularized autoconfiguration. Depending on plain
+     liquibase-core (all that Boot 3 needed) gives you the library with NO
+     autoconfiguration: Liquibase silently never runs and the failure shows up
+     as a confusing Hibernate "Schema validation: missing table" error. --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-liquibase&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>Note how the failure presented: not "Liquibase is missing" but "table not found". A missing
+autoconfiguration never announces itself — it produces a symptom several layers away. When something
+that should be automatic is not happening, the condition report above is the fastest route to the
+answer.</p>
+
+<h2>The embedded server</h2>
+
+<p>Traditional Java web deployment meant building a WAR and handing it to a servlet container you
+installed and configured separately. Boot inverts that: the server is a library your application
+starts.</p>
+
+<pre class="language-bash"><code class="language-bash">./mvnw package
+java -jar target/demo-0.0.1-SNAPSHOT.jar</code></pre>
+
+<p>That jar is executable and self-contained — application, dependencies and Tomcat. It is why Spring
+Boot and containers fit together so well: the Dockerfile is a base JRE image and one
+<code>COPY</code>.</p>
+
+<p>Configure it with properties rather than a server config file:</p>
+
+<pre class="language-properties"><code class="language-properties">server.port=8085
+server.servlet.context-path=/api
+server.tomcat.threads.max=200</code></pre>
+
+<p>The pizza API's port comment is worth stealing, because the failure mode is genuinely
+confusing:</p>
+
+<pre class="language-properties"><code class="language-properties"># 8085, deliberately. On this machine 8080 is taken by another Java app and 8099 by
+# the lovemesomecoding admin API. Note that a Boot app binds *:port on IPv6 while some
+# other servers bind 127.0.0.1 on IPv4, so a clashing `curl localhost:PORT` can quietly
+# hit the OTHER app and return a plausible-looking 404.
+server.port=8085</code></pre>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li>A <strong>starter</strong> is a curated dependency set; the <strong>parent</strong> supplies
+  the versions.</li>
+  <li><strong>Auto-configuration is conditional and always backs off</strong> when you define your
+  own bean. It is a default, not a constraint.</li>
+  <li><code>--debug</code> prints the condition evaluation report, which answers both "why is this
+  here" and "why is this missing".</li>
+  <li>In Boot 4, <strong>autoconfiguration often lives in its own module</strong>. A missing one
+  fails silently and far from the cause.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-migration-from-spring">from Spring to Spring Boot, and
+Boot 3 to 4</a> — what the XML turns into, and the renames that break a Boot 3 build.</p>

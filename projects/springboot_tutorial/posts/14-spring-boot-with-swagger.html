@@ -1,0 +1,176 @@
+<p>API documentation that lives in a separate document is wrong within a fortnight. Generating it from
+the code means it is wrong only when the code is.</p>
+
+<p>First, a naming clarification that causes real confusion. <strong>Swagger</strong> was the original
+project; it was donated and renamed <strong>OpenAPI</strong>. <strong>Springfox</strong> was the old
+Spring integration and is dead — it never supported Spring Boot 3, let alone 4. <strong>springdoc-openapi</strong>
+is what you use now. Tutorials mentioning <code>@EnableSwagger2</code> or <code>Docket</code> are
+Springfox and will not work.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;properties&gt;
+    &lt;!-- Boot 4.1 does not manage springdoc, so the version is pinned here.
+         2.8.6 is verified working against Spring Framework 7.0.8. --&gt;
+    &lt;springdoc.version&gt;2.8.6&lt;/springdoc.version&gt;
+&lt;/properties&gt;
+
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springdoc&lt;/groupId&gt;
+    &lt;artifactId&gt;springdoc-openapi-starter-webmvc-ui&lt;/artifactId&gt;
+    &lt;version&gt;${springdoc.version}&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>⚠️ <strong>Note the explicit version.</strong> springdoc is not in the Spring Boot BOM, so omitting
+it fails with <code>'dependencies.dependency.version' … is missing</code> — the same message a
+renamed starter produces (lesson 3), and it means something different here. Pin it, and pin a version
+verified against your Spring Framework version; springdoc reads Spring's internals and is sensitive
+to them.</p>
+
+<p>That is the whole setup. Start the app and you already have:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">/v3/api-docs        the OpenAPI 3 document, as JSON
+/v3/api-docs.yaml   the same thing as YAML
+/swagger-ui.html    the interactive UI</code></pre>
+
+<pre class="language-properties"><code class="language-properties">springdoc.swagger-ui.path=/swagger-ui.html
+springdoc.swagger-ui.operationsSorter=method</code></pre>
+
+<h2>⚠️ Spring Security will hide it from you</h2>
+
+<p>The first thing that happens on a secured app is a 401 from Swagger UI. The doc endpoints have to
+be permitted explicitly:</p>
+
+<pre class="language-java"><code class="language-java">// ---- documentation -------------------------------------------------
+.requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html")
+.permitAll()</code></pre>
+
+<p>All three patterns are needed — the UI is static assets under <code>/swagger-ui/**</code>, and it
+fetches the document from <code>/v3/api-docs/**</code>. Permitting only the HTML page gives you a UI
+that loads and then reports that it cannot read the spec.</p>
+
+<p><strong>In production, do the opposite.</strong> Publishing your complete API surface, including
+every admin endpoint, is free reconnaissance:</p>
+
+<pre class="language-properties"><code class="language-properties"># application-prod.properties
+springdoc.api-docs.enabled=false
+springdoc.swagger-ui.enabled=false</code></pre>
+
+<h2>Describing the API</h2>
+
+<pre class="language-java"><code class="language-java">@Configuration
+public class OpenApiConfig {
+
+    @Bean
+    public OpenAPI pizzaOpenAPI() {
+        return new OpenAPI()
+                .info(new Info()
+                        .title("Pizza API")
+                        .version("v1")
+                        .description("Ordering API for the pizza demo app. "
+                                + "Menu browsing and guest checkout are public; everything under "
+                                + "/api/admin requires an ADMIN token. "
+                                + "Demo accounts: admin@pizza.test / admin123 and "
+                                + "customer@pizza.test / pizza123."))
+                .components(new Components()
+                        .addSecuritySchemes(
+                                "bearerAuth",
+                                new SecurityScheme()
+                                        .type(SecurityScheme.Type.HTTP)
+                                        .scheme("bearer")
+                                        .bearerFormat("JWT")));
+    }
+}</code></pre>
+
+<p>The description is doing real work. Someone opening this page needs to know which endpoints are
+public, which need a token, and how to get one — that is what makes the difference between
+documentation and a list of URLs.</p>
+
+<h2>Making "Try it out" work with JWT</h2>
+
+<p>Declaring the security scheme above is half of it. Marking which endpoints use it is the other
+half:</p>
+
+<pre class="language-java"><code class="language-java">@Tag(name = "Admin · Products", description = "Menu management (ADMIN only)")
+@RequestMapping("/api/admin/products")
+@RestController
+@SecurityRequirement(name = "bearerAuth")     // &lt;- name must match the scheme above
+class AdminProductRestController { }</code></pre>
+
+<p>Now Swagger UI shows an <strong>Authorize</strong> button. Call
+<code>POST /api/auth/login</code>, copy the token, paste it in, and every subsequent request carries
+the header. Without <code>@SecurityRequirement</code> there is no button, and every admin call from
+the UI returns 403 — which reads like a broken endpoint rather than a missing header.</p>
+
+<p>The <code>name</code> is a string in two places. A typo produces exactly the same symptom as
+omitting it.</p>
+
+<h2>Documenting operations</h2>
+
+<pre class="language-java"><code class="language-java">@Operation(summary = "Deactivate a product — hidden from the menu, still editable here")
+@PatchMapping("/{id}/deactivate")
+public ResponseEntity&lt;Void&gt; deactivateProduct(@PathVariable UUID id) { }
+
+@Operation(summary = "Soft-delete a product — past orders still reference it")
+@DeleteMapping("/{id}")
+public ResponseEntity&lt;Void&gt; deleteProduct(@PathVariable UUID id) { }</code></pre>
+
+<p>Those two summaries are the model to copy. Neither restates the method name; each explains the
+consequence — which is the only thing a caller cannot work out from the signature. "Deactivate a
+product" would be worthless; "hidden from the menu, still editable here" answers the question
+somebody was about to ask.</p>
+
+<h2>Documenting the models</h2>
+
+<p>springdoc reads your DTOs, so records and Bean Validation annotations already produce a schema —
+<code>@NotBlank</code> becomes <code>required</code>, <code>@Size(max = 120)</code> becomes
+<code>maxLength</code>. Add <code>@Schema</code> where the type does not tell the whole story:</p>
+
+<pre class="language-java"><code class="language-java">@Schema(description = "A placed order")
+public record OrderDTO(
+        @Schema(description = "Public UUID — unguessable, unlike a sequential id") UUID id,
+        OrderStatus status,
+        OrderType orderType,
+        BigDecimal total,
+        @Schema(description = "Card brand that paid, display only", example = "visa")
+        String cardBrand,
+        @Schema(description = "Last four digits. NOT the card number.", example = "4242")
+        String cardLast4,
+        List&lt;OrderItemDTO&gt; items) {}</code></pre>
+
+<p>Note what those descriptions are for. <code>cardLast4</code> is documented as
+<em>"Last four digits. NOT the card number"</em> — that is a note to the next developer as much as to
+an API consumer, and it belongs where they will actually read it.</p>
+
+<p>Hide what is not part of the API:</p>
+
+<pre class="language-java"><code class="language-java">@Hidden  // A browser page, not part of the JSON API — keep it out of the OpenAPI document.
+public class OrderReceiptController { }</code></pre>
+
+<h2>What the generated document is good for</h2>
+
+<p>The UI is the visible benefit; the document is the useful one. <code>/v3/api-docs</code> is a
+machine-readable contract you can:</p>
+
+<ul>
+  <li><strong>Generate clients from</strong> — TypeScript, Python, Go — so the frontend's types come
+  from the backend rather than from someone reading and retyping.</li>
+  <li><strong>Diff in CI</strong> to catch breaking changes before they ship.</li>
+  <li><strong>Import into Postman or Insomnia</strong> as a complete collection.</li>
+</ul>
+
+<pre class="language-bash"><code class="language-bash">curl http://localhost:8085/v3/api-docs &gt; openapi.json</code></pre>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>springdoc, not Springfox</strong>, and pin the version — Boot does not manage it.</li>
+  <li><strong>Permit all three doc paths in Spring Security</strong>, and disable the whole thing in
+  production.</li>
+  <li><strong>Declare the scheme and mark the endpoints</strong> — both, or the Authorize button
+  never appears.</li>
+  <li><strong>Write summaries that state the consequence</strong>, not the method name.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-with-thymeleaf">server-rendered pages with Thymeleaf</a> —
+when a document beats a JSON endpoint.</p>

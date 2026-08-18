@@ -1,0 +1,243 @@
+<p>Without a deliberate error strategy, an API returns whatever each layer's default happens to be:
+Spring's Whitelabel page here, a Jackson parse failure there, a stack trace somewhere else. The
+frontend then needs a different error path per endpoint, and some of those responses leak your
+internals.</p>
+
+<p>The fix is one error shape and one place that produces it.</p>
+
+<h2>The error shape</h2>
+
+<pre class="language-java"><code class="language-java">@Setter
+@Getter
+@ToString
+@JsonInclude(value = Include.NON_NULL)
+public class ApiError {
+
+    public static final String DEFAULT_MSG = "Something went wrong.";
+
+    private String message;
+
+    /** The path that failed, to make a log line actionable. */
+    private String path;
+
+    private LocalDateTime timestamp = LocalDateTime.now();
+
+    /** Detail for the developer. Never a stack trace — those stay in the server log. */
+    private String debugMessage;
+
+    /** Field-level failures, when the error is a validation failure. */
+    private List&lt;ApiSubError&gt; errors;
+
+    /** Not serialised: it becomes the HTTP status rather than part of the body. */
+    @JsonIgnore
+    private HttpStatus status = HttpStatus.BAD_REQUEST;
+}</code></pre>
+
+<p>Two details worth copying. <code>@JsonInclude(NON_NULL)</code> keeps the payload clean — a
+non-validation error has no <code>errors</code> array rather than
+<code>"errors": null</code>. And <code>status</code> is <code>@JsonIgnore</code>d because it becomes
+the HTTP status; repeating it in the body invites the two to disagree.</p>
+
+<p>Field-level failures get their own small type:</p>
+
+<pre class="language-java"><code class="language-java">public class ApiSubError {
+
+    /** The field that failed, when the error is field-specific. */
+    private String field;
+
+    /** The rejected value. Never populated for passwords or other secrets. */
+    private Object rejectedValue;
+
+    private String message;
+}</code></pre>
+
+<h2>Your own exception</h2>
+
+<p>Static factories make call sites read as sentences:</p>
+
+<pre class="language-java"><code class="language-java">public class ApiException extends RuntimeException {
+
+    private ApiError error;
+
+    /** 400 — the request is well-formed but semantically wrong. */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, message);
+    }
+
+    /** 404 — no such row. */
+    public static ApiException notFound(String what, Object id) {
+        return new ApiException(HttpStatus.NOT_FOUND, what + " " + id + " was not found");
+    }
+
+    /** 401 — deliberately vague, so it cannot be used to enumerate accounts. */
+    public static ApiException unauthorized(String message) {
+        return new ApiException(HttpStatus.UNAUTHORIZED, message);
+    }
+
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, message);
+    }
+}</code></pre>
+
+<p>Used from anywhere in the service layer:</p>
+
+<pre class="language-java"><code class="language-java">Product product = productDAO.findByPublicIdWithSizes(id)
+        .orElseThrow(() -&gt; ApiException.notFound("Product", id));</code></pre>
+
+<p><strong>Extend <code>RuntimeException</code>, not <code>Exception</code>.</strong> A checked
+exception would force <code>throws</code> declarations up through every layer, and — more importantly
+— Spring only rolls a transaction back automatically for unchecked exceptions. A checked exception
+thrown mid-transaction commits the partial work.</p>
+
+<h2>One place that handles everything</h2>
+
+<p><code>@RestControllerAdvice</code> applies across every controller:</p>
+
+<pre class="language-java"><code class="language-java">@Slf4j
+@RestControllerAdvice
+public class RestExceptionHandler {
+
+    /** The application's own exception already carries its status and message. */
+    @ExceptionHandler(ApiException.class)
+    public ResponseEntity&lt;ApiError&gt; handleApiException(
+            ApiException ex, HttpServletRequest request) {
+        ApiError error = ex.getError();
+        error.setPath(request.getRequestURI());
+        return ResponseEntity.status(error.getStatus()).body(error);
+    }
+}</code></pre>
+
+<h3>Validation failures become a field map</h3>
+
+<pre class="language-java"><code class="language-java">@ExceptionHandler(MethodArgumentNotValidException.class)
+public ResponseEntity&lt;ApiError&gt; handleValidation(
+        MethodArgumentNotValidException ex, HttpServletRequest request) {
+    ApiError error = new ApiError(
+            HttpStatus.BAD_REQUEST, "Validation failed", request.getRequestURI());
+
+    for (FieldError fieldError : ex.getBindingResult().getFieldErrors()) {
+        error.addValidationError(fieldError.getField(), fieldError.getDefaultMessage());
+    }
+    return ResponseEntity.badRequest().body(error);
+}</code></pre>
+
+<p>Which produces something a form can render directly, marking each input:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "message": "Validation failed",
+  "path": "/api/admin/products",
+  "timestamp": "2026-08-18T09:14:22.104",
+  "errors": [
+    { "field": "name",  "message": "must not be blank" },
+    { "field": "sizes", "message": "A product needs at least one size" }
+  ]
+}</code></pre>
+
+<h3>⚠️ Bad input must not become a 500</h3>
+
+<p>This is the pair of handlers most APIs are missing, and the comment in the pizza API explains
+why they exist:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * An unreadable or wrongly-typed request body — most often a malformed UUID such as
+ * {@code "productId":"not-a-uuid"}.
+ *
+ * &lt;p&gt;Without this handler the catch-all below turns it into a 500, which is wrong and actively
+ * misleading: the server is fine, the request is not. Bad input is always 4xx.
+ */
+@ExceptionHandler(HttpMessageNotReadableException.class)
+public ResponseEntity&lt;ApiError&gt; handleUnreadableBody(
+        HttpMessageNotReadableException ex, HttpServletRequest request) {
+    log.debug("Rejected an unreadable request body on {}", request.getRequestURI(), ex);
+    ApiError error = new ApiError(
+            HttpStatus.BAD_REQUEST,
+            "Request body could not be parsed. Check that every id is a valid UUID.",
+            request.getRequestURI());
+    return ResponseEntity.badRequest().body(error);
+}
+
+/**
+ * A path variable that will not convert — e.g. {@code GET /api/orders/garbage} where the
+ * handler expects a UUID. Same reasoning as above: the caller's fault, so 400.
+ */
+@ExceptionHandler(MethodArgumentTypeMismatchException.class)
+public ResponseEntity&lt;ApiError&gt; handleTypeMismatch(
+        MethodArgumentTypeMismatchException ex, HttpServletRequest request) {
+    String expected = ex.getRequiredType() == null
+            ? "the expected type"
+            : ex.getRequiredType().getSimpleName();
+    ApiError error = new ApiError(
+            HttpStatus.BAD_REQUEST,
+            "'%s' is not a valid %s for parameter '%s'"
+                    .formatted(ex.getValue(), expected, ex.getName()),
+            request.getRequestURI());
+    return ResponseEntity.badRequest().body(error);
+}</code></pre>
+
+<p>Left unhandled, both hit the catch-all and become 500s. Your error rate then measures how often
+someone typed a bad URL, and a real outage is invisible inside the noise.</p>
+
+<h3>The catch-all</h3>
+
+<pre class="language-java"><code class="language-java">/** Catch-all. Logs the real cause but never leaks a stack trace to the client. */
+@ExceptionHandler(Exception.class)
+public ResponseEntity&lt;ApiError&gt; handleUnexpected(Exception ex, HttpServletRequest request) {
+    log.error("Unhandled exception on {}", request.getRequestURI(), ex);
+    ApiError error = new ApiError(
+            HttpStatus.INTERNAL_SERVER_ERROR,
+            "Something went wrong on our end",
+            request.getRequestURI());
+    return ResponseEntity.status(error.getStatus()).body(error);
+}</code></pre>
+
+<p><strong>Log everything, return nothing.</strong> The full exception goes to the server log where
+you can find it; the client gets a sentence. A stack trace in a response body tells an attacker your
+framework versions, package layout and often your SQL.</p>
+
+<p>Spring picks the <em>most specific</em> handler, so this one only runs when nothing else
+matched.</p>
+
+<h2>Security exceptions</h2>
+
+<pre class="language-java"><code class="language-java">@ExceptionHandler(AuthenticationException.class)
+public ResponseEntity&lt;ApiError&gt; handleAuthentication(
+        AuthenticationException ex, HttpServletRequest request) {
+    // Deliberately vague: saying "no such user" vs "wrong password" tells an attacker which
+    // email addresses are registered.
+    ApiError error = new ApiError(
+            HttpStatus.UNAUTHORIZED, "Invalid email or password", request.getRequestURI());
+    return ResponseEntity.status(error.getStatus()).body(error);
+}</code></pre>
+
+<p>⚠️ Security exceptions thrown by the <em>filter chain</em> never reach a
+<code>@RestControllerAdvice</code>, because filters run before the DispatcherServlet (lesson 10).
+Those need an <code>AuthenticationEntryPoint</code> and an <code>AccessDeniedHandler</code>
+configured on the filter chain instead. If your 401s come back as HTML when you expected JSON, this
+is why.</p>
+
+<h2>404 versus 403 — a security decision</h2>
+
+<p>When someone asks for a resource that exists but is not theirs, the instinct is 403. The pizza API
+returns <strong>404</strong>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">/api/me/** resolves the owner from the token — no user id in the path. Foreign-owned
+resources return 404, not 403 (403 would confirm the id exists).</code></pre>
+
+<p>403 is an information leak: it confirms the resource exists. Walk the ids, collect the 403s, and
+you have enumerated every order in the system without reading one. 404 for "not yours" and "not
+there" gives an attacker nothing.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>One <code>ApiError</code> shape</strong>, produced by one
+  <code>@RestControllerAdvice</code>.</li>
+  <li><strong>Extend <code>RuntimeException</code></strong> so transactions roll back.</li>
+  <li><strong>Handle parse and type-mismatch failures explicitly</strong>, or bad input becomes 500s
+  and your error rate stops meaning anything.</li>
+  <li><strong>Log the cause, return a sentence.</strong> Never a stack trace.</li>
+  <li><strong>404 rather than 403</strong> for resources that are not the caller's.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-rest-file-upload">file upload</a> — and why the only part
+of an upload you can trust is the bytes.</p>

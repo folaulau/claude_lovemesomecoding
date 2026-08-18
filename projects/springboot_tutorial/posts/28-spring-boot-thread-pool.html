@@ -1,0 +1,253 @@
+<p>Some work should not happen while a customer waits. Sending an email, calling a slow third party,
+generating a report — none of it needs to finish before the HTTP response goes out. Moving it to
+another thread is one annotation; sizing the pool it runs on is where the engineering is.</p>
+
+<h2>Turning it on</h2>
+
+<pre class="language-java"><code class="language-java">@Slf4j
+@Configuration
+@EnableAsync
+@EnableScheduling
+@EnableResilientMethods
+public class ThreadPoolConfig implements AsyncConfigurer, SchedulingConfigurer { }</code></pre>
+
+<p><code>@EnableAsync</code> for <code>@Async</code>, <code>@EnableScheduling</code> for
+<code>@Scheduled</code>. Without them the annotations are inert — the method just runs
+synchronously, and nothing tells you.</p>
+
+<h2>Sizing the pool on purpose</h2>
+
+<pre class="language-java"><code class="language-java">/*
+ * corePoolSize parameter is the amount of core threads which will be instantiated and kept in the
+ * pool. If all core threads are busy and more tasks are submitted, then the pool is allowed to grow
+ * up to a maximumPoolSize.
+ */
+@Bean(name = "taskExecutor")
+public ThreadPoolTaskExecutor taskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(25);
+    executor.setMaxPoolSize(150);
+    executor.setQueueCapacity(100);
+    executor.setThreadNamePrefix("Pizza-API-");
+    executor.setAllowCoreThreadTimeOut(true);
+    executor.setKeepAliveSeconds(60);
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    executor.setAwaitTerminationSeconds(60);
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+    executor.setTaskDecorator(new LogTaskDecorator());
+    executor.initialize();
+
+    return executor;
+}</code></pre>
+
+<p>⚠️ <strong>The bean name is not decoration.</strong> Spring's <code>@Async</code> support looks for
+a bean literally called <code>taskExecutor</code>. Name it anything else and your async work silently
+runs on a default <code>SimpleAsyncTaskExecutor</code> — which creates <strong>a new thread per
+task</strong> and has no upper bound at all. Under load that is how you exhaust memory.</p>
+
+<h3>⚠️ The growth rule surprises everyone</h3>
+
+<p>A <code>ThreadPoolExecutor</code> does <strong>not</strong> grow from core to max when it is busy.
+It grows when <em>the queue is full</em>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">task arrives
+    │
+    ├─ fewer than corePoolSize threads?      → start a new thread
+    ├─ queue not full?                       → QUEUE IT
+    ├─ fewer than maxPoolSize threads?       → start a new thread
+    └─ otherwise                             → rejection policy</code></pre>
+
+<p>With <code>queueCapacity = 100</code>, threads 26 through 150 are only created after 100 tasks are
+already waiting. A large queue therefore means your <code>maxPoolSize</code> is almost never reached —
+which is a reasonable design, but not the one most people think they configured.</p>
+
+<ul>
+  <li><strong>Small queue, large max</strong> — responsive, more threads, more context switching.</li>
+  <li><strong>Large queue, small max</strong> — steady thread count, tasks wait longer.</li>
+  <li><strong>Unbounded queue</strong> (the default with <code>Executors.newFixedThreadPool</code>) —
+  <code>maxPoolSize</code> is meaningless and the queue grows until you run out of memory.</li>
+</ul>
+
+<p>Rough starting points: for CPU-bound work, core ≈ number of cores; for I/O-bound work, much
+higher, because threads spend most of their time blocked. The pizza API's 25/150 is I/O-bound
+sizing.</p>
+
+<h3>The rejection policy</h3>
+
+<pre class="language-java"><code class="language-java">executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Policy</th><th>When full</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>AbortPolicy</code> (default)</td><td>throws
+    <code>RejectedExecutionException</code></td></tr>
+    <tr><td><code>CallerRunsPolicy</code></td><td>the submitting thread runs it</td></tr>
+    <tr><td><code>DiscardPolicy</code></td><td>silently drops it</td></tr>
+    <tr><td><code>DiscardOldestPolicy</code></td><td>drops the oldest queued task</td></tr>
+  </tbody>
+</table>
+
+<p><code>CallerRunsPolicy</code> is usually the right choice: it applies natural backpressure. When the
+pool is saturated the caller — often a request thread — does the work itself, which slows down
+request acceptance and stops the queue growing further. Nothing is lost. The two
+<code>Discard</code> policies lose work silently, which is almost never what you want.</p>
+
+<h2>Using it</h2>
+
+<pre class="language-java"><code class="language-java">@Async
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void sendConfirmation(OrderPlacedEvent event) {
+    try {
+        mailService.sendOrderConfirmation(
+                orderService.getOrderByPublicId(event.orderPublicId()));
+    } catch (Exception ex) {
+        log.error("Confirmation for order {} failed — the order itself is unaffected",
+                event.orderPublicId(), ex);
+    }
+}</code></pre>
+
+<p>Return <code>CompletableFuture</code> when you need the result:</p>
+
+<pre class="language-java"><code class="language-java">@Async
+public CompletableFuture&lt;ReportDTO&gt; buildReport(LocalDate from) {
+    return CompletableFuture.completedFuture(reportService.build(from));
+}
+
+// Run three in parallel and wait for all of them
+var a = reportService.buildReport(lastWeek);
+var b = reportService.buildTopProducts(lastWeek);
+var c = reportService.buildStatusCounts(lastWeek);
+CompletableFuture.allOf(a, b, c).join();</code></pre>
+
+<h2>⚠️ Three things that catch people</h2>
+
+<h3>1. An <code>@Async void</code> method throws away its exceptions</h3>
+
+<p>Nothing is watching the return value, so an exception has nowhere to go. It reaches the
+<code>AsyncUncaughtExceptionHandler</code> and nothing else:</p>
+
+<pre class="language-java"><code class="language-java">@Override
+public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+    return (ex, method, listOfObjects) -&gt; {
+        log.error("****** AsyncConfig - handleUncaughtException(...) ******");
+        log.error("*  Class name: {}", method.getDeclaringClass());
+        log.error("*  Method name - {}", method.getName());
+        log.error("*  Exception message - {}", ex.getMessage());
+        for (Object param : listOfObjects) {
+            log.error("*  Param - {}", param);
+        }
+    };
+}</code></pre>
+
+<p>Configure one, or async failures are completely invisible. With a
+<code>CompletableFuture</code> return type the exception surfaces on <code>get()</code> instead.</p>
+
+<h3>2. The proxy rule</h3>
+
+<pre class="language-java"><code class="language-java">public void process() {
+    sendEmail();          // runs SYNCHRONOUSLY — self-invocation, no proxy
+}
+
+@Async
+public void sendEmail() { }</code></pre>
+
+<p>Same as <code>@Transactional</code>, <code>@Cacheable</code> and <code>@PreAuthorize</code> —
+lesson 8.</p>
+
+<h3>3. A new thread has no context</h3>
+
+<p>The <code>SecurityContext</code>, the transaction and the request scope all live in
+<code>ThreadLocal</code>s. An <code>@Async</code> method starts with none of them: no authenticated
+user, no persistence context, and any lazy association is detached.</p>
+
+<p>This is why the pizza API's events carry values rather than entities (lesson 9), and why the async
+listener re-reads the order rather than receiving it.</p>
+
+<p>Logging context needs carrying across explicitly, which is what the pool's task decorator does:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Keep context tags to use in the new thread&lt;br&gt;
+ * For example, we are using the memberUuid in the new thread.
+ */
+class LogTaskDecorator implements TaskDecorator {
+
+    @Override
+    public Runnable decorate(Runnable runnable) {
+        Map&lt;String, String&gt; contextMap = MDC.getCopyOfContextMap();
+        return () -&gt; {
+            try {
+                if (contextMap != null) {
+                    MDC.setContextMap(contextMap);
+                }
+                runnable.run();
+            } finally {
+                MDC.clear();
+            }
+        };
+    }
+}</code></pre>
+
+<p>Without it, a trace id attached to the request thread is absent from every async log line, and
+correlating them becomes impossible.</p>
+
+<h2>Scheduled work</h2>
+
+<pre class="language-java"><code class="language-java">/** Task scheduler for @Scheduled tasks */
+@Bean(name = "taskScheduler")
+public ThreadPoolTaskScheduler taskScheduler() {
+    ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+    scheduler.setPoolSize(10);
+    scheduler.setThreadNamePrefix("Pizza-API-");
+    scheduler.setWaitForTasksToCompleteOnShutdown(true);
+    scheduler.initialize();
+    return scheduler;
+}
+
+/** Configure @Scheduled tasks to use the taskScheduler thread pool */
+@Override
+public void configureTasks(ScheduledTaskRegistrar taskRegistrar) {
+    taskRegistrar.setScheduler(taskScheduler());
+}</code></pre>
+
+<p><strong>Configuring this matters.</strong> The default scheduler is single-threaded, so one slow
+job delays every other one — and a job that hangs stops all scheduled work in the application,
+permanently.</p>
+
+<pre class="language-java"><code class="language-java">@Scheduled(cron = "0 0 3 * * *")           // 03:00 daily
+@Scheduled(fixedDelay = 60000)             // 60s after the previous run FINISHES
+@Scheduled(fixedRate = 60000)              // every 60s regardless of duration</code></pre>
+
+<p><code>fixedDelay</code> is the safer default: with <code>fixedRate</code>, a job that takes longer
+than its interval starts overlapping itself.</p>
+
+<p>⚠️ <strong>With multiple instances, every instance runs every scheduled job.</strong> A nightly
+report emailed three times is the mild version; a job that charges cards is not. You need
+ShedLock, a database lock, or a scheduler outside the application.</p>
+
+<h2>Graceful shutdown</h2>
+
+<pre class="language-java"><code class="language-java">executor.setWaitForTasksToCompleteOnShutdown(true);
+executor.setAwaitTerminationSeconds(60);</code></pre>
+
+<p>Without these, a deploy kills in-flight async work mid-task. Combine with:</p>
+
+<pre class="language-properties"><code class="language-properties">server.shutdown=graceful
+spring.lifecycle.timeout-per-shutdown-phase=30s</code></pre>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Name the executor bean <code>taskExecutor</code></strong>, or you get an unbounded
+  default.</li>
+  <li><strong>The pool grows when the queue is full</strong>, not when threads are busy.</li>
+  <li><strong><code>CallerRunsPolicy</code></strong> for backpressure that loses nothing.</li>
+  <li><strong>Configure an <code>AsyncUncaughtExceptionHandler</code></strong>, or void async
+  failures vanish.</li>
+  <li><strong>A new thread has no security context and no transaction.</strong></li>
+  <li><strong>Configure the scheduler pool</strong> — the default is one thread.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-retry">retries</a> — and why retrying a payment without an
+idempotency key charges the customer twice.</p>

@@ -1,6 +1,6 @@
 # Spring Boot tutorial track — progress report
 
-**Status:** IN PROGRESS — demo-app gaps 6/13 closed, post authoring not started
+**Status:** PUBLISHED — live on prod, 2026-08-18
 **Started:** 2026-08-18
 **Where it lands:** https://lovemesomecoding.com/spring-boot
 
@@ -160,16 +160,16 @@ Every one behind a profile, defaulting to **off**, so `./mvnw spring-boot:run` a
 | 1 | `PizzaProperties` — the whole `pizza.*` namespace bound to validated records; all 9 `@Value` sites refactored onto it | 7 | none | **done** |
 | 2 | `aspect/ServiceTimingAspect` — `@Around` timing over the service layer | 8 | none | **done** |
 | 3 | `OrderPlacedEvent` + `OrderPlacedListener`; published from `createOrder` | 9 | none | **done** |
-| 4 | `MultipartFile` — product image upload | 13 | none | not started |
+| 4 | `storage/` — image upload validated by magic number; upload + stream-back endpoints | 13 | none | **done** |
 | 5 | `CacheConfig` + `@Cacheable` on the menu, `@CacheEvict` on all 4 write paths | 21 | none | **done** |
 | 6 | `@EnableMethodSecurity` + `@PreAuthorize` on all 3 `AdminUserServiceImpl` methods | 26 | none | **done** |
 | 7 | `@Retryable` on the Stripe calls, with a Stripe idempotency key | 29 | none | **done** |
-| 8 | Thymeleaf — a server-rendered receipt page | 15 | none | not started |
-| 9 | Elasticsearch — menu search | 22 | **ES node** | not started |
-| 10 | JMS — order events onto a queue | 30 | **broker** | not started |
-| 11 | Email — order confirmation mail | 31 | **SMTP sink** | not started |
-| 12 | OAuth2 — social login | 27 | **identity provider** | not started |
-| 13 | Gradle build alongside Maven | 33 | none | not started |
+| 8 | Thymeleaf — `receipt.html` + layout fragments, `OrderReceiptController` | 15 | none | **done** |
+| 9 | `search/` — `ProductDocument`, repository, service, endpoint **with a DB fallback** | 22 | **ES node** | **done**, profile `search` |
+| 10 | `messaging/` — Artemis publisher + listener, JSON converter, DLQ | 30 | **broker** | **done**, profile `messaging` |
+| 11 | `mail/` — `MimeMessageHelper`, body rendered from the receipt template | 31 | **SMTP sink** | **done**, off until `spring.mail.host` is set |
+| 12 | `security/oauth2/` — Google login, reconciled on **verified** email only | 27 | **identity provider** | **done**, profile `oauth2` |
+| 13 | `build.gradle.kts` + wrapper pinned to 8.14.3, `GRADLE.md` | 33 | none | **done**, on its own branch |
 
 **Verified after every change: `./mvnw test` → 60/60 passing, `spotless:apply` clean.** The 60-test
 baseline was captured before the first edit precisely so "don't break existing functionality" is a
@@ -187,6 +187,16 @@ measured claim rather than an assumption.
    Note it has **no `@Recover` equivalent** — it rethrows once retries are exhausted. Lesson 29.
 3. **`spring-boot-starter-cache` IS still BOM-managed**, unlike the aop starter — so the Boot 4
    modularisation is inconsistent enough that you have to check each starter rather than assume.
+4. **`DefaultJmsListenerContainerFactoryConfigurer` moved** from
+   `org.springframework.boot.autoconfigure.jms` to `org.springframework.boot.jms.autoconfigure` —
+   Boot 4 split autoconfiguration into per-technology modules. Lesson 30.
+5. **`MappingJackson2MessageConverter` is deprecated for removal** in Spring 7 (it is tied to
+   Jackson 2); `JacksonJsonMessageConverter` is the Jackson 3 replacement. Lesson 30.
+6. **Boot 4.1's Gradle plugin requires Gradle 8.14+.** The machine had 8.12 and the failure names
+   the version but not the fix — which is the argument for committing a wrapper. Lesson 33.
+7. **The stale-class trap in `pizza/CLAUDE.md` is real and cost time twice**, both times presenting
+   as `NoClassDefFoundError` with an *unqualified* class name. `./mvnw clean compile` fixes it.
+   Worth a callout in lesson 32.
 
 ## Site changes this requires
 
@@ -202,6 +212,34 @@ measured claim rather than an assumption.
 - ⚠️ **The React track left the backend Lambda un-redeployed.** That is still outstanding and now
   affects this track too — until `lovemesomecoding_backend/scripts/deploy.sh` runs, editing any of
   these posts through `/admin` normalises unknown languages down to `plaintext`.
+
+## Demo-app branches
+
+`lovemesomecoding_demo_project` is a separate repo. **Not pushed — Folau does that.**
+
+| Branch | Holds |
+|---|---|
+| `main` | **merged 2026-08-18** (fast-forward): all 12 non-Gradle features, 40 files, 1 commit |
+| `springboot-tutorial-examples` | same commit as `main`; can be deleted once pushed |
+| `springboot-tutorial-gradle` | the above + the Gradle build, kept separate so two build files never sit on one branch and confuse an IDE import |
+
+### Verified on `main` after the merge
+
+- `./mvnw clean compile` clean · `./mvnw test` **60/60**
+- App boots on the default `local` profile in **4.6 s** with only MySQL running — **zero** errors
+  and zero connection failures in the log, which is the profile gating doing its job
+- Old endpoints: menu 200, login 200, admin-with-token 200, admin-without-token 403, Swagger 200
+- New endpoints: search falls back to the DB and returns real hits; `/api/search/reindex` gives
+  503 with an admin token and 403 without; the Thymeleaf receipt renders real order data at
+  `/orders/{id}/receipt`
+- Menu cache measurably serving (first call 3.5 ms, subsequent ~1.5 ms); all **5** product write
+  paths carry evictions
+
+⚠️ **The Gradle branch's history is untidy.** Two commits landed on it during the session with the
+messages `asdf` and `a`, and the first of them mixes the Gradle files together with pre-existing
+uncommitted changes to `pizza/CLAUDE.md`, `pizza/progress_report.md` and 10 frontend screenshots —
+none of which belong on a Gradle branch. The *content* is all correct and the build passes; only
+the history is wrong. Left alone rather than rewritten, because they are Folau's commits.
 
 ## Files
 
@@ -228,16 +266,48 @@ projects/springboot_tutorial/
 | 2026-08-18 | Scaffold `manifest.py` (35 entries) / `seed.py` / `check_content.py` | Claude | done |
 | 2026-08-18 | Capture the demo-app baseline — 60 tests green before any edit | Claude | done |
 | 2026-08-18 | Close app gaps 1, 2, 3, 5, 6, 7 — config, AOP, events, cache, method security, retry | Claude | done |
-| | Close app gaps 4, 8–13 — upload, Thymeleaf, ES, JMS, email, OAuth2, Gradle | Claude | not started |
-| | Author 35 post bodies | Claude | not started |
-| | `check_content.py` — every sample round-trips byte-for-byte | Claude | not started |
-| | Seed local, sync, build, review at `:3000` | Claude | not started |
-| | Seed prod `--force-dates --write`, `npm run deploy` | Claude | not started |
+| 2026-08-18 | Close app gaps 4, 8, 9, 10, 11, 12 — upload, Thymeleaf, ES, JMS, mail, OAuth2 | Claude | done |
+| 2026-08-18 | Close app gap 13 — Gradle build + wrapper, verified `build`/`test`/`bootJar` | Claude | done |
+| 2026-08-18 | Commit the demo-app work to branches (see below) | Claude | done |
+| 2026-08-18 | Author 35 post bodies — 39,909 words, 326 code blocks | Claude | done |
+| 2026-08-18 | `check_content.py` — 35 posts, 326 blocks round-trip byte-for-byte | Claude | done |
+| 2026-08-18 | Seed local `--force-dates --write` — 35 posts, category count 35 | Claude | done |
+| 2026-08-18 | Sync + build — `verify-build` 547/547, index cross-check 44/44 | Claude | done |
+| 2026-08-18 | Back up the prod content tree (S3 versioning is OFF) — 674 objects | Claude | done |
+| 2026-08-18 | Seed prod `--force-dates --write` — 573 posts, 35 in `/spring-boot` | Claude | done |
+| 2026-08-18 | `npm run deploy` — 1523 files, edge serving `394b0bd`, all 35 URLs 200 | Claude | done |
+| | Review the 35 published posts | Folau | **next** |
 | | Redeploy the backend Lambda | Folau | **outstanding, inherited from the React track** |
+
+## Publish state — LIVE
+
+| Tree | State |
+|---|---|
+| `local` | 35 posts, dates 2026-06-11 … 2026-08-18 |
+| `prod` | **35 posts live**, 573 posts total (was 569) |
+| backup | `s3://lovemesomecoding-db-.../lovemesomecoding/backups/prod-2026-08-18-pre-springboot/` |
+
+Verified after deploy: `verify-build` 573/573 posts, 44/44 category counts agree, 746 HTML files,
+1523 files uploaded, edge serving build `394b0bd`. **All 35 URLs return 200**, and Prism tokenises
+the `properties` blocks live — confirming the pipeline fix end to end.
+
+### ⚠️ The prod backup matters
+
+**S3 object versioning is NOT enabled on the content bucket.** Overwriting a post is therefore
+irreversible, and this publish rewrote 31 indexed URLs. The full prod tree was copied to
+`backups/prod-2026-08-18-pre-springboot/` (674 objects, verified equal) before the first write.
+
+**Enabling versioning on that bucket is worth doing** — it would make every future seed reversible
+without a manual backup step.
 
 ## Outstanding
 
-1. Everything below "Write this progress report" in the task log.
-2. **Backend Lambda still not redeployed** (inherited). Seeding runs the local service layer, so
-   what lands in S3 is correct — but `/admin` edits would normalise unknown languages to
-   `plaintext` and silently lose highlighting.
+1. **Review the 35 published posts.** They went live without a human read.
+2. **Backend Lambda not redeployed.** `properties` was added to `app/services/content.py`, but
+   seeding ran the local service layer — so what is in S3 is correct while the deployed Lambda
+   still has the old language list. Editing any of these 35 posts through `/admin` before
+   `lovemesomecoding_backend/scripts/deploy.sh` runs would normalise every
+   `application.properties` block down to `plaintext` and silently lose the highlighting. Same
+   outstanding item the React track left behind — it now affects two tracks.
+3. **Enable S3 object versioning** on the content bucket.
+4. **Run the pizza Playwright suite** against the 12 backend features added for this track.

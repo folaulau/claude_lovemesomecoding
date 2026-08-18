@@ -1,0 +1,189 @@
+<p>Two migrations get confused with each other. One is historical — classic Spring to Spring Boot, which
+most codebases finished years ago. The other is live and is probably why you are here: <strong>Spring
+Boot 3 to Spring Boot 4</strong>. This lesson covers both, briefly for the first and carefully for
+the second.</p>
+
+<h2>Part 1 — Classic Spring to Spring Boot</h2>
+
+<p>A pre-Boot Spring MVC application needed three things Boot deleted outright.</p>
+
+<h3>The XML</h3>
+
+<p>Component scanning, the view resolver, the datasource and the transaction manager were declared in
+XML:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;beans xmlns="http://www.springframework.org/schema/beans"&gt;
+
+    &lt;context:component-scan base-package="com.example.app"/&gt;
+    &lt;mvc:annotation-driven/&gt;
+
+    &lt;bean id="dataSource" class="org.apache.commons.dbcp2.BasicDataSource"&gt;
+        &lt;property name="driverClassName" value="com.mysql.cj.jdbc.Driver"/&gt;
+        &lt;property name="url" value="jdbc:mysql://localhost:3306/app"/&gt;
+        &lt;property name="username" value="root"/&gt;
+        &lt;property name="password" value=""/&gt;
+    &lt;/bean&gt;
+
+    &lt;bean class="org.springframework.orm.jpa.JpaTransactionManager"&gt;
+        &lt;property name="entityManagerFactory" ref="entityManagerFactory"/&gt;
+    &lt;/bean&gt;
+
+&lt;/beans&gt;</code></pre>
+
+<p>All of that becomes one annotation and four properties:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootApplication
+public class App {
+    public static void main(String[] args) {
+        SpringApplication.run(App.class, args);
+    }
+}</code></pre>
+
+<pre class="language-properties"><code class="language-properties">spring.datasource.url=jdbc:mysql://localhost:3306/app
+spring.datasource.username=root
+spring.datasource.password=</code></pre>
+
+<h3>The WAR and the servlet container</h3>
+
+<p>You built a WAR, installed Tomcat, edited <code>server.xml</code>, dropped the WAR in
+<code>webapps/</code> and restarted. Boot produces an executable jar with the server inside it, so
+deployment is <code>java -jar</code>. Lesson 2 covers this.</p>
+
+<h3>The version matrix</h3>
+
+<p>You picked a Spring version, then found a Hibernate version compatible with it, then a Jackson
+version compatible with both. The Boot parent does this for you.</p>
+
+<p><strong>Migration order that works:</strong> add the Boot parent and starters; add a
+<code>@SpringBootApplication</code> class; delete XML one file at a time, checking the app still
+starts after each; move <code>web.xml</code> settings into <code>application.properties</code>;
+switch packaging from <code>war</code> to <code>jar</code> last, because it is the step that is
+awkward to undo.</p>
+
+<h2>Part 2 — Spring Boot 3 to Spring Boot 4</h2>
+
+<p>This is a bigger break than 2 to 3 was in some ways, because the changes are spread across renamed
+artifacts and moved packages rather than concentrated in one namespace rename.</p>
+
+<h3>Java 21 is the floor</h3>
+
+<p>Boot 3 ran on Java 17. Boot 4 requires <strong>Java 21</strong>. This is not negotiable and it is
+the first thing to check.</p>
+
+<h3>⚠️ Artifacts were renamed, and the old names are simply gone</h3>
+
+<p>The one that catches everyone:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- Boot 3 --&gt;
+&lt;artifactId&gt;spring-boot-starter-aop&lt;/artifactId&gt;
+
+&lt;!-- Boot 4 --&gt;
+&lt;artifactId&gt;spring-boot-starter-aspectj&lt;/artifactId&gt;</code></pre>
+
+<p>The old name is not deprecated — it is <em>absent from the BOM</em>. So the build fails with:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">[ERROR] 'dependencies.dependency.version' for
+        org.springframework.boot:spring-boot-starter-aop:jar is missing.</code></pre>
+
+<p>Nothing in that message mentions a rename. It reads like a missing
+<code>&lt;version&gt;</code> tag, and the natural next move — pinning a version by hand — makes it
+worse. <code>spring-boot-starter-web</code> similarly becomes
+<code>spring-boot-starter-webmvc</code>.</p>
+
+<p><strong>Not every starter changed, which is the trap.</strong>
+<code>spring-boot-starter-cache</code>, <code>spring-boot-starter-mail</code> and
+<code>spring-boot-starter-thymeleaf</code> all kept their names. You cannot apply a rule; you have to
+check each one against the BOM.</p>
+
+<h3>⚠️ Autoconfiguration classes moved package</h3>
+
+<p>Boot 4 split autoconfiguration into per-technology modules, and the classes moved with them:</p>
+
+<pre class="language-java"><code class="language-java">// Boot 3
+import org.springframework.boot.autoconfigure.jms.DefaultJmsListenerContainerFactoryConfigurer;
+
+// Boot 4
+import org.springframework.boot.jms.autoconfigure.DefaultJmsListenerContainerFactoryConfigurer;</code></pre>
+
+<p>Note the shape of the change: <code>autoconfigure.jms</code> became <code>jms.autoconfigure</code>.
+The technology name moved in front. That pattern holds across the other modules, so once you have seen
+it the rest are mechanical.</p>
+
+<h3>⚠️ Depending on a library no longer implies its autoconfiguration</h3>
+
+<p>Covered in lesson 2, and repeated here because it is a migration issue specifically. In Boot 3,
+<code>liquibase-core</code> was enough. In Boot 4 it gives you the library and no autoconfiguration,
+so Liquibase never runs — and the error you get is from Hibernate, several layers away:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Schema-validation: missing table [product_size]</code></pre>
+
+<p>The fix is the starter, not the library:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-liquibase&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<h3>Spring Framework 7 comes with it</h3>
+
+<p>Boot 4 brings Framework 7, which has its own changes.</p>
+
+<p><strong>Retry moved into the core container.</strong> The separate <code>spring-retry</code>
+library is now legacy:</p>
+
+<pre class="language-java"><code class="language-java">// Boot 3 + spring-retry
+import org.springframework.retry.annotation.EnableRetry;
+import org.springframework.retry.annotation.Retryable;
+
+// Boot 4 / Framework 7 — no extra dependency
+import org.springframework.resilience.annotation.EnableResilientMethods;
+import org.springframework.resilience.annotation.Retryable;</code></pre>
+
+<p>They are not drop-in equivalents. The built-in version has <strong>no <code>@Recover</code></strong>
+— it rethrows once retries are exhausted, and you handle the failure at the call site. Lesson 29
+covers both.</p>
+
+<p><strong>Jackson 2 types are deprecated for removal.</strong> Anything named
+<code>MappingJackson2*</code> has a Jackson 3 replacement:</p>
+
+<pre class="language-java"><code class="language-java">// Deprecated in Framework 7
+import org.springframework.jms.support.converter.MappingJackson2MessageConverter;
+
+// Replacement
+import org.springframework.jms.support.converter.JacksonJsonMessageConverter;</code></pre>
+
+<p><strong>Spring Security 7 removed the old chained-setter DSL.</strong> Configuration written
+against Security 5 will not compile. Lesson 24 covers the lambda DSL that replaced it.</p>
+
+<h3>The Gradle plugin needs a newer Gradle</h3>
+
+<p>Boot 4.1's Gradle plugin requires <strong>Gradle 8.14 or later</strong>, or 9.x:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Spring Boot plugin requires Gradle 8.x (8.14 or later) or 9.x.
+The current version is Gradle 8.12</code></pre>
+
+<p>That message at least names the problem. The fix is a committed wrapper, so the build does not
+depend on whichever Gradle is on someone's <code>PATH</code> — lesson 33.</p>
+
+<h2>A migration order that works</h2>
+
+<ol>
+  <li><strong>Java 21 first.</strong> Build and test on 21 while still on Boot 3, so the JDK upgrade
+  and the framework upgrade fail separately.</li>
+  <li><strong>Bump the parent</strong> to 4.1.0 and fix the pom until it resolves. Expect renamed
+  artifacts; check each against the BOM instead of guessing.</li>
+  <li><strong>Fix compilation</strong> — moved packages and the Framework 7 replacements above.</li>
+  <li><strong>Start the app with <code>--debug</code></strong> and read the condition evaluation
+  report. This is where silently-missing autoconfiguration shows up, and it is much cheaper to find
+  here than in production.</li>
+  <li><strong>Run the tests.</strong> Security and slice tests are where behavioural changes
+  surface.</li>
+</ol>
+
+<p>Step 4 is the one people skip and the one that pays. A missing autoconfiguration does not fail the
+build and does not fail startup — it fails later, somewhere unrelated, exactly as the Liquibase case
+above did.</p>
+
+<p>Next: <a href="/spring-boot/spring-boot-code-structure">structuring a project</a> — the package
+layout the rest of this track uses, and the one structural mistake that is genuinely hard to
+diagnose.</p>

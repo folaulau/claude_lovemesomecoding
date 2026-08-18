@@ -1,0 +1,197 @@
+<p>URL rules protect an entry point. Method-level security protects a method, which is a different thing
+— and the difference starts to matter the moment two entry points can reach the same service.</p>
+
+<h2>Turning it on</h2>
+
+<pre class="language-java"><code class="language-java">@Configuration
+@EnableWebSecurity
+// Turns on @PreAuthorize / @PostAuthorize. Defence in depth: the URL rules below guard the
+// HTTP entry points, and the annotations guard the service methods regardless of which entry
+// point reached them. A new controller that forgets its URL rule is still refused.
+@EnableMethodSecurity
+public class SecurityConfig { }</code></pre>
+
+<p>Without <code>@EnableMethodSecurity</code>, every annotation below is inert. No error, no warning —
+the same silent failure as <code>@EnableCaching</code> (lesson 21), and just as easy to miss because
+everything appears to work.</p>
+
+<p>In older code you may see <code>@EnableGlobalMethodSecurity(prePostEnabled = true)</code>. That is
+deprecated; <code>@EnableMethodSecurity</code> enables the pre/post annotations by default.</p>
+
+<h2>The three annotations</h2>
+
+<table>
+  <thead>
+    <tr><th>Annotation</th><th>Runs</th><th>Expression language</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>@PreAuthorize</code></td><td>before the method</td><td>SpEL — the useful one</td></tr>
+    <tr><td><code>@PostAuthorize</code></td><td>after, can see the result</td><td>SpEL</td></tr>
+    <tr><td><code>@Secured</code></td><td>before</td><td>role names only — legacy</td></tr>
+  </tbody>
+</table>
+
+<p><code>@Secured("ROLE_ADMIN")</code> is the oldest and can only check role names, with the
+<code>ROLE_</code> prefix spelled out. <code>@PreAuthorize</code> does everything it does and more.
+There is no reason to choose <code>@Secured</code> in new code.</p>
+
+<h2>In practice</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Every method here carries {@code @PreAuthorize("hasRole('ADMIN')")} even though
+ * {@code SecurityConfig} already restricts {@code /api/admin/**} to admins. That is not
+ * belt-and-braces for its own sake: URL rules protect one entry point, and this service is a bean
+ * that any future controller, scheduled job or message listener can inject. The annotation travels
+ * with the method, so the guard cannot be left behind when the caller changes.
+ */
+@Service
+@Slf4j
+public class AdminUserServiceImpl implements AdminUserService {
+
+    @Override
+    @PreAuthorize("hasRole('ADMIN')")
+    @Transactional(readOnly = true)
+    public List&lt;AdminUserDTO&gt; getAllUsers() {
+        return userDAO.findAllForAdmin();
+    }
+
+    @Override
+    @PreAuthorize("hasRole('ADMIN')")
+    @Transactional
+    public AdminUserDTO changeRole(String actingAdminEmail, UUID userId, UserRole role) { /* … */ }
+
+    @Override
+    @PreAuthorize("hasRole('ADMIN')")
+    @Transactional
+    public void deleteUser(String actingAdminEmail, UUID userId) { /* … */ }
+}</code></pre>
+
+<p>That comment is the argument for the whole feature. The URL rule
+<code>/api/admin/** → hasRole("ADMIN")</code> already covers today's only caller. But
+<code>AdminUserService</code> is a bean, and a message listener or a scheduled job added next year can
+inject it — reaching the method by a path that has no URL and therefore no URL rule.</p>
+
+<h2>Expressions</h2>
+
+<pre class="language-java"><code class="language-java">// Roles and authorities
+@PreAuthorize("hasRole('ADMIN')")
+@PreAuthorize("hasAnyRole('ADMIN', 'STAFF')")
+@PreAuthorize("hasAuthority('ORDER_REFUND')")
+
+// Just authenticated
+@PreAuthorize("isAuthenticated()")
+
+// Combined
+@PreAuthorize("hasRole('ADMIN') and #order.total &lt; 1000")
+
+// Against the caller's own identity — the interesting case
+@PreAuthorize("#email == authentication.name")
+public UserDTO getProfile(String email) { }
+
+// Delegate to a bean, for anything non-trivial
+@PreAuthorize("@orderSecurity.isOwner(#orderId, authentication.name)")
+public OrderDTO getOrder(UUID orderId) { }</code></pre>
+
+<p><code>#name</code> refers to a method parameter, <code>authentication</code> to the current
+<code>Authentication</code>, and <code>@beanName</code> calls a Spring bean.</p>
+
+<p><strong>That last form is the one to reach for.</strong> An expression more complicated than a role
+check belongs in a bean, where it can be read, unit-tested and reused. Ownership logic written as a
+SpEL string is untestable and fails at runtime rather than compile time.</p>
+
+<p>⚠️ <strong><code>hasRole('ADMIN')</code> checks for the authority <code>ROLE_ADMIN</code>.</strong>
+<code>hasAuthority('ADMIN')</code> checks for <code>ADMIN</code>. Same trap as lesson 23, in a
+different place.</p>
+
+<h2><code>@PostAuthorize</code>, and why it is rarely right</h2>
+
+<pre class="language-java"><code class="language-java">@PostAuthorize("returnObject.email == authentication.name")
+public UserDTO getUser(UUID id) { }</code></pre>
+
+<p>It runs after the method and can inspect <code>returnObject</code>. Useful when ownership is only
+knowable once you have loaded the thing.</p>
+
+<p>Two problems. <strong>The work is already done</strong> — you queried the database and built the
+DTO, then threw it away. And <strong>it does not undo side effects</strong>: on a method that writes,
+the write has happened and only the response is refused. Never put <code>@PostAuthorize</code> on
+something that mutates state.</p>
+
+<p>Where you can, prefer designing the ownership question away. The pizza API's approach is stronger
+than any annotation:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">/api/me/** resolves the owner from the token — no user id in the path.</code></pre>
+
+<p>If the caller cannot name a resource that is not theirs, there is nothing to authorize.</p>
+
+<h2>⚠️ The proxy rule, one more time</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;⚠️ Being proxy-based, it has the same blind spot as {@code @Transactional} and
+ * {@code @Cacheable}: a call from another method inside THIS class skips the check entirely.
+ */</code></pre>
+
+<pre class="language-java"><code class="language-java">@Service
+public class AdminUserServiceImpl {
+
+    public void bulkDelete(List&lt;UUID&gt; ids) {
+        ids.forEach(id -&gt; deleteUser(admin, id));   // NO authorization check runs
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    public void deleteUser(String actingAdminEmail, UUID userId) { }
+}</code></pre>
+
+<p>Lesson 8 covers why. It is worth repeating here because the consequence is worse: with
+<code>@Transactional</code> a self-invocation costs you a transaction, and with
+<code>@PreAuthorize</code> it costs you the security check entirely — silently. Any public method that
+loops over an annotated one needs its own annotation.</p>
+
+<p>The same applies to <code>private</code> and <code>final</code> methods: a proxy cannot override
+them, so annotations on them never run.</p>
+
+<h2>Rules that annotations cannot express</h2>
+
+<p>Some authorization is business logic and belongs in the method:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Admins cannot demote or delete themselves — that would lock the last admin out.</code></pre>
+
+<p>That is why <code>changeRole</code> and <code>deleteUser</code> take the acting admin's email as a
+parameter as well as the target. No role check can express "not yourself"; it is a rule about the
+relationship between two arguments, and it lives in the method body where it can be tested
+directly.</p>
+
+<p><strong>Use annotations for "may this kind of user call this at all", and code for rules about the
+specific data.</strong></p>
+
+<h2>What it returns</h2>
+
+<p>A failed check throws <code>AccessDeniedException</code>, which the pizza API's exception handler
+turns into a clean 403:</p>
+
+<pre class="language-java"><code class="language-java">@ExceptionHandler(AccessDeniedException.class)
+public ResponseEntity&lt;ApiError&gt; handleAccessDenied(
+        AccessDeniedException ex, HttpServletRequest request) {
+    ApiError error = new ApiError(
+            HttpStatus.FORBIDDEN,
+            "You do not have permission to do that",
+            request.getRequestURI());
+    return ResponseEntity.status(error.getStatus()).body(error);
+}</code></pre>
+
+<p>Remember lesson 12's caveat: 403 confirms the resource exists. For a resource that simply is not
+the caller's, 404 leaks less.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong><code>@EnableMethodSecurity</code></strong>, or every annotation is silently
+  inert.</li>
+  <li><strong><code>@PreAuthorize</code> over <code>@Secured</code></strong> — same job, more
+  capable.</li>
+  <li><strong>URL rules and method annotations do different jobs.</strong> Use both.</li>
+  <li><strong>Delegate real logic to a bean</strong> rather than growing a SpEL string.</li>
+  <li><strong>A self-invocation skips the check entirely.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-oauth2">OAuth2</a> — and the reconciliation step every
+tutorial leaves out.</p>

@@ -1,0 +1,202 @@
+<p>Building a REST API in Spring Boot is easy enough that most of the interesting decisions are not
+about the framework at all. They are about what you expose, what you accept, and what you say when
+something goes wrong.</p>
+
+<h2>The shape of a controller</h2>
+
+<pre class="language-java"><code class="language-java">@Tag(name = "Products", description = "Menu browsing (public)")
+@RequestMapping("/api/products")
+@RestController
+@Slf4j
+public class ProductRestController {
+
+    @Autowired
+    private ProductService productService;
+
+    @Operation(summary = "List the active menu, optionally filtered by type")
+    @GetMapping
+    public ResponseEntity&lt;List&lt;ProductDTO&gt;&gt; getProducts(
+            @RequestParam(required = false) ProductType type) {
+        return new ResponseEntity&lt;&gt;(
+                type == null ? productService.getMenu() : productService.getByType(type), OK);
+    }
+}</code></pre>
+
+<p><code>@RestController</code> is <code>@Controller</code> + <code>@ResponseBody</code>: return
+values are serialised into the response body rather than resolved as view names. That distinction
+matters exactly once, in lesson 15.</p>
+
+<p><strong>Controllers should be thin.</strong> Bind the request, call one service method, choose a
+status. Business logic in a controller is untestable without HTTP and unreachable from anywhere
+else — a message listener or a scheduled job cannot call it.</p>
+
+<h2>Modelling URLs</h2>
+
+<p>Resources are nouns; the verb is the HTTP method.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">GET    /api/products              list
+GET    /api/products/{id}         one
+POST   /api/admin/products        create
+PUT    /api/admin/products/{id}   replace
+PATCH  /api/admin/products/{id}/deactivate   partial state change
+DELETE /api/admin/products/{id}   delete
+
+# not this
+POST /api/getProducts
+POST /api/products/delete/{id}</code></pre>
+
+<p>The pizza API puts admin endpoints under a separate <code>/api/admin/**</code> prefix rather than
+mixing them into the same path. That is a security decision as much as a design one: it lets the
+whole admin surface be protected by a single matcher instead of per-method annotations that are easy
+to forget on a new endpoint.</p>
+
+<h2>Status codes that mean something</h2>
+
+<pre class="language-java"><code class="language-java">// 201 for a creation
+@PostMapping
+public ResponseEntity&lt;ProductDTO&gt; createProduct(@Valid @RequestBody ProductCreateDTO dto) {
+    return new ResponseEntity&lt;&gt;(productService.createProduct(dto), CREATED);
+}
+
+// 204 when there is genuinely nothing to return
+@DeleteMapping("/{id}")
+public ResponseEntity&lt;Void&gt; deleteProduct(@PathVariable UUID id) {
+    productService.deleteProduct(id);
+    return ResponseEntity.noContent().build();
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Code</th><th>Means</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>200</td><td>fine, here it is</td></tr>
+    <tr><td>201</td><td>created</td></tr>
+    <tr><td>204</td><td>fine, nothing to send</td></tr>
+    <tr><td>400</td><td><strong>your</strong> request is wrong</td></tr>
+    <tr><td>401</td><td>who are you?</td></tr>
+    <tr><td>403</td><td>I know who you are; no</td></tr>
+    <tr><td>404</td><td>no such thing</td></tr>
+    <tr><td>409</td><td>conflicts with current state</td></tr>
+    <tr><td>500</td><td><strong>our</strong> fault</td></tr>
+  </tbody>
+</table>
+
+<p>The 4xx/5xx line is the one that matters operationally. A 500 should mean "we have a bug"; if
+malformed input produces one, your error rate becomes meaningless and every alert is noise. Lesson 12
+is largely about keeping bad input in the 4xx range.</p>
+
+<h2>DTOs, and why not entities</h2>
+
+<p>Returning JPA entities directly is the most common early mistake, and the pizza API's
+<code>ProductDTO</code> documents all three reasons:</p>
+
+<ul>
+  <li><strong>Lazy collections blow up.</strong> Jackson serialises outside the transaction, so a
+  lazy association throws <code>LazyInitializationException</code> — or, worse, triggers a cascade of
+  queries that serialises half your database.</li>
+  <li><strong>The entity's shape is a database concern.</strong> Renaming a column should not break
+  every client.</li>
+  <li><strong>It leaks.</strong> <code>User</code> has a <code>passwordHash</code>. One
+  <code>return user;</code> publishes it.</li>
+</ul>
+
+<p><strong>Use separate DTOs for request and response.</strong> The response carries an id; the
+request must not let a client choose one:</p>
+
+<pre class="language-java"><code class="language-java">public record ProductDTO(
+        UUID id,                     // response only
+        String name,
+        String description,
+        ProductType type,
+        String imageUrl,
+        boolean active,
+        Integer displayOrder,
+        List&lt;ProductSizeDTO&gt; sizes,
+        LocalDateTime createdAt,
+        LocalDateTime updatedAt) {}
+
+public record ProductCreateDTO(      // request only — no id, no timestamps
+        @NotBlank @Size(max = 120) String name,
+        @Size(max = 500) String description,
+        @NotNull ProductType type,
+        @Size(max = 500) String imageUrl,
+        Boolean active,
+        Integer displayOrder,
+        @NotEmpty(message = "A product needs at least one size") @Valid List&lt;SizeDTO&gt; sizes) { }</code></pre>
+
+<p>Reusing one class for both directions is how <strong>mass-assignment</strong> bugs get in: the
+client sends a field you never intended to be settable, and the binder happily sets it. The pizza
+API's registration endpoint is the sharp version of this — <code>RegisterDTO</code> has no
+<code>role</code> field at all, so a role can never arrive from a request body.</p>
+
+<p>Records are ideal for DTOs: immutable, concise, and Jackson supports them natively.</p>
+
+<h2>Validation</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-validation&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p><strong><code>@Valid</code> on the parameter is what actually runs the constraints.</strong>
+Annotating the DTO alone does nothing — a genuinely common and completely silent mistake:</p>
+
+<pre class="language-java"><code class="language-java">public ResponseEntity&lt;ProductDTO&gt; createProduct(@Valid @RequestBody ProductCreateDTO dto) { }
+//                                              ▲ without this, the constraints are ignored</code></pre>
+
+<p>Nested objects need <code>@Valid</code> too — note it on the <code>sizes</code> list above, without
+which each <code>SizeDTO</code>'s own constraints are skipped.</p>
+
+<p>Custom messages are worth writing. <code>"A product needs at least one size"</code> is something a
+UI can display; <code>"must not be empty"</code> is not.</p>
+
+<h2>Expose a UUID, not your primary key</h2>
+
+<p>Every table in the pizza API has a <code>BIGINT</code> primary key for internal foreign keys
+<strong>and</strong> a <code>public_id</code> UUID. Only the UUID is ever published.</p>
+
+<pre class="language-java"><code class="language-java">@Schema(description = "Public UUID — use this in every request")
+UUID id,</code></pre>
+
+<p>Sequential ids are guessable. <code>GET /api/orders/1041</code> invites
+<code>GET /api/orders/1042</code>, and if authorization is anything less than perfect that is a data
+breach with a trivial exploit. They also leak business information: order 1041 today and 1052
+tomorrow tells a competitor your daily volume.</p>
+
+<p>The pizza API is honest about where it did not finish this job:</p>
+
+<pre class="language-java"><code class="language-java">// LIMITATION: ids are sequential, so anyone could walk them. A production
+// system would use an unguessable reference (UUID) or a signed link.
+// Left simple here deliberately, and called out rather than hidden.
+.requestMatchers(HttpMethod.GET, "/api/orders/*", "/api/orders/*/payment-status")
+.permitAll()</code></pre>
+
+<h2>Never trust the client for anything that matters</h2>
+
+<p>The single most exploitable e-commerce bug is trusting a client-sent price. The pizza API's
+<code>OrderCreateDTO</code> carries no prices at all — the request chooses <em>which</em> products,
+and <code>PricingService</code> reads every figure from the database:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;b&gt;This class is the security boundary of the whole checkout.&lt;/b&gt; Every figure it produces
+ * comes from the product_size, crust and topping tables. Nothing in OrderCreateDTO influences
+ * a price — the request only chooses WHICH rows apply.
+ */
+@Service
+public class PricingService { }</code></pre>
+
+<p>The general rule: <strong>a field a client can set is a field a client can set to anything.</strong>
+Prices, roles, ownership and status all belong to the server.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Thin controllers.</strong> Bind, delegate, choose a status.</li>
+  <li><strong>Separate request and response DTOs</strong>, and never return entities.</li>
+  <li><strong><code>@Valid</code> on the parameter</strong>, and again on nested collections.</li>
+  <li><strong>Expose UUIDs</strong>, and recompute anything that matters on the server.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-exception-handling">exception handling</a> — one error
+shape for every endpoint.</p>

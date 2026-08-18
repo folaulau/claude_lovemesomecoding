@@ -1,0 +1,216 @@
+<p>Networks drop packets. Services rate-limit. Databases hit a deadlock and roll one transaction back.
+A great many failures are <em>transient</em>, and the correct response is to try again in a moment.</p>
+
+<p>The dangerous part is that retrying an operation that already succeeded is how you charge someone
+twice.</p>
+
+<h2>Spring Framework 7 has retry built in</h2>
+
+<p>This changed in Boot 4, and it is worth being precise about because most material online describes
+the old library:</p>
+
+<pre class="language-java"><code class="language-java">// Boot 3 + the separate spring-retry dependency
+import org.springframework.retry.annotation.EnableRetry;
+import org.springframework.retry.annotation.Retryable;
+
+// Boot 4 / Framework 7 — in the core container, no extra dependency
+import org.springframework.resilience.annotation.EnableResilientMethods;
+import org.springframework.resilience.annotation.Retryable;</code></pre>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- No spring-retry dependency on purpose: Spring Framework 7 ships retry in
+     the core container (org.springframework.resilience.annotation.Retryable
+     plus @EnableResilientMethods), so the separate library is now legacy. --&gt;</code></pre>
+
+<p>You still need <code>spring-boot-starter-aspectj</code>, because this is proxy-based like
+everything else in lesson 8.</p>
+
+<pre class="language-java"><code class="language-java">// Spring Framework 7 moved retry into the core container. @EnableResilientMethods activates
+// org.springframework.resilience.annotation.Retryable (and @ConcurrencyLimit), which is why this
+// project needs no spring-retry dependency and no @EnableRetry.
+@EnableResilientMethods
+public class ThreadPoolConfig { }</code></pre>
+
+<h2>The annotation</h2>
+
+<pre class="language-java"><code class="language-java">@Retryable(
+        includes = {ApiConnectionException.class, RateLimitException.class},
+        maxRetries = 3,
+        delay = 200,
+        multiplier = 2.0,
+        maxDelay = 2000,
+        jitter = 100)
+public PaymentIntent retrieve(String paymentIntentId) throws StripeException {
+    requireConfigured();
+    return stripe.paymentIntents().retrieve(paymentIntentId);
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Attribute</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>includes</code></td><td>which exceptions are worth retrying</td></tr>
+    <tr><td><code>excludes</code></td><td>which are not, when <code>includes</code> is too
+    broad</td></tr>
+    <tr><td><code>maxRetries</code></td><td>attempts <em>after</em> the first</td></tr>
+    <tr><td><code>delay</code></td><td>initial wait, in ms</td></tr>
+    <tr><td><code>multiplier</code></td><td>backoff factor</td></tr>
+    <tr><td><code>maxDelay</code></td><td>ceiling on the wait</td></tr>
+    <tr><td><code>jitter</code></td><td>random ± to spread retries out</td></tr>
+  </tbody>
+</table>
+
+<p>So this one waits roughly 200ms, 400ms, 800ms, each ±100ms, capped at 2s.</p>
+
+<h3>Why backoff, and why jitter</h3>
+
+<p><strong>Backoff</strong> because whatever failed is probably still failing. Three immediate retries
+just deliver three more requests to a struggling service.</p>
+
+<p><strong>Jitter</strong> because of the thundering herd. If a service goes down for two seconds,
+every client that failed retries at exactly 200ms, then exactly 400ms — synchronised waves of traffic
+hitting it the instant it recovers, knocking it over again. Randomising spreads them out. It looks
+like a detail and it is the difference between a blip and an outage.</p>
+
+<h2>⚠️ Retry the right exceptions</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Note which exceptions are listed. A dropped connection or a rate limit is worth trying
+ * again — the request may well succeed a moment later. An {@code InvalidRequestException} is
+ * not: the request was malformed, and sending it three more times just makes the same mistake
+ * three more times, slower. Retrying the wrong exception turns a fast failure into a slow one.
+ */</code></pre>
+
+<p>The test is simple: <strong>could this succeed if I tried again unchanged?</strong></p>
+
+<ul>
+  <li><strong>Yes</strong> — connection reset, timeout, 429, 503, deadlock. Retry.</li>
+  <li><strong>No</strong> — 400, 401, 404, validation failure, a null pointer. Never retry.</li>
+</ul>
+
+<p>Retrying a 400 is worse than not retrying: the caller waits four times as long for the same
+failure, and you have quadrupled load on a service that was already telling you to stop.</p>
+
+<h2>⚠️ The part that matters: idempotency</h2>
+
+<p><strong>A retry is only safe if repeating the operation is safe.</strong> For a read, it always is.
+For a write, it usually is not — and the failure mode is a customer charged twice.</p>
+
+<p>Consider: you call Stripe, Stripe creates the PaymentIntent, and the response is lost to a network
+blip. Your client sees a connection failure. It retries. Stripe has no idea this is the same request
+and creates a second PaymentIntent.</p>
+
+<p>The fix is an <strong>idempotency key</strong>:</p>
+
+<pre class="language-java"><code class="language-java">@Retryable(
+        includes = {ApiConnectionException.class, RateLimitException.class},
+        maxRetries = 3,
+        delay = 200,
+        multiplier = 2.0,
+        maxDelay = 2000,
+        jitter = 100)
+public PaymentIntent createPaymentIntent(BigDecimal amount, UUID orderId, String receiptEmail)
+        throws StripeException {
+
+    // … build the params …
+
+    // THE reason this method is safe to retry. Without an idempotency key, a request that
+    // succeeded at Stripe but whose response was lost to a network blip would be retried and
+    // create a SECOND PaymentIntent — the classic double-charge. Keyed on our own order id,
+    // Stripe recognises the replay and returns the original PaymentIntent instead.
+    RequestOptions options = RequestOptions.builder()
+            .setIdempotencyKey("order-" + orderId)
+            .build();
+
+    return stripe.paymentIntents().create(params.build(), options);
+}</code></pre>
+
+<p>The order's own UUID is a natural key: it is unique, stable across retries, and already exists. The
+provider stores the key with the result and returns the original response for a replay.</p>
+
+<p>The order of operations in the pizza API supports this — the order row is saved
+<em>before</em> Stripe is called, precisely so the id exists to key on:</p>
+
+<pre class="language-java"><code class="language-java">// Saved BEFORE talking to Stripe, so the PaymentIntent can carry a real order id and an
+// abandoned checkout still leaves a record.
+CustomerOrder saved = orderDAO.save(order);</code></pre>
+
+<p><strong>Without an idempotency mechanism, do not retry a write.</strong> Retry the read that tells
+you whether it succeeded, then decide.</p>
+
+<h2>⚠️ There is no <code>@Recover</code></h2>
+
+<p>This is the main behavioural difference from the old <code>spring-retry</code> library, and it is
+easy to trip over when migrating. Framework 7's built-in retry <strong>rethrows the last exception
+once attempts are exhausted</strong> — there is no fallback-method mechanism.</p>
+
+<p>Handle it at the call site:</p>
+
+<pre class="language-java"><code class="language-java">try {
+    PaymentIntent intent = stripeService.createPaymentIntent(
+            saved.getTotal(), saved.getPublicId(), saved.contactEmail());
+    saved.setStripePaymentIntentId(intent.getId());
+    orderDAO.save(saved);
+    clientSecret = intent.getClientSecret();
+} catch (StripeException ex) {
+    log.error("Stripe rejected the PaymentIntent for order {}", saved.getPublicId(), ex);
+    throw ApiException.badRequest("Could not start payment: " + ex.getMessage());
+}</code></pre>
+
+<p>If you genuinely need a declarative fallback, <code>spring-retry</code> and its
+<code>@Recover</code> still work on Boot 4 — you just have to add the dependency and use its
+annotations, not the built-in ones. Do not mix the two.</p>
+
+<h2>⚠️ Retry and transactions</h2>
+
+<pre class="language-java"><code class="language-java">@Retryable(includes = SQLException.class)
+@Transactional                        // WRONG ORDER
+public void doWork() { }</code></pre>
+
+<p>Both are proxies, and the order decides whether the retry is inside or outside the transaction. If
+retry is inside, every attempt runs in the <em>same</em> already-doomed transaction — once it is
+marked rollback-only, retrying achieves nothing.</p>
+
+<p>The safe arrangement is <strong>retry on the outside, transaction on the inside</strong>, in
+separate beans:</p>
+
+<pre class="language-java"><code class="language-java">@Service
+@RequiredArgsConstructor
+public class OrderRetryFacade {
+
+    private final OrderWorker worker;
+
+    @Retryable(includes = CannotAcquireLockException.class, maxRetries = 3, delay = 100)
+    public void process(UUID id) {
+        worker.processInTransaction(id);   // separate bean → real proxy → new transaction
+    }
+}</code></pre>
+
+<p>Separate beans, because a self-invocation would bypass both proxies (lesson 8).</p>
+
+<h2>Retry is not a circuit breaker</h2>
+
+<p>Retries help with <em>brief</em> failures. When a dependency is properly down, retrying makes it
+worse — every client tripling its request rate against a service that cannot answer.</p>
+
+<p>A <strong>circuit breaker</strong> notices sustained failure and stops calling for a while, failing
+fast instead. Framework 7 ships <code>@ConcurrencyLimit</code> for bounding in-flight calls;
+Resilience4j remains the standard choice for full circuit breaking, bulkheads and rate limiting.</p>
+
+<p><strong>Retry for the blip, circuit-break for the outage.</strong> Most systems need both, and
+retry alone is the more common mistake.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Framework 7 has retry built in</strong> — no <code>spring-retry</code>, and
+  <code>@EnableResilientMethods</code> rather than <code>@EnableRetry</code>.</li>
+  <li><strong>Retry only what could succeed unchanged.</strong></li>
+  <li><strong>Backoff with jitter</strong>, or you build a thundering herd.</li>
+  <li><strong>Never retry a write without an idempotency key.</strong></li>
+  <li><strong>No <code>@Recover</code></strong> — handle exhaustion at the call site.</li>
+  <li><strong>Retry outside, transaction inside</strong>, in separate beans.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-jms">messaging with JMS</a> — handing work to a queue so the
+request can return.</p>

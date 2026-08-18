@@ -1,0 +1,165 @@
+<p>Inversion of control sounds abstract and is not. A class that needs a collaborator normally builds
+one; with IoC it declares that it needs one and something else supplies it. The container does the
+supplying. That is dependency injection, and in practice it means one thing: <strong>use constructor
+injection</strong>.</p>
+
+<h2>The problem it solves</h2>
+
+<p>Without injection, a class builds what it needs:</p>
+
+<pre class="language-java"><code class="language-java">public class OrderService {
+
+    private final ProductDAO productDAO = new ProductDAOImp();
+    private final StripeService stripe = new StripeService();
+
+    // …
+}</code></pre>
+
+<p>This compiles and it is rigid. <code>OrderService</code> now knows the concrete class of both
+collaborators, decides their lifecycle, and cannot be tested without a real Stripe client. There is
+no seam.</p>
+
+<p>With injection, it asks:</p>
+
+<pre class="language-java"><code class="language-java">@Service
+public class OrderService {
+
+    private final ProductDAO productDAO;
+    private final StripeService stripe;
+
+    public OrderService(ProductDAO productDAO, StripeService stripe) {
+        this.productDAO = productDAO;
+        this.stripe = stripe;
+    }
+}</code></pre>
+
+<p>Now it depends on an interface, the container decides the implementation, and a test hands it two
+mocks with a plain <code>new</code>.</p>
+
+<h2>The three styles, and which to use</h2>
+
+<h3>Constructor injection — the default</h3>
+
+<pre class="language-java"><code class="language-java">@Service
+@RequiredArgsConstructor
+public class MailServiceImpl implements MailService {
+
+    private final ObjectProvider&lt;JavaMailSender&gt; mailSenderProvider;
+    private final TemplateEngine templateEngine;
+    private final PizzaProperties properties;
+}</code></pre>
+
+<p>Three properties make this the right default:</p>
+
+<ul>
+  <li><strong>The fields can be <code>final</code>.</strong> The object is fully built or not built at
+  all — there is no window where a dependency is null.</li>
+  <li><strong>Dependencies are visible.</strong> A constructor with nine parameters is embarrassing,
+  and that is useful information: the class is doing too much. Field injection hides the same nine
+  and the class quietly grows.</li>
+  <li><strong>It is trivially testable</strong> — <code>new MailServiceImpl(a, b, c)</code>, no
+  container, no reflection.</li>
+</ul>
+
+<p>Since Spring 4.3, <strong><code>@Autowired</code> is not needed</strong> on a single constructor.
+Lombok's <code>@RequiredArgsConstructor</code> generates one from the <code>final</code> fields, which
+removes the boilerplate that made people reach for field injection in the first place.</p>
+
+<h3>Field injection — avoid in new code</h3>
+
+<pre class="language-java"><code class="language-java">@Service
+public class ProductServiceImpl implements ProductService {
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    @Autowired
+    private EntityDTOMapper mapper;
+}</code></pre>
+
+<p>Shorter, and worse. The fields cannot be <code>final</code>; the class cannot be constructed
+correctly without reflection, so a unit test needs Spring or
+<code>ReflectionTestUtils</code>; and there is no pressure against adding a tenth dependency.</p>
+
+<p>The pizza API uses this style in its older services and constructor injection in the newer ones.
+That inconsistency is honest — it is what a real codebase looks like mid-migration — but for new code
+there is no argument for it.</p>
+
+<h3>Setter injection — for genuinely optional dependencies</h3>
+
+<p>Rare. If a dependency is truly optional, an <code>ObjectProvider</code> in the constructor
+expresses it better, which is what the pizza API does for its optional integrations:</p>
+
+<pre class="language-java"><code class="language-java">private final ObjectProvider&lt;JavaMailSender&gt; mailSenderProvider;
+
+public void sendOrderConfirmation(OrderDTO order) {
+    JavaMailSender sender = mailSenderProvider.getIfAvailable();
+    if (sender == null) {
+        log.debug("No mail server configured — skipping");
+        return;
+    }
+    // …
+}</code></pre>
+
+<p>Boot only creates a <code>JavaMailSender</code> when <code>spring.mail.host</code> is set. As a
+required dependency it would stop the whole application from starting on a machine with no mail
+configured. <code>ObjectProvider</code> is the container's supported way of saying "give me this if it
+exists", and it degrades instead of failing.</p>
+
+<h2>Circular dependencies</h2>
+
+<p>Two beans that need each other:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">The dependencies of some of the beans in the application context form a cycle:
+
+┌─────┐
+|  orderService defined in file [OrderServiceImpl.class]
+↑     ↓
+|  notificationService defined in file [NotificationServiceImpl.class]
+└─────┘</code></pre>
+
+<p><strong>Boot 4 refuses to start on this by default</strong>, and that is correct — a cycle is a
+design problem, not a configuration one. Three real fixes, best first:</p>
+
+<ol>
+  <li><strong>Extract the shared part.</strong> Usually both classes want one piece of logic; move it
+  into a third bean they both depend on. The cycle disappears because it was never necessary.</li>
+  <li><strong>Publish an event instead of calling back.</strong> If <code>OrderService</code> needs
+  <code>NotificationService</code> to react to something, it does not need a reference — it needs to
+  announce that the thing happened. This is what the pizza API does, and lesson 9 covers it.</li>
+  <li><strong>Inject an <code>ObjectProvider</code></strong> on one side so resolution is deferred to
+  first use rather than construction.</li>
+</ol>
+
+<p>And the non-fix:</p>
+
+<pre class="language-properties"><code class="language-properties"># Makes the error go away and the design problem stay.
+spring.main.allow-circular-references=true</code></pre>
+
+<p>It works by injecting a half-initialised proxy. It is available for migrating legacy code and
+should not survive into anything new.</p>
+
+<h2><code>@Lazy</code></h2>
+
+<p><code>@Lazy</code> defers a bean's creation until first use. It is occasionally the right tool —
+an expensive bean that is rarely used — and is frequently misused to paper over a cycle or to hide a
+slow startup. If startup is slow, find out which bean is slow; deferring it just moves the cost to a
+user's first request.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Constructor injection, <code>final</code> fields,
+  <code>@RequiredArgsConstructor</code>.</strong> That is the default and it needs no
+  <code>@Autowired</code>.</li>
+  <li><strong>A long constructor is a design smell you should be able to see</strong> — which is
+  precisely what field injection hides.</li>
+  <li><strong><code>ObjectProvider</code> for genuinely optional dependencies</strong>, so a missing
+  integration degrades rather than failing startup.</li>
+  <li><strong>Fix cycles, do not enable them.</strong> Extract a third bean or publish an
+  event.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-configuration-properties">configuration, profiles and
+properties</a> — where settings come from, which source wins, and why typed records beat scattered
+strings.</p>

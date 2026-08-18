@@ -1,0 +1,201 @@
+<p>Every application has settings that differ between your laptop and production. Spring Boot's answer
+is a layered configuration system, and the part worth learning properly is which layer wins and how
+to bind settings to types instead of scattering strings.</p>
+
+<h2>Where configuration comes from</h2>
+
+<p>Boot reads from many sources and merges them. <strong>Later sources override earlier ones</strong>,
+and the practical order, lowest priority first, is:</p>
+
+<ol>
+  <li><code>application.properties</code> (or <code>.yml</code>) in the jar</li>
+  <li><code>application-{profile}.properties</code> for each active profile</li>
+  <li>An <code>application.properties</code> beside the jar</li>
+  <li>OS environment variables</li>
+  <li>Java system properties (<code>-D</code>)</li>
+  <li>Command-line arguments (<code>--server.port=9000</code>)</li>
+</ol>
+
+<p>That ordering is the whole design. Defaults ship in the jar; environments override with env vars;
+a human overrides everything from the command line for one run.</p>
+
+<pre class="language-bash"><code class="language-bash"># All three set the same thing. The last one wins.
+export SERVER_PORT=8081
+java -Dserver.port=8082 -jar app.jar --server.port=8083</code></pre>
+
+<p><strong>Environment variables are spelled differently.</strong> Boot relaxes the binding, so
+<code>pizza.jwt.expiration-minutes</code> is settable as
+<code>PIZZA_JWT_EXPIRATIONMINUTES</code> — upper case, dots and dashes to underscores. This is how
+you configure a container without a properties file.</p>
+
+<h2><code>@Value</code>, and why the pizza API stopped using it</h2>
+
+<p><code>@Value</code> injects a single property:</p>
+
+<pre class="language-java"><code class="language-java">@Value("${pizza.pricing.tax-rate}")
+private BigDecimal taxRate;
+
+@Value("${pizza.pricing.delivery-fee}")
+private BigDecimal deliveryFee;
+
+// With a default, after the colon:
+@Value("${pizza.oauth2.success-redirect:http://localhost:5173/oauth2/callback}")
+private String successRedirect;</code></pre>
+
+<p>It is fine for one or two values. It scales badly, and the pizza API demonstrated exactly how: the
+two fields above were declared in <code>PricingService</code> <strong>and again</strong> in
+<code>CartServiceImpl</code>. The same keys, written out four times, with nothing checking that they
+still agreed. That is the failure mode <code>@Value</code> invites — the property name is a string
+repeated wherever it is needed.</p>
+
+<p>It has a second problem. A missing property becomes a null field, and the failure surfaces later
+and elsewhere. A missing <code>pizza.jwt.secret</code> produced a
+<code>NullPointerException</code> from inside the JWT library on the first login attempt.</p>
+
+<h2><code>@ConfigurationProperties</code></h2>
+
+<p>Bind a whole namespace once, into types:</p>
+
+<pre class="language-java"><code class="language-java">@Validated
+@ConfigurationProperties(prefix = "pizza")
+public record PizzaProperties(
+        @Valid Pricing pricing,
+        @Valid Jwt jwt,
+        @Valid Stripe stripe,
+        @Valid Cors cors,
+        @Valid Storage storage,
+        @Valid Mail mail) {
+
+    public record Pricing(
+            @DecimalMin("0.0") @DecimalMax("1.0") BigDecimal taxRate,
+            @DecimalMin("0.0") BigDecimal deliveryFee) {}
+
+    public record Jwt(
+            @NotBlank @Size(min = 32) String secret,
+            @Positive long expirationMinutes) {}
+
+    public record Stripe(String secretKey, String publishableKey, String webhookSecret) {}
+
+    public record Cors(@NotEmpty List&lt;String&gt; allowedOrigins) {}
+
+    public record Storage(@NotBlank String uploadDir, @Positive long maxImageBytes) {}
+
+    public record Mail(@NotBlank String from) {}
+}</code></pre>
+
+<p>Enable scanning for it once, on the application class:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootApplication
+@ConfigurationPropertiesScan
+public class PizzaSpringbootBackendApplication { /* … */ }</code></pre>
+
+<p>Then inject it like any other bean:</p>
+
+<pre class="language-java"><code class="language-java">BigDecimal fee = dto.orderType() == OrderType.DELIVERY
+        ? scale(properties.pricing().deliveryFee())
+        : BigDecimal.ZERO;
+BigDecimal tax = scale(subtotal.multiply(properties.pricing().taxRate()));</code></pre>
+
+<p><strong>Why records.</strong> A record component can only be set by the constructor, so these
+values are immutable after startup. Boot binds constructor arguments by name, which is why there are
+no setters and no <code>@ConstructorBinding</code>.</p>
+
+<p><strong>Relaxed binding does the naming translation.</strong>
+<code>pizza.pricing.tax-rate</code> binds to <code>taxRate</code>; kebab-case in the file, camelCase
+in Java, no annotation needed.</p>
+
+<p><strong>Lists bind properly.</strong> <code>Cors</code> takes a
+<code>List&lt;String&gt;</code>, and Boot splits the comma-separated property itself — which deletes
+the <code>split(",")</code> that every <code>@Value</code> version of this ends up writing by
+hand.</p>
+
+<h2><code>@Validated</code> is the part that earns its keep</h2>
+
+<p>Those constraints are checked <em>while the context is starting</em>, so a bad value fails the
+application at boot with a message naming the property:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Property: pizza.jwt.secret
+Value: "short"
+Reason: size must be between 32 and 2147483647</code></pre>
+
+<p>Compare that with the <code>@Value</code> version's <code>NullPointerException</code> at first
+login. The 32-character minimum is not arbitrary — HS256 requires a 256-bit key and jjwt throws
+<code>WeakKeyException</code> for anything shorter. Checking it here converts a runtime failure into
+a startup failure that says what to fix.</p>
+
+<p>Note what is deliberately <em>not</em> validated. <code>Stripe</code> has no
+<code>@NotBlank</code>, because the keys default to empty so the app still starts without them.
+Payment endpoints then fail loudly when used, which is the right trade for a demo someone just
+cloned.</p>
+
+<h2>Profiles</h2>
+
+<p>A profile is a named set of overrides. Put them in
+<code>application-{profile}.properties</code>:</p>
+
+<pre class="language-properties"><code class="language-properties"># application.properties — the defaults, and the profile to use if nobody says otherwise
+spring.profiles.active=local
+spring.data.elasticsearch.repositories.enabled=false</code></pre>
+
+<pre class="language-properties"><code class="language-properties"># application-search.properties — activated with --spring.profiles.active=local,search
+spring.data.elasticsearch.repositories.enabled=true
+spring.elasticsearch.uris=http://localhost:9200
+spring.elasticsearch.connection-timeout=2s</code></pre>
+
+<p>Profiles are additive, so <code>local,search</code> applies both files. This is the cleanest way to
+flip a default: nothing in the default configuration has to know the profile exists.</p>
+
+<p>Beans can be profile-scoped too, and in the pizza API this is load-bearing rather than
+decorative:</p>
+
+<pre class="language-java"><code class="language-java">@Configuration
+@EnableJms
+@Profile("messaging")
+public class MessagingConfig { /* … */ }</code></pre>
+
+<p>A <code>@JmsListener</code> container starts polling as soon as the context is up. Without the
+profile, merely having the Artemis starter on the classpath would make the app try to reach a broker
+at every startup and fill the log with connection retries. Gated, the default run needs nothing but
+MySQL.</p>
+
+<h2>Keeping secrets out of the repository</h2>
+
+<p>The pattern the pizza API uses — an env var with an empty default, overridable by a gitignored
+file:</p>
+
+<pre class="language-properties"><code class="language-properties"># application.properties — committed. No secrets, and the app still starts without them.
+pizza.stripe.secret-key=${STRIPE_SECRET_KEY:}
+pizza.stripe.webhook-secret=${STRIPE_WEBHOOK_SECRET:}
+
+# HS256 needs >= 256 bits of key. Overridden in application-local.properties.
+pizza.jwt.secret=change-me-this-is-a-development-only-placeholder-secret-key</code></pre>
+
+<p><code>${VAR:default}</code> reads an environment variable and falls back after the colon.
+Real values go in <code>application-local.properties</code>, which is gitignored, or in env vars in
+production. Three rules worth keeping:</p>
+
+<ul>
+  <li><strong>Never commit a real secret</strong>, and treat one that was committed as burned — rotate
+  it rather than deleting the line.</li>
+  <li><strong>A placeholder must look like a placeholder.</strong> The JWT default above says
+  <code>change-me</code> and <code>development-only</code> in the value itself.</li>
+  <li><strong>The app should still start without secrets</strong>, so a first-time clone works and the
+  failure happens at the feature, not at boot.</li>
+</ul>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Later sources win</strong> — jar, then profile, then env, then system properties, then
+  the command line.</li>
+  <li><strong><code>@Value</code> for one or two values; <code>@ConfigurationProperties</code> for a
+  namespace.</strong> Duplicated keys across classes is the smell that means it is time.</li>
+  <li><strong><code>@Validated</code> turns a runtime NPE into a startup error that names the
+  property.</strong></li>
+  <li><strong>Profiles for environment differences and for gating optional integrations off by
+  default.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-aop">aspect-oriented programming</a> — and the proxy rule
+that explains why <code>@Transactional</code>, <code>@Cacheable</code> and <code>@Async</code> all
+fail in the same silent way.</p>

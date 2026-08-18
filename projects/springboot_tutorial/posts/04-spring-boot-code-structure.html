@@ -1,0 +1,178 @@
+<p>Spring Boot has no opinion about your package layout, which means the decision is yours and it
+compounds. This lesson describes the structure the pizza API uses and the reasoning behind each
+choice — including the one mistake that produces a genuinely baffling error.</p>
+
+<h2>The one rule you cannot break</h2>
+
+<p><code>@SpringBootApplication</code> includes <code>@ComponentScan</code>, which scans <strong>the
+annotated class's package and everything below it</strong>. Nothing else.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">com.pizza.api
+├── PizzaSpringbootBackendApplication.java   &lt;- scanning starts here
+├── config/                                   scanned
+├── entity/                                   scanned
+└── security/                                 scanned
+
+com.pizza.util                                NOT scanned - a sibling, not a child</code></pre>
+
+<p>Put a <code>@Service</code> in <code>com.pizza.util</code> and Spring never sees it. The failure is
+not "package not scanned" — it is:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Parameter 0 of constructor in com.pizza.api.entity.order.CustomerOrderServiceImpl
+required a bean of type 'com.pizza.util.TaxCalculator' that could not be found.</code></pre>
+
+<p>Which sends you looking for a missing <code>@Service</code> annotation that is right there. Keep
+the application class in the <strong>root package</strong> of your application and this problem never
+occurs.</p>
+
+<h2>Package by feature, not by layer</h2>
+
+<p>The layout most tutorials show groups by technical role:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">com.example.app
+├── controller/    ProductController, OrderController, UserController, CartController...
+├── service/       ProductService, OrderService, UserService, CartService...
+├── repository/    ProductRepository, OrderRepository, UserRepository...
+└── model/         Product, Order, User, Cart...</code></pre>
+
+<p>It looks tidy and it works badly at scale. Every change to one feature touches four directories,
+and no directory tells you what the application does. Open <code>controller/</code> in a mature
+project and you are looking at forty files with nothing in common.</p>
+
+<p>The pizza API groups by domain instead:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">com.pizza.api
+├── config/      SecurityConfig · OpenApiConfig · RestMVCConfig · ThreadPoolConfig
+│                CacheConfig · PizzaProperties
+├── aspect/      ServiceTimingAspect
+├── dto/         every DTO + ONE central EntityDTOMapper (MapStruct)
+├── entity/      DatabaseTableNames + one package per domain:
+│   ├── cart/    Cart, CartItem, CartItemTopping + DAO/Service/Controller
+│   ├── crust/
+│   ├── order/   CustomerOrder, OrderItem, PricingService, OrderPlacedEvent
+│   ├── product/ Product, ProductSize
+│   ├── topping/
+│   └── user/    User, UserAddress, UserPaymentMethod, auth + profile + admin
+├── exception/   ApiError · ApiSubError · ApiException · RestExceptionHandler
+├── mail/        MailService + Impl
+├── mapper/      JdbcTemplate RowMapper classes
+├── messaging/   JMS publisher, listener and config
+├── payment/     StripeService · StripeWebhookController
+├── report/      ReportDAO/Imp · ReportService/Impl · ReportRestController
+├── search/      Elasticsearch document, repository, service
+├── security/    JwtService · JwtAuthenticationFilter · oauth2/
+└── storage/     ProductImageStorageService + Impl</code></pre>
+
+<p>Everything about products lives in <code>entity/product/</code>: the entity, its DAO, its service,
+its controller. Deleting the feature means deleting a directory. Understanding it means reading
+one.</p>
+
+<h2>Interface plus implementation, always</h2>
+
+<p>Every service and every DAO in the pizza API is an interface and a separate class:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">entity/product/
+├── Product.java                 the JPA entity
+├── ProductRepository.java       Spring Data - derived queries
+├── ProductDAO.java              the data-access interface
+├── ProductDAOImp.java           repository + JdbcTemplate
+├── ProductService.java          the business interface
+├── ProductServiceImpl.java      the implementation
+├── ProductRestController.java   HTTP
+├── ProductType.java             enums
+└── SizeName.java</code></pre>
+
+<pre class="language-java"><code class="language-java">public interface ProductService {
+
+    List&lt;ProductDTO&gt; getMenu();
+
+    List&lt;ProductDTO&gt; getByType(ProductType type);
+
+    ProductDTO getProductByPublicId(UUID id);
+
+    ProductDTO createProduct(ProductCreateDTO dto);
+
+    ProductDTO updateProduct(UUID id, ProductCreateDTO dto);
+
+    ProductDTO setProductImage(UUID id, MultipartFile file);
+
+    void deactivateProduct(UUID id);
+
+    void deleteProduct(UUID id);
+}</code></pre>
+
+<p>Is the interface worth it when there is exactly one implementation? Reasonable people disagree.
+The argument for it here: the interface is the readable summary of what the feature does — eight
+lines against three hundred — and it is what the controller and the tests depend on. The argument
+against is that it is ceremony. Pick one and be consistent; the cost of mixing both styles is higher
+than the cost of either.</p>
+
+<h2>The DAO layer</h2>
+
+<p>This is the pizza API's most opinionated choice. Each DAO implementation wires in <em>both</em> a
+Spring Data repository and a <code>JdbcTemplate</code>, and uses whichever fits the method:</p>
+
+<ul>
+  <li><strong>Repository</strong> for simple things — save, single-row lookups, existence checks. It
+  returns managed entities that dirty checking can track, and it honours the
+  <code>@SQLRestriction</code> that hides soft-deleted rows.</li>
+  <li><strong><code>JdbcTemplate</code></strong> for anything that aggregates or whose result is not
+  an entity. JPA has nothing to offer those.</li>
+</ul>
+
+<p>Lessons 16 and 17 cover each in depth. The structural point is that the choice is made
+<em>inside</em> the DAO, so the service above it never knows or cares which was used.</p>
+
+<h2>Where the cross-cutting pieces go</h2>
+
+<table>
+  <thead>
+    <tr><th>Package</th><th>Holds</th><th>Why not in the feature package</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>config/</code></td><td>Security, OpenAPI, thread pools, caching, typed
+    properties</td><td>They configure the application, not one domain</td></tr>
+    <tr><td><code>exception/</code></td><td>The error shape and one
+    <code>@RestControllerAdvice</code></td><td>One error contract for every endpoint — lesson
+    12</td></tr>
+    <tr><td><code>dto/</code></td><td>Every DTO and one central MapStruct
+    mapper</td><td>DTOs cross feature boundaries; one mapper avoids twelve</td></tr>
+    <tr><td><code>security/</code></td><td>JWT service and filter</td><td>Applies to every
+    request</td></tr>
+  </tbody>
+</table>
+
+<p>A reasonable alternative is to keep each feature's DTOs in its own package. The pizza API chose
+one <code>dto/</code> package because a single <code>EntityDTOMapper</code> then has one obvious
+home; with per-feature DTOs you get per-feature mappers, which is more files and more places for the
+mapping conventions to drift.</p>
+
+<h2>Naming</h2>
+
+<p>Consistency matters more than the specific convention, but two are worth calling out:</p>
+
+<ul>
+  <li><strong><code>CustomerOrder</code>, not <code>Order</code>.</strong> <code>ORDER</code> is a SQL
+  reserved word, and an entity called <code>Order</code> generates SQL that needs quoting in every
+  query. Renaming the class is cheaper than fighting it.</li>
+  <li><strong>Pick <code>Impl</code> or <code>Imp</code> and never mix them.</strong> The pizza API
+  uses <code>DAOImp</code> and <code>ServiceImpl</code> — inherited from the codebase it was
+  patterned on, and inconsistent. It is consistent <em>within each layer</em>, which is enough to be
+  predictable, and changing it now would touch every file for no functional gain.</li>
+</ul>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Application class in the root package.</strong> Everything else is preference; this one
+  produces a misleading error.</li>
+  <li><strong>Group by feature.</strong> A directory should tell you what the app does, not what
+  layer it is.</li>
+  <li><strong>Be consistent</strong> about interfaces and naming. Half-applied conventions are worse
+  than either extreme.</li>
+  <li><strong>Cross-cutting code goes in its own package</strong>, feature code stays with its
+  feature.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-bean">beans, scopes and lifecycle</a> — what the container
+is actually holding, and why <code>@Primary</code> and <code>@Qualifier</code> exist.</p>

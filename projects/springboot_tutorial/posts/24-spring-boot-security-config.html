@@ -1,0 +1,223 @@
+<p>The filter chain is where you say which requests need what. Spring Security 7 — which comes with Boot
+4 — removed the older configuration styles entirely, so a great deal of what you will find online no
+longer compiles.</p>
+
+<h2>What is gone</h2>
+
+<pre class="language-java"><code class="language-java">// Spring Security 5 and earlier. Removed. Does not compile.
+@Configuration
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.authorizeRequests()
+                .antMatchers("/api/public/**").permitAll()
+                .anyRequest().authenticated()
+            .and()
+                .formLogin();
+    }
+}</code></pre>
+
+<p><code>WebSecurityConfigurerAdapter</code>, <code>antMatchers</code> and the <code>.and()</code>
+chaining are all gone. A tutorial containing any of them is at least three major versions out of
+date.</p>
+
+<h2>The modern shape</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;This is Spring Security 7's lambda DSL — version 7 removed the older chained-setter style
+ * entirely, so examples written against Spring Security 5 will not compile here.
+ *
+ * &lt;p&gt;Rules are evaluated IN ORDER, first match wins. That is why the specific patterns
+ * ({@code /api/orders/mine}) come before the general ones ({@code /api/orders/**}).
+ */
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+    private final PizzaProperties properties;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.cors(Customizer.withDefaults())
+                .csrf(csrf -&gt; csrf.disable())
+                .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -&gt; auth
+                        .requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
+                        .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                        .anyRequest().authenticated())
+                .addFilterBefore(
+                        jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}</code></pre>
+
+<p>A <code>SecurityFilterChain</code> <strong>bean</strong>, not a subclass. Each setting takes a
+lambda. <code>requestMatchers</code> replaces <code>antMatchers</code>.</p>
+
+<h2>⚠️ Order decides everything</h2>
+
+<p>Rules are evaluated top to bottom and <strong>the first match wins</strong>. Get the order wrong and
+you silently open an endpoint:</p>
+
+<pre class="language-java"><code class="language-java">// WRONG — /api/orders/mine is matched by the general rule first and becomes public.
+.requestMatchers(HttpMethod.GET, "/api/orders/**").permitAll()
+.requestMatchers(HttpMethod.GET, "/api/orders/mine").authenticated()
+
+// RIGHT — specific before general.
+.requestMatchers(HttpMethod.GET, "/api/orders/mine").authenticated()
+.requestMatchers(HttpMethod.GET, "/api/orders/**").permitAll()</code></pre>
+
+<p>Nothing warns you about the first version. It starts up cleanly and serves other customers' order
+history.</p>
+
+<h2>Default deny</h2>
+
+<pre class="language-java"><code class="language-java">// Default deny. Anything not listed above needs authentication, so a new
+// endpoint is closed until someone deliberately opens it.
+.anyRequest()
+.authenticated()</code></pre>
+
+<p>End with <code>.authenticated()</code>, never <code>.permitAll()</code>. The difference shows up
+months later when a colleague adds an endpoint and forgets a rule: with default-deny it returns 403
+and they fix it; with default-permit it is public and nobody notices.</p>
+
+<h2>Reading a real configuration</h2>
+
+<p>The pizza API's rules are worth reading in full, because each one records a product decision:</p>
+
+<pre class="language-java"><code class="language-java">// ---- documentation -------------------------------------------------
+.requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html")
+.permitAll()
+
+// ---- the caller's own profile --------------------------------------
+// /api/me/** always means "the signed-in caller", so there is no id in
+// the path that could be swapped for someone else's.
+.requestMatchers("/api/me/**")
+.authenticated()
+
+// ---- Stripe callbacks ----------------------------------------------
+// Stripe cannot present a JWT. This endpoint is protected instead by
+// verifying the Stripe-Signature header — see StripeWebhookController.
+.requestMatchers("/api/webhooks/**")
+.permitAll()
+
+// ---- public menu ---------------------------------------------------
+.requestMatchers(HttpMethod.GET, "/api/products/**", "/api/toppings/**", "/api/crusts/**")
+.permitAll()
+
+// ---- cart ----------------------------------------------------------
+// Public, like guest checkout — you do not need an account to fill a
+// basket. The cart's unguessable UUID is what protects it.
+.requestMatchers("/api/carts", "/api/carts/**")
+.permitAll()
+
+// ---- orders --------------------------------------------------------
+// Specific first: order history needs a real account.
+.requestMatchers(HttpMethod.GET, "/api/orders/mine")
+.authenticated()
+// Placing an order must NOT require a login — this is guest checkout.
+.requestMatchers(HttpMethod.POST, "/api/orders")
+.permitAll()
+
+// ---- admin ---------------------------------------------------------
+.requestMatchers("/api/admin/**")
+.hasRole("ADMIN")</code></pre>
+
+<p>Two things worth stealing. <strong>Every <code>permitAll</code> has a comment saying why</strong> —
+a public endpoint is a decision, and an undocumented one looks like an oversight to the next reader.
+And <strong>the HTTP method is part of the rule</strong>: <code>GET /api/products</code> is public
+while <code>POST /api/admin/products</code> is not, so browsing and editing are separated without
+needing separate paths.</p>
+
+<p>The pizza API also does the same for a rule that would otherwise be protected only by accident:</p>
+
+<pre class="language-java"><code class="language-java">// Browsing the menu is public, and so is searching it. The reindex endpoint
+// below it is NOT — it falls through to /api/search/** ... which does not
+// exist, so it lands on anyRequest().authenticated(). Stated explicitly
+// instead, because "protected by accident" is not protected.
+.requestMatchers(HttpMethod.GET, "/api/search/products").permitAll()
+.requestMatchers(HttpMethod.POST, "/api/search/reindex").hasRole("ADMIN")</code></pre>
+
+<h2>CSRF — when disabling it is safe</h2>
+
+<pre class="language-java"><code class="language-java">// Safe to disable ONLY because this API is stateless and token-based: there is no
+// session cookie for a cross-site request to ride on. Never do this for a
+// cookie-authenticated app.
+.csrf(csrf -&gt; csrf.disable())</code></pre>
+
+<p>CSRF attacks work because browsers attach cookies automatically. A malicious page posts to your
+bank, the browser helpfully includes the session cookie, and the request is authenticated.</p>
+
+<p>A JWT in an <code>Authorization</code> header is not attached automatically — the attacker's page
+cannot read your token or make the browser send it. So there is nothing to protect against.</p>
+
+<p><strong>That reasoning depends entirely on the token not being in a cookie.</strong> Store the JWT
+in a cookie and CSRF is back, and disabling it is a real vulnerability. <code>csrf.disable()</code>
+without a comment explaining which of these you are is how it gets copied into an app where it is
+wrong.</p>
+
+<h2>Stateless sessions</h2>
+
+<pre class="language-java"><code class="language-java">.sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))</code></pre>
+
+<p>No <code>HttpSession</code> is created or used. Every request stands alone, carrying its own token,
+which is what lets you run any number of instances behind a load balancer with no sticky sessions and
+no shared session store.</p>
+
+<h2>Filter placement</h2>
+
+<pre class="language-java"><code class="language-java">// Runs before the username/password filter so a valid token authenticates the
+// request before anything tries to challenge it.
+.addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)</code></pre>
+
+<p>Order within the chain matters as much as rule order. A JWT filter placed after the authentication
+challenge never gets a chance to run.</p>
+
+<h2>Returning JSON for security errors</h2>
+
+<p>A JSON API that returns an HTML login page for a 401 is a bad API. As lesson 12 noted, filter-level
+failures never reach a <code>@RestControllerAdvice</code>, so they are configured here instead:</p>
+
+<pre class="language-java"><code class="language-java">.exceptionHandling(ex -&gt; ex
+        .authenticationEntryPoint((request, response, authException) -&gt; {
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.getWriter().write(
+                    "{\"message\":\"Authentication required\"}");
+        })
+        .accessDeniedHandler((request, response, deniedException) -&gt; {
+            response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.getWriter().write(
+                    "{\"message\":\"You do not have permission to do that\"}");
+        }))</code></pre>
+
+<h2>Debugging it</h2>
+
+<pre class="language-properties"><code class="language-properties">logging.level.org.springframework.security=DEBUG</code></pre>
+
+<p>That prints the whole filter chain and which rule matched — which turns "why is this 403" from
+guesswork into reading. It is the first thing to switch on and the first thing to switch off before
+production, since it logs a great deal.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>A <code>SecurityFilterChain</code> bean and the lambda DSL.</strong>
+  <code>WebSecurityConfigurerAdapter</code> is gone.</li>
+  <li><strong>Specific rules before general ones</strong>, and end with
+  <code>anyRequest().authenticated()</code>.</li>
+  <li><strong>Comment every <code>permitAll</code></strong> so a decision does not read as an
+  oversight.</li>
+  <li><strong>Disabling CSRF is safe only for header-based tokens</strong>, never for cookie
+  auth.</li>
+  <li><strong>Configure JSON entry points</strong>, because filter errors bypass your advice.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-api-authentication">stateless API authentication with
+JWT</a>.</p>

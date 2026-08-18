@@ -1,0 +1,221 @@
+<p>Maven and Gradle both build Spring Boot applications, and Spring supports both equally. This lesson
+is the pizza API's <code>pom.xml</code> translated into Gradle, side by side, so you can read either
+build file and know what the other one says.</p>
+
+<h2>Two files instead of one</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">// settings.gradle.kts
+//
+// The project name Gradle uses for the built artifact. Maven takes this from
+// <artifactId>; in Gradle it lives here, NOT in build.gradle.kts, because it has to be
+// known before the build script is evaluated.
+rootProject.name = "pizza-springboot-backend"</code></pre>
+
+<p>That surprises people coming from Maven: the artifact name is not in the build script. It has to be
+known before the script is evaluated, so it lives in <code>settings.gradle.kts</code>.</p>
+
+<h2>Plugins replace the parent</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">plugins {
+    java
+
+    // Packages the app as an executable jar and wires in `bootRun`. This is the plugin
+    // that corresponds to spring-boot-maven-plugin.
+    id("org.springframework.boot") version "4.1.0"
+
+    // The dependency-management plugin is what gives Gradle Maven's <parent> behaviour:
+    // it applies the Spring Boot BOM so versions can be omitted below. Without it every
+    // `implementation("org.springframework.boot:...")` line would need an explicit
+    // version, which is the single most common difference between a Maven pom and a
+    // Gradle script people port by hand.
+    id("io.spring.dependency-management") version "1.1.7"
+
+    id("com.diffplug.spotless") version "7.0.2"
+}</code></pre>
+
+<p>Maven's <code>&lt;parent&gt;</code> does two jobs: it supplies the plugin and it supplies the
+managed versions. Gradle splits them, and forgetting the second one is the classic porting mistake —
+every dependency then demands an explicit version.</p>
+
+<h2>Toolchains beat <code>java.version</code></h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">java {
+    toolchain {
+        // A toolchain, not `sourceCompatibility`. This makes Gradle FIND (or download) a
+        // JDK 21 rather than assuming whichever JVM happens to be running the build, so
+        // the build is reproducible on a machine whose default java is 17 or 25.
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}</code></pre>
+
+<p>This is genuinely better than Maven's <code>&lt;java.version&gt;</code>, which only sets the
+compiler's source and target levels while still compiling against whatever JDK is running. A
+toolchain makes the JDK itself part of the build definition.</p>
+
+<h2>Dependency scopes</h2>
+
+<table>
+  <thead>
+    <tr><th>Maven</th><th>Gradle</th><th>Means</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>compile</code> (default)</td><td><code>implementation</code></td><td>needed to
+    compile and run</td></tr>
+    <tr><td><code>runtime</code></td><td><code>runtimeOnly</code></td><td>needed to run
+    only</td></tr>
+    <tr><td><code>provided</code></td><td><code>compileOnly</code></td><td>needed to compile
+    only</td></tr>
+    <tr><td><code>test</code></td><td><code>testImplementation</code></td><td>tests</td></tr>
+    <tr><td>—</td><td><code>api</code></td><td>leaks onto consumers' compile classpath</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-kotlin"><code class="language-kotlin">implementation("org.springframework.boot:spring-boot-starter-webmvc")
+implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+implementation("org.springframework.boot:spring-boot-starter-liquibase")
+
+// Boot 4 renamed spring-boot-starter-aop to spring-boot-starter-aspectj.
+implementation("org.springframework.boot:spring-boot-starter-aspectj")
+implementation("org.springframework.boot:spring-boot-starter-cache")
+
+// `runtimeOnly` is Gradle's <scope>runtime</scope>: the driver is needed to RUN but
+// nothing should compile against it, and Gradle enforces that where Maven only asks.
+runtimeOnly("com.mysql:mysql-connector-j")
+
+implementation("io.jsonwebtoken:jjwt-api:$jjwtVersion")
+runtimeOnly("io.jsonwebtoken:jjwt-impl:$jjwtVersion")
+runtimeOnly("io.jsonwebtoken:jjwt-jackson:$jjwtVersion")</code></pre>
+
+<p><strong><code>implementation</code> versus <code>api</code> is Gradle's real advantage.</strong>
+Maven puts every compile dependency on your consumers' compile classpath, so their code can
+accidentally use your transitive dependencies and break when you upgrade one.
+<code>implementation</code> hides them, which makes builds faster and upgrades safer.</p>
+
+<h2>Annotation processors</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">implementation("org.mapstruct:mapstruct:$mapstructVersion")
+
+// `compileOnly` + `annotationProcessor` is the Gradle spelling of Maven's
+// <optional>true</optional> on Lombok: on the compile classpath, absent from the jar.
+compileOnly("org.projectlombok:lombok")
+developmentOnly("org.springframework.boot:spring-boot-devtools")
+
+// ⚠️ ORDER IS LOAD-BEARING, exactly as in the pom. Lombok must run before MapStruct,
+// and lombok-mapstruct-binding is what lets MapStruct see the accessors Lombok
+// generated. Get it wrong and the build still succeeds — it just produces mappers
+// that map nothing, which is a genuinely horrible afternoon.
+annotationProcessor("org.projectlombok:lombok")
+annotationProcessor("org.projectlombok:lombok-mapstruct-binding:$lombokMapstructBindingVersion")
+annotationProcessor("org.mapstruct:mapstruct-processor:$mapstructVersion")</code></pre>
+
+<p>Same trap as lesson 19, spelled differently. Declaration order in this block is the processing
+order.</p>
+
+<p><code>developmentOnly</code> has no Maven equivalent — it keeps devtools out of the packaged
+jar automatically, where Maven needs <code>&lt;optional&gt;</code> plus a plugin exclusion.</p>
+
+<h2>Tests need telling</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test")
+testImplementation("org.springframework.security:spring-security-test")
+
+// Gradle does not put JUnit's launcher on the test runtime classpath automatically.
+// Leaving this out produces "Please make sure that the JUnit Platform is on the
+// classpath", which sounds like a missing test framework rather than a missing runner.
+testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+
+testCompileOnly("org.projectlombok:lombok")
+testAnnotationProcessor("org.projectlombok:lombok")</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">tasks.withType&lt;Test&gt; {
+    // Maven's Surefire picks JUnit 5 up on its own; Gradle has to be told.
+    useJUnitPlatform()
+}</code></pre>
+
+<p>Forgetting <code>useJUnitPlatform()</code> is the most common Gradle-and-JUnit-5 problem: the build
+succeeds and reports zero tests, which is far worse than failing. Note also that Lombok needs
+declaring separately for test sources — <code>testCompileOnly</code> and
+<code>testAnnotationProcessor</code> — because Gradle's source sets are independent.</p>
+
+<h2>⚠️ Boot 4.1 needs Gradle 8.14+</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">Spring Boot plugin requires Gradle 8.x (8.14 or later) or 9.x.
+The current version is Gradle 8.12</code></pre>
+
+<p>That message names the version and not the fix, and the fix is not "upgrade the Gradle on your
+machine" — it is to stop depending on the Gradle on your machine at all:</p>
+
+<pre class="language-bash"><code class="language-bash">gradle wrapper --gradle-version 8.14.3</code></pre>
+
+<p>Which generates <code>gradlew</code>, <code>gradlew.bat</code> and
+<code>gradle/wrapper/</code>. <strong>Commit all four</strong>, and invoke <code>./gradlew</code>
+rather than <code>gradle</code>. The wrapper downloads the pinned version on first use, so everyone
+and every CI runner builds with the same Gradle — the same argument as <code>./mvnw</code>.</p>
+
+<p>One packaging trap: many <code>.gitignore</code> files ignore <code>*.jar</code>, which silently
+excludes <code>gradle-wrapper.jar</code> and leaves the wrapper unable to bootstrap on a fresh clone.
+The negation is required, not optional:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">*.jar
+!gradle/wrapper/gradle-wrapper.jar</code></pre>
+
+<h2>The commands</h2>
+
+<table>
+  <thead>
+    <tr><th>Maven</th><th>Gradle</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>./mvnw compile</code></td><td><code>./gradlew compileJava</code></td></tr>
+    <tr><td><code>./mvnw test</code></td><td><code>./gradlew test</code></td></tr>
+    <tr><td><code>./mvnw package</code></td><td><code>./gradlew build</code></td></tr>
+    <tr><td><code>./mvnw spring-boot:run</code></td><td><code>./gradlew bootRun</code></td></tr>
+    <tr><td><code>./mvnw clean</code></td><td><code>./gradlew clean</code></td></tr>
+    <tr><td><code>./mvnw spotless:apply</code></td><td><code>./gradlew spotlessApply</code></td></tr>
+    <tr><td><code>./mvnw dependency:tree</code></td><td><code>./gradlew dependencies</code></td></tr>
+  </tbody>
+</table>
+
+<p><code>./gradlew build</code> runs <code>check</code> too, so it compiles, tests, runs Spotless and
+produces the jar in one go — closer to <code>mvn verify</code> than to <code>mvn package</code>.</p>
+
+<h2>Which should you choose?</h2>
+
+<p><strong>Gradle</strong> is faster on incremental builds — a build cache and a daemon that stays
+warm — and its <code>implementation</code>/<code>api</code> distinction genuinely improves large
+multi-module projects. The cost is that a build script is a program, and programs can become
+inscrutable.</p>
+
+<p><strong>Maven</strong> is declarative and boring, which is a real feature. Any Java developer can
+read a <code>pom.xml</code>; not every Java developer can read a 400-line Kotlin DSL script with
+custom tasks.</p>
+
+<p>For a single-module service like the pizza API, the difference barely matters — which is why it
+stays on Maven, with this Gradle build maintained alongside on its own branch so both stay honest. For
+a large multi-module build with slow tests, Gradle's incrementality is worth real money.</p>
+
+<p><strong>Do not run both in one directory.</strong> Two build files makes IDEs ask which to import,
+and importing the wrong one fails confusingly.</p>
+
+<h2>Groovy or Kotlin DSL?</h2>
+
+<p>Everything above is <code>build.gradle.kts</code>, the Kotlin DSL — type-safe, with real IDE
+completion and refactoring. The Groovy DSL (<code>build.gradle</code>) is more concise and still very
+common. Kotlin is the better default for new projects; the concepts are identical.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong><code>io.spring.dependency-management</code> replaces the parent's version
+  management.</strong> Omit it and every dependency needs a version.</li>
+  <li><strong>Toolchains, not <code>sourceCompatibility</code></strong> — the JDK becomes part of the
+  build.</li>
+  <li><strong><code>compileOnly</code> + <code>annotationProcessor</code> for Lombok</strong>, and the
+  processor order still matters.</li>
+  <li><strong><code>useJUnitPlatform()</code></strong>, or you get a green build that ran no
+  tests.</li>
+  <li><strong>Commit the wrapper</strong>, and un-ignore <code>gradle-wrapper.jar</code>.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-code-snippets">the cheat sheet</a> — everything in this
+track on one page.</p>

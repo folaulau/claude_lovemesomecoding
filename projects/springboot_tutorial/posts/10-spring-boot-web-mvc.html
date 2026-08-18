@@ -1,0 +1,194 @@
+<p>Spring Web MVC is the servlet-based web framework underneath every <code>@RestController</code> you
+write. You can be productive without knowing how a request reaches your method — until something goes
+wrong in the gap between the socket and your code, at which point knowing the path is the difference
+between a fix and a guess.</p>
+
+<h2>One dependency</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-webmvc&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>⚠️ In Boot 3 this was <code>spring-boot-starter-web</code>. Boot 4 renamed it and the old name is
+not in the BOM — see lesson 3.</p>
+
+<p>That starter brings Spring MVC, Jackson, an embedded Tomcat and validation glue, and
+auto-configures a <code>DispatcherServlet</code> mapped to <code>/</code>.</p>
+
+<h2>How a request reaches your method</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">HTTP request
+    │
+    ▼
+Servlet container (embedded Tomcat)
+    │
+    ▼
+Filter chain            ← JwtAuthenticationFilter, CORS, Spring Security live here
+    │
+    ▼
+DispatcherServlet       ← the front controller: one servlet for every request
+    │
+    ├─▶ HandlerMapping          which method handles this URL and verb?
+    ├─▶ HandlerAdapter          invoke it
+    │     ├─▶ ArgumentResolvers   build the method's parameters
+    │     │     @PathVariable · @RequestParam · @RequestBody · @RequestPart
+    │     │
+    │     └─▶ your controller method
+    │
+    ├─▶ HttpMessageConverter    turn the return value into a response body
+    └─▶ HandlerExceptionResolver  if anything threw  →  @RestControllerAdvice</code></pre>
+
+<p>Three things are worth internalising from that diagram:</p>
+
+<ul>
+  <li><strong>Filters run before the DispatcherServlet.</strong> Spring Security is a filter, so a
+  401 or 403 can be produced before your controller is ever consulted — which is why an endpoint can
+  return 403 for a URL that has no handler at all.</li>
+  <li><strong>Argument resolvers build your parameters.</strong> <code>@RequestBody</code> is not
+  magic; it is a resolver calling a message converter.</li>
+  <li><strong>Message converters produce the body.</strong> Returning a
+  <code>ProductDTO</code> works because Jackson is on the classpath and a converter knows what to do
+  with it.</li>
+</ul>
+
+<h2>Mapping requests</h2>
+
+<pre class="language-java"><code class="language-java">@Tag(name = "Products", description = "Menu browsing (public)")
+@RequestMapping("/api/products")
+@RestController
+@Slf4j
+public class ProductRestController {
+
+    @Autowired
+    private ProductService productService;
+
+    @Operation(summary = "List the active menu, optionally filtered by type")
+    @GetMapping
+    public ResponseEntity&lt;List&lt;ProductDTO&gt;&gt; getProducts(
+            @RequestParam(required = false) ProductType type) {
+        // …
+    }
+
+    @Operation(summary = "Get one product with its sizes")
+    @GetMapping("/{id}")
+    public ResponseEntity&lt;ProductDTO&gt; getProduct(@PathVariable UUID id) {
+        log.info("GET /api/products/{}", id);
+        return new ResponseEntity&lt;&gt;(productService.getProductByPublicId(id), OK);
+    }
+}</code></pre>
+
+<p><code>@RequestMapping</code> on the class sets the prefix; <code>@GetMapping</code>,
+<code>@PostMapping</code>, <code>@PutMapping</code>, <code>@PatchMapping</code> and
+<code>@DeleteMapping</code> are shorthands for it with a method.</p>
+
+<p>Notice the parameter types: <code>UUID</code> and <code>ProductType</code>, not
+<code>String</code>. Spring converts, and a value that will not convert becomes a
+<code>MethodArgumentTypeMismatchException</code> before your method runs — so the method body never
+has to consider malformed input. Lesson 12 turns that into a clean 400.</p>
+
+<h2>Binding parameters</h2>
+
+<pre class="language-java"><code class="language-java">// Path segment
+@GetMapping("/{id}")
+public ProductDTO get(@PathVariable UUID id) { }
+
+// Query string: /api/products?type=DRINK
+@GetMapping
+public List&lt;ProductDTO&gt; list(@RequestParam(required = false) ProductType type) { }
+
+// With a default
+@GetMapping("/search")
+public List&lt;ProductDTO&gt; search(
+        @RequestParam String q,
+        @RequestParam(defaultValue = "0") int page) { }
+
+// JSON body, validated
+@PostMapping
+public ProductDTO create(@Valid @RequestBody ProductCreateDTO dto) { }
+
+// One named part of a multipart body
+@PostMapping(value = "/{id}/image", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+public ProductDTO upload(@PathVariable UUID id, @RequestPart("file") MultipartFile file) { }
+
+// A header
+@PostMapping("/stripe")
+public ResponseEntity&lt;String&gt; webhook(
+        @RequestBody String payload,
+        @RequestHeader(value = "Stripe-Signature", required = false) String signature) { }</code></pre>
+
+<p><strong><code>required = false</code> versus <code>defaultValue</code>:</strong> the first gives you
+<code>null</code> and a decision to make, the second gives you a value. Prefer
+<code>defaultValue</code> when there is a sensible one — it removes a null check from your
+method.</p>
+
+<h2>Message converters</h2>
+
+<p>Return an object and Jackson serialises it. Return <code>ResponseEntity&lt;T&gt;</code> and you
+also control the status and headers:</p>
+
+<pre class="language-java"><code class="language-java">return ResponseEntity.ok()
+        .contentType(MediaType.IMAGE_JPEG)
+        .cacheControl(CacheControl.maxAge(Duration.ofDays(365)).cachePublic())
+        .header("Content-Disposition", "inline; filename=\"" + fileName + "\"")
+        .body(image);</code></pre>
+
+<p>Converters are chosen by the return type and the request's <code>Accept</code> header. Returning a
+<code>Resource</code> rather than a <code>byte[]</code> matters for files: Spring streams it, so a
+2 MB image never sits in heap in its entirety. With <code>byte[]</code> the whole file is buffered
+per concurrent request.</p>
+
+<h2>CORS</h2>
+
+<p>A browser refuses cross-origin requests unless the server opts in. The pizza API's React app runs
+on <code>:5173</code> and the API on <code>:8085</code> — different origins, so CORS is required.</p>
+
+<pre class="language-java"><code class="language-java">@Bean
+public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration config = new CorsConfiguration();
+    config.setAllowedOrigins(properties.cors().allowedOrigins());
+    config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+    config.setAllowedHeaders(List.of("*"));
+    config.setAllowCredentials(true);
+
+    UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/**", config);
+    return source;
+}</code></pre>
+
+<p>⚠️ <strong>CORS and Spring Security have to agree.</strong> Security runs as a filter, ahead of
+MVC, so it can reject the browser's preflight <code>OPTIONS</code> request before any CORS handling
+happens — and the browser then reports a CORS error for what is really an authentication problem.
+The fix is to let Security use the same configuration:</p>
+
+<pre class="language-java"><code class="language-java">http.cors(Customizer.withDefaults())   // picks up the CorsConfigurationSource bean above</code></pre>
+
+<p>Also note <code>allowCredentials(true)</code> is incompatible with
+<code>allowedOrigins("*")</code>. The spec forbids it, and the error message is about the wildcard
+rather than about credentials.</p>
+
+<h2>Static resources</h2>
+
+<p>Anything in <code>src/main/resources/static/</code> is served from the classpath automatically.
+Add your own mappings when you need to:</p>
+
+<pre class="language-java"><code class="language-java">@Override
+public void addResourceHandlers(ResourceHandlerRegistry registry) {
+    registry.addResourceHandler("/webjars/**")
+            .addResourceLocations("classpath:/META-INF/resources/webjars/");
+}</code></pre>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Boot 4: <code>spring-boot-starter-webmvc</code>.</strong></li>
+  <li><strong>Filters run before the DispatcherServlet</strong>, which is why security errors can
+  appear for URLs that have no handler.</li>
+  <li><strong>Bind to real types</strong> — <code>UUID</code>, enums — and let conversion failures
+  become 400s rather than method-body checks.</li>
+  <li><strong>Make CORS and Security use the same configuration</strong>, or preflight failures will
+  masquerade as CORS bugs.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-rest">building a REST API</a> — status codes, DTOs, and why
+the pizza API exposes a UUID instead of its primary key.</p>

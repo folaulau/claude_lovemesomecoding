@@ -1,0 +1,195 @@
+<p>JPA maps rows onto an object graph and tracks changes to it. That is genuinely valuable — and for a
+query that aggregates, or whose result is not an entity at all, it is machinery with nothing to
+do.</p>
+
+<p>Spring Boot gives you <code>JdbcTemplate</code> alongside JPA. Using both, deliberately, is not
+inconsistency.</p>
+
+<h2>Where the choice gets made</h2>
+
+<p>Every DAO in the pizza API wires in a Spring Data repository <strong>and</strong> a
+<code>JdbcTemplate</code>, so the decision is made once per method rather than argued about at every
+call site:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Users, backed by a repository AND a JdbcTemplate.
+ *
+ * &lt;ul&gt;
+ *   &lt;li&gt;&lt;b&gt;UserRepository&lt;/b&gt; for saves and single-row lookups. Spring Data derives those
+ *       from the method name, returns managed entities that dirty-checking can track, and honours
+ *       the {@code @SQLRestriction} that hides soft-deleted rows. Hand-writing them would be more
+ *       code that does less.
+ *   &lt;li&gt;&lt;b&gt;NamedParameterJdbcTemplate&lt;/b&gt; for queries that aggregate. JPA has nothing to
+ *       offer a query whose result is not an entity.
+ * &lt;/ul&gt;
+ */
+@Slf4j
+@Repository
+public class UserDAOImp implements UserDAO {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private NamedParameterJdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private AdminUserRowMapper adminUserRowMapper;
+}</code></pre>
+
+<p>The rule of thumb: <strong>if the result is an entity, use the repository; if it is a number, a
+projection or a report row, use SQL.</strong></p>
+
+<h2>Named parameters, not positional ones</h2>
+
+<p><code>NamedParameterJdbcTemplate</code> wraps the plain <code>JdbcTemplate</code> and binds
+<code>:name</code> instead of <code>?</code>, so a query mentioning the same value twice does not
+depend on argument order. Prefer it.</p>
+
+<pre class="language-java"><code class="language-java">Map.of("from", from, "limit", limit)</code></pre>
+
+<p>⚠️ <strong>Bind, never concatenate.</strong> The parameters are sent separately from the statement,
+so nothing a caller passes can change the shape of the SQL. String-concatenating a value into a query
+is SQL injection, and it is injection even when the value "obviously" comes from your own code —
+today.</p>
+
+<h2>Declare the SQL inside the method that runs it</h2>
+
+<pre class="language-java"><code class="language-java">@Override
+public ReportDTOs.Summary findSummary(LocalDateTime from) {
+    String query =
+            """
+            SELECT COUNT(*)                  AS total_orders,
+                   COALESCE(SUM(o.total), 0) AS total_revenue,
+                   COALESCE(AVG(o.total), 0) AS average_order_value
+            FROM customer_order o
+            WHERE o.status IN ('PAID','PREPARING','COMPLETED')
+              AND o.deleted = 0
+              AND o.created_at &gt;= :from
+            """;
+
+    // An aggregate without GROUP BY always returns exactly one row — COUNT/SUM over an empty set
+    // is a row of zeroes, not zero rows — so this cannot throw EmptyResultDataAccessException.
+    return jdbcTemplate.queryForObject(query, Map.of("from", from), reportSummaryRowMapper);
+}</code></pre>
+
+<p>Java text blocks make SQL readable, and keeping the query in the method that binds its parameters
+means you read both together. A constants file full of query strings separates the two things that
+must change together.</p>
+
+<p>Note the comment on <code>queryForObject</code>. It throws
+<code>EmptyResultDataAccessException</code> when a query returns no rows, which is a real trap — but
+not here, because an aggregate without <code>GROUP BY</code> always returns exactly one row. Knowing
+which case you are in is the difference between a comment and a production incident.</p>
+
+<h2>RowMappers belong in their own classes</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * Maps a best-seller row onto {@link ReportDTOs.TopProduct}.
+ *
+ * &lt;p&gt;{@code product_name} is the name SNAPSHOTTED onto the order line, not a join back to the
+ * product table — a product deleted from the menu still has to appear in historical sales.
+ */
+@Component
+public class TopProductRowMapper implements RowMapper&lt;ReportDTOs.TopProduct&gt; {
+
+    @Override
+    public ReportDTOs.TopProduct mapRow(ResultSet rs, int rowNum) throws SQLException {
+        return new ReportDTOs.TopProduct(
+                rs.getString("product_name"),
+                rs.getLong("units_sold"),
+                RowValues.money(rs.getBigDecimal("revenue")));
+    }
+}</code></pre>
+
+<p>A lambda inside the DAO would work. A class is better: it is unit-testable on its own, and the
+query and its mapping can then change independently. <strong>The column aliases in the SQL are the
+contract between the two</strong> — rename <code>units_sold</code> in the query and this class breaks,
+which is exactly the coupling you want to be explicit.</p>
+
+<h2>The API you will actually use</h2>
+
+<pre class="language-java"><code class="language-java">// A list
+List&lt;AdminUserDTO&gt; users = jdbcTemplate.query(query, Map.of(), adminUserRowMapper);
+
+// Exactly one row — throws if there are none or many
+Summary summary = jdbcTemplate.queryForObject(query, params, summaryRowMapper);
+
+// A single scalar
+Long count = jdbcTemplate.queryForObject(
+        "SELECT COUNT(*) FROM customer_order WHERE deleted = 0", Map.of(), Long.class);
+
+// Insert / update / delete — returns rows affected
+int updated = jdbcTemplate.update(
+        "UPDATE customer_order SET status = :status WHERE public_id = :id",
+        Map.of("status", "PAID", "id", orderId.toString()));</code></pre>
+
+<p>For "zero or one row", wrap it:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;User&gt; rows = jdbcTemplate.query(query, params, userRowMapper);
+return rows.stream().findFirst();</code></pre>
+
+<p>That is cleaner than catching <code>EmptyResultDataAccessException</code> as control flow.</p>
+
+<h2>⚠️ Hand-written SQL must filter <code>deleted = 0</code> itself</h2>
+
+<p>This is the most expensive gotcha in the pizza codebase, and it is worth reading the whole
+comment:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;b&gt;Every query filters {@code deleted = 0}, and that is not optional.&lt;/b&gt; The entities carry
+ * {@code @SQLRestriction("deleted = false")}, so soft-deleted rows vanish from ordinary JPA reads
+ * and it is tempting to assume they are gone everywhere. They are not: that annotation is applied by
+ * Hibernate when it builds a query from the entity model, and SQL written here never goes near the
+ * entity model. Omitting the predicate silently counts cancelled-and-deleted orders as revenue — the
+ * reports stay entirely plausible, just wrong, which is why it went unnoticed for a while. Guarded
+ * by {@code ReportServiceImplTest#softDeletedOrdersAreExcluded}.
+ */</code></pre>
+
+<p>Every element of that failure is what makes it dangerous: nothing threw, nothing logged, and the
+numbers looked reasonable. The only defences are the habit and a test that asserts it —
+<em>"guarded by"</em> naming the test is a good pattern to copy, because it tells the next person that
+removing the predicate has a specific consequence somebody already found.</p>
+
+<h2>Aggregate in the database</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;The queries aggregate in the DATABASE and return a handful of rows. The alternative — loading
+ * every order into memory and summing in Java — works fine on 18 demo rows and falls over on a real
+ * order table. Aggregation belongs where the data is.
+ */</code></pre>
+
+<p>The same reasoning applies to counting. The pizza API's admin user list used to load every user
+and then, per user, count their orders and measure their address and card lists —
+a textbook N+1 that <code>findAllForAdmin()</code> replaced with one query that counts in SQL.</p>
+
+<h2>What about <code>@Query(nativeQuery = true)</code>?</h2>
+
+<p>You can put native SQL on a Spring Data repository method. The pizza API moved away from it, and
+the reasoning is instructive:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * These aggregates used to be declared as {@code @Query(nativeQuery = true)} on a repository
+ * interface, which meant real SQL travelling through a persistence layer that added nothing to it,
+ * returning interface projections that Spring had to build proxies for. Here the SQL is plain, the
+ * mapping is an explicit {@code RowMapper}, and what you read is what the database runs.
+ */</code></pre>
+
+<p>If you are writing SQL anyway, a repository adds indirection rather than removing it. Keep the
+repository for derived queries, where it genuinely writes code for you.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Repository for entities, <code>JdbcTemplate</code> for aggregates.</strong> Make the
+  choice inside the DAO.</li>
+  <li><strong>Named parameters, bound never concatenated.</strong></li>
+  <li><strong>SQL in the method, RowMappers in their own classes.</strong> Column aliases are the
+  contract.</li>
+  <li><strong>Hand-written SQL must filter soft deletes itself</strong> — nothing will tell you it
+  did not.</li>
+  <li><strong>Aggregate in the database.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-liquibase">schema migrations with Liquibase</a> — putting
+the schema itself under version control.</p>

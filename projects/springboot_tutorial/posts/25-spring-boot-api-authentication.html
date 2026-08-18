@@ -1,0 +1,194 @@
+<p>Session cookies work well for a server-rendered app on one domain. They fit badly when the client is
+a React app on a different origin, or a mobile app, or another service — which is why token
+authentication is the default for APIs.</p>
+
+<p>A JWT is a signed, self-contained statement of who the caller is. The server verifies the signature
+and reads it. There is nothing to look up.</p>
+
+<h2>What is actually in a token</h2>
+
+<p>Three base64url segments separated by dots:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJhZG1pbkBwaXp6YS50ZXN0Iiwicm9sZSI6IkFETUlOIn0.T3ky…
+└──── header ────┘ └──────────────── payload ─────────────────┘ └── signature ──┘</code></pre>
+
+<p>⚠️ <strong>A JWT is signed, not encrypted.</strong> Anyone holding one can decode the payload —
+paste it into any JWT decoder and read it. The pizza API's <code>JwtService</code> says it plainly:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;A JWT is signed, not encrypted: anyone holding one can read its payload. Never put anything
+ * secret in the claims. The signature only guarantees that WE issued it and nobody edited it.
+ */</code></pre>
+
+<p>So an email address and a role are fine. A password, a card number or an internal note about the
+customer are not.</p>
+
+<h2>Issuing one</h2>
+
+<pre class="language-java"><code class="language-java">public String generateToken(User user) {
+    Instant now = Instant.now();
+    Instant expiry = now.plusSeconds(properties.jwt().expirationMinutes() * 60);
+
+    return Jwts.builder()
+            .subject(user.getEmail())
+            .claim(CLAIM_ROLE, user.getRole().name())
+            .claim(CLAIM_USER_ID, user.getId())
+            .issuedAt(Date.from(now))
+            .expiration(Date.from(expiry))
+            .signWith(key)
+            .compact();
+}</code></pre>
+
+<p><code>subject</code> is the standard claim for "who this is about". Custom claims —
+<code>role</code>, <code>uid</code> — go alongside.</p>
+
+<p><strong>Put in only what every request needs.</strong> The role is here because authorization
+consults it on every call and a database lookup per request would defeat the point. The user's name
+and addresses are not, because they are needed rarely and would bloat a token sent with every single
+request.</p>
+
+<h2>The signing key</h2>
+
+<pre class="language-java"><code class="language-java">@PostConstruct
+void init() {
+    byte[] keyBytes = properties.jwt().secret().getBytes(StandardCharsets.UTF_8);
+    // HS256 requires at least 256 bits. Failing loudly at startup beats discovering a weak
+    // key in production.
+    if (keyBytes.length &lt; 32) {
+        throw new IllegalStateException(
+                "pizza.jwt.secret must be at least 32 characters for HS256 (got "
+                        + keyBytes.length + ")");
+    }
+    this.key = Keys.hmacShaKeyFor(keyBytes);
+}</code></pre>
+
+<pre class="language-properties"><code class="language-properties"># HS256 needs >= 256 bits of key. Overridden in application-local.properties.
+pizza.jwt.secret=change-me-this-is-a-development-only-placeholder-secret-key
+pizza.jwt.expiration-minutes=120</code></pre>
+
+<p>The key <strong>is</strong> the security of the whole scheme. Anyone who has it can mint a token
+claiming to be any user with any role. Keep it out of the repository (lesson 7), make it long and
+random, and rotate it if it is ever exposed — which invalidates every issued token, so plan for
+that.</p>
+
+<p>The validation is worth doing at startup for the reason the comment gives: a short key otherwise
+fails on the first login, inside the JWT library, with a message about key length that mentions
+nothing you configured.</p>
+
+<h2>Verifying one</h2>
+
+<pre class="language-java"><code class="language-java">/** Returns the claims if the token is valid, or null if it is malformed, forged or expired. */
+public Claims parse(String token) {
+    try {
+        return Jwts.parser()
+                .verifyWith(key)
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    } catch (JwtException | IllegalArgumentException ex) {
+        // Any failure means "not authenticated". Distinguishing them would only help an
+        // attacker probe the implementation.
+        return null;
+    }
+}</code></pre>
+
+<p><code>parseSignedClaims</code> verifies the signature <em>and</em> the expiry, and throws if either
+fails. Collapsing every failure to <code>null</code> is deliberate: distinguishing "expired" from
+"forged" in the response tells an attacker whether their forgery attempt was structurally correct.</p>
+
+<p>⚠️ <strong>Never use <code>parseClaimsJwt</code> or any method that skips verification.</strong> An
+unverified token is a string the client wrote. The classic attack is changing the header to
+<code>{"alg":"none"}</code> and dropping the signature; a parser that does not verify accepts it, and
+the attacker is an admin. Modern jjwt refuses, but the general rule stands: <strong>if you did not
+verify the signature, you learned nothing.</strong></p>
+
+<h2>The filter</h2>
+
+<p>Covered in lesson 23; the shape that matters is that it never rejects:</p>
+
+<pre class="language-java"><code class="language-java">String token = extractToken(request);
+
+if (token != null &amp;&amp; SecurityContextHolder.getContext().getAuthentication() == null) {
+    Claims claims = jwtService.parse(token);
+
+    if (claims != null) {
+        var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
+        var authentication = new UsernamePasswordAuthenticationToken(email, null, authorities);
+        SecurityContextHolder.getContext().setAuthentication(authentication);
+    }
+}
+
+filterChain.doFilter(request, response);</code></pre>
+
+<p>A bad token leaves the context anonymous and the authorization rules decide. That is what lets one
+endpoint serve guests and members.</p>
+
+<h2>⚠️ The honest trade-off: you cannot revoke it</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Tokens are stateless — there is no server-side session to look up, which is what lets the
+ * same token work for the React app, the Angular app and Swagger alike. The trade-off is that a
+ * token cannot be revoked before it expires; real systems add a short lifetime plus a refresh
+ * token, which is deliberately out of scope here.
+ */</code></pre>
+
+<p>This is the property most tutorials skip. Statelessness is the entire benefit — no session store,
+no sticky sessions, any instance can serve any request — and it is exactly why revocation is
+impossible. The server does not track issued tokens, so it cannot un-issue one.</p>
+
+<p>Consequences: a "log out everywhere" button cannot work; a fired employee's token stays valid;
+demoting an admin does not take effect until their token expires. With a 120-minute expiry, that is a
+two-hour window.</p>
+
+<p>The standard mitigations, in order of cost:</p>
+
+<ol>
+  <li><strong>Short-lived access tokens</strong> (5–15 minutes) plus a long-lived <strong>refresh
+  token</strong> that <em>is</em> stored server-side and can be revoked. This is what most production
+  systems do.</li>
+  <li><strong>A denylist</strong> of revoked token ids in Redis, checked per request. Works, and gives
+  back the lookup you were avoiding.</li>
+  <li><strong>A per-user token version</strong> in the database, included as a claim. Bumping it
+  invalidates that user's tokens. One lookup per request, but only one.</li>
+</ol>
+
+<p>The pizza API does none of these and says so. That is the right call for a demo and the wrong one
+for a bank; what matters is knowing which you are building.</p>
+
+<h2>Where to keep the token in a browser</h2>
+
+<table>
+  <thead>
+    <tr><th>Location</th><th>XSS</th><th>CSRF</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>localStorage</code></td><td>❌ readable by any injected script</td><td>✅ not sent
+    automatically</td></tr>
+    <tr><td>httpOnly cookie</td><td>✅ not readable by script</td><td>❌ sent automatically — needs
+    CSRF protection</td></tr>
+  </tbody>
+</table>
+
+<p>There is no free option; you are choosing which attack to defend against by other means. The pizza
+API uses <code>localStorage</code>, which is why disabling CSRF is safe for it (lesson 24). If you
+move the token into a cookie, that decision has to be revisited.</p>
+
+<p>The OAuth2 handler (lesson 27) shows the related detail: it returns the token in the URL
+<strong>fragment</strong> rather than the query string, because a fragment is never sent to the
+server and never lands in an access log or a <code>Referer</code> header.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Signed, not encrypted.</strong> Nothing secret in the claims.</li>
+  <li><strong>The signing key is the whole scheme.</strong> Long, random, out of the repository,
+  validated at startup.</li>
+  <li><strong>Always verify the signature</strong>, and collapse every failure to "not
+  authenticated".</li>
+  <li><strong>Stateless means unrevocable.</strong> Short expiry plus refresh tokens if that
+  matters.</li>
+  <li><strong>Claims are for what every request needs</strong>, nothing more.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-security-secured-on-method-level">method-level
+security</a> — guards that travel with the method rather than the URL.</p>

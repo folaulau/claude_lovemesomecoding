@@ -1,0 +1,214 @@
+<p>Accepting a file is four lines of Spring. Accepting a file <em>safely</em> is the rest of this
+lesson, because an upload endpoint takes a file chosen by a stranger and writes it to your disk.</p>
+
+<h2>The endpoint</h2>
+
+<pre class="language-java"><code class="language-java">@Operation(summary = "Upload an image for a product")
+@PostMapping(value = "/{id}/image", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+public ResponseEntity&lt;ProductDTO&gt; uploadImage(
+        @PathVariable UUID id, @RequestPart("file") MultipartFile file) {
+    log.info("POST /api/admin/products/{}/image ({} bytes)", id, file.getSize());
+    return new ResponseEntity&lt;&gt;(productService.setProductImage(id, file), OK);
+}</code></pre>
+
+<p>Three things make this a multipart endpoint rather than a normal one:</p>
+
+<ul>
+  <li><strong><code>consumes = MULTIPART_FORM_DATA_VALUE</code></strong> — without it the request is
+  matched against the JSON handlers and rejected as an unsupported media type.</li>
+  <li><strong><code>@RequestPart</code>, not <code>@RequestBody</code></strong> — it binds one named
+  part of the body.</li>
+  <li><strong>The part name matters.</strong> <code>"file"</code> must match what the client puts in
+  its <code>FormData</code>; a mismatch is a 400 naming the missing part.</li>
+</ul>
+
+<pre class="language-javascript"><code class="language-javascript">const body = new FormData();
+body.append('file', selectedFile);          // &lt;- must match @RequestPart("file")
+
+await fetch(`/api/admin/products/${id}/image`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}` },
+  body,                                      // do NOT set Content-Type yourself
+});</code></pre>
+
+<p><strong>Never set <code>Content-Type</code> by hand for a multipart request.</strong> The browser
+has to generate it, because it includes a boundary token it just invented. Setting it manually
+produces a boundary-less header and the server cannot parse the body.</p>
+
+<h2>Two size limits, and they are not redundant</h2>
+
+<pre class="language-properties"><code class="language-properties"># The application's rule — produces a friendly 400.
+pizza.storage.upload-dir=./uploads/products
+pizza.storage.max-image-bytes=2097152
+
+# The servlet-level backstop. It must be LARGER than pizza.storage.max-image-bytes,
+# because a request killed here never reaches the controller and cannot produce a
+# friendly error. max-request-size covers the whole multipart body, not one part -
+# raising only max-file-size still rejects a large upload, which is a confusing hour
+# to spend the first time it happens.
+spring.servlet.multipart.max-file-size=5MB
+spring.servlet.multipart.max-request-size=10MB</code></pre>
+
+<p>The servlet limit is enforced while the request is still being parsed and produces a raw
+<code>MaxUploadSizeExceededException</code>. The application limit produces a normal 400 with a
+message a user can act on. Keep the application limit lower so it is the one that normally fires.</p>
+
+<h2>⚠️ Three things you must not trust</h2>
+
+<p>The upload arrives with a filename, a declared content type and some bytes. Only one of those is
+evidence.</p>
+
+<h3>1. The filename is not a name, it is a path</h3>
+
+<p><code>../../../etc/passwd</code> resolved against your upload directory writes outside your upload
+directory. The pizza API's defence is to <strong>discard the client's name entirely</strong>:</p>
+
+<pre class="language-java"><code class="language-java">// The browser's filename is used for NOTHING except this log line. The stored name is a
+// UUID we generate, which makes path traversal and filename collisions both impossible.
+String original = StringUtils.cleanPath(
+        file.getOriginalFilename() == null ? "unnamed" : file.getOriginalFilename());
+String storedName = UUID.randomUUID() + "." + format;
+
+Path target = uploadRoot.resolve(storedName).normalize();
+if (!target.getParent().equals(uploadRoot)) {
+    throw ApiException.badRequest("Invalid file name");
+}</code></pre>
+
+<p>Generating the name solves two problems at once: traversal becomes impossible, and so do
+collisions between two customers who both uploaded <code>photo.jpg</code>.</p>
+
+<p>The <code>getParent().equals(uploadRoot)</code> check is belt and braces here — the name is a UUID
+we just generated — but it is one line and one refactor away from being necessary. Where it genuinely
+matters is the read path, since that name comes from a URL:</p>
+
+<pre class="language-java"><code class="language-java">// fileName reaches us from a path variable, so here the traversal risk is real rather than
+// theoretical. Strip it to a bare name first, then verify where it resolved to.
+String safeName = Path.of(StringUtils.cleanPath(fileName)).getFileName().toString();
+Path target = uploadRoot.resolve(safeName).normalize();
+
+if (!target.getParent().equals(uploadRoot)) {
+    throw ApiException.notFound("Image", fileName);
+}</code></pre>
+
+<h3>2. The declared content type is a claim</h3>
+
+<p><code>Content-Type</code> is set by the client. Checking it stops honest mistakes and nothing
+else — an attacker simply sends <code>image/png</code> with whatever bytes they like. The extension
+is no better.</p>
+
+<h3>3. The bytes are the only evidence</h3>
+
+<p>Read the leading bytes — the "magic number" — and require them to match a real image format:</p>
+
+<pre class="language-java"><code class="language-java">private static final Map&lt;String, byte[]&gt; MAGIC_NUMBERS = Map.of(
+        "jpg",  new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF},
+        "png",  new byte[] {(byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A},
+        "gif",  new byte[] {'G', 'I', 'F', '8'},
+        "webp", new byte[] {'R', 'I', 'F', 'F'});
+
+private String detectImageFormat(MultipartFile file) {
+    byte[] head = new byte[12];
+    try (InputStream in = file.getInputStream()) {
+        int read = in.read(head);
+        if (read &lt; 4) {
+            throw ApiException.badRequest("File is too small to be an image");
+        }
+    } catch (IOException ex) {
+        throw ApiException.badRequest("Could not read the uploaded file");
+    }
+
+    for (Map.Entry&lt;String, byte[]&gt; entry : MAGIC_NUMBERS.entrySet()) {
+        if (startsWith(head, entry.getValue())) {
+            return entry.getKey();
+        }
+    }
+
+    throw ApiException.badRequest("Only JPEG, PNG, GIF and WebP images are accepted");
+}</code></pre>
+
+<p>Note that it <em>returns the detected format</em> and that value becomes the stored extension. The
+file is named after what it actually is, never after what it claimed to be.</p>
+
+<p>Two more rules worth stating plainly: <strong>never store uploads inside your web root</strong>,
+and <strong>never serve them from a path that could execute them</strong>. An "image" upload that
+lands somewhere the server will happily interpret is how a file upload becomes remote code
+execution.</p>
+
+<h2>Storing it</h2>
+
+<pre class="language-java"><code class="language-java">@PostConstruct
+void init() throws IOException {
+    // normalize() collapses any ".." in the CONFIGURED path; toAbsolutePath() gives us a fixed
+    // root to compare against later.
+    this.uploadRoot = Path.of(properties.storage().uploadDir())
+            .toAbsolutePath()
+            .normalize();
+    Files.createDirectories(uploadRoot);
+    log.info("Product images are stored in {}", uploadRoot);
+}
+
+try (InputStream in = file.getInputStream()) {
+    Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+} catch (IOException ex) {
+    log.error("Could not store upload {}", original, ex);
+    throw ApiException.badRequest("Could not store the uploaded file");
+}</code></pre>
+
+<p>Then update the row — <strong>and note the ordering</strong>:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Note the ordering: the file is written BEFORE the row is updated. Do it the other way
+ * round and a storage failure leaves the database pointing at an image that does not exist.
+ * This way the worst case is an orphaned file, which is a cleanup job rather than a broken
+ * menu.
+ */
+@Transactional
+public ProductDTO setProductImage(UUID id, MultipartFile file) {
+    Product product = productDAO.findByPublicIdWithSizes(id)
+            .orElseThrow(() -&gt; ApiException.notFound("Product", id));
+
+    String storedName = imageStorage.store(file);
+    product.setImageUrl(imageStorage.urlFor(storedName));
+
+    return mapper.mapProductToProductDTO(productDAO.save(product));
+}</code></pre>
+
+<p><strong>Local disk is the demo choice, not the production one.</strong> It does not survive a
+container restart and is not shared between instances, so a second replica serves 404s for anything
+the first one stored. Production writes to S3 or another object store.</p>
+
+<h2>Streaming it back</h2>
+
+<pre class="language-java"><code class="language-java">@GetMapping("/images/{fileName}")
+public ResponseEntity&lt;Resource&gt; getImage(@PathVariable String fileName) {
+    Resource image = imageStorage.load(fileName);
+
+    return ResponseEntity.ok()
+            .contentType(contentType)
+            // The name contains a UUID, so the bytes behind a given URL never change and it is
+            // safe to cache hard.
+            .cacheControl(CacheControl.maxAge(Duration.ofDays(365)).cachePublic())
+            .header("Content-Disposition", "inline; filename=\"" + fileName + "\"")
+            .body(image);
+}</code></pre>
+
+<p><strong>Return <code>Resource</code>, not <code>byte[]</code>.</strong> Spring streams a
+<code>Resource</code>, so a 2 MB image never sits in heap in its entirety; with <code>byte[]</code>
+the whole file is buffered per concurrent request, which is fine until it is not.</p>
+
+<p><code>inline</code> renders in the page; <code>attachment</code> triggers a save dialog. Getting
+that backwards makes every product photo prompt a download.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong><code>@RequestPart</code> + <code>consumes = MULTIPART_FORM_DATA_VALUE</code></strong>,
+  and let the browser set its own <code>Content-Type</code>.</li>
+  <li><strong>Two size limits</strong> — application below servlet, so the friendly error is the one
+  that fires.</li>
+  <li><strong>Generate the stored filename.</strong> Never build a path from client input.</li>
+  <li><strong>Validate the bytes</strong>, not the extension or the declared type.</li>
+  <li><strong>Write the file before the row</strong>, and stream with <code>Resource</code>.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-with-swagger">API docs with springdoc-openapi</a>.</p>

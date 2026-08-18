@@ -1,0 +1,200 @@
+<p>Your application code is in version control. Your database schema, in most projects, is in somebody's
+head and a folder of SQL files with names like <code>fix_final_v2.sql</code>. Liquibase puts the
+schema under the same discipline as the code: every change is a file, applied in order, recorded,
+identical on every machine.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- Spring Boot 4 modularized autoconfiguration. Depending on plain
+     liquibase-core (all that Boot 3 needed) gives you the library with NO
+     autoconfiguration: Liquibase silently never runs and the failure shows up
+     as a confusing Hibernate "Schema validation: missing table" error. --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-liquibase&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>⚠️ Read that comment twice if you are coming from Boot 3. <code>liquibase-core</code> was enough
+there; in Boot 4 it gives you the library and no autoconfiguration, so migrations never run — and the
+error you eventually see comes from Hibernate, about a missing table, several layers from the cause.</p>
+
+<pre class="language-properties"><code class="language-properties">spring.liquibase.enabled=true
+spring.liquibase.change-log=classpath:db/changelog/db.changelog-master.xml
+
+# Liquibase owns the schema, so Hibernate must not touch it — only check it.
+spring.jpa.hibernate.ddl-auto=validate</code></pre>
+
+<p><strong><code>validate</code> is the other half of the setup.</strong> Liquibase creates the
+schema; Hibernate compares it against the entities and refuses to start if they have drifted. Two
+tools, each doing one job, and a loud failure at boot rather than a silent mismatch found in
+production.</p>
+
+<h2>The master changelog is a manifest</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd"&gt;
+
+    &lt;!--
+      This file is a MANIFEST ONLY. Every actual change lives in a formatted-SQL
+      file under sql/.
+
+      Why is the master XML when the changesets are SQL? Liquibase's formatted-SQL
+      format has no include/includeAll directive, so a .sql master cannot pull in
+      other files. The manifest has to be XML (or YAML/JSON); the changes stay SQL.
+
+      includeAll orders files by filename, which is why they are numerically prefixed.
+    --&gt;
+    &lt;includeAll path="db/changelog/sql" relativeToChangelogFile="false"/&gt;
+
+&lt;/databaseChangeLog&gt;</code></pre>
+
+<p>That comment answers the question everyone asks — why mix XML and SQL — and the answer is a real
+constraint, not a preference.</p>
+
+<p><strong>Liquibase can express changes in XML, YAML or JSON</strong>, which makes them portable
+across database vendors. The pizza API writes plain SQL instead, on the grounds that a team fluent in
+SQL reads it faster than an abstraction over it, and that a demo targeting one database gains nothing
+from portability. Both positions are defensible; pick one.</p>
+
+<h2>A changeset</h2>
+
+<pre class="language-sql"><code class="language-sql">--liquibase formatted sql
+
+-- Adds a `deleted` flag to every table, matching the trademachine convention.
+--
+-- `deleted` and `active` are NOT the same thing, and both are kept:
+--   * active  = temporarily off the menu. Still visible and editable in the admin screen.
+--   * deleted = gone for good. Filtered out of every query by @SQLRestriction on the entity.
+--
+-- Rows are never physically removed, because historical orders reference them.
+
+--changeset pizza:500-add-deleted-flag
+ALTER TABLE product            ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE product_size       ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE customer_order     ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE;
+--rollback ALTER TABLE product DROP COLUMN deleted;
+--rollback ALTER TABLE product_size DROP COLUMN deleted;
+--rollback ALTER TABLE customer_order DROP COLUMN deleted;</code></pre>
+
+<p>Four things to notice:</p>
+
+<ul>
+  <li><strong><code>--liquibase formatted sql</code> must be the first line.</strong> Without it the
+  file is ignored — silently.</li>
+  <li><strong><code>--changeset author:id</code></strong> identifies each unit. The id must be unique
+  within the file and never change.</li>
+  <li><strong><code>--rollback</code></strong> tells Liquibase how to undo it. Optional, and worth
+  writing while you still remember.</li>
+  <li><strong>The comment explains <em>why</em>.</strong> "Adds a deleted column" is visible in the
+  SQL; that <code>active</code> and <code>deleted</code> mean different things is not.</li>
+</ul>
+
+<h2>⚠️ Never edit an applied changeset</h2>
+
+<p>This is the rule that produces the confusing failure. Liquibase records a <strong>checksum</strong>
+of every changeset it applies, in a table called <code>DATABASECHANGELOG</code>. On the next startup
+it re-reads your files and compares. Change one character in an applied changeset and:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">liquibase.exception.ValidationFailedException: Validation Failed:
+     1 changesets check sum
+          db/changelog/sql/006-add-soft-delete.sql::500-add-deleted-flag::pizza
+          was: 8:a1b2c3d4e5f6... but is now: 8:f6e5d4c3b2a1...</code></pre>
+
+<p>That is Liquibase working correctly. The database has already run the old version; your file now
+says something different; it cannot know which is true. <strong>Add a new changeset instead.</strong>
+Even for a typo in a comment.</p>
+
+<p>The escape hatch — <code>clearCheckSums</code>, or editing the
+<code>DATABASECHANGELOG</code> table — exists, is occasionally necessary on a development database,
+and should never be reached for on production. Fixing forward is almost always cheaper.</p>
+
+<h2>Two tables Liquibase creates</h2>
+
+<table>
+  <thead>
+    <tr><th>Table</th><th>What it does</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>DATABASECHANGELOG</code></td><td>every applied changeset, with its checksum and
+    when it ran</td></tr>
+    <tr><td><code>DATABASECHANGELOGLOCK</code></td><td>a mutex, so two instances starting together do
+    not both migrate</td></tr>
+  </tbody>
+</table>
+
+<p>The lock is why Liquibase is safe with multiple replicas — the first one in migrates, the others
+wait. It is also the cause of a hang after a crash: a killed process leaves the lock held, and the
+next startup waits forever. <code>liquibase releaseLocks</code>, or delete the row.</p>
+
+<h2>Ordering and naming</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">db/changelog/
+├── db.changelog-master.xml
+└── sql/
+    ├── 001-schema.sql
+    ├── 002-seed-menu.sql
+    ├── 003-seed-orders.sql
+    ├── 004-add-public-ids.sql
+    ├── 005-add-audit-timestamps.sql
+    ├── 006-add-soft-delete.sql
+    ├── 007-cart.sql
+    ├── 008-user-addresses-and-payment-methods.sql
+    └── 009-order-card-details.sql</code></pre>
+
+<p><code>includeAll</code> orders by filename, which is why they are numerically prefixed.
+<strong>Zero-pad the numbers</strong> — without padding, <code>10-x.sql</code> sorts before
+<code>2-x.sql</code> and your migrations run in the wrong order.</p>
+
+<p>The names are also a readable history of the project. Reading that list top to bottom tells you the
+schema started simple, gained public UUIDs, then audit timestamps, then soft deletes, then a cart.</p>
+
+<h2>Seed data</h2>
+
+<p><code>002-seed-menu.sql</code> and <code>003-seed-orders.sql</code> are migrations too. That is
+convenient — every developer gets the same fourteen products — and it has a consequence worth
+knowing: the pizza API's tests assert absolute seeded counts, so changing a seed changes what the
+tests expect.</p>
+
+<p>For production, keep reference data (countries, statuses) in migrations and keep demo data in a
+separate changelog activated by a profile.</p>
+
+<h2>Useful commands</h2>
+
+<pre class="language-bash"><code class="language-bash"># What would run, without running it
+./mvnw liquibase:updateSQL
+
+# Apply pending changesets (Boot also does this at startup)
+./mvnw liquibase:update
+
+# Undo the last N
+./mvnw liquibase:rollback -Dliquibase.rollbackCount=1
+
+# Generate a changelog from an existing database — how you adopt Liquibase mid-project
+./mvnw liquibase:generateChangeLog</code></pre>
+
+<p><code>updateSQL</code> is the one to build a habit around: it prints the SQL that would run, which
+is what you want to read before a production deploy.</p>
+
+<h2>Liquibase or Flyway?</h2>
+
+<p>Both are good and Boot supports both. Flyway is simpler — numbered SQL files, no manifest, no
+abstraction layer. Liquibase does more: rollbacks, preconditions, contexts, and vendor-neutral
+changesets if you want them. If you only ever write SQL against one database, Flyway is less
+machinery for the same result.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Boot 4 needs <code>spring-boot-starter-liquibase</code></strong>, not
+  <code>liquibase-core</code>.</li>
+  <li><strong>Liquibase owns the schema, <code>ddl-auto=validate</code> polices it.</strong></li>
+  <li><strong>Never edit an applied changeset.</strong> Add a new one.</li>
+  <li><strong>Zero-pad the filenames</strong> and write a comment saying why, not what.</li>
+  <li><strong><code>updateSQL</code> before a production deploy.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-mapstruct">mapping DTOs with MapStruct</a> — and the
+annotation-processor ordering that silently produces mappers that map nothing.</p>

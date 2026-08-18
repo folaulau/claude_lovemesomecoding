@@ -1,0 +1,207 @@
+<p>A bean is an object the Spring container creates, configures and hands out. That is the whole
+definition. Everything else — scopes, lifecycle callbacks, <code>@Primary</code> — is detail about
+<em>which</em> object and <em>when</em>.</p>
+
+<h2>Two ways to declare one</h2>
+
+<p><strong>Stereotype annotations</strong>, for classes you own. Spring finds them by component
+scanning and instantiates them:</p>
+
+<pre class="language-java"><code class="language-java">@Service
+public class ProductServiceImpl implements ProductService { /* … */ }
+
+@Repository
+public class ProductDAOImp implements ProductDAO { /* … */ }
+
+@RestController
+public class ProductRestController { /* … */ }
+
+@Component
+public class ServiceTimingAspect { /* … */ }</code></pre>
+
+<p>All four are <code>@Component</code> underneath. The difference is intent, plus one behaviour:
+<code>@Repository</code> also translates vendor-specific persistence exceptions into Spring's
+<code>DataAccessException</code> hierarchy, so a MySQL error and a Postgres error arrive as the same
+type.</p>
+
+<p><strong><code>@Bean</code> methods</strong>, for objects you do not own — third-party classes you
+cannot annotate:</p>
+
+<pre class="language-java"><code class="language-java">@Configuration
+public class OpenApiConfig {
+
+    @Bean
+    public OpenAPI pizzaOpenAPI() {
+        return new OpenAPI()
+                .info(new Info()
+                        .title("Pizza API")
+                        .version("v1")
+                        .description("Ordering API for the pizza demo app."))
+                .components(new Components()
+                        .addSecuritySchemes("bearerAuth",
+                                new SecurityScheme()
+                                        .type(SecurityScheme.Type.HTTP)
+                                        .scheme("bearer")
+                                        .bearerFormat("JWT")));
+    }
+}</code></pre>
+
+<p><code>OpenAPI</code> comes from springdoc. You cannot put <code>@Component</code> on it, so you
+build it in a method and let Spring manage the result. <strong>The method name becomes the bean
+name</strong> — here, <code>pizzaOpenAPI</code>.</p>
+
+<p>The rule of thumb: your class, use a stereotype; someone else's class, use <code>@Bean</code>.</p>
+
+<h2>Scopes</h2>
+
+<p><strong>Singleton is the default</strong>, and it is the right answer nearly always. One instance
+per container, created at startup, shared by everyone.</p>
+
+<p>This has a consequence people miss: <strong>a singleton bean must be stateless</strong>, or it must
+make its state thread-safe itself. One instance is serving every concurrent request.</p>
+
+<pre class="language-java"><code class="language-java">@Service
+public class BrokenService {
+
+    // A field on a singleton is shared by every request on every thread.
+    // Two customers checking out at once will overwrite each other's total.
+    private BigDecimal currentTotal;
+
+    public void process(Order order) {
+        this.currentTotal = order.getTotal();   // race
+        // …
+    }
+}</code></pre>
+
+<p>Keep per-request state in local variables and method parameters, which live on the calling
+thread's stack. Notice that every service in the pizza API does exactly this — the fields are
+collaborators (DAOs, mappers), never data.</p>
+
+<p>The other scopes, briefly:</p>
+
+<table>
+  <thead>
+    <tr><th>Scope</th><th>One instance per</th><th>Use when</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>singleton</code></td><td>container</td><td>almost always</td></tr>
+    <tr><td><code>prototype</code></td><td>injection point</td><td>the object carries mutable
+    per-use state</td></tr>
+    <tr><td><code>request</code></td><td>HTTP request</td><td>per-request context in a web app</td></tr>
+    <tr><td><code>session</code></td><td>HTTP session</td><td>rare; stateless APIs have no
+    session</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-java"><code class="language-java">@Component
+@Scope("prototype")
+public class ReportBuilder { /* new instance every time it is injected or requested */ }</code></pre>
+
+<p>⚠️ <strong>A prototype injected into a singleton is injected once.</strong> The singleton is
+created once, so its dependency is resolved once, and you get one "prototype" instance for the life
+of the application. If you genuinely need a fresh one per call, inject an
+<code>ObjectProvider&lt;ReportBuilder&gt;</code> and call <code>getObject()</code>.</p>
+
+<h2>Lifecycle</h2>
+
+<p>Two callbacks matter, and they run around dependency injection:</p>
+
+<pre class="language-java"><code class="language-java">@Service
+public class JwtService {
+
+    private final PizzaProperties properties;
+    private SecretKey key;
+
+    public JwtService(PizzaProperties properties) {
+        this.properties = properties;   // 1. constructor - dependencies arrive
+    }
+
+    @PostConstruct
+    void init() {                        // 2. after injection, before first use
+        byte[] keyBytes = properties.jwt().secret().getBytes(StandardCharsets.UTF_8);
+        if (keyBytes.length &lt; 32) {
+            throw new IllegalStateException(
+                    "pizza.jwt.secret must be at least 32 characters for HS256");
+        }
+        this.key = Keys.hmacShaKeyFor(keyBytes);
+    }
+
+    @PreDestroy
+    void shutdown() {                    // 3. on graceful shutdown
+        // release anything that needs releasing
+    }
+}</code></pre>
+
+<p><code>@PostConstruct</code> exists because <strong>the constructor is too early for anything that
+uses an injected dependency</strong> in the field-injection style, and because derived state should
+be computed once rather than on every call. The example above is a good one: the key is derived from
+configuration, validated, and cached.</p>
+
+<p>Note what the validation buys. Without it, a short secret fails on the <em>first login attempt</em>,
+inside the JWT library, with a message about key length that mentions nothing you configured. With
+it, the application refuses to start and says which property is wrong. <strong>Fail at startup, not
+at first use</strong> — that is most of what <code>@PostConstruct</code> is for.</p>
+
+<h2>When two beans satisfy one type</h2>
+
+<p>The moment there are two implementations of an interface, injection becomes ambiguous:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Parameter 0 of constructor in OrderServiceImpl required a single bean,
+but 2 were found:
+    - stripePaymentGateway
+    - paypalPaymentGateway</code></pre>
+
+<p><strong><code>@Primary</code></strong> names the default:</p>
+
+<pre class="language-java"><code class="language-java">@Primary
+@Service
+public class StripePaymentGateway implements PaymentGateway { }
+
+@Service
+public class PayPalPaymentGateway implements PaymentGateway { }</code></pre>
+
+<p><strong><code>@Qualifier</code></strong> asks for a specific one, and wins over
+<code>@Primary</code>:</p>
+
+<pre class="language-java"><code class="language-java">public OrderService(@Qualifier("payPalPaymentGateway") PaymentGateway gateway) {
+    this.gateway = gateway;
+}</code></pre>
+
+<p>The pizza API needs this for its thread pools, because it declares two beans of closely related
+types and one of them must be picked explicitly:</p>
+
+<pre class="language-java"><code class="language-java">@Autowired
+@Qualifier(value = "taskExecutor")
+private ThreadPoolTaskExecutor taskExecutor;</code></pre>
+
+<p><strong>Use <code>@Primary</code> when one choice is obviously the normal one</strong> and the
+other is a special case. Use <code>@Qualifier</code> at the injection point when the caller genuinely
+has to choose. If you find yourself writing <code>@Qualifier</code> everywhere, the types are
+probably wrong — two things that are never interchangeable should not share an interface.</p>
+
+<h2>Bean names</h2>
+
+<p>Every bean has a name, defaulting to the decapitalised class name (<code>ProductServiceImpl</code>
+→ <code>productServiceImpl</code>) or, for <code>@Bean</code> methods, the method name. You can set it
+explicitly:</p>
+
+<pre class="language-java"><code class="language-java">@Bean(name = "taskExecutor")
+public ThreadPoolTaskExecutor taskExecutor() { /* … */ }</code></pre>
+
+<p>That one is not cosmetic. Spring's <code>@Async</code> support looks for a bean literally named
+<code>taskExecutor</code>; name it something else and your async work silently runs on a default
+executor instead of the pool you carefully sized. Lesson 28 covers this.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Your class → stereotype. Someone else's class → <code>@Bean</code> method.</strong></li>
+  <li><strong>Singletons must be stateless.</strong> Fields are collaborators, not data.</li>
+  <li><strong><code>@PostConstruct</code> is where you validate configuration</strong> so failures
+  happen at startup with a useful message.</li>
+  <li><strong><code>@Primary</code> for the usual choice, <code>@Qualifier</code> when the caller must
+  decide.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-dependency-injection">dependency injection</a> — why
+constructor injection is the only default worth having.</p>

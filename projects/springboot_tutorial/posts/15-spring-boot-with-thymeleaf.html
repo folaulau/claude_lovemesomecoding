@@ -1,0 +1,205 @@
+<p>Not every page needs a JavaScript framework. When the output is a <em>document</em> — a receipt, an
+invoice, an email body, something to be printed — rendering it on the server is simpler and more
+robust than shipping JSON to a client that reassembles it.</p>
+
+<p>Thymeleaf is Spring Boot's default template engine, and its distinguishing feature is that a
+template is valid HTML. You can open it in a browser and see a sensible page with placeholder
+content, because every dynamic instruction is an attribute rather than a tag.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-thymeleaf&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre class="language-properties"><code class="language-properties"># Template caching OFF for development so an edit to receipt.html shows on refresh.
+# Boot's own default is true, and leaving it that way locally means every template
+# change looks like it did nothing until the app is restarted.
+spring.thymeleaf.cache=false</code></pre>
+
+<p>Templates live in <code>src/main/resources/templates/</code> and resolve by name, so returning
+<code>"receipt"</code> renders <code>templates/receipt.html</code>.</p>
+
+<h2>⚠️ <code>@Controller</code>, not <code>@RestController</code></h2>
+
+<p>This single difference is the whole lesson's most common bug:</p>
+
+<pre class="language-java"><code class="language-java">@Slf4j
+@Controller                 // NOT @RestController
+@RequiredArgsConstructor
+@Hidden
+public class OrderReceiptController {
+
+    private final CustomerOrderService orderService;
+
+    @GetMapping("/orders/{id}/receipt")
+    public String receipt(@PathVariable UUID id, Model model) {
+        OrderDTO order = orderService.getOrderByPublicId(id);
+        model.addAttribute("order", order);
+
+        return "receipt";   // a VIEW NAME, resolved to templates/receipt.html
+    }
+}</code></pre>
+
+<p><code>@RestController</code> is <code>@Controller</code> + <code>@ResponseBody</code>, and
+<code>@ResponseBody</code> means "serialise the return value into the response". Here the return
+value is the string <code>"receipt"</code> — so with <code>@RestController</code> the browser
+receives the literal seven characters <code>receipt</code>. A blank page showing one word, and no
+error anywhere.</p>
+
+<p><strong>Put the DTO in the model, not the entity.</strong> Rendering happens <em>after</em> the
+controller returns, by which time <code>open-in-view=false</code> has closed the persistence context.
+A lazy association touched in the template throws <code>LazyInitializationException</code> from
+inside the view layer, which is a confusing place to find a database error.</p>
+
+<h2>The syntax worth knowing</h2>
+
+<p>Five attributes cover almost everything.</p>
+
+<h3><code>th:text</code> — replace an element's body</h3>
+
+<pre class="language-markup"><code class="language-markup">&lt;title th:text="${title}"&gt;Pizza&lt;/title&gt;</code></pre>
+
+<p>The placeholder <code>Pizza</code> is what you see opening the file directly, and it is replaced at
+render time. That is the "natural template" idea: a designer can work on the file without running
+the application.</p>
+
+<p><code>th:text</code> <strong>escapes HTML</strong>, which is the correct default and your XSS
+protection. <code>th:utext</code> does not escape — reserve it for HTML you generated yourself, never
+for anything a user typed.</p>
+
+<h3><code>th:if</code> / <code>th:unless</code> — conditionals</h3>
+
+<pre class="language-markup"><code class="language-markup">&lt;p th:if="${order.orderType.name() == 'DELIVERY'}"&gt;
+  &lt;strong&gt;Delivering to&lt;/strong&gt;&lt;br /&gt;
+  &lt;span th:text="${order.customerName}"&gt;name&lt;/span&gt;&lt;br /&gt;
+  &lt;span th:text="${order.addressLine1}"&gt;line 1&lt;/span&gt;
+&lt;/p&gt;
+&lt;p th:unless="${order.orderType.name() == 'DELIVERY'}"&gt;
+  &lt;strong&gt;Collection&lt;/strong&gt;
+&lt;/p&gt;</code></pre>
+
+<p>Note that <code>th:if</code> <strong>removes the element entirely</strong> rather than hiding it
+with CSS. Nothing sensitive ships in the markup, which is a meaningful difference from
+<code>display: none</code>.</p>
+
+<h3><code>th:each</code> — loops</h3>
+
+<pre class="language-markup"><code class="language-markup">&lt;tr th:each="item : ${order.items}"&gt;
+  &lt;td&gt;
+    &lt;span th:text="${item.productName}"&gt;Product&lt;/span&gt;
+    &lt;span th:if="${item.size}" th:text="|(${item.size})|"&gt;(LARGE)&lt;/span&gt;
+    &lt;div th:if="${not #lists.isEmpty(item.toppings)}" class="toppings"
+         th:text="'Toppings: ' + ${#strings.listJoin(item.toppings.![toppingName], ', ')}"&gt;
+      Toppings
+    &lt;/div&gt;
+  &lt;/td&gt;
+  &lt;td th:text="${item.quantity}"&gt;1&lt;/td&gt;
+  &lt;td th:text="'$' + ${#numbers.formatDecimal(item.lineTotal, 1, 2)}"&gt;$0.00&lt;/td&gt;
+&lt;/tr&gt;</code></pre>
+
+<p>An optional second variable gives you iteration status —
+<code>th:each="item, stat : ${items}"</code> — with <code>stat.index</code>, <code>.count</code>,
+<code>.first</code>, <code>.last</code>, <code>.odd</code> and <code>.even</code>. That is how you
+stripe rows or special-case the last one without tracking a counter yourself.</p>
+
+<h3>Literal substitution and utility objects</h3>
+
+<p><code>|…|</code> is a literal substitution block — inline <code>${}</code> without breaking the
+string into a chain of concatenations:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;span th:text="|Order ${order.id}|"&gt;Order …&lt;/span&gt;
+&lt;span th:text="|${order.city}, ${order.state} ${order.postalCode}|"&gt;city&lt;/span&gt;</code></pre>
+
+<p>The <code>#</code>-prefixed names are expression utility objects:</p>
+
+<table>
+  <thead>
+    <tr><th>Object</th><th>Used for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>#numbers</code></td><td><code>formatDecimal(total, 1, 2)</code> — money</td></tr>
+    <tr><td><code>#temporals</code></td><td><code>format(createdAt, 'd MMM yyyy, HH:mm')</code></td></tr>
+    <tr><td><code>#strings</code></td><td><code>listJoin</code>, <code>isEmpty</code>,
+    <code>abbreviate</code></td></tr>
+    <tr><td><code>#lists</code></td><td><code>isEmpty</code>, <code>size</code></td></tr>
+  </tbody>
+</table>
+
+<p>They exist so formatting stays in the template. Building the joined toppings string in the
+controller would put a presentation concern in the wrong layer.</p>
+
+<h3><code>th:fragment</code> and <code>th:replace</code> — reuse</h3>
+
+<p>A fragment is a named, reusable chunk — Thymeleaf's answer to the copy-and-pasted header that
+drifts out of step between pages:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;!-- fragments/layout.html --&gt;
+&lt;head th:fragment="head(title)"&gt;
+  &lt;meta charset="utf-8" /&gt;
+  &lt;title th:text="${title}"&gt;Pizza&lt;/title&gt;
+&lt;/head&gt;
+
+&lt;div th:fragment="brand" th:remove="tag"&gt;
+  &lt;h1&gt;🍕 Pizza&lt;/h1&gt;
+  &lt;p class="muted"&gt;Thank you for your order&lt;/p&gt;
+&lt;/div&gt;</code></pre>
+
+<pre class="language-markup"><code class="language-markup">&lt;!-- receipt.html --&gt;
+&lt;head th:replace="~{fragments/layout :: head('Receipt · Order ' + ${order.id})}"&gt;
+  &lt;title&gt;Receipt&lt;/title&gt;
+&lt;/head&gt;
+
+&lt;div th:replace="~{fragments/layout :: brand}"&gt;&lt;/div&gt;</code></pre>
+
+<p>Fragments take parameters, as <code>head(title)</code> does. <code>th:remove="tag"</code> drops the
+wrapper element but keeps its children, so a fragment does not inject a stray <code>&lt;div&gt;</code>
+into every page that uses it.</p>
+
+<h2>The same template, rendered to a string</h2>
+
+<p>This is where server-side rendering earns its place in an otherwise JSON application. The
+confirmation email uses the identical template:</p>
+
+<pre class="language-java"><code class="language-java">// The Context is the model. Thymeleaf has no idea it is producing an email; it sees the
+// same variable name the receipt page sets, which is why one template serves both.
+Context context = new Context();
+context.setVariable("order", order);
+String html = templateEngine.process("receipt", context);
+
+MimeMessageHelper helper = new MimeMessageHelper(message, true, StandardCharsets.UTF_8.name());
+helper.setTo(order.email());
+helper.setSubject("Your Pizza order " + order.id());
+helper.setText(html, true);</code></pre>
+
+<p>Same engine, same template, same model — but no HTTP request, so no view resolution either.
+<code>process()</code> hands you the HTML and you decide where it goes. Lesson 31 covers the email
+side.</p>
+
+<h2>When to use this, and when not to</h2>
+
+<p><strong>Reach for it when</strong> the output is a document (receipts, invoices, printable pages),
+when it must work from an email link with no application to boot, when it is the body of an email,
+or for small internal admin pages where a React build is more machinery than the page is worth.</p>
+
+<p><strong>Do not reach for it</strong> for interactive UI. The pizza API's menu, cart and checkout
+stay in React because they are stateful and interactive; the receipt is server-rendered because it is
+a document. Mixing the two deliberately, by output type, is a coherent position — mixing them by
+accident is not.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong><code>@Controller</code> returns a view name; <code>@RestController</code> returns the
+  string itself.</strong> This is the bug you will hit.</li>
+  <li><strong>DTOs in the model, not entities</strong> — rendering happens after the persistence
+  context closes.</li>
+  <li><strong><code>th:text</code> escapes; <code>th:utext</code> does not.</strong> Default to the
+  first.</li>
+  <li><strong><code>templateEngine.process()</code> renders to a String</strong>, which is how the
+  same template becomes an email body.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-hibernate">JPA and Hibernate</a> — entities, the
+persistence context, and the N+1 problem.</p>

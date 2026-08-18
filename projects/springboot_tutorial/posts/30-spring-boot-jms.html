@@ -1,0 +1,259 @@
+<p>Application events (lesson 9) decouple code inside one JVM. A message broker decouples
+<em>services</em>, and adds the thing events cannot give you: the message survives a restart, and the
+consumer does not have to be running when it is sent.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-artemis&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre class="language-bash"><code class="language-bash">docker run -p 61616:61616 -e AMQ_USER=admin -e AMQ_PASSWORD=admin \
+  apache/activemq-artemis:latest-alpine</code></pre>
+
+<p>The pizza API puts the whole thing behind a profile, and the reason is specific:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;{@code @Profile("messaging")} is doing real work here rather than decorating. A
+ * {@code @JmsListener} container starts polling as soon as the context is up, so merely having the
+ * Artemis starter on the classpath with a listener declared would make the application try to reach
+ * a broker at every startup — and fill the log with connection retries on any machine that has not
+ * got one. Gating the listener means the default experience is unchanged: MySQL, and nothing else.
+ */
+@Configuration
+@EnableJms
+@Profile("messaging")
+public class MessagingConfig { }</code></pre>
+
+<h2>Destinations as constants</h2>
+
+<pre class="language-java"><code class="language-java">/** The queue orders are announced on. A constant, so producer and consumer cannot disagree. */
+public static final String ORDER_QUEUE = "pizza.orders";
+
+/**
+ * The dead-letter destination.
+ *
+ * &lt;p&gt;Without somewhere for poison messages to go, a message that always fails is redelivered
+ * forever: it blocks the queue, burns CPU and fills the log, and the underlying bug is hidden
+ * behind the noise. Artemis will move a message here after its redelivery attempts are
+ * exhausted.
+ */
+public static final String ORDER_DLQ = "DLQ.pizza.orders";</code></pre>
+
+<p>Same reasoning as cache names in lesson 21: a destination is a string in at least two places, and a
+typo means the producer writes to a queue nobody reads. Nothing fails.</p>
+
+<h2>Queue or topic?</h2>
+
+<table>
+  <thead>
+    <tr><th></th><th>Queue</th><th>Topic</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Delivery</td><td>one consumer gets each message</td><td>every subscriber gets a
+    copy</td></tr>
+    <tr><td>Scaling</td><td>add consumers to share the load</td><td>each subscriber sees
+    everything</td></tr>
+    <tr><td>Use for</td><td>work to be done once</td><td>broadcasting a fact</td></tr>
+  </tbody>
+</table>
+
+<p>"Route this order to the kitchen" is a queue — doing it twice would print two tickets. "An order was
+placed" broadcast to analytics, email and inventory is a topic. Spring defaults to queues; set
+<code>pubSubDomain=true</code> for topics.</p>
+
+<h2>JSON on the wire</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Out of the box, JMS moves a {@code SimpleMessageConverter} payload: String, byte[],
+ * Serializable, Map. Sending a record such as {@link OrderMessage} through that either fails or
+ * drags Java serialisation into your wire format, which then couples both ends of the queue to your
+ * class files. JSON keeps the contract readable and lets the consumer be written in something other
+ * than Java.
+ */
+@Bean
+public MessageConverter jacksonJmsMessageConverter() {
+    JacksonJsonMessageConverter converter = new JacksonJsonMessageConverter();
+    converter.setTargetType(MessageType.TEXT);
+    // The consumer needs to know which class to deserialise into. This names the JMS string
+    // property carrying that type id — without it, the receiving side gets a LinkedHashMap.
+    converter.setTypeIdPropertyName("_type");
+    return converter;
+}</code></pre>
+
+<p>⚠️ <strong>Two Boot 4 / Framework 7 renames are baked into this class:</strong></p>
+
+<ul>
+  <li><code>MappingJackson2MessageConverter</code> is deprecated for removal in Spring 7 (it is tied to
+  Jackson 2). <code>JacksonJsonMessageConverter</code> is the Jackson 3 replacement.</li>
+  <li><code>DefaultJmsListenerContainerFactoryConfigurer</code> moved from
+  <code>org.springframework.boot.autoconfigure.jms</code> to
+  <code>org.springframework.boot.jms.autoconfigure</code> when Boot 4 split autoconfiguration into
+  per-technology modules. The old import simply does not resolve.</li>
+</ul>
+
+<h2>The listener container factory</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;Taking Boot's {@code Configurer} first and then overriding is the pattern to copy: it
+ * keeps every sensible default Boot computed (including the converter above) instead of
+ * silently discarding them, which is what building a bare factory by hand does.
+ */
+@Bean
+public DefaultJmsListenerContainerFactory jmsListenerContainerFactory(
+        ConnectionFactory connectionFactory,
+        DefaultJmsListenerContainerFactoryConfigurer configurer) {
+
+    DefaultJmsListenerContainerFactory factory = new DefaultJmsListenerContainerFactory();
+    configurer.configure(factory, connectionFactory);
+
+    // Transacted sessions: the message is only acknowledged once the listener returns
+    // normally. Throw, and it goes back on the queue for redelivery — which is what makes the
+    // dead-letter queue above meaningful.
+    factory.setSessionTransacted(true);
+    factory.setConcurrency("1-3");
+    return factory;
+}</code></pre>
+
+<p><code>setSessionTransacted(true)</code> is the important line. The broker only removes the message
+once your listener returns normally. Throw, and it is redelivered — which is what turns an exception
+into a retry rather than a lost message.</p>
+
+<h2>A wire contract, not an internal type</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;A separate type from {@link OrderPlacedEvent} on purpose. The in-process event can change
+ * whenever both sides are recompiled together; this one is a &lt;b&gt;wire contract&lt;/b&gt; that some other
+ * service — possibly not even a Java one — deserialises. Letting an internal refactor rename a
+ * field on a published message is how you break a consumer you have never met.
+ */
+public record OrderMessage(
+        UUID orderId, String customerEmail, BigDecimal total, String orderType) {
+
+    public static OrderMessage from(OrderPlacedEvent event) {
+        return new OrderMessage(
+                event.orderPublicId(), event.contactEmail(), event.total(),
+                event.orderType().name());
+    }
+}</code></pre>
+
+<p>Note <code>orderType</code> is a <code>String</code>, not the enum. A consumer in another language
+has no notion of your enum, and adding a constant to it should not be a breaking change on the
+wire.</p>
+
+<h2>Publishing</h2>
+
+<pre class="language-java"><code class="language-java">public void publish(OrderMessage message) {
+    JmsTemplate jms = jmsTemplateProvider.getIfAvailable();
+    if (jms == null) {
+        log.debug("Messaging is off — not publishing order {}", message.orderId());
+        return;
+    }
+
+    try {
+        // convertAndSend runs the payload through the MessageConverter from MessagingConfig,
+        // so what actually goes on the wire is JSON plus a _type property.
+        jms.convertAndSend(MessagingConfig.ORDER_QUEUE, message);
+    } catch (Exception ex) {
+        // The order is already committed and paid for. A broker outage must not turn that into
+        // a customer-visible failure, so this is logged and swallowed — the same call the
+        // confirmation email makes.
+        log.error("Could not publish order {} — the order is unaffected", message.orderId(), ex);
+    }
+}</code></pre>
+
+<h3>⚠️ Publish after commit</h3>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;AFTER_COMMIT for the same reason the email is: publishing inside the transaction would let
+ * a consumer read the order from the database before the insert is visible, and act on an order
+ * that a rollback is about to erase. Message brokers have no idea your transaction exists.
+ */
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void publishToQueue(OrderPlacedEvent event) {
+    messagePublisher.publish(OrderMessage.from(event));
+}</code></pre>
+
+<p>This is worse than the email case, because it is a genuine race even without a rollback: brokers are
+fast, and a consumer can read the database before your transaction commits, find nothing, and
+conclude the order does not exist.</p>
+
+<p>That leaves the dual-write problem — the database commits and then the broker call fails, so the
+message is never sent. The industry answer is the <strong>transactional outbox</strong>: write the
+message to a table in the same transaction, and a separate process publishes from it. The pizza API
+logs and moves on, which is right for a demo and worth knowing is not the general answer.</p>
+
+<h2>Consuming</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * ⚠️ &lt;b&gt;A listener must be idempotent.&lt;/b&gt; JMS guarantees at-least-once delivery, not
+ * exactly-once: a broker restart or a slow acknowledgement can hand you the same message twice.
+ * Anything with an external effect — charging a card, sending an email — has to be safe to repeat,
+ * usually by recording the message id and ignoring one that has already been seen.
+ */
+@JmsListener(destination = MessagingConfig.ORDER_QUEUE,
+             containerFactory = "jmsListenerContainerFactory")
+public void onOrderPlaced(@Payload OrderMessage message) {
+    log.info("Kitchen received order {} for {} ({} {})",
+            message.orderId(), message.customerEmail(), message.total(), message.orderType());
+
+    // Throwing here would roll the transacted session back and the broker would redeliver.
+    // After the configured redelivery attempts, Artemis moves the message to
+    // MessagingConfig.ORDER_DLQ rather than looping on it forever.
+}</code></pre>
+
+<p><strong>At-least-once is the guarantee you actually get</strong>, from every broker worth using.
+Exactly-once is achievable only by making the consumer idempotent — the same conclusion as lesson 29,
+arrived at from the other direction.</p>
+
+<p><code>containerFactory</code> names the bean explicitly. Omit it and Spring uses its own default
+factory, silently dropping the transacted sessions and concurrency configured above.</p>
+
+<h2>Poison messages</h2>
+
+<p>A message that always fails is redelivered forever without a dead-letter queue. Configure the
+limit:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.artemis.broker-url=tcp://localhost:61616
+spring.jms.listener.session.acknowledge-mode=client
+spring.jms.listener.min-concurrency=1
+spring.jms.listener.max-concurrency=3</code></pre>
+
+<p>Then <strong>monitor the DLQ</strong>. A dead-letter queue nobody watches is a folder where you
+quietly lose orders — which is worse than the infinite redelivery it replaced, because at least that
+was noisy.</p>
+
+<h2>Do you need a broker?</h2>
+
+<p><strong>No, if</strong> producer and consumer are the same application — an application event
+(lesson 9) or an <code>@Async</code> method is simpler and has no infrastructure.</p>
+
+<p><strong>Yes, if</strong> the consumer is a different service, the work must survive a restart, the
+consumer may be offline when the message is sent, or you need to absorb bursts.</p>
+
+<p>The pizza API's queue is an honest demo rather than a real need, and its listener says so: a queue
+whose producer and consumer are the same application is a queue that did not need to exist.</p>
+
+<h2>JMS, or Kafka?</h2>
+
+<p>JMS brokers (Artemis, ActiveMQ) are <strong>message queues</strong>: a message is consumed and
+gone, with per-message acknowledgement and dead-letter handling. Kafka is a <strong>distributed
+log</strong>: messages are retained, consumers track their own offset and can replay.</p>
+
+<p>Task distribution and request/reply suit JMS. Event streaming, replay and multiple independent
+consumers of the same history suit Kafka. Spring supports both with a similar programming model —
+<code>@KafkaListener</code> looks a lot like <code>@JmsListener</code>.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Gate the listener behind a profile</strong>, or the app needs a broker to start.</li>
+  <li><strong>Boot 4 renames:</strong> <code>JacksonJsonMessageConverter</code>, and the configurer
+  moved to <code>boot.jms.autoconfigure</code>.</li>
+  <li><strong>A separate message type</strong> — the wire contract is not your internal event.</li>
+  <li><strong>Publish AFTER_COMMIT.</strong> Brokers do not know about your transaction.</li>
+  <li><strong>Listeners must be idempotent</strong>, and you must have a DLQ and watch it.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-email">sending email</a>.</p>

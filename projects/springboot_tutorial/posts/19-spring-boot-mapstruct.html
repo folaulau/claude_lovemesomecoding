@@ -1,0 +1,215 @@
+<p>Once you accept that entities and DTOs are different types (lesson 11), something has to convert
+between them. Hand-written mapping code is tedious, and its failure mode is quiet: someone adds a
+field to both classes, forgets one line in the mapper, and it is always null.</p>
+
+<p>MapStruct generates that code at compile time. No reflection, no runtime cost, and a mapping
+mistake becomes a compile error.</p>
+
+<h2>Setup — and the ordering that matters</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.mapstruct&lt;/groupId&gt;
+    &lt;artifactId&gt;mapstruct&lt;/artifactId&gt;
+    &lt;version&gt;${mapstruct.version}&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre class="language-xml"><code class="language-xml">&lt;plugin&gt;
+    &lt;groupId&gt;org.apache.maven.plugins&lt;/groupId&gt;
+    &lt;artifactId&gt;maven-compiler-plugin&lt;/artifactId&gt;
+    &lt;configuration&gt;
+        &lt;!-- Order is load-bearing. Lombok must run before MapStruct, and
+             lombok-mapstruct-binding is what lets MapStruct see the getters
+             and setters Lombok generates. Get this wrong and MapStruct still
+             compiles, but the generated mappers map nothing. --&gt;
+        &lt;annotationProcessorPaths&gt;
+            &lt;path&gt;
+                &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+                &lt;artifactId&gt;lombok&lt;/artifactId&gt;
+                &lt;version&gt;${lombok.version}&lt;/version&gt;
+            &lt;/path&gt;
+            &lt;path&gt;
+                &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+                &lt;artifactId&gt;lombok-mapstruct-binding&lt;/artifactId&gt;
+                &lt;version&gt;${lombok-mapstruct-binding.version}&lt;/version&gt;
+            &lt;/path&gt;
+            &lt;path&gt;
+                &lt;groupId&gt;org.mapstruct&lt;/groupId&gt;
+                &lt;artifactId&gt;mapstruct-processor&lt;/artifactId&gt;
+                &lt;version&gt;${mapstruct.version}&lt;/version&gt;
+            &lt;/path&gt;
+        &lt;/annotationProcessorPaths&gt;
+    &lt;/configuration&gt;
+&lt;/plugin&gt;</code></pre>
+
+<p>⚠️ <strong>Read that comment before you debug anything.</strong> This is the classic MapStruct
+problem and it is horrible precisely because <em>the build succeeds</em>. MapStruct runs before
+Lombok has generated the accessors, sees a class with no getters, and generates a mapper that maps
+nothing. Every DTO comes back with null fields, and there is no error anywhere to search for.</p>
+
+<p>Three things must be true: Lombok first, then <code>lombok-mapstruct-binding</code>, then
+<code>mapstruct-processor</code>. Skipping the binding is the same bug.</p>
+
+<h2>The mapper is an interface</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * The single mapper for every entity ↔ DTO conversion.
+ *
+ * &lt;p&gt;MapStruct generates the implementation at COMPILE time — open
+ * {@code target/generated-sources/annotations} to read the plain Java it writes. No reflection, no
+ * runtime cost, and a mapping mistake is a compile error rather than a surprise null.
+ */
+@Mapper(
+        componentModel = "spring",
+        nullValueCheckStrategy = NullValueCheckStrategy.ALWAYS,
+        unmappedTargetPolicy = ReportingPolicy.IGNORE)
+public interface EntityDTOMapper {
+
+    @Mapping(target = "id", source = "publicId")
+    ProductDTO mapProductToProductDTO(Product product);
+
+    List&lt;ProductDTO&gt; mapProductsToProductDTOs(List&lt;Product&gt; products);
+}</code></pre>
+
+<p><code>componentModel = "spring"</code> makes the generated class a <code>@Component</code>, so you
+inject the interface like any other bean. Without it you get a static <code>INSTANCE</code> field
+instead.</p>
+
+<p>The <code>List</code> method needs no annotation at all — MapStruct sees it already knows how to
+map the element type and writes the loop.</p>
+
+<p><strong>Go and read the generated code.</strong> <code>target/generated-sources/annotations</code>
+contains plain Java: a class calling getters and setters, exactly what you would have written. That
+is the strongest argument for MapStruct over a reflection-based mapper — there is no mystery, just
+code you did not have to type.</p>
+
+<h2>Renaming a field</h2>
+
+<pre class="language-java"><code class="language-java">@Mapping(target = "id", source = "publicId")
+ProductDTO mapProductToProductDTO(Product product);</code></pre>
+
+<p>Everything matching by name is mapped automatically; <code>@Mapping</code> handles the rest. The
+comment on this one explains why it is the most important line in the file:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * &lt;p&gt;&lt;b&gt;Note {@code id &lt;- publicId} on every mapping.&lt;/b&gt; That one line is what keeps the numeric
+ * primary key server-side: there is no path by which the BIGINT can reach a client.
+ */</code></pre>
+
+<h2>The reverse direction is a security boundary</h2>
+
+<pre class="language-java"><code class="language-java">/**
+ * The inverse direction. Everything the server owns is ignored, because it must never be
+ * settable from a request body — this is the mass-assignment guard.
+ */
+@Mapping(target = "id", ignore = true)
+@Mapping(target = "publicId", ignore = true)
+@Mapping(target = "createdAt", ignore = true)
+@Mapping(target = "updatedAt", ignore = true)
+@Mapping(target = "deleted", ignore = true)
+@Mapping(target = "sizes", ignore = true)
+Product mapProductCreateDTOToProduct(ProductCreateDTO dto);</code></pre>
+
+<p>Every <code>ignore = true</code> is a field a client must not be able to set. Without them,
+MapStruct maps by name — so if <code>ProductCreateDTO</code> ever gained a <code>deleted</code> field,
+the mapper would faithfully copy it and a request could undelete a product.</p>
+
+<p><strong>The best protection is what is absent.</strong> As the mapper's own comment puts it: no
+mapping produces a password hash, because <code>UserDTO</code> has no such field. MapStruct maps by
+matching names, so the hash cannot leak through this mapper even by accident. Designing the DTO
+correctly is a stronger guarantee than remembering an annotation.</p>
+
+<h2>Two settings worth understanding</h2>
+
+<p><strong><code>unmappedTargetPolicy</code></strong> controls what happens when a target field has no
+source:</p>
+
+<table>
+  <thead>
+    <tr><th>Value</th><th>Effect</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ERROR</code></td><td>build fails — safest, noisiest</td></tr>
+    <tr><td><code>WARN</code></td><td>the default</td></tr>
+    <tr><td><code>IGNORE</code></td><td>silent</td></tr>
+  </tbody>
+</table>
+
+<p>The pizza API uses <code>IGNORE</code> because most of its DTOs are deliberately narrower than
+their entities and <code>WARN</code> produced pages of noise on every build. That is a real trade:
+<code>ERROR</code> would catch a genuinely forgotten field. If you can live with the annotations,
+<code>ERROR</code> is the stronger choice.</p>
+
+<p><strong><code>nullValueCheckStrategy = ALWAYS</code></strong> makes the generated code null-check
+before calling a getter on a nested object, rather than assuming it is present.</p>
+
+<h2>Nested objects and expressions</h2>
+
+<pre class="language-java"><code class="language-java">// Reach into a nested object with dotted paths
+@Mapping(target = "productName", source = "product.name")
+@Mapping(target = "crustName", source = "crust.name")
+OrderItemDTO mapOrderItemToOrderItemDTO(OrderItem item);
+
+// Compute something MapStruct cannot infer
+@Mapping(target = "displayName",
+         expression = "java(user.getFullName() != null ? user.getFullName() : user.getEmail())")
+UserDTO mapUserToUserDTO(User user);
+
+// A constant
+@Mapping(target = "source", constant = "API")
+OrderDTO mapOrder(CustomerOrder order);</code></pre>
+
+<p><code>expression</code> is an escape hatch and should stay small. Once the logic is more than a
+ternary it belongs in a <code>default</code> method on the interface, where it can be read and
+tested:</p>
+
+<pre class="language-java"><code class="language-java">default String displayName(User user) {
+    if (user == null) {
+        return null;
+    }
+    return user.getFullName() == null || user.getFullName().isBlank()
+            ? user.getEmail()
+            : user.getFullName();
+}</code></pre>
+
+<p>MapStruct finds <code>default</code> methods and uses them automatically when the types line
+up.</p>
+
+<h2>One mapper or many?</h2>
+
+<p>The pizza API has exactly one, <code>EntityDTOMapper</code>, for every conversion in the
+application. The reasoning is in lesson 4: with one central <code>dto/</code> package, one mapper has
+an obvious home, whereas per-feature DTOs give you per-feature mappers and more places for the
+conventions to drift.</p>
+
+<p>The cost is a long file. The alternative — <code>ProductMapper</code>, <code>OrderMapper</code>,
+<code>UserMapper</code> — is more navigable and needs <code>uses = {…}</code> so mappers can call each
+other. Either works; the failure is having both styles at once.</p>
+
+<h2>When something maps to null</h2>
+
+<ol>
+  <li><strong>Check the annotation-processor order first.</strong> It is this, more often than
+  anything else.</li>
+  <li><strong>Read the generated implementation</strong> in
+  <code>target/generated-sources/annotations</code>. If the setter is missing there, the processor
+  never saw the getter.</li>
+  <li><strong><code>./mvnw clean compile</code>.</strong> Stale generated sources are real, and the
+  pizza API's own docs warn about stale classes producing behaviour that does not match the
+  source.</li>
+</ol>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Processor order: Lombok, binding, MapStruct.</strong> Wrong order compiles fine and maps
+  nothing.</li>
+  <li><strong><code>componentModel = "spring"</code></strong> so the mapper is an injectable
+  bean.</li>
+  <li><strong><code>ignore = true</code> on every server-owned field</strong> in the request
+  direction — that is your mass-assignment guard.</li>
+  <li><strong>A field absent from the DTO cannot leak.</strong> Design beats vigilance.</li>
+  <li><strong>Read the generated code.</strong> It is ordinary Java.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-lombok">Lombok</a> — including the two annotations that
+will bite you on a JPA entity.</p>

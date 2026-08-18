@@ -1,0 +1,189 @@
+<p>An order is placed. The kitchen needs a ticket, the customer needs an email, a message goes onto a
+queue, analytics wants a row. Wire all four into the checkout code and you have a method with four
+extra dependencies and four new ways for something unrelated to break a payment.</p>
+
+<p>Events invert that. The order code announces what happened and stops caring who listens.</p>
+
+<h2>Publishing</h2>
+
+<p>Since Spring 4.2 an event can be any object — no <code>extends ApplicationEvent</code> — so a
+record is the natural shape:</p>
+
+<pre class="language-java"><code class="language-java">public record OrderPlacedEvent(
+        UUID orderPublicId, String contactEmail, BigDecimal total, OrderType orderType) {
+
+    static OrderPlacedEvent from(CustomerOrder order) {
+        return new OrderPlacedEvent(
+                order.getPublicId(), order.contactEmail(), order.getTotal(), order.getOrderType());
+    }
+}</code></pre>
+
+<p>Inject <code>ApplicationEventPublisher</code> and publish:</p>
+
+<pre class="language-java"><code class="language-java">@Autowired
+private ApplicationEventPublisher events;
+
+@Transactional
+public OrderCreateResponseDTO createOrder(OrderCreateDTO dto, String userEmail) {
+    // … price it, save it, talk to Stripe …
+
+    // Announce it and stop caring who acts on it.
+    events.publishEvent(OrderPlacedEvent.from(saved));
+
+    return new OrderCreateResponseDTO(toDtoWithItems(saved.getPublicId()), clientSecret);
+}</code></pre>
+
+<p><strong>Carry values, not entities.</strong> The record holds the id and the totals rather than the
+<code>CustomerOrder</code>. An async listener runs on a different thread, after the transaction and
+its persistence context have closed, so touching a lazy association on a detached entity there throws
+<code>LazyInitializationException</code>. Copying the few fields a listener needs sidesteps the whole
+problem — and it also stops a listener quietly mutating the entity.</p>
+
+<h2>Listening</h2>
+
+<pre class="language-java"><code class="language-java">@Slf4j
+@Component
+@RequiredArgsConstructor
+public class OrderPlacedListener {
+
+    private final CustomerOrderService orderService;
+    private final MailService mailService;
+    private final OrderMessagePublisher messagePublisher;
+
+    @Order(10)
+    @EventListener
+    public void routeToKitchen(OrderPlacedEvent event) {
+        log.info("Kitchen ticket queued for order {} ({})",
+                event.orderPublicId(), event.orderType());
+    }
+}</code></pre>
+
+<p>The method parameter type <em>is</em> the subscription — Spring routes by it. Multiple listeners
+can take the same event, and <code>@Order</code> sets their sequence, lower first. Without it the
+order is unspecified, which is fine right up until one listener starts depending on another having
+run.</p>
+
+<h2>⚠️ Transaction phase — the mistake that matters</h2>
+
+<p>A plain <code>@EventListener</code> runs <strong>immediately and synchronously, inside the
+publisher's transaction</strong>. The publishing method has not committed yet. It may still roll
+back.</p>
+
+<p>So this is a real bug:</p>
+
+<pre class="language-java"><code class="language-java">// WRONG for anything with an effect outside the database.
+@EventListener
+public void sendConfirmation(OrderPlacedEvent event) {
+    mailService.sendOrderConfirmation(/* … */);   // sent before commit
+}</code></pre>
+
+<p>If the transaction rolls back a millisecond later, the customer is holding an email about an order
+that does not exist. It works in every test until the one time the transaction fails, which is
+exactly when you least want to be sending confident emails.</p>
+
+<p><code>@TransactionalEventListener</code> defers until the transaction reaches a phase you
+name:</p>
+
+<pre class="language-java"><code class="language-java">@Async
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void sendConfirmation(OrderPlacedEvent event) {
+    try {
+        mailService.sendOrderConfirmation(
+                orderService.getOrderByPublicId(event.orderPublicId()));
+    } catch (Exception ex) {
+        log.error("Confirmation for order {} failed — the order itself is unaffected",
+                event.orderPublicId(), ex);
+    }
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Phase</th><th>Runs</th><th>Use for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>AFTER_COMMIT</code> (default)</td><td>after a successful commit</td><td>email,
+    queues, external calls — nearly always this</td></tr>
+    <tr><td><code>AFTER_ROLLBACK</code></td><td>after a rollback</td><td>compensating
+    actions</td></tr>
+    <tr><td><code>AFTER_COMPLETION</code></td><td>either way</td><td>cleanup</td></tr>
+    <tr><td><code>BEFORE_COMMIT</code></td><td>just before commit</td><td>rare — last-moment
+    validation</td></tr>
+  </tbody>
+</table>
+
+<p>The decision rule is simple: <strong>if the work must be undone when the transaction rolls back,
+use <code>@EventListener</code>. If it cannot be undone, use <code>AFTER_COMMIT</code>.</strong>
+Kitchen routing rolls back with the order, so it is a plain listener. Email cannot be un-sent, so it
+is <code>AFTER_COMMIT</code>.</p>
+
+<p>⚠️ A <code>@TransactionalEventListener</code> with no active transaction <strong>does not
+run at all</strong> by default. If a listener mysteriously never fires, check whether the publisher
+was actually transactional. <code>fallbackExecution = true</code> makes it run anyway.</p>
+
+<h2>Async listeners</h2>
+
+<p><code>@Async</code> moves the listener onto a thread pool. Note that the two annotations do
+different jobs and you often want both: <strong><code>AFTER_COMMIT</code> decides <em>when</em>,
+<code>@Async</code> decides <em>on which thread</em>.</strong></p>
+
+<p>Without <code>@Async</code>, listeners are synchronous — a slow one delays the HTTP response, and
+five slow ones delay it five times.</p>
+
+<p>Two consequences worth knowing:</p>
+
+<ul>
+  <li><strong>An exception from an <code>@Async void</code> method is invisible to the caller.</strong>
+  It goes to the <code>AsyncUncaughtExceptionHandler</code> and nowhere near the customer, who has
+  already been told the order succeeded — which it did. That is why the listener above catches and
+  logs: a failed confirmation email is not a failed order, and the method has to behave that
+  way.</li>
+  <li><strong>The transaction is gone.</strong> A new thread has no persistence context, which is the
+  other half of why events carry values rather than entities.</li>
+</ul>
+
+<p><code>@Async</code> requires <code>@EnableAsync</code> and a configured executor — lesson 28.</p>
+
+<h2>Built-in lifecycle events</h2>
+
+<p>Spring publishes its own, and they are occasionally very useful:</p>
+
+<pre class="language-java"><code class="language-java">@EventListener(ApplicationReadyEvent.class)
+public void onReady() {
+    log.info("Application is up and serving");
+}</code></pre>
+
+<p><code>ApplicationReadyEvent</code> fires once everything is initialised and the server is
+accepting requests. It is the correct place for startup work that needs a fully-built context —
+better than <code>@PostConstruct</code>, which runs while the context is still being assembled.</p>
+
+<h2>When not to use events</h2>
+
+<p>Events have the same cost as AOP: they hide the call graph. "What happens when an order is placed?"
+becomes a search for listeners rather than a read of one method.</p>
+
+<p><strong>Good fit:</strong> genuinely independent reactions, several consumers, things that must
+happen after commit, and breaking a circular dependency between two services.</p>
+
+<p><strong>Bad fit:</strong> a step the caller depends on. If <code>createOrder</code> needs a result
+back, call a method — an event has no return value, and faking one with shared mutable state is
+worse than the coupling you were avoiding.</p>
+
+<p>These are still <em>in-process</em> events, delivered in the same JVM. They are not a message
+queue: nothing is persisted, and a crash loses anything in flight. When you need delivery guarantees
+across services, that is lesson 30.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Publish values, not entities</strong> — async listeners have no persistence
+  context.</li>
+  <li><strong><code>@EventListener</code> runs inside the transaction; use
+  <code>@TransactionalEventListener(AFTER_COMMIT)</code> for anything that cannot be undone.</strong></li>
+  <li><strong><code>@Async</code> chooses the thread, the phase chooses the timing</strong> — they are
+  independent and you often want both.</li>
+  <li><strong>An <code>@Async void</code> exception vanishes.</strong> Catch and log it
+  deliberately.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-web-mvc">Spring Web MVC</a> — how a request actually
+reaches your method.</p>

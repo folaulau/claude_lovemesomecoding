@@ -1,0 +1,207 @@
+<p>Some behaviour does not belong to any one method but is wanted in forty of them: timing, audit
+logging, security checks, transaction boundaries. Copying it into each is how the business logic
+disappears under plumbing, and how the forty-first method ends up without it. AOP moves that
+behaviour into one place.</p>
+
+<p>This lesson also explains <strong>the proxy rule</strong>, which is the single most useful thing in
+this whole track — because <code>@Transactional</code>, <code>@Cacheable</code>,
+<code>@Async</code>, <code>@Retryable</code> and <code>@PreAuthorize</code> are all built on the same
+mechanism and all fail in the same silent way.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- NOTE THE ARTIFACT NAME. Spring Boot 3 called this spring-boot-starter-aop.
+     Boot 4 renamed it to spring-boot-starter-aspectj, and the old name is not
+     in the BOM at all - so a Boot 3 pom fails with "version is missing" rather
+     than with anything that mentions the rename. --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-aspectj&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>No <code>@EnableAspectJAutoProxy</code> is needed — Boot auto-configures it once the starter is
+present.</p>
+
+<h2>The vocabulary, in one example</h2>
+
+<p>Here is the pizza API's timing aspect in full. Every AOP term is visible in it:</p>
+
+<pre class="language-java"><code class="language-java">@Slf4j
+@Aspect
+@Component
+public class ServiceTimingAspect {
+
+    private static final long SLOW_CALL_MILLIS = 250;
+
+    @Pointcut("execution(* com.pizza.api.entity..*ServiceImpl.*(..))")
+    public void serviceLayer() {}
+
+    @Pointcut("execution(* com.pizza.api.report.*ServiceImpl.*(..))")
+    public void reportLayer() {}
+
+    @Around("serviceLayer() || reportLayer()")
+    public Object time(ProceedingJoinPoint joinPoint) throws Throwable {
+        long start = System.nanoTime();
+        String target = joinPoint.getSignature().toShortString();
+
+        try {
+            return joinPoint.proceed();
+        } catch (Throwable ex) {
+            long millis = (System.nanoTime() - start) / 1_000_000;
+            log.warn("{} failed after {} ms: {}", target, millis, ex.toString());
+            throw ex;
+        } finally {
+            long millis = (System.nanoTime() - start) / 1_000_000;
+            if (millis &gt;= SLOW_CALL_MILLIS) {
+                log.warn("SLOW {} took {} ms", target, millis);
+            } else if (log.isDebugEnabled()) {
+                log.debug("{} took {} ms", target, millis);
+            }
+        }
+    }
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Term</th><th>What it is here</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Aspect</strong></td><td>the class — a module of cross-cutting behaviour</td></tr>
+    <tr><td><strong>Join point</strong></td><td>a method call that could be intercepted</td></tr>
+    <tr><td><strong>Pointcut</strong></td><td>the expression selecting which ones</td></tr>
+    <tr><td><strong>Advice</strong></td><td><code>time(…)</code> — the code that runs</td></tr>
+    <tr><td><strong>Weaving</strong></td><td>Spring wrapping the bean in a proxy at startup</td></tr>
+  </tbody>
+</table>
+
+<h2>Reading a pointcut</h2>
+
+<pre class="language-java"><code class="language-java">execution(* com.pizza.api.entity..*ServiceImpl.*(..))
+//        ▲ ▲                      ▲            ▲ ▲
+//        │ │                      │            │ └── any arguments
+//        │ │                      │            └──── any method name
+//        │ │                      └─────────────── class name ends "ServiceImpl"
+//        │ └────────────────────────────────────── package and sub-packages (..)
+//        └──────────────────────────────────────── any return type</code></pre>
+
+<p>Note the difference between <code>.</code> and <code>..</code>: one dot is a literal separator,
+two dots means "this package and everything below it". A pointcut that silently matches nothing is
+almost always a <code>.</code> that should have been <code>..</code>.</p>
+
+<p>Other useful forms:</p>
+
+<pre class="language-java"><code class="language-java">// Every method in classes annotated with @RestController
+@Pointcut("within(@org.springframework.web.bind.annotation.RestController *)")
+public void controllers() {}
+
+// Every method annotated with a specific annotation
+@Pointcut("@annotation(com.pizza.api.aspect.Audited)")
+public void audited() {}
+
+// Combine them
+@Around("controllers() &amp;&amp; !audited()")</code></pre>
+
+<p><strong>Named pointcuts are worth the extra lines.</strong> The expression is declared once, and
+the advice then reads as prose instead of as a regex.</p>
+
+<h2>The five advice types</h2>
+
+<table>
+  <thead>
+    <tr><th>Advice</th><th>Runs</th><th>Can it stop the call?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>@Before</code></td><td>before</td><td>only by throwing</td></tr>
+    <tr><td><code>@AfterReturning</code></td><td>after success</td><td>no</td></tr>
+    <tr><td><code>@AfterThrowing</code></td><td>after an exception</td><td>no</td></tr>
+    <tr><td><code>@After</code></td><td>always, like <code>finally</code></td><td>no</td></tr>
+    <tr><td><code>@Around</code></td><td>wraps the call</td><td><strong>yes</strong></td></tr>
+  </tbody>
+</table>
+
+<p><code>@Around</code> is the only one that can see the outcome <em>and</em> decide whether the call
+happens at all. It must call <code>joinPoint.proceed()</code> and return its result — forget, and the
+method never runs and every caller silently gets <code>null</code>.</p>
+
+<p>Note what the aspect above deliberately does <strong>not</strong> do: it never swallows the
+exception. It logs and rethrows. An aspect that quietly turns a failure into a <code>null</code> is
+how observability code becomes the bug.</p>
+
+<h2>⚠️ The proxy rule</h2>
+
+<p>Spring implements all of this by wrapping your bean in a proxy. The container hands the proxy to
+everyone who injects the bean, so calls arriving from <em>another bean</em> pass through the advice.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   another bean ──▶ [ proxy ] ──▶ [ your bean ]
+                       ▲                 │
+                    advice runs          │ this.b() goes straight here.
+                                         └─▶ no proxy, no advice.</code></pre>
+
+<p>Which means:</p>
+
+<pre class="language-java"><code class="language-java">@Service
+public class ProductServiceImpl {
+
+    public void a() {
+        b();          // NOT advised - internal call, the proxy is not involved
+    }
+
+    @Transactional    // no transaction when called from a()
+    public void b() { /* … */ }
+}</code></pre>
+
+<p><strong>This is not an AOP quirk.</strong> It applies identically to:</p>
+
+<ul>
+  <li><code>@Transactional</code> — no transaction, and the write commits outside one</li>
+  <li><code>@Cacheable</code> — nothing cached, the method just runs every time</li>
+  <li><code>@Async</code> — runs on the caller's thread, synchronously</li>
+  <li><code>@Retryable</code> — no retry, the first failure propagates</li>
+  <li><code>@PreAuthorize</code> — <strong>no authorization check at all</strong></li>
+</ul>
+
+<p>Every one of these fails <em>silently</em>. Nothing logs, nothing throws; the behaviour is simply
+absent. <strong>When an annotation "isn't working", a self-invocation is the first thing to
+check.</strong></p>
+
+<p>The fixes, best first:</p>
+
+<ol>
+  <li><strong>Move the annotated method to another bean.</strong> Usually the right answer — if
+  <code>b()</code> deserves its own transaction, it is doing its own job.</li>
+  <li><strong>Inject the interface into itself</strong> and call through it, so the call goes via the
+  proxy. Works, and looks strange enough that it needs a comment.</li>
+  <li><strong><code>AopContext.currentProxy()</code></strong> — requires
+  <code>exposeProxy = true</code> and is a last resort.</li>
+</ol>
+
+<p>Two related consequences of proxying: <strong><code>private</code> and <code>final</code> methods
+are never advised</strong> (a proxy cannot override them), and by default Spring proxies the interface
+if there is one, so the bean type you inject should be the interface.</p>
+
+<h2>When AOP is the wrong tool</h2>
+
+<p>AOP hides behaviour. That is the point, and it is also the cost: someone reading
+<code>createOrder</code> cannot see that it is being timed. Worth it for genuinely uniform,
+genuinely cross-cutting concerns — logging, metrics, transactions, security. Not worth it for
+business rules, where "why did this happen?" should be answerable by reading the method.</p>
+
+<p>Prefer the framework's own annotations where they exist. Do not write a caching aspect; use
+<code>@Cacheable</code>.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Boot 4: <code>spring-boot-starter-aspectj</code></strong>, not
+  <code>-aop</code>.</li>
+  <li><strong><code>@Around</code> must call <code>proceed()</code></strong> and should rethrow, never
+  swallow.</li>
+  <li><strong>The proxy rule: a self-invocation is never advised</strong>, and this silently breaks
+  <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code>, <code>@Retryable</code>
+  and <code>@PreAuthorize</code> too.</li>
+  <li><strong>Use it for cross-cutting concerns, not for business logic.</strong></li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-event-handling">application events</a> — the other way to
+decouple, and the transaction-phase mistake that emails customers about orders that were rolled
+back.</p>
