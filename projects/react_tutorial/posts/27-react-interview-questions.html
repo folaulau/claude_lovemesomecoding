@@ -1,0 +1,522 @@
+<p>Twenty questions pitched at senior level — the ones that separate someone who has used React from
+someone who understands why it behaves the way it does. Most of them are not really about API
+surface; they are about rendering, identity and when <em>not</em> to reach for a feature.</p>
+
+<p>Every answer here is grounded in the same application the rest of this track uses: a pizza
+ordering site with a cart, forms, routing, a lazily-loaded admin dashboard and Redux. Where an answer
+has a longer version, it is linked.</p>
+
+<h2>Rendering and reconciliation</h2>
+
+<h3>1. What actually causes a component to re-render?</h3>
+
+<p>Exactly three things:</p>
+
+<ul>
+  <li>Its own state changed — a <code>useState</code> setter or a <code>useReducer</code> dispatch
+      that produced a <strong>new</strong> value.</li>
+  <li>Its parent re-rendered. This one catches people out: a child re-renders even if none of its
+      props changed, unless it is wrapped in <code>memo</code>.</li>
+  <li>A context it consumes published a new value.</li>
+</ul>
+
+<p>What does <strong>not</strong> cause a re-render: mutating an object, changing a ref's
+<code>.current</code>, or changing a module-level variable. React compares with
+<code>Object.is</code>, so <code>setItems(items)</code> after <code>items.push(x)</code> is a no-op —
+same reference, nothing happened as far as React is concerned.</p>
+
+<p>The senior follow-up is usually "so how do you stop a child re-rendering?" — and the honest first
+answer is that you usually should not bother, because re-rendering is cheap and the real cost is the
+DOM commit, which React already skips when the output is unchanged.</p>
+
+<h3>2. Explain reconciliation, and why <code>key</code> matters.</h3>
+
+<p>When state changes, React produces a new element tree and diffs it against the old one to work out
+the minimum set of DOM operations. To keep it linear rather than O(n³) it makes two assumptions:
+different element types produce different trees, and <strong>the developer will tell it which
+children are stable across renders</strong> — which is what <code>key</code> is.</p>
+
+<p>Within a list, position alone is ambiguous. If the first item disappears, did everything shift up
+by one, or did every item's content change? The key answers that, so React can move a DOM node
+instead of rebuilding it, and keep whatever state lives inside it.</p>
+
+<p>Using the array index defeats the whole mechanism, because the index describes the position rather
+than the item:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{items.map((item, index) =&gt; (
+  &lt;CartLine key={index} item={item} /&gt;     // works until the list changes
+))}</code></pre>
+
+<p>Delete the first of three cart lines and React sees key <code>0</code> still present with different
+content, concludes the item was edited rather than removed, and reuses that DOM node — so the
+quantity dropdown of the deleted row is now attached to the second row. For read-only text you may
+never notice; the moment a row has state or an uncontrolled input, you do.</p>
+
+<p>Longer version: <a href="/react/react-keys">Rendering Lists and Keys</a>.</p>
+
+<h3>3. Why is declaring a component inside another component a bug?</h3>
+
+<p>Because component <em>identity</em> is the function reference, and an inner declaration produces a
+new function on every render:</p>
+
+<pre class="language-tsx"><code class="language-tsx">function MenuPage() {
+  const [filter, setFilter] = useState('ALL');
+
+  // A brand-new function on every render of MenuPage.
+  function ProductRow({ product }) {
+    return &lt;li&gt;{product.name}&lt;/li&gt;;
+  }
+
+  return &lt;ul&gt;{products.map((p) =&gt; &lt;ProductRow key={p.id} product={p} /&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+<p>React compares element types by reference. A different type means "this is a different component",
+so it unmounts the whole subtree and mounts a fresh one — every render. State inside those rows is
+lost, inputs lose focus mid-typing, and every effect re-runs. It presents as a state bug and it is a
+definition-location bug.</p>
+
+<p>The same mechanism used deliberately is a useful tool: change a component's <code>key</code> and
+React discards it and mounts a fresh one, which is the idiomatic way to reset a form when the thing
+it is editing changes.</p>
+
+<h2>State</h2>
+
+<h3>4. Why does this only increment once?</h3>
+
+<pre class="language-tsx"><code class="language-tsx">function handleClick() {
+  setCount(count + 1);
+  setCount(count + 1);
+  setCount(count + 1);
+}</code></pre>
+
+<p>Because <code>count</code> is a <code>const</code> belonging to <em>this</em> render. Setting state
+does not change the variable you are holding — it schedules a render with a new one. All three calls
+read the same frozen <code>0</code> and all three say "make it 1", and React performs one re-render
+for the whole handler.</p>
+
+<p>The fix is the updater form, which receives the latest pending state:</p>
+
+<pre class="language-tsx"><code class="language-tsx">function handleClick() {
+  setCount((c) =&gt; c + 1);
+  setCount((c) =&gt; c + 1);
+  setCount((c) =&gt; c + 1);       // now it really is 3
+}</code></pre>
+
+<p><strong>The rule: if the new value depends on the old one, use the updater form.</strong></p>
+
+<p>A strong answer names why this design is good rather than treating it as a gotcha — everything a
+render sees is frozen for the duration of that render, so a handler can never observe half-updated
+state. A strong answer also knows that React 18 extended automatic batching to promises,
+<code>setTimeout</code> and native event handlers, where React 17 batched only inside React event
+handlers.</p>
+
+<h3>5. Why does React insist on immutable state updates?</h3>
+
+<p>Because reference comparison is what the rest of React is built on. <code>memo</code>,
+<code>useMemo</code>, <code>useCallback</code> and every dependency array decide whether something
+changed by comparing references. Mutating one object in place quietly switches all of that off at
+once, and it also makes time-travel debugging and cheap undo impossible.</p>
+
+<p>The three list operations, all non-mutating — this is the real cart reducer:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// add
+items: [...state.items, action.payload]
+
+// remove
+items: state.items.filter((item) =&gt; item.lineId !== action.payload.lineId)
+
+// update one
+items: state.items.map((item) =&gt;
+  item.lineId === target ? { ...item, quantity: next } : item,
+)</code></pre>
+
+<p>Note that <code>map</code> returns every non-matching item <strong>as is</strong>, preserving its
+identity — which is exactly what lets a <code>memo</code>'d row skip re-rendering. The mutating
+methods to watch for are <code>push</code>, <code>splice</code>, and especially <code>sort</code> and
+<code>reverse</code>, which read like they return a new array and do not.</p>
+
+<p>Redux Toolkit appears to break this rule and does not — it runs reducers through Immer, which
+records writes against a draft and produces the copy for you.</p>
+
+<h3>6. What is a stale closure, and where do you meet one?</h3>
+
+<p>An event handler or effect callback closes over the props and state of the render that created it.
+If it outlives that render, it is holding old values.</p>
+
+<p>The classic is a timer. Here is the real toast provider — it adds a toast and removes it three
+seconds later:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const showToast = useCallback((message: string, variant: ToastVariant = 'success') =&gt; {
+  const id = crypto.randomUUID();
+  setToasts((current) =&gt; [...current, { id, message, variant }]);
+
+  window.setTimeout(() =&gt; {
+    setToasts((current) =&gt; current.filter((toast) =&gt; toast.id !== id));
+  }, 3000);
+}, []);</code></pre>
+
+<p>Written as <code>setToasts([...toasts, newToast])</code> it would be broken twice over: firing two
+toasts quickly would lose the first, and the timeout would restore a three-second-old snapshot of the
+list. The updater form reads nothing from the closure, which is also why the empty
+<code>useCallback</code> dependency array is correct rather than a shortcut.</p>
+
+<p>The other common cause is an effect with an under-specified dependency array — the effect keeps
+the first render's values forever. Which is question 8.</p>
+
+<h2>Hooks</h2>
+
+<h3>7. Why can't hooks be called conditionally?</h3>
+
+<p>Because React identifies hook state by <strong>call order</strong>, not by name. It has nothing
+else to go on — <code>useState</code> is called with a value, not a key. Internally each component
+has an ordered list of hook slots, and the <em>n</em>th <code>useState</code> call maps to the
+<em>n</em>th slot.</p>
+
+<p>Put one behind an <code>if</code> and the number of calls changes between renders, so slot 2 now
+holds what slot 3 held, and state silently belongs to the wrong variable. React detects the count
+mismatch and throws <em>"Rendered fewer hooks than expected"</em>.</p>
+
+<p>In practice the cause is almost always a hook after an early <code>return</code>, which is easy to
+miss when a guard clause is added later.</p>
+
+<h3>8. What goes wrong when you lie to a dependency array?</h3>
+
+<p>Two opposite failures, and a senior answer names both.</p>
+
+<p><strong>Under-listing</strong> gives you a stale closure — the effect or memo keeps values from the
+render that created it:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// The memo keeps the FIRST filter's results forever.
+const visible = useMemo(() =&gt; products.filter((p) =&gt; p.type === activeFilter), [products]);</code></pre>
+
+<p><strong>Listing something recreated every render</strong> means it never matches, so the effect
+runs every render — and if the effect sets state, that is an infinite loop:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// `options` is a new object every render, so the effect runs every render.
+const options = { page, size: 20 };
+useEffect(() =&gt; { void load(options); }, [options]);</code></pre>
+
+<p>The important part of the answer is what you do about it. When
+<code>react-hooks/exhaustive-deps</code> wants a dependency you do not want to react to, the fix is
+to restructure — move the value into a ref, wrap the function in <code>useCallback</code>, compute it
+inside the effect, or depend on the primitive fields rather than the object. Deleting it from the
+array and adding an eslint-disable is how the bug ships.</p>
+
+<h3>9. Name three effects that should be deleted.</h3>
+
+<p>This is really "do you know that most effects should not exist".</p>
+
+<p><strong>Deriving data.</strong> An effect that watches state to set other state costs an extra
+render and creates a second source of truth that can go stale:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Wrong.
+const [pizzas, setPizzas] = useState&lt;Product[]&gt;([]);
+useEffect(() =&gt; {
+  setPizzas(products.filter((p) =&gt; p.type === 'PIZZA'));
+}, [products]);
+
+// Right — just calculate it.
+const pizzas = useMemo(() =&gt; products.filter((p) =&gt; p.type === 'PIZZA'), [products]);</code></pre>
+
+<p><strong>Reacting to an event.</strong> The click already happened in a handler; watching state to
+discover it is indirect and fragile. Show the toast, send the request and navigate in the handler.</p>
+
+<p><strong>Resetting state when a prop changes.</strong> Usually better expressed as a
+<code>key</code> on the component, which resets everything in one line.</p>
+
+<p>The rule of thumb: <strong>an effect synchronises React with something outside React.</strong> If
+both sides of the problem are inside React, you want a calculation during render or a line in an
+event handler.</p>
+
+<h3>10. How do you fetch data in an effect without race conditions?</h3>
+
+<p>The naive version has a real bug: two requests in flight can resolve out of order, and the slower,
+staler one wins. It also sets state on unmounted components.</p>
+
+<p>The answer is a cleanup function. Here is the real menu fetch:</p>
+
+<pre class="language-tsx"><code class="language-tsx">useEffect(() =&gt; {
+  const controller = new AbortController();
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const [productData, toppingData, crustData] = await Promise.all([
+        api.get&lt;Product[]&gt;('/api/products', { signal: controller.signal }),
+        api.get&lt;Topping[]&gt;('/api/toppings', { signal: controller.signal }),
+        api.get&lt;Crust[]&gt;('/api/crusts', { signal: controller.signal }),
+      ]);
+      setProducts(productData);
+      setToppings(toppingData);
+      setCrusts(crustData);
+    } catch (err) {
+      // An abort is not a failure — it means we navigated away or StrictMode re-ran the effect.
+      if (controller.signal.aborted) return;
+      setError('Could not load the menu.');
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  }
+
+  void load();
+  return () =&gt; controller.abort();
+}, [reloadToken]);</code></pre>
+
+<p>Four details worth naming: the effect callback cannot itself be <code>async</code> (its return
+value must be the cleanup function, not a promise); <code>AbortController</code> plus cleanup is what
+makes it safe to re-run or unmount mid-flight; an abort is caught and ignored rather than shown as a
+failure; and <code>Promise.all</code> rather than three sequential awaits.</p>
+
+<p>The strongest close is admitting you would not write this by hand in production —
+caching, deduplication, retries and revalidation are what TanStack Query or RTK Query already do.</p>
+
+<h3>11. When do you use a ref instead of state?</h3>
+
+<p>When the value must survive re-renders but the screen does not depend on it. Changing a ref does
+not trigger a render, and that is the entire distinction.</p>
+
+<p>Two legitimate uses: reaching a DOM node for something React has no declarative equivalent for —
+focus, scroll, measurement, media playback — and holding a mutable value like a timer id.</p>
+
+<p>A good concrete example is the cart's server-side id:</p>
+
+<pre class="language-tsx"><code class="language-tsx">/*
+ * A ref, not state: the persist effect needs the CURRENT cart id without re-running every time
+ * the id changes (which would cause an extra PUT).
+ */
+const cartIdRef = useRef&lt;string | null&gt;(cartIdStore.get());</code></pre>
+
+<p>As state, the id would belong in the persist effect's dependency array, so setting it would re-run
+the effect and issue a second PUT. Nothing on screen displays the id, so it is genuinely not display
+state.</p>
+
+<p>The trap to name: <strong>reading or writing a ref during render is a bug.</strong> React may
+render twice, discard the result, or pause. Refs are touched in event handlers and effects.</p>
+
+<h3>12. Two components call the same custom hook. Do they share state?</h3>
+
+<p>No — and this is the question that reveals whether someone understands what a hook is. A custom
+hook is a function that calls other hooks. Calling it twice creates two independent sets of hook
+slots, in two different components.</p>
+
+<p>Hooks share <strong>logic</strong>, never state. If two components must see the same value, that is
+context (or a store), and the usual shape is both together: a provider owning the state and a custom
+hook consuming it:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function useCart(): CartContextValue {
+  const context = useContext(CartContext);
+  if (context === undefined) {
+    throw new Error('useCart must be used inside a &lt;CartProvider&gt;');
+  }
+  return context;
+}</code></pre>
+
+<p>Four lines doing three jobs: hiding the context object so the implementation stays private,
+narrowing <code>CartContextValue | undefined</code> to <code>CartContextValue</code> so no consumer
+needs a null check, and turning a missing provider into a sentence instead of <em>"cannot read
+properties of undefined"</em>.</p>
+
+<h2>Architecture</h2>
+
+<h3>13. Why do people say "context causes performance problems", and are they right?</h3>
+
+<p>Partly. Every component consuming a context re-renders when that context's value changes, and
+context compares the value by <strong>reference</strong>. So the actual problem is almost always
+this:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// A brand-new object every render, so every consumer re-renders every time —
+// even when nothing they read has changed.
+&lt;CartContext.Provider value={{ items, totals, addItem, removeItem }}&gt;</code></pre>
+
+<p>Two fixes, and a senior answer gives both.</p>
+
+<p><strong>Memoise the value</strong>, and every function inside it:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const addItem = useCallback((input: AddItemInput) =&gt; { /* … */ }, []);
+
+const value = useMemo&lt;CartContextValue&gt;(
+  () =&gt; ({ items: state.items, totals: calculateTotals(state.items, state.orderType), addItem, /* … */ }),
+  [state.items, state.orderType, addItem /* … */],
+);</code></pre>
+
+<p><strong>Split contexts by how often they change.</strong> This app has four providers rather than
+one — auth changes on sign-in, the menu changes once, the cart changes constantly, toasts change
+constantly and briefly. A single <code>AppContext</code> would mean every cart click re-rendering
+everything that only cares who is signed in.</p>
+
+<p>The honest caveat: context has no selector API, so a consumer cannot subscribe to one field of a
+value. That is a genuine limitation, and it is one of the reasons stores exist.</p>
+
+<h3>14. When would you add Redux to an app that already has context and reducers?</h3>
+
+<p>A reducer inside a context provider is already Redux's architecture, so the answer has to be about
+what the library adds beyond that:</p>
+
+<ul>
+  <li><strong>State that outlives the components showing it.</strong> The strongest one. In this app
+      the admin reports were held in <code>useState</code>, so switching tabs and back threw the
+      report away and refetched it. Store state is not owned by a component, so the tab comes back
+      instantly.</li>
+  <li><strong>Per-selector subscriptions</strong>, so a component re-renders for the slice it reads
+      and not for unrelated ones.</li>
+  <li><strong>Modelled async</strong> — <code>createAsyncThunk</code> gives you the
+      pending/fulfilled/rejected triple instead of writing loading and error flags by hand.</li>
+  <li><strong>DevTools.</strong> Every action with its payload, the state diff it produced, and the
+      ability to step backwards. React DevTools shows current state, not the sequence that produced
+      it.</li>
+</ul>
+
+<p>And what it costs: two dependencies, more indirection, and the requirement that actions be
+serialisable — which in this app meant flattening <code>ApiError</code> at the edge, because Redux
+Toolkit serialises a thrown error down to name/message/stack and drops the structured body the forms
+needed.</p>
+
+<p>The answer that lands best names the modern caveat: much of what used to go in Redux was
+<em>server</em> data, and server data has better tools now. Reach for a store for genuinely shared,
+long-lived, client-side state — not because the app is "big".</p>
+
+<h3>15. What do error boundaries not catch?</h3>
+
+<p>Event handlers, async code, errors thrown inside the boundary itself, and server rendering. Which
+is most of what actually goes wrong — a failed request is far more common than a component throwing
+during render.</p>
+
+<p>So a real application has two systems. Expected failures — the network is down, the password is
+wrong — are modelled as state and rendered. Error boundaries are for the unexpected: the bug you did
+not know you had.</p>
+
+<p>Two more things a senior answer includes. <strong>They still require a class component</strong>,
+because there is no hook equivalent of <code>componentDidCatch</code> — so even a fully modern
+codebase keeps one. And <strong>placement is the whole benefit</strong>: a boundary around the routed
+content leaves the navbar, cart drawer and footer alive when a page crashes, whereas one at the root
+catches everything and therefore loses everything.</p>
+
+<h3>16. Where do you split your bundle, and what goes wrong if you overdo it?</h3>
+
+<p>At route boundaries, and specifically routes a given visitor is unlikely to visit — plus heavy
+single-screen libraries (charts, editors, maps) and anything behind a permission most users lack.</p>
+
+<p>Real numbers from this app's build make the case:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">dist/assets/store-z0RVAOPD.js               36.54 kB │ gzip:  12.84 kB   ← Redux, admin only
+dist/assets/index-B9HlveUY.js              350.46 kB │ gzip: 109.21 kB   ← what a customer downloads
+dist/assets/AdminReportsPage-b0f8Qhta.js   353.73 kB │ gzip:  98.69 kB   ← charts, admin only</code></pre>
+
+<p>Roughly 430 kB never reaches a customer. Note <em>why</em> Redux ended up in a lazy chunk:
+<code>&lt;Provider store={store}&gt;</code> is mounted inside the lazily-loaded
+<code>AdminLayout</code> rather than in <code>main.tsx</code>. Where you mount a provider is a
+bundling decision as well as an architectural one — that is a good detail to volunteer.</p>
+
+<p>What goes wrong when overdone: splitting something needed immediately adds a network round trip to
+the critical path, and splitting many small components produces a swarm of tiny requests. The two
+practical failure modes are a visible pause on first navigation — fixed by preloading on hover — and
+a chunk 404 after a deploy while someone has the old page open, which is why the
+<code>Suspense</code> boundary needs an error boundary outside it.</p>
+
+<h2>Performance</h2>
+
+<h3>17. When does <code>memo</code> do nothing?</h3>
+
+<p>Whenever a prop is a new reference on every render, which is three cases and one underlying
+cause:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;ProductCard product={product} onSelect={(p) =&gt; setSelected(p)} /&gt;   // inline arrow
+&lt;ProductCard product={product} options={{ compact: true }} /&gt;        // object literal
+&lt;ProductCard product={product} badges={product.tags.map(toBadge)} /&gt; // array built in render</code></pre>
+
+<p>In each case the shallow comparison fails every time, so <code>memo</code> adds a comparison and
+saves nothing. <code>memo</code> and <code>useCallback</code> are a pair — the real menu page wraps
+its handler precisely so the fourteen memoised cards actually hit:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const handleSelect = useCallback((product: Product) =&gt; {
+  setSelectedProduct(product);
+}, []);</code></pre>
+
+<p>Two more points worth making. <code>useCallback</code> on a handler passed to a plain DOM element
+is pure waste, because nothing downstream compares it. And composition is often the better fix than
+memoisation — moving state down, or passing the expensive subtree as <code>children</code> so it is
+not re-created, solves the same problem structurally.</p>
+
+<h3>18. A page feels slow. How do you find out why?</h3>
+
+<p>The answer should be a method, not a list of hooks.</p>
+
+<ol>
+  <li><strong>Reproduce and profile.</strong> React DevTools Profiler, record the interaction, look at
+      the flamegraph: what re-rendered, how many times, and how long each took. The "why did this
+      render?" setting names the trigger.</li>
+  <li><strong>Separate the two costs.</strong> Many cheap re-renders is a different problem from one
+      expensive render. The first is a memoisation or state-placement problem; the second is an
+      algorithm or a too-large list.</li>
+  <li><strong>Check it is React at all.</strong> Very often it is not — an unoptimised image, a
+      blocking request, a 2 MB bundle, a layout thrash. The browser's Performance panel and the
+      network tab come before any <code>useMemo</code>.</li>
+  <li><strong>Fix the cause, then re-measure.</strong> Structural fixes first — move state down,
+      paginate or virtualise a long list, split the bundle. Memoisation last, because it is the one
+      that adds code without changing the shape of the problem.</li>
+</ol>
+
+<p>A candidate who opens with "I'd wrap it in <code>useMemo</code>" has answered the wrong question.
+The biggest wins are usually a list that should be paginated, an image that should be smaller, or a
+bundle that should be split.</p>
+
+<h2>Modern React</h2>
+
+<h3>19. What changed in React 19 that affects how you write code?</h3>
+
+<p>The ones that come up:</p>
+
+<ul>
+  <li><strong><code>ref</code> is an ordinary prop.</strong> <code>forwardRef</code> is no longer
+      needed for function components. Existing code still works.</li>
+  <li><strong><code>ReactDOM.render</code> is gone.</strong> Deprecated in 18, removed in 19 — the
+      entry point is <code>createRoot</code> from <code>react-dom/client</code>. This is what
+      <em>"ReactDOM.render is not a function"</em> means.</li>
+  <li><strong>Actions</strong> — <code>useActionState</code>, <code>useFormStatus</code> and
+      <code>useOptimistic</code> — which handle the pending/error/optimistic triad that everyone
+      hand-rolls around form submission.</li>
+  <li><strong>The <code>use</code> hook</strong>, which reads a promise or a context and, unlike every
+      other hook, may be called conditionally.</li>
+  <li><strong>Cleanup functions from callback refs</strong>, and better hydration error messages.</li>
+  <li><strong>The React Compiler</strong> — optional, and where enabled it memoises automatically,
+      which makes most hand-written <code>useMemo</code>/<code>useCallback</code>/<code>memo</code>
+      unnecessary. It relies on your components being pure and your state immutable, which is why
+      those rules matter more rather than less.</li>
+</ul>
+
+<h3>20. Explain Server Components, and the concurrent features you have actually used.</h3>
+
+<p><strong>Server Components</strong> render on the server and send a description of the UI rather
+than JavaScript. They can read a database or the filesystem directly, and they ship zero bundle. The
+cost is the boundary: they have no state, no effects and no event handlers, and anything crossing
+from server to client must be serialisable — so a function cannot be passed as a prop.
+<code>'use client'</code> marks where interactivity resumes. In practice they need a framework; a
+plain Vite + React app does not have them.</p>
+
+<p><strong>Concurrent features</strong> are about keeping the app responsive while React works:</p>
+
+<ul>
+  <li><code>useTransition</code> marks an update as non-urgent, so typing stays responsive while an
+      expensive filtered list re-renders behind it, and gives you an <code>isPending</code> flag.</li>
+  <li><code>useDeferredValue</code> is the same idea applied to a value rather than a setter — render
+      the previous result while the new one is computed.</li>
+  <li><code>Suspense</code> declares "this subtree is not ready", which is what makes both of the
+      above composable. Most people first meet it as the partner to <code>lazy</code>.</li>
+</ul>
+
+<p>The honest close is worth saying out loud: on a normal CRUD application you may never reach for
+<code>useTransition</code>, and reaching for it before profiling is a smell. Knowing what problem it
+solves is the point.</p>
+
+<h2>How to use this list</h2>
+
+<p>If you are preparing, the highest-value work is not memorising these — it is being able to point at
+code you have written and say why. Questions 1, 4, 5 and 8 are the load-bearing ones; nearly every
+other React question reduces to one of them.</p>
+
+<p>If you are interviewing someone, the follow-up is where the signal is. "Why is that a problem?" and
+"when would you not do that?" separate understanding from recall far better than another question
+does.</p>
+
+<p>The rest of this track starts at <a href="/react/react-get-started">Get Started</a>.</p>

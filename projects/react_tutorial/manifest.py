@@ -2,11 +2,11 @@
 
 `file` is relative to `posts/`. `date` drives ordering everywhere on the site —
 archives and the sitemap sort newest first, and prev/next walks the category
-oldest-first — so the dates ascend with the track and lesson 25 is the newest.
+oldest-first — so the dates ascend with the track and lesson 27 is the newest.
 
 17 of these slugs were published in 2019 and are indexed. They are being
 rewritten in place, NOT replaced: changing one of those slugs changes a live URL.
-The 8 marked `new` below did not exist before.
+The 10 marked `new` below did not exist before.
 
 Because the old posts carry 2019 dates and `upsert_post` never overwrites an
 existing date, seeding this track needs `seed.py --force-dates` for the reading
@@ -374,6 +374,20 @@ POSTS = [
             "variables, partials and mixins in a component stylesheet, .module.scss to get "
             "scoping and Sass at once, and the one thing Sass still does that plain CSS cannot: "
             "recompile Bootstrap itself with your own colours."
+        ),
+    },
+    # ------------------------------------------------------------- interview
+    {
+        "slug": "react-interview-questions",
+        "title": "React – Interview Questions",
+        "file": "27-react-interview-questions.html",
+        "date": "2026-08-20T09:00:00",
+        "tags": ["react", "interview"],
+        "excerpt": (
+            "Twenty senior-level questions and answers — what actually triggers a re-render, why "
+            "three setState calls only count once, what breaks when you lie to a dependency array, "
+            "when memo silently does nothing, what error boundaries do not catch, and how to "
+            "diagnose a slow page without reaching for useMemo first. Grounded in real code."
         ),
     },
 ]

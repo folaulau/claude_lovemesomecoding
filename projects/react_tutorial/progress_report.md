@@ -16,14 +16,14 @@ This project rewrites all 17 **in place** — same slugs, so no URL is lost — 
 (function components, hooks, TypeScript) and adds 8 new posts for the topics that hooks-era React
 needs and no existing slug covers.
 
-**Result: a 26-post track**, after a `react-get-started` landing page was added at the front.
+**Result: a 27-post track** — a `react-get-started` landing page at the front and a `react-interview-questions` page at the end.
 
 ## Decisions
 
 | Decision | Choice | Why |
 |---|---|---|
 | Existing 17 posts | Rewrite in place, keep every slug | They are indexed URLs. Rewriting keeps the ranking and kills the stale content in one move. |
-| Track size | 26 posts (17 rewritten + 9 new) | Comparable to the Oracle track's 14; deep enough to be a real tutorial, finite enough to maintain. |
+| Track size | 27 posts (17 rewritten + 10 new) | Comparable to the Oracle track's 14; deep enough to be a real tutorial, finite enough to maintain. |
 | Dates | Restamped to 2026-06-03 … 2026-08-17, 3 days apart | The old posts carried 2019 dates, which `upsert_post` never overwrites — hence `seed.py --force-dates`. Without it the pager reads in the wrong order. |
 | Redux example | Redux Toolkit for the admin area only | Folau built it: four slices, `<Provider>` inside `AdminLayout`. Storefront keeps its four contexts, so `pizza/CLAUDE.md` still holds — and Redux lands in the lazy admin chunk. |
 | Sass example | `theme.css` converted to `theme.scss` + `_tokens.scss` | Compiled output diffed against the original: identical bar Sass normalising `rgb()`, a computed `--pizza-red-dark`, and `prefers-reduced-motion` inverted to `no-preference`. |
@@ -34,62 +34,69 @@ needs and no existing slug covers.
 ## Topic list
 
 The order is the reading order. `date` ascends with the track so the prev/next pager reads
-lesson 1 → lesson 25 (see `projects/oracle/README.md` for why).
+lesson 1 → lesson 27 (see `projects/oracle/README.md` for why).
 
 ### Part 1 — Getting started
 
-| # | Slug | Title | State | Pizza example |
-|---|------|-------|-------|---------------|
-| 1 | `react-set-up` | Set Up a React Project with Vite | rewrite (57w) | the app's own `package.json` / `vite.config.ts` |
-| 2 | `react-es6` | The JavaScript You Need First | rewrite (346w) | destructuring, spread, `map`, modules — all over the app |
-| 3 | `react-render-html` | Rendering to the DOM | rewrite (334w) | `main.tsx` — `createRoot`, `StrictMode` |
+| # | Slug | Title | State | Source in the demo app |
+|---|------|-------|-------|------------------------|
+| 1 | `react-get-started` | Get Started | **new** | the track index; versions table |
+| 2 | `react-set-up` | Set Up a Project with Vite | rewrite | `package.json`, `vite.config.ts`, `index.html` |
+| 3 | `react-es6` | The JavaScript You Need First | rewrite | destructuring, spread and `map`, all over the app |
+| 4 | `react-render-html` | Rendering to the DOM | rewrite | `main.tsx` |
 
 ### Part 2 — Describing the UI
 
-| # | Slug | Title | State | Pizza example |
-|---|------|-------|-------|---------------|
-| 4 | `react-components` | Your First Component | rewrite (434w) | `Footer.tsx`, `ProductCard.tsx` |
-| 5 | `react-jsx` | JSX | rewrite (530w) | `HomePage.tsx` |
-| 6 | `react-props` | Props | rewrite (372w) | `ProductCard.tsx`, `CartDrawer.tsx` |
-| 7 | `react-conditional-rendering` | Conditional Rendering | **new** | `AppNavbar.tsx`, `ProtectedRoute.tsx` |
-| 8 | `react-keys` | Rendering Lists and Keys | rewrite (194w) | `MenuPage.tsx`, `CartDrawer.tsx` |
+| # | Slug | Title | State | Source in the demo app |
+|---|------|-------|-------|------------------------|
+| 5 | `react-components` | Your First Component | rewrite | `Footer.tsx`, `ProductCard.tsx`, `App.tsx` |
+| 6 | `react-jsx` | JSX | rewrite | `ProductCard`, `HomePage`, `LoginPage` |
+| 7 | `react-props` | Props | rewrite | `ProductCard`, `ProtectedRoute` |
+| 8 | `react-conditional-rendering` | Conditional Rendering | **new** | `ProtectedRoute`, `AppNavbar`, `CartDrawer` |
+| 9 | `react-keys` | Rendering Lists and Keys | rewrite | `MenuPage`, `CartDrawer`, `PizzaBuilderModal` |
 
 ### Part 3 — Interactivity
 
-| # | Slug | Title | State | Pizza example |
-|---|------|-------|-------|---------------|
-| 9 | `react-events` | Handling Events | rewrite (416w) | `ProductCard.tsx`, `AppNavbar.tsx` |
-| 10 | `react-state` | State with useState | rewrite (188w) | `PizzaBuilderModal.tsx` |
-| 11 | `react-update-state` | Updating State Correctly | rewrite (88w) | `CartContext.tsx` reducer — objects and arrays |
-| 12 | `react-forms` | Forms and Controlled Inputs | rewrite (302w) | `LoginPage.tsx`, `CheckoutPage.tsx` |
+| # | Slug | Title | State | Source in the demo app |
+|---|------|-------|-------|------------------------|
+| 10 | `react-events` | Handling Events | rewrite | `ProductCard`, `LoginPage`, `PizzaBuilderModal` |
+| 11 | `react-state` | State with useState | rewrite | `PizzaBuilderModal`, `MenuPage`, `App` |
+| 12 | `react-update-state` | Updating State Correctly | rewrite | `cartReducer`, `ToastContext` |
+| 13 | `react-forms` | Forms and Controlled Inputs | rewrite | `LoginPage`, `PizzaBuilderModal` |
 
 ### Part 4 — Managing state
 
-| # | Slug | Title | State | Pizza example |
-|---|------|-------|-------|---------------|
-| 13 | `react-context` | Passing Data Deeply with Context | **new** | `AuthContext.tsx`, `MenuContext.tsx` |
-| 14 | `react-usereducer` | useReducer | **new** | `CartContext.tsx` |
-| 15 | `react-custom-hooks` | Custom Hooks | **new** | `useCart`, `useAuth`, `useMenu`, `useToast` |
-| 16 | `react-redux` | Redux — and Whether You Need It | rewrite (957w) | Context + `useReducer` as the alternative. **Gap: pizza has no Redux.** |
+| # | Slug | Title | State | Source in the demo app |
+|---|------|-------|-------|------------------------|
+| 14 | `react-context` | Passing Data Deeply with Context | **new** | all four providers |
+| 15 | `react-usereducer` | useReducer | **new** | `CartContext.tsx` |
+| 16 | `react-custom-hooks` | Custom Hooks | **new** | `useCart`, `useAuth`, `useMenu`, `useToast` |
+| 17 | `react-redux` | Redux, and Whether You Need It | rewrite | `store/` — four slices, `AdminLayout`, `AdminOrdersPage` |
 
 ### Part 5 — Escape hatches
 
-| # | Slug | Title | State | Pizza example |
-|---|------|-------|-------|---------------|
-| 17 | `react-lifecycle` | The Component Lifecycle with useEffect | rewrite (416w) | `MenuContext.tsx` — fetching, cleanup, deps |
-| 18 | `react-useref` | Refs | **new** | `PizzaBuilderModal.tsx` |
-| 19 | `react-error-boundary` | Error Boundaries | **new** | `ErrorBoundary.tsx` |
+| # | Slug | Title | State | Source in the demo app |
+|---|------|-------|-------|------------------------|
+| 18 | `react-lifecycle` | The Component Lifecycle with useEffect | rewrite | `MenuContext`, `CartContext` |
+| 19 | `react-useref` | Refs | **new** | `PizzaBuilderModal`, `CartContext` |
+| 20 | `react-error-boundary` | Error Boundaries | **new** | `ErrorBoundary.tsx`, `App.tsx` |
 
 ### Part 6 — Going to production
 
-| # | Slug | Title | State | Pizza example |
-|---|------|-------|-------|---------------|
-| 20 | `react-route` | Routing with React Router | rewrite (38w) | `App.tsx`, `ProtectedRoute.tsx`, `AdminLayout.tsx` |
-| 21 | `react-usememo-usecallback` | useMemo, useCallback and memo | **new** | `MenuPage.tsx`, `CartContext.tsx`, `ProductCard.tsx` |
-| 22 | `react-lazy-suspense` | Code Splitting with lazy and Suspense | **new** | `App.tsx` — the admin bundle |
-| 23 | `react-css` | Styling | rewrite (284w) | `theme.css`, `className` patterns |
-| 24 | `react-with-bootstrap` | React with Bootstrap | rewrite (13w) | the whole app — `react-bootstrap` |
-| 25 | `react-sass` | Sass | rewrite (41w) | **Gap: pizza uses plain CSS.** |
+| # | Slug | Title | State | Source in the demo app |
+|---|------|-------|-------|------------------------|
+| 21 | `react-route` | Routing with React Router | rewrite | `App`, `ProtectedRoute`, `AdminLayout`, `MenuPage` |
+| 22 | `react-usememo-usecallback` | useMemo, useCallback and memo | **new** | `MenuPage`, `CartContext`, `ProductCard` |
+| 23 | `react-lazy-suspense` | Code Splitting with lazy and Suspense | **new** | `App.tsx` + real build output |
+| 24 | `react-css` | Styling | rewrite | `theme.scss`, utility classes |
+| 25 | `react-with-bootstrap` | Bootstrap | rewrite | `CartDrawer`, `PizzaBuilderModal`, `AppNavbar` |
+| 26 | `react-sass` | Sass | rewrite | `_tokens.scss`, `theme.scss` |
+
+### Part 7 — Interview prep
+
+| # | Slug | Title | State | Source in the demo app |
+|---|------|-------|-------|------------------------|
+| 27 | `react-interview-questions` | Interview Questions | **new** | draws on the whole app + the real build output |
 
 ## Demo-app changes this required
 
