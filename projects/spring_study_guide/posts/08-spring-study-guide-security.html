@@ -1,0 +1,333 @@
+<p>Spring Security is a chain of servlet filters in front of your application. Every question below
+is ultimately about that chain: what runs in it, in what order, and what it puts where.</p>
+
+<h2>Authentication and authorisation</h2>
+
+<p><strong>What are they, and which comes first?</strong></p>
+
+<ul>
+<li><strong>Authentication</strong> — establishing <em>who</em> the caller is. Are these credentials
+valid?</li>
+<li><strong>Authorisation</strong> — deciding whether <em>that</em> caller may do <em>this</em>.</li>
+</ul>
+
+<p>Authentication first, necessarily: you cannot decide what someone is allowed to do until you know
+who they are. In HTTP terms, failing the first is <strong>401</strong> and failing the second is
+<strong>403</strong>.</p>
+
+<p><strong>Is security a cross-cutting concern? How is it implemented?</strong></p>
+
+<p>Yes, and Spring implements it two ways at once. At the web layer it is a
+<strong>filter chain</strong> in front of the DispatcherServlet. At the method layer it is
+<strong>AOP</strong> — <code>@PreAuthorize</code> is a proxy, with all the proxy rules that implies.</p>
+
+<h2>The filter chain</h2>
+
+<p><strong>What is the <code>DelegatingFilterProxy</code>?</strong></p>
+
+<p>A servlet filter registered with the container that does nothing but delegate to a Spring bean.
+It exists because filters are created by the servlet container, which knows nothing about the Spring
+context — so the container gets a thin proxy and the real filter gets to be a fully injected bean.</p>
+
+<p><strong>What is the security filter chain?</strong></p>
+
+<p>The ordered list of filters each request passes through. Each has one job, and the order is the
+design. Abbreviated, in order:</p>
+
+<ol>
+<li><code>SecurityContextHolderFilter</code> — loads any existing context.</li>
+<li><code>CsrfFilter</code>.</li>
+<li><code>LogoutFilter</code>.</li>
+<li><strong>Authentication filters</strong> —
+<code>UsernamePasswordAuthenticationFilter</code>, and custom ones like a JWT filter.</li>
+<li><code>ExceptionTranslationFilter</code> — turns security exceptions into 401 or 403.</li>
+<li><code>AuthorizationFilter</code> — applies the rules; <strong>last</strong>, because by now the
+caller is known.</li>
+</ol>
+
+<p>Inspect the real chain at startup with
+<code>logging.level.org.springframework.security=DEBUG</code>. It prints every filter in order,
+which beats guessing.</p>
+
+<p><strong>What is the SecurityContext?</strong></p>
+
+<p>The holder of the current <code>Authentication</code> — the principal, its credentials and its
+granted authorities. It lives in <code>SecurityContextHolder</code>, which by default is backed by a
+<strong>ThreadLocal</strong>.</p>
+
+<pre class="language-java"><code class="language-java">Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+String email = auth.getName();</code></pre>
+
+<p>Two consequences of that ThreadLocal worth being able to state:</p>
+
+<ul>
+<li>The context is <strong>cleared at the end of the request</strong>, because the thread goes back
+to a pool and the next request must not inherit it.</li>
+<li>It does <strong>not</strong> propagate to a new thread. An <code>@Async</code> method sees an
+empty context unless you set <code>MODE_INHERITABLETHREADLOCAL</code> or use
+<code>DelegatingSecurityContextExecutor</code>.</li>
+</ul>
+
+<h2>Configuration</h2>
+
+<p><strong>How do you configure it today?</strong></p>
+
+<p>By publishing a <code>SecurityFilterChain</code> bean and configuring it with the lambda DSL.
+<code>WebSecurityConfigurerAdapter</code> was deprecated in Spring Security 5.7 and removed in 6, and
+Spring Security 7 removed the older chained-setter style as well — so examples written against
+Spring Security 5 do not compile.</p>
+
+<pre class="language-java"><code class="language-java">@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.cors(Customizer.withDefaults())
+                // Safe to disable ONLY because this API is stateless and token-based:
+                // there is no session cookie for a cross-site request to ride on.
+                // Never do this for a cookie-authenticated app.
+                .csrf(csrf -&gt; csrf.disable())
+                .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -&gt; auth
+                        .requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/products/**").permitAll()
+
+                        // SPECIFIC BEFORE GENERAL. Order history needs an account...
+                        .requestMatchers(HttpMethod.GET, "/api/orders/mine").authenticated()
+                        // ...but placing an order must not - this is guest checkout.
+                        .requestMatchers(HttpMethod.POST, "/api/orders").permitAll()
+
+                        .requestMatchers("/api/admin/**").hasRole("ADMIN")
+
+                        // Default deny: anything not listed needs authentication, so a
+                        // new endpoint is closed until someone deliberately opens it.
+                        .anyRequest().authenticated())
+                .addFilterBefore(jwtAuthenticationFilter,
+                        UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}</code></pre>
+
+<p><strong>Why do you need URL rules at all, and in what order must they be written?</strong></p>
+
+<p><strong>First match wins</strong>, so specific patterns must come before general ones. Put
+<code>/api/orders/**</code> above <code>/api/orders/mine</code> and the specific rule is unreachable
+— and nothing warns you. This is the single most common Spring Security misconfiguration.</p>
+
+<p>Always finish with <code>anyRequest().authenticated()</code>. Default-deny means a newly added
+controller is closed until someone opens it deliberately; without it, a forgotten rule is a public
+endpoint.</p>
+
+<p><strong>What does <code>**</code> match?</strong> Any number of path segments, including
+none. A single <code>*</code> matches within one segment only. So <code>/api/orders/*</code> matches
+<code>/api/orders/42</code> but not <code>/api/orders/42/items</code>, while
+<code>/api/orders/**</code> matches both.</p>
+
+<p><strong>Why is an MVC matcher safer than an Ant matcher?</strong> Because it matches the way
+Spring MVC actually routes, so the two cannot disagree. An Ant matcher works on the raw path, and the
+classic exploit is a request that MVC maps to a protected handler but whose literal path does not
+match the pattern — <code>/admin/users.json</code>, a trailing slash, an encoded character. Under
+Spring Security 6+, <code>requestMatchers(...)</code> chooses an MVC matcher automatically when Spring
+MVC is present, which is why the modern answer is "use <code>requestMatchers</code> and do not
+hand-pick".</p>
+
+<h2>Passwords</h2>
+
+<p><strong>Does Spring Security support hashing? What is salting?</strong></p>
+
+<p>Yes. Register a <code>PasswordEncoder</code> bean — <code>BCryptPasswordEncoder</code> is the
+usual choice.</p>
+
+<p>A <strong>salt</strong> is random data mixed into the password before hashing, so that two users
+with the same password get different hashes and a precomputed rainbow table is useless. BCrypt
+generates the salt itself and stores it inside the hash string, which is why
+<code>matches()</code> needs nothing but the raw password and the stored hash.</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * BCrypt is deliberately slow, and that is the point: it makes brute-forcing a stolen
+ * password table expensive. Never store a password with a fast hash such as MD5 or SHA-256.
+ */
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}</code></pre>
+
+<p>The interface is <code>encode()</code> and <code>matches()</code> — note there is no
+<code>decode()</code>, because a hash is one-way. If a system can email you your existing password,
+it is not hashing them.</p>
+
+<h2>Method security</h2>
+
+<p><strong>Why do you need it? What is typically secured that way?</strong></p>
+
+<p>Because URL rules protect <em>one entry point</em>. A service is a bean that any future
+controller, scheduled job or message listener can inject — and the annotation travels with the
+method, so the guard cannot be left behind when the caller changes. It is the
+<strong>service layer</strong> that gets secured this way: the layer where a business operation
+lives, not the layer that happens to be reachable over HTTP.</p>
+
+<pre class="language-java"><code class="language-java">@Service
+public class AdminUserServiceImpl implements AdminUserService {
+
+    @Override
+    @PreAuthorize("hasRole('ADMIN')")
+    @Transactional
+    public void deleteUser(String actingAdminEmail, UUID userId) { ... }
+}</code></pre>
+
+<p>Switch it on with <code>@EnableMethodSecurity</code>.</p>
+
+<p><strong><code>@Secured</code> versus <code>@RolesAllowed</code> versus
+<code>@PreAuthorize</code>?</strong></p>
+
+<table>
+<thead><tr><th>Annotation</th><th>From</th><th>Takes</th></tr></thead>
+<tbody>
+<tr><td><code>@Secured</code></td><td>Spring Security</td><td>a list of role strings, OR-ed</td></tr>
+<tr><td><code>@RolesAllowed</code></td><td>Jakarta (JSR-250)</td><td>the same, but portable</td></tr>
+<tr><td><code>@PreAuthorize</code></td><td>Spring Security</td><td><strong>a SpEL expression</strong></td></tr>
+</tbody>
+</table>
+
+<p><strong>Which one takes SpEL?</strong> <code>@PreAuthorize</code> and
+<code>@PostAuthorize</code> — and that is why they are the ones to use. Only they can express a rule
+about the arguments or the result:</p>
+
+<pre class="language-java"><code class="language-java">@PreAuthorize("hasRole('ADMIN')")
+@PreAuthorize("hasAnyRole('ADMIN','STAFF')")
+@PreAuthorize("#email == authentication.name")            // only your own record
+@PostAuthorize("returnObject.ownerEmail == authentication.name")  // checked AFTER the call</code></pre>
+
+<p><code>@PostAuthorize</code> runs after the method and can inspect the return value — useful, but
+note the method has already executed, so it is no defence against a method with side effects.</p>
+
+<p><strong>⚠️ <code>hasRole("ADMIN")</code> checks for the authority
+<code>ROLE_ADMIN</code>.</strong> The prefix is added by the framework. Storing "ROLE_ADMIN" in the
+database and then calling <code>hasRole("ROLE_ADMIN")</code> looks for
+<code>ROLE_ROLE_ADMIN</code> and silently denies everything. Use
+<code>hasAuthority()</code> if you want no prefix at all.</p>
+
+<pre class="language-java"><code class="language-java">// Where the prefix is added in the pizza API - once, in the filter, not in the database.
+var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));</code></pre>
+
+<p><strong>⚠️ And it is proxy-based</strong>, so it has the same blind spot as
+<code>@Transactional</code>: a call from another method inside the same class skips the check
+entirely.</p>
+
+<h2>Stateless authentication with JWT</h2>
+
+<p>A JWT is <strong>signed, not encrypted</strong> — anyone holding one can read its payload, so
+never put anything secret in the claims. The signature only guarantees that you issued it and nobody
+edited it.</p>
+
+<pre class="language-java"><code class="language-java">public String generateToken(User user) {
+    Instant now = Instant.now();
+
+    return Jwts.builder()
+            .subject(user.getEmail())
+            .claim("role", user.getRole().name())
+            .issuedAt(Date.from(now))
+            .expiration(Date.from(now.plusSeconds(expirationMinutes * 60)))
+            .signWith(key)
+            .compact();
+}
+
+/** Returns the claims if valid, or null if malformed, forged or expired. */
+public Claims parse(String token) {
+    try {
+        return Jwts.parser().verifyWith(key).build().parseSignedClaims(token).getPayload();
+    } catch (JwtException | IllegalArgumentException ex) {
+        // Any failure means "not authenticated". Distinguishing them would only help an
+        // attacker probe the implementation.
+        return null;
+    }
+}</code></pre>
+
+<p>The filter that consumes it:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Extends OncePerRequestFilter because a plain Filter can run more than once per request
+ * (forwards, error dispatches), and re-authenticating each time is wasted work.
+ *
+ * Note what it does NOT do: it never rejects a request. A missing or bad token simply
+ * leaves the context anonymous, and the authorization rules then decide whether that is
+ * acceptable. Keeping authentication and authorization separate is what lets guest
+ * checkout share an endpoint with authenticated ordering.
+ */
+@Component
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+            FilterChain filterChain) throws ServletException, IOException {
+
+        String token = extractToken(request);
+
+        if (token != null &amp;&amp; SecurityContextHolder.getContext().getAuthentication() == null) {
+            Claims claims = jwtService.parse(token);
+
+            if (claims != null) {
+                var authorities =
+                        List.of(new SimpleGrantedAuthority("ROLE_" + claims.get("role", String.class)));
+                var authentication = new UsernamePasswordAuthenticationToken(
+                        claims.getSubject(), null, authorities);
+
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            }
+        }
+
+        filterChain.doFilter(request, response);   // ALWAYS continue the chain
+    }
+}</code></pre>
+
+<p>The trade-off to be able to state: a stateless token cannot be revoked before it expires. Real
+systems pair a short-lived access token with a refresh token, or keep a deny-list — which
+reintroduces exactly the state the design removed.</p>
+
+<h2>CSRF and CORS — different problems</h2>
+
+<ul>
+<li><strong>CSRF</strong> exploits credentials the <em>browser sends automatically</em> — cookies.
+If your API authenticates with a <code>Bearer</code> header, there is nothing to ride on, and
+disabling CSRF is correct. If it authenticates with a session cookie, disabling CSRF is a
+vulnerability.</li>
+<li><strong>CORS</strong> is the browser asking whether another origin may read your response. It is
+a browser policy, not a security control — it does not stop a request being made, only a script from
+reading the reply.</li>
+</ul>
+
+<h2>Is hiding UI enough?</h2>
+
+<p><strong>Is it enough to hide sections of a page from users who may not use them?</strong></p>
+
+<p>No, and this is the question to answer emphatically. Hiding a button is a usability improvement,
+not a security control — the endpoint is still there and anyone can call it with
+<code>curl</code>. <strong>Every rule must be enforced on the server.</strong> The UI may hide, the
+server must refuse.</p>
+
+<p>Enforcing it twice is fine and is what the pizza API does: the URL rules guard the HTTP entry
+points and <code>@PreAuthorize</code> guards the service methods, so a new controller that forgets its
+URL rule is still refused.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Authentication is who; authorisation is what. 401 versus 403.</li>
+<li>It is a filter chain; <code>AuthorizationFilter</code> runs last because by then the caller is
+known.</li>
+<li>The <code>SecurityContext</code> is a ThreadLocal — cleared per request, not inherited by new
+threads.</li>
+<li><code>SecurityFilterChain</code> bean plus the lambda DSL. No
+<code>WebSecurityConfigurerAdapter</code>.</li>
+<li>Matchers are first-match-wins: specific before general, and always end with
+<code>anyRequest().authenticated()</code>.</li>
+<li><code>hasRole("ADMIN")</code> means the authority <code>ROLE_ADMIN</code>.</li>
+<li>Hiding UI is not security.</li>
+</ul>

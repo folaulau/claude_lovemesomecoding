@@ -1,0 +1,295 @@
+<p>Spring MVC is one servlet and a set of delegates behind it. Once you can name the delegates and
+say what each one does with a request, most of the questions answer themselves.</p>
+
+<h2>The pattern</h2>
+
+<p><strong>What does MVC stand for and what is the idea?</strong></p>
+
+<p>Model–View–Controller. Three responsibilities kept apart so each can change without the others:</p>
+
+<ul>
+<li><strong>Model</strong> — the data the view needs.</li>
+<li><strong>View</strong> — how it is rendered.</li>
+<li><strong>Controller</strong> — handles the request, decides what to do, chooses the view.</li>
+</ul>
+
+<p>The payoff is substitution: the same controller can render HTML or JSON, and the controller can be
+tested without either.</p>
+
+<p><strong>Is Spring MVC part of spring-core?</strong></p>
+
+<p>No. It is its own module, <code>spring-webmvc</code>, brought in by
+<code>spring-boot-starter-webmvc</code>.</p>
+
+<h2>The DispatcherServlet</h2>
+
+<p><strong>What is it and what is it for?</strong></p>
+
+<p>The <strong>front controller</strong>: a single servlet that receives every request in the
+application and coordinates the components that handle it. Centralising the entry point is what
+allows one place to own routing, argument binding, view resolution and exception handling.</p>
+
+<p><strong>Walk through a request.</strong></p>
+
+<ol>
+<li>The <code>DispatcherServlet</code> receives it.</li>
+<li><code>HandlerMapping</code> finds the handler — usually a controller method.</li>
+<li>Any <code>HandlerInterceptor</code>s run their <code>preHandle</code>.</li>
+<li><code>HandlerAdapter</code> invokes the method, resolving each argument with an
+<code>HandlerMethodArgumentResolver</code>.</li>
+<li>The return value is handled: either a <code>ModelAndView</code>, or — with
+<code>@ResponseBody</code> — written straight to the response by an
+<code>HttpMessageConverter</code>.</li>
+<li><code>ViewResolver</code> turns a view name into a <code>View</code>.</li>
+<li>The <code>View</code> renders using the model.</li>
+<li>Anything thrown along the way goes to a <code>HandlerExceptionResolver</code>.</li>
+</ol>
+
+<p><strong>The delegates worth naming:</strong> <code>HandlerMapping</code>,
+<code>HandlerAdapter</code>, <code>HandlerExceptionResolver</code>, <code>ViewResolver</code>,
+<code>LocaleResolver</code>, <code>MultipartResolver</code>.</p>
+
+<p><strong>Is the DispatcherServlet instantiated via an application context?</strong></p>
+
+<p>Yes. In a classic setup there are two contexts: a <em>root</em> context holding services and
+repositories, and a <em>servlet</em> (web) context per DispatcherServlet holding controllers, view
+resolvers and handler mappings. The servlet context is a <strong>child</strong> of the root — so
+controllers can see services, but services cannot see controllers.</p>
+
+<p>In Spring Boot there is normally just one context and the distinction rarely comes up. It is still
+asked about, and it still explains why a bean defined in the wrong place cannot be seen.</p>
+
+<p><strong>What is a web application context and what extra scopes does it have?</strong></p>
+
+<p>A <code>WebApplicationContext</code> — an <code>ApplicationContext</code> aware of the
+<code>ServletContext</code>. It adds <code>request</code>, <code>session</code>,
+<code>application</code> and <code>websocket</code> scopes on top of <code>singleton</code> and
+<code>prototype</code>.</p>
+
+<p><strong>What is the default scope in the web context?</strong> Still <code>singleton</code> —
+which is why a controller must not hold per-request state in a field.</p>
+
+<p><strong>What is the session scope for?</strong> State that must survive across requests from the
+same user — a wizard's partial input, for instance. Note it makes the application stateful, so it
+does not survive a load balancer without sticky sessions or a shared session store. The pizza API
+avoids it entirely and is <code>STATELESS</code> by design.</p>
+
+<h2>Controllers</h2>
+
+<p><strong>What is <code>@Controller</code> for?</strong></p>
+
+<p>It marks the class as a web handler and as a <code>@Component</code>, so component scanning finds
+it and the handler mapping will consider its methods.</p>
+
+<p><strong>How is a request mapped to a method?</strong></p>
+
+<p>By <code>@RequestMapping</code> and its shortcuts, matched on path, HTTP method, and optionally
+headers, params, <code>consumes</code> and <code>produces</code>. A class-level mapping is the
+prefix; method-level mappings are appended to it.</p>
+
+<pre class="language-java"><code class="language-java">@RestController
+@RequestMapping("/api/products")
+public class ProductRestController {
+
+    @GetMapping
+    public ResponseEntity&lt;List&lt;ProductDTO&gt;&gt; getProducts(
+            @RequestParam(required = false) ProductType type) {
+        List&lt;ProductDTO&gt; products =
+                type == null ? productService.getMenu() : productService.getByType(type);
+        return new ResponseEntity&lt;&gt;(products, OK);
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity&lt;ProductDTO&gt; getProduct(@PathVariable UUID id) {
+        return new ResponseEntity&lt;&gt;(productService.getProductByPublicId(id), OK);
+    }
+}</code></pre>
+
+<p><strong>What is the difference between <code>@RequestMapping</code> and
+<code>@GetMapping</code>?</strong></p>
+
+<p><code>@GetMapping</code> is <code>@RequestMapping(method = GET)</code> as a meta-annotation.
+There is one per verb — <code>@PostMapping</code>, <code>@PutMapping</code>,
+<code>@PatchMapping</code>, <code>@DeleteMapping</code>. Use them; a bare
+<code>@RequestMapping</code> matches <em>every</em> verb, which is almost never intended.</p>
+
+<h2>Method parameters</h2>
+
+<p><strong>What is <code>@RequestParam</code> for, and how does it differ from
+<code>@PathVariable</code>?</strong></p>
+
+<ul>
+<li><code>@RequestParam</code> reads a query-string or form parameter —
+<code>?type=PIZZA</code>.</li>
+<li><code>@PathVariable</code> reads a segment of the URI itself —
+<code>/api/products/{id}</code>.</li>
+</ul>
+
+<p>Both are required by default. <code>@RequestParam(required = false)</code> or a
+<code>defaultValue</code> makes one optional. Spring converts the string to the declared type, so
+<code>UUID</code> and enum parameters simply work — and a bad value becomes a
+<code>MethodArgumentTypeMismatchException</code>, which you should handle as a 400 rather than let
+become a 500.</p>
+
+<p><strong>What parameter types can a controller method declare?</strong></p>
+
+<p><code>HttpServletRequest</code> / <code>HttpServletResponse</code>, <code>HttpSession</code>,
+<code>Model</code> / <code>ModelMap</code>, <code>Principal</code>, <code>Locale</code>,
+<code>HttpEntity</code>, <code>BindingResult</code>, <code>MultipartFile</code>, a command object to
+bind onto, and any of your own types Spring can convert to.</p>
+
+<p><strong>Which annotations can go on a parameter?</strong></p>
+
+<table>
+<thead><tr><th>Annotation</th><th>Binds from</th></tr></thead>
+<tbody>
+<tr><td><code>@RequestParam</code></td><td>query string or form field</td></tr>
+<tr><td><code>@PathVariable</code></td><td>a URI template variable</td></tr>
+<tr><td><code>@RequestBody</code></td><td>the request body, deserialised</td></tr>
+<tr><td><code>@RequestHeader</code></td><td>a header</td></tr>
+<tr><td><code>@CookieValue</code></td><td>a cookie</td></tr>
+<tr><td><code>@ModelAttribute</code></td><td>the model, or bound from the request</td></tr>
+<tr><td><code>@SessionAttribute</code></td><td>the session</td></tr>
+<tr><td><code>@Valid</code></td><td>— triggers bean validation on the bound object</td></tr>
+</tbody>
+</table>
+
+<p><strong>What return types are valid?</strong></p>
+
+<p><code>String</code> (a view name), <code>ModelAndView</code>, <code>View</code>,
+<code>void</code> (the method wrote the response itself), <code>ResponseEntity&lt;T&gt;</code>, any
+object with <code>@ResponseBody</code>, <code>Callable</code> or <code>DeferredResult</code> for
+async, and <code>HttpEntity</code>.</p>
+
+<h2>Model and view</h2>
+
+<p><strong>What is the Model?</strong> A map of named attributes passed from the controller to the
+view. It is the contract between them: everything the template dereferences must be put in it, and
+nothing else is visible.</p>
+
+<pre class="language-java"><code class="language-java">// @Controller, NOT @RestController. That single difference is the whole lesson:
+// @RestController is @Controller + @ResponseBody, and @ResponseBody would send the
+// literal text "receipt" to the browser instead of resolving it to a template.
+@Controller
+public class OrderReceiptController {
+
+    @GetMapping("/orders/{id}/receipt")
+    public String receipt(@PathVariable UUID id, Model model) {
+        OrderDTO order = orderService.getOrderByPublicId(id);
+        model.addAttribute("order", order);
+
+        // Resolved to templates/receipt.html by the Thymeleaf view resolver.
+        return "receipt";
+    }
+}</code></pre>
+
+<p><strong>Put a DTO in the model, never an entity.</strong> Rendering happens after the controller
+returns, by which time <code>open-in-view=false</code> has closed the persistence context — so a lazy
+association touched by the template throws <code>LazyInitializationException</code> in the view
+layer, which is a miserable place to debug it.</p>
+
+<p><strong>What is a View, and why support different types?</strong></p>
+
+<p>A <code>View</code> renders the model into the response. Supporting several — Thymeleaf, JSON,
+PDF, Excel — means the same controller and the same model can produce different outputs, chosen by
+content negotiation rather than by branching in the controller.</p>
+
+<p><strong>What does a ViewResolver do, and how is the view chosen?</strong></p>
+
+<p>It maps the logical view name the controller returned onto a concrete <code>View</code>. Resolvers
+are consulted in order until one returns non-null. The usual implementation prepends a prefix and
+appends a suffix:</p>
+
+<pre class="language-properties"><code class="language-properties"># Thymeleaf's defaults - "receipt" becomes classpath:/templates/receipt.html
+spring.thymeleaf.prefix=classpath:/templates/
+spring.thymeleaf.suffix=.html
+
+# Boot's default is true. Off in development, or an edit to a template appears to do
+# nothing until the app restarts.
+spring.thymeleaf.cache=false</code></pre>
+
+<p>Return <code>"redirect:/orders"</code> for a redirect and <code>"forward:/other"</code> for a
+server-side forward — those prefixes are handled before any resolver sees the name.</p>
+
+<h2>Why controllers are testable</h2>
+
+<p><strong>Why are controllers testable artifacts?</strong></p>
+
+<p>Because a controller method is an ordinary method on an ordinary bean. It takes typed parameters
+and returns a value; it does not extend a framework class or require a
+<code>HttpServletRequest</code>. So you can call it directly with plain arguments — or drive the
+whole MVC stack without a server using <code>MockMvc</code>:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest
+@AutoConfigureMockMvc
+@Transactional
+class ApiSecurityIntegrationTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Test
+    void menuIsPublic() throws Exception {
+        mockMvc.perform(get("/api/products")).andExpect(status().isOk());
+    }
+}</code></pre>
+
+<p>That is real routing, real argument binding, real converters and real security filters — with no
+port bound and no container started.</p>
+
+<h2>Configuring MVC</h2>
+
+<p><strong>How do you customise Spring MVC without losing Boot's defaults?</strong></p>
+
+<p>Implement <code>WebMvcConfigurer</code> and override only what you need. Adding
+<code>@EnableWebMvc</code> switches Boot's MVC auto-configuration <strong>off</strong> entirely —
+almost never what you want in a Boot application.</p>
+
+<pre class="language-java"><code class="language-java">@Configuration
+public class RestMVCConfig {
+
+    @Bean
+    public WebMvcConfigurer corsConfigurer() {
+        return new WebMvcConfigurer() {
+
+            @Override
+            public void addCorsMappings(CorsRegistry registry) {
+                registry.addMapping("/**")
+                        .allowCredentials(true)
+                        .allowedHeaders("*")
+                        .allowedMethods("*")
+                        .allowedOrigins("http://localhost:5173", "http://127.0.0.1:5173");
+            }
+
+            @Override
+            public void addResourceHandlers(ResourceHandlerRegistry registry) {
+                registry.addResourceHandler("/webjars/**")
+                        .addResourceLocations("classpath:/META-INF/resources/webjars/");
+            }
+        };
+    }
+}</code></pre>
+
+<p>Other hooks on the same interface: <code>addInterceptors</code>,
+<code>addArgumentResolvers</code>, <code>addFormatters</code>,
+<code>configureMessageConverters</code>.</p>
+
+<h2>When to render on the server at all</h2>
+
+<p>Server-side rendering earns its place when the output is a <strong>document</strong>: it has to be
+printable, it has to work from a link in an email where no JavaScript app boots, and the same
+template can render the email body. It does not earn its place for a menu or a cart, which are
+interactive and belong in the browser app.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>One front controller — the <code>DispatcherServlet</code> — delegating to
+<code>HandlerMapping</code>, <code>HandlerAdapter</code>, <code>ViewResolver</code>,
+<code>HandlerExceptionResolver</code>.</li>
+<li>Controllers are singletons, so no mutable state in fields.</li>
+<li><code>@RequestParam</code> = query string, <code>@PathVariable</code> = URI segment.</li>
+<li><code>@RestController</code> = <code>@Controller</code> + <code>@ResponseBody</code>; using it on
+a view controller sends the view name as text.</li>
+<li>Customise with <code>WebMvcConfigurer</code>; never add <code>@EnableWebMvc</code> in Boot.</li>
+</ul>

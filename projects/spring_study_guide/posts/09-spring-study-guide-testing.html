@@ -1,0 +1,285 @@
+<p>The first question is always some version of "do you need Spring for this test?" — and the right
+answer is usually no. Knowing when it is yes, and what it costs, is the rest of the topic.</p>
+
+<h2>When you need Spring, and when you do not</h2>
+
+<p><strong>Do you use Spring in a unit test?</strong></p>
+
+<p>No. A unit test exercises one class with its collaborators replaced by mocks. If the class takes
+its dependencies through a constructor, <code>new</code> is all you need — and the test runs in
+milliseconds.</p>
+
+<p>That is one of the concrete payoffs of constructor injection: field injection makes this
+impossible without reflection, which is how tests end up loading a context they did not need.</p>
+
+<p><strong>What kind of test does use Spring?</strong></p>
+
+<p>An integration test — one that exercises how components fit together: wiring, transactions,
+proxies, security filters, the web layer, real SQL. Anything where the framework's behaviour is part
+of what you are checking.</p>
+
+<table>
+<thead><tr><th></th><th>Unit test</th><th>Integration test</th></tr></thead>
+<tbody>
+<tr><td>Context</td><td>none</td><td>Spring</td></tr>
+<tr><td>Collaborators</td><td>mocks</td><td>real</td></tr>
+<tr><td>Speed</td><td>milliseconds</td><td>seconds</td></tr>
+<tr><td>Catches</td><td>logic errors</td><td>wiring, SQL, transaction and security errors</td></tr>
+</tbody>
+</table>
+
+<p>Write many of the first and enough of the second.</p>
+
+<h2>Mocking</h2>
+
+<p><strong>How are frameworks like Mockito used?</strong></p>
+
+<p>To stand in for a collaborator so you can control what it returns and assert how it was called.
+<code>spring-boot-starter-test</code> brings Mockito, JUnit 5, AssertJ and Hamcrest.</p>
+
+<pre class="language-java"><code class="language-java">@ExtendWith(MockitoExtension.class)   // no Spring context at all
+class PricingServiceUnitTest {
+
+    @Mock private ProductDAO productDAO;
+    @InjectMocks private PricingService pricingService;
+
+    @Test
+    void rejectsAnUnknownProduct() {
+        // Stub the method the service ACTUALLY calls. Stubbing findByPublicId here
+        // instead would compile, never match, and the test would fail for a reason
+        // that has nothing to do with the behaviour under test.
+        when(productDAO.findByPublicIdWithSizes(any())).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -&gt; pricingService.price(orderRequest))
+                .isInstanceOf(ApiException.class)
+                .hasMessageContaining("Unknown product");
+
+        verify(productDAO).findByPublicIdWithSizes(any());
+    }
+}</code></pre>
+
+<p><strong>Mock what you do not own or cannot afford to call</strong> — a payment gateway, a mail
+server, a slow dependency. Do not mock the class under test, and do not mock value objects.</p>
+
+<p><strong>What replaced <code>@MockBean</code>?</strong></p>
+
+<p><code>@MockitoBean</code>. <code>@MockBean</code> was deprecated in Spring Boot 3.4; the
+replacement lives in <code>org.springframework.test.context.bean.override.mockito</code>. Both
+replace a bean <em>in the application context</em> with a mock — which is what you want when a
+<code>@SpringBootTest</code> must not call the real Stripe:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest
+class OrderApiTest {
+
+    @MockitoBean private StripeService stripeService;   // was @MockBean before Boot 3.4
+}</code></pre>
+
+<p><strong>⚠️ Every distinct set of bean overrides is a different context</strong>, so a
+<code>@MockitoBean</code> that appears in only one test class costs a whole extra context load. That
+is the main reason a fast suite becomes a slow one.</p>
+
+<h2>The test context, and why it is cached</h2>
+
+<p><strong>How do you share an application context across tests?</strong></p>
+
+<p>You do not have to — the Spring TestContext framework caches it automatically, keyed on the
+configuration. Every test class asking for the same configuration gets the <em>same</em> context.
+Starting a context is the expensive part of an integration test; the cache is what makes a suite of
+60 of them take seconds rather than minutes.</p>
+
+<p><strong>What evicts it?</strong> Any change to the key: different configuration classes, different
+active profiles, different properties, different bean overrides — or an explicit
+<code>@DirtiesContext</code>.</p>
+
+<p>The practical rule: <strong>keep your test configurations few and identical</strong>. Adding one
+property to one test class silently doubles the number of contexts.</p>
+
+<p><code>@DirtiesContext</code> is the escape hatch for a test that genuinely corrupts the context.
+Use it rarely; it throws away the cache.</p>
+
+<h2>How Boot simplifies this</h2>
+
+<p><strong>How does Spring Boot simplify writing tests?</strong></p>
+
+<ul>
+<li><code>@SpringBootTest</code> finds your <code>@SpringBootApplication</code> and loads the whole
+context — no <code>@ContextConfiguration</code> to write.</li>
+<li>It brings the Spring JUnit 5 extension with it, so there is no <code>@RunWith</code> and no
+<code>@ExtendWith(SpringExtension.class)</code>.</li>
+<li>Slice annotations load a fraction of the context.</li>
+<li><code>spring-boot-starter-test</code> supplies the whole toolchain in one dependency.</li>
+</ul>
+
+<p><strong>How is <code>@ContextConfiguration</code> used?</strong> To name the configuration classes
+or locations for a test in plain Spring. In Boot you rarely write it — <code>@SpringBootTest</code>
+finds the application class by walking up the package tree from the test.</p>
+
+<h2>Slice tests</h2>
+
+<p>Each loads only the layer it names, so it starts far faster than a full context.</p>
+
+<table>
+<thead><tr><th>Annotation</th><th>Loads</th></tr></thead>
+<tbody>
+<tr><td><code>@WebMvcTest</code></td><td>controllers, converters, filters — no services or repositories</td></tr>
+<tr><td><code>@DataJpaTest</code></td><td>JPA, repositories, an embedded database; transactional and rolled back</td></tr>
+<tr><td><code>@JdbcTest</code></td><td><code>JdbcTemplate</code> and a DataSource</td></tr>
+<tr><td><code>@JsonTest</code></td><td>Jackson serialisation only</td></tr>
+<tr><td><code>@RestClientTest</code></td><td>a client, with the server stubbed</td></tr>
+</tbody>
+</table>
+
+<p><code>@WebMvcTest</code> creates no service beans, so every collaborator the controller needs must
+be supplied with <code>@MockitoBean</code>. That is the trade: fast, focused, and it will not catch a
+wiring mistake below the controller.</p>
+
+<h2>The full-context test</h2>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest
+@Transactional
+@DisplayName("ProductService")
+class ProductServiceImplTest {
+
+    @Autowired
+    private ProductService productService;
+
+    /**
+     * The regression this class exists for. Updating used to clear the sizes and re-add
+     * them, which made Hibernate schedule the INSERTs before the DELETEs in one flush:
+     * "Duplicate entry '42-SMALL' for key 'uk_product_size'". Every product edit 500'd.
+     */
+    @Test
+    @DisplayName("updates prices in place without a unique-constraint violation")
+    void updatesPricesInPlace() {
+        ProductDTO created = productService.createProduct(create());
+
+        ProductDTO updated = productService.updateProduct(
+                created.id(), dto(created.name() + " edited", 8.49, 10.49, 12.49));
+
+        assertThat(updated.sizes()).hasSize(3);
+    }
+}</code></pre>
+
+<p>That bug is a good argument for integration tests in one paragraph: nothing about it is visible in
+a unit test, because the fault is in the SQL Hibernate generates and the order it generates it in.</p>
+
+<h2><code>@Transactional</code> in tests</h2>
+
+<p><strong>When and where do you use it?</strong></p>
+
+<p>On a test class or method, to get every test rolled back afterwards. That keeps tests independent
+and leaves the database as it was found — which is what lets these tests mutate seeded rows freely:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * @Transactional rolls every test back, so the soft-delete cases below can mutate the
+ * seeded orders without leaving the demo database dirty.
+ */
+@SpringBootTest
+@Transactional
+class ReportServiceImplTest { ... }</code></pre>
+
+<p><strong>What is the default rollback policy in a test?</strong></p>
+
+<p><strong>Roll back — always.</strong> Note that this is the opposite of production, where the
+default is to commit unless a <code>RuntimeException</code> escapes. In a test, Spring rolls back
+even on success. Override with <code>@Rollback(false)</code> or <code>@Commit</code> if you really
+need the data to persist.</p>
+
+<p><strong>⚠️ Two traps.</strong> A transactional test <em>hides</em>
+<code>LazyInitializationException</code>, because the persistence context stays open for the whole
+test and the lazy load that fails in production succeeds here. And a transactional test cannot see
+work done by another thread, so anything <code>@Async</code> is invisible to it — and a
+<code>@SpringBootTest(webEnvironment = RANDOM_PORT)</code> test making real HTTP calls runs the
+server on a different thread, so <code>@Transactional</code> will not roll its work back.</p>
+
+<h2>Testing the web layer</h2>
+
+<p><strong>MockMvc</strong> drives the full MVC stack — routing, binding, converters, security
+filters — with no port bound and no container started.</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest
+@AutoConfigureMockMvc
+@Transactional
+@DisplayName("API security")
+class ApiSecurityIntegrationTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Test
+    @DisplayName("the menu is public")
+    void menuIsPublic() throws Exception {
+        mockMvc.perform(get("/api/products")).andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("admin endpoints are closed without a token")
+    void adminRequiresToken() throws Exception {
+        mockMvc.perform(get("/api/admin/products")).andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("a CUSTOMER token does not open admin endpoints")
+    void customerCannotReachAdmin() throws Exception {
+        String token = tokenFor("customer@pizza.test", "pizza123");
+
+        mockMvc.perform(get("/api/admin/products").header("Authorization", "Bearer " + token))
+                .andExpect(status().isForbidden());
+    }
+}</code></pre>
+
+<p>Security rules are exactly the kind of thing that has to be tested at this level: a matcher
+ordering mistake is invisible in any unit test and obvious here.</p>
+
+<p><strong>Note the import moved in Boot 4</strong> — <code>@AutoConfigureMockMvc</code> is now
+<code>org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc</code>, because Boot 4
+split auto-configuration into per-technology modules.</p>
+
+<p><strong>For a real HTTP call</strong> use
+<code>@SpringBootTest(webEnvironment = RANDOM_PORT)</code> with <code>TestRestTemplate</code> or the
+newer <code>RestTestClient</code>. That exercises the actual server and serialisation, at the cost
+of a real port and, as noted above, no automatic rollback.</p>
+
+<p><strong>Testing as a particular user</strong> without logging in:
+<code>@WithMockUser(roles = "ADMIN")</code>, from
+<code>spring-security-test</code>.</p>
+
+<h2>Useful test annotations</h2>
+
+<table>
+<thead><tr><th>Annotation</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>@SpringBootTest</code></td><td>loads the full context</td></tr>
+<tr><td><code>@AutoConfigureMockMvc</code></td><td>adds a <code>MockMvc</code> to it</td></tr>
+<tr><td><code>@MockitoBean</code></td><td>replaces a context bean with a mock</td></tr>
+<tr><td><code>@TestConfiguration</code></td><td>test-only beans, not picked up by component scanning</td></tr>
+<tr><td><code>@ActiveProfiles("test")</code></td><td>activates a profile</td></tr>
+<tr><td><code>@Sql("data.sql")</code></td><td>runs a script before or after a test</td></tr>
+<tr><td><code>@DirtiesContext</code></td><td>evicts the cached context</td></tr>
+<tr><td><code>@DisplayName</code></td><td>a readable name in the report</td></tr>
+</tbody>
+</table>
+
+<h2>Two things worth saying in an interview</h2>
+
+<p><strong>Test against the database you deploy on.</strong> An in-memory H2 standing in for MySQL
+will not reproduce its SQL dialect, its collation or its isolation default. Testcontainers starts a
+real database in Docker for the test run, and <code>@ServiceConnection</code> wires Boot to it with
+no property plumbing.</p>
+
+<p><strong>Assert on behaviour, not on internals.</strong> The best test in the pizza suite checks
+that the reported daily revenue sums back to the reported total — it would catch a wrong SQL
+rewrite that any assertion on "the method called the DAO once" would sail straight past.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Unit tests need no Spring. Constructor injection is what makes that true.</li>
+<li>The test context is cached on its configuration — every variation costs another context load.</li>
+<li><code>@MockitoBean</code>, not <code>@MockBean</code>, since Boot 3.4.</li>
+<li>Tests roll back by default; production commits by default. Opposite rules.</li>
+<li>A transactional test hides <code>LazyInitializationException</code> and cannot see other
+threads.</li>
+<li><code>MockMvc</code> for the web layer without a server; <code>RANDOM_PORT</code> when you need a
+real one.</li>
+</ul>

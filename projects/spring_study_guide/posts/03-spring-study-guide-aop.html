@@ -1,0 +1,240 @@
+<p>Some behaviour is wanted in forty methods and belongs to none of them: timing, audit logging,
+security checks, transaction boundaries. AOP moves it into one place.</p>
+
+<p>This is also the topic that explains the most about Spring generally, because
+<code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code>, <code>@Retryable</code>
+and <code>@PreAuthorize</code> are all AOP underneath and all fail in the same way.</p>
+
+<h2>The concept</h2>
+
+<p><strong>What is AOP?</strong></p>
+
+<p>Aspect Oriented Programming: separating cross-cutting concerns from business logic by declaring
+them once, in an aspect, and having the framework apply them to the methods you nominate.</p>
+
+<p><strong>What is a cross-cutting concern?</strong></p>
+
+<p>A requirement that cuts across many modules and does not belong to any of them. Logging,
+security, transactions, caching, monitoring, retries.</p>
+
+<p><strong>What two problems does AOP solve?</strong></p>
+
+<ul>
+<li><strong>Tangling</strong> — business logic and plumbing interleaved in the same method, so
+neither reads clearly.</li>
+<li><strong>Scattering</strong> — the same plumbing duplicated across many modules, so changing it
+means finding every copy, and the one you miss is a bug.</li>
+</ul>
+
+<p>Without AOP: a stopwatch and a try/finally copied into forty methods, and the forty-first is the
+one somebody forgot.</p>
+
+<h2>The vocabulary</h2>
+
+<p>You are expected to use these precisely.</p>
+
+<table>
+<thead><tr><th>Term</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><strong>Join point</strong></td><td>A point in execution where advice could apply. In Spring AOP, always a method call.</td></tr>
+<tr><td><strong>Pointcut</strong></td><td>An expression selecting which join points.</td></tr>
+<tr><td><strong>Advice</strong></td><td>The code that runs at a selected join point.</td></tr>
+<tr><td><strong>Aspect</strong></td><td>A class holding pointcuts and advice together.</td></tr>
+<tr><td><strong>Target</strong></td><td>The real bean being advised.</td></tr>
+<tr><td><strong>Weaving</strong></td><td>Wiring the advice to the target. Spring does it at runtime, with proxies.</td></tr>
+</tbody>
+</table>
+
+<p>The distinction that gets tested: a <strong>join point</strong> is any point where advice
+<em>could</em> run; a <strong>pointcut</strong> is the expression that says where it <em>does</em>.</p>
+
+<h2>All of it in one class</h2>
+
+<pre class="language-java"><code class="language-java">@Slf4j
+@Aspect
+@Component
+public class ServiceTimingAspect {
+
+    private static final long SLOW_CALL_MILLIS = 250;
+
+    // Named pointcuts are worth three extra lines: the expression is declared once and
+    // the advice below reads as prose instead of as a regex.
+    @Pointcut("execution(* com.pizza.api.entity..*ServiceImpl.*(..))")
+    public void serviceLayer() {}
+
+    @Pointcut("execution(* com.pizza.api.report.*ServiceImpl.*(..))")
+    public void reportLayer() {}
+
+    @Around("serviceLayer() || reportLayer()")
+    public Object time(ProceedingJoinPoint joinPoint) throws Throwable {
+        long start = System.nanoTime();
+        String target = joinPoint.getSignature().toShortString();
+
+        try {
+            return joinPoint.proceed();
+        } catch (Throwable ex) {
+            long millis = (System.nanoTime() - start) / 1_000_000;
+            log.warn("{} failed after {} ms: {}", target, millis, ex.toString());
+            throw ex;   // NEVER swallow it
+        } finally {
+            long millis = (System.nanoTime() - start) / 1_000_000;
+            if (millis &gt;= SLOW_CALL_MILLIS) {
+                log.warn("SLOW {} took {} ms", target, millis);
+            }
+        }
+    }
+}</code></pre>
+
+<p>Note what the advice does <em>not</em> do: it never swallows the exception. An aspect that
+quietly turns a failure into a <code>null</code> is how observability code becomes the bug.</p>
+
+<h2>Enabling it</h2>
+
+<p><strong>What do you have to do to have <code>@Aspect</code> detected?</strong></p>
+
+<p>Two things: the class must be a Spring bean (hence <code>@Component</code>), and auto-proxying
+must be on. In plain Spring that is <code>@EnableAspectJAutoProxy</code>; in Spring Boot the starter
+auto-configures it and you write nothing.</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- NOTE THE NAME. Boot 3 called this spring-boot-starter-aop.
+     Boot 4 renamed it, and the old name is not in the BOM at all - so an
+     unchanged Boot 3 pom fails with "'dependencies.dependency.version' is
+     missing", an error that never mentions the rename. --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-aspectj&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<h2>The five advice types</h2>
+
+<table>
+<thead><tr><th>Advice</th><th>Runs</th><th>Can it stop the call?</th></tr></thead>
+<tbody>
+<tr><td><code>@Before</code></td><td>before the method</td><td>only by throwing</td></tr>
+<tr><td><code>@AfterReturning</code></td><td>after a normal return; sees the value</td><td>no</td></tr>
+<tr><td><code>@AfterThrowing</code></td><td>only when it throws; sees the exception</td><td>no</td></tr>
+<tr><td><code>@After</code></td><td>always, like <code>finally</code></td><td>no</td></tr>
+<tr><td><code>@Around</code></td><td>wraps the whole call</td><td><strong>yes</strong></td></tr>
+</tbody>
+</table>
+
+<p><strong>Which two can you use to handle exceptions?</strong></p>
+
+<p><code>@AfterThrowing</code> to observe one, and <code>@Around</code> to actually catch it. Only
+<code>@Around</code> can swallow or replace an exception, because only <code>@Around</code> controls
+whether <code>proceed()</code> is called and what happens afterwards.</p>
+
+<p><strong>What is the ordering when several aspects match?</strong></p>
+
+<p>Unspecified unless you say. Add <code>@Order</code> — lower runs first on the way in, last on the
+way out.</p>
+
+<h2>Reading pointcut expressions</h2>
+
+<pre class="language-java"><code class="language-java">execution(* com.pizza.api.entity..*ServiceImpl.*(..))</code></pre>
+
+<p>Left to right: any return type, in package <code>com.pizza.api.entity</code> <em>or below</em>
+(that is what <code>..</code> means between packages), in a class whose name ends
+<code>ServiceImpl</code>, any method name, any arguments (that is what <code>(..)</code> means).</p>
+
+<pre class="language-java"><code class="language-java">// public methods on classes annotated @Service
+execution(public * *(..)) &amp;&amp; within(@org.springframework.stereotype.Service *)
+
+// every method in one package, exactly - no sub-packages
+execution(* com.pizza.api.report.*.*(..))
+
+// any method annotated @Transactional
+@annotation(org.springframework.transaction.annotation.Transactional)
+
+// beans whose NAME ends in Service - Spring-specific, not AspectJ
+bean(*Service)</code></pre>
+
+<p>Combine with <code>&amp;&amp;</code>, <code>||</code> and <code>!</code>.</p>
+
+<h2>JoinPoint and ProceedingJoinPoint</h2>
+
+<p><strong>What is <code>JoinPoint</code> for?</strong></p>
+
+<p>Reflective access to the call being advised: the signature, the arguments, the target object. Any
+advice type may declare it as its first parameter.</p>
+
+<p><strong>What is a <code>ProceedingJoinPoint</code>, and when is it used?</strong></p>
+
+<p><code>JoinPoint</code> plus <code>proceed()</code>. Only <code>@Around</code> gets one, and it is
+what makes <code>@Around</code> different: until you call <code>proceed()</code> the target method
+has not run, and you may decline to call it at all.</p>
+
+<pre class="language-java"><code class="language-java">@Around("serviceLayer()")
+public Object advise(ProceedingJoinPoint pjp) throws Throwable {
+    String method = pjp.getSignature().toShortString();
+    Object[] args = pjp.getArgs();
+
+    Object result = pjp.proceed();        // or proceed(newArgs) to alter them
+    return result;                        // returning something else replaces the result
+}</code></pre>
+
+<p>An <code>@Around</code> that forgets to call <code>proceed()</code> silently stops the method from
+running and returns <code>null</code>. It is the single easiest way to break an application with
+AOP.</p>
+
+<h2>Spring AOP versus AspectJ</h2>
+
+<table>
+<thead><tr><th></th><th>Spring AOP</th><th>AspectJ</th></tr></thead>
+<tbody>
+<tr><td>Weaving</td><td>runtime, via proxies</td><td>compile-time, post-compile or load-time</td></tr>
+<tr><td>Join points</td><td>method execution only</td><td>methods, constructors, field access, static init…</td></tr>
+<tr><td>Applies to</td><td>Spring beans only</td><td>any object</td></tr>
+<tr><td>Setup</td><td>none beyond the starter</td><td>a weaver or a special compiler</td></tr>
+</tbody>
+</table>
+
+<p>Spring AOP handles the cases almost everyone actually has. Reach for AspectJ when you need to
+advise something that is not a Spring bean, or a join point that is not a method call.</p>
+
+<h2>⚠️ The limitations — this is the part that matters</h2>
+
+<p>Spring AOP is proxy-based, and that dictates everything below.</p>
+
+<ol>
+<li><strong>Only Spring beans are advised.</strong> An object you created with <code>new</code> has
+no proxy around it.</li>
+<li><strong>Only public methods</strong> (protected too, under CGLIB). Private, static and
+<code>final</code> methods are never advised.</li>
+<li><strong><code>final</code> classes cannot be proxied by CGLIB</strong>, and a class with no
+interface cannot be proxied by the JDK. Boot uses CGLIB by default, so the usual failure is a
+<code>final</code> class.</li>
+<li><strong>Self-invocation is not advised.</strong> ⬇️</li>
+</ol>
+
+<pre class="language-java"><code class="language-java">public void a() { b(); }   // b() is NOT advised - the call never leaves the object
+public void b() { ... }    // advised only when ANOTHER bean calls it</code></pre>
+
+<p>Advice runs when a call arrives <strong>through</strong> the proxy. A call to a sibling method on
+<code>this</code> goes straight down the vtable, and the proxy never sees it.</p>
+
+<p>This is not an AOP quirk you can file away. It is why:</p>
+
+<ul>
+<li>a <code>@Transactional</code> method called from a sibling method runs with <strong>no
+transaction</strong>;</li>
+<li>a <code>@Cacheable</code> method called internally <strong>always hits the database</strong>;</li>
+<li>an <code>@Async</code> method called internally runs <strong>on the caller's thread</strong>;</li>
+<li>a <code>@PreAuthorize</code> method called internally is <strong>not checked at all</strong>.</li>
+</ul>
+
+<p>All four fail silently. If an annotation appears to do nothing, look for a self-invocation before
+you look at anything else. The fix is to move the annotated method to another bean — where it
+belongs anyway, because two responsibilities in one class is what put them together in the first
+place.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Join point = where advice <em>could</em> run. Pointcut = where it <em>does</em>.</li>
+<li>Five advice types; only <code>@Around</code> can stop or replace the call, and it must call
+<code>proceed()</code>.</li>
+<li>Spring AOP is runtime proxying, method execution only, Spring beans only.</li>
+<li>Self-invocation bypasses the proxy — and therefore every annotation built on it.</li>
+<li>Boot 4: the starter is <code>spring-boot-starter-aspectj</code>.</li>
+</ul>

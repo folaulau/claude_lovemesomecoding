@@ -1,0 +1,439 @@
+<p>Three separate topics that are always examined together: how Spring talks to a database, how it
+manages transactions, and how JPA and Spring Data sit on top of both.</p>
+
+<h2>Exceptions</h2>
+
+<p><strong>What is the difference between a checked and an unchecked exception?</strong></p>
+
+<p>A checked exception extends <code>Exception</code> and the compiler forces you to catch or declare
+it. An unchecked exception extends <code>RuntimeException</code> and it does not.</p>
+
+<p><strong>Why does Spring prefer unchecked exceptions?</strong></p>
+
+<p>Because a checked exception you cannot do anything about is pure noise. <code>SQLException</code>
+is the classic case: your service has no way to recover from "the connection dropped", so the
+<code>catch</code> block either logs and rethrows or, worse, swallows it. Making it unchecked lets
+the code that <em>can</em> handle it do so, and lets everything in between stay clean.</p>
+
+<p><strong>What is the data access exception hierarchy?</strong></p>
+
+<p>Spring translates vendor-specific errors — <code>SQLException</code> with a MySQL error code,
+Hibernate's own exceptions — into one consistent tree rooted at
+<code>DataAccessException</code>, which is unchecked.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">DataAccessException
+├── DataIntegrityViolationException      constraint violated
+│   └── DuplicateKeyException            unique index hit
+├── EmptyResultDataAccessException       queryForObject found nothing
+├── IncorrectResultSizeDataAccessException
+├── OptimisticLockingFailureException
+├── CannotAcquireLockException
+└── ...</code></pre>
+
+<p>The point is portability: <code>DuplicateKeyException</code> means the same thing whether the
+database was MySQL, PostgreSQL or Oracle, so your service layer does not have to know which. The
+translation is switched on by <code>@Repository</code> — one more reason the stereotype
+annotations are not interchangeable.</p>
+
+<h2>DataSource</h2>
+
+<p><strong>How do you configure a DataSource?</strong></p>
+
+<p>In Boot, by setting properties. It auto-configures a connection pool — HikariCP — from them.</p>
+
+<pre class="language-properties"><code class="language-properties">spring.datasource.url=jdbc:mysql://127.0.0.1:3306/pizza?useSSL=false&amp;connectionTimeZone=LOCAL
+spring.datasource.username=root
+spring.datasource.password=</code></pre>
+
+<p>For tests and demos, <code>EmbeddedDatabaseBuilder</code> builds an in-memory H2 or HSQL database
+and runs schema and data scripts into it. Useful, but be aware you are then testing against a
+different database than you deploy on — Testcontainers is the modern answer to that.</p>
+
+<h2>JdbcTemplate</h2>
+
+<p><strong>What is the template pattern, and what is the JdbcTemplate?</strong></p>
+
+<p>The template pattern puts the fixed part of an algorithm in one place and lets callers supply the
+varying part. For JDBC the fixed part is: get a connection, create a statement, bind parameters,
+execute, iterate the results, close everything in the right order even on failure, translate the
+exception. The varying part is the SQL and the row mapping. <code>JdbcTemplate</code> owns the fixed
+part; you supply the rest.</p>
+
+<p><strong>What are the callback interfaces used with queries?</strong></p>
+
+<table>
+<thead><tr><th>Callback</th><th>Called</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>RowMapper&lt;T&gt;</code></td><td>once per row, returns an object</td><td>the normal case</td></tr>
+<tr><td><code>ResultSetExtractor&lt;T&gt;</code></td><td>once for the whole ResultSet</td><td>building one object from many rows</td></tr>
+<tr><td><code>RowCallbackHandler</code></td><td>once per row, returns nothing</td><td>streaming — writing a file, accumulating state</td></tr>
+</tbody>
+</table>
+
+<pre class="language-java"><code class="language-java">@Component
+public class TopProductRowMapper implements RowMapper&lt;ReportDTOs.TopProduct&gt; {
+
+    @Override
+    public ReportDTOs.TopProduct mapRow(ResultSet rs, int rowNum) throws SQLException {
+        return new ReportDTOs.TopProduct(
+                rs.getString("product_name"),
+                rs.getLong("units_sold"),
+                RowValues.money(rs.getBigDecimal("revenue")));
+    }
+}</code></pre>
+
+<p><strong>Can you run plain SQL, and how does it return objects?</strong></p>
+
+<pre class="language-java"><code class="language-java">// A list of mapped objects
+List&lt;ReportDTOs.RevenueByDay&gt; rows =
+        jdbcTemplate.query(sql, Map.of("from", from), revenueByDayRowMapper);
+
+// Exactly one - throws EmptyResultDataAccessException if there are none,
+// IncorrectResultSizeDataAccessException if there are two
+ReportDTOs.Summary summary =
+        jdbcTemplate.queryForObject(sql, Map.of("from", from), reportSummaryRowMapper);
+
+// A single scalar
+Long count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM customer_order", Map.of(), Long.class);
+
+// Anything that is not a query
+jdbcTemplate.update("UPDATE product SET active = :active WHERE id = :id", params);</code></pre>
+
+<p><strong>When does the JdbcTemplate acquire and release its connection?</strong></p>
+
+<p>Per method call — it borrows from the pool, runs, and returns it. Unless a transaction is
+already in progress, in which case it uses the one bound to the current thread and does
+<em>not</em> close it. That is what allows a <code>JdbcTemplate</code> call and a JPA call inside the
+same <code>@Transactional</code> method to be part of the same transaction.</p>
+
+<p><strong>Always use named or indexed parameters, never string concatenation.</strong>
+<code>:from</code> and <code>:limit</code> are bound by the driver, so nothing a caller passes can
+change the shape of the statement. Concatenating a value into SQL is how injection happens.</p>
+
+<p><strong>When is JdbcTemplate the right choice over JPA?</strong> Reporting and aggregation. JPA's
+job is to map rows onto an object graph and track changes to it; a <code>GROUP BY</code> that
+returns nine rows of totals wants neither. In the pizza API the reports are plain SQL with explicit
+<code>RowMapper</code>s for exactly that reason.</p>
+
+<h2>Transactions</h2>
+
+<p><strong>What is a transaction?</strong></p>
+
+<p>A unit of work that is ACID — Atomic, Consistent, Isolated, Durable. All of it commits or none of
+it does.</p>
+
+<p><strong>Local versus global?</strong></p>
+
+<p>A local transaction involves one resource — a single database — and is managed by that resource.
+A global (distributed, XA) transaction spans several resources and needs a transaction manager to
+coordinate a two-phase commit. Global transactions are expensive and rare; almost everything you
+write is local.</p>
+
+<p><strong>Is a transaction a cross-cutting concern? How does Spring implement it?</strong></p>
+
+<p>Yes — and Spring implements it with AOP. <code>@Transactional</code> puts a proxy around the bean;
+the proxy starts a transaction before the method, commits after it returns, rolls back if it throws.
+Everything in the <a href="/spring-study-guide/spring-study-guide-aop">AOP</a> lesson applies here,
+self-invocation included.</p>
+
+<p><strong>What is the <code>PlatformTransactionManager</code>?</strong></p>
+
+<p>The abstraction that actually does the work, with one implementation per technology —
+<code>DataSourceTransactionManager</code> for plain JDBC, <code>JpaTransactionManager</code> for
+JPA, <code>JtaTransactionManager</code> for global transactions. Boot picks the right one; the
+annotation stays the same regardless, which is the whole point of the abstraction.</p>
+
+<p><strong>What does <code>@EnableTransactionManagement</code> do?</strong></p>
+
+<p>Registers the infrastructure that finds <code>@Transactional</code> and creates the proxies.
+Spring Boot switches it on for you.</p>
+
+<h2>Declaring a transaction</h2>
+
+<pre class="language-java"><code class="language-java">@Service
+public class ProductServiceImpl implements ProductService {
+
+    // readOnly lets Hibernate skip dirty checking and tells the driver this will not
+    // write - cheaper, and an accidental write fails loudly.
+    @Override
+    @Transactional(readOnly = true)
+    public List&lt;ProductDTO&gt; getMenu() {
+        return mapper.mapProductsToProductDTOs(productDAO.findActiveMenu());
+    }
+
+    @Override
+    @Transactional
+    public ProductDTO createProduct(ProductCreateDTO dto) { ... }
+}</code></pre>
+
+<p><strong>What does declarative transaction management mean?</strong> That you declare the boundary
+with an annotation and the framework applies it, instead of writing
+<code>begin</code>/<code>commit</code>/<code>rollback</code> by hand. The programmatic alternative —
+<code>TransactionTemplate</code> — is still there for the cases where the boundary is not a whole
+method.</p>
+
+<p><strong>Where can <code>@Transactional</code> go?</strong> On a method or on a class. On a class
+it applies to every public method, with a method-level annotation overriding it. Put it on the
+<strong>service</strong> layer: that is where a business operation begins and ends. A transaction per
+repository call gives you one transaction per statement, which is no transaction at all.</p>
+
+<p><strong>Use the Spring annotation</strong>
+(<code>org.springframework.transaction.annotation.Transactional</code>), not
+<code>jakarta.transaction.Transactional</code>. Both compile. Only the Spring one supports
+<code>readOnly</code>, <code>isolation</code>, <code>timeout</code> and the rollback rules.</p>
+
+<h2>Propagation</h2>
+
+<p><strong>What does propagation mean?</strong> What happens when a transactional method is called by
+another transactional method.</p>
+
+<table>
+<thead><tr><th>Propagation</th><th>Existing transaction</th><th>No transaction</th></tr></thead>
+<tbody>
+<tr><td><code>REQUIRED</code> <em>(default)</em></td><td>join it</td><td>start one</td></tr>
+<tr><td><code>REQUIRES_NEW</code></td><td>suspend it, start a new one</td><td>start one</td></tr>
+<tr><td><code>SUPPORTS</code></td><td>join it</td><td>run without</td></tr>
+<tr><td><code>NOT_SUPPORTED</code></td><td>suspend it, run without</td><td>run without</td></tr>
+<tr><td><code>MANDATORY</code></td><td>join it</td><td><strong>throw</strong></td></tr>
+<tr><td><code>NEVER</code></td><td><strong>throw</strong></td><td>run without</td></tr>
+<tr><td><code>NESTED</code></td><td>savepoint inside it</td><td>start one</td></tr>
+</tbody>
+</table>
+
+<p><code>REQUIRES_NEW</code> is the one with a real use case and a real trap. The use case: writing
+an audit record that must survive the caller rolling back. The trap: it holds two connections at
+once, so a pool with fewer connections than nesting depth deadlocks.</p>
+
+<h2>Isolation</h2>
+
+<p><strong>What is an isolation level?</strong> How much one in-flight transaction can see of
+another's uncommitted work. Weaker is faster and admits more anomalies.</p>
+
+<table>
+<thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th></tr></thead>
+<tbody>
+<tr><td><code>READ_UNCOMMITTED</code></td><td>possible</td><td>possible</td><td>possible</td></tr>
+<tr><td><code>READ_COMMITTED</code></td><td>no</td><td>possible</td><td>possible</td></tr>
+<tr><td><code>REPEATABLE_READ</code></td><td>no</td><td>no</td><td>possible</td></tr>
+<tr><td><code>SERIALIZABLE</code></td><td>no</td><td>no</td><td>no</td></tr>
+</tbody>
+</table>
+
+<ul>
+<li><strong>Dirty read</strong> — you read a row another transaction has not committed yet.</li>
+<li><strong>Non-repeatable read</strong> — you read the same row twice and get different values.</li>
+<li><strong>Phantom read</strong> — you run the same query twice and get a different set of rows.</li>
+</ul>
+
+<p>Spring adds <code>DEFAULT</code>, meaning "whatever the database's own default is" — which is
+<code>REPEATABLE_READ</code> on MySQL/InnoDB and <code>READ_COMMITTED</code> on PostgreSQL and
+Oracle. Worth knowing, because the same code behaves differently on the two.</p>
+
+<h2>Rollback</h2>
+
+<p><strong>What is the default rollback policy?</strong></p>
+
+<p>Roll back on <code>RuntimeException</code> and <code>Error</code>. <strong>Commit</strong> on a
+checked exception.</p>
+
+<p>That surprises people every time, and it is worth being able to say why: Spring treats an
+unchecked exception as an unexpected failure and a checked one as an anticipated outcome the caller
+is expected to handle. Override it explicitly when your domain disagrees:</p>
+
+<pre class="language-java"><code class="language-java">@Transactional(rollbackFor = Exception.class)          // roll back on checked too
+@Transactional(noRollbackFor = ProductNotFoundException.class)</code></pre>
+
+<p><strong>And if you catch the exception yourself, there is no rollback</strong> — the proxy never
+sees it. Catching an exception inside a transactional method and returning normally commits
+everything done so far. If you catch it and still want the rollback, mark it yourself:</p>
+
+<pre class="language-java"><code class="language-java">TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();</code></pre>
+
+<p><strong>What happens when a <code>@Transactional</code> method calls another
+<code>@Transactional</code> method on the same object?</strong></p>
+
+<p>The second annotation is ignored entirely — including its propagation. Self-invocation does not go
+through the proxy. A <code>REQUIRES_NEW</code> called that way just runs in the caller's
+transaction, which is precisely the opposite of what was asked for. Move it to another bean.</p>
+
+<p><strong>Why is "unit of work" important, and why does JDBC autocommit violate it?</strong></p>
+
+<p>Because a business operation is usually several statements and is only correct if all of them
+happen. With autocommit on, every statement commits by itself, so a failure halfway leaves the
+database in a state that no business rule permits — an order row with no line items. Spring turns
+autocommit off for the duration of a transaction.</p>
+
+<h2>JPA</h2>
+
+<p><strong>What do JPA and ORM stand for?</strong></p>
+
+<p>Jakarta Persistence API — a specification for object-relational mapping; Hibernate is the usual
+implementation. ORM is object-relational mapping: representing rows as objects and associations as
+references.</p>
+
+<p><strong>Benefits and drawbacks?</strong></p>
+
+<p>You write far less boilerplate, get dirty checking, caching, lazy loading and portability across
+databases. In exchange you get a large abstraction whose failure modes — N+1 queries,
+<code>LazyInitializationException</code>, surprising flush ordering — require you to know the SQL it
+generates. ORM does not save you from understanding your database; it saves you from typing it.</p>
+
+<p><strong>What is the persistence context, and what is the EntityManager?</strong></p>
+
+<p>The persistence context is a first-level cache of managed entities plus their loaded state. The
+<code>EntityManager</code> is the API you use to interact with it. One persistence context is
+normally scoped to one transaction.</p>
+
+<p>What it does for you: entities are unique within it (<code>find</code> twice returns the same
+instance), and at flush time it compares each managed entity against its loaded state and issues
+UPDATEs for what changed. That is dirty checking — and it is why this works with no
+<code>save()</code> call at all:</p>
+
+<pre class="language-java"><code class="language-java">@Override
+@PreAuthorize("hasRole('ADMIN')")
+@Transactional
+public AdminUserDTO changeRole(String actingAdminEmail, UUID userId, UserRole role) {
+    User target = requireUser(userId);   // managed from here on
+    target.setRole(role);                // dirty checking will flush this
+    return toDto(userDAO.save(target));  // explicit save, but not strictly required
+}</code></pre>
+
+<p><strong>The four entity states:</strong> <em>new/transient</em> (never persisted, not managed),
+<em>managed</em> (in the persistence context, changes tracked), <em>detached</em> (was managed, the
+context has closed), <em>removed</em> (scheduled for deletion at flush).</p>
+
+<p>Touching a lazy association on a <strong>detached</strong> entity throws
+<code>LazyInitializationException</code>. That single sentence explains the majority of JPA
+questions people arrive with.</p>
+
+<p><strong>Why is <code>@Entity</code> needed and where does it go?</strong> On the class, to mark it
+as mapped. It needs a no-arg constructor and an <code>@Id</code>. Field access is inferred from where
+<code>@Id</code> is placed — annotate the fields, or annotate the getters, but never mix the two in
+one class.</p>
+
+<pre class="language-java"><code class="language-java">@Entity
+@Table(name = "product")
+@SQLRestriction("deleted = false")   // Hibernate adds this to every query for this entity
+public class Product {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    // Two identifiers on purpose: id is the FK target and never leaves the server,
+    // publicId is what the API exposes. Sequential ids let anyone walk /api/products/1,2,3.
+    @JdbcTypeCode(SqlTypes.CHAR)
+    @Column(name = "public_id", nullable = false, unique = true, length = 36)
+    private UUID publicId;
+
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    @OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true,
+               fetch = FetchType.LAZY)
+    private List&lt;ProductSize&gt; sizes = new ArrayList&lt;&gt;();
+}</code></pre>
+
+<p>The two exclusions are load-bearing. Lombok's <code>@Data</code> would otherwise walk the
+collection in <code>toString</code> and <code>equals</code> — forcing a lazy load on every log line,
+and recursing forever through the child's back-reference. It is the most common way Lombok and JPA
+go wrong together.</p>
+
+<p><strong>What do you need to configure to use JPA with Spring, and how does Boot make it
+easier?</strong></p>
+
+<p>By hand: a <code>DataSource</code>, a <code>LocalContainerEntityManagerFactoryBean</code>, a
+<code>JpaVendorAdapter</code>, a <code>JpaTransactionManager</code> and a
+<code>persistence.xml</code> or a packages-to-scan list. With
+<code>spring-boot-starter-data-jpa</code>: a URL, a username and a password.</p>
+
+<pre class="language-properties"><code class="language-properties"># Liquibase owns the schema, so Hibernate must not touch it. `validate` makes the app
+# refuse to start if the entities and the tables have drifted apart - a loud failure at
+# boot beats a silent mismatch discovered in production.
+spring.jpa.hibernate.ddl-auto=validate
+
+# Turn this OFF. Left on (the default), the persistence context stays open for the whole
+# request, so lazy loads succeed in the view layer and hide N+1 queries until production.
+spring.jpa.open-in-view=false</code></pre>
+
+<p><strong>What does <code>@PersistenceContext</code> do?</strong> Injects a container-managed
+<code>EntityManager</code> — actually a proxy that resolves to the one bound to the current
+transaction, which is what makes it safe to hold in a singleton. With Spring Data you rarely need
+it.</p>
+
+<h2>Spring Data repositories</h2>
+
+<p><strong>What is an "instant repository", and why is it an interface?</strong></p>
+
+<p>An interface you declare and never implement — Spring Data generates the implementation at
+runtime as a proxy. It is an interface precisely so that it <em>can</em> be proxied: there is no
+class to write, so there is no class to get wrong.</p>
+
+<pre class="language-java"><code class="language-java">public interface ProductRepository extends JpaRepository&lt;Product, Long&gt; {
+
+    // Derived from the method name: no body, no @Query.
+    List&lt;Product&gt; findByActiveTrueOrderByTypeAscDisplayOrderAsc();
+
+    Optional&lt;Product&gt; findByPublicId(UUID publicId);
+
+    boolean existsByNameIgnoreCase(String name);
+
+    // @EntityGraph fetches the sizes in the SAME query. Without it, listing 14 products
+    // is 1 query for the products plus 14 more for their sizes - the N+1 problem.
+    @EntityGraph(attributePaths = "sizes")
+    List&lt;Product&gt; findByTypeAndActiveTrueOrderByDisplayOrderAsc(ProductType type);
+
+    @EntityGraph(attributePaths = "sizes")
+    @Query("select p from Product p")
+    List&lt;Product&gt; findAllWithSizes();
+}</code></pre>
+
+<p><strong>What is the naming convention for finder methods?</strong></p>
+
+<p>A prefix — <code>findBy</code>, <code>readBy</code>, <code>getBy</code>, <code>countBy</code>,
+<code>existsBy</code>, <code>deleteBy</code> — then property names joined by <code>And</code> or
+<code>Or</code>, then optional keywords: <code>Between</code>, <code>LessThan</code>,
+<code>Like</code>, <code>Containing</code>, <code>IgnoreCase</code>, <code>OrderBy…Asc/Desc</code>,
+<code>True</code>, <code>False</code>, <code>In</code>, <code>IsNull</code>. The property names must
+match the entity's fields — a typo is a <strong>startup</strong> failure, not a runtime one, which is
+a feature.</p>
+
+<p><strong>How are they implemented at runtime?</strong></p>
+
+<p>Spring Data creates a JDK dynamic proxy per repository interface, backed by
+<code>SimpleJpaRepository</code>. Each call is routed to a query derived from the method name, a
+declared <code>@Query</code>, or a named query — in that order of precedence.</p>
+
+<p><strong>What is <code>@Query</code> for?</strong> Writing the query yourself when the method name
+would be unreadable or the query is not expressible by derivation. JPQL by default;
+<code>nativeQuery = true</code> for real SQL.</p>
+
+<p><strong>Return <code>Optional&lt;T&gt;</code> for single results.</strong> A repository method
+returning <code>T</code> returns <code>null</code> when there is no row, and the
+<code>NullPointerException</code> then surfaces somewhere unrelated.</p>
+
+<h2>⚠️ One trap worth the whole lesson</h2>
+
+<p><code>@SQLRestriction("deleted = false")</code> on the entity filters soft-deleted rows out of
+every JPA query automatically. It does <strong>not</strong> apply to SQL you write yourself —
+Hibernate adds it when it builds a query from the entity model, and <code>JdbcTemplate</code> never
+goes near the entity model.</p>
+
+<p>In the pizza API, omitting <code>AND deleted = 0</code> from the reporting SQL counted
+cancelled-and-deleted orders as revenue. Nothing failed. The reports stayed entirely plausible and
+were simply wrong, which is why it took a while to notice.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Spring's data exceptions are unchecked and vendor-neutral; <code>@Repository</code> enables the
+translation.</li>
+<li><code>@Transactional</code> goes on the service layer, is implemented with a proxy, and rolls
+back on unchecked exceptions <strong>only</strong>.</li>
+<li>Catching the exception yourself, or calling the method from a sibling, means no rollback and no
+transaction.</li>
+<li>Seven propagation modes; <code>REQUIRED</code> is the default and <code>REQUIRES_NEW</code>
+costs a second connection.</li>
+<li>Lazy loading on a detached entity is <code>LazyInitializationException</code>. Set
+<code>open-in-view=false</code> and fetch what you need with <code>@EntityGraph</code>.</li>
+<li>Repository method names are checked at startup.</li>
+</ul>

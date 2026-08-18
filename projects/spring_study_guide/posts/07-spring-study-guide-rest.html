@@ -1,0 +1,309 @@
+<p>REST questions split cleanly in two: what REST is as an architectural style, and how Spring
+implements it. Both get asked, and people usually prepare only the second.</p>
+
+<h2>The style</h2>
+
+<p><strong>What does REST stand for?</strong></p>
+
+<p>REpresentational State Transfer. The client transfers <em>representations</em> of resource state
+— JSON, XML, an image — over a uniform interface.</p>
+
+<p><strong>What is a resource?</strong></p>
+
+<p>Anything worth naming with a URI: a product, an order, a collection of orders. The URI identifies
+the resource; the representation is what you get back. <code>/api/products/{id}</code> is the
+resource, the JSON body is one representation of it.</p>
+
+<p><strong>What does CRUD mean, and which verbs map to it?</strong></p>
+
+<table>
+<thead><tr><th>Operation</th><th>Verb</th><th>Typical URI</th></tr></thead>
+<tbody>
+<tr><td>Create</td><td>POST</td><td><code>/api/products</code></td></tr>
+<tr><td>Read</td><td>GET</td><td><code>/api/products</code>, <code>/api/products/{id}</code></td></tr>
+<tr><td>Update</td><td>PUT (whole) / PATCH (partial)</td><td><code>/api/products/{id}</code></td></tr>
+<tr><td>Delete</td><td>DELETE</td><td><code>/api/products/{id}</code></td></tr>
+</tbody>
+</table>
+
+<p><strong>Is REST stateless?</strong></p>
+
+<p>Yes — that is one of its constraints. Every request carries everything needed to serve it; the
+server keeps no client session between requests. The pizza API is
+<code>SessionCreationPolicy.STATELESS</code> and carries identity in a JWT for exactly this reason:
+any instance can serve any request, so scaling out is just adding instances.</p>
+
+<p><strong>Is REST scalable and interoperable?</strong></p>
+
+<p>Scalable because it is stateless and cacheable — no server affinity, and GETs can be served from a
+cache or a CDN. Interoperable because it is plain HTTP and a media type, so any client on any
+platform can call it.</p>
+
+<h2>Safe and idempotent</h2>
+
+<p><strong>What are safe operations?</strong> Ones that do not change server state. GET, HEAD,
+OPTIONS. A GET that changes something is a bug — crawlers, prefetchers and browsers all assume
+otherwise.</p>
+
+<p><strong>What are idempotent operations, and why does it matter?</strong> Ones where doing it
+<em>n</em> times has the same effect as doing it once.</p>
+
+<table>
+<thead><tr><th>Verb</th><th>Safe</th><th>Idempotent</th></tr></thead>
+<tbody>
+<tr><td>GET</td><td>yes</td><td>yes</td></tr>
+<tr><td>HEAD</td><td>yes</td><td>yes</td></tr>
+<tr><td>PUT</td><td>no</td><td>yes</td></tr>
+<tr><td>DELETE</td><td>no</td><td>yes</td></tr>
+<tr><td>POST</td><td>no</td><td><strong>no</strong></td></tr>
+<tr><td>PATCH</td><td>no</td><td>not necessarily</td></tr>
+</tbody>
+</table>
+
+<p>It matters because networks fail. A client that sends a request and never sees the response cannot
+tell whether it was processed, so it retries — and if the operation is idempotent, retrying is safe.
+POST is not idempotent, which is why the payment call in the pizza API carries an idempotency key:</p>
+
+<pre class="language-java"><code class="language-java">// Without a key, a request that succeeded at Stripe but whose response was lost to a
+// network blip gets retried and creates a SECOND PaymentIntent - the classic double
+// charge. Keyed on our own order id, Stripe recognises the replay and returns the
+// original instead.
+RequestOptions options =
+        RequestOptions.builder().setIdempotencyKey("order-" + orderId).build();
+
+return stripe.paymentIntents().create(params.build(), options);</code></pre>
+
+<h2>Status codes</h2>
+
+<p><strong>What should each operation return on success?</strong></p>
+
+<table>
+<thead><tr><th>Operation</th><th>Success</th></tr></thead>
+<tbody>
+<tr><td>GET</td><td><strong>200</strong> OK</td></tr>
+<tr><td>POST creating something</td><td><strong>201</strong> Created, with a <code>Location</code> header</td></tr>
+<tr><td>PUT / PATCH</td><td><strong>200</strong> OK, or 204 if no body is returned</td></tr>
+<tr><td>DELETE</td><td><strong>204</strong> No Content</td></tr>
+<tr><td>Accepted for later processing</td><td><strong>202</strong> Accepted</td></tr>
+</tbody>
+</table>
+
+<p>And the failures worth distinguishing:</p>
+
+<table>
+<thead><tr><th>Code</th><th>Means</th></tr></thead>
+<tbody>
+<tr><td><strong>400</strong> Bad Request</td><td>the request is malformed or fails validation</td></tr>
+<tr><td><strong>401</strong> Unauthorized</td><td>not authenticated — despite the name</td></tr>
+<tr><td><strong>403</strong> Forbidden</td><td>authenticated, but not allowed</td></tr>
+<tr><td><strong>404</strong> Not Found</td><td>no such resource</td></tr>
+<tr><td><strong>409</strong> Conflict</td><td>violates current state — duplicate, version clash</td></tr>
+<tr><td><strong>422</strong> Unprocessable</td><td>syntactically fine, semantically wrong</td></tr>
+<tr><td><strong>500</strong></td><td><em>our</em> fault. Never a client's bad input.</td></tr>
+</tbody>
+</table>
+
+<p>The 401/403 distinction and the "400 not 500 for bad input" rule are the two that get asked.</p>
+
+<h2>Spring's annotations</h2>
+
+<p><strong>Is <code>@Controller</code> a stereotype? Is <code>@RestController</code>?</strong></p>
+
+<p>Both are — each is meta-annotated with <code>@Component</code>, so both are found by component
+scanning.</p>
+
+<p><strong>What is the difference between them?</strong></p>
+
+<p><code>@RestController</code> is <code>@Controller</code> + <code>@ResponseBody</code> at class
+level. So every method's return value is serialised into the response body instead of being treated
+as a view name.</p>
+
+<p><strong>When do you need <code>@ResponseBody</code>?</strong> On a method in a plain
+<code>@Controller</code> that should return data rather than a view. Never inside a
+<code>@RestController</code> — it is already implied.</p>
+
+<p><strong><code>@RequestBody</code> versus <code>@ResponseBody</code> — do not muddle
+them.</strong></p>
+
+<ul>
+<li><code>@RequestBody</code> is on a <strong>parameter</strong>: deserialise the incoming body into
+this object.</li>
+<li><code>@ResponseBody</code> is on a <strong>method or class</strong>: serialise the return value
+into the outgoing body.</li>
+</ul>
+
+<pre class="language-java"><code class="language-java">@PostMapping
+public ResponseEntity&lt;ProductDTO&gt; createProduct(@Valid @RequestBody ProductCreateDTO dto) {
+    return new ResponseEntity&lt;&gt;(productService.createProduct(dto), CREATED);
+}</code></pre>
+
+<p><strong>When do you need <code>@ResponseStatus</code>?</strong> To set a status other than 200
+without building a <code>ResponseEntity</code> — on a handler method, or on an exception class so
+that throwing it produces that status. <code>ResponseEntity</code> is the more flexible option
+because it can also set headers, and it lets one method return different statuses.</p>
+
+<p><strong>Which starter would you use for a Spring REST application?</strong>
+<code>spring-boot-starter-webmvc</code>, which brings Spring MVC, Jackson and Tomcat. It was
+called <code>spring-boot-starter-web</code> before Boot 4; that name still resolves but is
+deprecated.</p>
+
+<h2>HttpMessageConverter</h2>
+
+<p><strong>What is an <code>HttpMessageConverter</code>?</strong></p>
+
+<p>The thing that turns a Java object into an HTTP body and back. Each one declares which media types
+and which Java types it supports. <code>MappingJackson2HttpMessageConverter</code> handles
+<code>application/json</code>; there are converters for strings, byte arrays, form data and
+resources.</p>
+
+<p><strong>How is one chosen?</strong> By content negotiation. For the request, from the
+<code>Content-Type</code> header; for the response, from the <code>Accept</code> header, narrowed by
+the <code>produces</code> attribute of the mapping. If nothing matches you get 415 Unsupported Media
+Type or 406 Not Acceptable — which is what those two codes actually mean.</p>
+
+<p><strong>Return <code>Resource</code>, not <code>byte[]</code>, for a file.</strong> Spring streams
+a <code>Resource</code>, so a 2 MB image never sits in heap in its entirety; with
+<code>byte[]</code> the whole file is buffered per concurrent request.</p>
+
+<pre class="language-java"><code class="language-java">@GetMapping("/images/{fileName}")
+public ResponseEntity&lt;Resource&gt; getImage(@PathVariable String fileName) {
+    Resource image = imageStorage.load(fileName);
+
+    return ResponseEntity.ok()
+            .contentType(MediaType.IMAGE_JPEG)
+            // The name contains a UUID, so the bytes behind a URL never change.
+            .cacheControl(CacheControl.maxAge(Duration.ofDays(365)).cachePublic())
+            // "inline", not "attachment" - this renders on a page, it is not a download.
+            .header("Content-Disposition", "inline; filename=\"" + fileName + "\"")
+            .body(image);
+}</code></pre>
+
+<h2>Validation and errors</h2>
+
+<p><strong>How do you validate a request body?</strong></p>
+
+<p><code>@Valid</code> on the parameter and constraints on the DTO. A failure raises
+<code>MethodArgumentNotValidException</code> before the method body runs.</p>
+
+<p><strong>How do you return a consistent error?</strong> One
+<code>@RestControllerAdvice</code>, so the logic lives in one place instead of as a try/catch in
+every handler.</p>
+
+<pre class="language-java"><code class="language-java">@RestControllerAdvice
+public class RestExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity&lt;ApiError&gt; handleValidation(
+            MethodArgumentNotValidException ex, HttpServletRequest request) {
+
+        ApiError error = new ApiError(BAD_REQUEST, "Validation failed", request.getRequestURI());
+        for (FieldError fieldError : ex.getBindingResult().getFieldErrors()) {
+            error.addValidationError(fieldError.getField(), fieldError.getDefaultMessage());
+        }
+        return ResponseEntity.badRequest().body(error);
+    }
+
+    // Without this, the catch-all below turns a malformed UUID into a 500 - which is
+    // wrong and actively misleading. The server is fine; the request is not.
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity&lt;ApiError&gt; handleUnreadableBody(
+            HttpMessageNotReadableException ex, HttpServletRequest request) { ... }
+
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity&lt;ApiError&gt; handleAuthentication(
+            AuthenticationException ex, HttpServletRequest request) {
+        // Deliberately vague: "no such user" vs "wrong password" tells an attacker
+        // which email addresses are registered.
+        ApiError error = new ApiError(UNAUTHORIZED, "Invalid email or password",
+                request.getRequestURI());
+        return ResponseEntity.status(error.getStatus()).body(error);
+    }
+
+    /** Catch-all. Logs the real cause but never leaks a stack trace to the client. */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity&lt;ApiError&gt; handleUnexpected(Exception ex, HttpServletRequest request) {
+        log.error("Unhandled exception on {}", request.getRequestURI(), ex);
+        ApiError error = new ApiError(INTERNAL_SERVER_ERROR, "Something went wrong on our end",
+                request.getRequestURI());
+        return ResponseEntity.status(error.getStatus()).body(error);
+    }
+}</code></pre>
+
+<p>One predictable error envelope means the client has exactly one error path to handle instead of
+guessing at whatever each framework default happens to produce.</p>
+
+<h2>⚠️ Never expose entities</h2>
+
+<p>Return DTOs. An entity as a response body leaks your schema, drags lazy associations into
+serialisation (and often into a <code>LazyInitializationException</code>), and makes every column
+rename a breaking API change. As a <em>request</em> body it is worse: a client could set any field
+that exists, including <code>role</code> or <code>price</code>. In the pizza API every price is
+computed on the server and the client never sends one — that is a security boundary, not a style
+preference.</p>
+
+<h2>Calling a REST API from Spring</h2>
+
+<p><strong>What are the advantages of <code>RestTemplate</code>?</strong></p>
+
+<p>It handles connection management, message conversion and error translation, so calling an API is
+one line instead of a try/finally around a <code>HttpURLConnection</code>.</p>
+
+<p><strong>⚠️ But it is no longer the answer to "which client would you use".</strong>
+<code>RestTemplate</code> is still supported and still works, but Spring 6.1 introduced
+<code>RestClient</code>: the same synchronous behaviour with a fluent API. Every study guide written
+before 2024 names <code>RestTemplate</code>; the current answer is:</p>
+
+<table>
+<thead><tr><th>Client</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>RestClient</code></td><td>synchronous calls — the default choice today</td></tr>
+<tr><td><code>WebClient</code></td><td>reactive or streaming calls</td></tr>
+<tr><td><code>@HttpExchange</code> interface</td><td>a declarative client, like a Feign client but built in</td></tr>
+<tr><td><code>RestTemplate</code></td><td>existing code</td></tr>
+</tbody>
+</table>
+
+<pre class="language-java"><code class="language-java">// RestClient - the modern synchronous client
+RestClient client = RestClient.create("http://localhost:8085");
+
+List&lt;ProductDTO&gt; menu = client.get()
+        .uri("/api/products")
+        .retrieve()
+        .body(new ParameterizedTypeReference&lt;&gt;() {});
+
+ProductDTO created = client.post()
+        .uri("/api/admin/products")
+        .header("Authorization", "Bearer " + token)
+        .contentType(MediaType.APPLICATION_JSON)
+        .body(dto)
+        .retrieve()
+        .body(ProductDTO.class);</code></pre>
+
+<p>The <code>ParameterizedTypeReference</code> is there because of type erasure: without it there is
+no way to tell the converter you want a <code>List&lt;ProductDTO&gt;</code> rather than a list of
+maps.</p>
+
+<h2>Securing a REST API</h2>
+
+<p><strong>Is REST secure? What can you do about it?</strong></p>
+
+<p>REST says nothing about security — it is an architectural style, not a protocol. In practice:
+TLS everywhere; a bearer token or OAuth2 rather than a session cookie; authorisation checked on
+every request; validate all input; expose UUIDs rather than sequential ids so nobody can enumerate
+your resources; and rate limiting. See
+<a href="/spring-study-guide/spring-study-guide-security">Security</a> for how Spring does it.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Safe = no state change. Idempotent = repeating it is harmless. POST is neither, which is why
+retries need an idempotency key.</li>
+<li>201 for a create, 204 for a delete, 401 for "not signed in", 403 for "not allowed", and never
+500 for bad input.</li>
+<li><code>@RequestBody</code> on a parameter, <code>@ResponseBody</code> on a method.
+<code>@RestController</code> implies the latter.</li>
+<li>Message converters plus <code>Accept</code>/<code>Content-Type</code> decide the format; 406 and
+415 are what "no converter matched" looks like.</li>
+<li>DTOs in, DTOs out. Entities never cross the wire.</li>
+<li><code>RestClient</code>, not <code>RestTemplate</code>, for new code.</li>
+</ul>

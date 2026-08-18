@@ -1,0 +1,445 @@
+<p>Everything else in Spring sits on top of this. The container creates your objects, wires them
+together, and wraps some of them in proxies — and almost every surprising thing Spring does is
+explained by one of those three facts.</p>
+
+<h2>Dependency injection</h2>
+
+<p><strong>What is dependency injection?</strong></p>
+
+<p>An object does not create or look up what it depends on. Something else supplies them. In Spring
+that something else is the container.</p>
+
+<p><strong>What does it actually buy you?</strong></p>
+
+<ul>
+<li><strong>You can substitute the dependency.</strong> A test passes a mock; production passes the
+real thing. Without DI the collaborator is hard-coded inside a constructor and there is no seam.</li>
+<li><strong>The class stops knowing how to build its world.</strong> It declares what it needs and
+nothing about where it comes from.</li>
+<li><strong>Wiring lives in one place</strong> instead of being smeared across every
+<code>new</code>.</li>
+</ul>
+
+<p><strong>Is dependency injection a design pattern?</strong></p>
+
+<p>It is a specific form of <em>inversion of control</em>. IoC is the principle — control over flow
+and construction is handed to a framework; DI is the mechanism.</p>
+
+<p><strong>Why inject through interfaces?</strong></p>
+
+<p>Because the caller then depends on a contract rather than an implementation, so the
+implementation can be swapped, decorated or proxied without the caller changing. That last one is
+not theoretical: it is exactly how <code>@Transactional</code> works.</p>
+
+<h2>The three ways to inject, and which to use</h2>
+
+<pre class="language-java"><code class="language-java">// Constructor injection - the one to use.
+// @RequiredArgsConstructor generates the constructor over the final fields, and since
+// Spring 4.3 a single constructor needs no @Autowired at all.
+@Service
+@RequiredArgsConstructor
+public class OrderPlacedListener {
+
+    private final CustomerOrderService orderService;
+    private final MailService mailService;
+    private final OrderMessagePublisher messagePublisher;
+}</code></pre>
+
+<pre class="language-java"><code class="language-java">// Field injection - concise, and worse.
+@Service
+public class ProductServiceImpl implements ProductService {
+
+    @Autowired
+    private ProductDAO productDAO;
+}</code></pre>
+
+<p><strong>Why is constructor injection preferred?</strong></p>
+
+<ul>
+<li>The fields can be <code>final</code>, so the object is immutable and fully formed the moment it
+exists.</li>
+<li>A missing dependency fails at startup, not on the first call.</li>
+<li>The class can be built with <code>new</code> in a plain unit test, with no Spring at all.</li>
+<li>A constructor with eight arguments is visibly wrong. Eight <code>@Autowired</code> fields look
+fine, which is how classes quietly grow into god objects.</li>
+</ul>
+
+<p>Setter injection is the third option, and is only worth reaching for when a dependency is
+genuinely optional or genuinely needs to change after construction. That is rare.</p>
+
+<h2>The ApplicationContext</h2>
+
+<p><strong>What is the application context?</strong></p>
+
+<p>Spring's container. It reads your configuration, instantiates the beans, injects their
+dependencies, applies post-processing, publishes lifecycle events, and holds the lot until it
+closes. <code>ApplicationContext</code> extends <code>BeanFactory</code> and adds the things real
+applications need — event publishing, message resolution, resource loading, automatic
+<code>BeanPostProcessor</code> registration.</p>
+
+<p><strong>How do you create one?</strong></p>
+
+<pre class="language-java"><code class="language-java">// In a Spring Boot application you never write this - SpringApplication.run does it,
+// and returns the context it created.
+ApplicationContext context =
+        SpringApplication.run(PizzaSpringbootBackendApplication.class, args);
+
+// Plain Spring, for reference:
+var ctx = new AnnotationConfigApplicationContext(AppConfig.class);
+var ctx2 = new ClassPathXmlApplicationContext("beans.xml");   // legacy</code></pre>
+
+<p><strong>What is the container's lifecycle?</strong></p>
+
+<ol>
+<li>Bean definitions are loaded — from component scanning, <code>@Bean</code> methods, XML.</li>
+<li><code>BeanFactoryPostProcessor</code>s run and may <em>edit those definitions</em>.</li>
+<li>Beans are instantiated, and their dependencies injected.</li>
+<li><code>BeanPostProcessor</code>s run around each bean's initialisation.</li>
+<li>The context is ready; <code>ContextRefreshedEvent</code> is published.</li>
+<li>On shutdown, destruction callbacks run in reverse order.</li>
+</ol>
+
+<p><strong>How do you close it properly? Does Spring Boot do it for you?</strong></p>
+
+<p>Yes. <code>SpringApplication.run</code> registers a JVM shutdown hook, so a normal exit closes
+the context and runs every destroy callback. Written by hand, use try-with-resources —
+<code>ConfigurableApplicationContext</code> is <code>AutoCloseable</code>.</p>
+
+<h2>The bean lifecycle</h2>
+
+<p><strong>Describe the lifecycle of a bean.</strong></p>
+
+<ol>
+<li>Instantiate — the constructor runs, and constructor injection happens here.</li>
+<li>Populate — fields and setters are injected.</li>
+<li>Aware callbacks — <code>BeanNameAware</code>, <code>ApplicationContextAware</code> and friends.</li>
+<li><code>BeanPostProcessor.postProcessBeforeInitialization</code>.</li>
+<li><code>@PostConstruct</code>.</li>
+<li><code>InitializingBean.afterPropertiesSet()</code>, then any custom <code>initMethod</code>.</li>
+<li><code>BeanPostProcessor.postProcessAfterInitialization</code> — <strong>this is where proxies
+are created</strong>.</li>
+<li>Bean is in use.</li>
+<li><code>@PreDestroy</code>, then <code>DisposableBean.destroy()</code>, then any custom
+<code>destroyMethod</code>.</li>
+</ol>
+
+<p>Step 7 is the one worth remembering. The object your <code>@PostConstruct</code> ran on is not
+necessarily the object other beans get injected with — they get the proxy that wrapped it
+afterwards.</p>
+
+<pre class="language-java"><code class="language-java">@Service
+public class JwtService {
+
+    private SecretKey key;
+
+    // Runs after injection, so properties are available. Failing here fails the
+    // application at startup rather than on the first login - which is the point.
+    @PostConstruct
+    void init() {
+        byte[] keyBytes = properties.jwt().secret().getBytes(StandardCharsets.UTF_8);
+        if (keyBytes.length &lt; 32) {
+            throw new IllegalStateException(
+                    "pizza.jwt.secret must be at least 32 characters for HS256");
+        }
+        this.key = Keys.hmacShaKeyFor(keyBytes);
+    }
+}</code></pre>
+
+<p><strong>What are the other ways to declare init and destroy methods?</strong></p>
+
+<p>Three, in order of preference: the <code>@PostConstruct</code> / <code>@PreDestroy</code>
+annotations (portable, no Spring coupling); <code>initMethod</code> /
+<code>destroyMethod</code> attributes on <code>@Bean</code> (the only option for a third-party class
+you cannot annotate); and implementing <code>InitializingBean</code> /
+<code>DisposableBean</code> (couples your class to Spring — avoid).</p>
+
+<p>Note that <strong>destroy callbacks never run for a prototype bean</strong>. The container hands
+it over and forgets it. Anything holding a resource must not be a prototype, or must be closed by
+whoever asked for it.</p>
+
+<h2>Scopes</h2>
+
+<p><strong>What scopes exist and what is the default?</strong></p>
+
+<table>
+<thead><tr><th>Scope</th><th>One instance per</th></tr></thead>
+<tbody>
+<tr><td><code>singleton</code> <em>(default)</em></td><td>container</td></tr>
+<tr><td><code>prototype</code></td><td>injection or <code>getBean</code> call</td></tr>
+<tr><td><code>request</code></td><td>HTTP request</td></tr>
+<tr><td><code>session</code></td><td>HTTP session</td></tr>
+<tr><td><code>application</code></td><td>ServletContext</td></tr>
+<tr><td><code>websocket</code></td><td>WebSocket session</td></tr>
+</tbody>
+</table>
+
+<p>The last four only exist in a web-aware context.</p>
+
+<p><strong>Singleton means one per container, not one per JVM.</strong> Two contexts in the same
+process each get their own. And a singleton is shared across every request thread, so
+<strong>a singleton with mutable state is a data race</strong> — which is why the services in the
+pizza API hold only their injected collaborators and nothing else.</p>
+
+<p><strong>What happens if you inject a prototype into a singleton?</strong></p>
+
+<p>You get exactly one instance, injected once at startup, and it never changes. That is nearly
+always a bug. If you need a fresh instance per call, inject an
+<code>ObjectProvider&lt;T&gt;</code> and call <code>getObject()</code>, or use a scoped proxy.</p>
+
+<h2>Defining beans</h2>
+
+<p><strong><code>@Component</code> versus <code>@Bean</code> — when do you use which?</strong></p>
+
+<table>
+<thead><tr><th></th><th><code>@Component</code></th><th><code>@Bean</code></th></tr></thead>
+<tbody>
+<tr><td>Goes on</td><td>your own class</td><td>a method in a <code>@Configuration</code> class</td></tr>
+<tr><td>Found by</td><td>component scanning</td><td>being declared</td></tr>
+<tr><td>Use it for</td><td>code you own</td><td>third-party classes, or anything needing construction logic</td></tr>
+</tbody>
+</table>
+
+<pre class="language-java"><code class="language-java">@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    public static final String MENU_CACHE = "menu";
+
+    // ConcurrentMapCacheManager is not our class, so it cannot be annotated.
+    // A @Bean method is the only way to contribute it - and it lets us configure it.
+    @Bean
+    public ConcurrentMapCacheManager cacheManager() {
+        var manager = new ConcurrentMapCacheManager(MENU_CACHE, MENU_BY_TYPE_CACHE);
+        manager.setAllowNullValues(false);
+        return manager;
+    }
+}</code></pre>
+
+<p><strong>What is the default bean id, and how do you change it?</strong></p>
+
+<p>For <code>@Bean</code>, the method name. For <code>@Component</code>, the class name with a
+lower-case first letter. Override with <code>@Bean(name = "...")</code> or
+<code>@Component("...")</code>.</p>
+
+<p><strong>What does component scanning do, and where does it look?</strong></p>
+
+<p>It walks the classpath under a set of base packages looking for classes annotated with
+<code>@Component</code> or a meta-annotation of it — <code>@Service</code>,
+<code>@Repository</code>, <code>@Controller</code>, <code>@RestController</code>,
+<code>@Configuration</code> — and registers a bean definition for each.
+<code>@SpringBootApplication</code> implies <code>@ComponentScan</code> with the annotated class's
+own package as the base, which is why that class belongs at the root of your package tree.</p>
+
+<p>The stereotype annotations are not merely decorative. <code>@Repository</code> in particular
+enables translation of vendor-specific persistence exceptions into Spring's
+<code>DataAccessException</code> hierarchy.</p>
+
+<p><strong>Why would you make a <code>@Bean</code> method <code>static</code>?</strong></p>
+
+<p>Because <code>BeanFactoryPostProcessor</code>s must be created very early — before the
+enclosing configuration class can be fully initialised. A static method can be called without an
+instance, which avoids forcing the configuration class into premature instantiation.</p>
+
+<h2>Resolving ambiguity</h2>
+
+<p><strong>What happens when two beans match one injection point?</strong></p>
+
+<p><code>NoUniqueBeanDefinitionException</code>, at startup. Resolve it one of three ways:</p>
+
+<ol>
+<li><code>@Primary</code> on the one that should win by default.</li>
+<li><code>@Qualifier("name")</code> at the injection point to name the one you want.</li>
+<li>Name the field or parameter after the bean — matching by name is the fallback after matching by
+type.</li>
+</ol>
+
+<pre class="language-java"><code class="language-java">// Two ThreadPoolTaskExecutor-ish beans exist, so the injection point names one.
+@Autowired
+@Qualifier(value = "taskExecutor")
+private ThreadPoolTaskExecutor taskExecutor;</code></pre>
+
+<p><strong>What if a bean might not exist at all?</strong></p>
+
+<p><code>ObjectProvider&lt;T&gt;</code>. It resolves lazily and tolerates absence, which is how one
+security configuration can cover both the profile where OAuth2 is configured and the profile where
+it is not:</p>
+
+<pre class="language-java"><code class="language-java">private final ObjectProvider&lt;ClientRegistrationRepository&gt; clientRegistrationRepository;
+
+// ...
+if (clientRegistrationRepository.getIfAvailable() != null) {
+    http.oauth2Login(oauth2 -&gt; oauth2.successHandler(successHandler));
+}</code></pre>
+
+<h2>Lazy or eager?</h2>
+
+<p><strong>Are beans created lazily or eagerly?</strong></p>
+
+<p>Singletons are created <strong>eagerly</strong>, when the context starts. Prototypes are created
+on demand. Add <code>@Lazy</code> to defer a singleton until first use.</p>
+
+<p>Eager is the right default: a misconfigured bean fails the application at startup rather than at
+3am on the first request that happens to need it. Reach for <code>@Lazy</code> to break a circular
+dependency or to skip building something genuinely expensive and rarely used — and treat the first
+of those as a design smell rather than a solution.</p>
+
+<h2>Configuration values</h2>
+
+<p><strong>How do you inject a scalar value?</strong></p>
+
+<pre class="language-java"><code class="language-java">@Value("${pizza.oauth2.success-redirect:http://localhost:5173/oauth2/callback}")
+private String successRedirect;</code></pre>
+
+<p>The part after <code>:</code> is the default, used when the property is absent. Without a
+default, a missing property fails the context — which is usually what you want.</p>
+
+<p><strong>What is the Environment abstraction?</strong></p>
+
+<p>The container's unified view of properties and active profiles, whatever their source — command
+line, environment variables, <code>application.properties</code>, defaults. Ask it directly when
+you need to:</p>
+
+<pre class="language-java"><code class="language-java">Environment env = ctx.getEnvironment();
+System.out.println("Active Profile: " + Arrays.toString(env.getActiveProfiles()));
+System.out.println("Port: " + env.getProperty("server.port"));</code></pre>
+
+<p><strong>What is a property source, and what does <code>@PropertySource</code> do?</strong></p>
+
+<p>A property source is one named set of key/value pairs. The <code>Environment</code> holds an
+ordered list of them and returns the first hit, which is exactly how a command-line argument
+overrides a file. <code>@PropertySource</code> adds a file to that list.
+<code>PropertySourcesPlaceholderConfigurer</code> is the <code>BeanFactoryPostProcessor</code> that
+resolves <code>${...}</code> placeholders against it — Boot registers one for you.</p>
+
+<p><strong>What is SpEL, and what is the difference between <code>$</code> and
+<code>#</code>?</strong></p>
+
+<p>Spring Expression Language — an expression language for querying and manipulating an object graph
+at runtime. The two prefixes are completely different things:</p>
+
+<ul>
+<li><code>${...}</code> is a <strong>property placeholder</strong>. Resolved from the
+<code>Environment</code>, before SpEL is involved at all.</li>
+<li><code>#{...}</code> is a <strong>SpEL expression</strong>. Evaluated as code — it can reference
+beans, call methods, do arithmetic.</li>
+</ul>
+
+<pre class="language-java"><code class="language-java">@Value("${server.port}")            // the property named server.port
+@Value("#{systemProperties['user.region']}")   // a SpEL expression
+@Cacheable(value = "menuByType", key = "#type")   // SpEL over the method's arguments
+@PreAuthorize("hasRole('ADMIN')")                 // SpEL, over the security context</code></pre>
+
+<p>The last two are why SpEL is worth knowing even if you never write <code>#{}</code> yourself: the
+caching and security annotations are SpEL all the way down.</p>
+
+<h2>Prefer <code>@ConfigurationProperties</code> to <code>@Value</code></h2>
+
+<p>This is the modern answer, and it is not a style preference. The pizza API replaced nine scattered
+<code>@Value</code> annotations with one record — and two of the nine were the <em>same key</em>
+declared in two different classes, with nothing checking they still agreed.</p>
+
+<pre class="language-java"><code class="language-java">@Validated
+@ConfigurationProperties(prefix = "pizza")
+public record PizzaProperties(
+        @Valid Pricing pricing,
+        @Valid Jwt jwt,
+        @Valid Cors cors) {
+
+    public record Pricing(
+            @DecimalMin("0.0") @DecimalMax("1.0") BigDecimal taxRate,
+            @DecimalMin("0.0") BigDecimal deliveryFee) {}
+
+    public record Jwt(@NotBlank @Size(min = 32) String secret, @Positive long expirationMinutes) {}
+
+    // Binding to List&lt;String&gt; removes the split(",") every @Value version does by hand.
+    public record Cors(@NotEmpty List&lt;String&gt; allowedOrigins) {}
+}</code></pre>
+
+<p>Three things you get that <code>@Value</code> cannot give you: <strong>types</strong> (a
+<code>BigDecimal</code> is a <code>BigDecimal</code>, a list is a list), <strong>immutability</strong>
+(a record component is set once by the constructor), and <strong>validation at
+startup</strong> — <code>@Validated</code> checks the constraints while the context is building, so a
+missing <code>pizza.jwt.secret</code> fails at boot with a message naming the property instead of
+becoming a null field and a <code>NullPointerException</code> on the first login.</p>
+
+<h2>Profiles</h2>
+
+<p><strong>What are profiles for and how do you configure them?</strong></p>
+
+<p>A profile is a named group of beans and properties that is only active when you say so. Use it
+when whole components differ per environment — not for a value that differs, which is what
+properties are for.</p>
+
+<pre class="language-java"><code class="language-java">@Service
+@Profile("search")   // no Elasticsearch bean exists unless this profile is on,
+public class ProductSearchServiceImpl implements ProductSearchService { ... }</code></pre>
+
+<pre class="language-properties"><code class="language-properties">spring.profiles.active=local
+# and application-local.properties is layered over application.properties</code></pre>
+
+<p>Activate with <code>spring.profiles.active</code>, the <code>SPRING_PROFILES_ACTIVE</code>
+environment variable, or <code>--spring.profiles.active=</code> on the command line. You can have as
+many active at once as you like. <code>@Profile("!prod")</code> negates; <code>@Profile</code> works
+on <code>@Component</code> and <code>@Bean</code> alike.</p>
+
+<h2>Proxies</h2>
+
+<p><strong>What is a proxy, and which two types can Spring create?</strong></p>
+
+<p>A proxy is a stand-in object with the same type as the real bean. Callers hold the proxy; it adds
+behaviour and then delegates. This is how <code>@Transactional</code>,
+<code>@Cacheable</code>, <code>@Async</code>, <code>@PreAuthorize</code>, <code>@Retryable</code> and
+every AOP aspect are implemented.</p>
+
+<table>
+<thead><tr><th></th><th>JDK dynamic proxy</th><th>CGLIB</th></tr></thead>
+<tbody>
+<tr><td>Requires</td><td>the bean implements an interface</td><td>nothing — subclasses the class</td></tr>
+<tr><td>Proxies</td><td>only interface methods</td><td>public and protected methods</td></tr>
+<tr><td>Cannot handle</td><td>a class with no interface</td><td><code>final</code> classes or <code>final</code> methods</td></tr>
+</tbody>
+</table>
+
+<p>Spring Boot defaults to CGLIB (<code>proxyTargetClass=true</code>) so it works either way.</p>
+
+<p><strong>What visibility must a method have to be advised?</strong></p>
+
+<p><code>public</code> — with CGLIB, <code>protected</code> also works. <code>private</code>,
+<code>static</code> and <code>final</code> methods are never advised, and nothing warns you.</p>
+
+<p><strong>⚠️ The rule that catches everyone: self-invocation.</strong></p>
+
+<pre class="language-java"><code class="language-java">public void a() { b(); }   // b() is NOT advised - this call never leaves the object
+public void b() { ... }    // advised only when ANOTHER bean calls it</code></pre>
+
+<p>Advice runs when a call arrives <em>through</em> the proxy. A call to a sibling method on
+<code>this</code> goes straight down the vtable and the proxy never sees it. So a
+<code>@Transactional</code> method called from another method of the same class runs with no
+transaction at all — silently. If an annotation "isn't working", check for a self-invocation before
+anything else.</p>
+
+<h2>Post-processors</h2>
+
+<p><strong><code>BeanFactoryPostProcessor</code> versus
+<code>BeanPostProcessor</code>?</strong></p>
+
+<table>
+<thead><tr><th></th><th><code>BeanFactoryPostProcessor</code></th><th><code>BeanPostProcessor</code></th></tr></thead>
+<tbody>
+<tr><td>Operates on</td><td>bean <em>definitions</em></td><td>bean <em>instances</em></td></tr>
+<tr><td>Runs</td><td>once, before any bean is created</td><td>around every bean's initialisation</td></tr>
+<tr><td>Example</td><td><code>PropertySourcesPlaceholderConfigurer</code></td><td>the one that wraps beans in AOP proxies</td></tr>
+</tbody>
+</table>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Constructor injection, <code>final</code> fields, no <code>@Autowired</code> needed.</li>
+<li>Singletons are eager and shared — so they must be stateless.</li>
+<li>Proxies are created in <code>postProcessAfterInitialization</code>, which is why
+self-invocation bypasses every annotation built on them.</li>
+<li><code>${}</code> is a property; <code>#{}</code> is SpEL. Different mechanisms entirely.</li>
+<li><code>@ConfigurationProperties</code> over <code>@Value</code>: typed, immutable, validated at
+startup.</li>
+</ul>
