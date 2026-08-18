@@ -31,11 +31,25 @@ NAV_GROUP = "JavaScript"
 DEMO_APP = "lovemesomecoding_demo_project/pizza/pizza-react-frontend"
 
 POSTS = [
-    # ---------------------------------------------------------- getting started
+    # ------------------------------------------------------------ start here
+    {
+        "slug": "react-get-started",
+        "title": "React – Get Started",
+        "file": "01-react-get-started.html",
+        "date": "2026-06-03T09:00:00",
+        "tags": ["react", "vite", "typescript"],
+        "excerpt": (
+            "Start here. What React is and what problem it solves, the exact versions this track "
+            "is written against — React 19.2, TypeScript 6, Vite 8 — one command to create a "
+            "project and see it running, the demo application every example is taken from, and "
+            "the full lesson index in reading order."
+        ),
+    },
+    # ----------------------------------------------------- getting started
     {
         "slug": "react-set-up",
         "title": "React – Set Up a Project with Vite",
-        "file": "01-react-set-up.html",
+        "file": "02-react-set-up.html",
         "date": "2026-06-06T09:00:00",
         "tags": ["react", "vite", "typescript"],
         "excerpt": (
@@ -48,7 +62,7 @@ POSTS = [
     {
         "slug": "react-es6",
         "title": "React – The JavaScript You Need First",
-        "file": "02-react-es6.html",
+        "file": "03-react-es6.html",
         "date": "2026-06-09T09:00:00",
         "tags": ["react", "javascript", "es6"],
         "excerpt": (
@@ -61,7 +75,7 @@ POSTS = [
     {
         "slug": "react-render-html",
         "title": "React – Rendering to the DOM",
-        "file": "03-react-render-html.html",
+        "file": "04-react-render-html.html",
         "date": "2026-06-12T09:00:00",
         "tags": ["react", "dom"],
         "excerpt": (
@@ -75,7 +89,7 @@ POSTS = [
     {
         "slug": "react-components",
         "title": "React – Your First Component",
-        "file": "04-react-components.html",
+        "file": "05-react-components.html",
         "date": "2026-06-15T09:00:00",
         "tags": ["react", "components"],
         "excerpt": (
@@ -88,7 +102,7 @@ POSTS = [
     {
         "slug": "react-jsx",
         "title": "React – JSX",
-        "file": "05-react-jsx.html",
+        "file": "06-react-jsx.html",
         "date": "2026-06-18T09:00:00",
         "tags": ["react", "jsx"],
         "excerpt": (
@@ -101,7 +115,7 @@ POSTS = [
     {
         "slug": "react-props",
         "title": "React – Props",
-        "file": "06-react-props.html",
+        "file": "07-react-props.html",
         "date": "2026-06-21T09:00:00",
         "tags": ["react", "props", "typescript"],
         "excerpt": (
@@ -114,7 +128,7 @@ POSTS = [
     {
         "slug": "react-conditional-rendering",
         "title": "React – Conditional Rendering",
-        "file": "07-react-conditional-rendering.html",
+        "file": "08-react-conditional-rendering.html",
         "date": "2026-06-24T09:00:00",
         "tags": ["react", "jsx"],
         "excerpt": (
@@ -127,7 +141,7 @@ POSTS = [
     {
         "slug": "react-keys",
         "title": "React – Rendering Lists and Keys",
-        "file": "08-react-keys.html",
+        "file": "09-react-keys.html",
         "date": "2026-06-27T09:00:00",
         "tags": ["react", "lists", "keys"],
         "excerpt": (
@@ -141,7 +155,7 @@ POSTS = [
     {
         "slug": "react-events",
         "title": "React – Handling Events",
-        "file": "09-react-events.html",
+        "file": "10-react-events.html",
         "date": "2026-06-30T09:00:00",
         "tags": ["react", "events"],
         "excerpt": (
@@ -154,7 +168,7 @@ POSTS = [
     {
         "slug": "react-state",
         "title": "React – State with useState",
-        "file": "10-react-state.html",
+        "file": "11-react-state.html",
         "date": "2026-07-03T09:00:00",
         "tags": ["react", "state", "hooks"],
         "excerpt": (
@@ -167,7 +181,7 @@ POSTS = [
     {
         "slug": "react-update-state",
         "title": "React – Updating State Correctly",
-        "file": "11-react-update-state.html",
+        "file": "12-react-update-state.html",
         "date": "2026-07-06T09:00:00",
         "tags": ["react", "state", "hooks"],
         "excerpt": (
@@ -180,7 +194,7 @@ POSTS = [
     {
         "slug": "react-forms",
         "title": "React – Forms and Controlled Inputs",
-        "file": "12-react-forms.html",
+        "file": "13-react-forms.html",
         "date": "2026-07-09T09:00:00",
         "tags": ["react", "forms"],
         "excerpt": (
@@ -194,7 +208,7 @@ POSTS = [
     {
         "slug": "react-context",
         "title": "React – Passing Data Deeply with Context",
-        "file": "13-react-context.html",
+        "file": "14-react-context.html",
         "date": "2026-07-12T09:00:00",
         "tags": ["react", "context", "hooks"],
         "excerpt": (
@@ -207,7 +221,7 @@ POSTS = [
     {
         "slug": "react-usereducer",
         "title": "React – useReducer",
-        "file": "14-react-usereducer.html",
+        "file": "15-react-usereducer.html",
         "date": "2026-07-15T09:00:00",
         "tags": ["react", "state", "hooks"],
         "excerpt": (
@@ -220,7 +234,7 @@ POSTS = [
     {
         "slug": "react-custom-hooks",
         "title": "React – Custom Hooks",
-        "file": "15-react-custom-hooks.html",
+        "file": "16-react-custom-hooks.html",
         "date": "2026-07-18T09:00:00",
         "tags": ["react", "hooks"],
         "excerpt": (
@@ -233,7 +247,7 @@ POSTS = [
     {
         "slug": "react-redux",
         "title": "React – Redux, and Whether You Need It",
-        "file": "16-react-redux.html",
+        "file": "17-react-redux.html",
         "date": "2026-07-21T09:00:00",
         "tags": ["react", "redux", "state"],
         "excerpt": (
@@ -247,7 +261,7 @@ POSTS = [
     {
         "slug": "react-lifecycle",
         "title": "React – The Component Lifecycle with useEffect",
-        "file": "17-react-lifecycle.html",
+        "file": "18-react-lifecycle.html",
         "date": "2026-07-24T09:00:00",
         "tags": ["react", "hooks", "useeffect"],
         "excerpt": (
@@ -260,7 +274,7 @@ POSTS = [
     {
         "slug": "react-useref",
         "title": "React – Refs",
-        "file": "18-react-useref.html",
+        "file": "19-react-useref.html",
         "date": "2026-07-27T09:00:00",
         "tags": ["react", "hooks", "dom"],
         "excerpt": (
@@ -273,7 +287,7 @@ POSTS = [
     {
         "slug": "react-error-boundary",
         "title": "React – Error Boundaries",
-        "file": "19-react-error-boundary.html",
+        "file": "20-react-error-boundary.html",
         "date": "2026-07-30T09:00:00",
         "tags": ["react", "errors"],
         "excerpt": (
@@ -287,7 +301,7 @@ POSTS = [
     {
         "slug": "react-route",
         "title": "React – Routing with React Router",
-        "file": "20-react-route.html",
+        "file": "21-react-route.html",
         "date": "2026-08-02T09:00:00",
         "tags": ["react", "react-router"],
         "excerpt": (
@@ -300,7 +314,7 @@ POSTS = [
     {
         "slug": "react-usememo-usecallback",
         "title": "React – useMemo, useCallback and memo",
-        "file": "21-react-usememo-usecallback.html",
+        "file": "22-react-usememo-usecallback.html",
         "date": "2026-08-05T09:00:00",
         "tags": ["react", "hooks", "performance"],
         "excerpt": (
@@ -313,7 +327,7 @@ POSTS = [
     {
         "slug": "react-lazy-suspense",
         "title": "React – Code Splitting with lazy and Suspense",
-        "file": "22-react-lazy-suspense.html",
+        "file": "23-react-lazy-suspense.html",
         "date": "2026-08-08T09:00:00",
         "tags": ["react", "performance", "suspense"],
         "excerpt": (
@@ -326,7 +340,7 @@ POSTS = [
     {
         "slug": "react-css",
         "title": "React – Styling",
-        "file": "23-react-css.html",
+        "file": "24-react-css.html",
         "date": "2026-08-11T09:00:00",
         "tags": ["react", "css"],
         "excerpt": (
@@ -339,7 +353,7 @@ POSTS = [
     {
         "slug": "react-with-bootstrap",
         "title": "React – Bootstrap",
-        "file": "24-react-with-bootstrap.html",
+        "file": "25-react-with-bootstrap.html",
         "date": "2026-08-14T09:00:00",
         "tags": ["react", "bootstrap", "css"],
         "excerpt": (
@@ -352,7 +366,7 @@ POSTS = [
     {
         "slug": "react-sass",
         "title": "React – Sass",
-        "file": "25-react-sass.html",
+        "file": "26-react-sass.html",
         "date": "2026-08-17T09:00:00",
         "tags": ["react", "sass", "css"],
         "excerpt": (

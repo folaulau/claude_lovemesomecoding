@@ -1,0 +1,231 @@
+<p>Older React tutorials talk about a component lifecycle with three phases — mounting, updating,
+unmounting — and a method for each. Function components have no such methods. They have
+<code>useEffect</code>, and it covers all three.</p>
+
+<p>The more important shift is in how you are meant to think about it. An effect is not "code that
+runs after mount". It is <strong>a way to synchronise your component with something outside
+React</strong> — a server, a subscription, a timer, the browser API. Once you read it that way, the
+dependency array and the cleanup function stop being rules to memorise.</p>
+
+<h2>The mapping</h2>
+
+<table>
+  <thead>
+    <tr><th>Class method</th><th>Hook equivalent</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>componentDidMount</code></td><td><code>useEffect(fn, [])</code></td></tr>
+    <tr><td><code>componentDidUpdate</code></td><td><code>useEffect(fn, [deps])</code></td></tr>
+    <tr><td><code>componentWillUnmount</code></td><td>the function <code>fn</code> returns</td></tr>
+    <tr><td><code>componentDidCatch</code></td><td><strong>none</strong> — still needs a class</td></tr>
+  </tbody>
+</table>
+
+<p>That last row is not an oversight. <a href="/react/react-error-boundary">Error Boundaries</a> are
+the one thing hooks never replaced.</p>
+
+<h2>The shape</h2>
+
+<pre class="language-tsx"><code class="language-tsx">useEffect(() =&gt; {
+  // 1. the effect — runs after the render is committed to the screen
+  return () =&gt; {
+    // 2. the cleanup — runs before the next effect, and on unmount
+  };
+}, [/* 3. dependencies */]);</code></pre>
+
+<h3>The dependency array</h3>
+
+<p>It decides when the effect runs again, and there are exactly three cases:</p>
+
+<pre class="language-tsx"><code class="language-tsx">useEffect(() =&gt; { /* … */ });              // after EVERY render — almost always a mistake
+useEffect(() =&gt; { /* … */ }, []);          // once, after the first render
+useEffect(() =&gt; { /* … */ }, [reloadToken]);   // when reloadToken changes</code></pre>
+
+<p>The array must list every reactive value the effect reads — every prop, state variable, or value
+derived from them. The <code>react-hooks/exhaustive-deps</code> lint rule checks this, and when it
+disagrees with you it is almost always right.</p>
+
+<p><strong>Lying to it is the single biggest source of effect bugs.</strong> If the rule wants a
+dependency you do not want to react to, the answer is to restructure — move the value into a ref,
+wrap the function in <code>useCallback</code>, or compute it inside the effect — not to delete it
+from the array.</p>
+
+<h2>A real effect, in full</h2>
+
+<p>Fetching the menu. Everything in here is load-bearing:</p>
+
+<pre class="language-tsx"><code class="language-tsx">useEffect(() =&gt; {
+  const controller = new AbortController();
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const [productData, toppingData, crustData] = await Promise.all([
+        api.get&lt;Product[]&gt;('/api/products', { signal: controller.signal }),
+        api.get&lt;Topping[]&gt;('/api/toppings', { signal: controller.signal }),
+        api.get&lt;Crust[]&gt;('/api/crusts', { signal: controller.signal }),
+      ]);
+      setProducts(productData);
+      setToppings(toppingData);
+      setCrusts(crustData);
+    } catch (err) {
+      // An abort is not a failure — it means we navigated away or StrictMode re-ran the effect.
+      if (controller.signal.aborted) return;
+      setError(
+        err instanceof Error ? `Could not load the menu: ${err.message}` : 'Could not load the menu.',
+      );
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  }
+
+  void load();
+  return () =&gt; controller.abort();
+}, [reloadToken]);</code></pre>
+
+<p>Four decisions worth copying:</p>
+
+<p><strong>The async function is declared inside and then called.</strong> The effect callback itself
+cannot be <code>async</code> — an async function returns a promise, and React expects the return
+value to be a cleanup function. <code>useEffect(async () =&gt; …)</code> gives you a warning and a
+cleanup that never runs.</p>
+
+<p><strong><code>AbortController</code>, and cleanup that uses it.</strong> This is what makes the
+effect safe to run twice, cancel mid-flight, or unmount during. Without it, navigating away while a
+request is in flight sets state on a component that is gone, and two overlapping requests can finish
+out of order with the stale one winning.</p>
+
+<p><strong>An abort is caught and ignored.</strong> A cancelled request throws; treating that as a
+failure would flash "Could not load the menu" every time the user navigated away.</p>
+
+<p><strong><code>Promise.all</code>, not three awaits.</strong> The three requests are independent, so
+serialising them would triple the wait for nothing.</p>
+
+<h2>Cleanup</h2>
+
+<p>The returned function runs before the effect runs again, and once more when the component
+unmounts. Anything the effect started, the cleanup stops:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// a timer
+useEffect(() =&gt; {
+  const timer = window.setTimeout(() =&gt; { /* … */ }, 300);
+  return () =&gt; window.clearTimeout(timer);
+}, [state, hydrated]);
+
+// a subscription
+useEffect(() =&gt; {
+  const list = window.matchMedia(query);
+  list.addEventListener('change', onChange);
+  return () =&gt; list.removeEventListener('change', onChange);
+}, [query]);
+
+// a request
+useEffect(() =&gt; {
+  const controller = new AbortController();
+  /* … */
+  return () =&gt; controller.abort();
+}, []);</code></pre>
+
+<p>The debounced cart save is a nice case, because the cleanup is what produces the debounce.
+Clicking "+" three times quickly re-runs the effect three times, and each run cancels the previous
+timer — so only the last one fires:</p>
+
+<pre class="language-tsx"><code class="language-tsx">useEffect(() =&gt; {
+  // Never write before hydrating — that would overwrite the saved cart with an empty one.
+  if (!hydrated) return;
+
+  // Debounced: clicking "+" three times quickly is one write, not three.
+  const timer = window.setTimeout(() =&gt; {
+    void (async () =&gt; { /* … PUT the cart … */ })();
+  }, 300);
+
+  return () =&gt; window.clearTimeout(timer);
+}, [state, hydrated]);</code></pre>
+
+<p>Note the early <code>return</code> before any work — that is allowed, and returning nothing simply
+means there is no cleanup for that run.</p>
+
+<h2>StrictMode runs it twice</h2>
+
+<p>In development, React mounts your component, runs the effect, runs the cleanup, and runs the
+effect again. Every time. This is deliberate.</p>
+
+<p>It is checking that your effect is <em>resilient to being re-run</em>, because in a real app it
+will be — every dependency change does exactly this. If the double run breaks something, the cleanup
+is missing or incomplete, and that bug would have shown up later in a worse place.</p>
+
+<p>It does not happen in the production build. Deleting <code>&lt;StrictMode&gt;</code> to make the
+second request go away is fixing the smoke detector.</p>
+
+<h2>The infinite loop</h2>
+
+<p>Everyone writes this once:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Effect sets state → state changes → effect runs → …
+useEffect(() =&gt; {
+  setProducts(filterProducts(products));
+});                                          // no dependency array at all</code></pre>
+
+<p>Two variants of the same mistake. Missing the array entirely means "run after every render", and
+an effect that sets state causes a render. And this one, which looks correct:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// `options` is a new object every render, so the effect runs every render.
+useEffect(() =&gt; {
+  load(options);
+}, [options]);</code></pre>
+
+<p>Objects, arrays and functions declared in the component body are new references on every render,
+so a dependency array containing one is never equal to the last. The fixes are
+<a href="/react/react-usememo-usecallback"><code>useMemo</code> or <code>useCallback</code></a> around
+the value, or depending on the primitive fields instead of the object.</p>
+
+<h2>You probably do not need an effect</h2>
+
+<p>This is the most useful thing in the post. Most effects people write should not exist.</p>
+
+<h3>Not for derived data</h3>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG — an extra render, a second source of truth, and a chance to go stale.
+const [pizzas, setPizzas] = useState&lt;Product[]&gt;([]);
+useEffect(() =&gt; {
+  setPizzas(products.filter((p) =&gt; p.type === 'PIZZA'));
+}, [products]);
+
+// Right — just calculate it.
+const pizzas = useMemo(() =&gt; products.filter((p) =&gt; p.type === 'PIZZA'), [products]);</code></pre>
+
+<h3>Not for responding to an event</h3>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG — the click already happened; watching state to find out is indirect and fragile.
+useEffect(() =&gt; {
+  if (submitted) showToast('Added to your cart');
+}, [submitted]);
+
+// Right — do it where it happened.
+function handleAdd() {
+  addItem({ product, size, crust, toppings: selectedToppings, quantity });
+  showToast(`${quantity} × ${product.name} added to your cart`);
+  onHide();
+}</code></pre>
+
+<p>The rule of thumb: <strong>an effect is for synchronising with something outside React.</strong> If
+both sides of the problem are inside React — state, props, a click — you almost certainly want a
+calculation during render or a line in an event handler instead.</p>
+
+<h2>Effects that are genuinely necessary</h2>
+
+<p>For completeness, the ones in this app, all of which pass that test:</p>
+
+<ul>
+  <li>fetching the menu from the server on first render</li>
+  <li>validating a stored auth token against <code>/api/auth/me</code> on startup</li>
+  <li>loading a saved cart, and persisting it back, debounced</li>
+  <li>resetting the builder form when a different product is opened</li>
+</ul>
+
+<p>Every one of them crosses the boundary between React and something that is not React.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-useref">Refs</a> — the other escape hatch.</p>

@@ -1,0 +1,298 @@
+<p>React has no router. It renders components; it has no opinion about URLs. Every React application
+with more than one page uses a library for this, and in practice that library is
+<a href="https://reactrouter.com" rel="nofollow">React Router</a>.</p>
+
+<p>This post is written against <strong>react-router-dom 7</strong>, using the declarative
+<code>&lt;Routes&gt;</code> API.</p>
+
+<pre class="language-bash"><code class="language-bash">npm install react-router-dom</code></pre>
+
+<h2>The router goes at the top</h2>
+
+<p>One <code>&lt;BrowserRouter&gt;</code> wrapping the app, in the entry file:</p>
+
+<pre class="language-tsx"><code class="language-tsx">createRoot(document.getElementById('root')!).render(
+  &lt;StrictMode&gt;
+    &lt;BrowserRouter&gt;
+      &lt;AuthProvider&gt;
+        {/* … */}
+        &lt;App /&gt;
+      &lt;/AuthProvider&gt;
+    &lt;/BrowserRouter&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+<p><code>BrowserRouter</code> uses the History API, so URLs look normal:
+<code>/menu</code>, <code>/checkout</code>. The alternative, <code>HashRouter</code>, produces
+<code>/#/menu</code> and exists for static hosts that cannot be configured — which brings us to the
+one deployment detail that catches everyone:</p>
+
+<p><strong>Your server must return <code>index.html</code> for every path.</strong> The router is
+client-side, so the server has never heard of <code>/checkout</code>. Load the home page and
+navigate and it works; refresh on <code>/checkout</code> and you get a 404 until the server is told
+to serve the app for unknown paths. On Vite's dev server this is automatic; in production it is a
+one-line rewrite rule.</p>
+
+<h2>Routes</h2>
+
+<p><code>&lt;Routes&gt;</code> picks the best match among its <code>&lt;Route&gt;</code> children and
+renders it:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Routes&gt;
+  &lt;Route path="/" element={&lt;HomePage /&gt;} /&gt;
+  &lt;Route path="/menu" element={&lt;MenuPage /&gt;} /&gt;
+  &lt;Route path="/checkout" element={&lt;CheckoutPage /&gt;} /&gt;
+  &lt;Route path="/order-confirmation/:orderId" element={&lt;OrderConfirmationPage /&gt;} /&gt;
+  &lt;Route path="/login" element={&lt;LoginPage /&gt;} /&gt;
+  &lt;Route path="/register" element={&lt;RegisterPage /&gt;} /&gt;
+
+  &lt;Route
+    path="*"
+    element={
+      &lt;div className="container py-5 text-center"&gt;
+        &lt;h1 className="h4"&gt;Page not found&lt;/h1&gt;
+      &lt;/div&gt;
+    }
+  /&gt;
+&lt;/Routes&gt;</code></pre>
+
+<p><code>element</code> takes rendered JSX — <code>{&lt;MenuPage /&gt;}</code>, not
+<code>{MenuPage}</code>. That is what lets you pass props to a routed component.</p>
+
+<p><code>path="*"</code> is the catch-all. Order does not matter — v6 and later score routes by
+specificity rather than taking the first match — but keeping the catch-all last still reads
+better.</p>
+
+<p>Everything outside <code>&lt;Routes&gt;</code> stays mounted across navigation, which is exactly
+what you want for a navbar, a footer and a cart drawer:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;div className="d-flex flex-column min-vh-100"&gt;
+  &lt;AppNavbar onOpenCart={() =&gt; setCartOpen(true)} /&gt;
+
+  &lt;main className="flex-grow-1"&gt;
+    &lt;ErrorBoundary&gt;
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;Routes&gt;{/* … */}&lt;/Routes&gt;
+      &lt;/Suspense&gt;
+    &lt;/ErrorBoundary&gt;
+  &lt;/main&gt;
+
+  &lt;CartDrawer show={cartOpen} onHide={() =&gt; setCartOpen(false)} /&gt;
+  &lt;Footer /&gt;
+&lt;/div&gt;</code></pre>
+
+<h2>Link, not anchor</h2>
+
+<p>A plain <code>&lt;a href&gt;</code> triggers a full page load: the whole application unmounts,
+downloads again and restarts, and your cart, your auth state and your scroll position go with it.
+<code>&lt;Link&gt;</code> changes the URL and re-renders, which is the entire point.</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Link to="/menu" className="btn btn-primary btn-lg"&gt;
+  Order now
+&lt;/Link&gt;</code></pre>
+
+<p><code>&lt;NavLink&gt;</code> is a <code>Link</code> that knows whether it is the current page, so
+the active section can be highlighted without comparing to the URL by hand:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{/*
+  NavLink (not Link) gets an isActive flag, so the current section can be
+  highlighted without manually comparing to the URL.
+*/}
+&lt;Nav.Link as={NavLink} to="/menu" end&gt;
+  Menu
+&lt;/Nav.Link&gt;</code></pre>
+
+<p><code>end</code> means "match this path exactly". Without it <code>/menu</code> would count as
+active while you are on <code>/menu/pizzas</code>, and <code>/</code> would be active
+everywhere.</p>
+
+<p><code>as={NavLink}</code> is a react-bootstrap idiom: render this Bootstrap component using that
+element. It is how you get Bootstrap's styling and Router's behaviour in one tag.</p>
+
+<h2>URL parameters</h2>
+
+<p>A <code>:name</code> segment captures part of the path:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Route path="/order-confirmation/:orderId" element={&lt;OrderConfirmationPage /&gt;} /&gt;</code></pre>
+
+<pre class="language-tsx"><code class="language-tsx">import { useParams } from 'react-router-dom';
+
+export function OrderConfirmationPage() {
+  const { orderId } = useParams&lt;{ orderId: string }&gt;();
+  /* … fetch the order … */
+}</code></pre>
+
+<p>Params are always strings, and always possibly <code>undefined</code> as far as TypeScript is
+concerned — a route param cannot be proven present at the type level. Convert and guard.</p>
+
+<h2>Query strings as state</h2>
+
+<p><code>useSearchParams</code> gives you the query string with a <code>useState</code>-shaped API.
+This is worth more than it first appears:</p>
+
+<pre class="language-tsx"><code class="language-tsx">/*
+ * REACT ROUTER CONCEPT: useSearchParams
+ *
+ * The active filter lives in the URL rather than in component state, so /menu?type=PIZZA is
+ * shareable, bookmarkable, and survives a refresh. Treating the URL as state is usually the
+ * right call for anything a user might want to link to.
+ */
+const [searchParams, setSearchParams] = useSearchParams();
+const activeFilter = (searchParams.get('type') as Filter) ?? 'ALL';
+
+const handleFilter = useCallback(
+  (filter: Filter) =&gt; {
+    if (filter === 'ALL') {
+      setSearchParams({});
+    } else {
+      setSearchParams({ type: filter });
+    }
+  },
+  [setSearchParams],
+);</code></pre>
+
+<p>The filter is not in <code>useState</code>. Because it is in the URL, <code>/menu?type=PIZZA</code>
+can be linked to, bookmarked, shared, and survives a refresh — and the browser Back button steps
+through filter changes, for free.</p>
+
+<p>Ask this of every piece of UI state: <em>would a user ever want to link to this?</em> If yes, it
+belongs in the URL. Which tab is open, what is being searched for, which page of results — usually
+yes. Whether a dropdown is open — no.</p>
+
+<h2>Navigating from code</h2>
+
+<p>After a form submits, or a cart checkout starts, you navigate in a handler rather than by
+clicking:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const navigate = useNavigate();
+
+function goToCheckout() {
+  onHide();
+  navigate('/checkout');
+}</code></pre>
+
+<pre class="language-tsx"><code class="language-tsx">async function handleSubmit(event: React.FormEvent) {
+  event.preventDefault();
+  try {
+    await login(email, password);
+    navigate(redirectTo, { replace: true });
+  } catch {
+    // The error message is already surfaced through AuthContext; nothing to do here.
+  }
+}</code></pre>
+
+<p><code>{ replace: true }</code> swaps the current history entry instead of adding one. After a
+successful sign-in that matters: without it, pressing Back returns the user to the login page they
+have just left.</p>
+
+<h2>Layout routes</h2>
+
+<p>Nested routes let a parent render a shell and children render inside it. The parent puts an
+<code>&lt;Outlet /&gt;</code> where the child should go:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Route
+  path="/admin"
+  element={
+    &lt;ProtectedRoute requireAdmin&gt;
+      &lt;AdminLayout /&gt;
+    &lt;/ProtectedRoute&gt;
+  }
+&gt;
+  {/* `index` is the route shown at /admin itself. */}
+  &lt;Route index element={&lt;AdminReportsPage /&gt;} /&gt;
+  &lt;Route path="products" element={&lt;AdminProductsPage /&gt;} /&gt;
+  &lt;Route path="toppings" element={&lt;AdminToppingsPage /&gt;} /&gt;
+  &lt;Route path="crusts" element={&lt;AdminCrustsPage /&gt;} /&gt;
+  &lt;Route path="orders" element={&lt;AdminOrdersPage /&gt;} /&gt;
+  &lt;Route path="users" element={&lt;AdminUsersPage /&gt;} /&gt;
+&lt;/Route&gt;</code></pre>
+
+<pre class="language-tsx"><code class="language-tsx">export default function AdminLayout() {
+  return (
+    &lt;Container className="py-4"&gt;
+      &lt;h1 className="h3 fw-bold mb-1"&gt;Admin&lt;/h1&gt;
+      &lt;p className="text-muted"&gt;Menu management and reporting.&lt;/p&gt;
+
+      &lt;Nav variant="tabs" className="mb-4 admin-nav"&gt;
+        {TABS.map((tab) =&gt; (
+          &lt;Nav.Item key={tab.to}&gt;
+            &lt;Nav.Link as={NavLink} to={tab.to} end={tab.end}&gt;
+              {tab.label}
+            &lt;/Nav.Link&gt;
+          &lt;/Nav.Item&gt;
+        ))}
+      &lt;/Nav&gt;
+
+      &lt;Outlet /&gt;
+    &lt;/Container&gt;
+  );
+}</code></pre>
+
+<p>Three things fall out of that. Child paths are relative — <code>path="products"</code> resolves to
+<code>/admin/products</code>. <code>index</code> is what renders at <code>/admin</code> itself.
+And switching tabs never re-mounts the shell, so its state and scroll position survive.</p>
+
+<h2>Guarded routes</h2>
+
+<p>The layout route above is wrapped in <code>&lt;ProtectedRoute requireAdmin&gt;</code>, and that is
+the whole access-control story for six admin screens. Guarding the <em>parent</em> means a new tab
+cannot be added unprotected by accident:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function ProtectedRoute({ children, requireAdmin = false }: Props) {
+  const { isAuthenticated, isAdmin, initialising } = useAuth();
+  const location = useLocation();
+
+  /*
+   * Wait for the stored token to be validated before deciding anything.
+   *
+   * Without this, refreshing the page on /admin renders one frame where `isAuthenticated` is still
+   * false — and redirects a perfectly valid admin to the login screen.
+   */
+  if (initialising) {
+    return &lt;Spinner animation="border" variant="danger" role="status" /&gt;;
+  }
+
+  if (!isAuthenticated) {
+    return &lt;Navigate to="/login" state={{ from: location }} replace /&gt;;
+  }
+
+  if (requireAdmin &amp;&amp; !isAdmin) {
+    return &lt;Navigate to="/" replace /&gt;;
+  }
+
+  return &lt;&gt;{children}&lt;/&gt;;
+}</code></pre>
+
+<p><code>&lt;Navigate&gt;</code> is a redirect expressed as a component — rendering it navigates.
+That is much easier to reason about than calling <code>navigate()</code> from an effect, and it does
+not flash the protected content first.</p>
+
+<p>The <code>state={{ from: location }}</code> is what makes the round trip work. The login page reads
+it back and returns the user where they were headed:</p>
+
+<pre class="language-tsx"><code class="language-tsx">/**
+ * Where to go after a successful sign-in.
+ *
+ * ProtectedRoute stashes the attempted location in navigation state, so a user bounced off
+ * /admin lands back on /admin rather than on the home page.
+ */
+const redirectTo =
+  (location.state as { from?: { pathname: string } } | null)?.from?.pathname ?? '/';</code></pre>
+
+<p>And the <code>initialising</code> guard is not decoration. Without it, a signed-in admin who
+refreshes on <code>/admin</code> is thrown out, because the stored token has not been validated yet
+when the first frame renders.</p>
+
+<p><strong>This is a usability guard, not security.</strong> Anyone can edit client-side JavaScript.
+The real enforcement is the backend rejecting <code>/api/admin/**</code> without a valid admin token;
+the route guard just stops honest users seeing a broken page.</p>
+
+<h2>Routes and code splitting</h2>
+
+<p>Route boundaries are the natural place to split your bundle, because a route is by definition
+something most visitors will not visit. That is <a href="/react/react-lazy-suspense">the next but
+one lesson</a>.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-usememo-usecallback">useMemo, useCallback and memo</a>.</p>

@@ -1,0 +1,165 @@
+<p>A React application replaces the contents of exactly one DOM element and builds everything else
+itself. This post is about that handover — the one line of HTML, the entry file that takes it over,
+and what belongs there.</p>
+
+<h2>The one empty div</h2>
+
+<p>Here is the entire HTML file of a real, fairly large React app:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;!doctype html&gt;
+&lt;html lang="en"&gt;
+  &lt;head&gt;
+    &lt;meta charset="UTF-8" /&gt;
+    &lt;link rel="icon" type="image/svg+xml" href="/favicon.svg" /&gt;
+    &lt;meta name="viewport" content="width=device-width, initial-scale=1.0" /&gt;
+    &lt;title&gt;PizzaHub — order pizza online&lt;/title&gt;
+  &lt;/head&gt;
+  &lt;body&gt;
+    &lt;div id="root"&gt;&lt;/div&gt;
+    &lt;script type="module" src="/src/main.tsx"&gt;&lt;/script&gt;
+  &lt;/body&gt;
+&lt;/html&gt;</code></pre>
+
+<p>The navbar, the menu, the cart drawer, the Stripe checkout, the admin dashboard — none of it is
+in that file. React creates all of it at runtime and puts it inside
+<code>&lt;div id="root"&gt;&lt;/div&gt;</code>.</p>
+
+<p>The id is not special. <code>root</code> is just the convention; <code>app</code> would work
+identically as long as the entry file looks for the same name.</p>
+
+<h2>createRoot</h2>
+
+<p>The entry file is where React attaches itself. Two lines do the work:</p>
+
+<pre class="language-tsx"><code class="language-tsx">import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
+
+createRoot(document.getElementById('root')!).render(&lt;App /&gt;);</code></pre>
+
+<p><code>createRoot</code> takes the DOM node and returns a root — a handle to the piece of the page
+React now owns. <code>render</code> hands it the top component. From then on you never touch the DOM
+directly; you change state, and React works out the difference.</p>
+
+<p>The <code>!</code> is TypeScript, not React. <code>getElementById</code> is typed as possibly
+returning <code>null</code>, and <code>!</code> asserts that it does not. It is honest here — if
+that div is missing the app cannot start and a crash on line one is the correct outcome.</p>
+
+<h3>If you are following an older tutorial</h3>
+
+<p>You may see this instead:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// React 17 and earlier. Removed in React 19 — this now throws.
+import ReactDOM from 'react-dom';
+ReactDOM.render(&lt;App /&gt;, document.getElementById('root'));</code></pre>
+
+<p><code>ReactDOM.render</code> was deprecated in React 18 and deleted in 19. If you hit
+<em>"ReactDOM.render is not a function"</em>, that is what happened. The replacement is
+<code>createRoot</code> from <code>react-dom/client</code> — note the <code>/client</code>, which is
+a different entry point from the package root.</p>
+
+<h2>StrictMode</h2>
+
+<p>Almost every real entry file wraps the app in <code>&lt;StrictMode&gt;</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+
+createRoot(document.getElementById('root')!).render(
+  &lt;StrictMode&gt;
+    &lt;App /&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+<p>It renders nothing. What it does is deliberately run your components twice in development — every
+render, every effect, every state updater — and it does this to catch bugs that would otherwise only
+appear in production.</p>
+
+<p>This confuses everyone once. You add a <code>console.log</code> to a component and it prints
+twice. You write an effect that fetches data and see two network requests. Neither is a bug in
+React; both are React telling you something:</p>
+
+<ul>
+  <li><strong>Two renders</strong> — if rendering twice produces a different result, your component
+      is not pure. It is reading or writing something outside itself during render, and that will
+      break in ways that are miserable to debug.</li>
+  <li><strong>Two effect runs</strong> — the effect is mounted, cleaned up, and mounted again. If
+      the second run misbehaves, your cleanup function is missing or incomplete.</li>
+</ul>
+
+<p>The menu fetch in this app survives it, because it aborts properly on cleanup:</p>
+
+<pre class="language-tsx"><code class="language-tsx">useEffect(() =&gt; {
+  const controller = new AbortController();
+
+  async function load() {
+    /* … */
+    const [productData, toppingData, crustData] = await Promise.all([
+      api.get&lt;Product[]&gt;('/api/products', { signal: controller.signal }),
+      api.get&lt;Topping[]&gt;('/api/toppings', { signal: controller.signal }),
+      api.get&lt;Crust[]&gt;('/api/crusts', { signal: controller.signal }),
+    ]);
+    /* … */
+  }
+
+  void load();
+  return () =&gt; controller.abort();     // ← what makes StrictMode's double run harmless
+}, [reloadToken]);</code></pre>
+
+<p><strong>None of this happens in the production build.</strong> The temptation when you first meet
+the double render is to delete <code>StrictMode</code>. Resist it — you are not fixing the problem,
+you are turning off the thing that found it. <a href="/react/react-lifecycle">The Component
+Lifecycle with useEffect</a> goes through the cleanup rules properly.</p>
+
+<h2>What else belongs in the entry file</h2>
+
+<p>Global stylesheets and context providers, and nothing much else. Here is the real one:</p>
+
+<pre class="language-tsx"><code class="language-tsx">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+
+// Bootstrap's stylesheet first, then our theme, so our overrides win on equal specificity.
+import 'bootstrap/dist/css/bootstrap.min.css';
+import './styles/theme.scss';
+
+import App from './App.tsx';
+import { CartProvider } from './context/CartContext';
+import { AuthProvider } from './context/AuthContext';
+import { ToastProvider } from './context/ToastContext';
+import { MenuProvider } from './context/MenuContext';
+
+createRoot(document.getElementById('root')!).render(
+  &lt;StrictMode&gt;
+    &lt;BrowserRouter&gt;
+      &lt;AuthProvider&gt;
+        &lt;MenuProvider&gt;
+          &lt;CartProvider&gt;
+            &lt;ToastProvider&gt;
+              &lt;App /&gt;
+            &lt;/ToastProvider&gt;
+          &lt;/CartProvider&gt;
+        &lt;/MenuProvider&gt;
+      &lt;/AuthProvider&gt;
+    &lt;/BrowserRouter&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+<p>Two things to take from that.</p>
+
+<p><strong>Importing CSS from a JavaScript file is normal here.</strong> Vite understands it and
+injects the stylesheet. The <em>order</em> of those two imports is load-bearing: Bootstrap first, our
+overrides second, so that on equal specificity ours win.</p>
+
+<p><strong>The provider nesting is a real tree, and order matters when one provider consumes
+another.</strong> <code>CartProvider</code> calls <code>useMenu()</code> — it needs the catalogue to
+re-price a saved cart — so it must sit <em>inside</em> <code>MenuProvider</code>. Get that backwards
+and you get <em>"useMenu must be used inside a &lt;MenuProvider&gt;"</em> at startup. Where there is
+no such dependency, nest for readability: longest-lived outermost.</p>
+
+<p><a href="/react/react-context">Passing Data Deeply with Context</a> covers what those providers
+are doing.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-components">Your First Component</a> — what <code>&lt;App /&gt;</code>
+actually is.</p>

@@ -1,0 +1,230 @@
+<p><code>useReducer</code> is <code>useState</code> for state whose updates are a small, fixed set of
+operations — several of which depend on the previous value. Instead of scattering the logic across
+event handlers, you put it all in one function.</p>
+
+<h2>The same counter, both ways</h2>
+
+<pre class="language-tsx"><code class="language-tsx">// useState
+const [count, setCount] = useState(0);
+&lt;button onClick={() =&gt; setCount((c) =&gt; c + 1)}&gt;+&lt;/button&gt;
+
+// useReducer
+const [count, dispatch] = useReducer(counterReducer, 0);
+&lt;button onClick={() =&gt; dispatch({ type: 'INCREMENT' })}&gt;+&lt;/button&gt;
+
+function counterReducer(state: number, action: { type: string }) {
+  switch (action.type) {
+    case 'INCREMENT': return state + 1;
+    default: return state;
+  }
+}</code></pre>
+
+<p>For a counter this is strictly worse, and that is worth saying plainly: <code>useReducer</code> is
+more code and you should not reach for it by default.</p>
+
+<h2>When it earns its keep</h2>
+
+<p>The cart is the case it was built for. Six operations, most of which need the current cart to
+decide what to do — adding a pizza has to check whether an identical configuration is already there
+and bump the quantity instead of adding a second line. Written as <code>useState</code> calls, that
+logic ends up spread across the components that trigger it. As a reducer it is one function you can
+read top to bottom, and test without rendering anything.</p>
+
+<p>The signal to switch: <em>several pieces of state that must stay consistent with each other, and
+updates that depend on the previous value</em>.</p>
+
+<h2>Actions</h2>
+
+<p>An action is an object describing what happened. Typing it as a discriminated union is what makes
+this pattern pleasant in TypeScript:</p>
+
+<pre class="language-tsx"><code class="language-tsx">/**
+ * Every way the cart can change, as a discriminated union.
+ *
+ * TypeScript narrows `action.payload` based on `action.type`, so the reducer's switch is
+ * exhaustively type-checked: add a new action and forget to handle it, and the build fails.
+ */
+type CartAction =
+  | { type: 'ADD_ITEM'; payload: CartItem }
+  | { type: 'REMOVE_ITEM'; payload: { lineId: string } }
+  | { type: 'SET_QUANTITY'; payload: { lineId: string; quantity: number } }
+  | { type: 'SET_ORDER_TYPE'; payload: { orderType: OrderType } }
+  | { type: 'HYDRATE'; payload: CartState }
+  | { type: 'CLEAR' };</code></pre>
+
+<p>Inside <code>case 'REMOVE_ITEM'</code>, TypeScript knows <code>action.payload</code> has a
+<code>lineId</code> and nothing else. Inside <code>case 'CLEAR'</code> it knows there is no payload at
+all. That narrowing is free and it catches real mistakes.</p>
+
+<p>Name actions after <strong>what happened</strong>, not what to set. <code>ADD_ITEM</code>, not
+<code>SET_ITEMS</code> — the reducer's job is to decide what "add an item" means, and a caller that
+already knows the answer is a caller doing the reducer's work.</p>
+
+<h2>The reducer</h2>
+
+<p><code>(state, action) =&gt; newState</code>. Pure: same inputs, same output, no side effects, no
+mutation.</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function cartReducer(state: CartState, action: CartAction): CartState {
+  switch (action.type) {
+    case 'ADD_ITEM': {
+      const existing = state.items.find((item) =&gt; isSameConfiguration(item, action.payload));
+
+      if (existing) {
+        // Same configuration already in the cart: bump the quantity instead of adding a line.
+        return {
+          ...state,
+          items: state.items.map((item) =&gt;
+            item.lineId === existing.lineId
+              ? { ...item, quantity: item.quantity + action.payload.quantity }
+              : item,
+          ),
+        };
+      }
+
+      return { ...state, items: [...state.items, action.payload] };
+    }
+
+    case 'REMOVE_ITEM':
+      return {
+        ...state,
+        items: state.items.filter((item) =&gt; item.lineId !== action.payload.lineId),
+      };
+
+    case 'SET_QUANTITY': {
+      // Dropping to zero removes the line — it is what a user expects from a "−" button.
+      if (action.payload.quantity &lt;= 0) {
+        return {
+          ...state,
+          items: state.items.filter((item) =&gt; item.lineId !== action.payload.lineId),
+        };
+      }
+      return {
+        ...state,
+        items: state.items.map((item) =&gt;
+          item.lineId === action.payload.lineId
+            ? { ...item, quantity: action.payload.quantity }
+            : item,
+        ),
+      };
+    }
+
+    case 'SET_ORDER_TYPE':
+      return { ...state, orderType: action.payload.orderType };
+
+    /** Replace everything with what the server had saved. */
+    case 'HYDRATE':
+      return action.payload;
+
+    case 'CLEAR':
+      return { ...state, items: [] };
+
+    default:
+      return state;
+  }
+}</code></pre>
+
+<p>Every branch returns a <strong>new</strong> object. Not one calls <code>push</code> or assigns to
+<code>items[i]</code>, because React compares by reference —
+<a href="/react/react-update-state">Updating State Correctly</a> is the whole story there.</p>
+
+<p>Notice how much domain logic that is, all in one place: the merge rule for identical pizzas, the
+zero-removes-the-line rule, what "clear" keeps. None of it is in a component.</p>
+
+<h2>Wiring it up</h2>
+
+<pre class="language-tsx"><code class="language-tsx">const [state, dispatch] = useReducer(cartReducer, initialState);</code></pre>
+
+<p>Same shape as <code>useState</code>: current value, and a way to change it. The reducer function
+goes first, the initial state second.</p>
+
+<p><code>dispatch</code> has a property <code>useState</code>'s setter does not: <strong>React
+guarantees it never changes</strong>. That is why the callbacks wrapping it can have empty dependency
+arrays, and why a reducer inside a context provider is easier to keep stable than several
+<code>useState</code> setters:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const removeItem = useCallback((lineId: string) =&gt; {
+  dispatch({ type: 'REMOVE_ITEM', payload: { lineId } });
+}, []);                                                    // ← [] is correct, not a shortcut
+
+const setQuantity = useCallback((lineId: string, quantity: number) =&gt; {
+  dispatch({ type: 'SET_QUANTITY', payload: { lineId, quantity } });
+}, []);</code></pre>
+
+<h2>Reducers cannot do side effects</h2>
+
+<p>A reducer must be pure, so the request that saves the cart to the server cannot live in it. That
+belongs in an effect watching the state:</p>
+
+<pre class="language-tsx"><code class="language-tsx">useEffect(() =&gt; {
+  // Never write before hydrating — that would overwrite the saved cart with an empty one.
+  if (!hydrated) return;
+
+  // Debounced: clicking "+" three times quickly is one write, not three.
+  const timer = window.setTimeout(() =&gt; {
+    void (async () =&gt; {
+      try {
+        /* … PUT the whole cart … */
+      } catch {
+        // A failed save must not break the page.
+      }
+    })();
+  }, 300);
+
+  return () =&gt; window.clearTimeout(timer);
+}, [state, hydrated]);</code></pre>
+
+<p>This is a good example of the separation the pattern buys you: the reducer decides <em>what the
+cart is</em>, the effect deals with <em>keeping the server in step</em>, and neither knows about the
+other.</p>
+
+<h2>Reducer plus context</h2>
+
+<p>Put a reducer in a context provider and you have the architecture Redux made famous, with nothing
+installed. The pizza cart is exactly this:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function CartProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(cartReducer, initialState);
+
+  const addItem = useCallback((input: AddItemInput) =&gt; {
+    dispatch({ type: 'ADD_ITEM', payload: { lineId: crypto.randomUUID(), /* … */ } });
+  }, []);
+
+  const value = useMemo&lt;CartContextValue&gt;(
+    () =&gt; ({ items: state.items, totals: calculateTotals(state.items, state.orderType), addItem, /* … */ }),
+    [state.items, state.orderType, addItem /* … */],
+  );
+
+  return &lt;CartContext.Provider value={value}&gt;{children}&lt;/CartContext.Provider&gt;;
+}</code></pre>
+
+<p>Consumers never see <code>dispatch</code>. They call <code>addItem(…)</code>, and the action shape
+stays an implementation detail. That is worth doing: it means changing the reducer never touches a
+component.</p>
+
+<p><a href="/react/react-redux">Redux, and Whether You Need It</a> compares this directly against the
+real thing.</p>
+
+<h2>Testing</h2>
+
+<p>The payoff people forget. A reducer is a plain function, so its tests need no React at all:</p>
+
+<pre class="language-typescript"><code class="language-typescript">test('adding an identical configuration bumps the quantity instead of adding a line', () =&gt; {
+  const first = { ...pepperoni, lineId: 'a', quantity: 1 };
+  const again = { ...pepperoni, lineId: 'b', quantity: 2 };
+
+  const state = cartReducer(
+    cartReducer(initialState, { type: 'ADD_ITEM', payload: first }),
+    { type: 'ADD_ITEM', payload: again },
+  );
+
+  expect(state.items).toHaveLength(1);
+  expect(state.items[0].quantity).toBe(3);
+});</code></pre>
+
+<p>No render, no mock, no DOM. That is why <code>cartReducer</code> is exported.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-custom-hooks">Custom Hooks</a> — the <code>useCart</code> wrapper this post
+kept referring to.</p>

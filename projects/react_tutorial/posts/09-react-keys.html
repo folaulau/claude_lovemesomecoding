@@ -1,0 +1,152 @@
+<p>JSX has no loop. You render a list by turning an array of data into an array of elements, which
+means <code>map</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Row xs={1} sm={2} lg={4} className="g-4"&gt;
+  {visibleProducts.map((product) =&gt; (
+    &lt;Col key={product.id}&gt;
+      &lt;ProductCard product={product} onSelect={handleSelect} /&gt;
+    &lt;/Col&gt;
+  ))}
+&lt;/Row&gt;</code></pre>
+
+<p>React accepts an array of elements anywhere a single element goes, and renders them in order.
+Leave off the <code>key</code> and it still works — but the console warns, and eventually something
+strange happens. This post is about why.</p>
+
+<h2>What a key is actually for</h2>
+
+<p>When state changes, React has an old element tree and a new one and has to work out the minimum
+set of DOM operations to get from one to the other. Within a list, position alone is not enough
+information: if the first item disappears, has everything moved up by one, or did every item's
+content change?</p>
+
+<p>The key answers that. It is an identity — <em>this element is the same one as before</em> — so
+React can move a DOM node instead of rebuilding it, and keep whatever state lives inside it.</p>
+
+<p>Keys are never passed to your component. <code>key</code> is consumed by React itself; if the
+component needs the id, pass it separately.</p>
+
+<pre class="language-tsx"><code class="language-tsx">// The component receives `product`, not `key`.
+&lt;ProductCard key={product.id} product={product} onSelect={handleSelect} /&gt;</code></pre>
+
+<h2>Use a stable id</h2>
+
+<p>Something that belongs to the item and does not change when the list is reordered or filtered.
+A database id is ideal:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{orders.map((order) =&gt; (
+  &lt;tr key={order.id}&gt;
+    {/* … */}
+  &lt;/tr&gt;
+))}</code></pre>
+
+<p>When the item has no natural id, make one when the item is <em>created</em> and store it with the
+data. Cart lines do this — the browser mints a uuid the moment a pizza is added, because "this
+configuration in this cart" has no server id yet:</p>
+
+<pre class="language-tsx"><code class="language-tsx">dispatch({
+  type: 'ADD_ITEM',
+  payload: {
+    // crypto.randomUUID is built into modern browsers — no library needed.
+    lineId: crypto.randomUUID(),
+    productId: input.product.id,
+    /* … */
+  },
+});</code></pre>
+
+<pre class="language-tsx"><code class="language-tsx">{items.map((item) =&gt; (
+  &lt;div key={item.lineId} className="border-bottom pb-3"&gt;
+    {/* … */}
+  &lt;/div&gt;
+))}</code></pre>
+
+<p>Note it cannot be <code>item.productId</code>: a cart may hold two Pepperonis with different
+toppings, and those are different lines. Keys must be unique among their siblings.</p>
+
+<p><strong>Do not generate the key during render.</strong> <code>key={crypto.randomUUID()}</code>
+inside the <code>map</code> produces a new key every render, so every item looks new, and React
+throws the entire list away and rebuilds it every single time. That is worse than no key at all.</p>
+
+<h2>The index trap</h2>
+
+<p>This is what everyone writes first, and what the warning tempts you into:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{items.map((item, index) =&gt; (
+  &lt;CartLine key={index} item={item} /&gt;     // works until the list changes
+))}</code></pre>
+
+<p>The key of the first item is <code>0</code> whatever that item happens to be. So when you delete
+the first cart line, React sees key <code>0</code> still present with different content and concludes
+the item did not move — it changed. It reuses that DOM node and everything inside it.</p>
+
+<p>For read-only text you may never notice. The moment a row contains state, you do:</p>
+
+<ul>
+  <li>Remove the first of three lines and the quantity dropdown of the deleted row is now attached to
+      the second row.</li>
+  <li>Type into a row's input, sort the list, and your text follows the position rather than the
+      item.</li>
+  <li>A row mid-animation animates the wrong item.</li>
+</ul>
+
+<p>The index is safe only when all three of these hold: the list never reorders, items are never
+inserted or removed except at the end, and the items have no state or uncontrolled inputs. That is a
+static list — and a static list usually does not need <code>map</code> at all.</p>
+
+<h2>Keys are scoped to siblings</h2>
+
+<p>They only have to be unique within one <code>map</code>. Two different lists may both use
+<code>key={0}</code> without any interaction:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{TOPPING_GROUPS.map((group) =&gt; (
+  &lt;div key={group.category} className="mb-3"&gt;
+    &lt;div className="small fw-semibold mb-1"&gt;{group.label}&lt;/div&gt;
+    &lt;div className="d-flex flex-wrap gap-2"&gt;
+      {toppings.filter((t) =&gt; t.category === group.category).map((topping) =&gt; (
+        &lt;Button key={topping.id} /* … */&gt;
+          {topping.name}
+        &lt;/Button&gt;
+      ))}
+    &lt;/div&gt;
+  &lt;/div&gt;
+))}</code></pre>
+
+<p>Two nested maps, two independent key spaces.</p>
+
+<h2>The key goes on the outermost element of the map</h2>
+
+<p>A common slip is putting it on the component inside the wrapper:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG — the array elements are the &lt;Col&gt;s, so that is what needs the key.
+{visibleProducts.map((product) =&gt; (
+  &lt;Col&gt;
+    &lt;ProductCard key={product.id} product={product} onSelect={handleSelect} /&gt;
+  &lt;/Col&gt;
+))}
+
+// Right.
+{visibleProducts.map((product) =&gt; (
+  &lt;Col key={product.id}&gt;
+    &lt;ProductCard product={product} onSelect={handleSelect} /&gt;
+  &lt;/Col&gt;
+))}</code></pre>
+
+<p>If the outermost thing is a fragment, the shorthand cannot carry a key — use
+<code>&lt;Fragment key={…}&gt;</code>.</p>
+
+<h2>Keys as a deliberate reset</h2>
+
+<p>One more use, worth knowing because it looks like a hack and is actually the idiomatic answer.
+Changing a component's key destroys it and mounts a fresh one, discarding its state. That is
+occasionally exactly what you want:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{/* A new product means a genuinely new form — no toppings carried over. */}
+&lt;PizzaBuilderModal key={selectedProduct?.id} product={selectedProduct} onHide={close} /&gt;</code></pre>
+
+<p>The alternative is an effect that resets every field when the product changes, which is what this
+app does — it needs the reset to be selective. Both are legitimate; the key version is shorter when
+you want <em>everything</em> reset.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-events">Handling Events</a>.</p>

@@ -1,0 +1,177 @@
+<p>A custom hook is a function whose name begins with <code>use</code> and that calls other hooks.
+That is the entire specification. There is no <code>createHook</code>, no registration, no API — you
+write a function, and the naming convention is what makes it a hook.</p>
+
+<h2>The smallest useful one</h2>
+
+<p>Every context in this app ships with a hook next to it. Here is <code>useCart</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function useCart(): CartContextValue {
+  const context = useContext(CartContext);
+  if (context === undefined) {
+    throw new Error('useCart must be used inside a &lt;CartProvider&gt;');
+  }
+  return context;
+}</code></pre>
+
+<p>Four lines, and it does three jobs:</p>
+
+<ul>
+  <li><strong>It hides the context object.</strong> Nothing outside <code>CartContext.tsx</code>
+      imports <code>CartContext</code>, so how the cart is implemented stays private. Replace context
+      with something else and no component changes.</li>
+  <li><strong>It narrows the type.</strong> The context is
+      <code>CartContextValue | undefined</code>; the hook returns <code>CartContextValue</code>. Every
+      consumer is spared a null check.</li>
+  <li><strong>It gives one place for the guard.</strong> Forget the provider and you get a sentence
+      telling you so, rather than <em>"cannot read properties of undefined"</em> from somewhere
+      unrelated.</li>
+</ul>
+
+<p>The result is that consuming a context looks like nothing at all:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const { totals } = useCart();
+const { user, isAuthenticated, isAdmin, logout } = useAuth();
+const { crusts, toppings } = useMenu();
+const { showToast } = useToast();</code></pre>
+
+<p>Write this wrapper every time you create a context. It is the highest-value four lines in the
+codebase.</p>
+
+<h2>Extracting stateful logic</h2>
+
+<p>The real use of custom hooks is sharing logic that involves state or effects — something a plain
+function cannot do. Suppose two components both need to know whether the viewport is narrow:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// src/hooks/useMediaQuery.ts
+import { useEffect, useState } from 'react';
+
+export function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =&gt; window.matchMedia(query).matches);
+
+  useEffect(() =&gt; {
+    const list = window.matchMedia(query);
+    const onChange = (e: MediaQueryListEvent) =&gt; setMatches(e.matches);
+
+    setMatches(list.matches);              // in case it changed before the listener attached
+    list.addEventListener('change', onChange);
+    return () =&gt; list.removeEventListener('change', onChange);
+  }, [query]);
+
+  return matches;
+}</code></pre>
+
+<p>And then, in any component:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const isNarrow = useMediaQuery('(max-width: 768px)');
+
+return isNarrow ? &lt;CartDrawer /&gt; : &lt;CartSidebar /&gt;;</code></pre>
+
+<p>The listener, the cleanup and the initial read are written once. A component that uses it does not
+have to know <code>matchMedia</code> exists.</p>
+
+<h2>Hooks share logic, never state</h2>
+
+<p>This is the part that trips people up. Two components calling <code>useMediaQuery</code> get
+<strong>two independent pieces of state</strong>. The hook is a recipe, not a store.</p>
+
+<pre class="language-tsx"><code class="language-tsx">function Navbar() {
+  const isNarrow = useMediaQuery('(max-width: 768px)');   // its own useState
+}
+
+function Footer() {
+  const isNarrow = useMediaQuery('(max-width: 768px)');   // a different useState
+}</code></pre>
+
+<p>They happen to agree because they are watching the same thing, not because they are connected. If
+you need components to share the actual value — one cart, not one cart each — that is
+<a href="/react/react-context">context</a>. Custom hooks and context solve different problems and are
+usually used together, which is exactly what <code>useCart</code> is.</p>
+
+<h2>The rules apply</h2>
+
+<p>A custom hook is subject to the same two rules as a built-in one: call it at the top level, and
+only from a component or another hook. Which is precisely why the <code>use</code> prefix is not
+optional — it is how the linter knows to enforce those rules, and how a reader knows this function
+is not callable from an event handler.</p>
+
+<pre class="language-tsx"><code class="language-tsx">// This is NOT a hook, and naming it useFormatMoney would be actively misleading.
+export function formatMoney(amount: number): string {
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
+}</code></pre>
+
+<p>If a function calls no hooks, it is a plain function. Leave it as one — plain functions can be
+called anywhere, which is more useful, and <code>formatMoney</code> is called from event handlers
+and render alike.</p>
+
+<h2>Returning an object or a tuple</h2>
+
+<p>Return an array when the caller will want to rename the values — that is why
+<code>useState</code> does. Return an object when there are several and the names are the point:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Tuple: the caller names both. Right for a two-value pair.
+const [isOpen, setIsOpen] = useDisclosure();
+
+// Object: named fields, destructure what you need. Right for a richer API.
+const { products, pizzas, drinks, toppings, crusts, loading, error, reload } = useMenu();</code></pre>
+
+<p>The object form has a practical edge as the hook grows: adding a field breaks nothing, whereas
+adding a third element to a tuple is a change every caller has to think about.</p>
+
+<h2>A fetching hook</h2>
+
+<p>The most common thing people extract. Wrapping the loading/error/data triple once removes a great
+deal of repetition:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// src/hooks/useFetch.ts
+export function useFetch&lt;T&gt;(path: string) {
+  const [data, setData] = useState&lt;T | null&gt;(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  useEffect(() =&gt; {
+    const controller = new AbortController();
+    setLoading(true);
+    setError(null);
+
+    api
+      .get&lt;T&gt;(path, { signal: controller.signal })
+      .then(setData)
+      .catch((err) =&gt; {
+        // An abort is not a failure — it means we navigated away, or StrictMode re-ran the effect.
+        if (!controller.signal.aborted) {
+          setError(err instanceof Error ? err.message : 'Request failed');
+        }
+      })
+      .finally(() =&gt; {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+
+    return () =&gt; controller.abort();
+  }, [path]);
+
+  return { data, loading, error };
+}</code></pre>
+
+<p>Note what came along for free: every caller now gets the <code>AbortController</code> cleanup
+correct, because it is written once. That is the strongest argument for extracting a hook — not fewer
+lines, but the tricky part being right everywhere.</p>
+
+<p>This is also the point where you should ask whether to keep going. Caching, deduplication, retries
+and revalidation are all things you will want next, and all things
+<a href="https://tanstack.com/query" rel="nofollow">TanStack Query</a> already does. Writing it by
+hand once is worth it to understand what the library is doing; writing it twice is usually a
+mistake.</p>
+
+<h2>When to extract</h2>
+
+<p>When the same stateful logic appears in a second component. Not before — a hook extracted from one
+call site is usually shaped wrong, because you have only seen one set of requirements.</p>
+
+<p>The exception is the context wrapper, which is worth writing immediately. It is not really about
+reuse; it is about the guard and the type.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-redux">Redux, and Whether You Need It</a> — how all of this compares to the
+library everyone has heard of.</p>

@@ -1,0 +1,157 @@
+<p>Event handlers in React look like HTML attributes and behave like JavaScript function references.
+Nearly every problem people have with them comes from that second half.</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Button onClick={handleAdd}&gt;Add to cart&lt;/Button&gt;</code></pre>
+
+<p>camelCase, and the value goes in braces because it is a function, not a string.</p>
+
+<h2>The mistake everyone makes once</h2>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Button onClick={handleAdd}&gt;Add to cart&lt;/Button&gt;      {/* right — pass the function */}
+&lt;Button onClick={handleAdd()}&gt;Add to cart&lt;/Button&gt;    {/* wrong — CALLS it during render */}</code></pre>
+
+<p>The second line runs <code>handleAdd</code> immediately, while React is rendering, and gives
+<code>onClick</code> whatever it returned — usually <code>undefined</code>. The symptom is the
+handler firing once when the page loads and never again on click. If that function sets state, you
+get an infinite render loop instead.</p>
+
+<p>So how do you pass an argument? Wrap it in a function that has not been called yet:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Button size="sm" variant="primary" onClick={() =&gt; onSelect(product)}&gt;
+  {isPizza ? 'Build it' : 'Add'}
+&lt;/Button&gt;</code></pre>
+
+<p><code>() =&gt; onSelect(product)</code> is a function. React calls it on click, and only then does
+<code>onSelect(product)</code> run. This is the standard way to pass arguments and you will write it
+constantly:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Button onClick={() =&gt; setQuantity(item.lineId, item.quantity - 1)}&gt;−&lt;/Button&gt;
+&lt;Button onClick={() =&gt; setQuantity(item.lineId, item.quantity + 1)}&gt;+&lt;/Button&gt;
+&lt;Button onClick={() =&gt; removeItem(item.lineId)}&gt;Remove&lt;/Button&gt;
+&lt;Button onClick={() =&gt; setOrderType('DELIVERY')}&gt;Delivery&lt;/Button&gt;</code></pre>
+
+<h2>The event object</h2>
+
+<p>Handlers receive a synthetic event — React's wrapper over the native one, with the same interface
+and consistent behaviour across browsers. Most of the time you want <code>e.target.value</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Form.Control
+  id={`${formId}-email`}
+  type="email"
+  required
+  value={email}
+  onChange={(e) =&gt; setEmail(e.target.value)}
+  autoComplete="username"
+/&gt;</code></pre>
+
+<p>In TypeScript the event is typed for you when the handler is inline — TypeScript infers it from
+the element. It is only when you extract a named handler that you have to say what it is:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Inline: `e` is already typed. No annotation needed.
+onChange={(e) =&gt; setEmail(e.target.value)}
+
+// Extracted: annotate it.
+function handleQuantity(e: React.ChangeEvent&lt;HTMLSelectElement&gt;) {
+  setQuantity(Number(e.target.value));
+}
+
+async function handleSubmit(event: React.FormEvent) {
+  event.preventDefault();
+  /* … */
+}</code></pre>
+
+<p>The types you will meet most: <code>React.ChangeEvent&lt;HTMLInputElement&gt;</code>,
+<code>React.FormEvent</code>, <code>React.MouseEvent&lt;HTMLButtonElement&gt;</code>,
+<code>React.KeyboardEvent</code>.</p>
+
+<h2>preventDefault</h2>
+
+<p>The browser's default action still happens unless you stop it. On a form that means a full page
+reload, which throws away your entire application:</p>
+
+<pre class="language-tsx"><code class="language-tsx">async function handleSubmit(event: React.FormEvent) {
+  event.preventDefault();          // ← without this the page reloads and the app restarts
+  try {
+    await login(email, password);
+    navigate(redirectTo, { replace: true });
+  } catch {
+    // The error message is already surfaced through AuthContext; nothing to do here.
+  }
+}
+
+return (
+  &lt;Form onSubmit={handleSubmit}&gt;
+    {/* … */}
+    &lt;Button type="submit" variant="primary" className="w-100" disabled={loading}&gt;
+      {loading ? 'Signing in…' : 'Sign in'}
+    &lt;/Button&gt;
+  &lt;/Form&gt;
+);</code></pre>
+
+<p><strong>Returning <code>false</code> does not work.</strong> That is a jQuery and inline-HTML idiom;
+in React the return value of a handler is ignored. Call <code>preventDefault()</code>.</p>
+
+<p>Note also that the handler is on the <code>&lt;form&gt;</code>'s <code>onSubmit</code>, not the
+button's <code>onClick</code>. That is deliberate — pressing Enter in a text field submits a form but
+does not click anything, so an <code>onClick</code> handler silently misses keyboard users.</p>
+
+<h2>Bubbling, and stopping it</h2>
+
+<p>Events propagate up through the component tree just as they do in the DOM. Usually that is what
+you want; occasionally a click inside a clickable thing needs to not trigger the outer one:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;div onClick={openDetails}&gt;
+  &lt;h3&gt;{product.name}&lt;/h3&gt;
+  &lt;Button
+    onClick={(e) =&gt; {
+      e.stopPropagation();     // the card must not also open
+      addToCart(product);
+    }}
+  &gt;
+    Add
+  &lt;/Button&gt;
+&lt;/div&gt;</code></pre>
+
+<p>There is one real difference from the DOM worth knowing. React attaches a single listener at the
+root of your app rather than one per element, and dispatches from there. This is invisible almost
+always — but it means <code>e.stopPropagation()</code> on a React handler does not stop a listener
+you attached yourself with <code>addEventListener</code> on <code>document</code>, because yours
+already ran or ran at a different level. Mixing the two is where that surfaces.</p>
+
+<h2>Handlers are just functions</h2>
+
+<p>Nothing about them is special. Declare them in the component body, above the return:</p>
+
+<pre class="language-tsx"><code class="language-tsx">function toggleTopping(id: string) {
+  setSelectedToppingIds((current) =&gt;
+    current.includes(id) ? current.filter((t) =&gt; t !== id) : [...current, id],
+  );
+}
+
+function handleAdd() {
+  if (!product) return;
+
+  addItem({ product, size, crust, toppings: selectedToppings, quantity });
+  showToast(`${quantity} × ${product.name} added to your cart`);
+  onHide();
+}</code></pre>
+
+<p>They close over the current props and state, which is why <code>handleAdd</code> can read
+<code>product</code>, <code>size</code>, <code>crust</code> and <code>quantity</code> without any of
+them being passed in. That closure is also the source of the "stale value" confusion that
+<a href="/react/react-update-state">Updating State Correctly</a> untangles.</p>
+
+<h2>Side effects belong here</h2>
+
+<p>Components must stay pure during render, but event handlers are the opposite — they are
+<em>for</em> side effects. Sending a request, writing to <code>localStorage</code>, showing a toast,
+navigating: all of it belongs in a handler.</p>
+
+<p>If you find yourself reaching for <code>useEffect</code> to react to a click, stop. The click
+already happened in a handler; do the work there. That is the most common misuse of effects, and
+<a href="/react/react-lifecycle">The Component Lifecycle with useEffect</a> comes back to it.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-state">State with useState</a> — what those <code>set…</code> functions
+are.</p>

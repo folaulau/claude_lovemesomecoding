@@ -1,0 +1,190 @@
+<p>A ref is a value a component remembers across renders that does <strong>not</strong> trigger a
+re-render when it changes. It has two uses: reaching a real DOM node, and holding a mutable value
+that the screen does not depend on.</p>
+
+<h2>ref versus state</h2>
+
+<table>
+  <thead>
+    <tr><th></th><th><code>useState</code></th><th><code>useRef</code></th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Changing it re-renders</td><td>yes</td><td><strong>no</strong></td></tr>
+    <tr><td>Survives re-renders</td><td>yes</td><td>yes</td></tr>
+    <tr><td>How you change it</td><td><code>setX(next)</code></td><td><code>ref.current = next</code></td></tr>
+    <tr><td>Mutable</td><td>no — replace it</td><td>yes — assign to <code>.current</code></td></tr>
+    <tr><td>Safe to read during render</td><td>yes</td><td><strong>no</strong></td></tr>
+  </tbody>
+</table>
+
+<p>The decision is one question: <em>does the screen need to change when this value changes?</em> Yes
+means state. No means a ref.</p>
+
+<h2>Reaching a DOM node</h2>
+
+<p>React builds the DOM for you, and 95% of the time you never touch it. The exceptions are the
+things the DOM does that React has no declarative equivalent for: focus, scroll position, measuring,
+media playback, and canvas.</p>
+
+<p>Three steps — create the ref, attach it, use it after render:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const confirmButtonRef = useRef&lt;HTMLButtonElement&gt;(null);
+
+&lt;Button ref={confirmButtonRef} variant="primary" onClick={handleAdd}&gt;
+  Add to cart
+&lt;/Button&gt;</code></pre>
+
+<p>The pizza builder uses it to move focus onto the confirm button when the modal opens — which
+matters, because a keyboard or screen-reader user is otherwise left at the top of the document with
+no idea a dialog appeared:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;Modal
+  show={product !== null}
+  onHide={onHide}
+  size="lg"
+  centered
+  scrollable
+  // Bootstrap's Modal already traps focus and restores it on close; this just picks the
+  // element that should receive focus first.
+  onEntered={() =&gt; confirmButtonRef.current?.focus()}
+  aria-labelledby="builder-title"
+&gt;</code></pre>
+
+<p><code>?.</code> is not optional politeness. <code>ref.current</code> is <code>null</code> until
+React has attached the node, and <code>null</code> again after it unmounts. Always guard.</p>
+
+<h3>Typing it</h3>
+
+<pre class="language-tsx"><code class="language-tsx">const buttonRef = useRef&lt;HTMLButtonElement&gt;(null);
+const inputRef = useRef&lt;HTMLInputElement&gt;(null);
+const divRef = useRef&lt;HTMLDivElement&gt;(null);</code></pre>
+
+<p>The type is the element you are attaching to. Passing <code>null</code> as the initial value is
+what tells TypeScript this is a DOM ref rather than a mutable value ref — the two have subtly
+different types.</p>
+
+<h3>When you can read it</h3>
+
+<p>Not during render. The node does not exist yet on the first render, and touching the DOM during
+render breaks purity. Read it in an event handler or an effect:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Wrong — current is null on the first render, and this is a side effect during render.
+function SearchBox() {
+  const inputRef = useRef&lt;HTMLInputElement&gt;(null);
+  inputRef.current?.focus();
+  return &lt;input ref={inputRef} /&gt;;
+}
+
+// Right.
+function SearchBox() {
+  const inputRef = useRef&lt;HTMLInputElement&gt;(null);
+  useEffect(() =&gt; {
+    inputRef.current?.focus();
+  }, []);
+  return &lt;input ref={inputRef} /&gt;;
+}</code></pre>
+
+<h3>What not to do with it</h3>
+
+<p>A ref is an escape hatch, not a back door. Use it to <em>call methods on</em> a node — focus,
+scrollIntoView, play, measure. Do not use it to change what React is rendering:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Do not. React does not know about this and will overwrite it on the next render.
+divRef.current.style.display = 'none';
+divRef.current.textContent = 'Sold out';
+
+// Do. React owns what is on the screen.
+{soldOut ? &lt;span&gt;Sold out&lt;/span&gt; : &lt;Price value={price} /&gt;}</code></pre>
+
+<h2>Holding a value between renders</h2>
+
+<p>The second use has nothing to do with the DOM. Sometimes a component needs to remember something
+that the display does not depend on — and putting it in state would cause a pointless re-render, or
+worse, a loop.</p>
+
+<p>The cart provider stores the server-side cart id in a ref:</p>
+
+<pre class="language-tsx"><code class="language-tsx">/*
+ * A ref, not state: the persist effect needs the CURRENT cart id without re-running every time
+ * the id changes (which would cause an extra PUT).
+ */
+const cartIdRef = useRef&lt;string | null&gt;(cartIdStore.get());</code></pre>
+
+<p>Trace why. The persist effect reads the id, and creates a cart on the server if there is not one
+yet. As state, the id would have to be in the effect's dependency array — so setting it would re-run
+the effect, which would issue a second PUT. As a ref, the effect reads the latest value and nothing
+re-runs:</p>
+
+<pre class="language-tsx"><code class="language-tsx">let cartId = cartIdRef.current;
+
+if (!cartId) {
+  // Do not create a cart row just because someone loaded the home page.
+  if (state.items.length === 0) return;
+  const created = await api.post&lt;ServerCart&gt;('/api/carts');
+  cartId = created.id;
+  cartIdRef.current = cartId;
+  cartIdStore.set(cartId);
+}
+
+await api.put&lt;ServerCart&gt;(`/api/carts/${cartId}`, toWriteRequest(state));</code></pre>
+
+<p>The id genuinely is not display state — nothing on the screen shows it. That is what makes a ref
+the right call rather than a trick.</p>
+
+<p>The other classic is a timer id, which you need in order to cancel it and which no part of the UI
+displays:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const timerRef = useRef&lt;number | null&gt;(null);
+
+function startCountdown() {
+  timerRef.current = window.setTimeout(() =&gt; { /* … */ }, 3000);
+}
+
+function cancel() {
+  if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+}</code></pre>
+
+<h2>Reading or writing a ref during render is a bug</h2>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG on both lines. React may render twice, throw the result away, or pause — none of which
+// this code survives, and StrictMode will show you exactly that.
+function ProductCard({ product }: Props) {
+  renderCountRef.current++;
+  return &lt;div&gt;{renderCountRef.current}&lt;/div&gt;;
+}</code></pre>
+
+<p>Refs are read and written in event handlers and effects. If you need a value during render, it is
+either state, a prop, or something you can calculate.</p>
+
+<h2>forwardRef is no longer needed</h2>
+
+<p>Every tutorial written before React 19 has a section on <code>forwardRef</code>, because passing a
+ref to your own component used to require it — <code>ref</code> was not a real prop.</p>
+
+<pre class="language-tsx"><code class="language-tsx">// React 18 and earlier.
+const FancyInput = forwardRef&lt;HTMLInputElement, Props&gt;(function FancyInput(props, ref) {
+  return &lt;input ref={ref} {...props} /&gt;;
+});
+
+// React 19. `ref` is an ordinary prop.
+function FancyInput({ ref, ...props }: Props &amp; { ref?: Ref&lt;HTMLInputElement&gt; }) {
+  return &lt;input ref={ref} {...props} /&gt;;
+}</code></pre>
+
+<p><code>forwardRef</code> still works and is not urgent to remove. New code does not need it.</p>
+
+<h2>Callback refs</h2>
+
+<p>A ref prop can be a function instead of a ref object. React calls it with the node when it mounts
+and with <code>null</code> when it unmounts — useful when you need to react to the node appearing, or
+when you are collecting refs for a dynamic list:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;div ref={(node) =&gt; { if (node) observer.observe(node); }} /&gt;</code></pre>
+
+<p>In React 19 a callback ref may also return a cleanup function, which is tidier than checking for
+<code>null</code>.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-error-boundary">Error Boundaries</a> — the last escape hatch, and the one
+place a class component is still mandatory.</p>

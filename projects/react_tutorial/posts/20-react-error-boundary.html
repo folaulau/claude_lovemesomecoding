@@ -1,0 +1,209 @@
+<p>If a component throws while rendering, React unmounts your entire application. Not the broken
+component — all of it. The user gets a blank white page and the error goes to the console, which they
+will never see.</p>
+
+<p>That behaviour is deliberate. React's position is that a UI showing wrong data is worse than a UI
+showing nothing, and it has no way to know which parts of your tree are still trustworthy. An
+<strong>error boundary</strong> is how you tell it.</p>
+
+<h2>What a boundary is</h2>
+
+<p>A component that catches errors thrown anywhere below it and renders a fallback instead of
+crashing. It is still, in 2026, the one thing that <strong>requires a class component</strong> —
+there is no hook equivalent of <code>componentDidCatch</code>.</p>
+
+<p>Here is the whole thing from the pizza app:</p>
+
+<pre class="language-tsx"><code class="language-tsx">import { Component } from 'react';
+import type { ErrorInfo, ReactNode } from 'react';
+import { Alert, Button, Container } from 'react-bootstrap';
+
+interface Props {
+  children: ReactNode;
+}
+
+interface State {
+  error: Error | null;
+}
+
+export class ErrorBoundary extends Component&lt;Props, State&gt; {
+  state: State = { error: null };
+
+  /** Runs during the render phase and decides the new state — must stay side-effect free. */
+  static getDerivedStateFromError(error: Error): State {
+    return { error };
+  }
+
+  /** Runs after the error is committed. This is where logging belongs. */
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    // In production this would go to Sentry, Datadog or similar.
+    console.error('Uncaught render error:', error, errorInfo.componentStack);
+  }
+
+  handleReset = () =&gt; {
+    this.setState({ error: null });
+  };
+
+  render() {
+    if (this.state.error) {
+      return (
+        &lt;Container className="py-5"&gt;
+          &lt;Alert variant="danger"&gt;
+            &lt;Alert.Heading&gt;Something went wrong&lt;/Alert.Heading&gt;
+            &lt;p className="mb-3"&gt;
+              Sorry — this part of the page failed to load. Your cart has not been lost.
+            &lt;/p&gt;
+            &lt;pre className="small bg-light p-2 rounded overflow-auto"&gt;
+              {this.state.error.message}
+            &lt;/pre&gt;
+            &lt;Button variant="outline-danger" onClick={this.handleReset}&gt;
+              Try again
+            &lt;/Button&gt;
+          &lt;/Alert&gt;
+        &lt;/Container&gt;
+      );
+    }
+
+    return this.props.children;
+  }
+}</code></pre>
+
+<p>Two methods, and they run at different times for different reasons:</p>
+
+<ul>
+  <li><strong><code>getDerivedStateFromError</code></strong> is <code>static</code> and runs during
+      the render phase. It returns the new state — that is all it may do. No logging, no requests, no
+      side effects, because React may discard this render and try again.</li>
+  <li><strong><code>componentDidCatch</code></strong> runs after the error is committed, so side
+      effects are fine. This is where reporting belongs. Its <code>errorInfo.componentStack</code> is
+      genuinely useful: it names the React components on the path to the throw, which a JavaScript
+      stack trace does not.</li>
+</ul>
+
+<p>You need both. The first shows the fallback; the second tells you it happened.</p>
+
+<h2>Where to put it</h2>
+
+<p>A boundary catches everything below it and nothing above it, so placement is a decision about how
+much of the page you are willing to lose.</p>
+
+<p>The pizza app puts one around the routed content — inside the layout, outside the pages:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;div className="d-flex flex-column min-vh-100"&gt;
+  &lt;AppNavbar onOpenCart={() =&gt; setCartOpen(true)} /&gt;
+
+  &lt;main className="flex-grow-1"&gt;
+    {/* Any render error inside a route is caught here rather than blanking the whole app. */}
+    &lt;ErrorBoundary&gt;
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;Routes&gt;{/* … */}&lt;/Routes&gt;
+      &lt;/Suspense&gt;
+    &lt;/ErrorBoundary&gt;
+  &lt;/main&gt;
+
+  &lt;CartDrawer show={cartOpen} onHide={() =&gt; setCartOpen(false)} /&gt;
+  &lt;Footer /&gt;
+&lt;/div&gt;</code></pre>
+
+<p>So a crash in the checkout page leaves the navbar, the cart drawer and the footer alive. The user
+still has their cart, can still navigate, and sees an explanation rather than nothing. That is the
+whole benefit, and it comes from where the boundary sits, not from the boundary itself.</p>
+
+<p>A route-level boundary is the sensible default. Add narrower ones around genuinely independent
+widgets — a chart, an embedded third-party thing, a comment feed — where the rest of the page is
+perfectly usable without them. What you do not want is one boundary at the very root, which catches
+everything and therefore loses everything.</p>
+
+<h2>What it does not catch</h2>
+
+<p>This is the part people get wrong. An error boundary only catches errors thrown <strong>while
+rendering</strong>, in lifecycle methods, and in constructors of the tree below it. It does not
+catch:</p>
+
+<ul>
+  <li><strong>Event handlers.</strong> A click handler that throws is not part of rendering.</li>
+  <li><strong>Async code.</strong> A rejected promise, a <code>setTimeout</code> callback, anything
+      after an <code>await</code>.</li>
+  <li><strong>Errors in the boundary itself.</strong> They propagate to the next boundary up.</li>
+  <li><strong>Server rendering.</strong></li>
+</ul>
+
+<p>Which covers most of what actually goes wrong in a real application — failed requests happen far
+more often than a component throwing during render. Those need ordinary <code>try/catch</code> and a
+state variable:</p>
+
+<pre class="language-tsx"><code class="language-tsx">async function handleSubmit(event: React.FormEvent) {
+  event.preventDefault();
+  try {
+    await login(email, password);
+    navigate(redirectTo, { replace: true });
+  } catch {
+    // The error message is already surfaced through AuthContext; nothing to do here.
+  }
+}</code></pre>
+
+<p>…and, in the context that owns the request, an <code>error</code> field the UI can render:</p>
+
+<pre class="language-tsx"><code class="language-tsx">} catch (err) {
+  // An abort is not a failure — it means we navigated away or StrictMode re-ran the effect.
+  if (controller.signal.aborted) return;
+  setError(
+    err instanceof Error ? `Could not load the menu: ${err.message}` : 'Could not load the menu.',
+  );
+}</code></pre>
+
+<pre class="language-tsx"><code class="language-tsx">{error &amp;&amp; (
+  &lt;Alert variant="danger" className="d-flex justify-content-between align-items-center"&gt;
+    &lt;span&gt;{error}&lt;/span&gt;
+    &lt;Button size="sm" variant="outline-danger" onClick={reload}&gt;
+      Try again
+    &lt;/Button&gt;
+  &lt;/Alert&gt;
+)}</code></pre>
+
+<p>Think of it as two separate systems. Expected failures — the network is down, the password is
+wrong — are modelled as state and rendered. Error boundaries are for the unexpected: the bug you did
+not know you had.</p>
+
+<h3>Forcing an async error into a boundary</h3>
+
+<p>If you do want an async failure to hit the boundary, rethrow it during render:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const [error, setError] = useState&lt;Error | null&gt;(null);
+
+if (error) throw error;      // now it is a render-phase error, so the boundary catches it
+
+useEffect(() =&gt; {
+  load().catch(setError);
+}, []);</code></pre>
+
+<p>Use this sparingly. Most failures deserve a message in place, not a wiped-out page.</p>
+
+<h2>Recovering</h2>
+
+<p>The boundary above offers a "Try again" button that clears the error state and re-renders the
+children. That works when the failure was transient. When it was not — bad data in props, say — the
+children throw again immediately and the user is stuck in a loop.</p>
+
+<p>The more reliable reset is to change the boundary's <code>key</code> when the thing that failed
+changes, which unmounts the whole subtree and builds a fresh one:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{/* A new route means a genuinely fresh attempt, not a retry of the same broken state. */}
+&lt;ErrorBoundary key={location.pathname}&gt;
+  &lt;Routes&gt;{/* … */}&lt;/Routes&gt;
+&lt;/ErrorBoundary&gt;</code></pre>
+
+<p>Same mechanism as <a href="/react/react-keys">resetting a component with a key</a>.</p>
+
+<h2>The library version</h2>
+
+<p>If writing a class bothers you, <code>react-error-boundary</code> wraps this up with a
+<code>FallbackComponent</code> prop, an <code>onReset</code> callback, <code>resetKeys</code>, and a
+<code>useErrorBoundary</code> hook for throwing from async code. It is a small, well-maintained
+package and it is a reasonable default on a new project.</p>
+
+<p>It is still a class underneath. There is no way around that yet.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-route">Routing with React Router</a>.</p>

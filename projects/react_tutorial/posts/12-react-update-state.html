@@ -1,0 +1,168 @@
+<p>Calling a state setter does not change the variable you are holding. It schedules a re-render, and
+the new value appears in the <em>next</em> one. Almost every confusing state bug comes from expecting
+otherwise.</p>
+
+<h2>State is a snapshot</h2>
+
+<pre class="language-tsx"><code class="language-tsx">function Counter() {
+  const [count, setCount] = useState(0);
+
+  function handleClick() {
+    setCount(count + 1);
+    console.log(count);        // still 0 — even though we just "set" it to 1
+  }
+
+  return &lt;button onClick={handleClick}&gt;{count}&lt;/button&gt;;
+}</code></pre>
+
+<p><code>count</code> is a <code>const</code> belonging to <em>this</em> render. Nothing can change
+it, and React does not try to. What <code>setCount</code> does is tell React "next time you render
+this component, hand it 1". The current render finishes with the value it started with.</p>
+
+<p>This is not a quirk to work around; it is what makes React predictable. Everything a render sees
+is frozen for the duration of that render, so a handler cannot read a value that is half-updated.</p>
+
+<h2>The consequence: batching</h2>
+
+<pre class="language-tsx"><code class="language-tsx">function handleClick() {
+  setCount(count + 1);
+  setCount(count + 1);
+  setCount(count + 1);
+}</code></pre>
+
+<p>Starting from 0, this sets the count to <strong>1</strong>, not 3. Every <code>count</code> in
+that function is the same frozen <code>0</code>, so all three calls say "make it 1". React then
+performs one re-render for the whole handler, rather than three.</p>
+
+<h2>The updater function</h2>
+
+<p>Pass a function instead of a value and React calls it with the latest pending state, queuing your
+change on top of the previous one:</p>
+
+<pre class="language-tsx"><code class="language-tsx">function handleClick() {
+  setCount((c) =&gt; c + 1);
+  setCount((c) =&gt; c + 1);
+  setCount((c) =&gt; c + 1);       // now it really is 3
+}</code></pre>
+
+<p><strong>The rule: if the new value depends on the old one, use the updater form.</strong> It costs
+nothing and it is never wrong.</p>
+
+<p>It matters most when the "old value" is not visible at the call site. The toast provider adds a
+toast, and three seconds later removes it — by which time <code>toasts</code> from the original
+render is long stale, and the array may hold entirely different messages:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const showToast = useCallback((message: string, variant: ToastVariant = 'success') =&gt; {
+  const id = crypto.randomUUID();
+  setToasts((current) =&gt; [...current, { id, message, variant }]);
+
+  window.setTimeout(() =&gt; {
+    setToasts((current) =&gt; current.filter((toast) =&gt; toast.id !== id));
+  }, 3000);
+}, []);</code></pre>
+
+<p>Written as <code>setToasts([...toasts, newToast])</code> this would be broken in two ways: firing
+two toasts quickly would lose the first, and the timeout would restore a snapshot of the list from
+three seconds ago. The updater form has no such problem, and it is also why the
+<a href="/react/react-usememo-usecallback">useCallback</a> around it can have an empty dependency
+array — it never reads <code>toasts</code>.</p>
+
+<p>Same shape, toggling a topping on and off:</p>
+
+<pre class="language-tsx"><code class="language-tsx">function toggleTopping(id: string) {
+  setSelectedToppingIds((current) =&gt;
+    current.includes(id) ? current.filter((t) =&gt; t !== id) : [...current, id],
+  );
+}</code></pre>
+
+<h2>Never mutate</h2>
+
+<p>React decides whether to re-render by comparing the new state to the old one <em>by reference</em>.
+Change an object in place and the reference is identical, so React concludes nothing happened.</p>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG. The array is now different, but it is the SAME array, so nothing re-renders.
+items.push(newItem);
+setItems(items);
+
+// Right — a new array.
+setItems([...items, newItem]);</code></pre>
+
+<p>The mutating array methods to avoid: <code>push</code>, <code>pop</code>, <code>shift</code>,
+<code>unshift</code>, <code>splice</code>, <code>sort</code>, <code>reverse</code>. The last two
+catch people out because they read like they return a new array — they do not, they sort in place and
+return the same reference. Copy first: <code>[...items].sort(…)</code>.</p>
+
+<h3>Objects</h3>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG
+user.fullName = 'Folau';
+setUser(user);
+
+// Right
+setUser({ ...user, fullName: 'Folau' });</code></pre>
+
+<h3>Arrays of objects</h3>
+
+<p>This is the case that actually comes up, and the one worth memorising. Changing one item in a
+list means <code>map</code> — a new array, with a new object in one position and the originals
+everywhere else:</p>
+
+<pre class="language-tsx"><code class="language-tsx">case 'SET_QUANTITY': {
+  // Dropping to zero removes the line — it is what a user expects from a "−" button.
+  if (action.payload.quantity &lt;= 0) {
+    return {
+      ...state,
+      items: state.items.filter((item) =&gt; item.lineId !== action.payload.lineId),
+    };
+  }
+  return {
+    ...state,
+    items: state.items.map((item) =&gt;
+      item.lineId === action.payload.lineId
+        ? { ...item, quantity: action.payload.quantity }
+        : item,
+    ),
+  };
+}</code></pre>
+
+<p>Read the <code>map</code> carefully: the matching item is replaced by a copy with a new quantity,
+and every other item is returned <em>as is</em>. Untouched items keep their identity, which is what
+lets <a href="/react/react-usememo-usecallback">React.memo</a> skip re-rendering them.</p>
+
+<p>The three operations, all non-mutating:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// add
+items: [...state.items, action.payload]
+
+// remove
+items: state.items.filter((item) =&gt; item.lineId !== action.payload.lineId)
+
+// update one
+items: state.items.map((item) =&gt;
+  item.lineId === target ? { ...item, quantity: next } : item,
+)</code></pre>
+
+<h3>Nesting</h3>
+
+<p>Spread is shallow. Updating something two levels down means copying each level on the way:</p>
+
+<pre class="language-tsx"><code class="language-tsx">setOrder({
+  ...order,
+  address: { ...order.address, city: 'Salt Lake City' },
+});</code></pre>
+
+<p>If you are writing three levels of that, the state shape is the problem, not the syntax. Flatten
+it, or use a library like Immer that lets you write the mutation and produces the copy for you —
+Redux Toolkit bundles Immer for exactly this reason.</p>
+
+<h2>Why not just mutate and force an update?</h2>
+
+<p>Because immutability is what buys you the rest of React. Reference comparison is how
+<code>memo</code>, <code>useMemo</code> and <code>useCallback</code> decide whether to skip work; it
+is how effect dependency arrays detect change; it is what makes a reducer testable and time-travel
+debugging possible. Mutating one object in one place quietly switches all of that off.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-forms">Forms and Controlled Inputs</a> — state, applied to every input on
+the page.</p>

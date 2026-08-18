@@ -1,0 +1,194 @@
+<p>JSX has no <code>if</code>. It is an expression, and statements do not go inside expressions. So
+conditionals are done with the tools JavaScript already has for producing a value — and there are
+four worth knowing, each best in a different place.</p>
+
+<h2>1. An early return</h2>
+
+<p>When the whole component should render something else, do not nest — return early. Ordinary
+<code>if</code> statements are fine here, because you are above the <code>return</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function ProtectedRoute({ children, requireAdmin = false }: Props) {
+  const { isAuthenticated, isAdmin, initialising } = useAuth();
+  const location = useLocation();
+
+  if (initialising) {
+    return (
+      &lt;div className="text-center py-5"&gt;
+        &lt;Spinner animation="border" variant="danger" role="status"&gt;
+          &lt;span className="visually-hidden"&gt;Checking your session…&lt;/span&gt;
+        &lt;/Spinner&gt;
+      &lt;/div&gt;
+    );
+  }
+
+  if (!isAuthenticated) {
+    return &lt;Navigate to="/login" state={{ from: location }} replace /&gt;;
+  }
+
+  if (requireAdmin &amp;&amp; !isAdmin) {
+    return &lt;Navigate to="/" replace /&gt;;
+  }
+
+  return &lt;&gt;{children}&lt;/&gt;;
+}</code></pre>
+
+<p>Three guards, then the happy path, and none of it indented. Compare that to the same logic as
+nested ternaries and the case makes itself.</p>
+
+<p>The <code>initialising</code> guard is worth a second look, because leaving it out is a real bug:
+without it, refreshing the page on <code>/admin</code> renders one frame in which the stored token
+has not been checked yet, <code>isAuthenticated</code> is still <code>false</code>, and a perfectly
+valid admin gets bounced to the login screen.</p>
+
+<h2>2. &amp;&amp;, for "show this or nothing"</h2>
+
+<p><code>a &amp;&amp; b</code> evaluates to <code>b</code> when <code>a</code> is truthy, and to
+<code>a</code> when it is not. Since React renders nothing for <code>false</code>,
+<code>null</code> and <code>undefined</code>, that is a conditional:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{isAdmin &amp;&amp; (
+  &lt;Nav.Link as={NavLink} to="/admin"&gt;
+    Admin
+  &lt;/Nav.Link&gt;
+)}</code></pre>
+
+<p>This is the most common form, and it has one trap. <strong>The left side must be a boolean.</strong>
+React skips <code>false</code> but it happily renders <code>0</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Renders a literal "0" beside the Cart button when the cart is empty.
+{totals.itemCount &amp;&amp; &lt;Badge&gt;{totals.itemCount}&lt;/Badge&gt;}
+
+// Correct — the left side is now a boolean.
+{totals.itemCount &gt; 0 &amp;&amp; (
+  &lt;Badge bg="light" text="dark" pill className="cart-badge"&gt;
+    {totals.itemCount}
+  &lt;/Badge&gt;
+)}</code></pre>
+
+<p>The same applies to <code>items.length &amp;&amp; …</code> and any other count. Compare, or coerce
+with <code>Boolean(…)</code>. This bug ships regularly because it only shows up in the empty
+state.</p>
+
+<h2>3. The ternary, for "this or that"</h2>
+
+<p>When there are two branches and both render something, <code>? :</code> is the only thing that
+fits inside JSX:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;div className="product-thumb" aria-hidden="true"&gt;
+  {isPizza ? '🍕' : '🥤'}
+&lt;/div&gt;
+
+&lt;Button type="submit" variant="primary" className="w-100" disabled={loading}&gt;
+  {loading ? 'Signing in…' : 'Sign in'}
+&lt;/Button&gt;</code></pre>
+
+<p>It scales up to whole blocks, though this is about as far as it should go before you extract a
+component:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{items.length === 0 ? (
+  &lt;div className="text-center text-muted py-5"&gt;
+    &lt;div className="display-6 mb-2"&gt;🍕&lt;/div&gt;
+    &lt;p className="mb-0"&gt;Your cart is empty.&lt;/p&gt;
+  &lt;/div&gt;
+) : (
+  &lt;&gt;
+    &lt;Stack gap={3} className="flex-grow-1 overflow-auto"&gt;
+      {items.map((item) =&gt; (
+        /* … one cart line … */
+      ))}
+    &lt;/Stack&gt;
+    {/* … totals and the Checkout button … */}
+  &lt;/&gt;
+)}</code></pre>
+
+<p>Nested ternaries are where this stops being readable. Two levels is already too many; pull the
+decision above the <code>return</code> and assign to a variable, or split the component.</p>
+
+<h2>4. Returning null</h2>
+
+<p>A component may decide it renders nothing at all:</p>
+
+<pre class="language-tsx"><code class="language-tsx">function VizTooltip({ active, payload, label }: Props) {
+  if (!active || !payload?.length) return null;
+
+  return (
+    &lt;div className="viz-tooltip"&gt;
+      &lt;div className="viz-tooltip-label"&gt;{label}&lt;/div&gt;
+      {/* … */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<p>Returning <code>null</code> is not an error and not a special case — it is a normal thing for a
+component to do. The component stays mounted and keeps its state; it just contributes no DOM.</p>
+
+<h2>Which one, when</h2>
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>Use</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>The whole component renders something else</td><td>early <code>return</code></td></tr>
+    <tr><td>Show a thing, or nothing</td><td><code>&amp;&amp;</code></td></tr>
+    <tr><td>Show one thing or another</td><td>ternary</td></tr>
+    <tr><td>Render nothing at all</td><td><code>return null</code></td></tr>
+    <tr><td>More than two branches</td><td>compute above the <code>return</code></td></tr>
+  </tbody>
+</table>
+
+<p>That last row matters. Once there are three or more outcomes, work it out in ordinary JavaScript
+first and put a variable in the JSX:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// A lookup beats a chain of ternaries, and it is what the orders table actually does.
+const STATUS_VARIANT: Record&lt;OrderStatus, string&gt; = {
+  PENDING_PAYMENT: 'warning',
+  PAID: 'primary',
+  PREPARING: 'info',
+  COMPLETED: 'success',
+  CANCELLED: 'secondary',
+};
+
+&lt;Badge bg={STATUS_VARIANT[order.status]}&gt;
+  {order.status.replace('_', ' ').toLowerCase()}
+&lt;/Badge&gt;</code></pre>
+
+<h2>A note on loading and error states</h2>
+
+<p>Nearly every screen that fetches something has three of these stacked up, and it is worth writing
+them out explicitly rather than cleverly:</p>
+
+<pre class="language-tsx"><code class="language-tsx">{loading &amp;&amp; (
+  &lt;div className="text-center py-5"&gt;
+    &lt;Spinner animation="border" variant="danger" role="status"&gt;
+      &lt;span className="visually-hidden"&gt;Loading the menu…&lt;/span&gt;
+    &lt;/Spinner&gt;
+  &lt;/div&gt;
+)}
+
+{error &amp;&amp; (
+  &lt;Alert variant="danger" className="d-flex justify-content-between align-items-center"&gt;
+    &lt;span&gt;{error}&lt;/span&gt;
+    &lt;Button size="sm" variant="outline-danger" onClick={reload}&gt;
+      Try again
+    &lt;/Button&gt;
+  &lt;/Alert&gt;
+)}
+
+{!loading &amp;&amp; !error &amp;&amp; (
+  &lt;Row xs={1} sm={2} lg={4} className="g-4"&gt;
+    {visibleProducts.map((product) =&gt; (
+      &lt;Col key={product.id}&gt;
+        &lt;ProductCard product={product} onSelect={handleSelect} /&gt;
+      &lt;/Col&gt;
+    ))}
+  &lt;/Row&gt;
+)}</code></pre>
+
+<p>Three sibling conditions rather than one nested ternary. It is more lines and considerably easier
+to change — and the error branch offers a retry, which a spinner-or-content ternary has nowhere to
+put.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-keys">Rendering Lists and Keys</a>.</p>

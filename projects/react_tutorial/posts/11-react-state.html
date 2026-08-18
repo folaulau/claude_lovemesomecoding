@@ -1,0 +1,182 @@
+<p>State is what a component remembers between renders. Props come from outside and are read-only;
+state is owned by the component and changing it is what makes the screen update.</p>
+
+<h2>Why a variable will not do</h2>
+
+<pre class="language-tsx"><code class="language-tsx">function Counter() {
+  let count = 0;                                   // resets to 0 on every render
+
+  return &lt;button onClick={() =&gt; count++}&gt;{count}&lt;/button&gt;;   // and nothing re-renders
+}</code></pre>
+
+<p>Two separate problems. A local variable is recreated each time the function runs, so it cannot
+remember anything. And changing it does not tell React that anything happened, so even if it did
+remember, the button would never redraw.</p>
+
+<p><code>useState</code> solves both:</p>
+
+<pre class="language-tsx"><code class="language-tsx">import { useState } from 'react';
+
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  return &lt;button onClick={() =&gt; setCount(count + 1)}&gt;{count}&lt;/button&gt;;
+}</code></pre>
+
+<p>React stores the value outside the function and hands it back on every render. The setter both
+updates the stored value and schedules a re-render.</p>
+
+<h2>The shape of it</h2>
+
+<pre class="language-tsx"><code class="language-tsx">const [selectedProduct, setSelectedProduct] = useState&lt;Product | null&gt;(null);
+//     ↑ current value  ↑ setter                        ↑ type      ↑ initial value</code></pre>
+
+<p>It returns an array of exactly two elements, which is why you always see array destructuring. The
+names are yours; <code>[thing, setThing]</code> is the universal convention and worth keeping.</p>
+
+<p>TypeScript usually infers the type from the initial value — <code>useState(0)</code> is a
+<code>number</code>, <code>useState('')</code> is a <code>string</code>. You only need the explicit
+generic when the initial value does not describe the full range:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const [size, setSize] = useState&lt;SizeName&gt;('MEDIUM');           // else inferred as string
+const [crustId, setCrustId] = useState&lt;string | null&gt;(null);    // else inferred as null
+const [toasts, setToasts] = useState&lt;ToastMessage[]&gt;([]);       // else inferred as never[]
+const [quantity, setQuantity] = useState(1);                    // number — no help needed</code></pre>
+
+<p>That third one bites people: <code>useState([])</code> infers <code>never[]</code>, and then
+pushing anything into it is a type error.</p>
+
+<h3>Lazy initial state</h3>
+
+<p>The initial value is only used on the first render, but the expression that produces it runs on
+<em>every</em> render. If it is expensive, pass a function instead and React will call it once:</p>
+
+<pre class="language-tsx"><code class="language-tsx">useState(readFromLocalStorage());     // runs on every render, result thrown away after the first
+useState(() =&gt; readFromLocalStorage());   // runs once</code></pre>
+
+<h2>The rules of hooks</h2>
+
+<p>Two rules, and they are not stylistic — React identifies your state by <em>call order</em>, not by
+name. It has nothing else to go on.</p>
+
+<ol>
+  <li><strong>Only call hooks at the top level of a component.</strong> Never inside a condition, a
+      loop, a nested function or after an early return.</li>
+  <li><strong>Only call them from a React function</strong> — a component, or another hook.</li>
+</ol>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG — the number of hook calls now changes between renders, and React loses track.
+if (product) {
+  const [size, setSize] = useState('MEDIUM');
+}
+
+// Right — call it unconditionally, put the condition in the value.
+const [size, setSize] = useState&lt;SizeName&gt;('MEDIUM');
+const isPizza = product?.type === 'PIZZA';</code></pre>
+
+<p>The error message is <em>"Rendered fewer hooks than expected"</em> or <em>"Rendered more hooks
+than during the previous render"</em>. When you see it, look for a hook after an early return —
+that is the usual cause and it is easy to miss.</p>
+
+<h2>One state variable or several?</h2>
+
+<p>Split them when they change independently. The pizza builder has four, and every one moves on its
+own:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const [size, setSize] = useState&lt;SizeName&gt;('MEDIUM');
+const [crustId, setCrustId] = useState&lt;string | null&gt;(null);
+const [selectedToppingIds, setSelectedToppingIds] = useState&lt;string[]&gt;([]);
+const [quantity, setQuantity] = useState(1);</code></pre>
+
+<p>Group them when they always change together, or when one is meaningless without the other. Once a
+group of related values grows past three or four and the updates start depending on each other, a
+reducer is usually the better answer — see <a href="/react/react-usereducer">useReducer</a>.</p>
+
+<h3>Do not store what you can derive</h3>
+
+<p>This is the most valuable habit in this post. Anything computable from existing state or props is
+not state:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG — two sources of truth that can disagree, plus an effect to keep them in step.
+const [items, setItems] = useState&lt;CartItem[]&gt;([]);
+const [itemCount, setItemCount] = useState(0);
+
+// Right — one source of truth, recomputed on render.
+const [items, setItems] = useState&lt;CartItem[]&gt;([]);
+const itemCount = items.reduce((count, item) =&gt; count + item.quantity, 0);</code></pre>
+
+<p>The whole cart total is computed this way, never stored:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function calculateTotals(items: CartItem[], orderType: 'DELIVERY' | 'CARRYOUT'): CartTotals {
+  const subtotal = round2(items.reduce((sum, item) =&gt; sum + lineTotal(item), 0));
+  const deliveryFee = orderType === 'DELIVERY' &amp;&amp; subtotal &gt; 0 ? DELIVERY_FEE : 0;
+  const tax = round2(subtotal * TAX_RATE);
+
+  return {
+    subtotal,
+    tax,
+    deliveryFee,
+    total: round2(subtotal + tax + deliveryFee),
+    itemCount: items.reduce((count, item) =&gt; count + item.quantity, 0),
+  };
+}</code></pre>
+
+<p>Stored totals go stale. Derived totals cannot. If the derivation ever gets expensive, wrap it in
+<a href="/react/react-usememo-usecallback">useMemo</a> — but derive first and measure before
+optimising.</p>
+
+<h3>Prefer fewer, better-shaped variables</h3>
+
+<p>The menu page could have had <code>modalOpen</code> and <code>selectedProduct</code>. It has one:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// `null` means the modal is closed. One piece of state, not two.
+const [selectedProduct, setSelectedProduct] = useState&lt;Product | null&gt;(null);
+
+/* … */
+
+&lt;PizzaBuilderModal product={selectedProduct} onHide={() =&gt; setSelectedProduct(null)} /&gt;</code></pre>
+
+<p>Two booleans-and-values that must agree is a state that can be wrong —
+<code>modalOpen: true, selectedProduct: null</code> is representable and meaningless. Collapsing them
+makes that impossible.</p>
+
+<h2>State is per component instance</h2>
+
+<p>Render <code>&lt;ProductCard /&gt;</code> fourteen times and there are fourteen independent copies
+of its state. This is usually exactly what you want — and occasionally the problem, when two
+components need to agree.</p>
+
+<h2>Lifting state up</h2>
+
+<p>When two components need the same value, it belongs in their closest common parent. The cart
+drawer's open/closed flag lives in <code>App</code>, because the navbar opens it and the drawer
+consumes it, and <code>App</code> is the nearest thing above both:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export default function App() {
+  // The drawer's open/closed state lives here because both the navbar (which opens it) and the
+  // drawer itself need it. This is "lifting state up" — the cart CONTENTS are in context, but
+  // this piece of purely-visual state is not worth putting there.
+  const [cartOpen, setCartOpen] = useState(false);
+
+  return (
+    &lt;div className="d-flex flex-column min-vh-100"&gt;
+      &lt;AppNavbar onOpenCart={() =&gt; setCartOpen(true)} /&gt;
+      {/* … */}
+      &lt;CartDrawer show={cartOpen} onHide={() =&gt; setCartOpen(false)} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<p>The state moves up; a value and a function to change it move back down as props. Neither child
+owns it, and they cannot disagree.</p>
+
+<p>Lifting has a limit. When the common parent is five levels up and three intermediate components
+would carry a prop they never read, that is prop drilling, and
+<a href="/react/react-context">Context</a> is the tool. Note that this app uses <em>both</em>: the
+cart's <em>contents</em> are in context because half the app needs them, while whether the drawer is
+open is lifted into <code>App</code>, because only two components care.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-update-state">Updating State Correctly</a> — the part that surprises
+people.</p>

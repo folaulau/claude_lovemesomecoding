@@ -1,0 +1,393 @@
+<p>Redux is a state container. You have already built one: <a href="/react/react-usereducer">a
+reducer</a> inside <a href="/react/react-context">a context provider</a> is the same architecture —
+one state object, changed only by dispatching actions to a pure function.</p>
+
+<p>So the honest question is not "how do I use Redux", it is "what does Redux give me that the
+reducer-in-a-context does not, and is that worth a dependency". This post answers both, using an
+application that made the decision <em>both ways on purpose</em>: the pizza app runs its customer
+pages on Context and its admin dashboard on Redux.</p>
+
+<h2>Redux Toolkit, not classic Redux</h2>
+
+<p>If you have seen Redux before and remember action-type constants, hand-written action creators,
+<code>applyMeddleware</code>, <code>combineReducers</code> and a great deal of ceremony — that is
+classic Redux and nobody writes it any more. <strong>Redux Toolkit is the official way to use
+Redux</strong>, and it is a different experience.</p>
+
+<pre class="language-bash"><code class="language-bash">npm install @reduxjs/toolkit react-redux</code></pre>
+
+<h2>A slice</h2>
+
+<p>A slice is the initial state, the reducers, and the action creators, generated together:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface OrdersState {
+  items: Order[];
+  page: number;
+  totalPages: number;
+  /** Which statuses to show. Empty means everything. */
+  statusFilter: OrderStatus[];
+  loading: boolean;
+  error: string | null;
+}
+
+const initialState: OrdersState = {
+  items: [], page: 0, totalPages: 1, statusFilter: [], loading: false, error: null,
+};
+
+const ordersSlice = createSlice({
+  name: 'orders',
+  initialState,
+  reducers: {
+    pageChanged(state, action: PayloadAction&lt;number&gt;) {
+      state.page = action.payload;
+    },
+
+    /** Toggle one status in or out of the filter. */
+    statusFilterToggled(state, action: PayloadAction&lt;OrderStatus&gt;) {
+      const status = action.payload;
+      state.statusFilter = state.statusFilter.includes(status)
+        ? state.statusFilter.filter((s) =&gt; s !== status)
+        : [...state.statusFilter, status];
+    },
+
+    statusFilterCleared(state) {
+      state.statusFilter = [];
+    },
+  },
+});
+
+export const { pageChanged, statusFilterToggled, statusFilterCleared } = ordersSlice.actions;
+export const ordersReducer = ordersSlice.reducer;</code></pre>
+
+<p><code>createSlice</code> generated <code>pageChanged</code>, <code>statusFilterToggled</code> and
+<code>statusFilterCleared</code> as action creators, along with their type strings
+(<code>'orders/pageChanged'</code>). In classic Redux you wrote all three by hand and kept them in
+sync.</p>
+
+<h3>That mutation is not a mutation</h3>
+
+<p><code>state.page = action.payload</code> would be a bug in a plain React reducer. It is correct
+here because Redux Toolkit runs every reducer through
+<a href="https://immerjs.github.io/immer/" rel="nofollow">Immer</a>, which records writes against a
+draft and produces a new immutable object from them. The rule that state is never mutated still
+holds — Immer is doing the copying for you.</p>
+
+<p>This is the single biggest ergonomic difference from a hand-written reducer. Compare updating one
+item in a list:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// Plain React reducer — you write the copy.
+return {
+  ...state,
+  items: state.items.map((item) =&gt;
+    item.lineId === action.payload.lineId ? { ...item, quantity: action.payload.quantity } : item,
+  ),
+};
+
+// Redux Toolkit — Immer writes it for you.
+const item = state.items.find((i) =&gt; i.id === action.payload.id);
+if (item) item.quantity = action.payload.quantity;</code></pre>
+
+<p>Deeply nested state is where this stops being cosmetic and starts saving real pain.</p>
+
+<h2>Async: createAsyncThunk</h2>
+
+<p>A reducer must be pure, so it cannot make a request. A thunk is an action creator that returns a
+function instead of an object, which gives it somewhere to do async work:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const fetchOrders = createAsyncThunk(
+  'orders/fetch',
+  async (page: number) =&gt; adminApi.listOrders(page, 20),
+);
+
+export const changeOrderStatus = createAsyncThunk(
+  'orders/changeStatus',
+  async ({ id, status }: { id: UUID; status: OrderStatus }) =&gt;
+    adminApi.updateOrderStatus(id, status),
+);</code></pre>
+
+<p><code>createAsyncThunk</code> dispatches three actions on your behalf —
+<code>pending</code>, <code>fulfilled</code> and <code>rejected</code> — which you handle in
+<code>extraReducers</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">extraReducers: (builder) =&gt; {
+  builder
+    .addCase(fetchOrders.pending, (state) =&gt; {
+      state.loading = true;
+      state.error = null;
+    })
+    .addCase(fetchOrders.fulfilled, (state, action) =&gt; {
+      state.loading = false;
+      state.items = action.payload.content;
+      state.totalPages = action.payload.totalPages;
+    })
+    .addCase(fetchOrders.rejected, (state, action) =&gt; {
+      state.loading = false;
+      state.error = action.error.message ?? 'Could not load orders.';
+    })
+    /*
+     * Patch the one row that changed rather than refetching the page. The server returns the
+     * updated order, so the list can be kept in step without a second round trip.
+     */
+    .addCase(changeOrderStatus.fulfilled, (state, action) =&gt; {
+      const updated = action.payload;
+      state.items = state.items.map((order) =&gt; (order.id === updated.id ? updated : order));
+    });
+},</code></pre>
+
+<p>That loading/error/data triple is exactly what <code>MenuContext</code> writes out by hand on the
+customer side. Here it comes with the thunk.</p>
+
+<p><code>extraReducers</code> also lets a slice respond to actions it did not define, which is how
+two slices react to the same event without importing each other.</p>
+
+<h2>The store</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export const store = configureStore({
+  reducer: {
+    catalog: catalogReducer,
+    orders: ordersReducer,
+    reports: reportsReducer,
+    users: usersReducer,
+  },
+});
+
+/*
+ * Types derived FROM the store rather than declared alongside it, so they can never drift out of
+ * step with the reducers above. Add a slice and RootState grows automatically.
+ */
+export type RootState = ReturnType&lt;typeof store.getState&gt;;
+export type AppDispatch = typeof store.dispatch;
+
+export const useAppDispatch = useDispatch.withTypes&lt;AppDispatch&gt;();
+export const useAppSelector = useSelector.withTypes&lt;RootState&gt;();</code></pre>
+
+<p><code>configureStore</code> already wires in redux-thunk, the Redux DevTools connection, and — in
+development only — checks that shout if you mutate state outside a reducer or put something
+non-serialisable (a <code>Date</code>, a promise, a class instance) into the store. Classic Redux
+needed <code>applyMiddleware</code> and <code>composeEnhancers</code> by hand for the same result.</p>
+
+<p>Those last two lines are worth copying verbatim into any project. Components import
+<code>useAppSelector</code> and <code>useAppDispatch</code> instead of the raw hooks, so state is
+typed with no generic at the call site and dispatching a thunk typechecks — the plain
+<code>Dispatch</code> type does not know thunks are dispatchable.</p>
+
+<h2>Using it in a component</h2>
+
+<pre class="language-tsx"><code class="language-tsx">export default function AdminOrdersPage() {
+  const { showToast } = useToast();
+
+  /*
+   * REDUX CONCEPT: useSelector subscribes; useDispatch does not.
+   *
+   * This component re-renders when the slice it selects changes, and NOT when an unrelated slice
+   * does. Compare the six useState calls this replaced — the same state, but scattered across the
+   * component and gone the moment it unmounted.
+   */
+  const dispatch = useAppDispatch();
+  const { items: orders, page, totalPages, loading, error } = useAppSelector(selectOrdersState);
+
+  useEffect(() =&gt; {
+    void dispatch(fetchOrders(page));
+  }, [dispatch, page]);
+
+  async function changeStatus(order: Order, status: OrderStatus) {
+    /*
+     * `unwrap()` re-throws the thunk's rejection so this can be written as a normal try/catch.
+     * Without it, dispatch RESOLVES even for a rejected thunk — it hands back the action object —
+     * and the catch below would never run, silently reporting failures as successes.
+     */
+    try {
+      await dispatch(changeOrderStatus({ id: order.id, status })).unwrap();
+      showToast(`Order moved to ${status.replace('_', ' ').toLowerCase()}`);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Could not update the order', 'danger');
+    }
+  }
+  /* … */
+}</code></pre>
+
+<p>That <code>.unwrap()</code> note is worth remembering. <code>dispatch(thunk())</code> returns a
+promise that <strong>resolves</strong> even when the thunk failed — it hands back the action object,
+rejection and all. A <code>try/catch</code> without <code>unwrap()</code> never fires, and every
+failure is reported to the user as a success.</p>
+
+<h2>Selectors</h2>
+
+<p>A selector is a plain function from state to the part a component wants:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const selectOrdersState = (state: { orders: OrdersState }) =&gt; state.orders;
+
+export function selectVisibleOrders(state: { orders: OrdersState }): Order[] {
+  const { items, statusFilter } = state.orders;
+  if (statusFilter.length === 0) return items;
+  return items.filter((order) =&gt; statusFilter.includes(order.status));
+}</code></pre>
+
+<p>Two reasons to write them rather than reaching into state inline. The state <em>shape</em> stays
+private to the slice file, so renaming a field touches one file. And derived data is derived rather
+than stored — <code>selectVisibleOrders</code> filters on read, so a filtered list can never go stale
+against the list it came from. Same reasoning as
+<a href="/react/react-usememo-usecallback">useMemo</a>, without a store.</p>
+
+<p>One caveat: a selector that builds a new array or object returns a new reference every call, which
+defeats <code>useSelector</code>'s reference check and re-renders every time. For cheap filters that
+is fine; for expensive ones, memoise with <code>createSelector</code> from Redux Toolkit.</p>
+
+<h2>Where the Provider goes — and why it matters here</h2>
+
+<p>Most tutorials put <code>&lt;Provider store={store}&gt;</code> in <code>main.tsx</code> around the
+whole app. This one deliberately does not:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export default function AdminLayout() {
+  return (
+    &lt;Provider store={store}&gt;
+      &lt;Container className="py-4"&gt;
+        &lt;h1 className="h3 fw-bold mb-1"&gt;Admin&lt;/h1&gt;
+        {/* … tabs … */}
+        &lt;Outlet /&gt;
+      &lt;/Container&gt;
+    &lt;/Provider&gt;
+  );
+}</code></pre>
+
+<p>The provider wraps only the admin subtree, and that placement does two jobs.</p>
+
+<p><strong>It enforces the architecture.</strong> Customer-facing pages run on Context and cannot
+reach this store even by accident. "Redux for admin, Context for customers" is guaranteed by the
+component tree rather than by everyone remembering the convention.</p>
+
+<p><strong>It keeps Redux out of the main bundle.</strong> <code>AdminLayout</code> is behind
+<a href="/react/react-lazy-suspense"><code>lazy()</code></a>, so Redux, the four slices and their
+thunks are all pulled into the admin chunk. The customers who only ever order a pizza download none
+of it.</p>
+
+<h2>What Redux actually bought, in this app</h2>
+
+<p>Three concrete things, none of which are "it is the standard".</p>
+
+<h3>1. State that outlives the component</h3>
+
+<p>This is the strongest one. The reports dashboard used to hold its data in
+<code>useState</code>, so switching to the Products tab and back threw the report away and refetched
+it — a visible spinner, every time:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface ReportsState {
+  /** Keyed by the day-range, because 7/30/90 are three different reports, not one changing one. */
+  byRange: Record&lt;number, ReportDashboard&gt;;
+  days: number;
+  loading: boolean;
+  error: string | null;
+}</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">.addCase(fetchDashboard.fulfilled, (state, action) =&gt; {
+  state.loading = false;
+  // action.meta.arg is the argument the thunk was dispatched with — here, the range. Without
+  // it a slow 90-day response could land after the user switched to 7 and be filed wrongly.
+  state.byRange[action.meta.arg] = action.payload;
+})</code></pre>
+
+<p>Store state is not owned by a component, so unmounting the page does not discard it and the tab
+comes back instantly. You can build the same cache with a context provider mounted above the
+tabs — but note that you would then be building a cache, which is precisely the work Redux is saving
+you.</p>
+
+<p><code>action.meta.arg</code> is a small gem: it is the argument the thunk was dispatched with, so
+a slow 90-day response arriving after the user switched to 7 days is filed under 90 rather than
+overwriting the visible report.</p>
+
+<h3>2. Cross-screen consistency</h3>
+
+<p>Products, toppings and crusts share one slice, even though each has its own tab:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/*
+ * REDUX CONCEPT: slice boundaries follow the DOMAIN, not the screen
+ *
+ * Products, toppings and crusts get one slice between them, even though they have a tab each.
+ * They are one thing — the menu — and they change together: adding a topping should be visible to
+ * the product editor without either page knowing the other exists.
+ */</code></pre>
+
+<h3>3. DevTools</h3>
+
+<p>The Redux DevTools extension gives you every dispatched action with its payload, a diff of the
+state it produced, and the ability to step backwards through them. When a report disagrees with the
+orders table, that log is the fastest way to find out why. React DevTools has nothing equivalent —
+you can inspect current state, not the sequence that produced it.</p>
+
+<p>Whether that is worth a dependency depends entirely on how often you are debugging state, which
+is a question about your application, not about Redux.</p>
+
+<h2>What it cost</h2>
+
+<ul>
+  <li><strong>Two dependencies</strong>, and Redux's own dev-mode serialisability checks to satisfy.</li>
+  <li><strong>Indirection.</strong> Following a click now means component → action → thunk → reducer
+      → selector → component. Every hop is justified; there are still six of them.</li>
+  <li><strong>Rejections must be serialisable.</strong> This one caught the app out: Redux Toolkit
+      runs a thrown Error through <code>miniSerializeError</code>, which keeps <code>name</code>,
+      <code>message</code> and <code>stack</code> and discards everything else — including the
+      structured API body needed to put "already registered" underneath the right input. Failures
+      have to be flattened at the edge:</li>
+</ul>
+
+<pre class="language-typescript"><code class="language-typescript">/** A request failure, flattened into something safe to put in a Redux action. */
+export interface ApiFailure {
+  message: string;
+  /** Empty unless the server returned field-level validation errors. */
+  fieldErrors: Record&lt;string, string&gt;;
+}
+
+export function toApiFailure(err: unknown, fallback: string): ApiFailure {
+  if (err instanceof ApiError) {
+    return { message: err.message, fieldErrors: err.fieldErrors() };
+  }
+  return { message: err instanceof Error ? err.message : fallback, fieldErrors: {} };
+}</code></pre>
+
+<p>That file exists purely because Redux requires serialisable actions. It is not a large price, but
+it is a real one, and it is the kind of thing tutorials never mention.</p>
+
+<h2>Context + useReducer, or Redux?</h2>
+
+<table>
+  <thead>
+    <tr><th></th><th>Context + useReducer</th><th>Redux Toolkit</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Dependencies</td><td>none</td><td>two</td></tr>
+    <tr><td>Immutable updates</td><td>you write the spreads</td><td>Immer writes them</td></tr>
+    <tr><td>Async</td><td>an effect you write</td><td><code>createAsyncThunk</code></td></tr>
+    <tr><td>Survives unmount</td><td>only if the provider is above it</td><td>always</td></tr>
+    <tr><td>Re-render control</td><td>split contexts by hand</td><td>per-selector, automatic</td></tr>
+    <tr><td>Time-travel debugging</td><td>no</td><td>yes</td></tr>
+    <tr><td>Code to read</td><td>one file</td><td>slice + store + selectors</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Start with Context and useReducer.</strong> It is free, it is already in React, and for a
+great many applications it is where the story ends — this app's cart, auth, menu and toasts have
+never needed anything more.</p>
+
+<p><strong>Reach for Redux when</strong> state must outlive the components that show it, when several
+screens genuinely share and mutate the same data, when async flows get complex enough that you want
+them modelled rather than improvised, or when you are debugging state often enough that DevTools
+would pay for itself.</p>
+
+<p><strong>Do not reach for it because</strong> the app is "big", or because a job advert mentioned
+it. Size is not the signal; shared, long-lived, asynchronously-updated state is.</p>
+
+<h3>And consider the other answers</h3>
+
+<p>A lot of what people historically put in Redux was server data, and server data has better tools
+now. <a href="https://tanstack.com/query" rel="nofollow">TanStack Query</a> or Redux Toolkit's own
+<strong>RTK Query</strong> handle caching, deduplication, retries and revalidation properly, and
+between them remove most of the reason a store existed. For genuinely client-side state that is not
+worth a store, <a href="https://zustand.docs.pmnd.rs" rel="nofollow">Zustand</a> is a much smaller
+option.</p>
+
+<p>Redux is a good tool that spent a decade being used for problems it was not the best answer to.
+Knowing when not to use it is most of knowing how to use it.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-lifecycle">The Component Lifecycle with useEffect</a>.</p>

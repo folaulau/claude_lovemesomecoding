@@ -1,0 +1,244 @@
+<p>Props flow down one level at a time. When a value is needed six levels down, every component in
+between has to accept it and pass it on, whether or not it cares. That is <strong>prop
+drilling</strong>, and context is the way out.</p>
+
+<h2>The problem, concretely</h2>
+
+<p>The cart badge in the navbar needs the number of items in the cart. So does the cart drawer, the
+menu page, and checkout. Those components are nowhere near each other:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">App
+├── AppNavbar          ← needs the item count
+├── Routes
+│   ├── MenuPage
+│   │   └── PizzaBuilderModal   ← needs to ADD to the cart
+│   └── CheckoutPage            ← needs the whole cart
+└── CartDrawer                  ← needs the whole cart</code></pre>
+
+<p>Without context, the cart would have to live in <code>App</code> and be passed to every one of
+those, through <code>Routes</code> and any other component in the way. Adding a field to the cart
+would mean editing five files that do not use it.</p>
+
+<h2>Three pieces</h2>
+
+<p>Context is always the same three things: create it, provide it, consume it.</p>
+
+<pre class="language-tsx"><code class="language-tsx">// 1. Create — outside any component, usually in its own file.
+const CartContext = createContext&lt;CartContextValue | undefined&gt;(undefined);
+
+// 2. Provide — a component that owns the state and publishes it.
+export function CartProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(cartReducer, initialState);
+  const value = { /* … */ };
+  return &lt;CartContext.Provider value={value}&gt;{children}&lt;/CartContext.Provider&gt;;
+}
+
+// 3. Consume — anywhere below the provider.
+const { totals } = useContext(CartContext);</code></pre>
+
+<p>The provider is mounted once, near the top:</p>
+
+<pre class="language-tsx"><code class="language-tsx">createRoot(document.getElementById('root')!).render(
+  &lt;StrictMode&gt;
+    &lt;BrowserRouter&gt;
+      &lt;AuthProvider&gt;
+        &lt;MenuProvider&gt;
+          &lt;CartProvider&gt;
+            &lt;ToastProvider&gt;
+              &lt;App /&gt;
+            &lt;/ToastProvider&gt;
+          &lt;/CartProvider&gt;
+        &lt;/MenuProvider&gt;
+      &lt;/AuthProvider&gt;
+    &lt;/BrowserRouter&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+<p>Now the navbar reads the cart directly, no matter how deep it sits:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function AppNavbar({ onOpenCart }: { onOpenCart: () =&gt; void }) {
+  const { totals } = useCart();
+  const { user, isAuthenticated, isAdmin, logout } = useAuth();
+
+  return (
+    /* … */
+    &lt;Button variant="primary" onClick={onOpenCart} aria-label={`Open cart, ${totals.itemCount} items`}&gt;
+      Cart
+      {totals.itemCount &gt; 0 &amp;&amp; (
+        &lt;Badge bg="light" text="dark" pill className="cart-badge"&gt;
+          {totals.itemCount}
+        &lt;/Badge&gt;
+      )}
+    &lt;/Button&gt;
+  );
+}</code></pre>
+
+<h2>The undefined default, and why</h2>
+
+<p><code>createContext</code> takes a default, used when a component reads the context with no
+provider above it. It is tempting to supply a sensible-looking empty cart. Do not:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Tempting, and wrong: a component outside the provider silently gets an empty cart that
+// never updates, and you debug the symptom instead of the cause.
+const CartContext = createContext&lt;CartContextValue&gt;({ items: [], totals: emptyTotals, /* … */ });
+
+// `undefined` as the default is deliberate: it lets the useCart hook below detect a component
+// rendered outside the provider and throw a clear error.
+const CartContext = createContext&lt;CartContextValue | undefined&gt;(undefined);</code></pre>
+
+<p>Then the guard lives in one place, and the error names the actual problem:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function useCart(): CartContextValue {
+  const context = useContext(CartContext);
+  if (context === undefined) {
+    throw new Error('useCart must be used inside a &lt;CartProvider&gt;');
+  }
+  return context;
+}</code></pre>
+
+<p>That wrapper is a <a href="/react/react-custom-hooks">custom hook</a>, and it does three jobs at
+once: it hides the context object so nothing else imports it, it removes the
+<code>| undefined</code> from the type so consumers need no null check, and it produces a useful
+message instead of <em>"cannot read properties of undefined"</em>. Write it every time.</p>
+
+<h2>The provider owns the state</h2>
+
+<p>A context does not hold state — it distributes it. Something has to own it, and that is the
+provider component. Here is the menu one, which fetches from the API and shares the result:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function MenuProvider({ children }: { children: ReactNode }) {
+  const [products, setProducts] = useState&lt;Product[]&gt;([]);
+  const [toppings, setToppings] = useState&lt;Topping[]&gt;([]);
+  const [crusts, setCrusts] = useState&lt;Crust[]&gt;([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+  const [reloadToken, setReloadToken] = useState(0);
+
+  const reload = useCallback(() =&gt; setReloadToken((n) =&gt; n + 1), []);
+
+  useEffect(() =&gt; {
+    /* … fetch products, toppings and crusts … */
+  }, [reloadToken]);
+
+  // Derived lists, recomputed only when products actually change.
+  const pizzas = useMemo(() =&gt; products.filter((p) =&gt; p.type === 'PIZZA'), [products]);
+  const drinks = useMemo(() =&gt; products.filter((p) =&gt; p.type === 'DRINK'), [products]);
+
+  const value = useMemo&lt;MenuContextValue&gt;(
+    () =&gt; ({ products, pizzas, drinks, toppings, crusts, loading, error, reload }),
+    [products, pizzas, drinks, toppings, crusts, loading, error, reload],
+  );
+
+  return &lt;MenuContext.Provider value={value}&gt;{children}&lt;/MenuContext.Provider&gt;;
+}</code></pre>
+
+<p>The value being shared is not just data — it includes <code>loading</code>, <code>error</code> and
+a <code>reload</code> function. That is the point: the provider publishes a small API, and consumers
+never know there is an HTTP request behind it.</p>
+
+<p>It also means the menu is fetched <strong>once</strong>. Three components mounting would otherwise
+mean three identical round trips.</p>
+
+<h2>Split contexts by how often they change</h2>
+
+<p>This app has four providers rather than one, and that is deliberate:</p>
+
+<table>
+  <thead>
+    <tr><th>Context</th><th>Holds</th><th>Changes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>AuthContext</code></td><td>the signed-in user</td><td>rarely — sign in, sign out</td></tr>
+    <tr><td><code>MenuContext</code></td><td>the catalogue</td><td>once, on load</td></tr>
+    <tr><td><code>CartContext</code></td><td>the basket</td><td>constantly</td></tr>
+    <tr><td><code>ToastContext</code></td><td>notifications</td><td>constantly, briefly</td></tr>
+  </tbody>
+</table>
+
+<p>Every component reading a context re-renders when that context's value changes. One big
+<code>AppContext</code> would mean every cart click re-rendering everything that only cares who is
+signed in. Splitting by update frequency is the standard fix, and it costs nothing.</p>
+
+<h2>The re-render trap</h2>
+
+<p>Here is the mistake that makes people conclude context is slow:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// WRONG. A brand-new object every render, so every consumer re-renders every time —
+// even when nothing they read has changed.
+return (
+  &lt;CartContext.Provider value={{ items, totals, addItem, removeItem }}&gt;
+    {children}
+  &lt;/CartContext.Provider&gt;
+);</code></pre>
+
+<p>Context compares the value by reference. An object literal in the JSX is a new reference on every
+render of the provider, so every consumer sees a change. The fix is
+<a href="/react/react-usememo-usecallback">useMemo</a> around the value, and
+<code>useCallback</code> around each function in it:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const addItem = useCallback((input: AddItemInput) =&gt; {
+  dispatch({ type: 'ADD_ITEM', payload: { /* … */ } });
+}, []);
+
+const removeItem = useCallback((lineId: string) =&gt; {
+  dispatch({ type: 'REMOVE_ITEM', payload: { lineId } });
+}, []);
+
+const value = useMemo&lt;CartContextValue&gt;(
+  () =&gt; ({
+    items: state.items,
+    orderType: state.orderType,
+    totals: calculateTotals(state.items, state.orderType),
+    addItem,
+    removeItem,
+    setQuantity,
+    setOrderType,
+    clear,
+    hydrated,
+  }),
+  [state.items, state.orderType, addItem, removeItem, setQuantity, setOrderType, clear, hydrated],
+);</code></pre>
+
+<p>The <code>useCallback</code> calls have empty dependency arrays because they only ever call
+<code>dispatch</code>, which React guarantees is stable. That is one of the quieter advantages of
+<a href="/react/react-usereducer">useReducer</a> over <code>useState</code> in a provider.</p>
+
+<h2>One provider consuming another</h2>
+
+<p>Providers can use each other's contexts, and then nesting order stops being cosmetic.
+<code>CartProvider</code> calls <code>useMenu()</code> — a saved cart line stores only ids, so
+re-pricing it needs the catalogue:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function CartProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(cartReducer, initialState);
+
+  // The catalogue is needed to rebuild a saved line's base price and crust surcharge.
+  const { products, crusts, loading: menuLoading } = useMenu();
+  /* … */
+}</code></pre>
+
+<p>So <code>CartProvider</code> must be <em>inside</em> <code>MenuProvider</code>. Swap them and the
+app throws <em>"useMenu must be used inside a &lt;MenuProvider&gt;"</em> at startup — which, thanks
+to the guard, tells you precisely what is wrong.</p>
+
+<h2>What context is not for</h2>
+
+<p>Not everything shared belongs in context. Whether the cart drawer is open is needed by exactly two
+components, and it is <a href="/react/react-state">lifted into <code>App</code></a> as ordinary state
+instead:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// The drawer's open/closed state lives here because both the navbar (which opens it) and the
+// drawer itself need it. The cart CONTENTS are in context; this piece of purely-visual state
+// is not worth putting there.
+const [cartOpen, setCartOpen] = useState(false);</code></pre>
+
+<p>Reach for context when passing a prop down would mean threading it through components that do not
+use it. Two levels is not prop drilling; it is just props.</p>
+
+<p>Context is also not a data-fetching library. <code>MenuContext</code> does it by hand because
+doing it once by hand is worth seeing — but caching, retries, revalidation and deduplication are what
+TanStack Query exists for, and past a certain point you want that rather than more providers.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-usereducer">useReducer</a> — how the cart provider manages its state.</p>
