@@ -1,0 +1,238 @@
+<p>Three tools that do the same job — skip work when nothing relevant changed — at three different
+levels. They are also the three most misused features in React, because they look like free
+performance and are not.</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Caches</th><th>Skips</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>useMemo</code></td><td>a computed <strong>value</strong></td><td>recalculating it</td></tr>
+    <tr><td><code>useCallback</code></td><td>a <strong>function</strong></td><td>recreating it</td></tr>
+    <tr><td><code>memo</code></td><td>a <strong>component's output</strong></td><td>re-rendering it</td></tr>
+  </tbody>
+</table>
+
+<p>All three compare dependencies with <code>Object.is</code> — reference equality. Understanding
+that one fact explains every case where they silently do nothing.</p>
+
+<h2>Start here: they are not free</h2>
+
+<p>Each one costs a comparison on every render, plus memory to hold the cached value, plus a line of
+code and a dependency array that can go wrong. Wrapping everything makes an app slower and harder to
+read.</p>
+
+<p>The default is <strong>no memoisation</strong>. Add it when you have a reason.</p>
+
+<h2>useMemo</h2>
+
+<p>Caches the result of a calculation between renders:</p>
+
+<pre class="language-tsx"><code class="language-tsx">/*
+ * REACT CONCEPT: useMemo
+ * Recompute the filtered list only when the filter or the data changes — not on every re-render
+ * caused by opening the modal or the cart drawer.
+ */
+const visibleProducts = useMemo(() =&gt; {
+  if (activeFilter === 'ALL') return products;
+  return products.filter((product) =&gt; product.type === activeFilter);
+}, [activeFilter, products]);</code></pre>
+
+<p>Three good reasons to reach for it:</p>
+
+<h3>1. The calculation is genuinely expensive</h3>
+
+<p>Sorting or filtering thousands of rows, parsing something large, a heavy reduce. Fourteen pizzas
+is not expensive — that example is here because it feeds a <code>memo</code>'d child, which is reason
+three.</p>
+
+<h3>2. The result is a dependency of something else</h3>
+
+<p>This is the one people miss. An object or array created during render is a new reference every
+time, so any effect or memo depending on it re-runs every render:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// `options` is a new object every render → the effect runs every render → probably a loop.
+const options = { page, size: 20 };
+useEffect(() =&gt; { void load(options); }, [options]);
+
+// Stable across renders unless `page` changes.
+const options = useMemo(() =&gt; ({ page, size: 20 }), [page]);</code></pre>
+
+<h3>3. It is a context value</h3>
+
+<p>A context value is compared by reference, so an object literal in the provider's JSX re-renders
+every consumer on every render of the provider. This is the single most valuable place to use
+<code>useMemo</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const value = useMemo&lt;CartContextValue&gt;(
+  () =&gt; ({
+    items: state.items,
+    orderType: state.orderType,
+    totals: calculateTotals(state.items, state.orderType),
+    addItem,
+    removeItem,
+    setQuantity,
+    setOrderType,
+    clear,
+    hydrated,
+  }),
+  [state.items, state.orderType, addItem, removeItem, setQuantity, setOrderType, clear, hydrated],
+);
+
+return &lt;CartContext.Provider value={value}&gt;{children}&lt;/CartContext.Provider&gt;;</code></pre>
+
+<p>Note that the totals are <em>derived</em> here rather than stored in state — no
+<code>useState</code>, no effect keeping them in sync. That is the important habit;
+<code>useMemo</code> is just what makes deriving cheap.</p>
+
+<h2>useCallback</h2>
+
+<p><code>useCallback(fn, deps)</code> is <code>useMemo(() =&gt; fn, deps)</code>. It caches a function
+rather than a value, and there is exactly one reason to use it: <strong>something downstream compares
+that function by reference.</strong></p>
+
+<pre class="language-tsx"><code class="language-tsx">/*
+ * REACT CONCEPT: useCallback
+ * ProductCard is wrapped in React.memo, which compares props by reference. Passing an inline
+ * arrow here would create a brand-new function on every render, so every card would see a
+ * "changed" prop and re-render — memo would do nothing but waste a comparison.
+ */
+const handleSelect = useCallback((product: Product) =&gt; {
+  setSelectedProduct(product);
+}, []);</code></pre>
+
+<p>Remove that <code>useCallback</code> and the <code>memo</code> on <code>ProductCard</code> stops
+working entirely. They are a pair; neither is useful alone.</p>
+
+<p>The other case is a function inside a context value, for the same reason:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const removeItem = useCallback((lineId: string) =&gt; {
+  dispatch({ type: 'REMOVE_ITEM', payload: { lineId } });
+}, []);
+
+const setQuantity = useCallback((lineId: string, quantity: number) =&gt; {
+  dispatch({ type: 'SET_QUANTITY', payload: { lineId, quantity } });
+}, []);</code></pre>
+
+<p>Those empty dependency arrays are correct, not lazy: the functions read nothing but
+<code>dispatch</code>, which React guarantees never changes. That stability is a quiet advantage of
+<a href="/react/react-usereducer">useReducer</a> in a provider — <code>useState</code> setters are
+stable too, but derived values built from state are not.</p>
+
+<p><strong>Wrapping a handler that is passed to a plain DOM element does nothing.</strong>
+<code>&lt;button onClick={…}&gt;</code> does not compare anything. This is wasted:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Pointless. Nothing downstream cares about this function's identity.
+const handleClick = useCallback(() =&gt; setOpen(true), []);
+return &lt;button onClick={handleClick}&gt;Open&lt;/button&gt;;</code></pre>
+
+<h2>memo</h2>
+
+<p>Wraps a component so React skips re-rendering it when its props are shallowly equal to last
+time:</p>
+
+<pre class="language-tsx"><code class="language-tsx">/*
+ * REACT CONCEPT: React.memo
+ *
+ * memo skips re-rendering a component when its props are unchanged (compared shallowly).
+ *
+ * It matters here because the menu renders 14 of these. Without memo, opening the cart drawer —
+ * which changes state in a PARENT — would re-render all 14 cards even though not one of their
+ * props changed.
+ *
+ * memo only works if the props are referentially stable. That is exactly why `onSelect` is
+ * wrapped in useCallback by the parent: an inline arrow function would be a new object on every
+ * render and memo would never hit.
+ *
+ * Do not reach for memo by default. It costs a comparison on every render and is only worth it
+ * for components that are numerous, expensive, or both.
+ */
+export const ProductCard = memo(function ProductCard({ product, onSelect }: Props) {
+  const cheapest = Math.min(...product.sizes.map((s) =&gt; s.price));
+  const isPizza = product.type === 'PIZZA';
+
+  return (
+    &lt;Card className="product-card"&gt;
+      {/* … */}
+    &lt;/Card&gt;
+  );
+});</code></pre>
+
+<p>Note the named function inside <code>memo(…)</code>. An anonymous arrow works but shows up as
+<em>Anonymous</em> in React DevTools and in stack traces, which you will regret.</p>
+
+<h3>The three ways memo silently does nothing</h3>
+
+<p>All three are the same mistake — a prop that is a new reference every render:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// 1. An inline arrow.
+&lt;ProductCard product={product} onSelect={(p) =&gt; setSelected(p)} /&gt;
+
+// 2. An object literal.
+&lt;ProductCard product={product} options={{ compact: true }} /&gt;
+
+// 3. An array or JSX built during render.
+&lt;ProductCard product={product} badges={product.tags.map(toBadge)} /&gt;</code></pre>
+
+<p>In each case the comparison fails every time, so <code>memo</code> does nothing but add a
+comparison. Fix the props first; the <code>memo</code> is the last step, not the first.</p>
+
+<h3>When memo is worth it</h3>
+
+<p>Numerous, expensive, or both — and re-rendering for reasons that have nothing to do with them.
+<code>ProductCard</code> qualifies on the first and third: fourteen of them, and opening the cart
+drawer changes state in a shared ancestor.</p>
+
+<p>A component that renders once, or whose props change whenever its parent does, gains nothing.</p>
+
+<h3>Composition is often the better fix</h3>
+
+<p>Before reaching for <code>memo</code>, check whether the state can move down instead. A parent
+re-rendering its whole tree because of one piece of local state is a structural problem, and moving
+that state into the component that uses it — or wrapping the expensive part so it is passed as
+<code>children</code> rather than re-created — solves it with no memoisation at all.</p>
+
+<h2>Dependency arrays</h2>
+
+<p>Same rules as <a href="/react/react-lifecycle">useEffect</a>. List every reactive value the
+callback reads, and let the <code>react-hooks/exhaustive-deps</code> rule check you.</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Missing dependency: the memo keeps the FIRST filter's results forever.
+const visible = useMemo(() =&gt; products.filter((p) =&gt; p.type === activeFilter), [products]);
+
+// Correct.
+const visible = useMemo(
+  () =&gt; products.filter((p) =&gt; p.type === activeFilter),
+  [products, activeFilter],
+);</code></pre>
+
+<p>Under-listing produces stale values. Over-listing — or listing something recreated every render —
+means the memo never hits, which is merely wasteful. Neither is what you wanted.</p>
+
+<h2>The React Compiler</h2>
+
+<p>React ships an optional compiler that memoises components and values automatically, by
+understanding what actually depends on what. Where it is enabled, hand-written
+<code>useMemo</code>/<code>useCallback</code>/<code>memo</code> largely stop being necessary.</p>
+
+<p>Two reasons to still learn this:</p>
+
+<ul>
+  <li>Most existing codebases are full of it, and you have to be able to read them.</li>
+  <li>The compiler relies on your components being <a href="/react/react-components">pure</a> and
+      your state being <a href="/react/react-update-state">immutable</a>. Understanding why
+      reference equality matters is exactly what those rules are about.</li>
+</ul>
+
+<h2>Measure first</h2>
+
+<p>Everything above is an optimisation, and optimisations applied without measurement usually cost
+more than they save. Open the React DevTools Profiler, record the interaction that feels slow, and
+look at what actually re-rendered and how long it took. Then fix that.</p>
+
+<p>In practice the biggest wins are usually not memoisation at all: a list that should be paginated,
+an image that should be smaller, a bundle that should be split. Which is the next post.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-lazy-suspense">Code Splitting with lazy and Suspense</a>.</p>

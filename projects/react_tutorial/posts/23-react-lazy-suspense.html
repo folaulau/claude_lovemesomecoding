@@ -1,0 +1,188 @@
+<p>Everything imported at the top of your application ends up in the bundle every visitor downloads —
+including the screens most of them will never open. <code>lazy</code> and <code>Suspense</code> are
+how you stop that.</p>
+
+<h2>The problem, measured</h2>
+
+<p>The pizza app has six admin screens: reports with charts, and CRUD pages for products, toppings,
+crusts, orders and users. They are reachable only by an administrator. In a shop, that is a handful
+of people out of every thousand visitors.</p>
+
+<p>Imported normally, all of it — plus the charting library, plus Redux and its four slices — lands
+in the bundle that every customer downloads before they can look at a pizza.</p>
+
+<h2>lazy</h2>
+
+<pre class="language-tsx"><code class="language-tsx">/*
+ * REACT CONCEPT: lazy + Suspense (code splitting)
+ *
+ * React.lazy turns this import into a separate bundle that is fetched only when the route is
+ * first visited. Customers — the overwhelming majority of visitors — never open /admin, so its
+ * code should not be part of the JavaScript everyone downloads on the home page.
+ *
+ * Because the import is asynchronous, React needs something to show while it is in flight: that
+ * is what the &lt;Suspense fallback&gt; below provides.
+ *
+ * The lazily-imported module must have a DEFAULT export.
+ */
+const AdminLayout = lazy(() =&gt; import('./pages/admin/AdminLayout'));
+const AdminReportsPage = lazy(() =&gt; import('./pages/admin/AdminReportsPage'));
+const AdminProductsPage = lazy(() =&gt; import('./pages/admin/AdminProductsPage'));
+const AdminToppingsPage = lazy(() =&gt; import('./pages/admin/AdminToppingsPage'));
+const AdminCrustsPage = lazy(() =&gt; import('./pages/admin/AdminCrustsPage'));
+const AdminOrdersPage = lazy(() =&gt; import('./pages/admin/AdminOrdersPage'));
+const AdminUsersPage = lazy(() =&gt; import('./pages/admin/AdminUsersPage'));</code></pre>
+
+<p><code>lazy</code> takes a function that returns a dynamic <code>import()</code>. That import is a
+promise, and the bundler treats it as a split point: everything reachable from it goes into a
+separate file, fetched the first time the component renders.</p>
+
+<p>Two rules that will bite you:</p>
+
+<p><strong>The module must have a default export.</strong> This project uses named exports
+everywhere else; the admin pages are the deliberate exception:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// Every lazily-loaded page ends with this, and it is the reason why.
+export default function AdminLayout() { /* … */ }</code></pre>
+
+<p>If you would rather keep named exports, adapt in the import:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const AdminLayout = lazy(() =&gt;
+  import('./pages/admin/AdminLayout').then((m) =&gt; ({ default: m.AdminLayout })),
+);</code></pre>
+
+<p><strong>Declare it at module scope, never inside a component.</strong> A <code>lazy()</code> call
+inside a component body creates a new lazy component on every render, so React unmounts and refetches
+the whole subtree each time. Same class of bug as
+<a href="/react/react-components">declaring a component inside another component</a>.</p>
+
+<h2>Suspense</h2>
+
+<p>A lazy component cannot render until its code arrives, so React needs something to show meanwhile.
+That is <code>Suspense</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;main className="flex-grow-1"&gt;
+  {/* Any render error inside a route is caught here rather than blanking the whole app. */}
+  &lt;ErrorBoundary&gt;
+    &lt;Suspense
+      fallback={
+        &lt;div className="text-center py-5"&gt;
+          &lt;Spinner animation="border" variant="danger" role="status"&gt;
+            &lt;span className="visually-hidden"&gt;Loading…&lt;/span&gt;
+          &lt;/Spinner&gt;
+        &lt;/div&gt;
+      }
+    &gt;
+      &lt;Routes&gt;{/* … */}&lt;/Routes&gt;
+    &lt;/Suspense&gt;
+  &lt;/ErrorBoundary&gt;
+&lt;/main&gt;</code></pre>
+
+<p>One boundary covers all seven lazy components, because they are all inside it. You do not need one
+per lazy import — you need one wherever a distinct piece of loading UI makes sense.</p>
+
+<p><strong>Suspense goes above the lazy component, not around it in the same render.</strong> A
+component cannot suspend and catch its own suspension.</p>
+
+<h3>Pair it with an error boundary</h3>
+
+<p><code>Suspense</code> handles the pending case. It does not handle failure — and a chunk fetch
+genuinely does fail, most often when you deploy while someone has the old page open and the hashed
+filename no longer exists. Without a boundary, that is a blank page.</p>
+
+<p>Note the ordering above: <code>ErrorBoundary</code> is <em>outside</em>
+<code>Suspense</code>. That way a failed chunk load renders the error fallback.
+<a href="/react/react-error-boundary">Error Boundaries</a> has the details.</p>
+
+<h2>What it produced</h2>
+
+<p>Here is the real build output, unedited:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">dist/index.html                              0.88 kB │ gzip:   0.42 kB
+dist/assets/index--mWIANA6.css             233.62 kB │ gzip:  32.02 kB
+dist/assets/useMergedRefs-BY2lr20j.js        0.51 kB │ gzip:   0.32 kB
+dist/assets/rolldown-runtime-hePW80VL.js     0.71 kB │ gzip:   0.42 kB
+dist/assets/AdminLayout-BtuxqFaS.js          0.86 kB │ gzip:   0.44 kB
+dist/assets/AdminOrdersPage-DUtzGoIo.js      3.16 kB │ gzip:   1.35 kB
+dist/assets/AdminUsersPage-BlgOdDXt.js       3.47 kB │ gzip:   1.46 kB
+dist/assets/AdminCrustsPage-BlAwkw38.js      4.50 kB │ gzip:   1.74 kB
+dist/assets/AdminToppingsPage-C_l3qJy0.js    4.55 kB │ gzip:   1.77 kB
+dist/assets/AdminProductsPage-Cn3KqQMA.js    6.24 kB │ gzip:   2.22 kB
+dist/assets/ToastContext-BSYXrgfZ.js         9.53 kB │ gzip:   3.46 kB
+dist/assets/api-CJNWQurO.js                 14.12 kB │ gzip:   5.33 kB
+dist/assets/Table-YEv3Zq6I.js               17.56 kB │ gzip:   6.16 kB
+dist/assets/store-z0RVAOPD.js               36.54 kB │ gzip:  12.84 kB
+dist/assets/index-B9HlveUY.js              350.46 kB │ gzip: 109.21 kB
+dist/assets/AdminReportsPage-b0f8Qhta.js   353.73 kB │ gzip:  98.69 kB</code></pre>
+
+<p>Read that as two groups.</p>
+
+<p><strong><code>index-B9HlveUY.js</code>, 350 kB / 109 kB gzipped</strong>, is what a customer
+downloads. React, React DOM, the router, react-bootstrap, the four contexts, and every customer
+page.</p>
+
+<p><strong>Everything else is admin</strong>, and none of it is fetched until someone opens
+<code>/admin</code>. Adding it up: 354 kB of reports (almost entirely the charting library), 37 kB of
+Redux and its slices, 18 kB of Bootstrap's table, and 23 kB across the five CRUD pages — roughly
+<strong>430 kB, or 122 kB gzipped, that a customer never downloads</strong>. Statically imported, the
+entry bundle would have been more than twice its current size.</p>
+
+<p>Two of those lines are worth a second look.</p>
+
+<p><code>store-z0RVAOPD.js</code> exists because <code>&lt;Provider store={store}&gt;</code> is
+mounted inside <code>AdminLayout</code> rather than in <code>main.tsx</code>. Redux is only reachable
+from a lazy route, so the bundler puts it in a lazy chunk. Had the provider gone at the root, all
+37 kB would be in the entry bundle for everyone. Where you mount a provider is a bundling decision as
+well as an architectural one.</p>
+
+<p><code>Table-YEv3Zq6I.js</code> and <code>api-CJNWQurO.js</code> are <em>shared</em> chunks — code
+used by more than one lazy page, factored out so it is downloaded once rather than duplicated into
+each. You do not configure this; the bundler works it out.</p>
+
+<h2>Where to split</h2>
+
+<p>Routes, and specifically routes a given visitor is unlikely to visit. That is where the
+cost/benefit is clearest and where the loading state is least intrusive — a brief spinner during
+navigation is something users already expect.</p>
+
+<p>Good candidates beyond routes:</p>
+
+<ul>
+  <li>A heavy library used on one screen — charts, a rich text editor, a PDF viewer, a map.</li>
+  <li>A modal or drawer whose contents are large and rarely opened.</li>
+  <li>Anything behind a permission most users do not have.</li>
+</ul>
+
+<p>Do <strong>not</strong> split things that are needed immediately. Splitting the home page adds a
+network round trip to the critical path and makes the first load slower. And splitting many small
+components produces a swarm of tiny requests, which is worse than one file — modern bundlers already
+handle this well when you split at meaningful boundaries.</p>
+
+<h2>Preloading</h2>
+
+<p>The one downside of route splitting is a pause on first navigation. You can hide it by starting
+the fetch on hover or focus, before the click:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const preloadAdmin = () =&gt; { void import('./pages/admin/AdminLayout'); };
+
+&lt;Nav.Link as={NavLink} to="/admin" onMouseEnter={preloadAdmin} onFocus={preloadAdmin}&gt;
+  Admin
+&lt;/Nav.Link&gt;</code></pre>
+
+<p>The module registry deduplicates, so calling <code>import()</code> twice fetches once. By the time
+the click lands, the chunk is usually already there.</p>
+
+<h2>Suspense is bigger than lazy</h2>
+
+<p>Everything above uses <code>Suspense</code> for code loading, which is what it originally shipped
+for. It is a general mechanism for "this subtree is not ready yet", and frameworks now use it for
+data too — a component suspends while its data loads, and the nearest boundary shows the
+fallback.</p>
+
+<p>In a plain Vite + React app like this one, you will mostly meet it as the partner to
+<code>lazy</code>. Reaching for suspense-based data fetching means a framework or a library that
+supports it.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-css">Styling</a>.</p>
