@@ -1,0 +1,175 @@
+<p>The questions that actually get asked, with answers that show understanding rather than recall. Each
+one has a follow-up, because the follow-up is where the interview really happens.</p>
+
+<h2>What does this print, and why?</h2>
+
+<pre class="language-python"><code class="language-python">def add(item, basket=[]):
+    basket.append(item)
+    return basket
+
+print(add("a"))     # Output: ['a']
+print(add("b"))     # Output: ['a', 'b']
+</code></pre>
+
+<p>The default is evaluated <strong>once</strong>, when the <code>def</code> is executed, so every call
+relying on it shares one list. The fix is <code>basket=None</code> and building the list inside.</p>
+
+<p><em>Follow-up: why does Python do that?</em> Because a default is just an expression evaluated at
+definition time and stored on the function object — you can see it in
+<code>add.__defaults__</code>. Evaluating it per call would mean re-running arbitrary code on every
+invocation. The behaviour is consistent; it is only surprising when the value is mutable.</p>
+
+<h2>is versus ==</h2>
+
+<pre class="language-python"><code class="language-python">a = [1, 2, 3]
+b = [1, 2, 3]
+
+print(a == b)       # Output: True
+print(a is b)       # Output: False
+
+x = 256
+y = 256
+print(x is y)       # Output: True
+</code></pre>
+
+<p><code>==</code> asks whether the values are equal and can be redefined by <code>__eq__</code>.
+<code>is</code> asks whether they are the same object and cannot be redefined.</p>
+
+<p><em>Follow-up: why is <code>256 is 256</code> True?</em> CPython pre-allocates the small integers
+−5 to 256, so both names point at the same cached object. Try 257 and you may get
+<code>False</code>. That is an implementation detail, not a language guarantee, and it is precisely why
+you never use <code>is</code> for value comparison — only for <code>None</code>, <code>True</code> and
+<code>False</code>.</p>
+
+<h2>What is the GIL, and what does it not mean?</h2>
+
+<p>The Global Interpreter Lock allows only one thread to execute Python bytecode at a time in a single
+process. Threads do not give you parallel CPU work in the standard build.</p>
+
+<p>The half that candidates miss: <strong>the GIL is released during I/O.</strong> A thread waiting on a
+network call, a disk read or a database query is not holding it. So threads <em>do</em> help with
+I/O-bound work, and it is only CPU-bound work that gains nothing.</p>
+
+<pre class="language-python"><code class="language-python">import concurrent.futures, time
+
+def slow_io(n):
+    time.sleep(0.05)          # stands in for a network call
+    return n
+
+start = time.perf_counter()
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    results = list(pool.map(slow_io, range(4)))
+elapsed = time.perf_counter() - start
+
+print(results)                # Output: [0, 1, 2, 3]
+print(elapsed &lt; 0.15)         # Output: True
+</code></pre>
+
+<p>Four sleeps of 0.05s finishing in well under 0.2s — the GIL was released each time.</p>
+
+<p><em>Follow-up: so what do you use for CPU work?</em> <code>multiprocessing</code> or
+<code>ProcessPoolExecutor</code> — separate processes, each with its own interpreter and its own GIL,
+at the cost of pickling data between them. And 3.13 introduced a free-threaded build with no GIL,
+officially supported in 3.14, which is changing this answer.</p>
+
+<h2>Shallow versus deep copy</h2>
+
+<pre class="language-python"><code class="language-python">import copy
+
+original = {"name": "Alice", "tags": ["a", "b"]}
+
+shallow = copy.copy(original)
+deep = copy.deepcopy(original)
+
+shallow["tags"].append("c")
+
+print(original["tags"])     # Output: ['a', 'b', 'c']
+print(deep["tags"])         # Output: ['a', 'b']
+</code></pre>
+
+<p>A shallow copy is a new outer container holding <strong>the same inner objects</strong>, so mutating
+one of those is visible through both. <code>list(x)</code>, <code>x.copy()</code> and
+<code>x[:]</code> are all shallow.</p>
+
+<p><em>Follow-up: when would you avoid deepcopy?</em> It is slow, it recurses through the whole object
+graph, and it fails on things that cannot be copied — an open file, a database connection, a socket.
+Preferring immutable data is usually the better answer than copying defensively.</p>
+
+<h2>Explain decorators</h2>
+
+<p>A decorator is a function that takes a function and returns a replacement. <code>@log</code> above a
+<code>def</code> means exactly <code>fn = log(fn)</code>.</p>
+
+<pre class="language-python"><code class="language-python">import functools
+
+def log(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapper
+
+@log
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+print(add(2, 3))          # Output: 5
+print(add.__name__)       # Output: add
+</code></pre>
+
+<p><em>Follow-up: what does <code>functools.wraps</code> do and why does it matter?</em> It copies the
+original's name, docstring and metadata onto the wrapper. Without it the function is called
+<code>wrapper</code> in every traceback, debugger and <code>help()</code> — mentioning this
+unprompted is the answer that separates people who have written one from people who have read about
+them.</p>
+
+<h2>Generators versus lists</h2>
+
+<pre class="language-python"><code class="language-python">import sys
+
+squares_list = [n * n for n in range(50_000)]
+squares_gen = (n * n for n in range(50_000))
+
+print(sys.getsizeof(squares_list) &gt; 100_000)   # Output: True
+print(sys.getsizeof(squares_gen) &lt; 250)        # Output: True
+print(sum(squares_gen) == sum(squares_list))   # Output: True
+print(sum(squares_gen))                        # Output: 0
+</code></pre>
+
+<p>The generator stores a position, not results — constant memory whatever the size. That last line is
+the trap worth volunteering: a generator is consumed once and the second pass gets nothing.</p>
+
+<p><em>Follow-up: when would you prefer the list?</em> When you need it more than once, need
+<code>len()</code>, or need random access. And on small collections the list comprehension is usually
+<em>faster</em>, because each <code>yield</code> costs a suspend and resume.</p>
+
+<h2>args, kwargs, and mutability</h2>
+
+<p><em>What is the difference between <code>*args</code> and <code>**kwargs</code>?</em> The first
+collects extra positional arguments into a tuple, the second extra keyword arguments into a dict. The
+stars do the work; the names are convention.</p>
+
+<p><em>Is Python pass by value or pass by reference?</em> Neither, and saying so is the correct answer:
+the reference is passed by value. Rebinding a parameter does not affect the caller; mutating the object
+it points at does.</p>
+
+<p><em>What makes an object hashable?</em> A stable <code>__hash__</code> — in practice, immutability.
+It is why a tuple can be a dict key and a list cannot.</p>
+
+<h2>How to answer when you do not know</h2>
+
+<p>Say so, then show how you would find out. "I have not used <code>__slots__</code> in anger — I know
+it avoids the per-instance dict to save memory, and I would check whether it is worth the loss of
+dynamic attributes before reaching for it" is a strong answer. Guessing confidently is the weak
+one.</p>
+
+<p>Two things that consistently help: <strong>think out loud</strong>, because the interviewer is
+assessing your reasoning more than the answer, and <strong>volunteer the trade-off</strong>. Every
+question above has one, and naming it unprompted is what distinguishes someone who has used the
+feature from someone who has memorised it.</p>
+
+<p>And when a question is about something you built, be ready for "why did you do it that way?" — the
+answer that got you the interview is rarely as interesting as the alternatives you rejected.</p>
+
+<p>That is the end of this track. The basics are in the
+<a href="/python/python-get-started">Python track</a>.</p>

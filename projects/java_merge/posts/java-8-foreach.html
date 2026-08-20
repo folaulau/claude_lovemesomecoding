@@ -1,0 +1,189 @@
+<p><code>forEach</code> runs a piece of code once per element. It arrived with Java 8 as the
+functional counterpart to the for-each loop, and choosing between the two is mostly a readability
+question rather than a technical one.</p>
+
+<h2>The method</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo", "Cy");
+
+class Demo {
+    void run(List&lt;String&gt; names) {
+        names.forEach(name -&gt; System.out.println(name));   // lambda
+        names.forEach(System.out::println);                // method reference — same thing
+    }
+}
+</code></pre>
+
+<p>It takes a <code>Consumer</code> — one argument in, nothing out. That shape is the whole story:
+<code>forEach</code> exists to cause side effects, because it cannot return anything. If you want a
+result, you want <code>map</code>, <code>filter</code> or <code>collect</code> instead.</p>
+
+<p>It is declared on <code>Iterable</code>, so every collection has it, and separately on
+<code>Stream</code> and on <code>Map</code> — three different declarations of the same idea, which is
+why the map version can take two arguments while the others take one.</p>
+
+<h2>On lists and sets</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = List.of("Ana", "Bo");
+        Set&lt;Integer&gt; ids = Set.of(1, 2, 3);
+
+        names.forEach(name -&gt; System.out.println("hello " + name));
+        ids.forEach(System.out::println);
+
+        // Order: a List iterates in order. A HashSet does not promise any.
+        new TreeSet&lt;&gt;(ids).forEach(System.out::println);   // 1, 2, 3 — sorted
+    }
+}
+</code></pre>
+
+<h2>On maps — the two-argument version</h2>
+
+<p>This is the one that saves the most typing. <code>Map.forEach</code> takes a
+<code>BiConsumer</code>, handing you the key and the value directly instead of an
+<code>Entry</code> to unpack:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        Map&lt;String, Integer&gt; stock = Map.of("apples", 10, "pears", 4);
+
+        // The old way
+        for (Map.Entry&lt;String, Integer&gt; entry : stock.entrySet()) {
+            System.out.println(entry.getKey() + " = " + entry.getValue());
+        }
+
+        // The same thing
+        stock.forEach((item, count) -&gt; System.out.println(item + " = " + count));
+    }
+}
+</code></pre>
+
+<h2>On streams</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = List.of("Ana", "Bo", "Christopher");
+
+        names.stream()
+                .filter(n -&gt; n.length() &gt; 2)
+                .map(String::toUpperCase)
+                .forEach(System.out::println);      // ANA, CHRISTOPHER
+
+        // forEachOrdered guarantees encounter order even on a parallel stream
+        names.parallelStream().forEachOrdered(System.out::println);
+    }
+}
+</code></pre>
+
+<p>On a sequential stream <code>forEach</code> already runs in order. On a parallel one it does not,
+and <code>forEachOrdered</code> is how you ask for order back — at the cost of most of the
+parallelism, which is usually a sign the stream should not have been parallel.</p>
+
+<h2>What it cannot do</h2>
+
+<p>Three limitations, and each one is a reason to use a plain loop instead:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = List.of("Ana", "Bo", "Cy");
+
+        // 1. You cannot break out of it. This runs to the end regardless.
+        names.forEach(name -&gt; {
+            if (name.equals("Bo")) {
+                return;                 // skips THIS element only — like `continue`
+            }
+            System.out.println(name);
+        });
+
+        // A loop can stop early:
+        for (String name : names) {
+            if (name.equals("Bo")) break;
+            System.out.println(name);
+        }
+    }
+}
+</code></pre>
+
+<p>The <code>return</code> above is the mistake people make: it looks like <code>break</code> and
+behaves like <code>continue</code>, because it returns from the lambda, not from the loop. There is
+no way to stop a <code>forEach</code> early. If you need that, use a loop — or
+<code>anyMatch</code>, <code>findFirst</code> or <code>takeWhile</code>, which short-circuit
+properly.</p>
+
+<p><strong>2. You cannot modify the collection while iterating.</strong> Same rule as a for-each
+loop, same exception:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Ana", "Bo"));
+
+        // names.forEach(n -&gt; { if (n.startsWith("B")) names.remove(n); });
+        //   -> ConcurrentModificationException
+
+        names.removeIf(n -&gt; n.startsWith("B"));    // the right way
+        System.out.println(names);                  // [Ana]
+    }
+}
+</code></pre>
+
+<p><strong>3. You cannot mutate a local variable</strong> from inside it, because a lambda can only
+capture effectively-final variables. A counter is the usual thing people reach for, and the answer
+is not to fight the rule:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = List.of("Ana", "Bo", "Christopher");
+
+        // int count = 0;
+        // names.forEach(n -&gt; { if (n.length() &gt; 2) count++; });   // does not compile
+
+        long count = names.stream().filter(n -&gt; n.length() &gt; 2).count();
+        System.out.println(count);      // 2
+    }
+}
+</code></pre>
+
+<h2>Does it cost anything?</h2>
+
+<p>A fair question, since <code>forEach</code> creates a lambda object where a loop creates nothing.
+In practice the answer is no, for two reasons worth knowing rather than taking on faith.</p>
+
+<p>First, a lambda that captures nothing — <code>System.out::println</code>, or <code>n -&gt;
+n.trim()</code> — is instantiated once and reused, not allocated per call. Only a capturing lambda
+creates an object, and even then it is one object for the whole loop, not one per element.</p>
+
+<p>Second, the JIT compiler inlines both forms into much the same machine code once the method is
+hot. For a collection of any realistic size the difference is unmeasurable, and for a collection
+small enough that it might matter, the whole operation is already free.</p>
+
+<p>So choose on readability. The one real performance caveat is the opposite of the usual worry:
+<code>parallelStream().forEach(...)</code> is genuinely slower than a loop for small collections,
+because coordinating threads costs more than the work being coordinated.</p>
+
+<h2>Choosing between them</h2>
+
+<table>
+<thead><tr><th>Use</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>forEach</code></td><td>the body is one short action, especially a method
+reference</td></tr>
+<tr><td><code>forEach</code> on a map</td><td>you want key and value without unpacking an
+<code>Entry</code></td></tr>
+<tr><td>for-each loop</td><td>you need <code>break</code>, the index, or a body longer than a couple
+of lines</td></tr>
+<tr><td>neither</td><td>you are building a result — use <code>map</code>/<code>collect</code>, not a
+side effect</td></tr>
+</tbody>
+</table>
+
+<p>That last row is the one worth internalising. Code like
+<code>stream().forEach(list::add)</code> is a pipeline pretending to be a loop; it breaks under
+parallelism and reads worse than <code>stream().toList()</code>. If a <code>forEach</code> is
+filling something in, it is the wrong tool.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-8-interface-default-methods-and-static-methods">Default and static interface
+methods</a> is next — how <code>forEach</code> was added to <code>Iterable</code> without breaking
+every class that already implemented it.</p>

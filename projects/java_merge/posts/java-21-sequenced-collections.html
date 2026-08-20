@@ -1,0 +1,189 @@
+<p>Java 21 added three interfaces — <code>SequencedCollection</code>, <code>SequencedSet</code> and
+<code>SequencedMap</code> — giving every collection with a defined order the same way to ask for its
+first and last element, and to iterate backwards. It is a small addition that fixes a
+twenty-five-year-old inconsistency.</p>
+
+<h2>The inconsistency</h2>
+
+<p>Before Java 21, getting the first element depended entirely on which collection you had:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("a", "b", "c"));
+        Deque&lt;String&gt; deque = new ArrayDeque&lt;&gt;(List.of("a", "b", "c"));
+        SortedSet&lt;String&gt; sorted = new TreeSet&lt;&gt;(List.of("a", "b", "c"));
+        LinkedHashSet&lt;String&gt; linked = new LinkedHashSet&lt;&gt;(List.of("a", "b", "c"));
+
+        System.out.println(list.get(0));           // an index
+        System.out.println(deque.getFirst());      // a method
+        System.out.println(sorted.first());        // a differently named method
+        System.out.println(linked.iterator().next());   // no method at all
+    }
+}
+</code></pre>
+
+<p>Four ordered collections, four different answers — and the last one is the telling case. A
+<code>LinkedHashSet</code> has a perfectly well-defined first element and no way to ask for it. The
+last element was worse: iterating the entire set to find it.</p>
+
+<h2>The new interfaces</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("a", "b", "c"));
+
+        System.out.println(list.getFirst());       // a
+        System.out.println(list.getLast());        // c
+        System.out.println(list.reversed());       // [c, b, a]
+
+        list.addFirst("start");
+        list.addLast("end");
+        System.out.println(list);                  // [start, a, b, c, end]
+
+        System.out.println(list.removeFirst());    // start
+        System.out.println(list.removeLast());     // end
+    }
+}
+</code></pre>
+
+<p>Six methods, on everything ordered. <code>List</code>, <code>Deque</code>,
+<code>LinkedHashSet</code>, <code>SortedSet</code> and <code>LinkedHashMap</code> all gained them
+without any change to your code — they are <a href="/java/java-8-interface-default-methods-and-static-methods">default
+methods</a>, which is precisely the mechanism that makes adding to an interface possible.</p>
+
+<h2>The hierarchy</h2>
+
+<table>
+<thead><tr><th>Interface</th><th>Extends</th><th>Implemented by</th></tr></thead>
+<tbody>
+<tr><td><code>SequencedCollection&lt;E&gt;</code></td><td><code>Collection</code></td><td><code>List</code>,
+<code>Deque</code></td></tr>
+<tr><td><code>SequencedSet&lt;E&gt;</code></td><td><code>SequencedCollection</code>,
+<code>Set</code></td><td><code>LinkedHashSet</code>, <code>SortedSet</code></td></tr>
+<tr><td><code>SequencedMap&lt;K,V&gt;</code></td><td><code>Map</code></td><td><code>LinkedHashMap</code>,
+<code>SortedMap</code></td></tr>
+</tbody>
+</table>
+
+<p>The useful consequence is that you can now write a method taking any ordered collection:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    &lt;E&gt; E newest(SequencedCollection&lt;E&gt; items) {
+        return items.getLast();               // works for List, Deque, LinkedHashSet, TreeSet
+    }
+
+    void run() {
+        System.out.println(newest(List.of("a", "b")));                    // b
+        System.out.println(newest(new LinkedHashSet&lt;&gt;(List.of("a", "b")))); // b
+    }
+}
+</code></pre>
+
+<h2><code>reversed()</code> is a view, not a copy</h2>
+
+<p>The detail worth knowing. <code>reversed()</code> returns a <em>view</em> backed by the original,
+so it costs nothing to create and it sees later changes:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("a", "b"));
+        List&lt;String&gt; view = list.reversed();
+
+        list.add("c");
+        System.out.println(view);              // [c, b, a] — the view saw the addition
+
+        view.set(0, "z");                      // writing through the view
+        System.out.println(list);              // [a, b, z]
+
+        // For an independent copy, materialise it
+        List&lt;String&gt; copy = new ArrayList&lt;&gt;(list.reversed());
+        list.add("d");
+        System.out.println(copy.size());       // 3 — unaffected
+    }
+}
+</code></pre>
+
+<p>Compare with <code>Collections.reverse(list)</code>, which reverses in place and returns nothing.
+The view is usually what you want for iterating backwards, and it does not disturb the original.</p>
+
+<h2>Maps</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        LinkedHashMap&lt;String, Integer&gt; scores = new LinkedHashMap&lt;&gt;();
+        scores.put("Ana", 30);
+        scores.put("Bo", 25);
+        scores.put("Cy", 35);
+
+        System.out.println(scores.firstEntry());     // Ana=30
+        System.out.println(scores.lastEntry());      // Cy=35
+        System.out.println(scores.reversed());       // {Cy=35, Bo=25, Ana=30}
+
+        scores.putFirst("Zed", 10);                  // insert at the front
+        System.out.println(scores.sequencedKeySet().getFirst());   // Zed
+    }
+}
+</code></pre>
+
+<p><code>sequencedKeySet</code>, <code>sequencedValues</code> and <code>sequencedEntrySet</code> return
+ordered views, which is what lets you get the first key without iterating.</p>
+
+<h2>What "sequenced" means, and what it does not</h2>
+
+<p>The word is doing precise work here, and it is worth separating three ideas that get conflated.</p>
+
+<p>A collection is <strong>sequenced</strong> if it has a well-defined encounter order — there is a
+first element, a last element, and iterating twice gives the same sequence. That is a weaker property
+than being <em>sorted</em>, and a stronger one than being merely iterable.</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        // Sequenced by insertion — order is what you put in
+        SequencedSet&lt;String&gt; insertion = new LinkedHashSet&lt;&gt;(List.of("c", "a", "b"));
+        System.out.println(insertion.getFirst());     // c
+
+        // Sequenced by sorting — order is the comparator's
+        SequencedSet&lt;String&gt; sorted = new TreeSet&lt;&gt;(List.of("c", "a", "b"));
+        System.out.println(sorted.getFirst());        // a
+
+        // NOT sequenced — HashSet has no defined order, so it gains nothing
+        Set&lt;String&gt; unordered = new HashSet&lt;&gt;(List.of("c", "a", "b"));
+        // unordered.getFirst();                      // does not compile
+    }
+}
+</code></pre>
+
+<p>That last case is the point of the design. <code>HashSet</code> deliberately does not implement
+<code>SequencedSet</code>, because its iteration order is an implementation detail that can change
+between runs. Asking a <code>HashSet</code> for its "first" element is a meaningless question, and
+the type system now says so rather than letting you write
+<code>hashSet.iterator().next()</code> and believe the answer.</p>
+
+<p>The same reasoning applies to <code>HashMap</code>: it is a <code>Map</code>, not a
+<code>SequencedMap</code>. If you need order, that is what <code>LinkedHashMap</code> and
+<code>TreeMap</code> are for — the point the <a href="/java/java-collections">Collections</a> post
+makes about choosing an implementation deliberately.</p>
+
+<h2>One thing that can break</h2>
+
+<p>These are new methods on very old interfaces, so a class of yours that implements
+<code>List</code> and already had its own <code>getFirst()</code> with different semantics now
+conflicts with the interface's. It is rare, and the compiler tells you, but it is the one upgrade
+hazard here.</p>
+
+<p>There is also a semantic clash worth noting: <code>Deque</code> already had
+<code>addFirst</code> and <code>addLast</code>, and its <code>reversed()</code> had to be defined
+consistently with <code>descendingIterator()</code>. If you use <code>Deque</code> heavily, check
+that the two agree in your code rather than assuming.</p>
+
+<h2>Why it matters</h2>
+
+<p>None of this was impossible before — <code>list.get(list.size() - 1)</code> works, everyone wrote
+it, and everyone got the off-by-one wrong at least once. The value is in removing four different spellings of one idea, and in making
+<code>LinkedHashSet</code> and <code>LinkedHashMap</code> usable for the thing people actually use
+them for: keeping insertion order and then looking at the ends of it.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-21-unnamed-variables">Unnamed variables and patterns</a> is next — a use for
+the underscore.</p>

@@ -1,0 +1,196 @@
+<p>Reading and writing files is one of the few places Python has a rule you must not break: use
+<code>with</code>. This post covers that, the two ways to read, and the CSV and JSON modules you will
+reach for immediately afterwards.</p>
+
+<h2>Always use with</h2>
+
+<pre class="language-python"><code class="language-python">with open("notes.txt", "w") as handle:
+    handle.write("first line\n")
+    handle.write("second line\n")
+
+with open("notes.txt") as handle:
+    print(handle.read())
+
+# Output: first line
+# Output: second line
+</code></pre>
+
+<p><code>with</code> is a context manager: it closes the file when the block ends, <strong>including
+when the block raises</strong>. Without it, an exception between <code>open</code> and
+<code>close</code> leaves the handle open, and on a write that can mean data still sitting in a buffer
+that never reaches disk.</p>
+
+<p>This is not a style preference. There is no situation in ordinary code where a bare
+<code>open()</code> without <code>with</code> is the right call.</p>
+
+<h2>The modes</h2>
+
+<table>
+  <thead><tr><th>Mode</th><th>Does</th><th>If the file exists</th></tr></thead>
+  <tbody>
+    <tr><td><code>"r"</code></td><td>Read (the default)</td><td>Reads it; raises if absent</td></tr>
+    <tr><td><code>"w"</code></td><td>Write</td><td><strong>Truncates it to empty</strong></td></tr>
+    <tr><td><code>"a"</code></td><td>Append</td><td>Adds at the end</td></tr>
+    <tr><td><code>"x"</code></td><td>Create</td><td>Raises rather than overwriting</td></tr>
+  </tbody>
+</table>
+
+<p><code>"w"</code> destroying the existing contents the instant you open it — before you write
+anything — is the one to remember. When you mean "add to this file", <code>"a"</code> is the mode.</p>
+
+<p>Add <code>"b"</code> for binary (<code>"rb"</code>, <code>"wb"</code>) when the file is not text —
+images, zips, anything you are not decoding.</p>
+
+<h2>Read it all, or a line at a time</h2>
+
+<pre class="language-python"><code class="language-python">with open("data.txt", "w") as handle:
+    handle.write("100.00\n-25.00\n250.00\n")
+
+with open("data.txt") as handle:
+    print(handle.read().split())          # Output: ['100.00', '-25.00', '250.00']
+
+with open("data.txt") as handle:
+    print([line.strip() for line in handle])   # Output: ['100.00', '-25.00', '250.00']
+</code></pre>
+
+<p><code>.read()</code> loads the whole file into memory. Fine for a config file, fatal for a four
+gigabyte log.</p>
+
+<p>Looping over the handle reads one line at a time — the file object is an
+<a href="/python/python-generators-iterators">iterator</a>, so memory stays flat no matter how large the
+file is. Make this your default and use <code>.read()</code> only when you know the file is small.</p>
+
+<p>Each line keeps its trailing newline, which is why <code>.strip()</code> appears in almost every
+example you will see.</p>
+
+<h2>Always name the encoding</h2>
+
+<pre class="language-python"><code class="language-python">with open("names.txt", "w", encoding="utf-8") as handle:
+    handle.write("Zoë Cooper\n")
+
+with open("names.txt", encoding="utf-8") as handle:
+    print(handle.read().strip())     # Output: Zoë Cooper
+</code></pre>
+
+<p>Without <code>encoding=</code>, Python 3.12 uses the operating system's default — which is UTF-8 on
+macOS and Linux and something else on Windows. That is how a file written on one machine becomes
+<code>UnicodeDecodeError</code> on another, and it is the most common cross-platform bug in file
+handling.</p>
+
+<p>Pass <code>encoding="utf-8"</code> every time. It costs nothing and removes the entire class of
+problem.</p>
+
+<h2>pathlib instead of string paths</h2>
+
+<pre class="language-python"><code class="language-python">from pathlib import Path
+
+data = Path("data")
+data.mkdir(exist_ok=True)
+
+report = data / "report.txt"          # the / operator joins paths
+report.write_text("done\n", encoding="utf-8")
+
+print(report.name)                    # Output: report.txt
+print(report.suffix)                  # Output: .txt
+print(report.exists())                # Output: True
+print(report.read_text(encoding="utf-8").strip())   # Output: done
+</code></pre>
+
+<p><code>Path</code> replaces string concatenation and the old <code>os.path</code> functions. The
+<code>/</code> operator joins correctly on every platform, so no separator to get wrong.</p>
+
+<p><code>read_text()</code> and <code>write_text()</code> handle the open-and-close for you, which is
+the shortest correct way to deal with a small file. <code>mkdir(exist_ok=True)</code> and
+<code>unlink(missing_ok=True)</code> save the existence check.</p>
+
+<h2>CSV — do not split on commas</h2>
+
+<pre class="language-python"><code class="language-python">import csv
+
+with open("accounts.csv", "w", newline="", encoding="utf-8") as handle:
+    writer = csv.DictWriter(handle, fieldnames=["id", "name", "balance"],
+                            lineterminator="\n")
+    writer.writeheader()
+    writer.writerow({"id": 1, "name": "Cooper, Alice", "balance": "1250.00"})
+
+with open("accounts.csv", newline="", encoding="utf-8") as handle:
+    for row in csv.DictReader(handle):
+        print(row["name"], row["balance"])
+
+# Output: Cooper, Alice 1250.00
+</code></pre>
+
+<p>That name contains a comma. <code>line.split(",")</code> would break it into two fields; the
+<code>csv</code> module quotes it on the way out and unquotes it on the way back. Someone's surname will
+eventually contain a comma, and it will not be in your test data.</p>
+
+<p><code>newline=""</code> is required, not optional — the module does its own newline handling and
+without it a quoted field containing a newline is mangled on Windows. <code>DictReader</code> gives you
+rows keyed by column name, so <code>row["balance"]</code> survives someone adding a column and
+<code>row[2]</code> does not.</p>
+
+<h2>JSON</h2>
+
+<pre class="language-python"><code class="language-python">import json
+from pathlib import Path
+
+settings = {"currency": "USD", "overdraft": 500, "features": ["transfer"]}
+
+Path("settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
+loaded = json.loads(Path("settings.json").read_text(encoding="utf-8"))
+
+print(loaded["overdraft"])          # Output: 500
+print(loaded["features"])           # Output: ['transfer']
+print(json.dumps({"a": 1}))         # Output: {"a": 1}
+</code></pre>
+
+<p><code>dumps</code> object to string, <code>loads</code> string to object — the <code>s</code> is for
+"string", and the versions without it take a file handle. <code>indent=2</code> makes the file readable
+by a human, which is worth it for anything you might edit by hand.</p>
+
+<p>JSON has no date type, so a <code>datetime</code> raises <code>TypeError</code> on the way out.
+Convert to a string with <code>.isoformat()</code> first.</p>
+
+<h2>Writing safely: the temp-file swap</h2>
+
+<p>Opening a file in <code>"w"</code> mode empties it immediately. If your program dies halfway through
+writing, the old contents are gone and the new ones are incomplete. The bank app this track draws on
+avoids that by writing somewhere else and renaming:</p>
+
+<!-- from: bank/csv_table.py -->
+<pre class="language-python"><code class="language-python">handle = tempfile.NamedTemporaryFile(
+    mode="w", newline="", encoding="utf-8", dir=self.file.parent, delete=False
+)
+try:
+    with handle:
+        ...
+    os.replace(handle.name, self.file)
+except BaseException:
+    Path(handle.name).unlink(missing_ok=True)
+    raise
+</code></pre>
+
+<p><code>os.replace()</code> is atomic on every operating system Python supports, so the file is either
+entirely the old version or entirely the new one — never a half-written mixture. The temp file is
+created in the same directory on purpose, because renaming across filesystems is not atomic.</p>
+
+<p>Cheap insurance, and the right habit for anything you would be upset to lose.</p>
+
+<h2>When the file is not there</h2>
+
+<pre class="language-python"><code class="language-python">from pathlib import Path
+
+def load_settings(path):
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "{}"
+
+print(load_settings("missing.json"))     # Output: {}
+</code></pre>
+
+<p>Catch <code>FileNotFoundError</code> rather than checking <code>exists()</code> first. The check is a
+lie the moment it returns — the file can vanish between the check and the open — and the exception is
+the authority either way.</p>
+
+<p>Next: <a href="/python/python-user-input">User Input</a>.</p>

@@ -1,0 +1,161 @@
+<p>Debugging is a skill, not a talent, and most of it is one habit: <strong>read the error before you
+do anything else.</strong> Java's errors are unusually informative, and beginners routinely skip past
+them to start guessing.</p>
+
+<h2>Reading a stack trace</h2>
+
+<pre class="language-text"><code class="language-text">Exception in thread "main" java.lang.NullPointerException:
+        Cannot invoke "String.length()" because "name" is null
+    at com.lovemesomecoding.OrderService.validate(OrderService.java:42)
+    at com.lovemesomecoding.OrderService.placeOrder(OrderService.java:31)
+    at com.lovemesomecoding.App.main(App.java:12)
+</code></pre>
+
+<p>Four pieces of information, in order of usefulness:</p>
+
+<ol>
+<li><strong>The message.</strong> Since Java 14, a <code>NullPointerException</code> names the thing
+that was null and what you tried to do with it — <em>"because <code>name</code> is null"</em>. That
+sentence usually is the answer.</li>
+<li><strong>The top frame</strong> is where it was thrown:
+<code>OrderService.java:42</code>.</li>
+<li><strong>Reading down</strong> tells you how you got there. <code>main</code> called
+<code>placeOrder</code>, which called <code>validate</code>.</li>
+<li><strong>The first line that is <em>your</em> code</strong> is where to start. A trace that begins
+with twenty framework frames is common; scroll to your package name.</li>
+</ol>
+
+<p>The top frame is where the problem <em>surfaced</em>, which is not always where it was caused. A
+null at line 42 often means something failed to set it at line 20.</p>
+
+<h2>"Caused by" — read the bottom one first</h2>
+
+<pre class="language-text"><code class="language-text">Exception in thread "main" com.lovemesomecoding.DataAccessException: load failed
+    at com.lovemesomecoding.Repo.load(Repo.java:55)
+    ...
+Caused by: java.sql.SQLException: Connection refused
+    at org.postgresql.Driver.connect(Driver.java:120)
+    ... 12 more
+</code></pre>
+
+<p>Each <code>Caused by</code> is the exception that triggered the one above it. <strong>The last
+<code>Caused by</code> in the trace is the original failure</strong> — and it is nearly always the
+one that tells you what actually went wrong. Here, the real problem is not "load failed"; it is that
+the database is not accepting connections.</p>
+
+<p>This is why <a href="/java/java-exception-handling">Exception Handling</a> insists on passing the cause when
+you wrap an exception. Drop it and this whole section disappears from the trace.</p>
+
+<h2>The errors you will meet most</h2>
+
+<table>
+<thead><tr><th>Exception</th><th>Means</th><th>Look at</th></tr></thead>
+<tbody>
+<tr><td><code>NullPointerException</code></td><td>you used something that was
+null</td><td>the message — it names the variable</td></tr>
+<tr><td><code>ArrayIndexOutOfBoundsException</code></td><td>index outside the
+array</td><td><code>&lt;=</code> where you meant <code>&lt;</code></td></tr>
+<tr><td><code>ClassCastException</code></td><td>cast to a type it is not</td><td>the cast, and
+whether a generic is missing</td></tr>
+<tr><td><code>NumberFormatException</code></td><td>parsing a non-number</td><td>the input — the
+message quotes it</td></tr>
+<tr><td><code>ConcurrentModificationException</code></td><td>collection changed while
+iterating</td><td>a <code>remove</code> inside a loop</td></tr>
+<tr><td><code>StackOverflowError</code></td><td>infinite recursion</td><td>the repeating frame in
+the trace</td></tr>
+<tr><td><code>OutOfMemoryError</code></td><td>heap exhausted</td><td>an unbounded collection or
+cache</td></tr>
+</tbody>
+</table>
+
+<h2>Using a debugger</h2>
+
+<p>Print statements work, but a debugger answers questions printing cannot. The five things worth
+learning, in every IDE:</p>
+
+<ul>
+<li><strong>Breakpoint</strong> — click the gutter next to a line. Execution pauses there and you can
+inspect every variable in scope.</li>
+<li><strong>Step over</strong> (F8 in IntelliJ) — run the current line and stop on the next one.</li>
+<li><strong>Step into</strong> (F7) — go inside the method being called.</li>
+<li><strong>Resume</strong> (F9) — carry on to the next breakpoint.</li>
+<li><strong>Evaluate expression</strong> — type any Java expression and run it against the paused
+state. This is the one people do not discover and it is the most useful.</li>
+</ul>
+
+<p><strong>Conditional breakpoints</strong> are what make debugging a loop bearable. Right-click a
+breakpoint and give it a condition — <code>order.getId().equals("A-1099")</code> — and it pauses only
+on the iteration you care about instead of all 10,000.</p>
+
+<p>Related: an <strong>exception breakpoint</strong> pauses the moment a chosen exception is thrown,
+anywhere, which is how you catch something being swallowed by a <code>catch</code> block you did not
+write.</p>
+
+<h2>Logging that survives production</h2>
+
+<p>You cannot attach a debugger to a server at 3am, so logging is what you actually have. Use a
+logging framework, not <code>System.out</code>:</p>
+
+<pre class="language-java"><code class="language-java">class OrderService {
+    // In a real project this is SLF4J: private static final Logger log = LoggerFactory.getLogger(...)
+    void placeOrder(String orderId, double total) {
+        System.out.println("placing order id=" + orderId + " total=" + total);
+
+        try {
+            charge(total);
+        } catch (RuntimeException e) {
+            // Pass the exception as the LAST argument — that is what prints the stack trace
+            System.err.println("charge failed for order id=" + orderId);
+            e.printStackTrace();
+            throw e;
+        }
+    }
+
+    void charge(double total) { }
+}
+</code></pre>
+
+<p>Three rules that make logs useful:</p>
+
+<ul>
+<li><strong>Include identifiers.</strong> "Order failed" is useless; "order failed id=A-1099
+customer=C-42" lets you find the one record that matters.</li>
+<li><strong>Log the exception object, not just its message.</strong>
+<code>log.error("...", e)</code> prints the whole trace including every <code>Caused by</code>;
+<code>log.error(e.getMessage())</code> throws all of it away.</li>
+<li><strong>Use the levels.</strong> <code>ERROR</code> for things needing attention,
+<code>WARN</code> for recoverable oddities, <code>INFO</code> for milestones,
+<code>DEBUG</code> for detail you can switch on. Everything at <code>INFO</code> means nothing is at
+<code>INFO</code>.</li>
+</ul>
+
+<h2>When there is no exception</h2>
+
+<p>The harder case: the program runs and produces the wrong answer. A debugger is at its best here.
+Two techniques:</p>
+
+<p><strong>Bisect the pipeline.</strong> Put a breakpoint halfway through and check whether the data
+is already wrong. If it is, the bug is in the first half; if not, the second. Repeat. Five or six
+rounds will localise a bug in a very large amount of code.</p>
+
+<p><strong>Check your assumptions explicitly.</strong> Most stubborn bugs turn out to be a belief that
+was never true — the list is not empty, the config was loaded, this method is called once. Print or
+inspect the thing you are certain about. It is the certain ones that are wrong.</p>
+
+<h2>Two JVM facts worth knowing</h2>
+
+<pre class="language-bash"><code class="language-bash"># What is this process doing right now? A thread dump, no restart required.
+jstack &lt;pid&gt;
+
+# What is on the heap? Useful when memory grows and will not come down.
+jmap -histo &lt;pid&gt; | head -20
+</code></pre>
+
+<p>These ship with the JDK. <code>jstack</code> is the fastest way to diagnose a hung application —
+it shows every thread and what it is waiting on, which usually names the deadlock or the blocking
+call outright.</p>
+
+<h2>Next</h2>
+
+<p>Debugging tools are half of it. <a href="/java/how-to-solve-java-problems">How to solve Java
+problems</a> is next — the method to apply when you are stuck and the tools have not helped.</p>

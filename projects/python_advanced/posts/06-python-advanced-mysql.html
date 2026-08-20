@@ -1,0 +1,210 @@
+<p>Every Python database driver implements the same interface, so what you learn against one works
+against the others. This post uses <code>sqlite3</code> for the runnable examples — it ships with
+Python and needs no server — and points out where MySQL and PostgreSQL differ.</p>
+
+<h2>DB-API: the interface every driver shares</h2>
+
+<pre class="language-python"><code class="language-python">import sqlite3
+
+connection = sqlite3.connect(":memory:")
+cursor = connection.cursor()
+
+cursor.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, kind TEXT, balance REAL)")
+cursor.execute("INSERT INTO accounts VALUES (1, 'Checking', 1250.00)")
+connection.commit()
+
+cursor.execute("SELECT kind, balance FROM accounts")
+print(cursor.fetchall())        # Output: [('Checking', 1250.0)]
+print([d[0] for d in cursor.description])   # Output: ['kind', 'balance']
+
+connection.close()
+</code></pre>
+
+<p>Connect, get a cursor, execute, fetch, commit, close. PEP 249 specifies that shape, so
+<code>mysql-connector-python</code>, <code>psycopg</code> and <code>sqlite3</code> all offer it —
+the code changes only at the <code>connect()</code> call.</p>
+
+<p><code>fetchall()</code> loads every row into memory. Use <code>fetchone()</code> in a loop, or
+iterate the cursor directly, when the result set is large.</p>
+
+<p><code>cursor.description</code> carries the column names, which is how a generic result-printer or a
+CSV export knows its header without being told. Do not reach for <code>cursor.rowcount</code> after a
+<code>SELECT</code> — it is specified only for <code>INSERT</code>, <code>UPDATE</code> and
+<code>DELETE</code>, and several drivers return <code>-1</code> for a query.</p>
+
+<h2>Connecting to MySQL</h2>
+
+<!-- norun -->
+<pre class="language-python"><code class="language-python">import os
+import mysql.connector
+
+connection = mysql.connector.connect(
+    host=os.environ.get("DB_HOST", "localhost"),
+    user=os.environ["DB_USER"],
+    password=os.environ["DB_PASSWORD"],   # never a literal in source
+    database="bank",
+    autocommit=False,
+)
+</code></pre>
+
+<p>Credentials come from the environment, never from source. A password committed to git is committed
+forever — rewriting history does not remove it from anyone's clone, and rotating the credential is the
+only real fix.</p>
+
+<p><code>autocommit=False</code> is the default and worth stating anyway, because it is what makes the
+transaction section below possible.</p>
+
+<h2>Parameterised queries, always</h2>
+
+<pre class="language-python"><code class="language-python">import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE accounts (id INTEGER, kind TEXT, balance REAL)")
+db.execute("INSERT INTO accounts VALUES (1, 'Checking', 1250.0)")
+db.commit()
+
+evil = "Checking'; DROP TABLE accounts; --"
+
+# Safe: the value is sent separately from the SQL
+rows = db.execute("SELECT * FROM accounts WHERE kind = ?", (evil,)).fetchall()
+print(rows)                     # Output: []
+
+print(db.execute("SELECT COUNT(*) FROM accounts").fetchone())   # Output: (1,)
+</code></pre>
+
+<p>The table survived. The driver never substitutes the value into the SQL string — it sends the
+statement and the parameters separately, so the database parses the query before it has ever seen your
+data. There is nothing for an injected quote to escape from.</p>
+
+<p>The unsafe version is any f-string or <code>%</code> or <code>+</code> that puts a value into SQL
+text. It is not "unsafe unless you escape it"; it is unsafe, and the parameterised form is shorter
+anyway.</p>
+
+<p>One trap worth knowing: the <strong>placeholder differs by driver</strong>. <code>sqlite3</code> uses
+<code>?</code>, MySQL and psycopg use <code>%s</code>. It is a driver detail, not a Python format
+string — never use <code>%</code> formatting on a query that contains one.</p>
+
+<h2>Transactions</h2>
+
+<pre class="language-python"><code class="language-python">import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance REAL)")
+db.executemany("INSERT INTO accounts VALUES (?, ?)", [(1, 1000.0), (2, 50.0)])
+db.commit()
+
+def transfer(db, source, target, amount):
+    try:
+        db.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amount, source))
+        db.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amount, target))
+        balance = db.execute("SELECT balance FROM accounts WHERE id = ?", (source,)).fetchone()[0]
+        if balance &lt; 0:
+            raise ValueError("insufficient funds")
+        db.commit()
+        return "ok"
+    except Exception:
+        db.rollback()
+        return "rolled back"
+
+print(transfer(db, 2, 1, 500.0))    # Output: rolled back
+print(db.execute("SELECT balance FROM accounts ORDER BY id").fetchall())
+# Output: [(1000.0,), (50.0,)]
+</code></pre>
+
+<p>Both balances are unchanged. That is the point of a transaction: two updates that must both happen
+or neither, with no window in which the money exists in one account and not the other.</p>
+
+<p><code>rollback()</code> in the <code>except</code> is not optional. Without it the connection is left
+mid-transaction, holding locks, and the next operation on it inherits the mess.</p>
+
+<h2>A context manager instead of remembering</h2>
+
+<pre class="language-python"><code class="language-python">import sqlite3
+from contextlib import contextmanager
+
+@contextmanager
+def transaction(db):
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE accounts (id INTEGER, balance REAL)")
+
+with transaction(db):
+    db.execute("INSERT INTO accounts VALUES (1, 100.0)")
+
+try:
+    with transaction(db):
+        db.execute("INSERT INTO accounts VALUES (2, 200.0)")
+        raise RuntimeError("something failed")
+except RuntimeError:
+    pass
+
+print(db.execute("SELECT COUNT(*) FROM accounts").fetchone())   # Output: (1,)
+</code></pre>
+
+<p>One row, not two — the second insert was rolled back by the exception. Commit-on-success and
+rollback-on-failure become structural rather than something each caller has to remember, which is the
+same argument as <code>with open(...)</code> in
+<a href="/python/python-fileread-write">Files</a>.</p>
+
+<p>Note the bare <code>raise</code> after the rollback: swallowing the exception here would hide a
+failure behind a clean-looking rollback.</p>
+
+<h2>Rows as dicts</h2>
+
+<pre class="language-python"><code class="language-python">import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.row_factory = sqlite3.Row          # MySQL: connection.cursor(dictionary=True)
+db.execute("CREATE TABLE accounts (id INTEGER, kind TEXT, balance REAL)")
+db.execute("INSERT INTO accounts VALUES (1, 'Checking', 1250.0)")
+
+row = db.execute("SELECT * FROM accounts").fetchone()
+print(row["kind"])          # Output: Checking
+print(row["balance"])       # Output: 1250.0
+</code></pre>
+
+<p>By default a row is a tuple and you index it by position, which breaks the moment someone adds a
+column to the <code>SELECT</code>. Named access survives that. The mechanism differs per driver — a
+<code>row_factory</code> here, <code>cursor(dictionary=True)</code> in MySQL — but every driver has
+one.</p>
+
+<h2>Connection pooling</h2>
+
+<!-- norun -->
+<pre class="language-python"><code class="language-python">from mysql.connector import pooling
+
+pool = pooling.MySQLConnectionPool(pool_name="bank", pool_size=5, host="localhost",
+                                   user="app", password="…", database="bank")
+
+connection = pool.get_connection()    # borrow
+try:
+    ...
+finally:
+    connection.close()                # returns it to the pool, does not close it
+</code></pre>
+
+<p>Opening a connection costs a TCP handshake and authentication — a few milliseconds, which is
+enormous next to a query taking microseconds. A pool opens them once and lends them out.</p>
+
+<p><code>close()</code> on a pooled connection returns it rather than closing it, which reads wrong and
+is what the API does. Forgetting it exhausts the pool and the next
+<code>get_connection()</code> blocks — a hang rather than an error, and a genuinely unpleasant thing to
+diagnose.</p>
+
+<h2>When to use an ORM</h2>
+
+<p>SQLAlchemy and Django's ORM map rows to objects, generate the SQL, and handle connection pooling and
+migrations. That is worth a lot on an application with fifty tables and worth very little on a script
+with three queries.</p>
+
+<p>Use raw DB-API when the queries are few and you want to see exactly what runs. Use an ORM when you
+have a real schema, relationships to traverse and migrations to manage — and even then, know how to
+read the SQL it emits, because the day it generates something slow you will need to.</p>
+
+<p>Next: <a href="/python-advanced/python-advanced-machine-learning">Machine Learning</a>.</p>

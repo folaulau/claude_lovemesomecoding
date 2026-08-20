@@ -1,0 +1,154 @@
+<p>A sealed type declares exactly which types may extend it. The compiler enforces the list, and —
+this is the real payoff — it can then prove that a <code>switch</code> over that type has covered
+every case.</p>
+
+<h2>The problem</h2>
+
+<p>An ordinary interface is open: anyone, anywhere, can implement it. That is usually the point. But
+when you are modelling a closed set of alternatives — a payment is a card, a bank transfer or store
+credit, and there is no fourth kind — openness works against you:</p>
+
+<pre class="language-java"><code class="language-java">interface Payment { }
+record Card(String last4) implements Payment { }
+record BankTransfer(String iban) implements Payment { }
+
+class Processor {
+    String describe(Payment payment) {
+        if (payment instanceof Card c) return "card ending " + c.last4();
+        if (payment instanceof BankTransfer b) return "transfer from " + b.iban();
+        return "unknown";        // <- this line exists only because the compiler cannot help
+    }
+}
+</code></pre>
+
+<p>That fallback is dead weight. Worse, when someone adds <code>StoreCredit</code> next year, this
+method silently returns <code>"unknown"</code> instead of failing to compile.</p>
+
+<h2>Sealing it</h2>
+
+<pre class="language-java"><code class="language-java">sealed interface Payment permits Card, BankTransfer, StoreCredit { }
+
+record Card(String last4, double amount) implements Payment { }
+record BankTransfer(String iban, double amount) implements Payment { }
+record StoreCredit(double amount) implements Payment { }
+</code></pre>
+
+<p><code>permits</code> lists every allowed subtype. Anything else that tries to implement
+<code>Payment</code> will not compile — and the permitted types must be in the same package (or the
+same module).</p>
+
+<p>The <code>permits</code> clause can be omitted when all the subtypes are in the same file, which is
+common and reads well:</p>
+
+<pre class="language-java"><code class="language-java">sealed interface Shape {                 // no permits needed — all subtypes are right here
+    record Circle(double radius) implements Shape { }
+    record Square(double side) implements Shape { }
+    record Rectangle(double w, double h) implements Shape { }
+}
+</code></pre>
+
+<h2>Every subtype must choose</h2>
+
+<p>A type permitted by a sealed parent has to say what happens next. There are three options and no
+default:</p>
+
+<pre class="language-java"><code class="language-java">sealed interface Vehicle permits Car, Truck, Trailer { }
+
+final class Car implements Vehicle { }            // final: the line stops here
+
+sealed class Truck implements Vehicle permits PickupTruck { }   // sealed: continues, but controlled
+final class PickupTruck extends Truck { }
+
+non-sealed class Trailer implements Vehicle { }   // non-sealed: deliberately reopened
+class CargoTrailer extends Trailer { }            // ...so anyone may extend this one
+</code></pre>
+
+<p><code>non-sealed</code> is an explicit escape hatch — it says "the hierarchy is closed above here
+and open below". It is the only hyphenated keyword in Java, which is a reasonable mnemonic for how
+rarely you should need it.</p>
+
+<h2>The payoff: exhaustive switch</h2>
+
+<p>Because the compiler knows the complete list, a <code>switch</code> over a sealed type needs no
+<code>default</code>:</p>
+
+<pre class="language-java"><code class="language-java">sealed interface Payment permits Card, BankTransfer, StoreCredit { }
+record Card(String last4, double amount) implements Payment { }
+record BankTransfer(String iban, double amount) implements Payment { }
+record StoreCredit(double amount) implements Payment { }
+
+class Processor {
+    String describe(Payment payment) {
+        return switch (payment) {              // no default — all three are covered
+            case Card c -&gt; "card ending " + c.last4();
+            case BankTransfer b -&gt; "transfer from " + b.iban();
+            case StoreCredit s -&gt; "store credit of " + s.amount();
+        };
+    }
+}
+</code></pre>
+
+<p><strong>This is the whole reason sealed types exist.</strong> Add a fourth payment kind to the
+<code>permits</code> list and this method stops compiling — along with every other switch that
+handles payments. The compiler hands you the list of places to update instead of leaving you to find
+them.</p>
+
+<p>Resist adding a <code>default</code> branch out of habit. A <code>default</code> throws that
+guarantee away: the switch compiles forever, and the new case silently falls into it.</p>
+
+<h2>Record patterns</h2>
+
+<p>Since Java 21 a <code>case</code> can destructure a record, pulling its components out in the
+same step:</p>
+
+<pre class="language-java"><code class="language-java">sealed interface Shape { }
+record Circle(double radius) implements Shape { }
+record Rectangle(double w, double h) implements Shape { }
+
+class Geometry {
+    double area(Shape shape) {
+        return switch (shape) {
+            case Circle(double r) -&gt; Math.PI * r * r;            // r bound directly
+            case Rectangle(double w, double h) -&gt; w * h;
+        };
+    }
+
+    String classify(Shape shape) {
+        return switch (shape) {
+            case Rectangle(double w, double h) when w == h -&gt; "square";
+            case Rectangle r -&gt; "rectangle";
+            case Circle c when c.radius() &gt; 100 -&gt; "big circle";
+            case Circle c -&gt; "circle";
+        };
+    }
+}
+</code></pre>
+
+<p>Note the ordering rule in <code>classify</code>: a guarded case must come before the unguarded case
+for the same type, or the unguarded one would match everything first — and the compiler tells you
+so.</p>
+
+<h2>When to use them</h2>
+
+<p>Sealed types fit whenever you have a fixed set of alternatives that you want to handle
+exhaustively:</p>
+
+<ul>
+<li><strong>Results</strong> — <code>sealed interface Result permits Success, Failure</code>, so no
+caller can forget the failure case.</li>
+<li><strong>State machines</strong> — the states of an order, a connection, a job.</li>
+<li><strong>Expression trees</strong> — parsers, rule engines, anything you walk with a switch.</li>
+<li><strong>Domain alternatives</strong> — payment methods, notification channels, account types.</li>
+</ul>
+
+<p>They pair naturally with <a href="/java/java-17-records">records</a>: the sealed interface names the
+alternatives, and each record carries that alternative's data. Together they give you in plain Java
+what other languages call an algebraic data type.</p>
+
+<p><strong>Do not seal a plugin point.</strong> If the whole purpose of an interface is for other
+people — other teams, other modules, library users — to implement it, sealing is exactly wrong. Seal
+closed sets; leave extension points open.</p>
+
+<h2>Next</h2>
+
+<p>Sealed types are what make an exhaustive switch possible. <a href="/java/java-17-switch-expressions">Switch Expressions</a> is next.</p>

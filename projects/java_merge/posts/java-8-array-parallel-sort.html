@@ -1,0 +1,165 @@
+<p><code>Arrays.parallelSort</code> sorts an array using every core on the machine instead of one. It
+is a single-word change from <code>Arrays.sort</code>, which makes it tempting to use everywhere —
+and it is slower than the sequential version on most of the arrays you will actually sort.</p>
+
+<h2>Using it</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        int[] numbers = {5, 2, 9, 1, 7};
+        Arrays.parallelSort(numbers);
+        System.out.println(Arrays.toString(numbers));    // [1, 2, 5, 7, 9]
+
+        String[] names = {"Cy", "Ana", "Bo"};
+        Arrays.parallelSort(names);
+        System.out.println(Arrays.toString(names));      // [Ana, Bo, Cy]
+    }
+}
+</code></pre>
+
+<p>Like <code>Arrays.sort</code>, it sorts <strong>in place</strong> and returns <code>void</code>.
+Writing <code>int[] sorted = Arrays.parallelSort(numbers);</code> does not compile, which is a common
+first mistake.</p>
+
+<h2>How it works</h2>
+
+<p>It is a parallel merge sort built on the fork/join framework. The array is split in half
+repeatedly until each piece is small enough to be worth sorting directly, those pieces are sorted on
+separate threads, and the results are merged back up.</p>
+
+<p>Two consequences follow from that description, and both matter more than the algorithm itself:</p>
+
+<ul>
+<li><strong>It needs a working array as large as the one you gave it.</strong> The merge step cannot
+be done in place, so sorting a 100 MB array allocates another 100 MB.</li>
+<li><strong>Below a threshold it does not parallelise at all.</strong> The JDK sets that cutoff at
+8,192 elements; under it, <code>parallelSort</code> simply calls the sequential sort. So on a small
+array the two methods are identical apart from one extra check.</li>
+</ul>
+
+<h2>Comparators and ranges</h2>
+
+<pre class="language-java"><code class="language-java">record Person(String name, int age) { }
+
+class Demo {
+    void run() {
+        Person[] people = {
+                new Person("Cy", 35),
+                new Person("Ana", 30),
+                new Person("Bo", 25)};
+
+        Arrays.parallelSort(people, Comparator.comparingInt(Person::age));
+        System.out.println(people[0].name());            // Bo
+
+        // Sort only part of an array — from inclusive, to exclusive
+        int[] numbers = {9, 8, 7, 3, 1, 2};
+        Arrays.parallelSort(numbers, 3, 6);
+        System.out.println(Arrays.toString(numbers));    // [9, 8, 7, 1, 2, 3]
+    }
+}
+</code></pre>
+
+<p>The comparator overload only exists for object arrays. Primitive arrays sort in natural order and
+there is no way to supply a comparator — if you need one, box to <code>Integer[]</code>, at which
+point you have probably lost whatever performance you were chasing.</p>
+
+<h2>When it is actually faster</h2>
+
+<p>Three conditions have to hold together, and if any one fails the sequential sort wins:</p>
+
+<table>
+<thead><tr><th>Condition</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><strong>Large array</strong> — tens of thousands of elements at least</td><td>below 8,192 it
+does not parallelise; just above, the coordination still costs more than it saves</td></tr>
+<tr><td><strong>Several idle cores</strong></td><td>on one core it is a slower merge sort; on a busy
+server the threads queue</td></tr>
+<tr><td><strong>Expensive comparisons, or primitives</strong></td><td>the win comes from doing real
+work in parallel, not from moving pointers</td></tr>
+</tbody>
+</table>
+
+<p>The condition people forget is the second. <code>parallelSort</code> uses the common
+<code>ForkJoinPool</code>, which is shared by every parallel stream in the JVM. Inside a web
+application handling concurrent requests, all your cores are already busy and there is nothing to
+parallelise into — you have added coordination overhead to a sort that was fine.</p>
+
+<h2>Measure it, do not assume</h2>
+
+<pre class="language-java"><code class="language-java">class Benchmark {
+    void compare(int size) {
+        int[] a = new int[size];
+        Random random = new Random(42);              // fixed seed: same data both times
+        for (int i = 0; i &lt; size; i++) {
+            a[i] = random.nextInt();
+        }
+        int[] b = Arrays.copyOf(a, a.length);
+
+        long t0 = System.nanoTime();
+        Arrays.sort(a);
+        long sequential = System.nanoTime() - t0;
+
+        long t1 = System.nanoTime();
+        Arrays.parallelSort(b);
+        long parallel = System.nanoTime() - t1;
+
+        System.out.println(size + ": sequential " + sequential / 1_000_000 + "ms, "
+                + "parallel " + parallel / 1_000_000 + "ms");
+    }
+}
+</code></pre>
+
+<p>Run that across a range of sizes on the machine that will run the code, and you will find the
+crossover point. It is usually somewhere in the tens of thousands, and it moves with the hardware —
+which is the real argument for measuring rather than memorising a number from a blog post.</p>
+
+<p>Note the fixed <code>Random</code> seed. Sorting is sensitive to the data: an already-sorted array
+behaves completely differently from a random one, so both runs must see the same input for the
+comparison to mean anything.</p>
+
+<h2>The other parallel array methods</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        // Fill an array from its index, in parallel
+        int[] squares = new int[10];
+        Arrays.parallelSetAll(squares, i -&gt; i * i);
+        System.out.println(Arrays.toString(squares));   // [0, 1, 4, 9, 16, ...]
+
+        // Running totals, in place
+        int[] values = {1, 2, 3, 4};
+        Arrays.parallelPrefix(values, Integer::sum);
+        System.out.println(Arrays.toString(values));    // [1, 3, 6, 10]
+    }
+}
+</code></pre>
+
+<p><code>parallelPrefix</code> is the unusual one — it turns an array into its running totals, and
+the operation you pass must be <strong>associative</strong>, because the pieces are combined in an
+unspecified order. <code>Integer::sum</code> is; subtraction is not, and passing it produces wrong
+answers rather than an error.</p>
+
+<h2>Thread safety</h2>
+
+<p>One thing the method does not do is make the array safe to touch while it is being sorted. The
+sort is parallel internally, but the array is still yours and nothing guards it:</p>
+
+<p>If another thread reads the array during a <code>parallelSort</code>, it sees a half-sorted
+state — not a stale snapshot, an inconsistent one. If another thread <em>writes</em> to it, the
+result is undefined and may not even be a permutation of what you started with. The same is true of
+<code>Arrays.sort</code>, but a parallel sort widens the window and makes the race far easier to
+hit.</p>
+
+<p>The fix is the ordinary one: do not share a mutable array across threads. Sort it before you
+publish it, or copy it first with <code>Arrays.copyOf</code> and sort the copy.</p>
+
+<h2>The rule</h2>
+
+<p>Use <code>Arrays.sort</code>. Reach for <code>parallelSort</code> only when you have a large array,
+a machine with cores to spare, and a measurement showing it helps. The single-word change is
+seductive precisely because it hides all three conditions.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-8-completablefuture">CompletableFuture</a> is next — running work off the
+calling thread deliberately, rather than hoping a library does it for you.</p>

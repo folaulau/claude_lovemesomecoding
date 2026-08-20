@@ -1,0 +1,175 @@
+<p>Most debugging is reading. The traceback usually contains the answer, and the fastest way to get
+better at this is to stop skimming it. This post covers reading one properly, then
+<code>breakpoint()</code>, logging, and the error messages that mean something specific.</p>
+
+<h2>Read the traceback from the bottom</h2>
+
+<pre class="language-bash"><code class="language-bash">Traceback (most recent call last):
+  File "bank.py", line 40, in &lt;module&gt;
+    main()
+  File "bank.py", line 31, in main
+    total = summarise(accounts)
+  File "bank.py", line 22, in summarise
+    return sum(a["balance"] for a in accounts)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyError: 'balance'
+</code></pre>
+
+<p>Three lines matter, in this order:</p>
+
+<ol>
+  <li><strong>The last line</strong> — what went wrong. <code>KeyError: 'balance'</code> means a dict
+      had no such key.</li>
+  <li><strong>The bottom frame</strong> — where. Line 22, inside <code>summarise</code>.</li>
+  <li><strong>The frames above</strong> — how you got there, oldest first.</li>
+</ol>
+
+<p>From 3.11 the <code>^^^^</code> markers underline the exact expression rather than the whole line,
+which matters on a line with three calls on it.</p>
+
+<p>When the bottom frame is inside a library, scan upwards for the topmost frame that is
+<em>your</em> code. That is nearly always where the fix belongs — the library is usually working
+correctly on the wrong input.</p>
+
+<h2>print, done properly</h2>
+
+<pre class="language-python"><code class="language-python">accounts = [{"type": "Checking", "balance": 1250}, {"type": "Savings"}]
+
+for i, account in enumerate(accounts):
+    print(f"{i=} {account=}")
+
+# Output: i=0 account={'type': 'Checking', 'balance': 1250}
+# Output: i=1 account={'type': 'Savings'}
+</code></pre>
+
+<p>There is nothing wrong with <code>print</code> debugging — it is fast and it always works. The
+<code>=</code> suffix in an f-string prints the expression <em>and</em> its value, so the label cannot
+drift out of step with the variable. It is strictly better than
+<code>print("account:", account)</code>.</p>
+
+<p>One line of that output already solves the <code>KeyError</code> above: the second account has no
+<code>balance</code> key.</p>
+
+<h2>breakpoint()</h2>
+
+<pre class="language-python"><code class="language-python">def summarise(accounts):
+    total = 0
+    for account in accounts:
+        # breakpoint()      &lt;- uncomment to stop here
+        total += account.get("balance", 0)
+    return total
+
+print(summarise([{"balance": 100}, {}]))     # Output: 100
+</code></pre>
+
+<p>Put <code>breakpoint()</code> on a line and the program stops there and drops you into a prompt with
+every local variable available. It is built in since 3.7 — no import, and it respects the
+<code>PYTHONBREAKPOINT</code> environment variable, so setting
+<code>PYTHONBREAKPOINT=0</code> disables every one of them without editing the code.</p>
+
+<p>Seven commands cover almost everything:</p>
+
+<table>
+  <thead><tr><th>Command</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>n</code></td><td>Next line, stepping over calls</td></tr>
+    <tr><td><code>s</code></td><td>Step into the call</td></tr>
+    <tr><td><code>c</code></td><td>Continue until the next breakpoint</td></tr>
+    <tr><td><code>l</code></td><td>List the code around here</td></tr>
+    <tr><td><code>p expr</code></td><td>Print an expression</td></tr>
+    <tr><td><code>w</code></td><td>Where — the current stack</td></tr>
+    <tr><td><code>q</code></td><td>Quit</td></tr>
+  </tbody>
+</table>
+
+<p>Anything that is not a command is evaluated as Python, so you can call functions and inspect objects
+at the point of failure. That is the advantage over <code>print</code>: you decide what to look at
+<em>after</em> seeing the state, rather than guessing in advance.</p>
+
+<p>To land in the debugger at the moment of a crash without editing anything, run
+<code>python3 -m pdb -c continue yourscript.py</code> — it runs normally and opens a prompt on the
+exception, with the failing frame's locals intact.</p>
+
+<h2>Logging instead of print</h2>
+
+<pre class="language-python"><code class="language-python">import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("bank")
+
+log.debug("not shown — level is INFO")
+log.info("signed in as %s", "alice@bank.test")
+log.warning("balance is low: %s", 4.20)
+
+# Output: INFO bank: signed in as alice@bank.test
+# Output: WARNING bank: balance is low: 4.2
+</code></pre>
+
+<p>Note those lines go to <strong>stderr</strong>, not stdout — that is the default, and it is why piping a script's output to a file can appear to lose every log line while the errors still show on your terminal.</p>
+
+<p>Once code leaves your machine, <code>print</code> stops being enough — you want a level, a timestamp
+and the ability to turn detail on without a redeploy. Logging gives you all three, and
+<code>basicConfig(level=...)</code> is the one dial.</p>
+
+<p>Note the commas rather than an f-string. <code>log.info("signed in as %s", email)</code> only builds
+the message if that level is enabled; <code>log.info(f"signed in as {email}")</code> formats it every
+time, including the thousands of debug lines you switched off.</p>
+
+<p>Inside an <code>except</code> block use <code>log.exception("...")</code>, which logs at error level
+<em>and</em> attaches the full traceback automatically.</p>
+
+<h2>Errors that mean something specific</h2>
+
+<table>
+  <thead><tr><th>Message</th><th>Almost always means</th></tr></thead>
+  <tbody>
+    <tr><td><code>'NoneType' object has no attribute 'x'</code></td>
+        <td>A function returned <code>None</code> — often one that mutates in place, like
+            <code>list.sort()</code></td></tr>
+    <tr><td><code>list indices must be integers, not str</code></td>
+        <td>You have a list where you expected a dict. Check what the parser returned</td></tr>
+    <tr><td><code>'dict' object is not callable</code></td>
+        <td><code>d(key)</code> instead of <code>d[key]</code></td></tr>
+    <tr><td><code>local variable 'x' referenced before assignment</code></td>
+        <td>You assigned to <code>x</code> somewhere in the function, so it is local everywhere in
+            it</td></tr>
+    <tr><td><code>takes 1 positional argument but 2 were given</code></td>
+        <td>A method missing <code>self</code> in its definition</td></tr>
+    <tr><td><code>ModuleNotFoundError</code> for something you installed</td>
+        <td>Wrong virtual environment, or the file is named after the module</td></tr>
+  </tbody>
+</table>
+
+<h2>Narrow it down before you look</h2>
+
+<p>When the traceback does not tell you enough, the fastest route is not more printing — it is a smaller
+problem:</p>
+
+<pre class="language-python"><code class="language-python">def summarise(accounts):
+    return sum(a["balance"] for a in accounts)
+
+rows = [{"balance": 100}, {"type": "Savings"}, {"balance": 250}]
+
+for i, row in enumerate(rows):
+    try:
+        summarise([row])
+    except KeyError as error:
+        print(f"row {i} is missing {error}")     # Output: row 1 is missing 'balance'
+</code></pre>
+
+<p>Feed the failing function one item at a time and the guilty input names itself. The same instinct
+scales: halve the input, halve the code path, comment out half the pipeline. Bisecting beats staring.</p>
+
+<p>If it worked yesterday, <code>git bisect</code> does exactly this over commits and will find the one
+that broke it in a handful of steps.</p>
+
+<h2>Two habits worth having</h2>
+
+<p><strong>Reproduce it first.</strong> A bug you can trigger on demand is nearly fixed; one you cannot
+is a rumour. Getting to a reliable reproduction is usually most of the work.</p>
+
+<p><strong>Then write the test.</strong> Turn the reproduction into a
+<a href="/python/python-testing">test</a> that fails, and fix it until the test passes. You get a
+verified fix and a permanent guard against the bug returning, for about a minute of extra effort.</p>
+
+<p>Next: <a href="/python/python-best-practices">Best Practices</a>.</p>

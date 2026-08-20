@@ -1,0 +1,175 @@
+<p>A module is a <code>.py</code> file. A package is a directory of them. That is the whole vocabulary —
+everything else in this post is about what <code>import</code> really does and why circular imports
+happen.</p>
+
+<h2>A module is a file</h2>
+
+<p>Given <code>money.py</code> next to your script:</p>
+
+<pre class="language-python"><code class="language-python">from pathlib import Path
+
+Path("money.py").write_text(
+    'CENTS = 2\n'
+    'def format_money(value):\n'
+    '    return f"${value:,.{CENTS}f}"\n',
+    encoding="utf-8",
+)
+
+import money
+
+print(money.CENTS)                 # Output: 2
+print(money.format_money(1250))    # Output: $1,250.00
+</code></pre>
+
+<p>The file name without <code>.py</code> is the module name. Importing it runs the file once and gives
+you an object whose attributes are everything defined in it.</p>
+
+<p>"Once" is important: a second <code>import money</code> anywhere in the program does not re-run it.
+Python caches modules in <code>sys.modules</code>, so top-level code in a module executes exactly one
+time no matter how many files import it.</p>
+
+<h2>The four forms of import</h2>
+
+<pre class="language-python"><code class="language-python">import json                          # json.dumps(...)
+import json as j                     # j.dumps(...)
+from decimal import Decimal          # Decimal(...)
+from decimal import Decimal as D     # D(...)
+
+print(json.dumps({"a": 1}))          # Output: {"a": 1}
+print(D("0.1") + Decimal("0.2"))     # Output: 0.3
+</code></pre>
+
+<p><code>import x</code> keeps the namespace, so the reader can see where <code>dumps</code> came from.
+<code>from x import y</code> is shorter and worth it for something you use constantly.</p>
+
+<p>What you should not write is <code>from module import *</code>. It dumps every public name into your
+file, so you cannot tell what came from where, and a name added to that module later can silently
+shadow one of yours.</p>
+
+<h2>Where Python looks</h2>
+
+<pre class="language-python"><code class="language-python">import sys
+import json
+
+print(isinstance(sys.path, list))     # Output: True
+print("json" in sys.modules)          # Output: True
+print("sqlite3" in sys.modules)       # Output: False
+</code></pre>
+
+<p>The last two lines show the cache: <code>json</code> is in <code>sys.modules</code> because the line
+above imported it, and <code>sqlite3</code> is not because nothing has. Importing <code>json</code>
+again anywhere in this program would find it there and skip the file entirely.</p>
+
+<p><code>sys.path</code> is the list of directories searched, in order: the script's own directory
+first, then any <code>PYTHONPATH</code> entries, then the standard library, then site-packages.</p>
+
+<p>First in that list is the cause of the classic beginner trap. Name a file <code>random.py</code> or
+<code>json.py</code> and your file wins over the standard library one — every import of it, anywhere in
+the program, now gets yours. The symptom is a baffling <code>AttributeError</code> on a function you
+know exists. Do not name files after standard library modules.</p>
+
+<h2>Packages</h2>
+
+<pre class="language-bash"><code class="language-bash">bank/
+    __init__.py        # marks the directory as a package
+    money.py
+    models.py
+    stores.py
+    services.py
+</code></pre>
+
+<p>Then <code>from bank.money import format_money</code>, or <code>from bank import money</code>. The
+dots follow the directories.</p>
+
+<p><code>__init__.py</code> runs when the package is first imported and is usually empty. Its other use
+is deciding the package's public surface — putting <code>from .money import format_money</code> in it
+lets callers write <code>from bank import format_money</code> without knowing which file it lives in.</p>
+
+<p>Inside a package, use relative imports: <code>from .money import format_money</code> means "from the
+money module beside me". One dot is this package, two dots is the parent. They make the package movable
+and renameable without editing every file in it.</p>
+
+<h2>The __main__ guard</h2>
+
+<pre class="language-python"><code class="language-python">from pathlib import Path
+
+Path("report.py").write_text(
+    'def build():\n'
+    '    return "report"\n'
+    '\n'
+    'print("module-level code runs on import")\n'
+    '\n'
+    'if __name__ == "__main__":\n'
+    '    print("only when run directly")\n',
+    encoding="utf-8",
+)
+
+import report
+print(report.build())
+
+# Output: module-level code runs on import
+# Output: report
+</code></pre>
+
+<p><code>__name__</code> is <code>"__main__"</code> when the file is run directly and the module's own
+name when it is imported. So the guarded block ran nowhere above — the file was imported, not run.</p>
+
+<p>Without the guard, every module's top-level code fires the instant anyone imports it. That is how a
+utility module ends up starting a web server because someone wanted one function out of it. Put
+anything that <em>does</em> something behind the guard; leave definitions outside it.</p>
+
+<h2>Circular imports</h2>
+
+<p>Two modules that import each other. Python starts loading <code>a</code>, hits
+<code>import b</code>, starts loading <code>b</code>, which hits <code>import a</code> — and gets the
+half-finished <code>a</code> from the cache, missing whatever had not been defined yet. The error is
+<code>ImportError: cannot import name 'x' from partially initialized module</code>.</p>
+
+<p>There are three fixes and only one is good:</p>
+
+<ul>
+  <li><strong>Extract the shared thing.</strong> Whatever both modules need goes in a third module they
+      both import. This is the real fix, because a cycle almost always means a missing module.</li>
+  <li><strong>Import inside the function</strong> rather than at the top. Works, and hides the
+      dependency somewhere nobody reads.</li>
+  <li><strong>Import the module, not the name</strong> — <code>import b</code> then
+      <code>b.thing()</code>, which defers the lookup until call time.</li>
+</ul>
+
+<p>A circular import is a design problem wearing a syntax error's clothing. Reach for the first fix.</p>
+
+<h2>Installing packages</h2>
+
+<pre class="language-bash"><code class="language-bash">python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+pip install requests
+pip freeze &gt; requirements.txt    # record exact versions
+pip install -r requirements.txt  # reproduce them elsewhere
+</code></pre>
+
+<p>Always inside a virtual environment, one per project. Installing globally means two projects that
+need different versions of the same library will eventually fight, and the loser is whichever you
+touched last.</p>
+
+<p><code>pip freeze</code> pins exact versions, which is what makes an environment reproducible on
+someone else's machine. Commit <code>requirements.txt</code>; never commit <code>.venv/</code>.</p>
+
+<h2>Laying out a small project</h2>
+
+<pre class="language-bash"><code class="language-bash">myproject/
+    bank/                # the package — your code
+        __init__.py
+        money.py
+    tests/               # mirrors the package
+        test_money.py
+    requirements.txt
+    README.md
+</code></pre>
+
+<p>Run it as <code>python3 -m bank</code> rather than <code>python3 bank/__main__.py</code> — the
+<code>-m</code> form sets up the package correctly, so relative imports work. Running a file inside a
+package directly is the other common source of "attempted relative import with no known parent
+package".</p>
+
+<p>Next: <a href="/python/python-async">Async &amp; Await</a>.</p>

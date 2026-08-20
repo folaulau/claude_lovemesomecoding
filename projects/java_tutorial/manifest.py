@@ -36,12 +36,32 @@ CATEGORY = {
 # to the display name "Java" under the "Java" group.
 NAV_GROUP = "Java"
 
-# Unlike the sibling tracks, snippets here are NOT lifted from the demo app.
-# `int count = 0;` has no business being traced back to a pizza ordering API, and
-# forcing it there would make every basics post read like framework code. The
-# trade is that nothing external vouches for the samples, so `check_snippets.py`
-# compiles every block with javac instead. See progress_report.md.
-DEMO_APP = None
+# Folau, 2026-08-20: draw examples from the console bank app. He first pointed at
+# `bank/bank-python-console` — the Python twin — and confirmed the Java one is
+# what a Java tutorial should quote. The two are kept at parity over the same CSV
+# files by `bank/parity.sh`.
+#
+# This app is a far better fit than the pizza Spring Boot backend the sibling
+# tracks use: it is plain Java 21 with no framework, no build tool and no
+# database, and its own README says teachability outranks cleverness. A basics
+# post can quote it without the result reading like framework code.
+DEMO_APP = "lovemesomecoding_demo_project/bank/bank-java-console"
+
+# Which posts quote it, and which deliberately do not. The app has NO interfaces
+# and NO sealed types, so posts 13 and 24 are standalone by necessity, not choice
+# — do not go looking for source to cite there. The pure-syntax posts (variables,
+# operators, loops, packages) are standalone because a banking domain would add
+# noise to `i++`, not insight.
+#
+# A quoted block is marked `<!-- from: <path relative to DEMO_APP> -->` and is
+# verified by check_provenance.py rather than compiled by check_snippets.py — a
+# method lifted out of its class cannot compile alone. See progress_report.md.
+QUOTES_DEMO_APP = [
+    "java-data-types", "java-string", "java-conditional-statements", "java-class",
+    "java-oop", "java-static-and-final-keywords", "java-collections",
+    "java-exception-handling", "java-date", "java-stream", "java-method-reference",
+    "java-optional", "java-record", "java-best-practices",
+]
 
 # Stated on the get-started page and assumed by every other post.
 #

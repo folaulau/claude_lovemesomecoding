@@ -1,0 +1,161 @@
+<p>Java 11 is the upgrade that breaks things. Not because the language changed — it barely did — but
+because Java 11 removed several modules that had been part of the JDK since the 1990s. Most upgrades
+from 8 fail for the same handful of reasons, and they are all fixable.</p>
+
+<h2>Why this one hurts</h2>
+
+<p>Java 9 introduced the module system and split the monolithic JDK into named modules. Anything
+tagged as "Java EE or CORBA" was deprecated for removal, and Java 11 removed it. Code that had
+compiled unchanged for fifteen years suddenly could not find classes it had always found.</p>
+
+<p>The upgrade is worth doing anyway: Java 8 has been out of free public support for years, and
+almost every library you depend on has moved on.</p>
+
+<h2>The removed Java EE modules</h2>
+
+<p>This is the big one. Six packages left the JDK:</p>
+
+<table>
+<thead><tr><th>Gone</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><code>java.xml.bind</code> (JAXB)</td><td><code>NoClassDefFoundError:
+javax/xml/bind/JAXBContext</code></td><td>add <code>jakarta.xml.bind-api</code> +
+<code>jaxb-runtime</code></td></tr>
+<tr><td><code>java.activation</code></td><td><code>javax/activation/DataSource</code></td><td>add
+<code>jakarta.activation</code></td></tr>
+<tr><td><code>java.xml.ws</code> (JAX-WS)</td><td><code>javax/xml/ws/*</code></td><td>add
+<code>jakarta.xml.ws-api</code></td></tr>
+<tr><td><code>java.xml.ws.annotation</code></td><td><code>javax/annotation/PostConstruct</code></td><td>add
+<code>jakarta.annotation-api</code></td></tr>
+<tr><td><code>java.transaction</code></td><td><code>javax/transaction/*</code></td><td>add
+<code>jakarta.transaction-api</code></td></tr>
+<tr><td><code>java.corba</code></td><td>CORBA classes</td><td>no replacement — rewrite</td></tr>
+</tbody>
+</table>
+
+<p>The pattern is the same each time: what was in the JDK is now an ordinary dependency you declare.
+The classes are unchanged, so adding the artifact is usually the whole fix.</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- The two that come up most often --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;jakarta.xml.bind&lt;/groupId&gt;
+    &lt;artifactId&gt;jakarta.xml.bind-api&lt;/artifactId&gt;
+    &lt;version&gt;4.0.2&lt;/version&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;jakarta.annotation&lt;/groupId&gt;
+    &lt;artifactId&gt;jakarta.annotation-api&lt;/artifactId&gt;
+    &lt;version&gt;3.0.0&lt;/version&gt;
+&lt;/dependency&gt;
+</code></pre>
+
+<p>One trap: the <code>javax.*</code> to <code>jakarta.*</code> rename. Older versions of these
+artifacts still use <code>javax.*</code> package names and are drop-in; the modern
+<code>jakarta.*</code> ones require changing your imports. Pick one and be consistent — mixing them
+produces a classpath where two identically-named classes exist in different packages.</p>
+
+<h2>JavaFX and Nashorn</h2>
+
+<p><strong>JavaFX</strong> left the JDK in Java 11 and became a separate project, OpenJFX. Desktop
+applications need it added as a dependency and usually as a plugin too, since it ships
+platform-specific native libraries.</p>
+
+<p><strong>Nashorn</strong>, the JavaScript engine, was deprecated in 11 and removed in 15. Code
+calling <code>new ScriptEngineManager().getEngineByName("nashorn")</code> gets <code>null</code> back
+rather than an error, so it fails as a <code>NullPointerException</code> somewhere later. The
+replacement is GraalJS, or reconsidering why the application evaluates JavaScript at all.</p>
+
+<h2>Warnings that become errors</h2>
+
+<pre class="language-bash"><code class="language-bash"># Reflective access into JDK internals: a warning in 9-16, an error from 17
+WARNING: An illegal reflective access operation has occurred
+WARNING: Illegal reflective access by com.example.Something to field java.lang.String.value
+</code></pre>
+
+<p>Do not ignore these. On Java 11 they are warnings and everything still works; on Java 17 the same
+call throws <code>InaccessibleObjectException</code>. The libraries that caused this — older
+Hibernate, Spring, Mockito, Lombok — all have versions that do not, so the fix is almost always a
+dependency upgrade rather than a code change.</p>
+
+<p><code>--add-opens</code> will silence it as a stopgap, and treating that as the solution is how a
+Java 17 upgrade becomes painful two years later.</p>
+
+<h2>A migration order that works</h2>
+
+<ol>
+<li><strong>Upgrade your build tool and plugins first, on Java 8.</strong> Old Maven compiler,
+Surefire and Shade plugins do not understand Java 11 and produce confusing failures. Get them current
+before changing the JDK.</li>
+<li><strong>Upgrade dependencies next, still on Java 8.</strong> Most Java 11 problems are a
+library's problem, already fixed upstream. Doing this separately means a failure has one possible
+cause.</li>
+<li><strong>Then switch the JDK</strong> and set the release level:</li>
+</ol>
+
+<pre class="language-xml"><code class="language-xml">&lt;properties&gt;
+    &lt;maven.compiler.release&gt;11&lt;/maven.compiler.release&gt;
+&lt;/properties&gt;
+</code></pre>
+
+<p>Use <code>release</code> rather than <code>source</code> and <code>target</code>. It additionally
+checks that you only call APIs that exist in that version, which <code>source</code>/<code>target</code>
+does not — with those, code compiles against the newer JDK's API and then fails at runtime on the
+older one.</p>
+
+<ol start="4">
+<li><strong>Run <code>jdeps</code></strong> to find removed-module usage before you hit it at
+runtime:</li>
+</ol>
+
+<pre class="language-bash"><code class="language-bash">jdeps --jdk-internals --multi-release 11 target/myapp.jar
+</code></pre>
+
+<p>It reports every dependency on an internal or removed API, which is a far better list than
+discovering them one <code>NoClassDefFoundError</code> at a time.</p>
+
+<h2>Smaller things that also changed</h2>
+
+<p>A short list of deprecations and behaviour changes that produce confusing symptoms rather than
+clean errors:</p>
+
+<ul>
+<li><strong><code>Thread.stop</code>, <code>Thread.suspend</code> and <code>Thread.resume</code></strong>
+were already deprecated and now throw. Anything relying on them needs a real cancellation mechanism —
+an interrupt flag, or a volatile boolean the loop checks.</li>
+<li><strong>The default garbage collector changed</strong> to G1 in Java 9. If you had tuned flags
+for Parallel or CMS, those flags may now be unrecognised, and an unrecognised GC flag stops the JVM
+from starting at all.</li>
+<li><strong>Applets and Web Start are gone.</strong> There is no migration path; those applications
+need rewriting as something else.</li>
+<li><strong>The version string format changed.</strong> <code>1.8.0_292</code> became
+<code>11.0.2</code>, so any code parsing <code>System.getProperty("java.version")</code> with an
+assumption about a leading <code>1.</code> will misread it. Use
+<code>Runtime.version()</code> instead:</li>
+</ul>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        Runtime.Version version = Runtime.version();
+        System.out.println(version.feature());     // 21 — the major version, as an int
+        System.out.println(version);               // the full version string
+    }
+}
+</code></pre>
+
+<h2>What you get</h2>
+
+<p>Worth remembering while fixing the fifth <code>NoClassDefFoundError</code>: the
+<a href="/java/java-11-string-methods">new String methods</a>, <code>var</code>, the
+<a href="/java/java-11-httpclient">HttpClient</a>, <a href="/java/java-11-api-improvements">a dozen
+API conveniences</a>, <a href="/java/java-11-single-file-execution">single-file execution</a>, and
+significantly better garbage collectors — G1 became the default in 9, and container awareness landed
+so the JVM stops ignoring the memory limit on its Docker container.</p>
+
+<p>That last one alone justifies the upgrade for anything running in Kubernetes. A Java 8 JVM in a
+container sizes its heap from the host's total memory, not the cgroup limit, which is why so many
+Java 8 containers were killed for exceeding it.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-17-records">Records</a> is next, opening the Java 17 section — where the
+language starts changing again in earnest.</p>

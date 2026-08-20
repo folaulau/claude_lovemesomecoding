@@ -1,0 +1,201 @@
+<p>Python has no checked exceptions. Nothing forces you to handle anything, which makes the decisions
+about <em>what</em> to catch entirely yours. This post covers the mechanics and the judgement.</p>
+
+<h2>try and except</h2>
+
+<pre class="language-python"><code class="language-python">def parse_amount(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+print(parse_amount("15.50"))     # Output: 15.5
+print(parse_amount("fifteen"))   # Output: None
+</code></pre>
+
+<p>Code that might fail goes in <code>try</code>; the recovery goes in <code>except</code>. Name the
+exception you expect — that is the whole discipline. If something other than <code>ValueError</code>
+happens, it propagates, which is what you want for a bug you have not thought about.</p>
+
+<h2>Never write a bare except</h2>
+
+<pre class="language-python"><code class="language-python">def total(rows):
+    try:
+        return sum(float(r) for r in rows)
+    except:                      # catches EVERYTHING
+        return 0
+
+print(total(["1", "2"]))         # Output: 3.0
+print(total(None))               # Output: 0
+</code></pre>
+
+<p>The second call did not fail because of bad data — <code>None</code> is not iterable, which is a
+programming mistake. The bare <code>except</code> turned it into <code>0</code> and the program carried
+on with a wrong total.</p>
+
+<p>A bare <code>except</code> also catches <code>KeyboardInterrupt</code>, so <kbd>Ctrl-C</kbd> stops
+working. If you genuinely must catch broadly, use <code>except Exception</code>, which at least excludes
+the ones that mean "stop the program" — and log it rather than swallowing it.</p>
+
+<h2>Catching more than one</h2>
+
+<pre class="language-python"><code class="language-python">import json
+
+def load(text):
+    try:
+        return json.loads(text)["balance"]
+    except (json.JSONDecodeError, KeyError) as error:
+        return f"bad input: {type(error).__name__}"
+
+print(load('{"balance": 100}'))     # Output: 100
+print(load('not json'))             # Output: bad input: JSONDecodeError
+print(load('{"other": 1}'))         # Output: bad input: KeyError
+</code></pre>
+
+<p>A tuple handles several the same way; separate <code>except</code> blocks handle them differently.
+<code>as error</code> binds the exception object so you can inspect or log it.</p>
+
+<p>Order matters: <code>except</code> blocks are tried top to bottom and the first matching one wins, so
+a broad type above a narrow one makes the narrow one unreachable.</p>
+
+<h2>else and finally</h2>
+
+<pre class="language-python"><code class="language-python">def withdraw(balance, amount):
+    try:
+        amount = float(amount)
+    except ValueError:
+        print("not a number")
+    else:
+        print(f"withdrawing {amount}")      # only if nothing raised
+    finally:
+        print("done")                       # always
+
+withdraw(100, "25")
+withdraw(100, "abc")
+
+# Output: withdrawing 25.0
+# Output: done
+# Output: not a number
+# Output: done
+</code></pre>
+
+<p><code>else</code> runs only when the <code>try</code> succeeded. Its value is keeping the
+<code>try</code> block down to the one line that might fail — anything else in there could raise the
+same exception and be caught by mistake.</p>
+
+<p><code>finally</code> always runs, exception or not, return or not. It is for cleanup. In practice
+<code>with</code> replaces most uses of it, which is the <a href="/python/python-fileread-write">next
+post</a>.</p>
+
+<h2>Raising your own</h2>
+
+<pre class="language-python"><code class="language-python">class InsufficientFundsError(Exception):
+    def __init__(self, requested, available):
+        super().__init__(
+            f"Insufficient funds: asked for ${requested:,.2f}, "
+            f"only ${available:,.2f} available."
+        )
+        self.requested = requested
+        self.available = available
+
+    @property
+    def shortfall(self):
+        return self.requested - self.available
+
+try:
+    raise InsufficientFundsError(250, 100)
+except InsufficientFundsError as error:
+    print(error)             # Output: Insufficient funds: asked for $250.00, only $100.00 available.
+    print(error.shortfall)   # Output: 150
+</code></pre>
+
+<p>Subclass <code>Exception</code>, never <code>BaseException</code>. Calling
+<code>super().__init__(message)</code> is what makes <code>str(error)</code> work — forget it and your
+exception prints as an empty string.</p>
+
+<p>Carrying the numbers as attributes means a caller that wants them does not have to parse your
+message. That is the difference between an exception that reports and one that can be handled.</p>
+
+<h2>A base class per application</h2>
+
+<p>The bank app defines one root so a single <code>except</code> catches every rule it enforces:</p>
+
+<!-- from: bank/errors.py -->
+<pre class="language-python"><code class="language-python">class BankError(Exception):
+    ...
+
+class AuthenticationError(BankError):
+    ...
+
+class InsufficientFundsError(BankError):
+    ...
+</code></pre>
+
+<p><code>except BankError</code> at the menu catches every deliberate failure and nothing else. Without
+the shared base you either list every subclass or fall back to <code>except Exception</code>, which
+swallows your own bugs along with them.</p>
+
+<h2>raise ... from</h2>
+
+<p>When you catch a low-level error and re-raise a meaningful one, keep the original attached:</p>
+
+<pre class="language-python"><code class="language-python">from decimal import Decimal, InvalidOperation
+
+def parse_money(text):
+    try:
+        return Decimal(text)
+    except InvalidOperation as error:
+        raise ValueError(f"'{text}' is not an amount") from error
+
+try:
+    parse_money("abc")
+except ValueError as error:
+    print(error)                        # Output: 'abc' is not an amount
+    print(type(error.__cause__).__name__)   # Output: InvalidOperation
+</code></pre>
+
+<p>The caller gets an error in their own vocabulary; the traceback still shows what really happened,
+under "The above exception was the direct cause of the following exception".</p>
+
+<p>Leave out <code>from error</code> and Python prints "During handling of the above exception, another
+exception occurred" — a subtly different message meaning the second error was accidental. Say which one
+you meant.</p>
+
+<h2>Reading the traceback</h2>
+
+<p>An uncaught exception prints a traceback, and it is the most useful thing on your screen. Read it
+<strong>from the bottom up</strong>:</p>
+
+<pre class="language-bash"><code class="language-bash">Traceback (most recent call last):
+  File "bank.py", line 40, in &lt;module&gt;
+    main()
+  File "bank.py", line 31, in main
+    withdraw(account, "abc")
+  File "bank.py", line 22, in withdraw
+    amount = float(text)
+             ^^^^^^^^^^^
+ValueError: could not convert string to float: 'abc'
+</code></pre>
+
+<p>The last line is what went wrong. The block above it is the call chain that got there, oldest at the
+top — so the frame just above the error is the line that actually failed, and the frames above that are
+how you arrived. From 3.11 the <code>^^^^</code> markers underline the exact expression, not just the
+line.</p>
+
+<p>The habit worth building is to read the final line first, then scan upwards for the topmost frame
+that is <em>your</em> code rather than a library's. That is nearly always where the fix belongs.</p>
+
+<h2>What not to catch</h2>
+
+<p>The reflex to wrap everything in <code>try</code> is worth resisting. An exception you cannot do
+anything useful about should travel — the traceback that reaches you is far more informative than a
+<code>None</code> returned from three functions down.</p>
+
+<p>Catch when you have a genuine recovery: a default to fall back on, a message to show the user, a
+retry to attempt. Otherwise let it raise.</p>
+
+<p>Python's habit is to try the operation rather than check first — "easier to ask forgiveness than
+permission". <code>float(text)</code> in a <code>try</code> is more idiomatic than a regex that predicts
+whether it will work, because the conversion is the authority on that question.</p>
+
+<p>Next: <a href="/python/python-fileread-write">File (read/write)</a>.</p>

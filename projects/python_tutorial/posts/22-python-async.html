@@ -1,0 +1,209 @@
+<p><code>async</code> and <code>await</code> let one thread handle thousands of operations that are
+mostly spent waiting. Whether they help you at all comes down to one question, so this post starts
+there.</p>
+
+<h2>The question that decides everything</h2>
+
+<p><strong>Is the work waiting, or computing?</strong></p>
+
+<ul>
+  <li><strong>I/O-bound</strong> — network calls, database queries, reading files, talking to an API.
+      The CPU is idle while something else takes its time. <strong>async helps, a lot.</strong></li>
+  <li><strong>CPU-bound</strong> — parsing, resizing images, crunching numbers. The CPU is the thing
+      that is busy. <strong>async does nothing.</strong> Use
+      <code>multiprocessing</code>.</li>
+</ul>
+
+<p>async is not parallelism. It is one thread that stops working on a task the moment that task starts
+waiting, and picks up another. If nothing ever waits, there is nothing to switch to and you have added
+syntax for no gain.</p>
+
+<h2>Coroutines</h2>
+
+<pre class="language-python"><code class="language-python">import asyncio
+
+async def fetch(name):
+    await asyncio.sleep(0.01)        # stands in for a network call
+    return f"got {name}"
+
+result = fetch("accounts")
+print(type(result).__name__)         # Output: coroutine
+
+print(asyncio.run(fetch("accounts")))   # Output: got accounts
+</code></pre>
+
+<p><code>async def</code> makes a coroutine function. <strong>Calling it does not run it</strong> — it
+returns a coroutine object, as the third line shows. Something has to drive it.</p>
+
+<p><code>asyncio.run()</code> is that something. It starts an event loop, runs the coroutine to
+completion, and shuts down. One call, at the top of your program, and never inside a coroutine.</p>
+
+<p>Forgetting to await is the characteristic beginner bug, and Python warns about it:
+<code>RuntimeWarning: coroutine 'fetch' was never awaited</code>. If you see that, you called a
+coroutine and threw the result away.</p>
+
+<h2>await</h2>
+
+<pre class="language-python"><code class="language-python">import asyncio
+
+async def fetch(name, delay):
+    await asyncio.sleep(delay)
+    return name
+
+async def main():
+    first = await fetch("accounts", 0.01)
+    second = await fetch("transactions", 0.01)
+    return [first, second]
+
+print(asyncio.run(main()))     # Output: ['accounts', 'transactions']
+</code></pre>
+
+<p><code>await</code> means "suspend here, let the loop run something else, resume when this is done".
+It may only appear inside an <code>async def</code>.</p>
+
+<p>But look carefully at what this does: the second fetch does not start until the first has finished.
+Two awaits in a row are <strong>sequential</strong>. Writing <code>async</code> everywhere and then
+awaiting one thing at a time gives you all of the complexity and none of the speed.</p>
+
+<h2>Doing things at the same time</h2>
+
+<pre class="language-python"><code class="language-python">import asyncio
+import time
+
+async def fetch(name, delay):
+    await asyncio.sleep(delay)
+    return name
+
+async def sequential():
+    return [await fetch("a", 0.1), await fetch("b", 0.1)]
+
+async def concurrent():
+    return await asyncio.gather(fetch("a", 0.1), fetch("b", 0.1))
+
+for coro in (sequential(), concurrent()):
+    started = time.perf_counter()
+    result = asyncio.run(coro)
+    elapsed = time.perf_counter() - started
+    print(result, "took about", round(elapsed, 1), "seconds")
+
+# Output: ['a', 'b'] took about 0.2 seconds
+# Output: ['a', 'b'] took about 0.1 seconds
+</code></pre>
+
+<p>Same work, half the time. <code>gather()</code> starts everything at once and waits for all of it,
+returning results in the order you passed them in — not the order they finished.</p>
+
+<p>This is the point of async, and it is worth being blunt about it: <strong>if your code has no
+<code>gather</code> or task group in it, async is almost certainly buying you nothing.</strong></p>
+
+<h2>Task groups</h2>
+
+<pre class="language-python"><code class="language-python">import asyncio
+
+async def fetch(name):
+    await asyncio.sleep(0.01)
+    return f"got {name}"
+
+async def main():
+    async with asyncio.TaskGroup() as group:
+        a = group.create_task(fetch("accounts"))
+        b = group.create_task(fetch("transactions"))
+    return [a.result(), b.result()]
+
+print(asyncio.run(main()))
+# Output: ['got accounts', 'got transactions']
+</code></pre>
+
+<p><code>TaskGroup</code> arrived in 3.11 and is the modern replacement for <code>gather</code>. The
+<code>async with</code> block does not exit until every task in it is finished, and if one raises, the
+others are cancelled and the error propagates.</p>
+
+<p><code>gather</code> by default does the opposite — one failure leaves the others running orphaned,
+which is a leak. Prefer <code>TaskGroup</code> for new code on 3.11 and later.</p>
+
+<h2>The blocking call that ruins it</h2>
+
+<pre class="language-python"><code class="language-python">import asyncio
+import time
+
+async def bad():
+    time.sleep(0.05)          # BLOCKS the whole event loop
+    return "done"
+
+async def good():
+    await asyncio.sleep(0.05)  # yields to the loop
+    return "done"
+
+async def main():
+    started = time.perf_counter()
+    await asyncio.gather(bad(), bad())
+    blocked = time.perf_counter() - started
+
+    started = time.perf_counter()
+    await asyncio.gather(good(), good())
+    yielded = time.perf_counter() - started
+
+    return round(blocked, 1), round(yielded, 1)
+
+print(asyncio.run(main()))     # Output: (0.1, 0.1)
+</code></pre>
+
+<p>Look at the numbers: <code>gather</code> made no difference to the blocking version, because
+<code>time.sleep</code> stops the entire event loop rather than yielding to it. Nothing else in the
+program runs — not the other task, not a web request, nothing.</p>
+
+<p>This is the failure mode that catches people in production. One ordinary library call — the
+<code>requests</code> library, a database driver that is not async, a synchronous file read — freezes
+every concurrent operation in the process. The rules:</p>
+
+<ul>
+  <li>Use async-aware libraries in async code: <code>httpx</code> or <code>aiohttp</code>, not
+      <code>requests</code>.</li>
+  <li>Never <code>time.sleep()</code> in a coroutine. <code>await asyncio.sleep()</code>.</li>
+  <li>When you must call something blocking, push it to a thread:
+      <code>await asyncio.to_thread(slow_function, arg)</code>.</li>
+</ul>
+
+<h2>What it looks like in real code</h2>
+
+<p>Everything above used <code>asyncio.sleep</code> to stand in for real waiting. This is the shape with
+an actual HTTP client — it needs <code>pip install httpx</code>, so it is not executed here:</p>
+
+<!-- norun -->
+<pre class="language-python"><code class="language-python">import asyncio
+import httpx
+
+async def fetch(client, url):
+    response = await client.get(url)
+    return url, response.status_code
+
+async def main(urls):
+    async with httpx.AsyncClient(timeout=10) as client:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(fetch(client, u)) for u in urls]
+    return [t.result() for t in tasks]
+
+results = asyncio.run(main([
+    "https://example.com",
+    "https://example.org",
+]))
+</code></pre>
+
+<p>Two <code>async with</code> blocks, nested for different reasons. The outer one manages the client's
+connection pool — sharing one client across every request is what makes this fast, and creating a fresh
+client per request throws that away. The inner one is the task group.</p>
+
+<p>Fifty URLs there take roughly as long as the slowest one rather than the sum of all fifty, and that
+ratio is the entire reason to write any of this.</p>
+
+<h2>Should you use it</h2>
+
+<p>Async is genuinely infectious: a coroutine can only be awaited by another coroutine, so one async
+function tends to turn the call chain above it async as well. That cost is real and worth paying only
+when you are doing many things that wait.</p>
+
+<p>Reach for it when you are making hundreds of network calls, writing a web service that talks to other
+services, or handling many slow connections at once. Skip it for a script that makes three HTTP requests
+— threads are simpler, or just do them in order.</p>
+
+<p>Next: <a href="/python/python-testing">Testing</a>.</p>

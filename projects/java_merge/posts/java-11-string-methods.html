@@ -1,0 +1,198 @@
+<p>Java 11 added five small <code>String</code> methods. None of them is clever, and together they
+delete a surprising amount of the utility code every project used to carry — the null-and-whitespace
+check, the manual line splitter, the loop that repeats a character.</p>
+
+<h2><code>isBlank()</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        System.out.println("".isEmpty());        // true
+        System.out.println("   ".isEmpty());     // false — three characters is not empty
+        System.out.println("   ".isBlank());     // true  — but it is blank
+        System.out.println("\t\n ".isBlank());   // true  — tabs and newlines count
+        System.out.println("a".isBlank());       // false
+    }
+}
+</code></pre>
+
+<p><code>isBlank()</code> is what people usually mean when they reach for <code>isEmpty()</code>. A
+form field containing three spaces is empty as far as your user is concerned, and
+<code>isEmpty()</code> disagrees.</p>
+
+<p>The everyday check, still needing its own null guard:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    boolean hasContent(String value) {
+        return value != null &amp;&amp; !value.isBlank();
+    }
+}
+</code></pre>
+
+<h2><code>strip()</code> and friends</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String padded = "  hello  ";
+
+        System.out.println("[" + padded.strip() + "]");          // [hello]
+        System.out.println("[" + padded.stripLeading() + "]");   // [hello  ]
+        System.out.println("[" + padded.stripTrailing() + "]");  // [  hello]
+    }
+}
+</code></pre>
+
+<p>These replace <code>trim()</code>, and the difference is not cosmetic. <code>trim()</code> was
+written in 1995 and removes any character with a code below U+0020 — a definition that predates
+Unicode having opinions about whitespace. It does not remove a non-breaking space, an em space, or an
+ideographic space, all of which arrive routinely from copy-paste and from Word documents:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String nbsp = " hello ";       // non-breaking spaces
+
+        System.out.println("[" + nbsp.trim() + "]");    // [ hello ] — unchanged
+        System.out.println("[" + nbsp.strip() + "]");   // [hello]
+    }
+}
+</code></pre>
+
+<p><code>strip()</code> uses <code>Character.isWhitespace</code>, which knows about all of it.
+<strong>Use <code>strip()</code> in new code and treat <code>trim()</code> as legacy.</strong> The one
+exception is if you specifically need the old behaviour for compatibility with something that already
+depends on it.</p>
+
+<h2><code>lines()</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String text = "first\nsecond\r\nthird\n";
+
+        text.lines().forEach(System.out::println);       // first, second, third
+
+        long count = text.lines().count();
+        System.out.println(count);                        // 3 — the trailing newline is not a line
+
+        List&lt;String&gt; nonEmpty = text.lines()
+                .map(String::strip)
+                .filter(s -&gt; !s.isBlank())
+                .toList();
+        System.out.println(nonEmpty.size());              // 3
+    }
+}
+</code></pre>
+
+<p>It returns a <code>Stream&lt;String&gt;</code>, not an array, so filtering and mapping follow
+naturally. It also handles all three line-ending conventions — <code>\n</code>, <code>\r\n</code> and
+a bare <code>\r</code> — which is the part that makes <code>split("\n")</code> a bug on Windows
+input.</p>
+
+<p>The comparison is worth seeing directly:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String text = "a\r\nb\n";
+
+        System.out.println(text.split("\n").length);      // 2, but "a" still has a trailing \r
+        System.out.println(text.lines().count());         // 2, clean
+    }
+}
+</code></pre>
+
+<h2><code>repeat(int)</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        System.out.println("-".repeat(30));               // a separator line
+        System.out.println("ab".repeat(3));               // ababab
+        System.out.println("x".repeat(0));                // "" — legal, empty
+
+        // Indenting, padding, simple tables
+        System.out.println(" ".repeat(4) + "indented");
+    }
+}
+</code></pre>
+
+<p>A negative count throws <code>IllegalArgumentException</code>; zero is fine and gives an empty
+string. Before this existed, everyone had a <code>StringUtils.repeat</code> or a loop with a
+<code>StringBuilder</code>.</p>
+
+<h2>Null safety, which these do not give you</h2>
+
+<p>Worth being explicit about, because the names suggest otherwise: none of these methods is
+null-safe. Calling any of them on a null reference throws, exactly as before:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String value = null;
+        // value.isBlank();      // NullPointerException
+
+        System.out.println(Objects.requireNonNullElse(value, "").isBlank());   // true
+        System.out.println(Optional.ofNullable(value)
+                .map(String::strip)
+                .filter(s -&gt; !s.isBlank())
+                .orElse("(none)"));                                            // (none)
+    }
+}
+</code></pre>
+
+<p>Java 11 did add <code>Predicate.not</code>, which pairs with these nicely and removes an awkward
+lambda:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; raw = List.of("Ana", "  ", "Bo", "");
+
+        // Before: a lambda, because there is no isNotBlank
+        System.out.println(raw.stream().filter(s -&gt; !s.isBlank()).toList());
+
+        // After
+        System.out.println(raw.stream().filter(Predicate.not(String::isBlank)).toList());
+        // [Ana, Bo]
+    }
+}
+</code></pre>
+
+<h2>Where they came from, and why it took so long</h2>
+
+<p>It is reasonable to ask why a language in its eleventh major version was still adding
+<code>repeat</code>. The answer is instructive about how Java evolves.</p>
+
+<p><code>String</code> is one of the most widely used classes in existence, and every method added to
+it is permanent — it can never be removed, and it constrains every future implementation. So the bar
+for adding one is high, and the argument is not "this is useful" but "the absence of this is causing
+identical code to be written in every project."</p>
+
+<p>By 2018 that was demonstrably true. Apache Commons had <code>StringUtils.isBlank</code>,
+<code>repeat</code> and <code>stripStart</code>; Guava had its own; and most codebases without either
+had hand-rolled versions with subtly different edge-case behaviour. Pulling the five most-duplicated
+helpers into the JDK removed a dependency from a lot of projects that were carrying Commons Lang for
+little else.</p>
+
+<p>The practical consequence for you: if you are working in a codebase that still imports
+<code>StringUtils</code> for these, the imports can usually go. Check the null behaviour first,
+though — <code>StringUtils.isBlank(null)</code> returns <code>true</code>, while
+<code>null.isBlank()</code> throws, and that difference has caused real bugs during exactly this
+cleanup.</p>
+
+<h2>All five, and what they replace</h2>
+
+<table>
+<thead><tr><th>Method</th><th>Returns</th><th>Replaces</th></tr></thead>
+<tbody>
+<tr><td><code>isBlank()</code></td><td>boolean</td><td><code>trim().isEmpty()</code></td></tr>
+<tr><td><code>strip()</code></td><td>String</td><td><code>trim()</code>, correctly</td></tr>
+<tr><td><code>stripLeading()</code> / <code>stripTrailing()</code></td><td>String</td><td>a regex, or
+a manual index scan</td></tr>
+<tr><td><code>lines()</code></td><td>Stream&lt;String&gt;</td><td><code>split("\\r?\\n")</code></td></tr>
+<tr><td><code>repeat(n)</code></td><td>String</td><td>a StringBuilder loop</td></tr>
+</tbody>
+</table>
+
+<p>All of them are on the <a href="/java/java-string">String</a> fundamentals post's list of things
+worth memorising, and all of them return a new string — <code>String</code> is still immutable, so
+an unassigned <code>value.strip();</code> does nothing at all.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-11-api-improvements">The Java 11 file and collection methods</a> is next —
+another handful of small additions that each remove a helper class.</p>

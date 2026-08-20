@@ -1,0 +1,211 @@
+<p>Java 11 shipped a real HTTP client in the JDK. Before it, making an HTTP call meant either
+<code>HttpURLConnection</code> — an API from 1997 that nobody enjoyed — or adding Apache HttpClient
+or OkHttp as a dependency. Now a simple GET is four lines with nothing on the classpath.</p>
+
+<h2>Three objects</h2>
+
+<p>The whole API is a client, a request and a response. Learn those three and the rest is
+detail:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws IOException, InterruptedException {
+        HttpClient client = HttpClient.newHttpClient();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://example.com/api/items"))
+                .GET()
+                .build();
+
+        HttpResponse&lt;String&gt; response =
+                client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        System.out.println(response.statusCode());   // 200
+        System.out.println(response.body());
+    }
+}
+</code></pre>
+
+<p>The client is immutable, thread-safe and holds a connection pool, so <strong>create one and reuse
+it</strong>. Building a new client per request throws away pooling and is the single most common
+misuse.</p>
+
+<p><code>BodyHandlers</code> decides what the body becomes — a <code>String</code>, a file, an
+<code>InputStream</code>, or nothing at all. That choice is a type parameter on the response, which
+is why <code>HttpResponse&lt;String&gt;</code> reads the way it does.</p>
+
+<h2>Configuring the client</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    HttpClient build() {
+        return HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_2)          // the default anyway
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NORMAL) // default is NEVER
+                .build();
+    }
+}
+</code></pre>
+
+<p>Two defaults worth knowing because they surprise people. <strong>Redirects are not followed</strong>
+unless you ask — a 301 comes back as a 301. And <code>connectTimeout</code> bounds establishing the
+connection only; bounding the whole request is a separate setting on the request itself.</p>
+
+<h2>POST, PUT, DELETE and headers</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(HttpClient client) throws IOException, InterruptedException {
+        String json = """
+                {"name": "Folau", "role": "engineer"}
+                """;
+
+        HttpRequest post = HttpRequest.newBuilder()
+                .uri(URI.create("https://example.com/api/users"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer token123")
+                .timeout(Duration.ofSeconds(30))             // the whole request
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .build();
+
+        HttpResponse&lt;String&gt; response =
+                client.send(post, HttpResponse.BodyHandlers.ofString());
+        System.out.println(response.statusCode());
+
+        HttpRequest delete = HttpRequest.newBuilder()
+                .uri(URI.create("https://example.com/api/users/1"))
+                .DELETE()
+                .build();
+
+        HttpRequest put = HttpRequest.newBuilder()
+                .uri(URI.create("https://example.com/api/users/1"))
+                .PUT(HttpRequest.BodyPublishers.ofString(json))
+                .build();
+    }
+}
+</code></pre>
+
+<p><code>BodyPublishers</code> is the mirror of <code>BodyHandlers</code> — it turns something into a
+request body. <code>ofString</code> covers most cases; <code>ofFile</code> and
+<code>noBody</code> cover the rest. Text blocks, added in Java 15, make inline JSON far more
+readable than the escaped string this example would have needed in Java 11 itself.</p>
+
+<h2>Asynchronous requests</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(HttpClient client) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://example.com/api/items"))
+                .build();
+
+        CompletableFuture&lt;String&gt; future =
+                client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                        .thenApply(HttpResponse::body)
+                        .exceptionally(e -&gt; "request failed: " + e.getMessage());
+
+        System.out.println(future.join());
+    }
+}
+</code></pre>
+
+<p><code>sendAsync</code> returns a <a href="/java/java-8-completablefuture">CompletableFuture</a>,
+which is where that post pays off: several independent calls can run at once by starting them all
+before joining any of them, and the whole chaining and error-handling vocabulary applies
+unchanged.</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void fetchAll(HttpClient client, List&lt;String&gt; urls) {
+        List&lt;CompletableFuture&lt;String&gt;&gt; calls = urls.stream()
+                .map(url -&gt; HttpRequest.newBuilder().uri(URI.create(url)).build())
+                .map(r -&gt; client.sendAsync(r, HttpResponse.BodyHandlers.ofString())
+                        .thenApply(HttpResponse::body))
+                .toList();                                    // all started here
+
+        CompletableFuture.allOf(calls.toArray(CompletableFuture[]::new)).join();
+        calls.forEach(c -&gt; System.out.println(c.join().length()));
+    }
+}
+</code></pre>
+
+<h2>Errors, and what counts as one</h2>
+
+<p>This is the part that catches everyone: <strong>a 404 or a 500 is not an exception.</strong> The
+request succeeded — the server answered — so you get a response object with that status code. Only a
+transport failure throws:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String fetch(HttpClient client, HttpRequest request) {
+        try {
+            HttpResponse&lt;String&gt; response =
+                    client.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() &gt;= 400) {          // you must check
+                throw new IllegalStateException(
+                        "HTTP " + response.statusCode() + ": " + response.body());
+            }
+            return response.body();
+
+        } catch (IOException e) {                        // network, DNS, TLS, timeout
+            throw new UncheckedIOException(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();          // always restore the flag
+            throw new IllegalStateException("interrupted", e);
+        }
+    }
+}
+</code></pre>
+
+<p>Note the <code>InterruptedException</code> handling. Catching it clears the thread's interrupt
+flag, so re-setting it with <code>Thread.currentThread().interrupt()</code> is not optional — without
+it, code further up the stack cannot tell that cancellation was requested.</p>
+
+<h2>Compared with what it replaced</h2>
+
+<p>The gap is worth seeing, because it explains why so many projects carried an HTTP dependency for
+one or two calls. The <code>HttpURLConnection</code> version of the four-line GET at the top of this
+post is roughly this:</p>
+
+<pre class="language-java"><code class="language-java">class Legacy {
+    String get(String url) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) URI.create(url).toURL().openConnection();
+        connection.setRequestMethod("GET");
+        connection.setConnectTimeout(10_000);
+        connection.setReadTimeout(30_000);
+        try {
+            StringBuilder body = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    body.append(line).append('\n');
+                }
+            }
+            return body.toString();
+        } finally {
+            connection.disconnect();
+        }
+    }
+}
+</code></pre>
+
+<p>Manual stream handling, a charset that is easy to omit, mutable configuration on the connection
+object itself, and a separate <code>getErrorStream()</code> path for non-2xx responses that this
+version does not even handle. It is also HTTP/1.1 only and synchronous only.</p>
+
+<p>The new client is HTTP/2 by default with automatic fallback, gives you async for free, and is
+immutable so a single configured client is safe to share across threads. If you are maintaining code
+that still uses <code>HttpURLConnection</code>, this is one of the easier and more worthwhile
+modernisations available.</p>
+
+<h2>What it does not do</h2>
+
+<p>It has no JSON support. It hands you a <code>String</code> and you parse it yourself with Jackson
+or Gson. That is a deliberate scope decision, not an oversight, and it means the client is useful
+without dragging a serialisation library into the JDK.</p>
+
+<p>It also has no built-in retry, no circuit breaker and no request logging. For a handful of calls
+that is fine. For a service that talks to many others, a higher-level client still earns its
+keep — but you no longer need one just to make a request.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-11-single-file-execution">Running Java files directly</a> is next — the change
+that makes Java usable for a quick script.</p>

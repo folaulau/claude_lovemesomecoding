@@ -1,0 +1,159 @@
+<p>Since Java 11 you can run a <code>.java</code> file directly, with no separate compile step and no
+<code>.class</code> file left behind. It sounds like a convenience for beginners, and it is, but it
+also makes Java usable for the kind of quick script you would otherwise have written in Python.</p>
+
+<h2>The change</h2>
+
+<pre class="language-bash"><code class="language-bash"># Before Java 11 — two commands, one artefact on disk
+javac Hello.java      # produces Hello.class
+java Hello
+
+# Java 11 onwards — one command, nothing left behind
+java Hello.java
+</code></pre>
+
+<p>Note the difference in what you pass. <code>java Hello</code> takes a <em>class name</em> and
+looks for compiled bytecode. <code>java Hello.java</code> takes a <em>file name</em> — the
+<code>.java</code> extension is what tells the launcher to compile first.</p>
+
+<h2>What actually happens</h2>
+
+<p>The launcher compiles the file in memory and runs it immediately. No <code>.class</code> file is
+written, and the compilation is thrown away when the program exits.</p>
+
+<p>Two things follow from that. Startup is slightly slower, because you pay for compilation on every
+run — irrelevant for a script, unacceptable for a server. And errors that a build would have caught
+now surface at launch, which is exactly what you want while experimenting.</p>
+
+<pre class="language-java"><code class="language-java">public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Hello, " + (args.length &gt; 0 ? args[0] : "world"));
+    }
+}
+</code></pre>
+
+<pre class="language-bash"><code class="language-bash">java Hello.java              # Hello, world
+java Hello.java Folau        # Hello, Folau
+</code></pre>
+
+<p>Arguments after the file name go to your program, not to the launcher — which is what makes real
+scripting possible.</p>
+
+<h2>The rules</h2>
+
+<p>Four constraints, and each has a reason:</p>
+
+<ul>
+<li><strong>Everything must be in one file.</strong> The launcher compiles that file and nothing
+else. You may declare several classes in it; you may not reference a class in another
+<code>.java</code> file beside it.</li>
+<li><strong>The first class in the file wins.</strong> Whichever class is declared first must have a
+<code>main</code> method — that is the entry point, regardless of the file name.</li>
+<li><strong>The file name need not match the class.</strong> This is the one rule that
+<em>relaxes</em>: <code>java script.java</code> works even if the class inside is called
+<code>Hello</code>. It is why shebang scripts can have no extension at all.</li>
+<li><strong>Only the JDK is on the classpath</strong> unless you add one with <code>--class-path</code>.
+No Maven, no dependency resolution.</li>
+</ul>
+
+<pre class="language-java"><code class="language-java">public class Report {                 // first class: this one runs
+
+    public static void main(String[] args) {
+        Formatter formatter = new Formatter();
+        System.out.println(formatter.line("done"));
+    }
+}
+
+class Formatter {                     // helper in the same file: fine
+    String line(String text) {
+        return "== " + text + " ==";
+    }
+}
+</code></pre>
+
+<h2>Shebang scripts</h2>
+
+<p>On Unix you can drop the extension entirely and make the file executable, which is where this
+stops being a curiosity:</p>
+
+<pre class="language-bash"><code class="language-bash">#!/usr/bin/java --source 11
+</code></pre>
+
+<pre class="language-bash"><code class="language-bash">chmod +x wordcount
+./wordcount notes.txt
+</code></pre>
+
+<p>The <code>--source</code> flag is mandatory in a shebang file. Without an extension the launcher
+cannot tell it is source rather than a class name, so the flag is what disambiguates. It also lets
+you pin the language level.</p>
+
+<p>A shebang file is not valid Java — the first line is not legal syntax — so it can only be run this
+way, never compiled with <code>javac</code>. That is a deliberate trade: it is a script, not a class.</p>
+
+<h2>A real script</h2>
+
+<pre class="language-java"><code class="language-java">public class WordCount {
+
+    public static void main(String[] args) throws Exception {
+        if (args.length == 0) {
+            System.err.println("usage: wordcount &lt;file&gt;");
+            System.exit(1);
+        }
+
+        Map&lt;String, Long&gt; counts = Files.lines(Path.of(args[0]))
+                .flatMap(line -&gt; Arrays.stream(line.toLowerCase().split("\\W+")))
+                .filter(word -&gt; !word.isBlank())
+                .collect(Collectors.groupingBy(word -&gt; word, Collectors.counting()));
+
+        counts.entrySet().stream()
+                .sorted(Map.Entry.&lt;String, Long&gt;comparingByValue().reversed())
+                .limit(10)
+                .forEach(e -&gt; System.out.printf("%6d  %s%n", e.getValue(), e.getKey()));
+    }
+}
+</code></pre>
+
+<p>That runs with <code>java WordCount.java notes.txt</code> and needs nothing installed beyond a
+JDK. It is also a fair illustration of why the feature matters: <a href="/java/java-8-streams">streams</a>
+and <a href="/java/java-8-collectors-class">collectors</a> make Java competitive for this kind of
+text-munging, and the compile step was the last thing making it inconvenient.</p>
+
+<h2>Adding a dependency anyway</h2>
+
+<p>"Only the JDK is on the classpath" is the rule, but it is a default rather than a hard limit. If
+you have a jar sitting somewhere, you can point at it:</p>
+
+<pre class="language-bash"><code class="language-bash"># One jar
+java --class-path lib/gson-2.10.1.jar Script.java
+
+# A directory of them
+java --class-path "lib/*" Script.java
+
+# Or set it once in the shebang line
+#!/usr/bin/java --source 11 --class-path /opt/lib/*
+</code></pre>
+
+<p>That works, and it is worth knowing for a script that needs to parse JSON. But it is also the
+point at which you should ask whether this is still a script. You are now managing a classpath by
+hand, with no version resolution and nothing recording which jars the script needs — the two
+problems a build tool exists to solve.</p>
+
+<h2>Where it fits</h2>
+
+<p>Use it for learning — typing an example and running it in one command removes a step that teaches
+you nothing. Use it for one-off scripts, build helpers and anything you would otherwise write as a
+shell script but want types for. Use it for a bug reproduction you are attaching to an issue, where a
+single self-contained file is worth a great deal.</p>
+
+<p>Do not use it for anything real. There is no dependency management, no test framework, no
+packaging and no incremental build — the moment you want a second file or a library, you want a
+build tool. The feature is a scratchpad, and it is very good at being one.</p>
+
+<p>Java 25 pushed this further with compact source files, where a script no longer needs a class or a
+<code>static main</code> at all — see <a href="/java/java-25-simplified-java">Module Imports and
+Simple Source Files</a>.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-11-migration-guide">The Java 11 migration guide</a> is next — what was removed
+between 8 and 11, and what breaks when you upgrade.</p>

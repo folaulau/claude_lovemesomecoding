@@ -1,0 +1,188 @@
+<p>A generator produces a sequence without building it. That one sentence is the whole idea, and it is
+what lets you process a four-gigabyte file in a few megabytes of memory. This post explains what the
+<code>for</code> loop is really doing, then how <code>yield</code> lets you take part in it.</p>
+
+<h2>What a for loop actually does</h2>
+
+<p>Looping is not indexing. <code>for</code> asks the object for an <strong>iterator</strong>, then asks
+that iterator for the next item until it says stop:</p>
+
+<pre class="language-python"><code class="language-python">accounts = ["Checking", "Savings"]
+
+it = iter(accounts)
+print(next(it))       # Output: Checking
+print(next(it))       # Output: Savings
+</code></pre>
+
+<p>Every <code>for</code> loop you have written is that, with the bookkeeping hidden. When the items
+run out, <code>next()</code> raises <code>StopIteration</code> and the loop ends quietly:</p>
+
+<!-- expect-error -->
+<pre class="language-python"><code class="language-python">it = iter(["only one"])
+next(it)
+next(it)
+</code></pre>
+
+<p>This is why any object that can answer <code>next()</code> works in a <code>for</code> loop — a
+list, a file, a dict, a database cursor. They do not share a base class; they share a protocol.</p>
+
+<h2>yield</h2>
+
+<p>Put <code>yield</code> in a function and it stops being a function that returns a value and becomes
+one that produces a series of them:</p>
+
+<pre class="language-python"><code class="language-python">def transactions():
+    print("starting")
+    yield 100
+    print("between")
+    yield -25
+    print("finishing")
+
+for amount in transactions():
+    print(amount)
+
+# Output: starting
+# Output: 100
+# Output: between
+# Output: -25
+# Output: finishing
+</code></pre>
+
+<p>Read that output carefully, because it is the whole mechanism. <code>starting</code> did not print
+when the generator was created — it printed when the loop asked for the first item. Each
+<code>yield</code> hands a value out and <strong>freezes the function where it stands</strong>, local
+variables intact. The next request resumes it on the following line.</p>
+
+<p>A normal function runs to completion and returns once. A generator runs in slices, on demand.</p>
+
+<h2>Why that matters</h2>
+
+<pre class="language-python"><code class="language-python">def squares_list(n):
+    return [i * i for i in range(n)]     # builds all n in memory
+
+def squares_gen(n):
+    for i in range(n):
+        yield i * i                      # builds one at a time
+
+import sys
+print(sys.getsizeof(squares_list(100_000)) &gt; 400_000)   # Output: True
+print(sys.getsizeof(squares_gen(100_000)) &lt; 250)        # Output: True
+</code></pre>
+
+<p>The list needs hundreds of kilobytes. The generator is a couple of hundred bytes no matter what
+<code>n</code> is, because it stores a position rather than the results.</p>
+
+<p>The other half is that a generator can start producing immediately. A function returning a list of
+ten thousand database rows gives you nothing until every row has been fetched; a generator gives you
+the first one straight away.</p>
+
+<h2>Generator expressions</h2>
+
+<p>Swap a comprehension's brackets for parentheses and you get a generator instead of a list:</p>
+
+<pre class="language-python"><code class="language-python">amounts = [100, -25, 250, -40]
+
+print([n * 2 for n in amounts])          # Output: [200, -50, 500, -80]
+print(sum(n for n in amounts if n &gt; 0))  # Output: 350
+print(any(n &lt; 0 for n in amounts))       # Output: True
+print(max(abs(n) for n in amounts))      # Output: 250
+</code></pre>
+
+<p>When a generator expression is the only argument to a function, its parentheses double as the
+call's, so you write <code>sum(n for n in ...)</code> rather than <code>sum((n for n in ...))</code>.</p>
+
+<p>The rule: if you are going to consume it once and immediately — <code>sum</code>, <code>any</code>,
+<code>max</code>, <code>join</code>, a <code>for</code> loop — use a generator expression. Use a list
+comprehension when you need to keep the result, index into it, or look at it more than once.</p>
+
+<h2>A generator is used up</h2>
+
+<p>This is the one that catches people. Once consumed, it is empty:</p>
+
+<pre class="language-python"><code class="language-python">numbers = (n for n in [1, 2, 3])
+
+print(sum(numbers))     # Output: 6
+print(sum(numbers))     # Output: 0
+print(list(numbers))    # Output: []
+</code></pre>
+
+<p>The second <code>sum</code> is not a bug in Python. The generator reached the end and there is no
+rewind — the values were never stored, so there is nothing to go back to. If you need the data twice,
+call <code>list()</code> on it and keep that.</p>
+
+<p>The related trap is <code>len()</code>, which does not work on a generator at all. Knowing the
+length would mean running it to the end, which is exactly what you were avoiding.</p>
+
+<h2>Reading a large file</h2>
+
+<p>This is the pattern you will actually use. A file object is already an iterator over its lines:</p>
+
+<pre class="language-python"><code class="language-python">from pathlib import Path
+
+Path("transactions.csv").write_text(
+    "id,amount\n1,100.00\n2,-25.00\n3,250.00\n"
+)
+
+def amounts(path):
+    with open(path) as handle:
+        next(handle)                       # skip the header
+        for line in handle:
+            yield float(line.split(",")[1])
+
+print(sum(a for a in amounts("transactions.csv") if a &gt; 0))   # Output: 350.0
+</code></pre>
+
+<p>That totals the file without ever holding more than one line in memory, and it works identically on
+three rows or thirty million. Replace <code>yield</code> with building a list and the second case stops
+working.</p>
+
+<h2>itertools, before you write it yourself</h2>
+
+<p>The standard library ships the generators people most often reinvent:</p>
+
+<pre class="language-python"><code class="language-python">from itertools import islice, chain, count
+
+print(list(islice(count(1), 5)))              # Output: [1, 2, 3, 4, 5]
+print(list(chain([1, 2], [3, 4])))            # Output: [1, 2, 3, 4]
+
+def all_transactions():
+    yield from range(1, 1000000)
+
+print(list(islice(all_transactions(), 3)))    # Output: [1, 2, 3]
+</code></pre>
+
+<p><code>count()</code> is an infinite generator — perfectly safe, because <code>islice</code> only
+ever asks it for five. That combination is worth internalising: an unbounded source plus a limit,
+where a list would have to be finite before you could take anything from it.</p>
+
+<p><code>islice</code> is also how you peek at a generator without consuming all of it, and
+<code>chain</code> joins several iterables into one stream without concatenating them in memory.</p>
+
+<h2>Chaining them</h2>
+
+<p>Generators compose. Each stage pulls from the one before it, one item at a time, so a pipeline of
+five costs no more memory than one:</p>
+
+<pre class="language-python"><code class="language-python">def read():
+    yield from ["100.00", "-25.00", "bad", "250.00"]
+
+def to_float(rows):
+    for row in rows:
+        try:
+            yield float(row)
+        except ValueError:
+            continue
+
+def credits(numbers):
+    for n in numbers:
+        if n &gt; 0:
+            yield n
+
+print(sum(credits(to_float(read()))))     # Output: 350.0
+</code></pre>
+
+<p><code>yield from</code> delegates to another iterable — it is shorthand for looping and yielding
+each item. Nothing runs until <code>sum</code> starts pulling, and then one value travels the whole
+chain before the next one starts.</p>
+
+<p>Next: <a href="/python/python-decorators">Decorators</a>.</p>

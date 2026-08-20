@@ -1,0 +1,189 @@
+<p>A virtual thread is a thread that costs almost nothing to create. You can have millions of them.
+That single change removes the reason most server code was written asynchronously, and it is the
+biggest thing to happen to Java concurrency in twenty years.</p>
+
+<h2>The problem</h2>
+
+<p>A platform thread — the only kind Java had until 21 — is a wrapper around an operating system
+thread. It costs about a megabyte of stack, takes real time to create, and the OS can only schedule
+so many. So servers pooled them: a few hundred threads, shared across many requests.</p>
+
+<p>That works until a request blocks on I/O. A thread waiting for a database is doing nothing, but it
+is still occupying a pool slot. With 200 threads, 200 slow queries means the 201st request waits —
+even though the machine is idle.</p>
+
+<p>The industry's answer was asynchronous code: callbacks, then futures, then reactive streams. It
+works, and it costs you readable stack traces, straightforward debugging, and the ability to write
+<code>try</code>/<code>catch</code> around a sequence of operations.</p>
+
+<h2>The change</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws InterruptedException {
+        // A platform thread — expensive
+        Thread platform = Thread.ofPlatform().start(() -&gt; System.out.println("platform"));
+
+        // A virtual thread — cheap
+        Thread virtual = Thread.ofVirtual().start(() -&gt; System.out.println("virtual"));
+
+        platform.join();
+        virtual.join();
+    }
+}
+</code></pre>
+
+<p>A virtual thread is scheduled by the JVM onto a small pool of platform threads. When it blocks, the
+JVM <em>unmounts</em> it — parks its stack on the heap and gives the carrier thread to someone else.
+When the blocking call returns, it is remounted, possibly on a different carrier.</p>
+
+<p>The crucial part: <strong>your code does not change.</strong> A blocking call still looks like a
+blocking call. The unmounting happens underneath.</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws InterruptedException {
+        // A million threads. On platform threads this would exhaust memory immediately.
+        List&lt;Thread&gt; threads = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 1_000_000; i++) {
+            threads.add(Thread.ofVirtual().start(() -&gt; {
+                try {
+                    Thread.sleep(Duration.ofSeconds(1));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }));
+        }
+        for (Thread t : threads) {
+            t.join();
+        }
+    }
+}
+</code></pre>
+
+<h2>How you will actually use them</h2>
+
+<p>Rarely by creating threads directly. The executor is the normal route, and it is a one-line
+change:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws Exception {
+        // A thread PER TASK, not a pool. Closing waits for every task to finish.
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i &lt; 10_000; i++) {
+                int id = i;
+                executor.submit(() -&gt; {
+                    Thread.sleep(Duration.ofMillis(100));   // blocking is fine now
+                    return id;
+                });
+            }
+        }   // AutoCloseable since Java 19 — no shutdown()/awaitTermination() dance
+    }
+}
+</code></pre>
+
+<p>Note there is no pool size. Pooling exists to share expensive objects, and virtual threads are not
+expensive — pooling them would reintroduce the queueing you are trying to remove.</p>
+
+<p>In a Spring Boot or Jakarta application you usually turn them on with one property rather than
+writing any of this, and every request handler gets its own virtual thread.</p>
+
+<h2>Write blocking code again</h2>
+
+<pre class="language-java"><code class="language-java">record User(String id, String name) { }
+record Order(String id) { }
+
+class Service {
+    User loadUser(String id) { return new User(id, "Folau"); }
+    List&lt;Order&gt; loadOrders(String id) { return List.of(new Order("o-1")); }
+
+    // Straight-line, debuggable, and on a virtual thread it scales
+    String summary(String id) {
+        User user = loadUser(id);
+        List&lt;Order&gt; orders = loadOrders(id);
+        return user.name() + " has " + orders.size() + " orders";
+    }
+}
+</code></pre>
+
+<p>That method has a real stack trace, steps in a debugger, and can be wrapped in
+<code>try</code>/<code>catch</code>. The equivalent
+<a href="/java/java-8-completablefuture">CompletableFuture</a> chain has none of those properties as
+naturally. Virtual threads make the simple version the scalable one.</p>
+
+<h2>What they do not fix</h2>
+
+<p><strong>They do not make CPU-bound work faster.</strong> A virtual thread still needs a carrier
+thread to run on, and there are only as many of those as you have cores. Virtual threads help when
+threads are <em>waiting</em>, not when they are computing.</p>
+
+<p><strong>Pinning.</strong> A virtual thread inside a <code>synchronized</code> block cannot unmount
+— it pins its carrier for the duration. If that block does I/O, you have blocked a carrier thread,
+and enough of those starve the whole scheduler:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    private final Object lock = new Object();
+    private final ReentrantLock better = new ReentrantLock();
+
+    void pins() throws Exception {
+        synchronized (lock) {
+            Thread.sleep(1000);          // pins the carrier thread
+        }
+    }
+
+    void doesNot() throws Exception {
+        better.lock();
+        try {
+            Thread.sleep(1000);          // unmounts cleanly
+        } finally {
+            better.unlock();
+        }
+    }
+}
+</code></pre>
+
+<p>Replacing <code>synchronized</code> with <code>ReentrantLock</code> around blocking calls is the
+fix. This mattered enough that later releases have been working to remove the limitation entirely.</p>
+
+<p><strong>ThreadLocal.</strong> Still works, but a million threads each holding a
+<code>ThreadLocal</code> value is a million objects. Scoped values are the intended replacement.</p>
+
+<h2>Structured concurrency</h2>
+
+<p>Virtual threads make it cheap to fan out, and fanning out raises the question of what happens when
+one branch fails. Structured concurrency — a preview API alongside virtual threads — ties the
+lifetimes of related tasks together so that cancelling or failing one cancels the rest:</p>
+
+<pre class="language-java"><code class="language-java">record User(String id) { }
+record Orders(int count) { }
+
+class Service {
+    User loadUser(String id) { return new User(id); }
+    Orders loadOrders(String id) { return new Orders(3); }
+
+    // The shape, using plain virtual threads. Both start together; if either
+    // fails, join() surfaces it rather than leaving the other running unnoticed.
+    String summary(String id) throws Exception {
+        try (ExecutorService scope = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future&lt;User&gt; user = scope.submit(() -&gt; loadUser(id));
+            Future&lt;Orders&gt; orders = scope.submit(() -&gt; loadOrders(id));
+            return user.get().id() + ": " + orders.get().count();
+        }
+    }
+}
+</code></pre>
+
+<p>The principle is worth knowing even before the API stabilises: a task that spawns subtasks should
+not outlive them, and an error in one subtask should not leave its siblings running. That is the
+guarantee unstructured thread-spawning never gave you, and the reason "just start a thread" was bad
+advice even when threads were cheap.</p>
+
+<h2>The rule</h2>
+
+<p>Use virtual threads for anything that waits — HTTP calls, database queries, file and queue
+operations. Keep a small fixed pool of platform threads for CPU-bound work. And when you adopt them,
+audit your <code>synchronized</code> blocks for blocking calls, because that is the one place the
+abstraction leaks.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-21-pattern-matching-switch">Pattern matching for switch</a> is next — the
+feature that finishes what <code>instanceof</code> pattern matching started.</p>

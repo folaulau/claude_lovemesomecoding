@@ -1,0 +1,181 @@
+<p>Beyond the <a href="/java/java-11-string-methods">String methods</a>, Java 11 added a handful of
+small API improvements. Each one removes a few lines you used to write by hand, and two of them —
+<code>Files.readString</code> and <code>Path.of</code> — you will use constantly.</p>
+
+<h2>Reading and writing a whole file</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws IOException {
+        Path path = Path.of("notes.txt");
+
+        Files.writeString(path, "hello\nworld\n");
+        String all = Files.readString(path);
+        System.out.println(all.lines().count());        // 2
+
+        Files.writeString(path, "more\n", StandardOpenOption.APPEND);
+        System.out.println(Files.readString(path).lines().count());   // 3
+    }
+}
+</code></pre>
+
+<p>Both default to UTF-8, which is the important detail. The pre-Java-11 equivalent was
+<code>new String(Files.readAllBytes(path), StandardCharsets.UTF_8)</code>, and the version people
+actually wrote omitted the charset — picking up the platform default, which differs between a
+developer's Mac and a Linux server. That class of bug is what these two methods delete.</p>
+
+<p>They read the whole file into memory, so they suit configuration, templates and small data files.
+For anything large, stream it:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(Path path) throws IOException {
+        try (Stream&lt;String&gt; lines = Files.lines(path)) {      // lazy, one line at a time
+            lines.filter(l -&gt; l.contains("ERROR")).forEach(System.out::println);
+        }
+    }
+}
+</code></pre>
+
+<p><code>Files.lines</code> holds the file open, so it must be closed — hence try-with-resources.
+<code>Files.readString</code> does not, because it has already finished by the time it returns.</p>
+
+<h2><code>Path.of</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        Path a = Path.of("data", "input", "file.txt");   // joins with the right separator
+        Path b = Paths.get("data", "input", "file.txt"); // the old form, identical result
+
+        System.out.println(a.equals(b));                  // true
+        System.out.println(a.getFileName());              // file.txt
+        System.out.println(a.getParent());                // data/input
+    }
+}
+</code></pre>
+
+<p><code>Paths.get</code> still works and always will. <code>Path.of</code> is preferred simply
+because the factory now lives on the interface it produces, matching <code>List.of</code>,
+<code>Set.of</code> and <code>Map.of</code>. Building paths from segments rather than concatenating
+strings is the habit worth keeping either way — it uses the platform separator and cannot produce a
+double slash.</p>
+
+<h2><code>Collection.toArray(IntFunction)</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = List.of("Ana", "Bo");
+
+        String[] old = names.toArray(new String[0]);       // works, slightly odd
+        String[] modern = names.toArray(String[]::new);    // Java 11
+        System.out.println(modern.length);                  // 2
+    }
+}
+</code></pre>
+
+<p>The <code>new String[0]</code> idiom always looked wrong — you allocate an empty array purely to
+tell the method what type you want. The new overload takes a function that makes the array instead,
+which reads as what it is. Performance is identical; this is purely about the code saying what it
+means.</p>
+
+<h2><code>List.copyOf</code>, <code>Set.copyOf</code>, <code>Map.copyOf</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; mutable = new ArrayList&lt;&gt;(List.of("Ana", "Bo"));
+
+        List&lt;String&gt; snapshot = List.copyOf(mutable);      // unmodifiable COPY
+        mutable.add("Cy");
+
+        System.out.println(mutable.size());                 // 3
+        System.out.println(snapshot.size());                // 2 — unaffected
+        // snapshot.add("Dee");                             // UnsupportedOperationException
+    }
+}
+</code></pre>
+
+<p>This is the one-call answer to defensive copying. The distinction from
+<code>Collections.unmodifiableList</code> matters and catches people:
+<code>unmodifiableList</code> returns a read-only <em>view</em> of the original, so changes to the
+original still show through it. <code>List.copyOf</code> takes a snapshot, so they do not.</p>
+
+<p>One caveat: these reject <code>null</code> elements outright. That is usually a feature — it
+surfaces a bug at the point it is made — but it will throw on a list that legitimately contains
+nulls.</p>
+
+<h2><code>Predicate.not</code> and <code>Optional.isEmpty</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; raw = List.of("Ana", "  ", "Bo");
+
+        System.out.println(raw.stream().filter(Predicate.not(String::isBlank)).toList());
+        // [Ana, Bo]
+
+        Optional&lt;String&gt; found = Optional.empty();
+        System.out.println(!found.isPresent());     // the old way
+        System.out.println(found.isEmpty());        // Java 11 — reads better
+    }
+}
+</code></pre>
+
+<p>Both exist for the same reason: a negation that had to be spelled with a <code>!</code> in front
+of a longer expression, where the <code>!</code> is easy to miss when scanning. Neither adds
+capability; both make the intent visible.</p>
+
+<h2><code>var</code> in lambda parameters</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Ana", "Bo"));
+
+        names.sort((var a, var b) -&gt; a.compareTo(b));    // legal since Java 11
+        names.sort((a, b) -&gt; a.compareTo(b));            // and this was always fine
+    }
+}
+</code></pre>
+
+<p>This one is worth knowing about mainly so you are not confused when you meet it. It exists so an
+annotation can be attached to a lambda parameter, which requires a type or <code>var</code> to attach
+it to. On its own it adds nothing, and the rule is all-or-nothing — you cannot write
+<code>(var a, b)</code>.</p>
+
+<h2>Nest-based access control</h2>
+
+<p>One Java 11 change you will never write code for, but which explains a stack trace you may have
+seen. A nested class and its outer class can access each other's private members — that is ordinary
+Java and always has been:</p>
+
+<pre class="language-java"><code class="language-java">class Outer {
+    private int secret = 42;
+
+    class Inner {
+        int read() {
+            return secret;          // private field of the enclosing class
+        }
+    }
+}
+</code></pre>
+
+<p>The JVM had no concept of that relationship, so before Java 11 the compiler faked it by generating
+hidden synthetic bridge methods — the <code>access$000</code> frames that used to appear in stack
+traces and confuse everyone reading them.</p>
+
+<p>Java 11 taught the JVM about nests directly, so the bridge methods are gone. The visible effects
+are cleaner stack traces, slightly smaller class files, and reflection that behaves the way the
+source code says it should. Nothing to do; just one fewer piece of unexplained noise when you are
+<a href="/java/java-debugging">reading a trace</a>.</p>
+
+<h2>What to take from this</h2>
+
+<p>None of these is a feature you go looking for. They are the kind of thing you adopt by noticing
+them in someone else's code, which is exactly why a version-by-version list is worth reading once
+even for releases you think you know.</p>
+
+<p>The two to change your habits over are <code>Files.readString</code>/<code>writeString</code>,
+because the alternative had a real charset bug in it, and <code>List.copyOf</code>, because defensive
+copying is the difference between an immutable object and one that merely looks immutable — a point
+the <a href="/java/java-static-and-final-keywords">static and final</a> post makes at length.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-11-httpclient">The HttpClient API</a> is next — the largest thing Java 11
+added, and the end of needing a third-party library to make an HTTP call.</p>

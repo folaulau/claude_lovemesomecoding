@@ -1,0 +1,216 @@
+<p>A functional interface is an interface with exactly one abstract method. That single rule is what
+makes lambdas work: when the compiler sees a lambda, it needs to know which method the lambda is
+implementing, and one abstract method means there is no ambiguity.</p>
+
+<h2>The rule, and the annotation</h2>
+
+<pre class="language-java"><code class="language-java">@FunctionalInterface
+interface Validator {
+    boolean test(String input);          // exactly one abstract method
+
+    default Validator and(Validator other) {   // default methods do not count
+        return s -&gt; this.test(s) &amp;&amp; other.test(s);
+    }
+
+    static Validator notNull() {               // static methods do not count either
+        return s -&gt; s != null;
+    }
+}
+</code></pre>
+
+<p><code>@FunctionalInterface</code> is optional but worth adding. It makes the compiler reject a
+second abstract method, so nobody can break every lambda that uses your interface by adding one
+later. Without it the interface still works with lambdas — the annotation documents the intent and
+enforces it.</p>
+
+<p>Note what does <em>not</em> count against the one-method limit: <code>default</code> methods,
+<code>static</code> methods, and public methods inherited from <code>Object</code> such as
+<code>equals</code> or <code>toString</code>.</p>
+
+<h2>They were already there before Java 8</h2>
+
+<p>The idea is older than the syntax. Several interfaces you have used for years qualify, which is
+why they work with lambdas without anyone changing them:</p>
+
+<pre class="language-java"><code class="language-java">Runnable job = () -&gt; System.out.println("working");        // run()
+Comparator&lt;String&gt; byLength = (a, b) -&gt; a.length() - b.length();   // compare()
+
+class Demo {
+    void run() {
+        new Thread(job).start();
+        List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Christopher", "Bo"));
+        names.sort(byLength);
+        System.out.println(names);                          // [Bo, Christopher]
+    }
+}
+</code></pre>
+
+<p>Java 8 did not invent functional interfaces. It added a compact way to implement them and a
+package full of ready-made ones.</p>
+
+<h2>The <code>java.util.function</code> package</h2>
+
+<p>Before writing your own, check whether one of these fits. These six cover almost everything:</p>
+
+<table>
+<thead><tr><th>Interface</th><th>Method</th><th>Shape</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><code>Predicate&lt;T&gt;</code></td><td><code>test</code></td><td>T →
+boolean</td><td>filtering, conditions</td></tr>
+<tr><td><code>Function&lt;T,R&gt;</code></td><td><code>apply</code></td><td>T →
+R</td><td>transforming</td></tr>
+<tr><td><code>Consumer&lt;T&gt;</code></td><td><code>accept</code></td><td>T →
+void</td><td>doing something with each item</td></tr>
+<tr><td><code>Supplier&lt;T&gt;</code></td><td><code>get</code></td><td>() →
+T</td><td>producing a value lazily</td></tr>
+<tr><td><code>UnaryOperator&lt;T&gt;</code></td><td><code>apply</code></td><td>T →
+T</td><td>transforming without changing type</td></tr>
+<tr><td><code>BiFunction&lt;T,U,R&gt;</code></td><td><code>apply</code></td><td>T, U →
+R</td><td>combining two things</td></tr>
+</tbody>
+</table>
+
+<pre class="language-java"><code class="language-java">Predicate&lt;String&gt; isLong = s -&gt; s.length() &gt; 5;
+Function&lt;String, Integer&gt; length = String::length;
+Consumer&lt;String&gt; print = System.out::println;
+Supplier&lt;LocalDate&gt; today = LocalDate::now;
+UnaryOperator&lt;String&gt; shout = s -&gt; s.toUpperCase() + "!";
+BiFunction&lt;Integer, Integer, Integer&gt; add = Integer::sum;
+
+class Demo {
+    void run() {
+        System.out.println(isLong.test("hello"));      // false
+        System.out.println(length.apply("hello"));     // 5
+        System.out.println(shout.apply("hey"));        // HEY!
+        System.out.println(add.apply(20, 22));         // 42
+        print.accept("done");
+    }
+}
+</code></pre>
+
+<p>There are primitive variants too — <code>IntPredicate</code>, <code>ToIntFunction</code>,
+<code>DoubleSupplier</code> and a couple of dozen more. They exist to avoid boxing every value into
+an <code>Integer</code>, which matters when you are processing millions of elements and is irrelevant
+otherwise.</p>
+
+<h2>Composing them</h2>
+
+<p>This is where they stop being a curiosity. The built-in interfaces carry <code>default</code>
+methods that build new ones out of old ones:</p>
+
+<pre class="language-java"><code class="language-java">Predicate&lt;String&gt; notBlank = s -&gt; !s.isBlank();
+Predicate&lt;String&gt; isShort = s -&gt; s.length() &lt; 10;
+
+class Demo {
+    void run() {
+        Predicate&lt;String&gt; valid = notBlank.and(isShort);
+        System.out.println(valid.test("hello"));        // true
+        System.out.println(valid.test(""));             // false
+        System.out.println(notBlank.negate().test("")); // true
+        System.out.println(notBlank.or(isShort).test("")); // true
+
+        Function&lt;String, String&gt; trim = String::strip;
+        Function&lt;String, Integer&gt; len = String::length;
+        System.out.println(trim.andThen(len).apply("  hi  "));   // 2
+        System.out.println(len.compose(trim).apply("  hi  "));   // 2 — same, other order
+    }
+}
+</code></pre>
+
+<p><code>andThen</code> runs this one first, then the argument. <code>compose</code> is the reverse.
+When you cannot remember which is which, use <code>andThen</code> — it reads left to right.</p>
+
+<h2>Writing your own</h2>
+
+<p>Write one when the built-ins do not express the intent, when you need a name that means something
+in your domain, or when you want more than two parameters:</p>
+
+<pre class="language-java"><code class="language-java">@FunctionalInterface
+interface Discount {
+    double applyTo(double price);
+}
+
+@FunctionalInterface
+interface TriFunction&lt;A, B, C, R&gt; {          // the JDK stops at two arguments
+    R apply(A a, B b, C c);
+}
+
+class Checkout {
+    double checkout(double price, Discount discount) {
+        return discount.applyTo(price);
+    }
+
+    void run() {
+        System.out.println(checkout(100, p -&gt; p * 0.9));   // 90.0
+        System.out.println(checkout(100, p -&gt; p - 15));    // 85.0
+
+        TriFunction&lt;Integer, Integer, Integer, Integer&gt; sum3 = (a, b, c) -&gt; a + b + c;
+        System.out.println(sum3.apply(1, 2, 3));           // 6
+    }
+}
+</code></pre>
+
+<p><code>Discount</code> is the better example of the two. <code>Function&lt;Double,
+Double&gt;</code> would work identically and say nothing; <code>Discount</code> tells the next reader
+what the parameter is for, and <code>applyTo</code> reads better at the call site than
+<code>apply</code>.</p>
+
+<h2>Where they show up</h2>
+
+<p>Once you recognise the shape, you see it everywhere in the standard library — and you can read
+those signatures instead of guessing:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Ana", "Bo"));
+Map&lt;String, Integer&gt; ages = new HashMap&lt;&gt;();
+
+class Demo {
+    void run(List&lt;String&gt; names, Map&lt;String, Integer&gt; ages) {
+        names.removeIf(s -&gt; s.isBlank());          // Predicate
+        names.replaceAll(String::toUpperCase);     // UnaryOperator
+        names.forEach(System.out::println);        // Consumer
+        ages.computeIfAbsent("Ana", k -&gt; 0);       // Function
+        ages.merge("Ana", 1, Integer::sum);        // BiFunction
+        Optional.empty().orElseGet(() -&gt; "none");  // Supplier
+    }
+}
+</code></pre>
+
+<h2>Two things that catch people</h2>
+
+<p><strong>A lambda is not an object of the interface's "type" in any special sense.</strong> It is
+an instance of some class the runtime supplies, so identity comparisons on lambdas are meaningless
+and two identical lambdas are not <code>equals</code>:</p>
+
+<pre class="language-java"><code class="language-java">Predicate&lt;String&gt; a = s -&gt; s.isEmpty();
+Predicate&lt;String&gt; b = s -&gt; s.isEmpty();
+
+class Demo {
+    void run(Predicate&lt;String&gt; a, Predicate&lt;String&gt; b) {
+        System.out.println(a == b);        // false
+        System.out.println(a.equals(b));   // false — do not store lambdas in a Set and expect dedup
+    }
+}
+</code></pre>
+
+<p><strong>An interface with two abstract methods cannot take a lambda</strong>, and the compiler
+error names the count rather than the fix. If you meant one of them to have a body, make it
+<code>default</code>:</p>
+
+<pre class="language-java"><code class="language-java">interface Broken {
+    boolean test(String s);
+    String describe();                    // now Broken is not functional
+}
+
+@FunctionalInterface
+interface Fixed {
+    boolean test(String s);
+    default String describe() {           // a body, so it no longer counts
+        return "a test";
+    }
+}
+</code></pre>
+
+<h2>Next</h2>
+
+<p>A lambda that does nothing but call one existing method can be written more directly still.
+<a href="/java/java-8-method-references">Method References</a> is next.</p>

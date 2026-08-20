@@ -1,0 +1,197 @@
+<p>Java has two date APIs. The old one — <code>Date</code>, <code>Calendar</code>,
+<code>SimpleDateFormat</code> — is mutable, not thread-safe, and confusing enough that it was
+replaced. The modern one, <code>java.time</code>, arrived in Java 8 and is what you should use for
+everything.</p>
+
+<p>This matters more than most "prefer the new API" advice, because search results are full of the
+old one and it is not labelled as obsolete.</p>
+
+<h2>Pick the right type</h2>
+
+<p>The most important decision is which class your field should be, and it follows from one question:
+<em>does this instant need a time zone to mean anything?</em></p>
+
+<table>
+<thead><tr><th>Type</th><th>Holds</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>LocalDate</code></td><td>a date, no time</td><td>birthday, invoice date, due
+date</td></tr>
+<tr><td><code>LocalTime</code></td><td>a time, no date</td><td>opening hours, an alarm</td></tr>
+<tr><td><code>LocalDateTime</code></td><td>both, <strong>no zone</strong></td><td>"9am local,
+wherever you are" — a scheduled meeting</td></tr>
+<tr><td><code>Instant</code></td><td>a moment on the UTC timeline</td><td><strong>timestamps —
+created_at, logs, anything you store</strong></td></tr>
+<tr><td><code>ZonedDateTime</code></td><td>an instant plus a zone</td><td>displaying a moment to a
+user in their zone</td></tr>
+<tr><td><code>Duration</code> / <code>Period</code></td><td>an amount of time / of
+days</td><td>"30 minutes", "2 months"</td></tr>
+</tbody>
+</table>
+
+<p><strong><code>LocalDateTime</code> is not a timestamp.</strong> It has no zone, so it does not
+identify a moment in history — two people in different countries writing down the same
+<code>LocalDateTime</code> mean two different instants. Using it for <code>created_at</code> is the
+most common mistake in this area.</p>
+
+<h2>Creating and reading</h2>
+
+<pre class="language-java"><code class="language-java">LocalDate today = LocalDate.now();
+LocalDate release = LocalDate.of(2023, 9, 19);          // month is 1-based, unlike the old API
+LocalDate parsed = LocalDate.parse("2026-08-20");       // ISO-8601 by default
+
+System.out.println(release.getYear());        // 2023
+System.out.println(release.getMonthValue());  // 9
+System.out.println(release.getDayOfWeek());   // TUESDAY
+System.out.println(release.isLeapYear());     // false
+
+Instant now = Instant.now();                  // UTC, the thing to store
+LocalTime opening = LocalTime.of(9, 30);
+</code></pre>
+
+<p>Note <code>LocalDate.of(2023, 9, 19)</code> — month 9 is September. The old
+<code>Calendar</code> used 0-based months, which caused a decade of off-by-one bugs. That is fixed.</p>
+
+<h2>Everything is immutable</h2>
+
+<pre class="language-java"><code class="language-java">LocalDate date = LocalDate.of(2026, 8, 20);
+
+date.plusDays(1);                             // returns a new date — and discards it
+System.out.println(date);                     // 2026-08-20, unchanged
+
+LocalDate tomorrow = date.plusDays(1);        // assign the result
+System.out.println(tomorrow);                 // 2026-08-21
+</code></pre>
+
+<p>Same rule as <code>String</code>: every method returns a new object. This is what makes the API
+thread-safe, and forgetting to assign the result is the mistake to watch for.</p>
+
+<h2>Date arithmetic</h2>
+
+<pre class="language-java"><code class="language-java">LocalDate date = LocalDate.of(2026, 8, 20);
+
+System.out.println(date.plusWeeks(2));            // 2026-09-03
+System.out.println(date.minusMonths(1));          // 2026-07-20
+System.out.println(date.withDayOfMonth(1));       // 2026-08-01
+System.out.println(date.plusMonths(1).withDayOfMonth(1).minusDays(1));  // end of this month
+
+LocalDate other = LocalDate.of(2026, 12, 25);
+System.out.println(date.isBefore(other));         // true
+System.out.println(ChronoUnit.DAYS.between(date, other));   // 127
+
+Period gap = Period.between(date, other);
+System.out.println(gap.getMonths() + " months, " + gap.getDays() + " days");
+
+Duration meeting = Duration.ofMinutes(90);
+System.out.println(meeting.toHours());            // 1
+</code></pre>
+
+<p><code>Period</code> is for calendar amounts (years, months, days) and <code>Duration</code> for
+clock amounts (hours, minutes, seconds). Adding one month to 31 January gives 28 or 29 February —
+the API picks the last valid day rather than overflowing, which is almost always what you want.</p>
+
+<p>Compare with <code>isBefore</code> / <code>isAfter</code> / <code>isEqual</code>, not with
+<code>==</code>.</p>
+
+<h2>Formatting and parsing</h2>
+
+<pre class="language-java"><code class="language-java">LocalDate date = LocalDate.of(2026, 8, 20);
+
+System.out.println(date.toString());                       // 2026-08-20 (ISO — the default)
+
+DateTimeFormatter uk = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+System.out.println(date.format(uk));                       // 20/08/2026
+
+LocalDate back = LocalDate.parse("20/08/2026", uk);
+System.out.println(back);                                  // 2026-08-20
+
+DateTimeFormatter stamp = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+System.out.println(LocalDateTime.of(2026, 8, 20, 14, 30).format(stamp));
+</code></pre>
+
+<p>Pattern letters are case-sensitive and two pairs are routinely confused:
+<code>MM</code> is month while <code>mm</code> is minutes, and <code>HH</code> is 24-hour while
+<code>hh</code> is 12-hour. A format that prints "20/08/2026" correctly and then shows every time as
+12:xx is nearly always <code>hh</code> where <code>HH</code> was meant.</p>
+
+<p>Unlike <code>SimpleDateFormat</code>, a <code>DateTimeFormatter</code> is immutable and
+thread-safe, so it can and should be a <code>static final</code> constant. From the console bank app
+this site uses for examples:</p>
+
+<!-- from: src/com/bank/model/Transaction.java -->
+<pre class="language-java"><code class="language-java">private static final DateTimeFormatter DISPLAY = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+</code></pre>
+
+<p>One instance, created once, shared by every transaction in the application. Doing the same with a
+<code>SimpleDateFormat</code> would be a bug that appears only under concurrent load.</p>
+
+<h2>Time zones</h2>
+
+<pre class="language-java"><code class="language-java">Instant now = Instant.now();                       // UTC — no zone, just a moment
+
+ZonedDateTime inLA = now.atZone(ZoneId.of("America/Los_Angeles"));
+ZonedDateTime inTonga = now.atZone(ZoneId.of("Pacific/Tongatapu"));
+
+System.out.println(inLA.getHour() + " vs " + inTonga.getHour());   // same instant, different clocks
+
+LocalDateTime naive = LocalDateTime.of(2026, 8, 20, 9, 0);
+Instant real = naive.atZone(ZoneId.of("America/Los_Angeles")).toInstant();   // now it is a moment
+System.out.println(real != null);
+</code></pre>
+
+<p>Use region ids such as <code>America/Los_Angeles</code>, never fixed offsets like
+<code>GMT-8</code> — the region id knows about daylight saving and the offset does not.</p>
+
+<p>The rule that avoids nearly every time-zone bug: <strong>store and compute in UTC
+(<code>Instant</code>), convert to a zone only when displaying to a person.</strong> A database
+column should hold an instant; the user's zone is a presentation concern.</p>
+
+<h2>The questions you will actually ask</h2>
+
+<p>Four things come up constantly, and each has a one-liner rather than the loop you might reach
+for:</p>
+
+<pre class="language-java"><code class="language-java">LocalDate birthday = LocalDate.of(1990, 5, 14);
+LocalDate today = LocalDate.of(2026, 8, 20);
+
+// Someone's age
+System.out.println(Period.between(birthday, today).getYears());     // 36
+
+// Is a date inside a range? (inclusive on both ends)
+LocalDate from = LocalDate.of(2026, 1, 1), to = LocalDate.of(2026, 12, 31);
+System.out.println(!today.isBefore(from) &amp;&amp; !today.isAfter(to));    // true
+
+// The next Monday, without arithmetic
+System.out.println(today.with(TemporalAdjusters.next(DayOfWeek.MONDAY)));   // 2026-08-24
+
+// Start and end of the month
+System.out.println(today.withDayOfMonth(1));                        // 2026-08-01
+System.out.println(today.with(TemporalAdjusters.lastDayOfMonth())); // 2026-08-31
+</code></pre>
+
+<p><code>TemporalAdjusters</code> is worth knowing about specifically because the hand-written version
+of "next Monday" or "last working day of the month" is where the bugs live.</p>
+
+<h2>What not to use</h2>
+
+<pre class="language-java"><code class="language-java">// Legacy — avoid in new code
+// Date date = new Date();                         // mutable, misleading toString
+// SimpleDateFormat f = new SimpleDateFormat(...);  // NOT thread-safe: shared instances corrupt output
+// Calendar c = Calendar.getInstance();             // 0-based months
+
+// Converting at a boundary you do not control
+Date legacy = Date.from(Instant.now());
+Instant modern = legacy.toInstant();
+System.out.println(modern != null);
+</code></pre>
+
+<p>You cannot always avoid the old classes — an older library may hand you a <code>Date</code>. Convert
+at the boundary with <code>toInstant()</code> and <code>Date.from()</code>, and keep
+<code>java.time</code> everywhere inside.</p>
+
+<p>The <code>SimpleDateFormat</code> note is worth taking seriously: it is not thread-safe, and the
+standard mistake is a <code>static final SimpleDateFormat</code> shared across requests, which
+produces intermittently mangled dates that are very hard to reproduce.</p>
+
+<h2>Next</h2>
+
+<p>Next: <a href="/java/java-8-stringjoiner">StringJoiner</a> — a small class for the very common job of building a delimited string.</p>

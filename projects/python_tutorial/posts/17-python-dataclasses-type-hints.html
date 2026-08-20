@@ -1,0 +1,210 @@
+<p>Most classes exist to hold a few fields. <code>@dataclass</code> writes the constructor, the repr and
+the equality for you, and type hints let a checker catch mistakes before the program runs. Together they
+remove most of the boilerplate from the previous two posts.</p>
+
+<h2>The problem</h2>
+
+<p>Here is the class from <a href="/python/python-class">Class</a>, written out in full:</p>
+
+<pre class="language-python"><code class="language-python">class Account:
+    def __init__(self, number, balance):
+        self.number = number
+        self.balance = balance
+
+    def __repr__(self):
+        return f"Account({self.number!r}, {self.balance!r})"
+
+    def __eq__(self, other):
+        if not isinstance(other, Account):
+            return NotImplemented
+        return (self.number, self.balance) == (other.number, other.balance)
+
+print(Account("1001", 1250) == Account("1001", 1250))   # Output: True
+</code></pre>
+
+<p>Thirteen lines, of which two carry information — the field names. Every one of the others is
+mechanical, and every one is a place to make a typo.</p>
+
+<h2>@dataclass</h2>
+
+<pre class="language-python"><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class Account:
+    number: str
+    balance: float = 0.0
+
+a = Account("1001", 1250.0)
+
+print(a)                                    # Output: Account(number='1001', balance=1250.0)
+print(a.balance)                            # Output: 1250.0
+print(a == Account("1001", 1250.0))         # Output: True
+print(Account("1001"))                      # Output: Account(number='1001', balance=0.0)
+</code></pre>
+
+<p>Four lines replace thirteen and do slightly more. The decorator reads the annotated fields and
+generates <code>__init__</code>, <code>__repr__</code> and <code>__eq__</code> from them, in order,
+with defaults working exactly as they do in a function.</p>
+
+<p>The annotations are load-bearing here — that is how the decorator finds the fields. A field with no
+annotation is invisible to it. This is the one place a type hint changes behaviour rather than just
+documenting it.</p>
+
+<h2>frozen, and the mutable default</h2>
+
+<pre class="language-python"><code class="language-python">from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class Transaction:
+    id: int
+    amount: float
+    tags: list[str] = field(default_factory=list)
+
+t = Transaction(1, 100.0)
+print(t.tags)          # Output: []
+
+try:
+    t.amount = 999
+except Exception as error:
+    print(type(error).__name__)     # Output: FrozenInstanceError
+</code></pre>
+
+<p><code>frozen=True</code> makes instances immutable, which also makes them hashable — so they can go
+in a set or be a dict key. Use it for anything that represents a fact rather than a thing that changes:
+a transaction has happened and will not un-happen.</p>
+
+<p><code>field(default_factory=list)</code> is how you get a mutable default safely. A plain
+<code>tags: list[str] = []</code> is the shared-default bug from
+<a href="/python/python-function">Functions</a>, and dataclasses refuse it outright with a
+<code>ValueError</code> rather than letting you ship it.</p>
+
+<h2>Validation with __post_init__</h2>
+
+<pre class="language-python"><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class Account:
+    number: str
+    balance: float = 0.0
+
+    def __post_init__(self):
+        if self.balance &lt; 0:
+            raise ValueError("balance cannot be negative")
+        self.number = self.number.strip()
+
+print(Account("  1001  ").number)     # Output: 1001
+
+try:
+    Account("1001", -5)
+except ValueError as error:
+    print(error)                      # Output: balance cannot be negative
+</code></pre>
+
+<p>The generated <code>__init__</code> calls <code>__post_init__</code> after setting the fields, which
+is where validation and normalisation go. Doing it here means an invalid instance cannot exist anywhere
+in the program — much stronger than checking at each call site.</p>
+
+<h2>In real code</h2>
+
+<p>The bank app's model layer is dataclasses throughout. This is its transaction record:</p>
+
+<!-- from: bank/models.py -->
+<pre class="language-python"><code class="language-python">@dataclass(frozen=True)
+class Transaction:
+    id: int
+    account_id: int
+    type: TransactionType
+    amount: Decimal
+    balance_after: Decimal
+    timestamp: datetime
+    description: str
+
+    @property
+    def signed_amount(self) -&gt; Decimal:
+        return self.type.signed(self.amount)
+</code></pre>
+
+<p>Seven fields, frozen because a statement line never changes once written, and a
+<code>@property</code> alongside them — a dataclass is a normal class and takes normal methods.</p>
+
+<h2>Type hints</h2>
+
+<p>Outside a dataclass, hints do nothing at runtime. They are for readers and for checkers:</p>
+
+<pre class="language-python"><code class="language-python">def apply_fee(balance: float, fee: float = 2.50) -&gt; float:
+    return balance - fee
+
+def find(number: str) -&gt; str | None:
+    return None if number == "missing" else "Checking"
+
+print(apply_fee(100.0))       # Output: 97.5
+print(find("missing"))        # Output: None
+</code></pre>
+
+<p>The syntax worth knowing is short: <code>name: type</code> for a parameter or variable,
+<code>-&gt; type</code> for the return, <code>|</code> for "either" (3.10 onwards), and builtin generics
+for containers — <code>list[str]</code>, <code>dict[str, float]</code>, <code>tuple[int, ...]</code>.
+The old <code>typing.List</code> spellings are obsolete since 3.9.</p>
+
+<p><code>str | None</code> is the one that repays the effort. It is the difference between a value you
+can use and one you must check first, and it is the single most common source of
+<code>AttributeError: 'NoneType' object has no attribute ...</code>.</p>
+
+<h2>What a checker adds</h2>
+
+<p>Nothing checks hints unless you run a checker. Install mypy and it reads the annotations you already
+wrote:</p>
+
+<pre class="language-bash"><code class="language-bash">pip install mypy
+mypy bank/
+
+# bank/services.py:42: error: Argument 1 to "apply_fee" has
+#     incompatible type "str"; expected "float"
+</code></pre>
+
+<p>That is the value proposition: a class of bug that would otherwise surface at runtime, in production,
+caught before the program starts. Editors use the same information for completion and inline warnings,
+which is a benefit you get without running anything.</p>
+
+<p>The pragmatic approach is to hint function signatures and dataclass fields, and not to bother inside
+function bodies where the types are obvious. Hints on the boundaries are where nearly all the value
+is.</p>
+
+<h2>Comparing and sorting dataclasses</h2>
+
+<p><code>order=True</code> generates the comparison operators as well, using the fields in declaration
+order — the same rule <a href="/python/python-tuples">tuples</a> follow:</p>
+
+<pre class="language-python"><code class="language-python">from dataclasses import dataclass, field, asdict
+
+@dataclass(order=True)
+class Account:
+    kind: str
+    balance: float
+
+accounts = [Account("Savings", 8400.5), Account("Checking", 1250.0)]
+
+for a in sorted(accounts):
+    print(a.kind)
+
+# Output: Checking
+# Output: Savings
+
+print(asdict(accounts[0]))     # Output: {'kind': 'Savings', 'balance': 8400.5}
+</code></pre>
+
+<p>Field order decides sort order, so put the field you sort by first — or pass
+<code>field(compare=False)</code> on the ones that should be ignored.</p>
+
+<p><code>asdict()</code> converts an instance to a plain dict, recursively, which is how a dataclass
+becomes JSON in one step. Its partner <code>replace(obj, balance=0)</code> returns a modified copy,
+which is what you use on a <code>frozen</code> instance instead of assigning to it.</p>
+
+<h2>When not to use a dataclass</h2>
+
+<p>If the class is mostly behaviour with one or two attributes, a plain class is clearer — the dataclass
+machinery buys you nothing. If it is an immutable record with no methods at all, a
+<a href="/python/python-tuples">NamedTuple</a> is lighter and unpacks. And if you need validation and
+parsing of external data, Pydantic does at runtime what mypy does statically.</p>
+
+<p>Next: <a href="/python/python-exception-handling">Exception Handling</a>.</p>

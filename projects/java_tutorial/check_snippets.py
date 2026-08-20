@@ -60,14 +60,27 @@ def find_jdk(version: str) -> str | None:
     return None
 
 
-# A <pre>, optionally preceded by HTML comments that pin its JDK or mark it as a
-# deliberate compile error. Order between the two markers does not matter.
+# A <pre>, optionally preceded by HTML comments that pin its JDK, mark it as a
+# deliberate compile error, or name the demo-app file it was lifted from.
 BLOCK = re.compile(
-    r'(?P<markers>(?:<!--\s*(?:jdk:\d+|expect-error)\s*-->\s*)*)'
+    r'(?P<markers>(?:<!--[^>]*-->\s*)*)'
     r'<pre\b[^>]*>(?:\s*<code\b[^>]*>)?(?P<body>.*?)(?:</code>\s*)?</pre>',
     re.S | re.I)
 JDK_MARKER = re.compile(r'<!--\s*jdk:(\d+)\s*-->', re.I)
 EXPECT_ERROR = re.compile(r'<!--\s*expect-error\s*-->', re.I)
+
+# A block lifted verbatim from bank-java-console. It is NOT compiled here, and
+# that is deliberate rather than a gap: a method lifted out of its class refers to
+# the fields and collaborators it had there (`userStore`, `idOf`, `Money`), so
+# wrapping it in a synthetic class could only be made to compile by editing it —
+# which would destroy the very thing that makes it worth quoting.
+#
+# These blocks are verified twice over instead:
+#   1. check_provenance.py proves every line really is in the named file.
+#   2. check.sh runs the app's own suite, so that file demonstrably compiles and
+#      its 51 tests pass.
+# That is a stronger guarantee than compiling a fragment in isolation.
+FROM_MARKER = re.compile(r'<!--\s*from:\s*[^\s>]+\s*-->', re.I)
 
 # Only Java blocks are compiled. A block is Java unless its class says otherwise
 # — the track also carries shell, xml and plaintext samples.
@@ -217,8 +230,9 @@ def wrap(code: str, index: int, jdk: str | None = None) -> tuple[str, str]:
     return as_statements("statements")
 
 
-def extract(entry) -> list[dict]:
-    """Every Java code block in one post, with its pinned JDK if it has one."""
+def extract(entry, lifted: list) -> list[dict]:
+    """Every compilable Java block in one post. Demo-app quotes are collected
+    into `lifted` and left to check_provenance.py — see FROM_MARKER."""
     raw = (HERE / "posts" / entry["file"]).read_text(encoding="utf-8")
     out = []
     for i, m in enumerate(BLOCK.finditer(raw)):
@@ -229,6 +243,9 @@ def extract(entry) -> list[dict]:
         if not code:
             continue
         markers = m.group("markers") or ""
+        if FROM_MARKER.search(markers):
+            lifted.append(entry["slug"])
+            continue
         jdk = JDK_MARKER.search(markers)
         out.append({"slug": entry["slug"], "index": i, "code": code,
                     "jdk": jdk.group(1) if jdk else None,
@@ -313,12 +330,13 @@ def main() -> int:
         return 1
 
     blocks = []
+    lifted = []
     for entry in manifest.POSTS:
         path = HERE / "posts" / entry["file"]
         if not path.exists():
             print(f"  .. {entry['slug']:36} not written yet, skipped")
             continue
-        blocks.extend(extract(entry))
+        blocks.extend(extract(entry, lifted))
 
     if not blocks:
         print("no post bodies written yet — nothing to compile")
@@ -381,6 +399,9 @@ def main() -> int:
         print(f"  {'x' if bad else 'ok':>2}  {entry['slug']:36} {len(bs):>2} blocks{note}")
 
     print(f"\n{len(jobs)} compilations across {len(blocks)} blocks")
+    if lifted:
+        print(f"{len(lifted)} block(s) quoted from the demo app were not compiled here — "
+              f"check_provenance.py and the app's own suite cover those")
     if failures:
         print(f"\nFAILED ({len(failures)}):")
         for f in sorted(failures):

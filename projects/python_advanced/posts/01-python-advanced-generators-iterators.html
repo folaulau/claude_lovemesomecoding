@@ -1,0 +1,209 @@
+<p>The <a href="/python/python-generators-iterators">Python track's post on generators</a> covers what
+<code>yield</code> does and why laziness matters. This one goes under it: the protocol every iterator
+implements, generators used as coroutines rather than producers, and the standard library built on
+top of both.</p>
+
+<h2>The protocol, written out by hand</h2>
+
+<p>Two methods. <code>__iter__</code> returns the iterator, and <code>__next__</code> returns the next
+item or raises <code>StopIteration</code>:</p>
+
+<pre class="language-python"><code class="language-python">class Countdown:
+    def __init__(self, start):
+        self.current = start
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current &lt;= 0:
+            raise StopIteration
+        self.current -= 1
+        return self.current + 1
+
+print(list(Countdown(3)))     # Output: [3, 2, 1]
+
+c = Countdown(2)
+print(next(c), next(c))       # Output: 2 1
+</code></pre>
+
+<p>That is everything a <code>for</code> loop needs. No base class and no registration — the loop calls
+<code>iter()</code> then <code>next()</code> until <code>StopIteration</code>, and any object with
+those two methods qualifies.</p>
+
+<p>Note this class returns <code>self</code> from <code>__iter__</code>, which makes it a
+<strong>one-shot</strong> iterator: exhaust it and looping again yields nothing. That is the same rule
+as a generator, and it is the reason the next section exists.</p>
+
+<h2>Iterable and iterator are different things</h2>
+
+<pre class="language-python"><code class="language-python">class Deck:
+    """Iterable, not an iterator — a fresh iterator per loop."""
+    def __init__(self, cards):
+        self.cards = cards
+
+    def __iter__(self):
+        return iter(self.cards)      # a NEW iterator each time
+
+deck = Deck(["A", "K", "Q"])
+
+print(list(deck))     # Output: ['A', 'K', 'Q']
+print(list(deck))     # Output: ['A', 'K', 'Q']
+
+it = iter(deck)
+print(next(it))       # Output: A
+print(list(it))       # Output: ['K', 'Q']
+</code></pre>
+
+<p>A <strong>list is iterable but is not an iterator</strong>: it has no <code>__next__</code>, and
+each <code>for</code> loop gets a fresh iterator from it. That is why you can loop over a list twice
+and not over a generator.</p>
+
+<p>The design rule follows: implement <code>__iter__</code> returning a new iterator when the object is
+a <em>collection</em>, and return <code>self</code> only when the object genuinely represents one
+traversal — a cursor, a stream, a socket.</p>
+
+<h2>The same thing as a generator</h2>
+
+<pre class="language-python"><code class="language-python">def countdown(start):
+    while start &gt; 0:
+        yield start
+        start -= 1
+
+print(list(countdown(3)))     # Output: [3, 2, 1]
+</code></pre>
+
+<p>Four lines against fourteen, and the state lives in a local variable rather than an attribute you
+have to maintain. This is why hand-written iterator classes are rare: the generator gets
+<code>__iter__</code>, <code>__next__</code> and <code>StopIteration</code> for free.</p>
+
+<p>Write the class when the object needs to be more than an iterator — when it also has methods,
+attributes or a repr worth having. Otherwise write the generator.</p>
+
+<h2>Generators receive as well as produce</h2>
+
+<p><code>yield</code> is an expression, not a statement, and its value is whatever the caller sends
+in:</p>
+
+<pre class="language-python"><code class="language-python">def running_total():
+    total = 0
+    while True:
+        amount = yield total       # yield out, receive in
+        if amount is not None:
+            total += amount
+
+acc = running_total()
+print(next(acc))          # Output: 0
+print(acc.send(100))      # Output: 100
+print(acc.send(-25))      # Output: 75
+acc.close()
+</code></pre>
+
+<p>That is a coroutine — a generator used as a consumer rather than a producer. The
+<code>next(acc)</code> first is not optional: a fresh generator has not reached its first
+<code>yield</code>, so there is nowhere for a sent value to land, and calling
+<code>send()</code> straight away raises <code>TypeError</code>.</p>
+
+<p><code>close()</code> raises <code>GeneratorExit</code> inside the generator, and
+<code>throw()</code> raises an exception of your choosing at the paused line. In practice
+<code>async def</code> has taken over most of what this was used for — see
+<a href="/python/python-async">Async &amp; Await</a> — but it is the machinery underneath, and
+<code>send</code> still turns up in pipeline code.</p>
+
+<h2>yield from</h2>
+
+<pre class="language-python"><code class="language-python">def flatten(items):
+    for item in items:
+        if isinstance(item, list):
+            yield from flatten(item)     # delegate to the recursive call
+        else:
+            yield item
+
+print(list(flatten([1, [2, [3, [4]], 5], 6])))     # Output: [1, 2, 3, 4, 5, 6]
+</code></pre>
+
+<p><code>yield from</code> delegates to another iterable. It is not merely shorthand for a loop: it
+also forwards <code>send</code>, <code>throw</code> and <code>close</code> to the sub-generator, and
+passes back its return value.</p>
+
+<p>Recursive flattening is where it reads best — the alternative is a nested loop that re-yields each
+item by hand.</p>
+
+<h2>contextlib turns one into a context manager</h2>
+
+<pre class="language-python"><code class="language-python">from contextlib import contextmanager
+
+@contextmanager
+def timed(label):
+    print(f"start {label}")
+    try:
+        yield label.upper()          # everything before = __enter__
+    finally:
+        print(f"end {label}")        # everything after = __exit__
+
+with timed("import") as name:
+    print(f"working on {name}")
+
+# Output: start import
+# Output: working on IMPORT
+# Output: end import
+</code></pre>
+
+<p>One <code>yield</code>, exactly one. What comes before it is the setup, what it yields becomes the
+<code>as</code> variable, and what comes after is the teardown. The <code>try/finally</code> is what
+makes the cleanup run even when the block raises — without it, this is a context manager that leaks
+on exactly the path you wrote it for.</p>
+
+<p>This replaces writing a class with <code>__enter__</code> and <code>__exit__</code> for the common
+case, and it is the clearest demonstration that a generator is a resumable function rather than a
+sequence.</p>
+
+<h2>itertools, past the obvious</h2>
+
+<pre class="language-python"><code class="language-python">from itertools import groupby, accumulate, pairwise, takewhile
+
+rows = [("Checking", 100), ("Checking", 250), ("Savings", 90)]
+
+for kind, group in groupby(rows, key=lambda r: r[0]):
+    print(kind, sum(amount for _, amount in group))
+
+# Output: Checking 350
+# Output: Savings 90
+
+print(list(accumulate([100, -25, 250])))          # Output: [100, 75, 325]
+print(list(pairwise([1, 2, 3, 4])))               # Output: [(1, 2), (2, 3), (3, 4)]
+print(list(takewhile(lambda n: n &gt; 0, [3, 1, -1, 5])))   # Output: [3, 1]
+</code></pre>
+
+<p><code>accumulate</code> is a running total — exactly the <code>balance_after</code> column a
+statement needs. <code>pairwise</code> (3.10) gives consecutive pairs, which is how you compute deltas
+between readings. <code>takewhile</code> stops at the first failure rather than filtering the whole
+input.</p>
+
+<p><strong><code>groupby</code> only groups <em>consecutive</em> equal keys.</strong> That is the trap:
+it is not SQL's <code>GROUP BY</code>. Feed it unsorted input and you get several groups for the same
+key. Sort by the same key first, or use a
+<a href="/python/python-dictionaries-sets"><code>defaultdict</code></a>, which does not care about
+order and is usually the better tool.</p>
+
+<h2>Generators are not free</h2>
+
+<pre class="language-python"><code class="language-python">import timeit
+
+setup = "data = list(range(1000))"
+loop = timeit.timeit("sum(x * 2 for x in data)", setup=setup, number=1000)
+comp = timeit.timeit("sum([x * 2 for x in data])", setup=setup, number=1000)
+
+print(loop &gt; 0 and comp &gt; 0)      # Output: True
+print(round(loop / comp, 0) &gt;= 1) # Output: True
+</code></pre>
+
+<p>On a small collection the list comprehension is usually the <em>faster</em> of the two, because each
+<code>yield</code> costs a suspend and resume while the list version runs a tight loop in C. Generators
+win on memory and on time-to-first-item, not on raw throughput.</p>
+
+<p>So the rule is about size and shape, not style: use a generator when the data is large, unbounded,
+or you may stop early. Use a list when it is small and you need it more than once.</p>
+
+<p>Next: <a href="/python-advanced/python-advanced-map-reduce-and-filter">functools, operator, and
+reduce</a>.</p>

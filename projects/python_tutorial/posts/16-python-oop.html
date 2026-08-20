@@ -1,0 +1,225 @@
+<p>Object-oriented programming in Python works differently from the languages it borrowed the vocabulary
+from. There are no interfaces to declare and no <code>private</code> to enforce. What matters is what an
+object can <em>do</em>, and this post covers how that changes the advice.</p>
+
+<h2>Inheritance</h2>
+
+<pre class="language-python"><code class="language-python">class Account:
+    def __init__(self, number, balance):
+        self.number = number
+        self.balance = balance
+
+    def describe(self):
+        return f"{self.kind()} {self.number}: ${self.balance:,.2f}"
+
+    def kind(self):
+        return "Account"
+
+class Savings(Account):
+    def __init__(self, number, balance, rate):
+        super().__init__(number, balance)
+        self.rate = rate
+
+    def kind(self):
+        return "Savings"
+
+    def add_interest(self):
+        self.balance += self.balance * self.rate
+
+s = Savings("2001-0001", 8400.50, 0.02)
+s.add_interest()
+
+print(s.describe())     # Output: Savings 2001-0001: $8,568.51
+</code></pre>
+
+<p><code>class Savings(Account)</code> inherits everything. <code>super().__init__(...)</code> runs the
+parent's initialiser — call it first, before your own setup, and do not skip it or the parent's
+attributes never get created.</p>
+
+<p>Notice what <code>describe()</code> did: it is defined on <code>Account</code>, but it called
+<code>kind()</code> and got the <em>subclass</em> version. That is polymorphism, and Python does it by
+default — every method is overridable and lookup always starts at the actual class.</p>
+
+<h2>Duck typing: no interface required</h2>
+
+<p>Python does not care what class an object is, only whether it has the method you are about to
+call:</p>
+
+<pre class="language-python"><code class="language-python">class Card:
+    def pay(self, amount):
+        return f"charged ${amount} to card"
+
+class BankTransfer:
+    def pay(self, amount):
+        return f"transferred ${amount}"
+
+def checkout(method, amount):
+    return method.pay(amount)          # no shared base class needed
+
+print(checkout(Card(), 25))            # Output: charged $25 to card
+print(checkout(BankTransfer(), 25))    # Output: transferred $25
+</code></pre>
+
+<p>These two classes are unrelated. Neither declares that it implements anything. <code>checkout</code>
+works because both have a <code>pay</code> method — "if it walks like a duck".</p>
+
+<p>The consequence for design: an interface in Python is a <strong>set of method names people agree
+on</strong>, not a declaration. That is why you will see far less inheritance in Python than in Java —
+most of what inheritance is used for there is achieved here by simply having the right methods.</p>
+
+<h2>Abstract base classes, when you want the promise enforced</h2>
+
+<p>Duck typing fails late — you find out a method is missing when something calls it. When that is not
+good enough, <code>abc</code> makes the requirement explicit:</p>
+
+<!-- expect-error -->
+<pre class="language-python"><code class="language-python">from abc import ABC, abstractmethod
+
+class PaymentMethod(ABC):
+    @abstractmethod
+    def pay(self, amount): ...
+
+class Voucher(PaymentMethod):
+    pass          # never implemented pay()
+
+Voucher()
+</code></pre>
+
+<p>That raises <code>TypeError: Can't instantiate abstract class Voucher</code> at the moment you try to
+create one, rather than later when something calls <code>pay</code>. The class becomes a contract you
+cannot half-implement.</p>
+
+<p>Use one when several classes must be interchangeable and forgetting a method is a real risk. For two
+classes in the same file, duck typing is enough.</p>
+
+<h2>Properties instead of getters and setters</h2>
+
+<p>Do not write <code>get_balance()</code> and <code>set_balance()</code>. Expose the attribute, and if
+you later need logic, add it without changing a single caller:</p>
+
+<pre class="language-python"><code class="language-python">class Account:
+    def __init__(self, balance):
+        self._balance = balance
+
+    @property
+    def balance(self):
+        return self._balance
+
+    @balance.setter
+    def balance(self, value):
+        if value &lt; 0:
+            raise ValueError("balance cannot be negative")
+        self._balance = value
+
+a = Account(100)
+a.balance = 250
+print(a.balance)      # Output: 250
+
+try:
+    a.balance = -1
+except ValueError as error:
+    print(error)      # Output: balance cannot be negative
+</code></pre>
+
+<p>Callers still write <code>a.balance</code> and <code>a.balance = 250</code>. This is why Java's habit
+of writing getters for every field up front is unnecessary here: you can start with a plain attribute
+and introduce a property later without breaking anything.</p>
+
+<h2>Prefer composition</h2>
+
+<p>Inheritance says "is a"; composition says "has a". The second is right more often:</p>
+
+<pre class="language-python"><code class="language-python">class InterestCalculator:
+    def __init__(self, rate):
+        self.rate = rate
+
+    def yearly(self, balance):
+        return round(balance * self.rate, 2)
+
+class Account:
+    def __init__(self, balance, calculator):
+        self.balance = balance
+        self.calculator = calculator      # HAS a calculator
+
+    def projected(self):
+        return self.balance + self.calculator.yearly(self.balance)
+
+a = Account(1000.0, InterestCalculator(0.05))
+print(a.projected())      # Output: 1050.0
+</code></pre>
+
+<p>The calculator can be swapped, tested on its own, and reused by something that is not an account.
+A <code>class SavingsAccount(Account)</code> hierarchy that grows a branch per product ends up with
+subclasses inheriting behaviour they do not want.</p>
+
+<p>The test: if you are inheriting to <em>reuse code</em> rather than because the subclass genuinely
+<em>is</em> a kind of the parent, use composition.</p>
+
+<h2>Exceptions are the clearest hierarchy you will write</h2>
+
+<p>Where inheritance does earn its place is exception types. The bank app this track draws on defines
+one base class so a single <code>except</code> catches everything the app raises on purpose:</p>
+
+<!-- from: bank/errors.py -->
+<pre class="language-python"><code class="language-python">class BankError(Exception):
+    ...
+
+class AuthenticationError(BankError):
+    ...
+
+class ValidationError(BankError):
+    ...
+
+class InsufficientFundsError(BankError):
+    ...
+</code></pre>
+
+<p>(The docstrings are elided here; in the app each class carries one explaining exactly when it is raised, which is the only documentation an exception class usually needs.)</p>
+
+<p><code>except BankError</code> then catches every rule the app enforces and nothing else — while
+<code>except Exception</code> would also swallow the typos in your own code.
+<a href="/python/python-exception-handling">Exception Handling</a> covers this properly.</p>
+
+<h2>The method resolution order</h2>
+
+<p>When a class has more than one parent, Python needs a rule for which method wins. That rule has a
+name and you can read it:</p>
+
+<pre class="language-python"><code class="language-python">class Auditable:
+    def save(self):
+        return "audited"
+
+class Timestamped:
+    def save(self):
+        return "timestamped"
+
+class Account(Auditable, Timestamped):
+    pass
+
+print(Account().save())                          # Output: audited
+print([c.__name__ for c in Account.__mro__])
+# Output: ['Account', 'Auditable', 'Timestamped', 'object']
+</code></pre>
+
+<p><code>__mro__</code> is the method resolution order — the exact list Python walks, left to right,
+looking for a name. <code>Auditable</code> comes first in the class statement, so its
+<code>save</code> wins.</p>
+
+<p>Every class ends at <code>object</code>, which is where the default <code>__repr__</code> and
+<code>__eq__</code> you have been overriding come from. When multiple inheritance confuses you, print
+the MRO — it turns a guess into a fact.</p>
+
+<h2>What Python does not have</h2>
+
+<ul>
+  <li><strong>No <code>private</code>.</strong> A leading underscore is a convention. There is no
+      keyword and no enforcement.</li>
+  <li><strong>No method overloading.</strong> One method per name — a second <code>def</code> replaces
+      the first. Use default arguments or <code>*args</code> instead.</li>
+  <li><strong>No interfaces.</strong> Duck typing, or an ABC when you want it checked.</li>
+  <li><strong>Multiple inheritance is allowed</strong>, and mostly used for small mixins rather than
+      two real parents.</li>
+</ul>
+
+<p>Next: <a href="/python/python-dataclasses-type-hints">Dataclasses &amp; Type Hints</a>, which removes
+most of the boilerplate from everything above.</p>

@@ -1,6 +1,6 @@
 # Java Tutorial track — progress report
 
-**Status:** SCAFFOLDED — manifest, tooling and decisions done; post bodies being written
+**Status:** ✅ **PUBLISHED TO PROD** — live at https://lovemesomecoding.com/java
 **Started:** 2026-08-20
 **Where it lands:** https://lovemesomecoding.com/java
 
@@ -54,29 +54,88 @@ All taken by Folau on 2026-08-20 unless noted.
 | Existing 28 slugs | **Keep every one** | All indexed. A slug change is a URL change. |
 | `how-to-solve-java-problems` | **Write it for real** (~1,400 words) | Good title, already indexed, currently blank. Redirecting it away would waste a ranking URL and a genuinely useful topic. |
 | Get started | **New `java-get-started` + trim `introduction-to-java`** | Two distinct jobs — "how do I run something" and "what is this thing" — currently half-served by one post. |
-| Snippets | **Standalone, compile-verified** | See below. This is the one place this track deliberately departs from its siblings. |
+| Snippets | **Standalone by default; the bank app in 14 posts** | Changed mid-session — see below. Everything authored is compiled; everything quoted is provenance-checked. |
 | Java version | **21 baseline, flag 25 where it matters** | See below. |
 | Tags | **Add to all 29** | Currently zero everywhere. |
 | `boldgrid` divs | **Strip entirely** | Migration residue with no styling attached to it. |
 | Dates | **Restamp 2026-06-24 … 2026-08-19, 2 days apart, at 12:00** | See below. |
-| Publish | **Seed local → Folau reviews → prod** | Same flow as every sibling track. |
+| Publish | **Seed local → Folau reviews → prod** | Same flow as every sibling track. Done 2026-08-20. |
 
-### Snippets: standalone, but compiled
+### Snippets: standalone by default, the bank app where it earns it
 
-`CLAUDE.md` says to build examples from `lovemesomecoding_demo_project`, and `/backend-dev`
-follows that rule with a `check_snippets.py` that requires every line to exist in
-`pizza-springboot-backend`.
+**This decision changed mid-session.** It is recorded here in the order it happened, because the
+first version of it is still half-true and the reasoning matters.
 
-**That rule is wrong for this track and Folau agreed to the exception.** `int count = 0;` has no
-business being traced back to a pizza ordering API. Forcing the basics posts to source their
-examples from a Spring Boot app would make "Java Variables" read like framework code, which is
-exactly the wrong register for the first ten posts.
+**Original call (approved):** snippets standalone and compile-verified, explicitly *not* lifted from
+`lovemesomecoding_demo_project` the way `/backend-dev` does. The objection was that `int count = 0;`
+has no business being traced back to a **pizza Spring Boot API**, and forcing the basics posts to
+source from a framework app would make "Java Variables" read like framework code.
 
-The trade is that nothing external vouches for the samples any more. So the checker was replaced
-rather than dropped: **`check_snippets.py` compiles every code block with `javac`.** A snippet
-cannot ship unless it actually compiles. That is a stronger guarantee than source-matching for
-standalone code, and a trim pass — where you delete the line that declared a variable three lines
-down — is precisely when a snippet gets silently broken.
+**Then Folau added a requirement** pointing at `lovemesomecoding_demo_project/bank/bank-python-console`
+— and that changes the picture, because the objection above was about *Spring Boot*, not about demo
+apps. See the next section.
+
+### The console bank app
+
+The path Folau gave is the **Python** twin. Flagged rather than guessed at, and he confirmed
+(2026-08-20) that **`bank-java-console`** is what a Java tutorial should quote. The two apps are
+kept at parity over the same CSV files by `bank/parity.sh`.
+
+It is a much better fit than the pizza backend:
+
+- **Plain Java 21.** No Maven, no Gradle, no Spring, no database. Shell scripts and CSV files.
+- Its own README says *"Readability and teachability outrank cleverness"* — it exists to produce
+  tutorial snippets.
+- It contains real, idiomatic examples of most of this track: `BigDecimal` money, records with
+  compact constructors, enums carrying behaviour, an exception hierarchy, `Optional` at a store
+  boundary, streams, defensive copying, file I/O.
+
+**14 of 29 posts quote it.** The split is recorded in `manifest.QUOTES_DEMO_APP`:
+
+| Quote the app | Standalone, and why |
+|---|---|
+| data-types, string, conditionals, class, oop, static-and-final, collections, exceptions, date, stream, method-reference, optional, record, best-practices | **variables, operators, for-loop, packages** — a banking domain adds noise to `i++`, not insight |
+| | **interface, sealed-class** — the app has **no interfaces and no sealed types**. Checked, not assumed. Nothing to cite. |
+| | **get-started, introduction, debugging, how-to-solve, completablefuture, lambda, code-snippets** — no natural home, or the topic is about tooling rather than code |
+
+### How a quoted snippet is verified
+
+A quoted block names its source in an HTML comment:
+
+```html
+<!-- from: src/com/bank/model/Money.java -->
+<pre class="language-java"><code class="language-java">...
+```
+
+**These are not compiled by `check_snippets.py`, and that is deliberate rather than a gap.** A method
+lifted out of its class refers to the fields and collaborators it had there — `userStore`, `idOf`,
+`Money` — so the only way to make it compile in isolation is to edit it, which would destroy the
+thing that makes it worth quoting.
+
+They are verified twice over instead:
+
+1. **`check_provenance.py`** proves every substantial line really is in the named file. It normalises
+   away the edits a post is allowed to make — an elided `{ ... }`, a rewritten comment, indentation —
+   and fails on anything else. Sanity-tested by pointing a block at the wrong file and confirming it
+   reported all 7 lines as absent.
+2. **`check.sh` runs the app's own suite** — 51 unit tests plus an end-to-end run. So the file the
+   snippet came from demonstrably compiles and behaves.
+
+That is a stronger guarantee than compiling a wrapped fragment would be.
+
+### Standalone snippets: still compiled
+
+The other 226 blocks are written for the page, and **`check_snippets.py` compiles every one of them
+with `javac`**. A snippet cannot ship unless it actually compiles — which matters most in a trim
+pass, where deleting the line that declared a variable three lines down is exactly how a sample
+breaks silently.
+
+Most blocks are fragments rather than compilation units, so the checker wraps each one before
+compiling. Deciding *how* to wrap turned out to be the fiddly part, and it is worth knowing that the
+classifier keys off **the first meaningful line** of the block. An earlier version tested the whole
+block with a set of regexes and mis-wrapped an anonymous class (`public int compare(...)` in the
+middle of a run of statements) as a class body. Six real bugs were caught this way before the design
+settled — see the log.
 
 ### Java version: 21 baseline, 25 in callouts
 
@@ -202,9 +261,12 @@ projects/java_tutorial/
   manifest.py          category metadata, LTS table, version policy, one entry per post
   posts/NN-slug.html   post bodies, plain semantic HTML
   seed.py              writes the posts into a content tree
-  check_content.py     proves the normaliser round-trips every code sample + enforces WORD_TARGET
+  check_content.py     proves the normaliser round-trips every code sample + enforces WORD_TARGET,
+                       the 4-10 h2 band, and that every post has tags
   check_links.py       HTML well-formedness + every internal link resolves
-  check_snippets.py    compiles every code block with javac 21 and javac 25
+  check_snippets.py    compiles every authored code block with javac 21 AND javac 25
+  check_provenance.py  proves every quoted block really is in the bank app file it names
+  check.sh             runs all of the above, plus the bank app's own test suite
 ```
 
 `seed.py`, `check_content.py` and `check_links.py` are lifted from `projects/backend_dev/`.
@@ -213,9 +275,8 @@ projects/java_tutorial/
 Run all three before seeding:
 
 ```bash
-python projects/java_tutorial/check_content.py
-python projects/java_tutorial/check_snippets.py
-AWS_PROFILE=folau python projects/java_tutorial/check_links.py
+projects/java_tutorial/check.sh              # content, snippets, provenance, bank suite
+projects/java_tutorial/check.sh --links      # ...plus the S3-backed link check
 ```
 
 Then:
@@ -230,8 +291,50 @@ track reads in the wrong order.
 
 ## Open questions
 
-None outstanding. All four scoping decisions and the version question were answered by Folau on
-2026-08-20.
+None outstanding.
+
+## Publish record — 2026-08-20
+
+| Step | Result |
+|---|---|
+| `check.sh` (all five gates) | green |
+| Prod dry run | 28 updates in place + 1 create, no slug collisions |
+| Rollback snapshot | 28 post JSONs + `posts.json`, `categories.json`, `by-category/java.json`, `search/index.json` |
+| `seed.py --env prod --write --force-dates` | `/java` = 29, tree 593 → **594** |
+| `npm run sync-content` | 594 posts, 44 categories pulled down |
+| `npm run build` | **594/594 posts served, all indexed URLs accounted for**, 44/44 category counts agree, 771 html files |
+| `./scripts/deploy.sh` | 1,573 files, build `394b0bd`, CF function republished (41 redirects), invalidation completed and edge verified |
+| Live check | **all 29 URLs return 200**; `/java` lists Get Started; no `boldgrid` residue |
+
+**Rollback snapshot** (delete once you are happy — it is in the session scratchpad and will not
+survive a reboot):
+
+```
+/private/tmp/claude-501/-Users-folaukaveinga-Github-claude-lovemesomecoding/2b384c78-8c10-47ca-bfb7-4c7635a2bee1/scratchpad/prod-backup-20260820-133012
+```
+
+To roll back a single post: `aws s3 cp <snapshot>/posts/<slug>.json
+s3://lovemesomecoding-db-329580012644-us-west-2-an/lovemesomecoding/prod/posts/<slug>.json
+--profile folau --region us-west-2`, then re-run the frontend deploy. Note the indexes are derived —
+restoring posts alone leaves the counts stale, so restore `index/` too or re-seed.
+
+## Also worth knowing
+
+`__pycache__` is tracked in git — six `.pyc` files across `projects/*/`, committed by the `asdf`
+commits during this session. `CLAUDE.md` says never to commit build output. A `.gitignore` rule was
+added; **the tracked copies still need removing**, which is a one-liner but rewrites the index, so it
+was left for you:
+
+```bash
+git rm -r --cached projects/*/__pycache__
+```
+
+## One thing to flag on review
+
+Every post landed in the **900–1,250** band rather than spread across 900–1,800. That is consistent
+and matches `/backend-dev`'s lower half, but it is shorter than the "1,200–1,800" figure discussed
+when the trim target was set. The ceiling was the point of the exercise and nothing was cut that
+needed saying — but if you want these fuller, the room is there and the guard already allows it.
 
 ## Log
 
@@ -241,4 +344,11 @@ None outstanding. All four scoping decisions and the version question were answe
 | 2026-08-20 | Folau: trim to 1,200–1,800; write the empty post for real; new get-started + trim intro; compile-verify standalone snippets. |
 | 2026-08-20 | Folau added the LTS-table and version-statement requirement to the get-started page. |
 | 2026-08-20 | Folau: Java 21 baseline, callouts for 25, compile under both JDKs. Verified the 25 compact-source form on this machine. |
+| 2026-08-20 | Word floor lowered 1200 -> 900: `/backend-dev`, the track the band was matched to, actually runs 926-1464. The ceiling is what this project is about. |
 | 2026-08-20 | Scaffolded the project: manifest with all 29 entries, LTS table, tooling copied and adapted. |
+| 2026-08-20 | Wrote all 29 posts. 178,146 words -> 28,708. Every post 4-6 min. |
+| 2026-08-20 | Seeded to **local**. `/java` holds 29, category count 29, tree total 594. |
+| 2026-08-20 | Folau added the demo-app requirement, pointing at `bank-python-console`. Flagged the language mismatch; he confirmed `bank-java-console`. |
+| 2026-08-20 | Reworked 14 posts to quote the bank app. Added `check_provenance.py` and wired the app's suite into `check.sh`. |
+| 2026-08-20 | Re-seeded to local. 29 posts, 242 code blocks, all five gates green. |
+| 2026-08-20 | **Published to prod.** Content seeded, site rebuilt (594/594 verified) and deployed as build `394b0bd`. All 29 URLs live. |

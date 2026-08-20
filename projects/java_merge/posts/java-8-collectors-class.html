@@ -1,0 +1,217 @@
+<p>A stream pipeline has to end somewhere. <code>collect</code> is the general-purpose ending, and
+the <code>Collectors</code> class supplies the recipes — turn this stream into a list, a map, a
+grouped report, or one joined string.</p>
+
+<p>There are dozens of them and you do not need dozens. Six do almost all the work in practice, and
+the one genuinely worth studying is <code>groupingBy</code>, because it replaces the loop-with-a-map
+that every codebase has written by hand at least once.</p>
+
+<h2>The basic three</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo", "Cy", "Bo");
+
+class Demo {
+    void run(List&lt;String&gt; names) {
+        List&lt;String&gt; list = names.stream().collect(Collectors.toList());
+        Set&lt;String&gt; set = names.stream().collect(Collectors.toSet());
+        TreeSet&lt;String&gt; sorted = names.stream()
+                .collect(Collectors.toCollection(TreeSet::new));
+
+        System.out.println(list.size());     // 4
+        System.out.println(set.size());      // 3 — Bo appears once
+        System.out.println(sorted.first());  // Ana
+    }
+}
+</code></pre>
+
+<p>For a plain list, prefer <code>.toList()</code> — added in Java 16, shorter, and it returns an
+unmodifiable list, which is usually what you want anyway. Reach for
+<code>Collectors.toCollection</code> when you need a specific implementation such as a
+<code>TreeSet</code> or a <code>LinkedList</code>.</p>
+
+<h2><code>joining</code></h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo", "Cy");
+
+class Demo {
+    void run(List&lt;String&gt; names) {
+        System.out.println(names.stream().collect(Collectors.joining()));
+        // AnaBoCy
+        System.out.println(names.stream().collect(Collectors.joining(", ")));
+        // Ana, Bo, Cy
+        System.out.println(names.stream().collect(Collectors.joining(", ", "[", "]")));
+        // [Ana, Bo, Cy]
+    }
+}
+</code></pre>
+
+<p>The three-argument form takes a delimiter, a prefix and a suffix, which covers most of the
+string-building you would otherwise do with a loop and a trailing-comma bug.</p>
+
+<h2><code>groupingBy</code> — the one you will use most</h2>
+
+<pre class="language-java"><code class="language-java">record Person(String name, String city, int age) { }
+
+class Demo {
+    void run() {
+        List&lt;Person&gt; people = List.of(
+                new Person("Ana", "Seattle", 30),
+                new Person("Bo", "Seattle", 25),
+                new Person("Cy", "Nuku'alofa", 35));
+
+        Map&lt;String, List&lt;Person&gt;&gt; byCity =
+                people.stream().collect(Collectors.groupingBy(Person::city));
+        System.out.println(byCity.get("Seattle").size());        // 2
+
+        // A second collector says what to do with each group instead of listing it
+        Map&lt;String, Long&gt; countByCity = people.stream()
+                .collect(Collectors.groupingBy(Person::city, Collectors.counting()));
+        System.out.println(countByCity.get("Seattle"));          // 2
+
+        Map&lt;String, List&lt;String&gt;&gt; namesByCity = people.stream()
+                .collect(Collectors.groupingBy(Person::city,
+                        Collectors.mapping(Person::name, Collectors.toList())));
+        System.out.println(namesByCity.get("Seattle"));          // [Ana, Bo]
+
+        Map&lt;String, Double&gt; avgAge = people.stream()
+                .collect(Collectors.groupingBy(Person::city,
+                        Collectors.averagingInt(Person::age)));
+        System.out.println(avgAge.get("Seattle"));               // 27.5
+    }
+}
+</code></pre>
+
+<p>The second argument — the <em>downstream</em> collector — is the part worth learning. Without it
+you get a <code>List</code> of everything in each group; with it you get exactly the summary you
+were about to write a loop for.</p>
+
+<h2><code>toMap</code>, and its one trap</h2>
+
+<pre class="language-java"><code class="language-java">record Person(String name, String city, int age) { }
+
+class Demo {
+    void run() {
+        List&lt;Person&gt; people = List.of(
+                new Person("Ana", "Seattle", 30),
+                new Person("Bo", "Seattle", 25));
+
+        Map&lt;String, Integer&gt; ages = people.stream()
+                .collect(Collectors.toMap(Person::name, Person::age));
+        System.out.println(ages.get("Ana"));       // 30
+
+        // Two people in one city: the two-argument form would THROW here
+        Map&lt;String, Integer&gt; byCity = people.stream()
+                .collect(Collectors.toMap(Person::city, Person::age, (a, b) -&gt; a + b));
+        System.out.println(byCity.get("Seattle")); // 55 — merged instead
+    }
+}
+</code></pre>
+
+<p><strong>A duplicate key throws <code>IllegalStateException</code>, it does not overwrite.</strong>
+That surprises everyone once. The third argument is a merge function deciding what happens when two
+elements produce the same key — <code>(a, b) -&gt; b</code> to keep the last, <code>(a, b) -&gt;
+a</code> to keep the first, or real arithmetic as above.</p>
+
+<h2>Counting and statistics</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;Integer&gt; numbers = List.of(3, 1, 4, 1, 5);
+
+class Demo {
+    void run(List&lt;Integer&gt; numbers) {
+        System.out.println(numbers.stream().collect(Collectors.counting()));        // 5
+        System.out.println(numbers.stream().collect(Collectors.summingInt(n -&gt; n))); // 14
+        System.out.println(numbers.stream().collect(Collectors.averagingInt(n -&gt; n))); // 2.8
+
+        IntSummaryStatistics stats = numbers.stream()
+                .collect(Collectors.summarizingInt(n -&gt; n));
+        System.out.println(stats.getMin() + ".." + stats.getMax() + " avg " + stats.getAverage());
+        // 1..5 avg 2.8
+    }
+}
+</code></pre>
+
+<p><code>summarizing*</code> is the efficient choice when you want several of count, sum, min, max
+and average — it walks the data once instead of once per question.</p>
+
+<h2><code>partitioningBy</code></h2>
+
+<pre class="language-java"><code class="language-java">List&lt;Integer&gt; numbers = List.of(1, 2, 3, 4, 5, 6);
+
+class Demo {
+    void run(List&lt;Integer&gt; numbers) {
+        Map&lt;Boolean, List&lt;Integer&gt;&gt; split = numbers.stream()
+                .collect(Collectors.partitioningBy(n -&gt; n % 2 == 0));
+
+        System.out.println(split.get(true));    // [2, 4, 6]
+        System.out.println(split.get(false));   // [1, 3, 5]
+    }
+}
+</code></pre>
+
+<p>It is <code>groupingBy</code> with a boolean key, and the difference is worth knowing: partitioning
+always returns both keys, even when one side is empty. Grouping by a predicate would silently omit
+the missing half and hand you a <code>null</code>.</p>
+
+<h2>Reducing and mapping downstream</h2>
+
+<p>Two more downstream collectors round out the set. <code>mapping</code> transforms each element
+before it reaches the inner collector, and <code>filtering</code> drops some of them — importantly,
+<em>after</em> grouping, so a group that loses everything still appears with an empty list:</p>
+
+<pre class="language-java"><code class="language-java">record Person(String name, String city, int age) { }
+
+class Demo {
+    void run() {
+        List&lt;Person&gt; people = List.of(
+                new Person("Ana", "Seattle", 30),
+                new Person("Bo", "Seattle", 17),
+                new Person("Cy", "Nuku'alofa", 15));
+
+        Map&lt;String, List&lt;Person&gt;&gt; adultsByCity = people.stream()
+                .collect(Collectors.groupingBy(Person::city,
+                        Collectors.filtering(p -&gt; p.age() &gt;= 18, Collectors.toList())));
+
+        System.out.println(adultsByCity.get("Seattle").size());     // 1
+        System.out.println(adultsByCity.get("Nuku'alofa"));         // [] — still present
+
+        // The oldest person per city
+        Map&lt;String, Optional&lt;Person&gt;&gt; oldest = people.stream()
+                .collect(Collectors.groupingBy(Person::city,
+                        Collectors.maxBy(Comparator.comparingInt(Person::age))));
+        System.out.println(oldest.get("Seattle").map(Person::name).orElse("none"));  // Ana
+    }
+}
+</code></pre>
+
+<p>Note the difference from filtering before the grouping: <code>stream().filter(...)</code> first
+would drop Nuku'alofa from the map entirely, because nothing from that city survives to create the
+key. Which behaviour you want depends on whether an empty group is meaningful — in a report, it
+usually is.</p>
+
+<h2>When not to use a collector</h2>
+
+<p>Several collectors have a shorter equivalent, and the shorter one is clearer:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo");
+
+class Demo {
+    void run(List&lt;String&gt; names) {
+        names.stream().collect(Collectors.toList());   // works
+        names.stream().toList();                        // better — Java 16+
+
+        names.stream().collect(Collectors.counting());  // works
+        System.out.println(names.stream().count());     // better
+
+        List.of(1, 2).stream().collect(Collectors.summingInt(n -&gt; n));  // works
+        System.out.println(List.of(1, 2).stream().mapToInt(n -&gt; n).sum()); // better
+    }
+}
+</code></pre>
+
+<p><code>Collectors</code> earns its place for grouping, joining, partitioning and building maps.
+For counting and summing, the stream already has a method that says it more directly.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-8-optional">Optional</a> is next — the return type that says "there might be
+nothing here" in the signature instead of in a comment.</p>

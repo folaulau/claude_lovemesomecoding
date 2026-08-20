@@ -1,0 +1,200 @@
+<p>Serialization is turning an object into bytes you can store or send, and back again. Python gives
+you several ways to do it, and the differences between them are mostly about trust.</p>
+
+<h2>JSON, and the types it refuses</h2>
+
+<pre class="language-python"><code class="language-python">import json
+
+order = {"item": "Pizza", "qty": 2, "price": 15.5, "tags": ["hot"], "note": None}
+
+encoded = json.dumps(order)
+print(encoded)
+# Output: {"item": "Pizza", "qty": 2, "price": 15.5, "tags": ["hot"], "note": null}
+
+back = json.loads(encoded)
+print(back["note"] is None)      # Output: True
+print(type(back["tags"]))        # Output: &lt;class 'list'&gt;
+</code></pre>
+
+<p>JSON covers dict, list, str, int, float, bool and None. Note <code>None</code> became
+<code>null</code> and came back as <code>None</code> — the mapping is lossless for those types.</p>
+
+<p>It has no date type, no decimal, no set and no tuple. A <code>datetime</code> raises on the way
+out:</p>
+
+<!-- expect-error -->
+<pre class="language-python"><code class="language-python">import json
+from datetime import datetime
+
+json.dumps({"when": datetime(2026, 8, 20)})
+</code></pre>
+
+<p><code>TypeError: Object of type datetime is not JSON serializable</code>. Tuples do not raise — they
+come back as lists, silently, which is the more dangerous behaviour of the two.</p>
+
+<h2>Custom encoders</h2>
+
+<pre class="language-python"><code class="language-python">import json
+from datetime import datetime, date
+from decimal import Decimal
+
+def encode(value):
+    """Called only for values json cannot handle itself."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)          # str, not float — a float would lose precision
+    if isinstance(value, set):
+        return sorted(value)
+    raise TypeError(f"cannot serialize {type(value).__name__}")
+
+payload = {
+    "when": datetime(2026, 8, 20, 15, 0),
+    "total": Decimal("1250.00"),
+    "tags": {"b", "a"},
+}
+
+print(json.dumps(payload, default=encode, sort_keys=True))
+# Output: {"tags": ["a", "b"], "total": "1250.00", "when": "2026-08-20T15:00:00"}
+</code></pre>
+
+<p><code>default=</code> is called only for objects json cannot handle, so it costs nothing on ordinary
+payloads. Raising <code>TypeError</code> for anything you did not plan for is deliberate — returning
+<code>str(value)</code> as a catch-all turns every unexpected object into a useless string that looks
+fine until someone tries to read it back.</p>
+
+<p><code>Decimal</code> to a <strong>string</strong>, never a float. Converting to float here undoes the
+entire reason you used <code>Decimal</code>, and it does it silently.</p>
+
+<h2>Getting the types back</h2>
+
+<pre class="language-python"><code class="language-python">import json
+from datetime import datetime
+from decimal import Decimal
+
+raw = '{"when": "2026-08-20T15:00:00", "total": "1250.00"}'
+
+def decode(pairs):
+    out = {}
+    for key, value in pairs:
+        if key == "when":
+            out[key] = datetime.fromisoformat(value)
+        elif key == "total":
+            out[key] = Decimal(value)
+        else:
+            out[key] = value
+    return out
+
+loaded = json.loads(raw, object_pairs_hook=decode)
+print(type(loaded["when"]).__name__)     # Output: datetime
+print(loaded["total"] + Decimal("1"))    # Output: 1251.00
+</code></pre>
+
+<p>JSON is <strong>asymmetric</strong>: encoding is automatic, decoding is not. The document does not
+record that <code>"1250.00"</code> was a <code>Decimal</code>, so something on the way back in has to
+know. That knowledge is your schema, whether you write it down or not — which is the argument for the
+libraries at the end of this post.</p>
+
+<h2>pickle is not a file format</h2>
+
+<pre class="language-python"><code class="language-python">import pickle
+from decimal import Decimal
+from datetime import datetime
+
+payload = {"when": datetime(2026, 8, 20), "total": Decimal("1250.00"), "tags": {"a", "b"}}
+
+blob = pickle.dumps(payload)
+back = pickle.loads(blob)
+
+print(back == payload)                   # Output: True
+print(type(back["total"]).__name__)      # Output: Decimal
+print(type(back["tags"]).__name__)       # Output: set
+</code></pre>
+
+<p>Everything survives — Decimal, datetime, set, and your own classes — with no encoder to write. That
+is the appeal, and it comes with a condition that is not a footnote:</p>
+
+<p><strong>Unpickling runs code.</strong> The format includes instructions to import modules and call
+callables, so <code>pickle.loads()</code> on untrusted bytes is arbitrary code execution, before any
+of your validation runs. No amount of checking the result afterwards helps.</p>
+
+<p>So: pickle is fine for a cache your own process wrote to your own disk. It is never acceptable for
+anything arriving over a network, uploaded by a user, or stored where someone else can write. It is
+also version-fragile — rename a class and old pickles stop loading.</p>
+
+<h2>YAML, and the same rule</h2>
+
+<!-- needs: yaml -->
+<pre class="language-python"><code class="language-python">import yaml
+
+text = """
+currency: USD
+overdraft: 500
+features:
+  - transfer
+  - statements
+"""
+
+config = yaml.safe_load(text)
+print(config["overdraft"] + 1)     # Output: 501
+print(config["features"][0])       # Output: transfer
+print(yaml.safe_dump({"a": 1}, default_flow_style=False).strip())   # Output: a: 1
+</code></pre>
+
+<p><strong><code>safe_load</code>, never <code>load</code>.</strong> Plain <code>yaml.load</code> can
+construct arbitrary Python objects and carries the same code execution problem pickle does. Modern
+PyYAML warns when you call it without a loader; do not silence the warning, change the call.</p>
+
+<p>YAML's other trap is that it is too clever about types — unquoted <code>no</code>, <code>on</code>
+and <code>off</code> have historically been read as booleans, and version numbers like
+<code>1.10</code> become floats. Quote anything you mean as a string.</p>
+
+<h2>Dataclasses round-trip without the mapping</h2>
+
+<pre class="language-python"><code class="language-python">import json
+from dataclasses import dataclass, asdict, field
+
+@dataclass
+class Account:
+    number: str
+    balance: float
+    tags: list[str] = field(default_factory=list)
+
+@dataclass
+class Customer:
+    name: str
+    accounts: list[Account]
+
+c = Customer("Alice", [Account("1001-0001", 1250.0, ["primary"])])
+
+encoded = json.dumps(asdict(c))
+print(encoded)
+# Output: {"name": "Alice", "accounts": [{"number": "1001-0001", "balance": 1250.0, "tags": ["primary"]}]}
+
+raw = json.loads(encoded)
+back = Customer(raw["name"], [Account(**a) for a in raw["accounts"]])
+print(back == c)          # Output: True
+</code></pre>
+
+<p><code>asdict()</code> walks nested dataclasses recursively, so the whole tree becomes plain dicts in
+one call. Coming back needs the <code>Account(**a)</code> step — <code>asdict</code> has no inverse,
+because the JSON does not say which class each dict was.</p>
+
+<p>That last line is the whole problem in miniature, and it is where a schema library starts paying
+for itself.</p>
+
+<h2>When to use a library</h2>
+
+<p>Hand-written encoders are fine for a handful of types you control. Past that, the decode side is
+where the bugs are, and two libraries exist to own it.</p>
+
+<p><strong>Pydantic</strong> validates and converts from type hints you were writing anyway, and is the
+default choice for API payloads and configuration. <strong>marshmallow</strong> declares schemas
+separately from the model, which suits keeping the wire format decoupled from your classes.</p>
+
+<p>The decision is simple: if the data comes from outside your program, you need validation, and
+validation is what these do. If it is your own cache on your own disk, <code>json</code> or
+<code>pickle</code> is enough.</p>
+
+<p>Next: <a href="/python-advanced/python-advanced-virtual-environments-pip">Packaging &amp;
+Publishing</a>.</p>

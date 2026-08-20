@@ -1,0 +1,225 @@
+<p>The <code>switch</code> statement Java inherited from C had two design flaws: it fell through
+unless you wrote <code>break</code>, and it could not produce a value. Java 14 fixed both, and Java
+17 made it standard. The old form still works; there is no reason to write it in new code.</p>
+
+<h2>Arrow labels</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void oldForm(int day) {
+        switch (day) {
+            case 1:
+                System.out.println("Monday");
+                break;              // forget this and Tuesday prints too
+            case 2:
+                System.out.println("Tuesday");
+                break;
+            default:
+                System.out.println("Other");
+        }
+    }
+
+    void newForm(int day) {
+        switch (day) {
+            case 1 -&gt; System.out.println("Monday");
+            case 2 -&gt; System.out.println("Tuesday");
+            default -&gt; System.out.println("Other");
+        }
+    }
+}
+</code></pre>
+
+<p>With <code>-&gt;</code> only the matching branch runs. There is no fall-through, so there is no
+<code>break</code> to forget — an entire category of bug removed by punctuation.</p>
+
+<p>A branch needing more than one statement takes a block:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(int day) {
+        switch (day) {
+            case 6, 7 -&gt; {                          // several labels, comma-separated
+                System.out.println("weekend");
+                System.out.println("no alarm");
+            }
+            default -&gt; System.out.println("weekday");
+        }
+    }
+}
+</code></pre>
+
+<h2>Switch as an expression</h2>
+
+<p>The larger change: a <code>switch</code> can now produce a value. This is what removes the
+assign-a-variable-in-every-branch pattern:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String oldWay(int day) {
+        String type;                                 // declared, then assigned four times
+        switch (day) {
+            case 1: case 2: case 3: case 4: case 5:
+                type = "weekday";
+                break;
+            case 6: case 7:
+                type = "weekend";
+                break;
+            default:
+                type = "invalid";
+        }
+        return type;
+    }
+
+    String newWay(int day) {
+        return switch (day) {                        // one expression, one assignment
+            case 1, 2, 3, 4, 5 -&gt; "weekday";
+            case 6, 7 -&gt; "weekend";
+            default -&gt; "invalid";
+        };                                           // note the semicolon
+    }
+}
+</code></pre>
+
+<p>The semicolon after the closing brace is easy to miss and the compiler error is clear when you do.
+It is there because this is an expression inside a statement, like any other assignment.</p>
+
+<h2><code>yield</code></h2>
+
+<p>When a branch of a switch expression needs several statements, it uses a block — and a block has
+to say which value it produces. That is what <code>yield</code> is for:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    int daysInMonth(int month, int year) {
+        return switch (month) {
+            case 1, 3, 5, 7, 8, 10, 12 -&gt; 31;
+            case 4, 6, 9, 11 -&gt; 30;
+            case 2 -&gt; {
+                boolean leap = (year % 4 == 0 &amp;&amp; year % 100 != 0) || year % 400 == 0;
+                yield leap ? 29 : 28;                // not `return` — that would exit the method
+            }
+            default -&gt; throw new IllegalArgumentException("bad month: " + month);
+        };
+    }
+}
+</code></pre>
+
+<p><code>yield</code> exits the switch with a value; <code>return</code> exits the whole method.
+Using <code>return</code> inside a switch expression does not compile, which is the language stopping
+a genuinely confusing construct.</p>
+
+<p>Note also the <code>default -&gt; throw</code>. A branch may throw instead of producing a value,
+and that is often the right answer for an input that should be impossible.</p>
+
+<h2>Exhaustiveness</h2>
+
+<p>A switch <em>expression</em> must cover every possible input, or it does not compile. A switch
+<em>statement</em> need not. That difference is the source of the feature's biggest practical
+benefit:</p>
+
+<pre class="language-java"><code class="language-java">enum Status { PENDING, SHIPPED, DELIVERED }
+
+class Demo {
+    String describe(Status status) {
+        return switch (status) {          // no default — all three covered
+            case PENDING -&gt; "waiting";
+            case SHIPPED -&gt; "on its way";
+            case DELIVERED -&gt; "arrived";
+        };
+    }
+}
+</code></pre>
+
+<p>Add a <code>CANCELLED</code> constant to that enum and this method stops compiling, along with
+every other exhaustive switch over <code>Status</code> in the codebase. The compiler hands you the
+list of places to update.</p>
+
+<p><strong>That is why you should resist adding a <code>default</code> branch to an enum switch.</strong>
+A <code>default</code> makes it compile forever, and the new constant silently falls into it — turning
+a compile error into a runtime surprise. If you genuinely need a fallback, throwing is better than
+returning something plausible:</p>
+
+<pre class="language-java"><code class="language-java">enum Status { PENDING, SHIPPED, DELIVERED }
+
+class Demo {
+    String risky(Status status) {
+        return switch (status) {
+            case PENDING -&gt; "waiting";
+            default -&gt; "something else";   // a new constant lands here, silently
+        };
+    }
+}
+</code></pre>
+
+<h2>Strings, and null</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    int parse(String command) {
+        return switch (command) {
+            case "start", "run" -&gt; 1;
+            case "stop" -&gt; 0;
+            default -&gt; -1;
+        };
+    }
+}
+</code></pre>
+
+<p>Switching on strings has worked since Java 7 and uses <code>equals</code>, not <code>==</code>, so
+it behaves as you would want. It is also case-sensitive, which is worth remembering when the input
+comes from a user.</p>
+
+<p><strong>A null selector throws <code>NullPointerException</code></strong> — including in the arrow
+form, and including when there is a <code>default</code>. The <code>default</code> branch does not
+catch null. Guard before the switch, or use <code>case null</code>, which
+<a href="/java/java-21-pattern-matching-switch">Java 21</a> added.</p>
+
+<h2>Which form to use</h2>
+
+<table>
+<thead><tr><th>Form</th><th>Use it</th></tr></thead>
+<tbody>
+<tr><td>expression with arrows</td><td>whenever you are producing a value — the default choice</td></tr>
+<tr><td>statement with arrows</td><td>when the branches perform actions rather than produce a
+value</td></tr>
+<tr><td>statement with colons</td><td>never in new code; recognise it in old code</td></tr>
+</tbody>
+</table>
+
+<p>The one legitimate use of the colon form is deliberate fall-through, and it is rare enough that
+when you see it you should check whether it was deliberate at all.</p>
+
+<h2>A note on scope</h2>
+
+<p>One small improvement the arrow form brings that nobody mentions: each branch gets its own scope.
+In the colon form, all the cases share one, so a variable declared in the first case is visible — and
+uninitialised — in the others:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void colonForm(int day) {
+        switch (day) {
+            case 1:
+                String label = "Monday";
+                System.out.println(label);
+                break;
+            case 2:
+                // `label` is in scope HERE too, and definitely unassigned.
+                // Declaring another `String label` would not compile.
+                System.out.println("Tuesday");
+        }
+    }
+
+    void arrowForm(int day) {
+        switch (day) {
+            case 1 -&gt; {
+                String label = "Monday";        // scoped to this block only
+                System.out.println(label);
+            }
+            case 2 -&gt; {
+                String label = "Tuesday";       // a second declaration is fine
+                System.out.println(label);
+            }
+        }
+    }
+}
+</code></pre>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-17-text-blocks">Text Blocks</a> is next — multi-line strings without the
+escaping.</p>

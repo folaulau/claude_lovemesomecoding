@@ -1,0 +1,193 @@
+<p>Building a comma-separated string is one of those jobs that looks trivial and produces a trailing
+comma every time. <code>StringJoiner</code> is the small class Java 8 added to stop that happening,
+and two shorter forms cover most of what you would use it for.</p>
+
+<h2>The problem</h2>
+
+<p>Everyone writes this once, and everyone gets the same bug:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = List.of("Ana", "Bo", "Cy");
+
+        StringBuilder sb = new StringBuilder();
+        for (String name : names) {
+            sb.append(name).append(", ");
+        }
+        System.out.println(sb);              // "Ana, Bo, Cy, "  <- trailing comma
+
+        // The usual fix, and it throws on an empty list
+        String fixed = sb.substring(0, sb.length() - 2);
+        System.out.println(fixed);           // "Ana, Bo, Cy"
+    }
+}
+</code></pre>
+
+<p>The trailing separator, the off-by-two on the trim, and the empty-input crash are three separate
+bugs in five lines. All three go away if the separator logic is not yours to write.</p>
+
+<h2><code>StringJoiner</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        StringJoiner joiner = new StringJoiner(", ");
+        joiner.add("Ana");
+        joiner.add("Bo");
+        joiner.add("Cy");
+        System.out.println(joiner);          // Ana, Bo, Cy — no trailing comma
+
+        // Delimiter, prefix, suffix
+        StringJoiner bracketed = new StringJoiner(", ", "[", "]");
+        bracketed.add("Ana").add("Bo");
+        System.out.println(bracketed);       // [Ana, Bo]
+    }
+}
+</code></pre>
+
+<p>The separator goes <em>between</em> elements, so a single element produces no separator at all and
+the empty case is handled rather than crashing. <code>add</code> returns the joiner, so calls
+chain.</p>
+
+<h2>The empty case</h2>
+
+<p>This is the detail that makes it worth using over a hand-rolled loop. An empty joiner produces its
+prefix and suffix, and you can override that:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        StringJoiner empty = new StringJoiner(", ", "[", "]");
+        System.out.println(empty);                    // []
+
+        StringJoiner custom = new StringJoiner(", ", "[", "]");
+        custom.setEmptyValue("nothing here");
+        System.out.println(custom);                   // nothing here
+
+        custom.add("Ana");
+        System.out.println(custom);                   // [Ana] — empty value no longer applies
+        System.out.println(custom.length());          // 5
+    }
+}
+</code></pre>
+
+<p><code>setEmptyValue</code> only applies while nothing has been added. The moment there is one
+element, the prefix and suffix take over again.</p>
+
+<h2>Merging joiners</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        StringJoiner first = new StringJoiner(", ", "[", "]");
+        first.add("Ana").add("Bo");
+
+        StringJoiner second = new StringJoiner(", ", "[", "]");
+        second.add("Cy");
+
+        first.merge(second);
+        System.out.println(first);        // [Ana, Bo, Cy]
+    }
+}
+</code></pre>
+
+<p><code>merge</code> takes the <em>contents</em> of the other joiner, not its prefix and suffix. That
+is deliberate and slightly surprising the first time — merging <code>[Cy]</code> in gives you
+<code>Cy</code>, not <code>[Cy]</code>. It is also the mechanism that lets a parallel stream combine
+partial results, which is how <code>Collectors.joining</code> works underneath.</p>
+
+<h2>The two shorter forms</h2>
+
+<p>In real code you will rarely construct a <code>StringJoiner</code> directly. Two wrappers cover
+almost every case.</p>
+
+<p><strong><code>String.join</code></strong> — when you already have the pieces:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        System.out.println(String.join(", ", "Ana", "Bo"));         // Ana, Bo
+        System.out.println(String.join(", ", List.of("Ana", "Bo"))); // Ana, Bo
+        System.out.println(String.join("/", "usr", "local", "bin")); // usr/local/bin
+    }
+}
+</code></pre>
+
+<p><strong><code>Collectors.joining</code></strong> — when the pieces come out of a stream, which is
+where you need to transform them first:</p>
+
+<pre class="language-java"><code class="language-java">record Person(String name, int age) { }
+
+class Demo {
+    void run() {
+        List&lt;Person&gt; people = List.of(new Person("Ana", 30), new Person("Bo", 25));
+
+        System.out.println(people.stream()
+                .map(Person::name)
+                .collect(Collectors.joining(", ", "[", "]")));      // [Ana, Bo]
+
+        // Transforming on the way through is the reason to prefer this over String.join
+        System.out.println(people.stream()
+                .filter(p -&gt; p.age() &gt;= 30)
+                .map(p -&gt; p.name().toUpperCase())
+                .collect(Collectors.joining(" and ")));             // ANA
+    }
+}
+</code></pre>
+
+<h2><code>StringJoiner</code> versus <code>StringBuilder</code></h2>
+
+<p>They look similar and solve different problems, which is worth being clear about because reaching
+for the wrong one is how the trailing-comma bug gets written in the first place.</p>
+
+<p><code>StringBuilder</code> is a general mutable buffer. You control every character that goes into
+it, including separators, and it can build anything — a sentence, an HTML fragment, a log line.
+<code>StringJoiner</code> is a special case of that: a list of items with something between them. It
+gives up generality and in exchange it handles the separator, the empty case and the prefix/suffix
+for you.</p>
+
+<p>The performance difference is not a reason to choose either. <code>StringJoiner</code> is backed
+by a <code>StringBuilder</code>, so it costs one extra object and no measurable time. Choose on what
+you are building, not on speed.</p>
+
+<p>One practical note: <code>StringJoiner</code> is not thread-safe, and neither is
+<code>StringBuilder</code>. Neither is intended to be shared across threads — build a string on one
+thread, or let <code>Collectors.joining</code> handle the combining, which it does correctly even on
+a parallel stream because of the <code>merge</code> mechanism above.</p>
+
+<h2>Which to use</h2>
+
+<table>
+<thead><tr><th>Use</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>String.join</code></td><td>you have a collection or varargs of strings
+already</td></tr>
+<tr><td><code>Collectors.joining</code></td><td>you are in a stream, or need to map before
+joining</td></tr>
+<tr><td><code>StringJoiner</code></td><td>you are adding elements conditionally across several
+statements</td></tr>
+<tr><td><code>StringBuilder</code></td><td>you are building a string that is not a delimited
+list</td></tr>
+</tbody>
+</table>
+
+<p>That third row is the case where the class itself still earns its place — when elements are added
+from different branches and there is no collection to stream:</p>
+
+<pre class="language-java"><code class="language-java">class Query {
+    String build(String name, Integer minAge, boolean activeOnly) {
+        StringJoiner where = new StringJoiner(" AND ", "WHERE ", "");
+        where.setEmptyValue("");                     // no conditions -> no WHERE clause
+
+        if (name != null) where.add("name = ?");
+        if (minAge != null) where.add("age &gt;= ?");
+        if (activeOnly) where.add("active = true");
+
+        return "SELECT * FROM customers " + where;
+    }
+}
+</code></pre>
+
+<p>That is the shape worth remembering: conditional pieces, a separator between whatever survives,
+and a sensible result when nothing does.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-8-array-parallel-sort">Array Parallel Sort</a> is next — one method that uses
+every core you have, and the conditions under which it is actually faster.</p>

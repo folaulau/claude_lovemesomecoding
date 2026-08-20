@@ -1,0 +1,230 @@
+<p>A stream lets you describe what you want done to a collection instead of writing the loop that
+does it. It is the single biggest change in how Java is written since Java 8, and the mental model is
+small: <strong>a source, some intermediate operations, and one terminal operation that makes it all
+run.</strong></p>
+
+<h2>The shape</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo", "Christopher", "Dee");
+
+List&lt;String&gt; result = names.stream()          // source
+        .filter(n -&gt; n.length() &gt; 2)          // intermediate — returns another stream
+        .map(String::toUpperCase)             // intermediate
+        .sorted()                             // intermediate
+        .toList();                            // terminal — produces the answer
+
+System.out.println(result);                   // [ANA, CHRISTOPHER, DEE]
+</code></pre>
+
+<p>The equivalent loop is longer and, more to the point, mixes <em>what</em> with <em>how</em> — you
+have to read the whole body to discover it is a filter and a transform.</p>
+
+<p><strong>Nothing happens until the terminal operation.</strong> Intermediate operations are lazy:
+they build a description of the work. This is not a detail, it is what makes the next section
+possible:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo", "Christopher");
+
+Optional&lt;String&gt; first = names.stream()
+        .filter(n -&gt; n.length() &gt; 2)
+        .findFirst();                          // stops as soon as it has one
+
+System.out.println(first.orElse("none"));      // Ana — "Christopher" was never examined
+</code></pre>
+
+<p>A stream processes each element through the whole pipeline before moving to the next, so
+<code>findFirst</code>, <code>anyMatch</code> and <code>limit</code> can short-circuit and skip the
+rest of the collection entirely.</p>
+
+<h2>The intermediate operations you will use</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; words = List.of("banana", "apple", "cherry", "apple", "date");
+
+System.out.println(words.stream().filter(w -&gt; w.contains("a")).toList());
+// [banana, apple, apple, date]
+
+System.out.println(words.stream().map(String::length).toList());
+// [6, 5, 6, 5, 4]
+
+System.out.println(words.stream().distinct().toList());
+// [banana, apple, cherry, date]
+
+System.out.println(words.stream().sorted().limit(2).toList());
+// [apple, apple]
+
+System.out.println(words.stream().skip(3).toList());
+// [apple, date]
+
+System.out.println(words.stream()
+        .sorted(Comparator.comparing(String::length).thenComparing(Comparator.naturalOrder()))
+        .toList());
+// [date, apple, apple, banana, cherry]
+</code></pre>
+
+<p><code>flatMap</code> is the one that looks odd until it clicks. It flattens nested structure —
+turning a stream of lists into a stream of their contents:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;List&lt;String&gt;&gt; nested = List.of(
+        List.of("a", "b"),
+        List.of("c"),
+        List.of());
+
+System.out.println(nested.stream().flatMap(List::stream).toList());   // [a, b, c]
+
+List&lt;String&gt; sentences = List.of("hello world", "goodbye moon");
+System.out.println(sentences.stream()
+        .flatMap(s -&gt; Arrays.stream(s.split(" ")))
+        .toList());                                                   // [hello, world, goodbye, moon]
+</code></pre>
+
+<h2>Terminal operations</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;Integer&gt; numbers = List.of(3, 1, 4, 1, 5);
+
+System.out.println(numbers.stream().count());                       // 5
+System.out.println(numbers.stream().anyMatch(n -&gt; n &gt; 4));          // true
+System.out.println(numbers.stream().allMatch(n -&gt; n &gt; 0));          // true
+System.out.println(numbers.stream().noneMatch(n -&gt; n &gt; 10));        // true
+System.out.println(numbers.stream().max(Comparator.naturalOrder()).orElse(0));   // 5
+
+System.out.println(numbers.stream().mapToInt(Integer::intValue).sum());          // 14
+System.out.println(numbers.stream().mapToInt(Integer::intValue).average().orElse(0)); // 2.8
+
+numbers.stream().limit(2).forEach(System.out::println);             // 3, then 1
+</code></pre>
+
+<p>Note <code>mapToInt</code> before <code>sum()</code> and <code>average()</code>. A
+<code>Stream&lt;Integer&gt;</code> has no <code>sum</code> — you convert to an
+<code>IntStream</code> first, which also avoids boxing every element.</p>
+
+<h2>Collectors</h2>
+
+<p><code>collect</code> is the general-purpose terminal operation, and three collectors cover most
+real use:</p>
+
+<pre class="language-java"><code class="language-java">record Person(String name, String city, int age) { }
+
+class Demo {
+    void run() {
+        List&lt;Person&gt; people = List.of(
+                new Person("Ana", "Nuku'alofa", 30),
+                new Person("Bo", "Seattle", 25),
+                new Person("Cy", "Seattle", 35));
+
+        // Group into a Map
+        Map&lt;String, List&lt;Person&gt;&gt; byCity =
+                people.stream().collect(Collectors.groupingBy(Person::city));
+        System.out.println(byCity.get("Seattle").size());        // 2
+
+        // Group and count in one step
+        Map&lt;String, Long&gt; countByCity =
+                people.stream().collect(Collectors.groupingBy(Person::city, Collectors.counting()));
+        System.out.println(countByCity);                          // {Seattle=2, Nuku'alofa=1}
+        // (a HashMap — the iteration order is not part of the contract)
+
+        // Build a Map from two fields
+        Map&lt;String, Integer&gt; ages =
+                people.stream().collect(Collectors.toMap(Person::name, Person::age));
+        System.out.println(ages.get("Cy"));                       // 35
+
+        // Join into a String
+        System.out.println(people.stream().map(Person::name)
+                .collect(Collectors.joining(", ", "[", "]")));    // [Ana, Bo, Cy]
+    }
+}
+</code></pre>
+
+<p>One trap in <code>toMap</code>: a duplicate key throws <code>IllegalStateException</code> rather
+than overwriting. Pass a merge function — <code>toMap(k, v, (a, b) -&gt; b)</code> — when duplicates
+are possible.</p>
+
+<h2>Where a stream comes from</h2>
+
+<p>A collection is the usual source, but not the only one:</p>
+
+<pre class="language-java"><code class="language-java">System.out.println(Stream.of("a", "b", "c").toList());          // straight from values
+System.out.println(Arrays.stream(new int[]{1, 2, 3}).sum());    // from an array
+System.out.println(IntStream.range(0, 5).boxed().toList());     // [0, 1, 2, 3, 4]
+System.out.println(IntStream.rangeClosed(1, 5).sum());          // 15
+System.out.println("a,b,c".chars().count());                    // 5 — characters, commas included
+
+System.out.println(Stream.iterate(1, n -&gt; n * 2).limit(5).toList());   // [1, 2, 4, 8, 16]
+</code></pre>
+
+<p><code>IntStream.range</code> is the stream equivalent of a counting <code>for</code> loop, and
+<code>Stream.iterate</code> produces an infinite stream — which is only safe because of laziness. The
+<code>limit(5)</code> is what makes it terminate; without it the pipeline never ends.</p>
+
+<h2><code>reduce</code>, and when to leave it alone</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;Integer&gt; numbers = List.of(1, 2, 3, 4);
+
+System.out.println(numbers.stream().reduce(0, Integer::sum));           // 10
+System.out.println(numbers.stream().reduce(1, (a, b) -&gt; a * b));        // 24
+
+// but for the common cases there is something clearer:
+System.out.println(numbers.stream().mapToInt(Integer::intValue).sum()); // 10
+</code></pre>
+
+<p><code>reduce</code> is not only for the cases a specialised method already covers. Here it is in
+the console bank app this site uses for examples, adding up a customer's balances — there is no
+<code>sum()</code> for <code>BigDecimal</code>, so <code>reduce</code> is the right tool:</p>
+
+<!-- from: src/com/bank/service/BankService.java -->
+<pre class="language-java"><code class="language-java">public BigDecimal totalBalance(User user) {
+    return accountsOf(user).stream()
+            .map(Account::balance)
+            // reduce folds the list into one value: start at zero, add each balance.
+            // BigDecimal::add is a method reference standing in for (a, b) -&gt; a.add(b).
+            .reduce(Money.ZERO, BigDecimal::add);
+}
+</code></pre>
+
+<p>The identity matters: <code>Money.ZERO</code> is what comes back for a customer with no accounts,
+which is correct and needs no special case.</p>
+
+<p><code>reduce</code> combines every element into one value, starting from an identity. It is the
+general tool, and the specific ones — <code>sum</code>, <code>max</code>, <code>count</code>,
+<code>joining</code> — say what they mean more directly. Reach for <code>reduce</code> when nothing
+more specific exists.</p>
+
+<h2>Rules that keep streams honest</h2>
+
+<p><strong>Do not mutate anything inside a stream.</strong> This is the most common misuse:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo");
+
+// Wrong — a side effect masquerading as a pipeline, and it breaks in parallel
+List&lt;String&gt; collected = new ArrayList&lt;&gt;();
+names.stream().forEach(collected::add);
+
+// Right — let the stream produce the result
+List&lt;String&gt; proper = names.stream().toList();
+System.out.println(proper);                       // [Ana, Bo]
+</code></pre>
+
+<p><strong>A stream is single-use.</strong> Reusing one throws <code>IllegalStateException: stream
+has already been operated upon or closed</code>. Create a new one from the source instead.</p>
+
+<p><strong>Be careful with <code>parallelStream()</code>.</strong> It is one word and looks free. It
+is worth it only for genuinely large datasets doing genuinely expensive per-element work — otherwise
+the coordination costs more than it saves, and any shared mutable state becomes a race. Measure
+before and after, or do not use it.</p>
+
+<h2>When a loop is still better</h2>
+
+<p>Streams are not automatically an improvement. Prefer a plain loop when:</p>
+
+<ul>
+<li>The body does several unrelated things, or is long.</li>
+<li>You need to <code>break</code> out on a complicated condition, or need the index.</li>
+<li>You need to modify the source collection.</li>
+<li>The stream version needs a comment to explain it.</li>
+</ul>
+
+<p>A four-stage pipeline that reads like a sentence is better than the loop. A pipeline with a
+nested lambda and a custom collector usually is not.</p>
+
+<h2>Next</h2>
+
+<p>Most pipelines end in a collector. <a href="/java/java-8-collectors-class">Collectors</a> is next — grouping, joining, partitioning, and building a map without tripping on duplicate keys.</p>

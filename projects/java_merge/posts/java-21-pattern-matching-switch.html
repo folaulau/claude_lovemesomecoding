@@ -1,0 +1,179 @@
+<p>Java 21 lets a <code>switch</code> match on types, not just constants. Combined with
+<a href="/java/java-17-sealed-classes">sealed types</a>, it turns a chain of <code>instanceof</code>
+checks into something the compiler can prove is complete.</p>
+
+<h2>The chain it replaces</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String oldWay(Object value) {
+        if (value instanceof Integer i) return "int: " + i;
+        if (value instanceof String s) return "text: " + s.length();
+        if (value instanceof List&lt;?&gt; l) return "list of " + l.size();
+        return "unknown";
+    }
+
+    String newWay(Object value) {
+        return switch (value) {
+            case Integer i -&gt; "int: " + i;
+            case String s -&gt; "text: " + s.length();
+            case List&lt;?&gt; l -&gt; "list of " + l.size();
+            default -&gt; "unknown";
+        };
+    }
+}
+</code></pre>
+
+<p>Each <code>case</code> tests a type and binds a variable of that type, the same as
+<a href="/java/java-17-pattern-matching-instanceof">instanceof pattern matching</a>. The gain over the
+<code>if</code> chain is that it is an expression — one <code>return</code>, and the compiler checks
+that every path produces a value.</p>
+
+<h2>Guards with <code>when</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String classify(Object value) {
+        return switch (value) {
+            case Integer i when i &lt; 0 -&gt; "negative";
+            case Integer i when i == 0 -&gt; "zero";
+            case Integer i -&gt; "positive: " + i;
+            case String s when s.isBlank() -&gt; "blank text";
+            case String s -&gt; "text: " + s;
+            default -&gt; "other";
+        };
+    }
+}
+</code></pre>
+
+<p><strong>Order matters, and the compiler enforces it.</strong> A guarded case must come before the
+unguarded case for the same type — put <code>case Integer i</code> first and the guarded ones below
+are unreachable, which is a compile error rather than a silent bug.</p>
+
+<p><code>when</code> is a contextual keyword, so any existing variable called <code>when</code> keeps
+working.</p>
+
+<h2><code>case null</code></h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String describe(Object value) {
+        return switch (value) {
+            case null -&gt; "nothing";              // now legal
+            case String s -&gt; "text: " + s;
+            default -&gt; "something";
+        };
+    }
+
+    String stillThrows(Object value) {
+        return switch (value) {
+            case String s -&gt; "text";
+            default -&gt; "other";                  // does NOT catch null
+        };
+    }
+}
+</code></pre>
+
+<p>This fixes a genuine wart. Before Java 21, <code>switch</code> on a null reference threw
+<code>NullPointerException</code> — including when there was a <code>default</code>, which surprised
+everyone. You can now handle null explicitly.</p>
+
+<p>The old behaviour is preserved when you do not: a switch with no <code>case null</code> still
+throws. That is deliberate backwards compatibility, and it means adding <code>case null</code> is
+opt-in. <code>case null, default -&gt; ...</code> combines the two when you want them to behave the
+same.</p>
+
+<h2>Exhaustiveness with sealed types</h2>
+
+<p>This is where the feature earns its place:</p>
+
+<pre class="language-java"><code class="language-java">sealed interface Payment permits Card, BankTransfer, StoreCredit { }
+record Card(String last4) implements Payment { }
+record BankTransfer(String iban) implements Payment { }
+record StoreCredit(double amount) implements Payment { }
+
+class Processor {
+    String describe(Payment payment) {
+        return switch (payment) {                // no default needed
+            case Card c -&gt; "card ending " + c.last4();
+            case BankTransfer b -&gt; "transfer from " + b.iban();
+            case StoreCredit s -&gt; "credit of " + s.amount();
+        };
+    }
+}
+</code></pre>
+
+<p>Because <code>Payment</code> is sealed, the compiler knows the complete list of subtypes and can
+verify you covered them. Add a fourth payment kind and every switch like this stops compiling — you
+get the list of places to update instead of a silent <code>default</code> swallowing the new case.</p>
+
+<p><strong>Do not add a <code>default</code> to an exhaustive switch.</strong> It compiles, and it
+throws away the guarantee.</p>
+
+<h2>Record patterns</h2>
+
+<p>Types and their contents can be matched together. <a href="/java/java-21-record-patterns">Record
+patterns</a> has the detail; the shape is worth seeing here because it is where the feature becomes
+genuinely expressive:</p>
+
+<pre class="language-java"><code class="language-java">sealed interface Shape permits Circle, Rectangle { }
+record Circle(double radius) implements Shape { }
+record Rectangle(double width, double height) implements Shape { }
+
+class Geometry {
+    String describe(Shape shape) {
+        return switch (shape) {
+            case Circle(double r) when r &gt; 100 -&gt; "big circle";
+            case Circle(double r) -&gt; "circle of radius " + r;
+            case Rectangle(double w, double h) when w == h -&gt; "square of " + w;
+            case Rectangle(double w, double h) -&gt; w + " by " + h;
+        };
+    }
+}
+</code></pre>
+
+<h2>Dominance, and the error you will meet</h2>
+
+<p>The compiler rejects any case that can never be reached because an earlier one already covers it.
+It calls this <em>dominance</em>, and the message names it:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String broken(Object value) {
+        return switch (value) {
+            case Object o -&gt; "anything";
+            // case String s -&gt; "text";     // error: this case label is dominated
+            default -&gt; "unreachable";
+        };
+    }
+
+    String fixed(Object value) {
+        return switch (value) {
+            case String s -&gt; "text";        // most specific first
+            case Object o -&gt; "anything";
+        };
+    }
+}
+</code></pre>
+
+<p>The rule is the same one that governs <code>catch</code> blocks: specific before general, or the
+general one swallows everything. It applies to guards too — an unguarded case dominates every guarded
+case for the same type, which is why the guarded ones must come first.</p>
+
+<p>This is a good error to get. The equivalent mistake in an <code>if</code>/<code>else if</code>
+chain compiles silently and the branch simply never runs.</p>
+
+<h2>What it does not replace</h2>
+
+<p>The same caution as the <code>instanceof</code> post: if you own the types and the behaviour
+belongs to them, a method on the interface beats a switch. Adding a shape then requires no edit at
+all, whereas the switch above needs one — even though the compiler will remind you.</p>
+
+<p>The switch is the better answer when the behaviour belongs to the caller rather than the type
+(formatting for one particular screen), when the hierarchy is not yours to change, or when you need
+the exhaustiveness check as documentation of a decision table.</p>
+
+<p>There is also a legitimate objection that type-switching is object-orientation turned inside out.
+It is — and sealed types are what make it safe, because the set is closed and checked. Type-switching
+over an open hierarchy still deserves the suspicion it always did.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-21-record-patterns">Record Patterns</a> is next — destructuring a record into
+its components as part of the match.</p>

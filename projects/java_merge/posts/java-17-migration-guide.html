@@ -1,0 +1,138 @@
+<p>Moving from Java 11 to 17 is a much smaller job than 8 to 11. Nothing large was removed from the
+JDK. The one change that breaks builds is strong encapsulation — reflective access into JDK internals
+stopped being a warning and became an error.</p>
+
+<h2>The change that matters</h2>
+
+<p>Java 9 hid the JDK's internal packages behind the module system but left the door open, printing a
+warning when something reached through it. Java 16 closed it by default and Java 17 made that
+permanent:</p>
+
+<pre class="language-text"><code class="language-text">// Java 11 — a warning, and everything works
+WARNING: An illegal reflective access operation has occurred
+WARNING: Illegal reflective access by com.example.Tool to field java.lang.String.value
+
+// Java 17 — an exception, and it does not
+java.lang.reflect.InaccessibleObjectException: Unable to make field private final byte[]
+    java.lang.String.value accessible: module java.base does not "opens java.lang" to unnamed module
+</code></pre>
+
+<p><strong>If you saw those warnings on Java 11 and ignored them, this is the bill.</strong> That is
+the single most useful thing to know before starting: run on 11 first, collect every warning, and fix
+those before switching the JDK.</p>
+
+<h2>Fixing it properly</h2>
+
+<p>The offender is almost never your code — it is a library reaching into the JDK. Old versions of
+Hibernate, Spring, Mockito, Lombok, Jackson's afterburner module and several bytecode tools all did
+it, and all have versions that do not.</p>
+
+<p>So the fix is nearly always <strong>upgrade the dependency</strong>. Find which one from the
+exception's stack trace, check its release notes for Java 17 support, and move to that version.</p>
+
+<pre class="language-bash"><code class="language-bash"># What is on the classpath and what does it reach into?
+jdeps --jdk-internals --multi-release 17 target/myapp.jar
+
+# Maven will tell you which dependency versions are available
+mvn versions:display-dependency-updates
+</code></pre>
+
+<h2>The flag you should not reach for</h2>
+
+<pre class="language-bash"><code class="language-bash"># Reopens a package. Works. Also postpones the problem indefinitely.
+java --add-opens java.base/java.lang=ALL-UNNAMED -jar myapp.jar
+</code></pre>
+
+<p><code>--add-opens</code> restores the old behaviour for one package. It is the right answer for
+exactly two situations: an unmaintained dependency with no fixed version, and buying time during an
+upgrade you have already scheduled.</p>
+
+<p>It is the wrong answer as a permanent fix, because the flag has to be threaded through every way
+the application is started — your IDE, the test runner, the container entrypoint, the CI job — and
+each one is a place someone will forget. A build that needs six <code>--add-opens</code> flags is a
+build that will break again on the next upgrade.</p>
+
+<p>If you must use it, put it in the build so it is at least recorded:</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;plugin&gt;
+    &lt;groupId&gt;org.apache.maven.plugins&lt;/groupId&gt;
+    &lt;artifactId&gt;maven-surefire-plugin&lt;/artifactId&gt;
+    &lt;configuration&gt;
+        &lt;argLine&gt;--add-opens java.base/java.lang=ALL-UNNAMED&lt;/argLine&gt;
+    &lt;/configuration&gt;
+&lt;/plugin&gt;
+</code></pre>
+
+<h2>Other things that break</h2>
+
+<ul>
+<li><strong>The security manager is deprecated for removal.</strong> It still works in 17 but warns.
+Almost nothing uses it; if you do, start planning.</li>
+<li><strong><code>Runtime.exec(String)</code> parsing changed</strong> subtly around quoting. Use the
+<code>String[]</code> or <code>ProcessBuilder</code> form, which you should have been using
+anyway.</li>
+<li><strong>Nashorn is gone</strong> — removed in 15. See the
+<a href="/java/java-11-migration-guide">Java 11 guide</a>; the symptom is a <code>null</code> engine
+rather than an error.</li>
+<li><strong>Floating-point is always strict.</strong> <code>strictfp</code> became the default and
+the keyword is now redundant. This can change results in the last bit on some platforms — relevant
+only if you have tests asserting exact <code>double</code> values, which
+<a href="/java/java-data-types">is a bad idea regardless</a>.</li>
+</ul>
+
+<h2>Should you go straight to 21 or 25?</h2>
+
+<p>A fair question, since 17 is no longer the newest LTS. The honest answer is that 11 → 17 → 21 in
+two steps is usually easier than 11 → 21 in one, and not because the second hop is hard — it is
+because a failed upgrade needs to be bisected.</p>
+
+<p>Strong encapsulation is the one genuinely disruptive change in this whole range, and it lands in
+17. If you jump straight to 21 and something breaks, you are debugging that change alongside every
+other difference at once. Landing on 17 first isolates it.</p>
+
+<p>The exception is a small application with few dependencies and good test coverage, where going
+directly to 21 or 25 is fine — the later hops are almost entirely additive. Check the
+<a href="/java/java-21-migration-guide">Java 21</a> and
+<a href="/java/java-25-migration-guide">Java 25</a> guides for what each adds, then decide based on
+how many dependencies you have rather than how many versions you are skipping.</p>
+
+<h2>The upgrade order</h2>
+
+<ol>
+<li><strong>On Java 11:</strong> upgrade build plugins, then dependencies. Fix every illegal-access
+warning. Do this in separate commits so a failure has one cause.</li>
+<li><strong>Switch the JDK</strong> and set the release level. Use <code>release</code>, not
+<code>source</code>/<code>target</code> — it checks that you only call APIs that exist in the
+version you are targeting.</li>
+</ol>
+
+<pre class="language-xml"><code class="language-xml">&lt;properties&gt;
+    &lt;maven.compiler.release&gt;17&lt;/maven.compiler.release&gt;
+&lt;/properties&gt;
+</code></pre>
+
+<ol start="3">
+<li><strong>Run the tests, then run the application.</strong> Reflective-access failures often appear
+only at runtime, on the code path that does the reflecting — a passing build proves less here than
+usual.</li>
+<li><strong>Only then</strong> start using the new language features. Upgrading the JDK and rewriting
+code in the same change makes a bisect useless.</li>
+</ol>
+
+<h2>Why it is worth it</h2>
+
+<p>Java 11 to 17 is the release range where the language changed most.
+<a href="/java/java-17-records">Records</a>, <a href="/java/java-17-sealed-classes">sealed
+classes</a>, <a href="/java/java-17-switch-expressions">switch expressions</a>,
+<a href="/java/java-17-text-blocks">text blocks</a>,
+<a href="/java/java-17-pattern-matching-instanceof">pattern matching</a> and
+<a href="/java/java-17-other-improvements">helpful NullPointerExceptions</a> all landed in it.</p>
+
+<p>There is also a straightforward performance argument. Compact strings, a faster concatenation
+strategy and six years of G1 tuning mean most applications get faster on the same hardware with no
+code changes at all — which is a rare thing to be able to say about an upgrade.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-21-virtual-threads">Virtual Threads</a> is next, opening the Java 21
+section — and it is the largest change to how Java handles concurrency in twenty years.</p>

@@ -1,0 +1,182 @@
+<p>Before Java 8, adding a method to an interface broke every class that implemented it. That is not
+a theoretical problem — it is why <code>Collection</code> went years without obvious conveniences.
+Default methods solved it, and understanding <em>why</em> they exist tells you when to use them.</p>
+
+<h2>The problem they were invented for</h2>
+
+<p>Java 8 wanted to add <code>stream()</code> to <code>Collection</code> and <code>forEach</code> to
+<code>Iterable</code>. Both are interfaces implemented by thousands of classes inside the JDK and
+millions outside it. Adding an abstract method to either would have failed to compile every one of
+them.</p>
+
+<p>The escape was to let an interface method carry a body. Existing implementers inherit it and
+carry on compiling; anyone who wants different behaviour overrides it. That is the entire feature,
+and it is why <code>forEach</code> works on a <code>List</code> you wrote in 2006.</p>
+
+<pre class="language-java"><code class="language-java">interface Greeter {
+    String name();                                  // implementers must supply this
+
+    default String greet() {                        // they get this free
+        return "Hello, " + name();
+    }
+}
+
+class English implements Greeter {
+    public String name() { return "Folau"; }        // greet() inherited as-is
+}
+
+class Tongan implements Greeter {
+    public String name() { return "Folau"; }
+
+    @Override
+    public String greet() { return "Malo e lelei, " + name(); }   // overridden
+}
+</code></pre>
+
+<h2>Real examples in the JDK</h2>
+
+<p>Once you know the shape, you recognise it across the standard library. Every one of these is a
+default method added to an existing interface without breaking anything:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;String&gt; names = new ArrayList&lt;&gt;(List.of("Ana", "", "Bo"));
+
+        names.forEach(System.out::println);         // Iterable.forEach
+        names.removeIf(String::isBlank);            // Collection.removeIf
+        names.replaceAll(String::toUpperCase);      // List.replaceAll
+        names.sort(Comparator.naturalOrder());      // List.sort
+        System.out.println(names);                  // [ANA, BO]
+
+        Map&lt;String, Integer&gt; ages = new HashMap&lt;&gt;();
+        ages.putIfAbsent("Ana", 30);                // Map.putIfAbsent
+        ages.merge("Ana", 1, Integer::sum);         // Map.merge
+        System.out.println(ages.getOrDefault("Bo", 0));   // Map.getOrDefault
+    }
+}
+</code></pre>
+
+<h2>Static methods on interfaces</h2>
+
+<p>Java 8 also allowed <code>static</code> methods on an interface. These are not inherited and
+cannot be overridden — they are called on the interface itself, and they exist so that helpers can
+live next to the contract instead of in a separate <code>XxxUtils</code> class:</p>
+
+<pre class="language-java"><code class="language-java">interface Validator {
+    boolean test(String input);
+
+    static Validator notBlank() {                   // a factory
+        return s -&gt; s != null &amp;&amp; !s.isBlank();
+    }
+
+    static Validator maxLength(int n) {
+        return s -&gt; s.length() &lt;= n;
+    }
+
+    default Validator and(Validator other) {
+        return s -&gt; this.test(s) &amp;&amp; other.test(s);
+    }
+}
+
+class Demo {
+    void run() {
+        Validator v = Validator.notBlank().and(Validator.maxLength(10));
+        System.out.println(v.test("hello"));        // true
+        System.out.println(v.test(""));             // false
+    }
+}
+</code></pre>
+
+<p>The JDK does this too — <code>Comparator.comparing</code>, <code>List.of</code>,
+<code>Map.entry</code> and <code>Predicate.not</code> are all static interface methods. Before Java 8
+they would have been on a <code>Collections</code>-style utility class, one step removed from the
+type they serve.</p>
+
+<h2>The diamond problem</h2>
+
+<p>Two interfaces can now supply two bodies for the same method, and a class implementing both has an
+ambiguity. Java refuses to guess — it will not compile until you say which you meant:</p>
+
+<pre class="language-java"><code class="language-java">interface Swimmer {
+    default String move() { return "swimming"; }
+}
+
+interface Runner {
+    default String move() { return "running"; }
+}
+
+class Triathlete implements Swimmer, Runner {
+    @Override
+    public String move() {
+        // Must resolve it. `Interface.super.method()` picks one explicitly.
+        return Swimmer.super.move() + " then " + Runner.super.move();
+    }
+}
+</code></pre>
+
+<p><code>Swimmer.super.move()</code> is the syntax, and it only exists for this situation. The
+resolution rules in full are: a class's own method beats any inherited default; a more specific
+interface beats a less specific one; and anything still ambiguous is a compile error. In practice you
+only ever meet the third case.</p>
+
+<h2>Private interface methods</h2>
+
+<p>Since Java 9, an interface can have private methods. They exist purely so two default methods can
+share code without exposing a helper on the public contract:</p>
+
+<pre class="language-java"><code class="language-java">interface Report {
+    List&lt;String&gt; rows();
+
+    default String asCsv() { return String.join(",", cleaned()); }
+
+    default String asList() { return String.join("\n", cleaned()); }
+
+    private List&lt;String&gt; cleaned() {                // not part of the contract
+        return rows().stream().map(String::strip).filter(s -&gt; !s.isEmpty()).toList();
+    }
+}
+</code></pre>
+
+<h2>When to use a default method — and when not to</h2>
+
+<p><strong>Use one</strong> to evolve an interface that already has implementers, or to provide a
+genuine convenience derived from the other methods — <code>and</code> on <code>Validator</code> above
+is a good example, because it is expressible entirely in terms of <code>test</code>.</p>
+
+<p><strong>Do not use one</strong> to smuggle in shared implementation. If several classes need the
+same code and the same state, that is what an abstract class is for. The tell is a default method
+that wishes it could read a field: an interface has no state, so any default method that "needs" one
+is a design that has outgrown the interface.</p>
+
+<table>
+<thead><tr><th></th><th>abstract method</th><th>default method</th><th>static method</th></tr></thead>
+<tbody>
+<tr><td>Has a body</td><td>no</td><td>yes</td><td>yes</td></tr>
+<tr><td>Inherited</td><td>must implement</td><td>yes, overridable</td><td>no</td></tr>
+<tr><td>Called on</td><td>an instance</td><td>an instance</td><td>the interface</td></tr>
+<tr><td>Counts toward "functional"</td><td>yes</td><td>no</td><td>no</td></tr>
+</tbody>
+</table>
+
+<p>That last row matters if you also want lambdas: an interface stays functional no matter how many
+default and static methods you add, because only abstract methods count.</p>
+
+<h2>One caveat about compatibility</h2>
+
+<p>Default methods make an interface change <em>source</em> compatible and <em>binary</em> compatible
+— existing code compiles and existing jars keep running. They do not make it
+<em>behaviourally</em> compatible.</p>
+
+<p>If a class already had its own <code>sort</code> method with a different meaning, adding a
+<code>default sort</code> to the interface it implements will silently bind calls to the class's
+version, or fail to compile if the signatures clash awkwardly. The JDK hit exactly this when adding
+<code>Iterable.forEach</code> — some existing libraries had their own <code>forEach</code>, and the
+override semantics had to be checked case by case.</p>
+
+<p>The practical advice: when you add a default method to a widely implemented interface, pick a name
+nobody is likely to have used, and expect to find out you were wrong.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-8-date-time-api">The Date and Time API</a> is next — the other large Java 8
+addition, and the one that finally made dates usable.</p>

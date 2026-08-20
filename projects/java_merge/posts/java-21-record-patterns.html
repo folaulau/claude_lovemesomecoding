@@ -1,0 +1,169 @@
+<p>A record pattern matches a record and pulls its components out in the same step. It is a small
+piece of syntax that removes the accessor calls from every branch of a
+<a href="/java/java-21-pattern-matching-switch">type switch</a>, and it composes to arbitrary depth.</p>
+
+<p>It only works on <a href="/java/java-17-records">records</a>, and that is not an arbitrary
+restriction. A record publishes its components as part of its contract — the compiler knows their
+order, types and accessors — so the destructuring is guaranteed to match the construction. An
+ordinary class has no such promise, which is why there is nothing to destructure.</p>
+
+<h2>The syntax</h2>
+
+<pre class="language-java"><code class="language-java">record Point(int x, int y) { }
+
+class Demo {
+    String before(Object value) {
+        if (value instanceof Point p) {
+            return "at " + p.x() + "," + p.y();      // bind the record, then call accessors
+        }
+        return "not a point";
+    }
+
+    String after(Object value) {
+        if (value instanceof Point(int x, int y)) {  // bind the components directly
+            return "at " + x + "," + y;
+        }
+        return "not a point";
+    }
+}
+</code></pre>
+
+<p>The pattern mirrors the record's declaration. <code>Point(int x, int y)</code> checks that the
+value is a <code>Point</code> and binds its two components to <code>x</code> and <code>y</code>.</p>
+
+<p>Component names in the pattern are yours to choose — they need not match the record's:</p>
+
+<pre class="language-java"><code class="language-java">record Point(int x, int y) { }
+
+class Demo {
+    void run(Object value) {
+        if (value instanceof Point(int across, int down)) {
+            System.out.println(across + down);
+        }
+        if (value instanceof Point(var a, var b)) {   // var works too
+            System.out.println(a + b);
+        }
+    }
+}
+</code></pre>
+
+<h2>In a switch</h2>
+
+<pre class="language-java"><code class="language-java">sealed interface Shape permits Circle, Rectangle, Triangle { }
+record Circle(double radius) implements Shape { }
+record Rectangle(double width, double height) implements Shape { }
+record Triangle(double base, double height) implements Shape { }
+
+class Geometry {
+    double area(Shape shape) {
+        return switch (shape) {
+            case Circle(double r) -&gt; Math.PI * r * r;
+            case Rectangle(double w, double h) -&gt; w * h;
+            case Triangle(double b, double h) -&gt; b * h / 2;
+        };
+    }
+}
+</code></pre>
+
+<p>Compare that with the version that binds the record and calls accessors — <code>case Circle c
+-&gt; Math.PI * c.radius() * c.radius()</code>. The pattern version puts the value you care about
+directly in scope, which is most of the readability win.</p>
+
+<p>No <code>default</code> is needed because <code>Shape</code> is
+<a href="/java/java-17-sealed-classes">sealed</a>; the compiler knows the three cases are all of
+them.</p>
+
+<h2>Nesting</h2>
+
+<p>The real power is that patterns compose. A record containing records can be destructured in one
+expression:</p>
+
+<pre class="language-java"><code class="language-java">record Point(int x, int y) { }
+record Line(Point start, Point end) { }
+
+class Demo {
+    String describe(Object value) {
+        return switch (value) {
+            // Reach two levels down in one pattern
+            case Line(Point(var x1, var y1), Point(var x2, var y2)) when x1 == x2 -&gt;
+                    "vertical line at x=" + x1;
+            case Line(Point(var x1, var y1), Point(var x2, var y2)) when y1 == y2 -&gt;
+                    "horizontal line at y=" + y1;
+            case Line(Point start, Point end) -&gt;
+                    "line from " + start + " to " + end;
+            default -&gt; "not a line";
+        };
+    }
+}
+</code></pre>
+
+<p>Note the mixed depth in the last case: a nested pattern can bind the whole component
+(<code>Point start</code>) or destructure it further. You choose per component, at each level.</p>
+
+<p>Written without patterns, that first case is
+<code>if (value instanceof Line l &amp;&amp; l.start().x() == l.end().x())</code> plus four accessor
+calls in the body. The pattern says the same thing in the shape of the data.</p>
+
+<h2>Type matching in nested patterns</h2>
+
+<pre class="language-java"><code class="language-java">record Box(Object contents) { }
+
+class Demo {
+    String unwrap(Object value) {
+        return switch (value) {
+            case Box(String s) -&gt; "boxed text: " + s;        // matches only if contents is a String
+            case Box(Integer i) -&gt; "boxed int: " + i;
+            case Box(Object o) -&gt; "boxed something: " + o;
+            default -&gt; "not a box";
+        };
+    }
+}
+</code></pre>
+
+<p>A nested pattern is a type test as well as a binding. <code>Box(String s)</code> fails to match a
+<code>Box</code> holding an <code>Integer</code> and falls through to the next case — so this reads as
+a decision table over the contents, not just the container.</p>
+
+<h2>Two things to know</h2>
+
+<p><strong>The component types must match exactly for primitives.</strong> Writing
+<code>Point(long x, long y)</code> against a record declared with <code>int</code> does not compile,
+even though the widening would be safe. Use <code>var</code> if you would rather not repeat the
+types.</p>
+
+<p><strong>Record patterns do not match null components.</strong> A nested pattern with a type test
+fails on null, which is usually what you want but is worth knowing:</p>
+
+<pre class="language-java"><code class="language-java">record Box(Object contents) { }
+
+class Demo {
+    void run() {
+        Object value = new Box(null);
+
+        if (value instanceof Box(String s)) {
+            System.out.println("text: " + s);      // does NOT run
+        }
+        if (value instanceof Box(var anything)) {
+            System.out.println("matched, contents = " + anything);   // this does
+        }
+    }
+}
+</code></pre>
+
+<p>A <code>var</code> pattern matches anything including null; a typed pattern does not.</p>
+
+<h2>When to use them</h2>
+
+<p>Record patterns are at their best where data arrives as a shape you did not design — a parsed
+message, an event, an expression tree — and you are dispatching on both its type and its contents.
+Combined with sealed interfaces they give you in plain Java what other languages call algebraic data
+types and exhaustive matching.</p>
+
+<p>They are not a reason to turn well-behaved objects into records so you can destructure them. If
+behaviour belongs on the type, put it there; the <a href="/java/java-oop">OOP</a> argument does not
+stop applying because a new syntax exists.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-21-sequenced-collections">Sequenced Collections</a> is next — a small addition
+that finally gives every ordered collection a first and last element.</p>

@@ -1,0 +1,172 @@
+<p><a href="/python/python-get-started">Get Started</a> covers creating a virtual environment and
+<a href="/python/python-modules-packages">Modules &amp; Packages</a> covers <code>pip install</code>.
+This post is what comes after: turning a folder of scripts into something other people — including
+future you, on another machine — can install and rely on.</p>
+
+<h2>pyproject.toml is the whole configuration</h2>
+
+<p>One file at the root of your project replaces <code>setup.py</code>, <code>setup.cfg</code> and
+most of what used to live beside them:</p>
+
+<pre class="language-bash"><code class="language-bash">[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bank-console"
+version = "0.2.0"
+description = "A console bank over CSV files."
+requires-python = ">=3.12"
+dependencies = [
+    "rich>=13,<14",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff", "mypy"]
+
+[project.scripts]
+bank = "bank.__main__:main"
+</code></pre>
+
+<p>Three things there matter more than the rest. <code>requires-python</code> stops pip installing your
+package into an interpreter that cannot run it — a clear error instead of a mysterious
+<code>SyntaxError</code>. <code>optional-dependencies</code> keeps test and lint tools out of what your
+users install. And <code>project.scripts</code> generates a real <code>bank</code> command on their
+PATH, pointing at a function.</p>
+
+<p>The build backend is pluggable; <code>hatchling</code> is a good default, and
+<code>setuptools</code> is what you will find in older projects.</p>
+
+<h2>Version ranges, not pins</h2>
+
+<p>This is the distinction that causes the most trouble, so it is worth stating plainly.</p>
+
+<p><strong>A library declares ranges.</strong> <code>rich&gt;=13,&lt;14</code> says "any 13.x". Pinning
+<code>rich==13.7.1</code> in a library is antisocial: it makes your package uninstallable alongside
+anything wanting 13.8, and the conflict lands on a user who did nothing wrong.</p>
+
+<p><strong>An application pins exactly.</strong> A deployed service should install byte-identical
+dependencies every time, and that is what a lockfile is for — not <code>pyproject.toml</code>.</p>
+
+<pre class="language-bash"><code class="language-bash">pip install pip-tools
+
+pip-compile pyproject.toml -o requirements.lock   # resolve once, exactly
+pip-sync requirements.lock                        # make the venv match, exactly
+</code></pre>
+
+<p><code>pip freeze &gt; requirements.txt</code> is not the same thing. Freeze records whatever happens
+to be installed — including packages you installed by hand and forgot, and no record of which were
+your actual dependencies. A lockfile is generated <em>from</em> your declared dependencies, so it is
+reproducible and regenerable.</p>
+
+<p><code>pip-sync</code> also removes packages not in the lockfile, which <code>pip install -r</code>
+does not. That is the difference between "these are installed" and "only these are installed".</p>
+
+<h2>Editable installs</h2>
+
+<pre class="language-bash"><code class="language-bash">python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -e ".[dev]"    # your package, editable, plus the dev extras
+</code></pre>
+
+<p><code>-e</code> installs a link rather than a copy, so edits take effect immediately with no
+reinstall. This is how you work on a package locally, and it fixes the most common structural
+complaint in Python projects — that tests cannot import the code.</p>
+
+<p>Once installed editable, <code>from bank.money import format_money</code> works from anywhere: your
+tests, a notebook, another project. No <code>sys.path</code> manipulation and no
+<code>PYTHONPATH</code> in a shell profile. If a project has a <code>conftest.py</code> whose only job
+is inserting the parent directory into <code>sys.path</code>, an editable install is the fix.</p>
+
+<h2>The src layout</h2>
+
+<pre class="language-bash"><code class="language-bash">bank-console/
+    pyproject.toml
+    src/
+        bank/
+            __init__.py
+            money.py
+    tests/
+        test_money.py
+    README.md
+</code></pre>
+
+<p>Putting the package under <code>src/</code> looks like pointless nesting and is not. Without it the
+project root is on <code>sys.path</code> when you run tests, so <code>import bank</code> finds the
+source directory whether or not the package installs correctly. With <code>src/</code> it cannot, so
+your tests exercise the <strong>installed</strong> package.</p>
+
+<p>The failure this prevents is the classic one: everything passes locally, and the published wheel is
+missing a module nobody noticed because the tests never used the wheel.</p>
+
+<h2>Building</h2>
+
+<pre class="language-bash"><code class="language-bash">pip install build twine
+
+python3 -m build          # writes dist/*.whl and dist/*.tar.gz
+twine check dist/*        # validate the metadata before uploading
+</code></pre>
+
+<p>Two artefacts. The <strong>wheel</strong> (<code>.whl</code>) is the built distribution pip prefers —
+installing it is unzipping. The <strong>sdist</strong> (<code>.tar.gz</code>) is the source, used when
+no matching wheel exists. Publish both.</p>
+
+<p>Inspect the wheel before you trust it — it is a zip, and this catches a missing module long before a
+user does:</p>
+
+<pre class="language-python"><code class="language-python">import zipfile, io
+
+# Stand-in for `unzip -l dist/bank_console-0.2.0-whl`
+buffer = io.BytesIO()
+with zipfile.ZipFile(buffer, "w") as z:
+    z.writestr("bank/__init__.py", "")
+    z.writestr("bank/money.py", "def format_money(v): return f'${v:,.2f}'")
+
+with zipfile.ZipFile(buffer) as z:
+    print(sorted(z.namelist()))
+# Output: ['bank/__init__.py', 'bank/money.py']
+</code></pre>
+
+<h2>Publishing</h2>
+
+<pre class="language-bash"><code class="language-bash">twine upload --repository testpypi dist/*    # rehearse here first
+twine upload dist/*                          # the real thing
+</code></pre>
+
+<p>Rehearse on TestPyPI, because <strong>a released version can never be replaced</strong>. PyPI lets
+you delete a file but will not accept the same version number again — a broken 1.0.2 means shipping
+1.0.3, and anyone who installed the broken one keeps it.</p>
+
+<p>Use a scoped API token rather than your password, stored in <code>~/.pypirc</code> or a CI secret,
+and prefer trusted publishing from GitHub Actions so no long-lived token exists at all.</p>
+
+<h2>Versioning, and what it promises</h2>
+
+<p><code>MAJOR.MINOR.PATCH</code>, and the contract is about what breaks:</p>
+
+<ul>
+  <li><strong>PATCH</strong> — a bug fix. Nobody's code stops working.</li>
+  <li><strong>MINOR</strong> — new functionality, backwards compatible. Old code still works.</li>
+  <li><strong>MAJOR</strong> — something removed or changed. Someone's code will break.</li>
+</ul>
+
+<p>Renaming a public function is a major bump even though it feels small — that is exactly the change
+that breaks a caller. Deprecate first: keep the old name working, warn when it is used, and remove it
+in the next major.</p>
+
+<h2>uv, briefly</h2>
+
+<pre class="language-bash"><code class="language-bash">uv venv                  # create a virtual environment
+uv pip install -e ".[dev]"
+uv lock                  # a lockfile, built in
+uv run pytest            # run in the project environment, no activation
+</code></pre>
+
+<p><code>uv</code> replaces <code>venv</code>, <code>pip</code> and <code>pip-tools</code> with one
+tool, and is dramatically faster. It reads the same <code>pyproject.toml</code>, so adopting it is not
+a migration and abandoning it costs nothing.</p>
+
+<p>Everything above still describes what is happening underneath, which is why it is worth knowing in
+that order. Next:
+<a href="/python-advanced/python-advanced-numpy-arrays">NumPy Arrays</a>.</p>

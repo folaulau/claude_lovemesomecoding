@@ -1,0 +1,193 @@
+<p>Every <code>instanceof</code> check used to be followed by a cast to the type you had just
+checked for. Pattern matching folds the two into one, and the compiler tracks where the result is
+valid. It is a small change that removes a line from a very common shape.</p>
+
+<h2>The old shape</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String describeOld(Object value) {
+        if (value instanceof String) {
+            String s = (String) value;              // check, then cast the same thing
+            return "text of length " + s.length();
+        }
+        return "something else";
+    }
+
+    String describeNew(Object value) {
+        if (value instanceof String s) {            // check and bind in one step
+            return "text of length " + s.length();
+        }
+        return "something else";
+    }
+}
+</code></pre>
+
+<p><code>s</code> is a <em>pattern variable</em>. It exists only where the check has succeeded, and
+it is already the right type, so there is no cast to get wrong and no chance of the cast drifting
+away from the check.</p>
+
+<h2>Scope, which is cleverer than it looks</h2>
+
+<p>The compiler works out where the pattern variable is definitely assigned, and that includes some
+places you might not expect:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    // Inside the if — the obvious case
+    void inside(Object value) {
+        if (value instanceof String s) {
+            System.out.println(s.length());
+        }
+        // s does not exist here
+    }
+
+    // After an early return — the check must have passed to reach this line
+    int afterGuard(Object value) {
+        if (!(value instanceof String s)) {
+            return 0;
+        }
+        return s.length();                          // s is in scope, and definitely a String
+    }
+
+    // In the same condition — && guarantees the left side ran first
+    boolean sameCondition(Object value) {
+        return value instanceof String s &amp;&amp; s.length() &gt; 3;
+    }
+}
+</code></pre>
+
+<p>That second form is the one worth adopting deliberately. Combined with a guard clause it flattens
+a method that would otherwise nest, which is the same argument the
+<a href="/java/java-conditional-statements">Conditional Statements</a> post makes.</p>
+
+<p>The third form only works with <code>&amp;&amp;</code>. Writing <code>||</code> there does not
+compile, and correctly so — if the left side is false, the variable was never bound, so the right
+side cannot use it.</p>
+
+<h2>Where it pays off most</h2>
+
+<p><code>equals</code> is the method every class writes and every class writes the same way. Pattern
+matching removes a third of it:</p>
+
+<pre class="language-java"><code class="language-java">class Point {
+    private final int x, y;
+
+    Point(int x, int y) { this.x = x; this.y = y; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Point other)) return false;    // check, bind, and null-safe
+        return x == other.x &amp;&amp; y == other.y;
+    }
+
+    @Override
+    public int hashCode() { return Objects.hash(x, y); }
+}
+</code></pre>
+
+<p>Note that <code>instanceof</code> is <code>false</code> for <code>null</code>, so this handles the
+null argument without a separate check — which the old three-line version needed.</p>
+
+<p>The other common shape is a chain of type tests:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String format(Object value) {
+        if (value instanceof Integer i) return "int: " + (i * 2);
+        if (value instanceof String s) return "text: " + s.strip();
+        if (value instanceof List&lt;?&gt; list) return "list of " + list.size();
+        if (value instanceof int[] array) return "array of " + array.length;
+        return String.valueOf(value);
+    }
+}
+</code></pre>
+
+<p>That chain is exactly what <a href="/java/java-21-pattern-matching-switch">pattern matching for
+switch</a> replaces in Java 21, and this is the step that made it possible.</p>
+
+<h2>Generics, and what you cannot check</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(Object value) {
+        // Fine: the wildcard says "some list, do not care what of"
+        if (value instanceof List&lt;?&gt; list) {
+            System.out.println(list.size());
+        }
+
+        // Does not compile: type arguments are erased at runtime, so this is
+        // not a question the JVM can answer.
+        // if (value instanceof List&lt;String&gt; strings) { }
+    }
+}
+</code></pre>
+
+<p>This is erasure, the subject of the <a href="/java/java-advanced-generics">Generics</a> post: a
+<code>List&lt;String&gt;</code> and a <code>List&lt;Integer&gt;</code> are the same class at runtime.
+You can ask whether something is a <code>List</code>; you cannot ask what is in it without looking.</p>
+
+<h2>One thing to avoid</h2>
+
+<p>Pattern matching makes type-testing chains pleasant to write, which makes it easier to write them
+where they do not belong:</p>
+
+<pre class="language-java"><code class="language-java">interface Shape { }
+record Circle(double radius) implements Shape { }
+record Square(double side) implements Shape { }
+
+class Demo {
+    // Works, but every new shape means editing this method
+    double areaByType(Shape shape) {
+        if (shape instanceof Circle c) return Math.PI * c.radius() * c.radius();
+        if (shape instanceof Square s) return s.side() * s.side();
+        throw new IllegalArgumentException("unknown shape");
+    }
+}
+</code></pre>
+
+<p>If you control the types, a method on the interface is better — that is
+<a href="/java/java-oop">polymorphism</a>, and adding a shape then requires no edit here at all.
+Pattern matching is for the cases where you do not control the hierarchy, or where the behaviour
+genuinely belongs to the caller rather than the type. With
+<a href="/java/java-17-sealed-classes">sealed types</a> the calculus changes again, because the
+compiler can then prove the chain is complete.</p>
+
+<h2>Shadowing and reuse</h2>
+
+<p>Two mechanical details that produce confusing compiler errors the first time you meet them.</p>
+
+<p>A pattern variable cannot shadow a local that is already in scope, so reusing an obvious name like
+<code>s</code> in the same method fails:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void shadowing(Object value) {
+        String s = "existing";
+        // if (value instanceof String s) { }      // error: variable s is already defined
+
+        if (value instanceof String text) {         // pick another name
+            System.out.println(text.length() + s.length());
+        }
+    }
+}
+</code></pre>
+
+<p>But the same name <em>can</em> be reused across branches that cannot both be live, because only
+one of them will ever have bound it:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String describe(Object value) {
+        if (value instanceof Integer n) {
+            return "int " + n;
+        } else if (value instanceof Long n) {       // fine — the branches are exclusive
+            return "long " + n;
+        }
+        return "other";
+    }
+}
+</code></pre>
+
+<p>The rule underneath both is the same one: the variable exists exactly where the compiler can prove
+the test passed, and nowhere else.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-17-other-improvements">Other Java 17 improvements</a> is next — the smaller
+additions between 11 and 17 that are easy to miss.</p>

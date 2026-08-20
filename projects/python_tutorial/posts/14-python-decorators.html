@@ -1,0 +1,261 @@
+<p>A decorator wraps a function in another function to add behaviour without editing it. They look like
+magic until you see the one fact underneath, so this post builds one from scratch rather than starting
+with the <code>@</code>.</p>
+
+<h2>Functions are objects</h2>
+
+<p>Everything a decorator does follows from this. A function can be assigned to a name, passed as an
+argument, and returned from another function:</p>
+
+<pre class="language-python"><code class="language-python">def greet(name):
+    return f"Hello, {name}"
+
+say = greet                       # a second name for the same function
+print(say("Alice"))               # Output: Hello, Alice
+
+def call_twice(fn, value):
+    return fn(fn(value))
+
+print(call_twice(str.upper, "ab"))   # Output: AB
+</code></pre>
+
+<p>No brackets after <code>greet</code> on the third line. <code>greet</code> is the function;
+<code>greet()</code> is the result of calling it. Confusing the two is the single most common mistake
+when starting with decorators.</p>
+
+<h2>A function that returns a function</h2>
+
+<pre class="language-python"><code class="language-python">def with_logging(fn):
+    def wrapper(*args, **kwargs):
+        print(f"calling {fn.__name__}")
+        result = fn(*args, **kwargs)
+        print(f"{fn.__name__} returned {result}")
+        return result
+    return wrapper
+
+def add(a, b):
+    return a + b
+
+add = with_logging(add)
+print(add(2, 3))
+
+# Output: calling add
+# Output: add returned 5
+# Output: 5
+</code></pre>
+
+<p><code>with_logging</code> takes a function and gives back a new one that does something before and
+after calling the original. <code>*args, **kwargs</code> is doing real work here — the wrapper has to
+accept whatever the wrapped function accepts, and it does not know what that is.</p>
+
+<p>That is a decorator. The rest is syntax.</p>
+
+<h2>The @ syntax</h2>
+
+<pre class="language-python"><code class="language-python">def with_logging(fn):
+    def wrapper(*args, **kwargs):
+        print(f"calling {fn.__name__}")
+        return fn(*args, **kwargs)
+    return wrapper
+
+@with_logging
+def add(a, b):
+    return a + b
+
+print(add(2, 3))
+
+# Output: calling add
+# Output: 5
+</code></pre>
+
+<p><code>@with_logging</code> above the <code>def</code> means exactly
+<code>add = with_logging(add)</code> underneath it. Nothing else. It runs once, when the module is
+imported, not on each call.</p>
+
+<h2>functools.wraps is not optional</h2>
+
+<p>The wrapper replaces the original, and it brings its own name and docstring with it:</p>
+
+<pre class="language-python"><code class="language-python">def broken(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapper
+
+@broken
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+print(add.__name__)     # Output: wrapper
+print(add.__doc__)      # Output: None
+</code></pre>
+
+<p>The function is now called <code>wrapper</code> and has lost its documentation. Every traceback,
+every debugger, every <code>help()</code> call will say <code>wrapper</code>. Fix it with one line:</p>
+
+<pre class="language-python"><code class="language-python">import functools
+
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapper
+
+@logged
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+print(add.__name__)     # Output: add
+print(add.__doc__)      # Output: Add two numbers.
+</code></pre>
+
+<p><code>@functools.wraps(fn)</code> copies the name, docstring and metadata across. Put it on every
+decorator you write, without thinking about whether this one needs it.</p>
+
+<h2>A decorator that takes arguments</h2>
+
+<p>This needs one more layer, and the extra nesting is why it looks worse than it is:</p>
+
+<pre class="language-python"><code class="language-python">import functools
+
+def repeat(times):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            for _ in range(times):
+                result = fn(*args, **kwargs)
+            return result
+        return wrapper
+    return decorator
+
+@repeat(times=3)
+def ping():
+    print("ping")
+    return "done"
+
+print(ping())
+
+# Output: ping
+# Output: ping
+# Output: ping
+# Output: done
+</code></pre>
+
+<p>Three levels, each with one job: <code>repeat</code> takes the arguments,
+<code>decorator</code> takes the function, <code>wrapper</code> takes the call. The reason for the
+extra layer is that <code>@repeat(times=3)</code> <em>calls</em> <code>repeat</code> first, and
+whatever comes back is what decorates the function.</p>
+
+<h2>The ones you already use</h2>
+
+<pre class="language-python"><code class="language-python">import functools
+
+class Account:
+    def __init__(self, balance):
+        self.balance = balance
+
+    @property
+    def formatted(self):
+        return f"${self.balance:,.2f}"
+
+    @staticmethod
+    def fee():
+        return 2.50
+
+@functools.cache
+def slow_square(n):
+    return n * n
+
+account = Account(1250)
+print(account.formatted)      # Output: $1,250.00
+print(Account.fee())          # Output: 2.5
+print(slow_square(12))        # Output: 144
+</code></pre>
+
+<p><code>@property</code> makes a method readable as an attribute — note <code>account.formatted</code>
+with no brackets. <code>@staticmethod</code> is a function that lives in the class but needs no
+instance. <code>@functools.cache</code> remembers results so a repeated call with the same arguments
+skips the work entirely, which is a one-line fix for a slow pure function.</p>
+
+<p>Frameworks lean on the same mechanism: <code>@app.route</code> in Flask,
+<code>@pytest.fixture</code> in <a href="/python/python-testing">pytest</a>,
+<code>@dataclass</code> in <a href="/python/python-dataclasses-type-hints">dataclasses</a>.</p>
+
+<h2>A useful one: timing</h2>
+
+<p>Enough theory — here is a decorator worth keeping. It reports how long a function took, and it works
+on any function without touching a line of it:</p>
+
+<pre class="language-python"><code class="language-python">import functools
+import time
+
+def timed(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - started
+            print(f"{fn.__name__} took {elapsed:.4f}s")
+    return wrapper
+
+@timed
+def total(n):
+    return sum(range(n))
+
+result = total(100)
+print(result)      # Output: 4950
+</code></pre>
+
+<p>Two details make this the version to copy. <code>time.perf_counter()</code> rather than
+<code>time.time()</code> — it is monotonic, so a clock adjustment mid-measurement cannot produce a
+negative duration. And the <code>try/finally</code>, so the timing still prints when the wrapped
+function raises. A timing decorator that goes silent on the slow call that failed is worse than none.</p>
+
+<p>The output line is deliberately not asserted above, because the elapsed time differs on every run —
+which is itself a useful reminder that anything time-dependent needs care in a
+<a href="/python/python-testing">test</a>.</p>
+
+<h2>Order matters</h2>
+
+<pre class="language-python"><code class="language-python">def outer(fn):
+    def w(*a, **k):
+        print("outer")
+        return fn(*a, **k)
+    return w
+
+def inner(fn):
+    def w(*a, **k):
+        print("inner")
+        return fn(*a, **k)
+    return w
+
+@outer
+@inner
+def job():
+    print("job")
+
+job()
+
+# Output: outer
+# Output: inner
+# Output: job
+</code></pre>
+
+<p>Decorators are applied bottom-up — <code>job = outer(inner(job))</code> — and therefore
+<em>run</em> top-down. When one of them authenticates and another logs, that order is the difference
+between logging attempted access and logging granted access.</p>
+
+<h2>When to write one</h2>
+
+<p>The test is whether the behaviour is genuinely orthogonal to what the function does: logging, timing,
+caching, retrying, checking permissions. Those are worth a decorator because they apply identically to
+twenty functions.</p>
+
+<p>Anything specific to one function belongs in that function, where a reader will find it. A decorator
+moves code somewhere the call site does not show, and that is a real cost — spend it on cross-cutting
+concerns only.</p>
+
+<p>Next: <a href="/python/python-class">Class</a>.</p>

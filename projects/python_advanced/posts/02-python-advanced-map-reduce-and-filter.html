@@ -1,0 +1,191 @@
+<p><a href="/python/python-lambda-functions">The Python track</a> makes the case that a comprehension
+beats <code>map</code> and <code>filter</code>, and it is right. This post covers what survives that
+argument: <code>functools</code>, the <code>operator</code> module, and the cases where
+<code>reduce</code> is genuinely the clearest thing to write.</p>
+
+<h2>Why map and filter mostly lose</h2>
+
+<pre class="language-python"><code class="language-python">amounts = [100, -25, 250, -40]
+
+print(list(map(lambda n: n * 2, amounts)))        # Output: [200, -50, 500, -80]
+print([n * 2 for n in amounts])                   # Output: [200, -50, 500, -80]
+
+print(list(filter(lambda n: n &gt; 0, amounts)))     # Output: [100, 250]
+print([n for n in amounts if n &gt; 0])              # Output: [100, 250]
+</code></pre>
+
+<p>The comprehension is shorter, needs no <code>list()</code> to be printable, and reads in the order
+the work happens. That is the whole case, and it holds for nearly every <code>map</code> or
+<code>filter</code> written with a lambda.</p>
+
+<p>The exception is when you already have a named function, where <code>map</code> is genuinely tidy:
+<code>map(str.strip, lines)</code> beats <code>[line.strip() for line in lines]</code> by a nose, and
+<code>map</code> over a large file is lazy where the comprehension is not.</p>
+
+<h2>reduce, and when it is the right shape</h2>
+
+<pre class="language-python"><code class="language-python">from functools import reduce
+import operator
+
+amounts = [100, 25, 250]
+
+print(reduce(operator.add, amounts))          # Output: 375
+print(sum(amounts))                           # Output: 375
+</code></pre>
+
+<p>That first line is the example everyone teaches and it is the wrong one — <code>sum</code> already
+exists and is clearer. Guido removed <code>reduce</code> from the builtins in Python 3 for precisely
+this reason.</p>
+
+<p>It earns its place when the combining step is <em>not</em> a builtin and the accumulator is not a
+number:</p>
+
+<pre class="language-python"><code class="language-python">from functools import reduce
+
+permissions = [{"read"}, {"read", "write"}, {"write", "admin"}]
+print(sorted(reduce(set.union, permissions)))     # Output: ['admin', 'read', 'write']
+
+overrides = [{"a": 1}, {"b": 2}, {"a": 99}]
+print(reduce(lambda acc, d: acc | d, overrides, {}))   # Output: {'a': 99, 'b': 2}
+</code></pre>
+
+<p>Merging a list of dicts in precedence order, unioning permission sets, composing functions — one
+expression each. The third argument is the starting value, which is what makes an empty input return
+<code>{}</code> rather than raising <code>TypeError</code>.</p>
+
+<p>Note the merge result: <code>a</code> is <code>99</code>, not <code>1</code>. Later dicts win, and
+the key keeps its original <em>position</em> while taking the new value — which is exactly the
+semantics you want for "defaults, then environment, then command line", and worth confirming rather
+than assuming.</p>
+
+<p>The test: if a <code>for</code> loop with an accumulator would be clearer, write the loop. Most of
+the time it is.</p>
+
+<h2>operator, instead of small lambdas</h2>
+
+<pre class="language-python"><code class="language-python">import operator
+
+accounts = [
+    {"kind": "Savings", "balance": 8400.5},
+    {"kind": "Checking", "balance": 1250.0},
+]
+
+by_balance = sorted(accounts, key=operator.itemgetter("balance"))
+print(by_balance[0]["kind"])              # Output: Checking
+
+rows = [("b", 2), ("a", 1)]
+print(sorted(rows, key=operator.itemgetter(0))[0])     # Output: ('a', 1)
+
+print(operator.itemgetter("kind", "balance")(accounts[0]))
+# Output: ('Savings', 8400.5)
+</code></pre>
+
+<p><code>itemgetter("balance")</code> does what <code>lambda a: a["balance"]</code> does, is
+implemented in C, and — the actual reason to prefer it — asking for two keys returns a
+<a href="/python/python-tuples">tuple</a>, which is the multi-column sort key in one call.</p>
+
+<p><code>attrgetter</code> is the same for attributes, and <code>methodcaller("strip")</code> for
+methods. Use them for key functions; do not reach for <code>operator.add</code> where <code>+</code>
+would do.</p>
+
+<h2>partial, for pre-filling arguments</h2>
+
+<pre class="language-python"><code class="language-python">from functools import partial
+
+def format_money(value, symbol="$", places=2):
+    return f"{symbol}{value:,.{places}f}"
+
+as_gbp = partial(format_money, symbol="£")
+whole = partial(format_money, places=0)
+
+print(format_money(1250.5))     # Output: $1,250.50
+print(as_gbp(1250.5))           # Output: £1,250.50
+print(whole(1250.5))            # Output: $1,250
+</code></pre>
+
+<p><code>partial</code> builds a new callable with some arguments already supplied. Where it pays off
+is any API that takes a callback and gives you no way to pass extra arguments — a
+<code>key=</code> function, a signal handler, a thread target.</p>
+
+<p>The alternative is a lambda that closes over a variable, which is where the
+<a href="/python/python-lambda-functions">late-binding trap</a> lives:
+<code>partial</code> captures values at the moment you call it, so a loop producing partials produces
+correct ones.</p>
+
+<h2>cache and lru_cache</h2>
+
+<pre class="language-python"><code class="language-python">from functools import cache
+
+calls = []
+
+@cache
+def fib(n):
+    calls.append(n)
+    return n if n &lt; 2 else fib(n - 1) + fib(n - 2)
+
+print(fib(30))                # Output: 832040
+print(len(calls))             # Output: 31
+print(fib.cache_info().hits)  # Output: 28
+</code></pre>
+
+<p>Thirty-one calls instead of about 2.7 million, from one decorator line. <code>@cache</code> (3.9) is
+unbounded; <code>@lru_cache(maxsize=128)</code> evicts the least recently used, which is what you want
+when the inputs are open-ended.</p>
+
+<p>Three conditions, all required. The function must be <strong>pure</strong> — same input, same
+output, no side effects. Its arguments must be <strong>hashable</strong>, so no lists or dicts. And the
+cache lives for the life of the process, so caching something that reads a file means never noticing
+the file changed.</p>
+
+<h2>singledispatch, instead of isinstance chains</h2>
+
+<pre class="language-python"><code class="language-python">from functools import singledispatch
+from decimal import Decimal
+
+@singledispatch
+def to_csv(value):
+    return str(value)
+
+@to_csv.register
+def _(value: Decimal):
+    return f"{value:f}"
+
+@to_csv.register
+def _(value: bool):
+    return "1" if value else "0"
+
+@to_csv.register
+def _(value: list):
+    return ";".join(to_csv(v) for v in value)
+
+print(to_csv(Decimal("1250.00")))          # Output: 1250.00
+print(to_csv(True))                        # Output: 1
+print(to_csv([Decimal("1.5"), False]))     # Output: 1.5;0
+print(to_csv(42))                          # Output: 42
+</code></pre>
+
+<p>The dispatch is on the type of the first argument, taken from the annotation. It replaces a chain of
+<code>isinstance</code> checks with something you can extend from another module without editing the
+original function — which is the real benefit, and why serialization libraries are built on it.</p>
+
+<p>Note <code>bool</code> registered separately from <code>int</code>. Since <code>bool</code> is a
+subclass of <code>int</code>, dispatch picks the most specific registration, so the order of the
+<code>register</code> calls does not matter.</p>
+
+<h2>What to reach for</h2>
+
+<table>
+  <thead><tr><th>Job</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>Transform every item</td><td>A comprehension</td></tr>
+    <tr><td>Keep some items</td><td>A comprehension with <code>if</code></td></tr>
+    <tr><td>Collapse to one value</td><td><code>sum</code>, <code>min</code>, <code>max</code>,
+        <code>any</code>, <code>all</code> — then a loop, then <code>reduce</code></td></tr>
+    <tr><td>A sort key</td><td><code>operator.itemgetter</code> / <code>attrgetter</code></td></tr>
+    <tr><td>Pre-fill a callback's arguments</td><td><code>functools.partial</code></td></tr>
+    <tr><td>Memoise a pure function</td><td><code>@cache</code> / <code>@lru_cache</code></td></tr>
+    <tr><td>Behaviour per type</td><td><code>@singledispatch</code></td></tr>
+  </tbody>
+</table>
+
+<p>Next: <a href="/python-advanced/python-advanced-serialization">Serialization</a>.</p>

@@ -1,0 +1,204 @@
+<p>A test is a small program that runs your code and complains if the answer is wrong. This post covers
+pytest, which is what most projects use, and <code>unittest</code>, which ships with Python and is what
+you will meet in code that had no dependencies to spare.</p>
+
+<h2>The shape of a test</h2>
+
+<pre class="language-python"><code class="language-python">def apply_fee(balance, fee=2.50):
+    if balance &lt; fee:
+        return balance
+    return round(balance - fee, 2)
+
+def test_fee_is_deducted():
+    assert apply_fee(100.00) == 97.50
+
+def test_fee_is_skipped_when_it_cannot_be_covered():
+    assert apply_fee(1.00) == 1.00
+
+test_fee_is_deducted()
+test_fee_is_skipped_when_it_cannot_be_covered()
+print("both passed")     # Output: both passed
+</code></pre>
+
+<p>That is a complete pytest test file. Functions named <code>test_*</code>, a plain
+<code>assert</code>, no base class and no imports. pytest discovers and runs them; the two calls at the
+bottom exist only so this block runs on its own.</p>
+
+<p>Name the test after the behaviour, not the function. <code>test_fee_is_skipped_when_it_cannot_be_covered</code>
+tells you what broke from the failure output alone, which is the entire point of the name.</p>
+
+<h2>Arrange, act, assert</h2>
+
+<pre class="language-python"><code class="language-python">class Account:
+    def __init__(self, balance):
+        self.balance = balance
+
+    def deposit(self, amount):
+        if amount &lt;= 0:
+            raise ValueError("amount must be positive")
+        self.balance += amount
+
+def test_deposit_increases_the_balance():
+    account = Account(100)          # arrange
+    account.deposit(50)             # act
+    assert account.balance == 150   # assert
+
+test_deposit_increases_the_balance()
+print("passed")      # Output: passed
+</code></pre>
+
+<p>Set up the world, do one thing, check one outcome. A test that acts twice is testing two behaviours
+and will not tell you which one broke.</p>
+
+<h2>Running it</h2>
+
+<pre class="language-bash"><code class="language-bash">pip install pytest
+
+pytest                    # everything under the current directory
+pytest -v                 # one line per test
+pytest tests/test_money.py::test_fee_is_deducted     # exactly one
+pytest -x                 # stop at the first failure
+pytest -k "fee"           # only tests whose name matches
+</code></pre>
+
+<p>pytest finds files named <code>test_*.py</code> and functions named <code>test_*</code> inside them.
+Put them in a <code>tests/</code> directory mirroring your package.</p>
+
+<h2>Testing that something raises</h2>
+
+<!-- norun -->
+<pre class="language-python"><code class="language-python">import pytest
+
+from bank.services import deposit
+
+def test_rejects_a_negative_deposit():
+    with pytest.raises(ValueError, match="must be positive"):
+        deposit(100, -5)
+</code></pre>
+
+<p><code>pytest.raises</code> as a context manager reads as "this block must raise". If it does not, the
+test fails — which is the check people forget, leaving a validation rule that silently stopped
+validating.</p>
+
+<p><code>match=</code> is a regex against the message. Use it, or a test for
+<code>ValueError</code> will pass on a <em>different</em> <code>ValueError</code> raised for an entirely
+unrelated reason.</p>
+
+<h2>Parametrising instead of copy-pasting</h2>
+
+<!-- norun -->
+<pre class="language-python"><code class="language-python">import pytest
+
+from bank.models import normalise
+
+@pytest.mark.parametrize("raw,expected", [
+    ("  Alice@Bank.TEST ", "alice@bank.test"),
+    ("BOB@bank.test", "bob@bank.test"),
+    ("carol@bank.test", "carol@bank.test"),
+])
+def test_email_is_normalised(raw, expected):
+    assert normalise(raw) == expected
+</code></pre>
+
+<p>Three test cases, one function. pytest runs it once per row and names each run after its arguments,
+so a failure tells you exactly which input broke — much better than one test with three asserts, where
+the first failure hides the rest.</p>
+
+<h2>Fixtures</h2>
+
+<!-- norun -->
+<pre class="language-python"><code class="language-python">import pytest
+
+@pytest.fixture
+def account():
+    """A fresh account for each test that asks for one."""
+    return {"balance": 100.0}
+
+def test_deposit(account):
+    account["balance"] += 50
+    assert account["balance"] == 150
+
+def test_starts_clean(account):
+    assert account["balance"] == 100
+</code></pre>
+
+<p>A fixture is set-up code you request by naming it as a parameter. It runs fresh for every test that
+asks, which is what keeps tests independent — <code>test_starts_clean</code> passes even though
+<code>test_deposit</code> modified its own copy, and it would pass in any order.</p>
+
+<p>That independence is the property that decides whether a suite stays trustworthy. Tests that share
+state pass in the order you wrote them and fail when someone adds a sixth one in the middle, and the
+resulting hunt is miserable. If a test only passes after another test has run, it is not a test.</p>
+
+<p>The built-in <code>tmp_path</code> fixture gives you a temporary directory, which is how you test
+<a href="/python/python-fileread-write">file handling</a> without touching real data.</p>
+
+<h2>unittest, from the standard library</h2>
+
+<p>The bank app this track draws on uses <code>unittest</code> deliberately — it ships with Python, so
+the suite runs anywhere with no install step:</p>
+
+<!-- from: tests/test_bank.py -->
+<pre class="language-python"><code class="language-python">def test_rounds_half_up_not_half_even(self):
+    self.assertEqual("2.35", str(round_money(Decimal("2.345"))))
+
+def test_rejects_text_that_is_not_a_number(self):
+    with self.assertRaises(ValueError):
+        parse_money("abc")
+</code></pre>
+
+<p>Subclass <code>unittest.TestCase</code>, name methods <code>test_*</code>, and use
+<code>self.assertEqual</code> rather than a bare <code>assert</code>. <code>setUp</code> runs before
+every test. Run it with <code>python3 -m unittest discover -s tests</code>.</p>
+
+<p>Its assertion methods are wordier than pytest's plain <code>assert</code>, and its failure output is
+less helpful. Choose pytest for new work; recognise <code>unittest</code> when you meet it.</p>
+
+<h2>Temporary files, not real ones</h2>
+
+<p>Tests that touch real data are tests you cannot run twice. pytest's <code>tmp_path</code> fixture
+hands you an empty directory that is deleted afterwards:</p>
+
+<!-- norun -->
+<pre class="language-python"><code class="language-python">import csv
+
+def load_accounts(path):
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+def test_reads_a_name_containing_a_comma(tmp_path):
+    file = tmp_path / "accounts.csv"
+    file.write_text(
+        'id,name\n1,"Cooper, Alice"\n',
+        encoding="utf-8",
+    )
+
+    rows = load_accounts(file)
+
+    assert rows[0]["name"] == "Cooper, Alice"
+</code></pre>
+
+<p><code>tmp_path</code> is a <code>Path</code>, fresh per test, so two tests writing
+<code>accounts.csv</code> cannot collide. The same idea without pytest is
+<code>tempfile.TemporaryDirectory()</code>, which is what the bank app's suite uses — it builds an
+entire CSV "database" in a temp directory in <code>setUp</code>, so every test starts from identical
+data and none of them can reach the real files.</p>
+
+<h2>What is worth testing</h2>
+
+<p>Not everything, and chasing a coverage percentage produces tests that assert the code does what the
+code does. Test in this order:</p>
+
+<ul>
+  <li><strong>The rules.</strong> Anything with a <code>raise</code> in it, anything with a threshold, a
+      limit or a "must be". These are what your program is <em>for</em>.</li>
+  <li><strong>The edges.</strong> Zero, empty, negative, one item, the boundary itself. Bugs live
+      here.</li>
+  <li><strong>Every bug you fix.</strong> Write the test that fails first, then fix it. That test is
+      what stops the bug coming back.</li>
+</ul>
+
+<p>Skip getters, skip framework code you did not write, and be suspicious of a test that needs ten lines
+of setup — that is usually the design telling you the function has too many dependencies.</p>
+
+<p>Next: <a href="/python/python-debugging">Debugging</a>.</p>
