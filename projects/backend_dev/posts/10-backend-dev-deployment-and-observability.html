@@ -1,0 +1,225 @@
+<p>Code that only runs on your laptop is not finished. The last stretch — getting it onto a machine
+someone else uses, and being able to tell what it is doing once it is there — is a real part of the
+job, and it is the part self-taught developers most often skip.</p>
+
+<h2>One artifact, many environments</h2>
+
+<p>Build <strong>once</strong>. Deploy that same file everywhere. Change behaviour with
+configuration, never with a rebuild.</p>
+
+<p>If you build a jar per environment, the thing you tested is not the thing you shipped, and the
+difference between them is exactly where the bug will be. So: one artifact, and environment-specific
+values supplied from outside.</p>
+
+<pre class="language-properties"><code class="language-properties"># Activated with -Dspring-boot.run.profiles=local,docker
+#
+# Points the app at the MySQL from docker-compose.yml instead of a MySQL installed on
+# the machine. The only difference is the port: the container publishes 3308, because
+# 3306 already belongs to the local installation.
+#
+# The default in application.properties is left alone on purpose — someone with a
+# native MySQL should keep working without knowing this profile exists.
+spring.datasource.url=jdbc:mysql://127.0.0.1:3308/pizza?useSSL=false&amp;allowPublicKeyRetrieval=true</code></pre>
+
+<p>Note what that profile does <em>not</em> do: it does not restate every setting. It overrides the
+one thing that differs and inherits the rest. A profile that duplicates the whole base file is two
+files that will disagree within a month.</p>
+
+<p>Secrets are the same principle, one level stricter — they come from the environment or a secret
+manager, and never live in a file you commit. That was
+<a href="/backend-dev/backend-dev-auth-and-security">post 7</a>.</p>
+
+<h2>Containers, and what they actually fix</h2>
+
+<p>A container image packages your app <em>and</em> the runtime it needs. What that buys you is not
+magic; it is one specific thing: <strong>the same bytes run in CI, in staging and in production</strong>,
+so "works on my machine" stops being a category of bug.</p>
+
+<p>Two habits worth having from the start:</p>
+
+<ul>
+<li><strong>Run your backing services in containers locally.</strong> A <code>docker-compose.yml</code>
+means a new developer gets a working database in one command instead of an afternoon.</li>
+<li><strong>Give every service a healthcheck</strong>, and understand why. This is the comment on the
+demo app's MySQL container:</li>
+</ul>
+
+<pre class="language-yaml"><code class="language-yaml">healthcheck:
+  # `docker compose up --wait` uses this. Without a healthcheck the container is
+  # "up" the instant the process starts, several seconds before MySQL accepts a
+  # connection — so the app races it and dies on a connection refused.
+  test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+  interval: 5s
+  timeout: 5s
+  retries: 20
+  start_period: 30s</code></pre>
+
+<p><strong>"The process started" is not "the service is ready."</strong> That gap is the source of an
+enormous number of confusing startup failures, in compose files and in Kubernetes alike.</p>
+
+<h2>The pipeline</h2>
+
+<p>Deploying by hand works until the day you are tired. Automate it early, even badly. A minimum
+useful pipeline, triggered on a push:</p>
+
+<ol>
+<li>Check out and compile.</li>
+<li><strong>Run the tests. Stop here if they fail.</strong></li>
+<li>Build the artifact or image, tagged with the commit.</li>
+<li>Deploy to staging.</li>
+<li>Deploy to production — with a human approving, at first.</li>
+</ol>
+
+<p>Tag the artifact with the commit hash, not <code>latest</code>. When something breaks you need to
+know exactly which code is running, and <code>latest</code> cannot tell you. It also makes rollback
+possible: <strong>knowing how to roll back matters more than deploying quickly.</strong> Practise it
+before you need it.</p>
+
+<h2>Migrations during a deploy</h2>
+
+<p>This is where deployment and <a href="/backend-dev/backend-dev-databases">databases</a> collide,
+and it catches people out once.</p>
+
+<p>During a rolling deploy, old and new code run <strong>at the same time</strong> for a minute or
+two. So the schema must be compatible with both. Additive changes are safe. A dropped or renamed
+column breaks every instance still running the old code — which is most of them, at that moment.</p>
+
+<p>Hence the three-step rename from post 6: add the new column, write to both while backfilling,
+drop the old one in a later deploy once nothing reads it. Slower, and it is the difference between a
+deploy and an outage.</p>
+
+<h2>Health checks</h2>
+
+<p>Your platform needs to ask two questions, and they are different:</p>
+
+<ul>
+<li><strong>Liveness</strong> — is this process alive, or should it be killed and restarted?</li>
+<li><strong>Readiness</strong> — can it serve traffic <em>right now</em>? A just-started app that is
+still opening its connection pool is alive but not ready, and sending it traffic produces errors for
+no reason.</li>
+</ul>
+
+<p>In Spring Boot both come from the Actuator dependency, which exposes
+<code>/actuator/health</code> along with separate liveness and readiness probes. Two rules. The
+endpoint must be reachable without authentication, or the load balancer cannot use it —</p>
+
+<pre class="language-java"><code class="language-java">.requestMatchers("/actuator/health")
+.permitAll()</code></pre>
+
+<p>— and the check should be <em>cheap</em>. One that runs a real query on every probe, from every
+instance, every few seconds, becomes its own source of load.</p>
+
+<p>An honest footnote, because it is a mistake worth recognising: that rule is lifted from the demo
+app, and the demo app <strong>does not have the Actuator dependency</strong>. So the path is
+permitted and nothing serves it — the rule is dead, and <code>/actuator/health</code> returns 404.
+Nothing fails at startup to tell you. If you are relying on a health check, curl it after deploying;
+a probe pointed at a URL that does not exist looks exactly like a healthy one that nobody asked
+about, right up until the load balancer starts failing every instance.</p>
+
+<h2>Logs you can actually use at 3am</h2>
+
+<p>Logging is not printing. The difference is whether you can find one request's story in ten million
+lines.</p>
+
+<p><strong>Log at the right level.</strong> <code>ERROR</code> means a human must look.
+<code>WARN</code> means something is wrong but handled. <code>INFO</code> is the significant events
+— a request arrived, an order was placed. <code>DEBUG</code> is for development. If everything is
+<code>ERROR</code>, nothing is.</p>
+
+<p><strong>Log the identifiers, never the secrets.</strong> Order ids, user ids, the path. Never
+passwords, tokens, card numbers or personal data — logs are copied to places with far weaker access
+control than your database, and they are retained for years.</p>
+
+<p><strong>Log the exception object, not its message.</strong> In SLF4J, passing the throwable as the
+last argument gives you the stack trace; string-concatenating <code>ex.getMessage()</code> throws it
+away, and the message alone is rarely enough:</p>
+
+<pre class="language-java"><code class="language-java">log.error("Unhandled exception on {}", request.getRequestURI(), ex);</code></pre>
+
+<p><strong>Give every request an id and put it on every line.</strong> This is the one that turns logs
+from noise into a tool: with a correlation id you can pull the complete story of one failed request
+out of a shared log. SLF4J's <code>MDC</code> holds it as thread-local context so you do not have to
+pass it through every method signature.</p>
+
+<p>Which introduces a trap the demo app handles explicitly. Thread-local context does
+<strong>not</strong> follow work onto another thread — so the moment you use <code>@Async</code> from
+<a href="/backend-dev/backend-dev-caching-async-and-messaging">post 8</a>, your background task logs
+without a correlation id and the trail goes cold. The fix is to copy the context across when the task
+is handed over:</p>
+
+<pre class="language-java"><code class="language-java">class LogTaskDecorator implements TaskDecorator {
+
+    @Override
+    public Runnable decorate(Runnable runnable) {
+        Map&lt;String, String&gt; contextMap = MDC.getCopyOfContextMap();
+        return () -&gt; {
+            try {
+                if (contextMap != null) {
+                    MDC.setContextMap(contextMap);
+                }
+                runnable.run();
+            } finally {
+                MDC.clear();
+            }
+        };
+    }
+}</code></pre>
+
+<p>The <code>MDC.clear()</code> in the <code>finally</code> is not tidiness. Pool threads are reused,
+so a context left behind gets attached to the <em>next</em> unrelated task — and you end up with one
+customer's id on another customer's log lines.</p>
+
+<h2>The three signals</h2>
+
+<table>
+<thead><tr><th>Signal</th><th>Answers</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><strong>Logs</strong></td><td>What happened, in detail, for one request</td><td>Volume</td></tr>
+<tr><td><strong>Metrics</strong></td><td>How often, how fast, how many — aggregated over time</td><td>Cheap</td></tr>
+<tr><td><strong>Traces</strong></td><td>Where the time went across services</td><td>Setup</td></tr>
+</tbody>
+</table>
+
+<p>Start with logs and four metrics: <strong>request rate, error rate, latency</strong> (as
+percentiles — the average hides the problem) <strong>and saturation</strong> (connection pool,
+thread pool, memory). Those four will tell you about most incidents before a customer does.</p>
+
+<p>You do not need a full metrics stack to begin. The demo app's timing aspect writes a
+<code>SLOW</code> line for any service call over 250ms — one class, no infrastructure, and it will
+find your worst endpoint this afternoon.</p>
+
+<h2>Alert on symptoms, not causes</h2>
+
+<p>Alert on things a user would notice: the error rate is up, latency is up, the queue is growing,
+the site is down. Do not alert on CPU at 80% — that might be perfectly healthy, and an alert that
+fires when nothing is wrong teaches everyone to ignore alerts. That is worse than having none,
+because the one that mattered arrives looking identical to the ninety that did not.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Build once, deploy the same artifact everywhere, configure from outside.</li>
+<li>A profile overrides what differs and inherits the rest.</li>
+<li>Containers make CI, staging and production run the same bytes. "Started" is not "ready" — use
+healthchecks.</li>
+<li>Automate the pipeline early; tests gate the deploy; tag with the commit, not
+<code>latest</code>.</li>
+<li>Know how to roll back before you need to.</li>
+<li>Old and new code run together during a deploy — the schema must suit both.</li>
+<li>Liveness and readiness are different questions. Keep the probe cheap and unauthenticated.</li>
+<li>Log identifiers, never secrets. Pass the exception object. Use a correlation id — and copy the
+context onto async threads, then clear it.</li>
+<li>Request rate, error rate, latency percentiles, saturation. Alert on symptoms.</li>
+</ul>
+
+<h2>You have reached the end</h2>
+
+<p>Ten posts: the job, the language, the framework, the API, the database, security, performance,
+tests, and getting it running. That is the shape of backend work. None of it is finished — every one
+of these has a deeper track on this site, and the
+<a href="/backend-dev/backend-dev-get-started">first post</a> lists which to read next.</p>
+
+<p>The useful thing to do now is build something small and take it all the way through: a real
+database, a real API, real tests, deployed somewhere you do not control. One end-to-end project
+teaches more than ten tutorials, because only the deployment step tells you which of your
+assumptions were wrong.</p>

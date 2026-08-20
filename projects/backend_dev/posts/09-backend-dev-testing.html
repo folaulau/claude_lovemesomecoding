@@ -1,0 +1,238 @@
+<p>Tests are not about proving code works today. They are about being able to change code
+<em>tomorrow</em> — code you did not write, in a system you do not fully understand — and knowing
+within thirty seconds whether you broke something.</p>
+
+<p>Without them, every change to an unfamiliar area is a gamble, so people stop making changes, so
+the code rots. That is the actual failure mode, and it is much more expensive than the bugs.</p>
+
+<h2>The three kinds</h2>
+
+<table>
+<thead><tr><th>Kind</th><th>Covers</th><th>Speed</th><th>How many</th></tr></thead>
+<tbody>
+<tr><td><strong>Unit</strong></td><td>One class, dependencies faked</td><td>Milliseconds</td><td>Most</td></tr>
+<tr><td><strong>Integration</strong></td><td>Several parts together, real database</td><td>Seconds</td><td>Fewer, on what matters</td></tr>
+<tr><td><strong>End-to-end</strong></td><td>The whole system through its front door</td><td>Slow, flaky</td><td>A handful</td></tr>
+</tbody>
+</table>
+
+<p>The usual advice is "mostly unit tests". For backend work I would soften that: the bugs that hurt
+live in the seams — the query, the transaction boundary, the security rule — and those are precisely
+what a unit test with everything mocked cannot see. Write plenty of unit tests for logic, and do not
+skimp on integration tests for the seams.</p>
+
+<h2>Start with the code where being wrong costs money</h2>
+
+<p>You cannot test everything, so test the things whose failure you would have to explain. In the
+demo app that is pricing:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Pricing is where the money is, so it gets the most direct tests.
+ *
+ * Every expected figure below is written out by hand from the seeded menu prices — if the
+ * implementation and the test ever agree on a wrong number, it will be because both were
+ * changed deliberately.
+ */
+@SpringBootTest
+@Transactional
+@DisplayName("PricingService")
+class PricingServiceTest {
+
+    @Autowired
+    private PricingService pricingService;
+
+    @Test
+    @DisplayName("prices a plain large pizza with delivery")
+    void pricesSimpleOrder() {
+        // Large Pepperoni = 16.99. Tax 16.99 * 0.085 = 1.44415 -&gt; 1.44. Delivery 3.99.
+        var priced = pricingService.price(requestWith(
+                OrderType.DELIVERY,
+                new OrderCreateDTO.ItemDTO(TestIds.PEPPERONI_PIZZA, SizeName.LARGE, null, null, 1)));
+
+        assertThat(priced.subtotal()).isEqualByComparingTo("16.99");
+        assertThat(priced.tax()).isEqualByComparingTo("1.44");
+        assertThat(priced.deliveryFee()).isEqualByComparingTo("3.99");
+        assertThat(priced.total()).isEqualByComparingTo("22.42");
+    }
+}</code></pre>
+
+<p>Three habits in there worth copying.</p>
+
+<p><strong>The expected values are written out by hand, with the arithmetic in a comment.</strong>
+The alternative — computing the expected value the same way the code does — is a test that passes
+whatever the code does, including when it is wrong.</p>
+
+<p><strong><code>isEqualByComparingTo</code>, not <code>isEqualTo</code>.</strong> For
+<code>BigDecimal</code>, <code>2.50</code> and <code>2.5</code> are equal in value and different in
+scale, so <code>equals</code> returns false. Money comparisons that use the wrong one fail for a
+reason that has nothing to do with the bug you are hunting.</p>
+
+<p><strong><code>@Transactional</code> on the test class</strong> means each test runs in a
+transaction that is rolled back at the end. Tests can write freely and the database is unchanged
+afterwards, so they can run in any order, repeatedly, without a cleanup step anyone can forget.</p>
+
+<h2>Test names should say what is true</h2>
+
+<p>A failing test is a bug report you read at speed. <code>testPricing1</code> tells you nothing;
+<em>"charges no delivery fee for carryout"</em> tells you what broke before you open the file.</p>
+
+<p>The best tests are named after the bug that caused them to exist:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * The regression this class exists for.
+ *
+ * Updating used to clear the sizes and re-add them, which made Hibernate schedule the
+ * INSERTs before the DELETEs in one flush and blow up with
+ * "Duplicate entry '42-SMALL' for key 'uk_product_size'". Every product edit returned a 500.
+ */
+@Test
+@DisplayName("updates prices in place without a unique-constraint violation")
+void updatesPricesInPlace() {
+    ProductDTO created = productService.createProduct(create());
+
+    ProductDTO updated =
+            productService.updateProduct(created.id(), dto(created.name() + " edited", 8.49, 10.49, 12.49));
+
+    assertThat(updated.name()).endsWith(" edited");
+    assertThat(updated.sizes()).hasSize(3);
+    assertThat(updated.sizes())
+            .extracting(s -&gt; s.price().doubleValue())
+            .containsExactlyInAnyOrder(8.49, 10.49, 12.49);
+}</code></pre>
+
+<p><strong>Every bug you fix deserves a test that would have caught it.</strong> That is the single
+highest-value testing habit there is: it turns each production incident into permanent protection,
+and it means the same bug cannot come back quietly during a refactor two years later.</p>
+
+<h2>Testing the API over HTTP</h2>
+
+<p>Service tests do not exercise the routing, the JSON binding, the validation or the status codes.
+Those need a request:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest
+@AutoConfigureMockMvc
+@Transactional
+@DisplayName("Order API")
+class OrderApiIntegrationTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockitoBean
+    private StripeService stripeService;
+
+    @BeforeEach
+    void stubStripe() {
+        Mockito.when(stripeService.isConfigured()).thenReturn(false);
+    }
+
+    @Test
+    @DisplayName("a guest can order without any token")
+    void guestCanOrder() throws Exception {
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(plainLargePepperoni("""
+                                "orderType":"CARRYOUT","customerName":"Guest","guestEmail":"guest@example.com\"""")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.order.status").value("PENDING_PAYMENT"))
+                .andExpect(jsonPath("$.order.subtotal").value(16.99))
+                .andExpect(jsonPath("$.order.total").value(18.43));
+    }
+}</code></pre>
+
+<p><code>MockMvc</code> drives the whole web layer without opening a real socket, so it is fast
+enough to run hundreds of times a day.</p>
+
+<h2>What to mock, and what not to</h2>
+
+<p><code>@MockitoBean</code> above replaces the real Stripe service in the Spring context. That one
+is worth mocking for concrete reasons: tests must not make live network calls — they would be slow,
+need credentials in CI, and leave junk PaymentIntents in a real Stripe account.</p>
+
+<p>The general rule: <strong>mock what you do not own and cannot control</strong> — payment
+providers, email, other teams' services, the clock. <strong>Do not mock your own database.</strong>
+A mocked repository proves your code calls a method you invented; it cannot tell you the query is
+wrong, the constraint fires, or the transaction does not cover what you thought. Those are the bugs
+you were trying to find.</p>
+
+<h2>Test the security rules, not just the happy path</h2>
+
+<p>Access control is a rule about what must <em>not</em> happen, and nothing else in your test suite
+will notice when it stops holding:</p>
+
+<pre class="language-java"><code class="language-java">@Test
+@DisplayName("admin endpoints are closed without a token")
+void adminRequiresToken() throws Exception {
+    mockMvc.perform(get("/api/admin/products")).andExpect(status().isForbidden());
+    mockMvc.perform(get("/api/admin/orders")).andExpect(status().isForbidden());
+    mockMvc.perform(get("/api/admin/reports/dashboard")).andExpect(status().isForbidden());
+}</code></pre>
+
+<p>Remember from <a href="/backend-dev/backend-dev-auth-and-security">post 7</a> that these rules are
+ordered and first match wins. A new rule inserted in the wrong place opens an endpoint silently, and
+this test is the only thing that will tell you.</p>
+
+<h2>Test data that does not rot</h2>
+
+<p>Three approaches, in increasing order of how long they keep working:</p>
+
+<ol>
+<li><strong>Hard-coded ids</strong> — <code>findById(1L)</code>. Breaks the moment the seed data
+changes.</li>
+<li><strong>Build what you need in the test</strong> — verbose, but the test is self-contained and
+says what it depends on.</li>
+<li><strong>Named constants for seeded rows</strong> — a shared vocabulary that survives reseeding.</li>
+</ol>
+
+<p>The demo app does the third, and makes the seeded ids deterministic on purpose:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * The UUIDs of the seeded demo rows.
+ *
+ * Changeset 301-backfill-public-ids derives these deterministically from the numeric id —
+ * &lt;prefix&gt;-0000-4000-8000-&lt;12-digit id&gt; — precisely so tests and frontend mocks have
+ * stable identifiers to reference. Rows created at runtime get random UUIDs instead.
+ */
+public final class TestIds {
+
+    private static UUID of(String prefix, long id) {
+        return UUID.fromString("%s-0000-4000-8000-%012d".formatted(prefix, id));
+    }
+
+    public static UUID product(long id) {
+        return of("aaaaaaaa", id);
+    }
+}</code></pre>
+
+<p>Two more rules that prevent most flaky tests. <strong>Never depend on test execution order</strong>
+— if test B needs test A to have run, they are one test. And <strong>never depend on the real
+clock</strong>; "expires in 30 days" tested against <code>now()</code> will fail on some future
+Tuesday for reasons nobody will enjoy diagnosing.</p>
+
+<h2>Coverage is a diagnostic, not a target</h2>
+
+<p>Coverage tells you which lines ran during the suite. It does not tell you whether anything was
+<em>checked</em> — a test that calls every method and asserts nothing scores 100%.</p>
+
+<p>Low coverage in an important area is a real signal worth acting on. A coverage <em>target</em>
+produces tests written to hit the number: assertion-free tests over getters, and the branch that
+actually matters still untested. Ask "would this test have caught the last bug in this file" rather
+than "is the number high enough".</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Tests exist so you can change unfamiliar code without fear. That is worth more than the bugs
+they catch.</li>
+<li>Test the code whose failure you would have to explain. Money and access control first.</li>
+<li>Write expected values by hand. Never compute them the way the code does.</li>
+<li>Name tests after what is true — best of all, after the bug that caused them.</li>
+<li><code>@Transactional</code> on the test class rolls everything back, so tests stay
+independent.</li>
+<li>Mock what you do not own. Never mock your own database.</li>
+<li>Test the negative cases in security — nothing else notices when a rule stops holding.</li>
+<li>Coverage is a diagnostic, not a target.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-deployment-and-observability">deployment and
+observability</a> — getting it running somewhere real.</p>

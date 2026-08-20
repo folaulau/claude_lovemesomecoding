@@ -1,0 +1,123 @@
+<p>Two structures can have identical Big O and differ by a factor of ten in practice. Big O counts
+operations; it does not know that some operations wait on memory. This post is the part the
+complexity table leaves out.</p>
+
+<h2>Stack and heap</h2>
+
+<p>Java puts your data in two places.</p>
+
+<table>
+<thead><tr><th></th><th>Stack</th><th>Heap</th></tr></thead>
+<tbody>
+<tr><td>Holds</td><td>local variables, parameters, references</td><td>every object and array</td></tr>
+<tr><td>Lifetime</td><td>the method call</td><td>until nothing references it</td></tr>
+<tr><td>Cleaned by</td><td>returning</td><td>the garbage collector</td></tr>
+<tr><td>Size</td><td>small — around 512 KB to 1 MB per thread</td><td>large</td></tr>
+<tr><td>Runs out with</td><td><code>StackOverflowError</code></td><td><code>OutOfMemoryError</code></td></tr>
+</tbody>
+</table>
+
+<pre class="language-java"><code class="language-java">int count = 5;                        // the value 5 lives on the stack
+int[] numbers = new int[1000];        // `numbers` is a reference on the stack;
+                                      // the 1000 ints are on the heap</code></pre>
+
+<p>This is why <a href="/data-structure-algorithm/data-structure-algorithm-recursion">recursion</a>
+has a depth limit and a loop does not: each call keeps a frame on that small stack until it
+returns.</p>
+
+<h2>Contiguous versus scattered</h2>
+
+<p>Here is the fact that the complexity table cannot express.</p>
+
+<p>An <code>int[1_000_000]</code> is <strong>one</strong> block of four million bytes. Element 500
+is immediately after element 499, always.</p>
+
+<p>A linked list of a million integers is a million separate <code>Node</code> objects, allocated
+whenever they were created and sitting wherever the allocator had room. Following the list means
+jumping around the heap.</p>
+
+<p>Both are O(n) to scan. They are not remotely the same speed, and the reason is the cache.</p>
+
+<h2>Cache lines</h2>
+
+<p>Your CPU does not read one byte from RAM. It reads a <strong>cache line</strong> — 64 bytes on
+essentially every current machine — into a cache that is far faster than main memory. Roughly:</p>
+
+<table>
+<thead><tr><th>Reading from</th><th>Costs about</th></tr></thead>
+<tbody>
+<tr><td>L1 cache</td><td>1 ns</td></tr>
+<tr><td>L2 cache</td><td>4 ns</td></tr>
+<tr><td>L3 cache</td><td>15 ns</td></tr>
+<tr><td>Main memory</td><td>80–100 ns</td></tr>
+</tbody>
+</table>
+
+<p>Main memory is on the order of <strong>a hundred times</strong> slower than L1. So the question
+that decides real performance is not how many elements you touch, it is how often you have to go
+out to RAM to get them.</p>
+
+<p>Now put the two layouts against that. An <code>int</code> is 4 bytes, so one 64-byte cache line
+holds <strong>16 consecutive array elements</strong>. Scanning an array, one trip to memory serves
+the next sixteen reads — and the hardware prefetcher, noticing the straight-line access pattern,
+fetches the following lines before you ask.</p>
+
+<p>Walking a linked list, each node is somewhere else. Every step is potentially its own trip to
+main memory, and the prefetcher cannot help because it cannot guess the next address until the
+current node has been read. That is <strong>pointer chasing</strong>, and it is why the array wins
+by a wide margin at the same O(n).</p>
+
+<h2>What a node actually costs</h2>
+
+<p>The other half of the story is size. On a 64-bit JVM with compressed references — the default
+for heaps under 32 GB — a linked list node holding one <code>int</code> costs roughly:</p>
+
+<table>
+<thead><tr><th>Part</th><th>Bytes</th></tr></thead>
+<tbody>
+<tr><td>Object header</td><td>12</td></tr>
+<tr><td>The <code>int</code> value</td><td>4</td></tr>
+<tr><td>The <code>next</code> reference</td><td>4</td></tr>
+<tr><td>Padding to an 8-byte boundary</td><td>4</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>24</strong></td></tr>
+</tbody>
+</table>
+
+<p>Against <strong>4</strong> bytes per element in an <code>int[]</code>. The linked list uses
+about six times the memory to store the same numbers — and worse, it is
+<code>Integer</code> objects rather than <code>int</code>s, because generics cannot hold primitives,
+so each value is itself a separate 16-byte heap object with its own reference to chase.</p>
+
+<p>Six times the memory means six times as many cache lines to hold the same data, which means the
+cache holds a sixth as much of it. The layout penalty compounds.</p>
+
+<pre class="language-java"><code class="language-java">// Contiguous, 4 bytes per element, no boxing.
+int[] values = new int[1000];
+
+// A List cannot hold primitives, so every element is a boxed Integer object:
+// the ArrayList's own array holds 1000 references, and each points at a separate
+// 16-byte object elsewhere on the heap.
+List&lt;Integer&gt; boxed = new ArrayList&lt;&gt;();</code></pre>
+
+<h2>What to do with this</h2>
+
+<ol>
+<li><strong>Prefer arrays and <code>ArrayList</code> by default.</strong> Contiguous layout is
+usually worth more than the theoretical advantage of a linked structure.</li>
+<li><strong>Use primitive arrays in hot loops.</strong> <code>int[]</code> over
+<code>List&lt;Integer&gt;</code> where it matters — you avoid both the boxing and the chasing.</li>
+<li><strong>Size collections up front</strong> when you know roughly how many elements are coming.
+<code>new ArrayList&lt;&gt;(10_000)</code> skips a chain of resize-and-copy.</li>
+<li><strong>Do not conclude that linked lists are useless.</strong> O(1) insertion at a known
+position is real, and it is what makes <code>LinkedHashMap</code>'s eviction order cheap.</li>
+</ol>
+
+<h2>⚠️ And do not over-apply it</h2>
+
+<p>All of the above is a tiebreaker between structures with the same complexity. It never beats
+choosing the right complexity class. A linked list with a hash index will demolish a contiguous
+array that you scan linearly, every time, no matter how cache-friendly the array is —
+<strong>O(1) beats O(n) long before cache behaviour gets a vote.</strong></p>
+
+<p>Get the complexity right first. Which is what
+<a href="/data-structure-algorithm/data-structure-algorithm-big-o-notation">Big O</a> is for.</p>

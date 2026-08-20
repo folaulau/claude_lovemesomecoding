@@ -1,0 +1,260 @@
+<p>A request that takes 40ms feels instant. One that takes 4 seconds feels broken. Three tools close
+that gap, and each has a distinct cost:</p>
+
+<ul>
+<li><strong>Caching</strong> — do not compute it again. Cost: it can be stale.</li>
+<li><strong>Async</strong> — do it, but not while the caller waits. Cost: no result to return.</li>
+<li><strong>Messaging</strong> — hand it to a different process entirely. Cost: real infrastructure,
+and a message can be delivered twice.</li>
+</ul>
+
+<h2>Before any of them: measure</h2>
+
+<p>Most slow endpoints are slow for a boring reason — a missing index, or the
+<a href="/backend-dev/backend-dev-databases">N+1 query</a> from the last post. Caching a query that
+takes 2 seconds because it has no index gives you a fast wrong answer some of the time and a 2-second
+answer the rest.</p>
+
+<p>Find out where the time goes first. The demo app does it with an aspect that times every service
+call and logs the slow ones — forty methods instrumented by one class:</p>
+
+<pre class="language-java"><code class="language-java">@Around("serviceLayer() || reportLayer()")
+public Object time(ProceedingJoinPoint joinPoint) throws Throwable {
+    long start = System.nanoTime();
+    String target = joinPoint.getSignature().toShortString();
+
+    try {
+        return joinPoint.proceed();
+    } catch (Throwable ex) {
+        long millis = (System.nanoTime() - start) / 1_000_000;
+        log.warn("{} failed after {} ms: {}", target, millis, ex.toString());
+        throw ex;   // never swallow it
+    } finally {
+        long millis = (System.nanoTime() - start) / 1_000_000;
+        if (millis &gt;= SLOW_CALL_MILLIS) {
+            log.warn("SLOW {} took {} ms", target, millis);
+        }
+    }
+}</code></pre>
+
+<h2>Caching: what is actually safe to cache</h2>
+
+<p>Something is a good candidate when it is <strong>read far more often than it changes</strong> and
+<strong>identical for everybody</strong>. A menu qualifies: every visitor loads it, it is the same
+for all of them, and it changes only when an administrator edits the catalogue.</p>
+
+<p>A cart does not. Neither does an order. They are per-user and change constantly, and caching them
+would be a correctness bug dressed as an optimisation.</p>
+
+<pre class="language-java"><code class="language-java">@Override
+@Cacheable(value = CacheConfig.MENU_CACHE, keyGenerator = "methodAwareKeyGenerator")
+@Transactional(readOnly = true)
+public List&lt;ProductDTO&gt; getMenu() {
+    return mapper.mapProductsToProductDTOs(productDAO.findActiveMenu());
+}
+
+@Override
+@Caching(
+        evict = {
+            @CacheEvict(value = CacheConfig.MENU_CACHE, allEntries = true),
+            @CacheEvict(value = CacheConfig.MENU_BY_TYPE_CACHE, allEntries = true)
+        })
+@Transactional
+public ProductDTO createProduct(ProductCreateDTO dto) { ... }</code></pre>
+
+<p>Reads populate the cache; every write clears it. That is the simplest invalidation strategy there
+is and it is the right default — evict broadly rather than trying to surgically update one entry.
+Menu edits are rare, so throwing the whole thing away costs nothing.</p>
+
+<h3>The bug this design is avoiding</h3>
+
+<p>Notice the cache names are <code>public static final</code> constants, not strings.</p>
+
+<pre class="language-java"><code class="language-java">/** The active, customer-facing menu. */
+public static final String MENU_CACHE = "menu";
+
+/** The active menu filtered to one product type. */
+public static final String MENU_BY_TYPE_CACHE = "menuByType";</code></pre>
+
+<p><code>@Cacheable</code> and <code>@CacheEvict</code> refer to a cache by name. Spell it differently
+in the two places — reads populate <code>"menu"</code>, writes evict <code>"menus"</code> — and stale
+data is served forever with nothing failing anywhere. Constants make the compiler enforce the
+agreement.</p>
+
+<h3>The gotcha nobody warns you about</h3>
+
+<p>An in-memory cache is <strong>per process</strong>. That is fine on one instance and wrong the
+moment there are two:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * ⚠️ ConcurrentMapCacheManager is a single-JVM cache
+ *
+ * It is an in-memory ConcurrentHashMap: nothing evicts by time, nothing bounds its size,
+ * and each instance has its own copy. That is fine for one process and wrong the moment
+ * there are two — instance A evicts on a write and instance B keeps serving the old menu
+ * until it restarts. A real deployment points spring.cache.type at Redis or Caffeine and
+ * gets a shared cache or a TTL.
+ */</code></pre>
+
+<p>The admin edits the menu, sees the change on instance A, and half the customers keep seeing the
+old menu because the load balancer sent them to instance B. Two fixes: a shared cache (Redis) so
+there is only one copy, or a TTL so every copy is wrong for at most a few seconds. Setting a TTL
+even when you think you do not need one is cheap insurance — it turns "wrong forever" into "wrong
+briefly". See <a href="/spring-boot/spring-boot-cache">Spring Boot – Caching</a> and
+<a href="/aws/aws-elasticache">AWS – Elasticache</a>.</p>
+
+<h2>Async: get the work off the request thread</h2>
+
+<p>Placing an order should not wait for a confirmation email. The email might take two seconds, and
+the mail server might be down — neither has anything to do with whether the order succeeded.</p>
+
+<p>Moving it off the request thread needs a pool to move it <em>to</em>, and the settings matter:</p>
+
+<pre class="language-java"><code class="language-java">@Bean(name = "taskExecutor")
+public ThreadPoolTaskExecutor taskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(25);
+    executor.setMaxPoolSize(150);
+    executor.setQueueCapacity(100);
+    executor.setThreadNamePrefix("Pizza-API-");
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    executor.setAwaitTerminationSeconds(60);
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+    executor.initialize();
+    return executor;
+}</code></pre>
+
+<p>Two of those lines are the ones people leave out and regret.
+<code>waitForTasksToCompleteOnShutdown</code> means a deploy does not kill work in flight.
+<code>CallerRunsPolicy</code> decides what happens when the queue is full: instead of throwing the
+task away, the submitting thread runs it — which slows the caller down and thereby stops new work
+arriving faster than it can be done. Backpressure, in one line.</p>
+
+<h2>The two-annotation combination worth learning</h2>
+
+<p>Here is the confirmation email in the demo app. Read the annotations before the body:</p>
+
+<pre class="language-java"><code class="language-java">@Async
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void sendConfirmation(OrderPlacedEvent event) {
+    try {
+        mailService.sendOrderConfirmation(orderService.getOrderByPublicId(event.orderPublicId()));
+    } catch (Exception ex) {
+        log.error("Confirmation for order {} failed — the order itself is unaffected",
+                  event.orderPublicId(), ex);
+    }
+}</code></pre>
+
+<p>The two annotations do different jobs and you usually need both:</p>
+
+<ul>
+<li><code>AFTER_COMMIT</code> decides <strong>when</strong> — not until the database transaction has
+actually committed.</li>
+<li><code>@Async</code> decides <strong>on which thread</strong> — not the one the customer is waiting
+on.</li>
+</ul>
+
+<p>Get the first one wrong and the bug is nasty precisely because it is rare: a plain listener sends
+the email while the transaction is still open, so a rollback a millisecond later leaves the customer
+holding a confirmation for an order that no longer exists. It works in every test until the one time
+the transaction fails.</p>
+
+<p>The try/catch is also deliberate. An exception escaping an <code>@Async void</code> method is
+invisible to the caller — it goes to an uncaught-exception handler and nowhere near the customer,
+who has already been told the order succeeded. Which it did. <strong>A failed confirmation email is
+not a failed order</strong>, and the method has to behave that way.</p>
+
+<h2>Events: decoupling inside one process</h2>
+
+<p>Without events, the method that creates an order ends with a growing list of calls — the kitchen
+service, the email service, the analytics service. Each is a new dependency injected into a class
+whose job is to create an order, and each is a new way for an unrelated failure to break checkout.</p>
+
+<p>Publishing one event inverts that. The order code announces what happened and stops caring who
+listens:</p>
+
+<pre class="language-java"><code class="language-java">events.publishEvent(OrderPlacedEvent.from(saved));</code></pre>
+
+<p>One rule about the event itself: <strong>carry values, not entities.</strong></p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Carry values, not entities. This record holds the id and the totals rather than the
+ * CustomerOrder itself. An async listener runs on a different thread, after the transaction
+ * and its persistence context have closed, so touching a lazy association on a detached
+ * entity there throws LazyInitializationException.
+ */
+public record OrderPlacedEvent(
+        UUID orderPublicId, String contactEmail, BigDecimal total, OrderType orderType) {}</code></pre>
+
+<h2>Messaging: decoupling between processes</h2>
+
+<p>An event dies with the process. A message on a broker — ActiveMQ, RabbitMQ, Kafka,
+<a href="/aws/aws-sqs">SQS</a> — survives it, and can be consumed by an application written by
+another team in another language.</p>
+
+<p>Reach for a queue when work must outlive the request, when the consumer is a different service, or
+when you need to absorb a spike by letting a backlog form instead of falling over.</p>
+
+<p>Two pieces of infrastructure that beginners skip and then need:</p>
+
+<ul>
+<li><strong>A dead-letter queue.</strong> Without somewhere for poison messages to go, a message that
+always fails is redelivered forever: it blocks the queue, burns CPU, fills the log, and hides the
+real bug behind the noise.</li>
+<li><strong>An explicit wire format.</strong> Out of the box JMS moves a String,
+<code>byte[]</code>, <code>Serializable</code> or <code>Map</code>. Push a domain object through
+that and you either get a failure or you drag Java serialisation into your wire format, which
+couples both ends of the queue to your class files. Configure a JSON converter instead: the contract
+stays readable and the consumer can be written in something other than Java.</li>
+</ul>
+
+<p>And publish <em>after</em> the commit, for the same reason as the email — a consumer that reads
+the order from the database before the insert is visible will act on an order that a rollback is
+about to erase. <strong>Message brokers have no idea your transaction exists.</strong></p>
+
+<h2>Retries, and the thing they will do to you</h2>
+
+<p>Anything crossing the network fails sometimes, so you retry. Two rules make retries safe rather
+than dangerous.</p>
+
+<p><strong>Back off.</strong> Retrying immediately, from every instance at once, is how a struggling
+service is turned into a dead one. Wait 1s, then 2s, then 4s, with a little randomness so the
+retries do not all land together.</p>
+
+<p><strong>Make the operation idempotent, or do not retry it.</strong> This is the important one. A
+timeout does not tell you whether the other side acted — it may have charged the card and lost the
+response. Retrying blindly charges twice. The fix is an idempotency key: the caller generates a
+unique id per attempt, you record it, and a second request with the same key returns the first
+result instead of doing the work again. Every payment provider works this way, and it is worth
+copying for any operation with a real-world effect.</p>
+
+<p>Finally, decide what happens when a background task fails permanently. The demo app's answer is
+explicit and worth stealing:</p>
+
+<pre class="language-java"><code class="language-java">} catch (Exception ex) {
+    // The order is already committed and paid for. A broker outage must not turn that into
+    // a customer-visible failure, so this is logged and swallowed — the same call the
+    // confirmation email makes.
+    log.error("Could not publish order {} — the order is unaffected", message.orderId(), ex);
+}</code></pre>
+
+<p>Swallowing an exception is normally a mistake. Here it is a decision, and the comment says which
+one. That is the difference.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Measure before optimising. Most slow endpoints are a missing index or an N+1.</li>
+<li>Cache what is read often, changes rarely and is the same for everyone. Never per-user state.</li>
+<li>Name caches with constants; evict broadly on write.</li>
+<li>An in-memory cache is per process. Two instances means two answers — use Redis or a TTL.</li>
+<li><code>AFTER_COMMIT</code> decides when; <code>@Async</code> decides on which thread. You usually
+need both.</li>
+<li>Events carry values, never entities.</li>
+<li>A queue when work must outlive the request or cross a service boundary. Give it a dead-letter
+queue and a JSON contract.</li>
+<li>Retries need backoff and idempotency. A timeout does not mean it did not happen.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-testing">testing</a> — how you change code you did not
+write without being afraid.</p>

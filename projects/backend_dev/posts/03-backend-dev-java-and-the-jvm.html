@@ -1,0 +1,213 @@
+<p>You do not need all of Java before you start a framework. You do need a specific subset — and it
+is not the subset a beginner course covers, because a beginner course optimises for "you can write a
+program" and backend work optimises for "you can change someone else's program without breaking
+it".</p>
+
+<p>This post is that subset, and the handful of JVM facts that explain the bugs you will actually
+hit.</p>
+
+<h2>What you can skip for now</h2>
+
+<p>Swing. Applets. Manual thread creation. The <code>Date</code> and <code>Calendar</code> classes —
+they are still in the language and every one of their replacements is better. Serialization.
+Reflection, until the day you need it, which may be never.</p>
+
+<p>Do not skip: collections, <code>equals</code>/<code>hashCode</code>, exceptions, generics,
+interfaces, and enough concurrency to know why your code is not single-threaded.</p>
+
+<h2>Collections — and which one to reach for</h2>
+
+<p>You will use these every hour. The interface is the type you declare; the class is what you
+<code>new</code>.</p>
+
+<table>
+<thead><tr><th>You want</th><th>Use</th><th>Cost of lookup</th></tr></thead>
+<tbody>
+<tr><td>An ordered list, mostly read by index or iterated</td><td><code>ArrayList</code></td><td>O(1) by index, O(n) by value</td></tr>
+<tr><td>To ask "have I seen this?"</td><td><code>HashSet</code></td><td>O(1)</td></tr>
+<tr><td>To look something up by a key</td><td><code>HashMap</code></td><td>O(1)</td></tr>
+<tr><td>Keys kept sorted</td><td><code>TreeMap</code></td><td>O(log n)</td></tr>
+<tr><td>Insertion order preserved in a map</td><td><code>LinkedHashMap</code></td><td>O(1)</td></tr>
+<tr><td>A map several threads write to</td><td><code>ConcurrentHashMap</code></td><td>O(1), and safe</td></tr>
+</tbody>
+</table>
+
+<p>The one that matters most: <strong>if you find yourself looping over a list to find a matching
+element, you probably wanted a map.</strong> That loop is O(n) and it is inside another loop more
+often than you would like. The demo app does this deliberately when pricing an order — it loads
+every topping the order mentions in one query and puts them in a <code>Map</code>, rather than
+querying per line:</p>
+
+<pre class="language-java"><code class="language-java">// Load every topping the order mentions in ONE query rather than one per line.
+Map&lt;UUID, Topping&gt; toppingsByPublicId = loadToppings(dto);</code></pre>
+
+<p>That single line is the difference between one database round trip and twenty. For why the costs
+in that table are what they are, the
+<a href="/data-structure-algorithm/data-structure-algorithm-get-started">Data Structures &amp;
+Algorithms</a> track goes underneath them.</p>
+
+<h2>equals and hashCode — the pair that breaks things quietly</h2>
+
+<p>Two rules, and the second is the one people miss:</p>
+
+<ol>
+<li>If two objects are <code>equals</code>, they <strong>must</strong> return the same
+<code>hashCode</code>.</li>
+<li>If you override one, override the other.</li>
+</ol>
+
+<p>Break rule 1 and a <code>HashMap</code> stops working — you put an object in, you look it up with
+an equal object, and it is not there. Nothing throws. The entry is simply in a different bucket
+forever.</p>
+
+<p>In backend code this shows up in a specific place: <strong>entity classes</strong>. Lombok's
+<code>@Data</code> generates <code>equals</code>, <code>hashCode</code> and <code>toString</code>
+across every field — including the collection of children. On a JPA entity that is a bug in three
+directions at once:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Sizes are owned by the product: saving a product saves its sizes, and removing a size
+ * from this list deletes the row (that is what orphanRemoval does).
+ *
+ * Excluded from equals/hashCode/toString. @Data would otherwise walk the collection —
+ * forcing a lazy load on every toString, and recursing forever through the child's
+ * parent reference. This is the single most common way @Data and JPA go wrong together.
+ */
+@ToString.Exclude
+@EqualsAndHashCode.Exclude
+@Builder.Default
+@OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+@OrderBy("price ASC")
+private List&lt;ProductSize&gt; sizes = new ArrayList&lt;&gt;();</code></pre>
+
+<p>Two exclusion annotations, and they prevent an infinite recursion, a surprise database query on
+every log line, and a hash code that changes as the collection loads. Read the comment, not just the
+code — that is what a real codebase looks like.</p>
+
+<h2>null, and Optional</h2>
+
+<p><code>NullPointerException</code> is the most common runtime failure in Java. Most of it comes
+from one habit: returning <code>null</code> to mean "nothing found", and the caller forgetting.</p>
+
+<p><code>Optional&lt;T&gt;</code> makes "there might be nothing" part of the type, so the compiler
+makes you deal with it:</p>
+
+<pre class="language-java"><code class="language-java">/** Convenience for pricing: the price for one size, if this product is sold in it. */
+public Optional&lt;BigDecimal&gt; priceFor(SizeName size) {
+    return sizes.stream()
+            .filter(s -&gt; s.getSize() == size)
+            .map(ProductSize::getPrice)
+            .findFirst();
+}</code></pre>
+
+<p>And at the call site, the "nothing found" branch cannot be skipped:</p>
+
+<pre class="language-java"><code class="language-java">BigDecimal basePrice = product.priceFor(line.size())
+        .orElseThrow(() -&gt; ApiException.badRequest(
+                product.getName() + " is not sold in size " + line.size()));</code></pre>
+
+<p>Use <code>Optional</code> as a <strong>return type</strong> for a lookup that may find nothing.
+Do not use it for fields or method parameters — that is not what it is for, and it makes everything
+noisier for no benefit. Never call <code>.get()</code> without checking first; that is the same bug
+you started with, wearing a hat.</p>
+
+<h2>Streams — and when not to</h2>
+
+<p>A stream expresses "for each of these, do this, keep those, collect the rest" without an index
+variable. Use it when it makes the intent clearer:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;UUID&gt; before = created.sizes().stream()
+        .map(s -&gt; s.id())
+        .sorted()
+        .toList();</code></pre>
+
+<p>Do not use it when the loop was already clear, and do not chain six operations because you can —
+a stack trace from a deeply nested stream is genuinely worse to read than one from a
+<code>for</code> loop. And never do database work inside one: a <code>.map()</code> that runs a
+query is N+1 in disguise, which is <a href="/backend-dev/backend-dev-databases">post 6</a>.</p>
+
+<h2>Exceptions that mean something</h2>
+
+<p>Two kinds. <strong>Checked</strong> exceptions must be declared or caught; <strong>unchecked</strong>
+ones (anything extending <code>RuntimeException</code>) need not be. Backend code overwhelmingly uses
+unchecked, because an error six layers down is almost never recoverable at layer five — it needs to
+travel to the top and become an HTTP response.</p>
+
+<p>The pattern worth copying: <strong>one application exception that carries its own status and
+message</strong>, with static factories so the call sites read like sentences.</p>
+
+<pre class="language-java"><code class="language-java">public class ApiException extends RuntimeException {
+
+    private ApiError error;
+
+    /** 400 — the request is well-formed but semantically wrong. */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, message);
+    }
+
+    /** 404 — no such row. */
+    public static ApiException notFound(String what, Object id) {
+        return new ApiException(HttpStatus.NOT_FOUND, what + " " + id + " was not found");
+    }
+}</code></pre>
+
+<p>Then <code>throw ApiException.notFound("Product", id)</code> reads as what it is. Two rules:
+never catch an exception and do nothing with it, and never put a stack trace in an HTTP response —
+it belongs in the log, where it tells you something and not an attacker.</p>
+
+<h2>Records</h2>
+
+<p>A record is an immutable data carrier: give it components, get a constructor,
+accessors, <code>equals</code>, <code>hashCode</code> and <code>toString</code> for free. Backend
+code is full of things that should be records — request bodies, response bodies, events,
+configuration, the result of a calculation.</p>
+
+<pre class="language-java"><code class="language-java">public record OrderPlacedEvent(
+        UUID orderPublicId, String contactEmail, BigDecimal total, OrderType orderType) {}</code></pre>
+
+<p>Immutability is the point, not the brevity. A value that cannot change after construction cannot
+be changed by another thread while you are reading it, and cannot be modified by a method you
+handed it to. That eliminates an entire class of bug for free.</p>
+
+<h2>The JVM facts that explain your production bugs</h2>
+
+<p>You do not need to know how the garbage collector works. You do need these five.</p>
+
+<ul>
+<li><strong>Your app is multi-threaded whether you wrote threads or not.</strong> The server runs
+each request on a thread from a pool. Any field on a shared object — a <code>@Service</code> bean,
+a static — is touched by all of them at once.</li>
+<li><strong>Therefore: keep beans stateless.</strong> Mutable state on a singleton service is the
+most common source of "it works locally, it corrupts data in production". Locally there is one user.</li>
+<li><strong>The heap is finite.</strong> Loading a whole table into a <code>List</code> works on the
+2,000 rows in dev and takes the process down on the 20 million in production. Paginate, stream, or
+aggregate in the database.</li>
+<li><strong>Blocking a thread costs a thread.</strong> While a request waits on a slow query or a
+third-party HTTP call, its thread is parked and unavailable. Enough of those at once and the pool is
+exhausted — your app is "down" while using almost no CPU. This is what
+<a href="/java-8/java-21-virtual-threads">virtual threads</a> in Java 21 are for.</li>
+<li><strong><code>BigDecimal</code> for money, always.</strong> <code>double</code> cannot represent
+0.1 exactly, so <code>0.1 + 0.2</code> is not <code>0.3</code>. Every price and total in the demo app
+is a <code>BigDecimal</code>, and every comparison uses
+<code>isEqualByComparingTo</code> rather than <code>equals</code> — because
+<code>2.50</code> and <code>2.5</code> are equal in value and different in scale.</li>
+</ul>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Collections, <code>equals</code>/<code>hashCode</code>, exceptions, generics — that is the core.
+Skip the rest until you need it.</li>
+<li>Looping to find a match usually means you wanted a <code>Map</code>.</li>
+<li>Override <code>equals</code> and <code>hashCode</code> together, and never over a lazy
+collection on an entity.</li>
+<li><code>Optional</code> as a return type for lookups. Never <code>.get()</code> unchecked.</li>
+<li>One unchecked application exception carrying its own status beats exceptions scattered
+everywhere.</li>
+<li>Records for anything that is a value. Immutable is thread-safe for free.</li>
+<li>Your beans are shared across threads — keep them stateless. Money is
+<code>BigDecimal</code>.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-what-to-learn-in-a-framework">what to learn in a
+framework</a> — the small part of a large thing that you use every day.</p>

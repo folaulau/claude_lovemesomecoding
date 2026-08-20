@@ -1,0 +1,245 @@
+<p>Your API is the only part of your work other people touch. They cannot see your class names or
+your clever refactor; they see URLs, JSON and status codes. Get that surface right and everything
+behind it can be rewritten. Get it wrong and you are stuck with it, because other people's code now
+depends on the mistake.</p>
+
+<h2>HTTP, in five minutes</h2>
+
+<p>A request is a method, a path, some headers and maybe a body. A response is a status code, some
+headers and maybe a body. That is all of it.</p>
+
+<p>The methods you will use, and the two properties that decide which one to pick:</p>
+
+<table>
+<thead><tr><th>Method</th><th>Means</th><th>Safe</th><th>Idempotent</th></tr></thead>
+<tbody>
+<tr><td><code>GET</code></td><td>Read something</td><td>Yes</td><td>Yes</td></tr>
+<tr><td><code>POST</code></td><td>Create something, or "do a thing"</td><td>No</td><td><strong>No</strong></td></tr>
+<tr><td><code>PUT</code></td><td>Replace something entirely</td><td>No</td><td>Yes</td></tr>
+<tr><td><code>PATCH</code></td><td>Change part of something</td><td>No</td><td>Usually</td></tr>
+<tr><td><code>DELETE</code></td><td>Remove something</td><td>No</td><td>Yes</td></tr>
+</tbody>
+</table>
+
+<p><strong>Safe</strong> means it changes nothing — a crawler, a browser prefetch or a monitoring
+tool may call it whenever it likes. Putting a state change behind a <code>GET</code> is how a link
+preview deletes a record.</p>
+
+<p><strong>Idempotent</strong> means doing it twice has the same effect as doing it once. This is not
+trivia: networks fail after the server has acted but before the response arrives, so clients retry.
+A retried <code>PUT</code> is harmless. A retried <code>POST /api/orders</code> is a second pizza.
+Handling that is <a href="/backend-dev/backend-dev-caching-async-and-messaging">post 8</a>.</p>
+
+<h2>Status codes worth knowing</h2>
+
+<table>
+<thead><tr><th>Code</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><td><strong>200</strong> OK</td><td>It worked and there is a body</td></tr>
+<tr><td><strong>201</strong> Created</td><td>A <code>POST</code> created something</td></tr>
+<tr><td><strong>204</strong> No Content</td><td>It worked and there is nothing to return — a delete</td></tr>
+<tr><td><strong>400</strong> Bad Request</td><td>The caller sent something wrong</td></tr>
+<tr><td><strong>401</strong> Unauthorized</td><td>We do not know who you are (it means <em>unauthenticated</em>)</td></tr>
+<tr><td><strong>403</strong> Forbidden</td><td>We know who you are and you may not do this</td></tr>
+<tr><td><strong>404</strong> Not Found</td><td>No such thing</td></tr>
+<tr><td><strong>409</strong> Conflict</td><td>It clashes with current state — duplicate name, stale version</td></tr>
+<tr><td><strong>422</strong> Unprocessable</td><td>Well-formed but semantically invalid (400 is fine too; be consistent)</td></tr>
+<tr><td><strong>500</strong> Server Error</td><td><strong>We</strong> broke</td></tr>
+</tbody>
+</table>
+
+<p>The line that matters most: <strong>4xx is the caller's fault, 5xx is yours.</strong> Returning
+500 for bad input is not a cosmetic error — it pages someone, it pollutes your error rate, and it
+tells the caller to retry something that will never succeed.</p>
+
+<h2>Designing the URLs</h2>
+
+<p>Paths name <strong>things</strong>; the method says what you are doing to them. So
+<code>DELETE /api/products/{id}</code>, never <code>POST /api/deleteProduct</code>.</p>
+
+<pre class="language-java"><code class="language-java">@Tag(name = "Admin · Products", description = "Menu management (ADMIN only)")
+@RequestMapping("/api/admin/products")
+@RestController
+@SecurityRequirement(name = "bearerAuth")
+class AdminProductRestController {
+
+    @PostMapping
+    public ResponseEntity&lt;ProductDTO&gt; createProduct(@Valid @RequestBody ProductCreateDTO dto) {
+        return new ResponseEntity&lt;&gt;(productService.createProduct(dto), CREATED);
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity&lt;ProductDTO&gt; updateProduct(@PathVariable UUID id,
+                                                    @Valid @RequestBody ProductCreateDTO dto) {
+        return new ResponseEntity&lt;&gt;(productService.updateProduct(id, dto), OK);
+    }
+
+    @PatchMapping("/{id}/deactivate")
+    public ResponseEntity&lt;Void&gt; deactivateProduct(@PathVariable UUID id) {
+        productService.deactivateProduct(id);
+        return ResponseEntity.noContent().build();
+    }
+}</code></pre>
+
+<p>Three decisions in there worth stealing:</p>
+
+<ul>
+<li><strong>Admin endpoints live under their own prefix.</strong> That lets the security rules be one
+<code>/api/admin/**</code> matcher instead of a per-method annotation somebody will forget on the
+next controller.</li>
+<li><strong>The id in the path is a UUID, not the numeric primary key.</strong> Sequential ids let
+anyone walk <code>/1</code>, <code>/2</code>, <code>/3</code> and count your customers. The demo app's
+entities carry both: a <code>BIGINT</code> key that never leaves the server, and a public UUID.</li>
+<li><strong>"Deactivate" is a <code>PATCH</code> to a sub-path</strong>, not a <code>PUT</code> of
+the whole object with one field flipped. State transitions deserve their own endpoint.</li>
+</ul>
+
+<h2>DTOs — do not return your entities</h2>
+
+<p>It is tempting to return the database entity straight from the controller. Do not. Three reasons,
+all of which you will otherwise learn the hard way:</p>
+
+<ol>
+<li><strong>You leak fields.</strong> The password hash, the internal id, the soft-delete flag. It
+only takes one new column on the entity to expose something.</li>
+<li><strong>Every rename becomes a breaking API change.</strong> Your database schema and your public
+contract now change together forever.</li>
+<li><strong>Mass assignment.</strong> If the same class binds the request, a caller can set fields
+you never meant them to — like their own role, or an id.</li>
+</ol>
+
+<p>So there are two classes, and the split is deliberate:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Admin payload for creating or updating a product.
+ *
+ * Separate from ProductDTO on purpose. The response carries an id; the request must not
+ * let a client choose one. Reusing one class for both directions is how mass-assignment
+ * bugs get in.
+ */
+public record ProductCreateDTO(
+        @NotBlank @Size(max = 120) String name,
+        @Size(max = 500) String description,
+        @NotNull ProductType type,
+        @Size(max = 500) String imageUrl,
+        Boolean active,
+        Integer displayOrder,
+        @NotEmpty(message = "A product needs at least one size") @Valid List&lt;SizeDTO&gt; sizes) {
+
+    public record SizeDTO(
+            @NotNull SizeName size,
+            @NotNull @DecimalMin(value = "0.0", inclusive = false, message = "Price must be positive")
+                    BigDecimal price) {}
+}</code></pre>
+
+<h2>Validate at the edge</h2>
+
+<p>Notice that the rules live on the DTO as annotations, and the controller only writes
+<code>@Valid</code>. The framework checks them before your method runs, so by the time you have an
+object it is already known to be well-formed. Every one of those constraints is a
+<code>if (x == null) throw ...</code> you did not have to write, in a place nobody can bypass.</p>
+
+<p><code>@Valid</code> on the nested list matters too — without it the outer object is checked and the
+<code>SizeDTO</code>s inside it are not, so a price of <code>-5.00</code> sails through.</p>
+
+<p>Validate <strong>shape</strong> here — required, length, range, format. Validate
+<strong>meaning</strong> in the service, where you can see the database: "this product name is
+already taken" is not something an annotation can know.</p>
+
+<h2>One error shape for the whole API</h2>
+
+<p>Every failure should look the same, so the client has one error path instead of guessing at
+whatever each layer happens to produce. Define an envelope once:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "message": "Validation failed",
+  "path": "/api/admin/products",
+  "timestamp": "2026-08-08T11:04:22.117",
+  "statusCode": 400,
+  "error": "Bad Request",
+  "errors": [
+    { "field": "name",     "message": "must not be blank" },
+    { "field": "sizes[0].price", "message": "Price must be positive" }
+  ]
+}</code></pre>
+
+<p>...and fill it in one place, with a handler that applies to every controller:</p>
+
+<pre class="language-java"><code class="language-java">@RestControllerAdvice
+@Slf4j
+public class RestExceptionHandler {
+
+    /** Raised by @Valid when a request body fails bean validation. */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity&lt;ApiError&gt; handleValidation(MethodArgumentNotValidException ex,
+                                                     HttpServletRequest request) {
+        ApiError error = new ApiError(HttpStatus.BAD_REQUEST, "Validation failed", request.getRequestURI());
+
+        for (FieldError fieldError : ex.getBindingResult().getFieldErrors()) {
+            error.addValidationError(fieldError.getField(), fieldError.getDefaultMessage());
+        }
+        return ResponseEntity.badRequest().body(error);
+    }
+
+    /** Catch-all. Logs the real cause but never leaks a stack trace to the client. */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity&lt;ApiError&gt; handleUnexpected(Exception ex, HttpServletRequest request) {
+        log.error("Unhandled exception on {}", request.getRequestURI(), ex);
+        ApiError error = new ApiError(HttpStatus.INTERNAL_SERVER_ERROR,
+                "Something went wrong on our end", request.getRequestURI());
+        return ResponseEntity.status(error.getStatus()).body(error);
+    }
+}</code></pre>
+
+<p>Two rules the catch-all is enforcing. <strong>Log the detail, return the summary</strong> — a
+stack trace in a response body tells an attacker your framework versions and your package layout.
+And <strong>the catch-all must be the last resort, not the common path</strong>: the demo app adds
+explicit handlers for an unparseable body and a bad path variable precisely because both used to
+fall through to here and become a 500, which said "the server is broken" when the truth was "your
+UUID has a typo in it".</p>
+
+<h2>Pagination</h2>
+
+<p>Any endpoint that returns a list will one day return a large one. Decide early — retrofitting
+pagination is a breaking change, because the response shape has to grow a wrapper.</p>
+
+<p><code>GET /api/orders?page=0&amp;size=20&amp;sort=createdAt,desc</code> is the conventional form and
+Spring Data understands it directly: accept a <code>Pageable</code> parameter and return a
+<code>Page</code>. Offset paging gets slow at very high page numbers and can skip or repeat rows if
+the data changes underneath you; when that starts to matter, switch to keyset paging
+("everything after this id"). Not before.</p>
+
+<h2>Versioning</h2>
+
+<p>You will need to make a breaking change eventually. Plan the escape hatch now — the common
+approach is a path prefix, <code>/api/v1/...</code>, with v1 kept alive while clients move.</p>
+
+<p>Most changes need not break anything. <strong>Adding</strong> a field is safe if clients ignore
+unknown ones. <strong>Removing</strong> or <strong>renaming</strong> a field, changing a type, or
+making an optional field required all break someone. That asymmetry is worth internalising: it is
+usually cheaper to add a new field than to fix an existing one.</p>
+
+<h2>Document it — and let the code do it</h2>
+
+<p>Hand-written API docs go stale within a month. Generate them from the code instead. The demo app
+uses springdoc, which reads the controllers and produces an OpenAPI document plus a browsable UI at
+<code>/swagger-ui.html</code>; the <code>@Tag</code> and <code>@Operation</code> annotations in the
+snippets above are what fill in the descriptions. Details in
+<a href="/spring-boot/spring-boot-with-swagger">Spring Boot – API Docs with springdoc-openapi</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Paths name things; the method says what you are doing. <code>GET</code> never changes anything.</li>
+<li>Idempotency is a real design constraint — clients retry, and networks fail after the server
+acted.</li>
+<li>4xx is their fault, 5xx is yours. Never return 500 for bad input.</li>
+<li>Never expose the numeric primary key. Never return entities — use DTOs, and separate the request
+DTO from the response DTO.</li>
+<li>Validate shape at the edge with annotations, meaning in the service.</li>
+<li>One error envelope, filled in one place. Log the stack trace, return a sentence.</li>
+<li>Decide pagination and versioning before you need them; both are breaking changes to add.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-databases">databases</a> — the part that bites hardest and
+gets taught least.</p>

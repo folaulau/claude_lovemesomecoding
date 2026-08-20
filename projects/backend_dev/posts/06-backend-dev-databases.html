@@ -1,0 +1,255 @@
+<p>This is the part of backend work that bites hardest and gets taught least. Frameworks change
+every few years; a badly shaped table is still there a decade later, with three services and a
+reporting pipeline reading it.</p>
+
+<p>Start relational — PostgreSQL or MySQL. "NoSQL because it scales" is a decision to make when you
+have a scaling problem and know its shape, not on day one.</p>
+
+<h2>Model the data before you write the feature</h2>
+
+<p>Ask three questions of every table: what is one row, what makes it unique, and what happens to
+its children when it is deleted. Get those wrong and you spend the next year working around it.</p>
+
+<p>A worked example — the demo app's menu. A product is sold in three sizes at three prices, so
+<em>price does not belong on the product</em>:</p>
+
+<pre class="language-sql"><code class="language-sql">--changeset pizza:001-create-product
+--comment Pizzas and drinks share one table, separated by `type`
+CREATE TABLE product (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name          VARCHAR(120) NOT NULL,
+    description   VARCHAR(500),
+    type          VARCHAR(20)  NOT NULL COMMENT 'PIZZA or DRINK',
+    image_url     VARCHAR(500),
+    active        BOOLEAN      NOT NULL DEFAULT TRUE,
+    display_order INT          NOT NULL DEFAULT 0,
+    created_at    DATETIME(6)  NOT NULL,
+    CONSTRAINT uk_product_name UNIQUE (name)
+);
+CREATE INDEX idx_product_type_active ON product (type, active);
+
+--changeset pizza:002-create-product-size
+--comment One price per size. A drink uses the same sizes, which keeps pricing uniform.
+CREATE TABLE product_size (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    product_id BIGINT         NOT NULL,
+    size       VARCHAR(20)    NOT NULL COMMENT 'SMALL, MEDIUM or LARGE',
+    price      DECIMAL(10, 2) NOT NULL,
+    CONSTRAINT fk_product_size_product FOREIGN KEY (product_id) REFERENCES product (id) ON DELETE CASCADE,
+    CONSTRAINT uk_product_size UNIQUE (product_id, size)
+);</code></pre>
+
+<p>Four things in there are doing real work:</p>
+
+<ul>
+<li><code>NOT NULL</code> on everything that must exist. A nullable column is a promise that your
+code will handle the null, and it will not.</li>
+<li><code>UNIQUE (product_id, size)</code> — the database enforces "one price per size per product".
+Application code cannot enforce this reliably, because two concurrent requests can both check and
+both insert.</li>
+<li><code>FOREIGN KEY ... ON DELETE CASCADE</code> — sizes cannot outlive their product, and cannot
+point at a product that never existed.</li>
+<li><code>DECIMAL(10,2)</code> for money. Never <code>FLOAT</code> or <code>DOUBLE</code>; they
+cannot represent 0.10 exactly and your totals will drift by cents.</li>
+</ul>
+
+<p><strong>Constraints are not paperwork.</strong> They are the last line of defence, and the only
+one that holds when two requests race, when someone runs a script by hand, or when the next
+developer forgets your rule.</p>
+
+<h2>Two ids, on purpose</h2>
+
+<p>The demo app's tables carry a numeric primary key <em>and</em> a public UUID:</p>
+
+<pre class="language-java"><code class="language-java">@Id
+@GeneratedValue(strategy = GenerationType.IDENTITY)
+@Column(name = "id", nullable = false, updatable = false, unique = true)
+private Long id;
+
+/**
+ * @JdbcTypeCode(SqlTypes.CHAR) is load-bearing: without it Hibernate stores a
+ * java.util.UUID as BINARY(16), which would not match the CHAR(36) column and
+ * ddl-auto=validate would refuse to start.
+ */
+@JdbcTypeCode(SqlTypes.CHAR)
+@Column(name = "public_id", nullable = false, updatable = false, unique = true, length = 36)
+private UUID publicId;</code></pre>
+
+<p><code>id</code> is compact, sequential, and the target of every foreign key — it never leaves the
+server. <code>publicId</code> is what the API exposes, because sequential ids are enumerable. You
+get the storage efficiency of an integer key and the opacity of a UUID, and the unique index makes
+looking up by <code>publicId</code> as cheap as a primary-key lookup.</p>
+
+<h2>Indexes — the 2ms versus 2s decision</h2>
+
+<p>Without an index the database reads every row to find yours. That is fine on 200 rows and fatal
+on 2 million, which is exactly why the problem never appears in development.</p>
+
+<p>The rules:</p>
+
+<ul>
+<li><strong>Index what you filter, join and sort on.</strong> Look at the <code>WHERE</code>
+clauses your app actually issues.</li>
+<li><strong>Column order matters in a composite index.</strong> An index on
+<code>(type, active)</code> serves <code>WHERE type = ?</code> and
+<code>WHERE type = ? AND active = ?</code> — but not <code>WHERE active = ?</code> alone. Leftmost
+prefix.</li>
+<li><strong>Every index costs writes.</strong> Each insert updates each index. Do not index
+everything.</li>
+<li><strong>Measure with <code>EXPLAIN</code>.</strong> It tells you whether your index was used
+instead of you guessing. A function around a column — <code>WHERE LOWER(name) = ?</code> — usually
+means it was not.</li>
+</ul>
+
+<h2>Transactions</h2>
+
+<p>A transaction is a group of statements that all happen or none do. Placing an order writes the
+order and its line items; if the second write fails, the first must not survive.</p>
+
+<pre class="language-java"><code class="language-java">@Override
+@Transactional
+public OrderCreateResponseDTO createOrder(OrderCreateDTO dto, String userEmail) { ... }
+
+@Override
+@Transactional(readOnly = true)
+public OrderDTO getOrderByPublicId(UUID id) { ... }</code></pre>
+
+<p>Three things to know beyond "it rolls back":</p>
+
+<ul>
+<li><strong>The boundary belongs on the service method</strong>, because that is where one unit of
+business work is. Not on the repository — a transaction per query guarantees nothing.</li>
+<li><strong><code>readOnly = true</code> is worth using.</strong> Hibernate skips dirty checking, the
+driver knows it will not write, and an accidental write fails loudly.</li>
+<li><strong>Spring rolls back on unchecked exceptions only</strong>, by default. A caught-and-logged
+exception rolls back nothing — the transaction commits half the work and everything looks fine.</li>
+</ul>
+
+<p>And the rule that saves you at 3am: <strong>keep transactions short, and never call a third-party
+API inside one.</strong> An HTTP call to a payment provider inside a transaction holds a database
+connection open for the duration. When that provider is slow, your connection pool empties and the
+whole application stops — over something that has nothing to do with your database.</p>
+
+<h2>ORM or SQL?</h2>
+
+<p>An ORM maps rows onto objects and tracks changes to them. Spring Data goes further: you declare
+an interface and the implementation is generated.</p>
+
+<pre class="language-java"><code class="language-java">public interface ProductRepository extends JpaRepository&lt;Product, Long&gt; {
+
+    /**
+     * @EntityGraph fetches the sizes in the SAME query. Without it, listing 14 products
+     * triggers 1 query for the products plus 14 more for their sizes — the N+1 problem.
+     */
+    @EntityGraph(attributePaths = "sizes")
+    List&lt;Product&gt; findByActiveTrueOrderByTypeAscDisplayOrderAsc();
+
+    @EntityGraph(attributePaths = "sizes")
+    Optional&lt;Product&gt; findWithSizesByPublicId(UUID publicId);
+
+    boolean existsByNameIgnoreCase(String name);
+}</code></pre>
+
+<p>No implementation class exists. The method <em>names</em> are the query.</p>
+
+<p><strong>Use the ORM for CRUD on an object graph. Drop to SQL for reporting and bulk work.</strong>
+Aggregates have no entity to load, nothing to dirty-check and nothing to keep in an identity map —
+running them through a persistence layer adds cost and hides the query:</p>
+
+<pre class="language-java"><code class="language-java">String query =
+        """
+        SELECT COUNT(*)                  AS total_orders,
+               COALESCE(SUM(o.total), 0) AS total_revenue,
+               COALESCE(AVG(o.total), 0) AS average_order_value
+        FROM customer_order o
+        WHERE o.status IN ('PAID','PREPARING','COMPLETED')
+          AND o.deleted = 0
+          AND o.created_at &gt;= :from
+        """;
+
+return jdbcTemplate.queryForObject(query, Map.of("from", from), reportSummaryRowMapper);</code></pre>
+
+<p>Two habits in that snippet. <strong>Aggregate in the database</strong> — loading every order into
+memory to sum it works on 18 demo rows and dies on a real order table. And <strong>named parameters,
+never string concatenation</strong>: <code>:from</code> is bound by the driver, so nothing a caller
+sends can change the shape of the statement. String-building a query with user input is SQL
+injection, and it is still the most damaging bug on this list.</p>
+
+<h2>N+1 — the performance bug you will write</h2>
+
+<p>You load 14 products. You loop over them asking for each one's sizes. Because the collection is
+lazy, each access is a query. One query became fifteen, and on a list of 500 it becomes 501.</p>
+
+<p>It is invisible locally — 15 fast queries still feel instant. Then the list grows, or the database
+moves to another host and each round trip costs 2ms instead of 0.1ms. Find it by turning on SQL
+logging in development and watching what one request actually issues. Fix it by fetching the
+children in the same query: <code>@EntityGraph</code>, a <code>join fetch</code>, or a second query
+that loads them all by id.</p>
+
+<h2>Connection pools</h2>
+
+<p>Opening a database connection is expensive, so the app keeps a pool of them open and lends them
+out. Boot configures one automatically, and you mostly leave it alone — but know that
+<strong>the pool is a hard limit on concurrency</strong>. Ten connections means ten requests can be
+in the database at once; the eleventh waits, and if it waits too long it fails.</p>
+
+<p>Which is why the "no third-party call inside a transaction" rule above matters, and why the fix
+for a full pool is almost never "make the pool bigger". It is to find what is holding connections
+for too long.</p>
+
+<h2>Migrations</h2>
+
+<p>The schema must be versioned in git and applied by a tool — Liquibase or Flyway — not by hand.
+Every change is a numbered file, applied once, in order, recorded in a table. The same sequence runs
+on your laptop, in CI and in production, so all three end up identical.</p>
+
+<p>The demo app pairs this with a setting that makes a mismatch impossible to ignore:</p>
+
+<pre class="language-properties"><code class="language-properties"># Liquibase owns the schema. `validate` makes Hibernate refuse to start if the
+# entities and the tables have drifted apart, which is exactly what we want:
+# a loud failure at boot beats a silent mismatch discovered in production.
+spring.jpa.hibernate.ddl-auto=validate</code></pre>
+
+<p>Never <code>ddl-auto=update</code> in production. It guesses, it will not drop or narrow anything,
+and it silently leaves you with a schema nobody chose.</p>
+
+<p>Two rules for changing a table that already has rows in it: <strong>additive changes are
+safe</strong> (a new nullable column, a new table), and <strong>a rename is a three-step
+deploy</strong> — add the new column, write to both while backfilling, then drop the old one once
+nothing reads it. A rename in one step breaks every instance still running the old code during the
+rollout.</p>
+
+<h2>Soft deletes, and the trap in them</h2>
+
+<p>Most systems do not really delete. Past orders reference the product; deleting the row breaks
+them. So rows carry a <code>deleted</code> flag and every read filters it out.</p>
+
+<p>Hibernate can apply that filter for you with <code>@SQLRestriction("deleted = false")</code> on
+the entity — and that is exactly what makes the trap. It applies to queries built from the
+<em>entity model</em>. Hand-written SQL never goes near the entity model, so the filter is simply
+absent:</p>
+
+<pre class="language-sql"><code class="language-sql">WHERE o.status IN ('PAID','PREPARING','COMPLETED')
+  AND o.deleted = 0            -- NOT optional. @SQLRestriction does not reach here.
+  AND o.created_at &gt;= :from</code></pre>
+
+<p>Omit that line and cancelled-and-deleted orders are counted as revenue. The reports stay entirely
+plausible — just wrong — which is why it went unnoticed in the demo app for a while, and why the
+regression test that now guards it is named after the bug.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Model the data first. What is one row, what makes it unique, what happens to its children.</li>
+<li>Constraints in the database, not just in code. They hold when two requests race.</li>
+<li><code>DECIMAL</code> for money. Never float.</li>
+<li>A numeric key for storage, a UUID for the API.</li>
+<li>Index what you filter, join and sort on; leftmost prefix; measure with <code>EXPLAIN</code>.</li>
+<li>Transactions on the service method, short, and never wrapping a third-party call.</li>
+<li>ORM for CRUD, SQL for reporting. Bind parameters, never concatenate.</li>
+<li>Watch for N+1 by logging SQL in development.</li>
+<li>Migrations in git, applied by a tool. Additive is safe; a rename takes three deploys.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-auth-and-security">authentication, authorization and
+security</a>.</p>

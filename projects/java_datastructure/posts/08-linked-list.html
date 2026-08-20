@@ -1,0 +1,164 @@
+<p>A linked list stores each element in its own node, along with a reference to the next one.
+Nothing is contiguous, nothing has an index, and the whole structure is held together by
+references.</p>
+
+<h2>The node</h2>
+
+<pre class="language-java"><code class="language-java">    /** A record cannot be used here: next has to be reassigned as the list changes. */
+    private static final class Node&lt;E&gt; {
+        E value;
+        Node&lt;E&gt; next;
+
+        Node(E value) {
+            this.value = value;
+        }
+    }</code></pre>
+
+<p>The comment is worth pausing on. A <code>record</code> would be the obvious modern choice for a
+two-field carrier, but record components are final, and building a list means reassigning
+<code>next</code> constantly. This is one of the few places where a plain mutable class is
+genuinely the right tool.</p>
+
+<h2>The trade, in both directions</h2>
+
+<table>
+<thead><tr><th>Operation</th><th>Linked list</th><th>Array / ArrayList</th></tr></thead>
+<tbody>
+<tr><td>Insert at front</td><td><strong>O(1)</strong></td><td>O(n)</td></tr>
+<tr><td>Insert at end</td><td><strong>O(1)</strong> — with a tail</td><td>O(1) amortised</td></tr>
+<tr><td>Remove from front</td><td><strong>O(1)</strong></td><td>O(n)</td></tr>
+<tr><td>Get by index</td><td>O(n)</td><td><strong>O(1)</strong></td></tr>
+<tr><td>Memory per element</td><td>~24 bytes of node</td><td><strong>one slot</strong></td></tr>
+<tr><td>Iteration</td><td>pointer chasing</td><td><strong>cache-friendly</strong></td></tr>
+</tbody>
+</table>
+
+<p>Neither structure is faster. They are fast at different things, and that is the only honest
+summary.</p>
+
+<h2>Adding at the front — the O(1) case</h2>
+
+<pre class="language-java"><code class="language-java">    /** O(1) - the whole point of a linked list. */
+    public void addFirst(E value) {
+        Node&lt;E&gt; node = new Node&lt;&gt;(value);
+        if (head == null) {
+            head = tail = node;
+        } else {
+            node.next = head;
+            head = node;
+        }
+        size++;
+    }</code></pre>
+
+<p>No element moves. Compare an array, where inserting at index 0 shifts every one of n
+elements.</p>
+
+<h2>Why the tail reference is not optional</h2>
+
+<pre class="language-java"><code class="language-java">    /** O(1) only because of the tail reference. */
+    public void addLast(E value) {
+        Node&lt;E&gt; node = new Node&lt;&gt;(value);
+        if (tail == null) {
+            head = tail = node;
+        } else {
+            tail.next = node;
+            tail = node;
+        }
+        size++;
+    }</code></pre>
+
+<p>Without <code>tail</code>, appending has to walk from the head to find the end — O(n) — and
+building an n-element list by appending becomes <strong>O(n²)</strong>. One extra field turns a
+quadratic loop into a linear one.</p>
+
+<h2>The asymmetry that argues for doubly linked lists</h2>
+
+<pre class="language-java"><code class="language-java">        Node&lt;E&gt; current = head;
+        while (current.next != tail) {
+            current = current.next;
+        }</code></pre>
+
+<p>Removing the <em>last</em> element is O(n) even with a tail reference, because you need the node
+<em>before</em> the tail and a singly linked list has no way back. That single asymmetry is the
+argument for a doubly linked list — each node also pointing at its predecessor — which is what
+<code>java.util.LinkedList</code> actually is. The cost is another reference per node.</p>
+
+<h2>Reversing in one pass</h2>
+
+<p>The classic interview exercise, and it is genuinely instructive: three references, four lines,
+and the order of the lines is the whole problem.</p>
+
+<pre class="language-java"><code class="language-java">    public void reverse() {
+        Node&lt;E&gt; previous = null;
+        Node&lt;E&gt; current = head;
+        tail = head;
+        while (current != null) {
+            Node&lt;E&gt; next = current.next;
+            current.next = previous;
+            previous = current;
+            current = next;
+        }
+        head = previous;
+    }</code></pre>
+
+<p>Stash <code>next</code> <em>before</em> overwriting <code>current.next</code>. Reverse those two
+lines and the rest of the list becomes unreachable — you have reversed the first node and dropped
+everything else on the floor.</p>
+
+<p>Note <code>tail = head</code> near the top. The old head becomes the new tail, and forgetting it
+leaves the list working perfectly until the next <code>addLast</code> appends to the wrong end —
+which is exactly what this assertion is for:</p>
+
+<pre class="language-java"><code class="language-java">        list.reverse();
+        Check.eq(list.toString(), "[3, 2, 1]", "reverse in place");
+        // The tail must have moved too, or a later addLast appends to the wrong end.
+        list.addLast(0);
+        Check.eq(list.toString(), "[3, 2, 1, 0]", "tail is correct after reverse");</code></pre>
+
+<h2>Floyd's cycle detection</h2>
+
+<p>A linked list can point back into itself, and then any naive traversal loops forever. The
+obvious fix is a <code>HashSet</code> of visited nodes — correct, and O(n) extra memory. Floyd's
+algorithm does it in O(1) space:</p>
+
+<pre class="language-java"><code class="language-java">    public boolean hasCycle() {
+        Node&lt;E&gt; slow = head;
+        Node&lt;E&gt; fast = head;
+        while (fast != null &amp;&amp; fast.next != null) {
+            slow = slow.next;
+            fast = fast.next.next;
+            if (slow == fast) {
+                return true;
+            }
+        }
+        return false;
+    }</code></pre>
+
+<p>One pointer takes one step, the other takes two. If there is a cycle the fast one eventually laps
+the slow one and they land on the same node; if there is not, the fast one runs off the end. Known
+universally as the tortoise and the hare.</p>
+
+<p>Note <code>slow == fast</code>, not <code>equals</code> — this compares node identity, and two
+distinct nodes holding equal values are not a cycle.</p>
+
+<h2>When to use one</h2>
+
+<p><strong>Rarely, directly.</strong> <code>ArrayDeque</code> gives you O(1) at both ends with
+contiguous memory and beats <code>LinkedList</code> at nearly everything.</p>
+
+<p>What linked structures are genuinely for is being a component of something else.
+<code>LinkedHashMap</code> threads a linked list through its hash table entries to remember
+insertion order and make LRU eviction O(1). A hash table with
+<a href="/data-structure-algorithm/data-structure-algorithm-hashtable">separate chaining</a> makes
+each bucket a small linked list. The structure earns its place inside other structures.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>O(1) at the front, O(n) by index — the mirror image of an array.</li>
+<li>A tail reference is what keeps <code>addLast</code> O(1).</li>
+<li>Removing the last element is O(n) unless the list is doubly linked.</li>
+<li>Reversal: stash <code>next</code> first, and move the tail.</li>
+<li>Floyd's cycle detection is O(n) time and O(1) space.</li>
+<li>Prefer <code>ArrayDeque</code> in application code.</li>
+</ul>

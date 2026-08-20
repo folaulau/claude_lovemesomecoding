@@ -1,0 +1,154 @@
+<p>A hash table turns the key into an array index and goes straight there. That one idea is what
+makes lookup O(1) instead of the O(n) of scanning a list, and it is why <code>HashMap</code> is the
+most-used collection in Java.</p>
+
+<h2>The idea</h2>
+
+<ol>
+<li>Compute <code>key.hashCode()</code> — an <code>int</code>.</li>
+<li>Fold it into the array's range to get a bucket index.</li>
+<li>Store the key and value there.</li>
+</ol>
+
+<p>Lookup repeats the same arithmetic and lands in the same bucket. No searching.</p>
+
+<pre class="language-java"><code class="language-java">    private int bucketFor(Object key, int length) {
+        return key == null ? 0 : Math.floorMod(key.hashCode(), length);
+    }</code></pre>
+
+<p><strong><code>Math.floorMod</code>, not <code>%</code>.</strong> A <code>hashCode</code> is
+routinely negative, and Java's <code>%</code> keeps the sign — <code>-7 % 16</code> is
+<code>-7</code>, and that is an <code>ArrayIndexOutOfBoundsException</code>. It is a real bug in a
+lot of hand-written hash tables, and it only fires for keys that happen to hash negative, so it
+survives casual testing. (<code>"polygenelubricants"</code> is the well-known <code>String</code>
+whose hash is <code>Integer.MIN_VALUE</code>, where even <code>Math.abs</code> fails, because
+negating it overflows straight back to itself.)</p>
+
+<h2>Collisions</h2>
+
+<p>Two different keys can produce the same bucket. They must — there are 2³² possible hash codes and
+maybe 16 buckets. So a hash table is not "an array of values", it is an array of
+<strong>buckets</strong>, and this one makes each bucket a small linked list. That is
+<strong>separate chaining</strong>.</p>
+
+<pre class="language-java"><code class="language-java">    public V put(K key, V value) {
+        int index = bucketFor(key, buckets.length);
+        for (Entry&lt;K, V&gt; e = buckets[index]; e != null; e = e.next) {
+            if (equal(e.key, key)) {
+                V previous = e.value;
+                e.value = value; // a Map replaces, it does not duplicate
+                return previous;
+            }
+        }
+        Entry&lt;K, V&gt; head = new Entry&lt;&gt;(key, value);
+        head.next = buckets[index];
+        buckets[index] = head;
+        size++;
+
+        if ((double) size / buckets.length &gt; MAX_LOAD_FACTOR) {
+            resize();
+        }
+        return null;
+    }</code></pre>
+
+<p>Note the scan of the chain before inserting: a map replaces an existing key rather than storing
+it twice. That scan is why the O(1) is an <em>average</em>.</p>
+
+<h2>Why O(1) is an average, not a guarantee</h2>
+
+<p>With a good hash and a bounded load factor, chains stay roughly one element long and a lookup is
+one array access plus one comparison.</p>
+
+<p>With a terrible hash, every key lands in the same bucket, the table becomes one long linked list,
+and every operation is <strong>O(n)</strong>. And <code>return 0;</code> is a perfectly legal
+<code>hashCode</code> — it satisfies the contract, since equal objects must have equal hashes and
+this trivially does. It just destroys the data structure.</p>
+
+<p>The real <code>HashMap</code> mitigates this: since Java 8, a bucket that grows past eight
+entries converts from a linked list into a red-black tree, so the worst case degrades to
+O(log n) rather than O(n). That is a patch on bad hashing, not a substitute for good hashing.</p>
+
+<h2>Load factor and resizing</h2>
+
+<p>The <strong>load factor</strong> is <code>size / buckets.length</code>. As it rises, chains
+lengthen and the O(1) decays. The standard threshold — used here and in the JDK — is
+<strong>0.75</strong>, a deliberate compromise between wasted memory and lengthening chains.</p>
+
+<pre class="language-java"><code class="language-java">    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void resize() {
+        Entry&lt;K, V&gt;[] old = buckets;
+        Entry&lt;K, V&gt;[] bigger = new Entry[old.length * 2];
+        for (Entry&lt;K, V&gt; bucket : old) {
+            for (Entry&lt;K, V&gt; e = bucket; e != null; ) {
+                Entry&lt;K, V&gt; next = e.next;
+                int index = bucketFor(e.key, bigger.length);
+                e.next = bigger[index];
+                bigger[index] = e;
+                e = next;
+            }
+        }
+        buckets = bigger;
+    }</code></pre>
+
+<p><strong>Every key must be rehashed, not merely moved.</strong> The bucket index depends on the
+table length, so the same key belongs somewhere else in a bigger table. Copying buckets across
+verbatim is a silent corruption — nothing throws, and <code>get</code> then looks in the right place
+and finds nothing. The test grows a table from 2 buckets to hold 200 keys and checks every one
+still resolves:</p>
+
+<pre class="language-java"><code class="language-java">        Check.eq(big.size(), 200, "all keys present after resizing");
+        Check.isTrue(big.bucketCount() &gt; 2, "table actually grew");</code></pre>
+
+<p>Because a resize touches every entry, a single <code>put</code> can be O(n). Amortised over the
+sequence it is still O(1) — the same argument as
+<a href="/data-structure-algorithm/data-structure-algorithm-arraylist">ArrayList</a>. And as there,
+pre-sizing avoids the repeated rehashing entirely.</p>
+
+<h2>⚠️ equals and hashCode</h2>
+
+<p>The contract, and the two ways it goes wrong:</p>
+
+<ul>
+<li><strong>Equal objects must have equal hash codes.</strong> Break this and lookup fails outright:
+you store with one hash, search with another, and the map says the key is not there while holding
+it.</li>
+<li><strong>Unequal objects may share a hash code.</strong> That is just a collision — correct, only
+slower.</li>
+</ul>
+
+<p>So overriding <code>equals</code> without <code>hashCode</code> is the classic bug, and it
+produces a map that appears to lose data.</p>
+
+<p>The other trap is <strong>mutating a key after inserting it</strong>. If the mutated field is
+part of <code>hashCode</code>, the entry is now in the bucket for its old hash while lookups compute
+the new one. It is unreachable, and it is still counted in <code>size()</code>. Use immutable keys —
+which is exactly what makes <code>record</code> types and <code>String</code> such good ones, since
+both generate a correct pair and cannot change.</p>
+
+<h2>What Java gives you</h2>
+
+<table>
+<thead><tr><th>Class</th><th>Order</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>HashMap</code></td><td>none</td><td>the default choice; allows one null key</td></tr>
+<tr><td><code>LinkedHashMap</code></td><td>insertion</td><td>a linked list threaded through the entries; also does LRU</td></tr>
+<tr><td><code>TreeMap</code></td><td>sorted by key</td><td>a red-black tree — O(log n), not O(1)</td></tr>
+<tr><td><code>ConcurrentHashMap</code></td><td>none</td><td>thread-safe without locking the whole map</td></tr>
+<tr><td><code>Hashtable</code></td><td>none</td><td>legacy, synchronised — do not use</td></tr>
+</tbody>
+</table>
+
+<p>"No order" means exactly that: <code>HashMap</code> iteration order is an accident of hashing and
+capacity, and it can change when the map resizes. Code that depends on it is code that will break
+after a deployment for no visible reason.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Hash the key to an index; that is the whole trick.</li>
+<li><code>Math.floorMod</code> — a negative hash code otherwise indexes out of bounds.</li>
+<li>O(1) is an average and it depends on a decent <code>hashCode</code>.</li>
+<li>Resizing must rehash every key, and a resize makes one put O(n).</li>
+<li>Override <code>equals</code> and <code>hashCode</code> together; never mutate a key in a map.</li>
+<li>No iteration order. Use <code>LinkedHashMap</code> or <code>TreeMap</code> if you need one.</li>
+</ul>

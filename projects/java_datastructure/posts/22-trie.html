@@ -1,0 +1,173 @@
+<p>A trie — a prefix tree — stores strings by their characters, one node per character, words spelled
+out along the paths from the root. The name comes from re<em>trie</em>val and is usually pronounced
+"try", to distinguish it from "tree".</p>
+
+<h2>The shape</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">insert: car, cargo, care, do, dog
+
+        (root)
+        /    \
+       c      d
+       |      |
+       a      o*
+       |      |
+       r*     g*
+      / \
+     g   e*
+     |
+     o*
+
+* marks the end of a word</code></pre>
+
+<p>Two things to read off that. Shared prefixes are stored <strong>once</strong> — "car", "cargo"
+and "care" share three nodes. And the asterisks are load-bearing: <code>do</code> is a word
+<em>and</em> a prefix of <code>dog</code>, so a node needs to say whether a word ends there.</p>
+
+<h2>The node</h2>
+
+<pre class="language-java"><code class="language-java">    private static final class Node {
+        // A HashMap, not a 26-slot array. The array version is faster and is what interview
+        // answers usually show, but it silently assumes lowercase ASCII - it breaks on digits,
+        // apostrophes and every non-English alphabet.
+        final Map&lt;Character, Node&gt; children = new HashMap&lt;&gt;();
+        boolean endOfWord;
+    }</code></pre>
+
+<p>The usual textbook version uses <code>Node[] children = new Node[26]</code>, which is faster and
+smaller per node — and which quietly assumes your alphabet is lowercase English. It breaks on
+digits, on an apostrophe in "don't", and on every language that is not English. That is a
+substantial assumption to bury in an array size:</p>
+
+<pre class="language-java"><code class="language-java">        // Non-alphabetic characters - the case a 26-slot array cannot represent.
+        Trie mixed = new Trie();
+        mixed.insert("a1");
+        mixed.insert("don't");
+        Check.isTrue(mixed.contains("a1"), "digits work");
+        Check.isTrue(mixed.contains("don't"), "punctuation works");</code></pre>
+
+<h2>Insert and look up</h2>
+
+<pre class="language-java"><code class="language-java">    /** O(m) in the length of the word. */
+    public void insert(String word) {
+        Node node = root;
+        for (char c : word.toCharArray()) {
+            node = node.children.computeIfAbsent(c, k -&gt; new Node());
+        }
+        if (!node.endOfWord) {
+            node.endOfWord = true;
+            size++;
+        }
+    }</code></pre>
+
+<p>Walk the characters, creating nodes as needed, and flag the last one.
+<code>computeIfAbsent</code> collapses the get-check-put into one call.</p>
+
+<h2>⚠️ contains is not startsWith</h2>
+
+<pre class="language-java"><code class="language-java">    public boolean contains(String word) {
+        Node node = find(word);
+        return node != null &amp;&amp; node.endOfWord;
+    }
+
+    public boolean startsWith(String prefix) {
+        return find(prefix) != null;
+    }</code></pre>
+
+<p>Both walk the same path. Only <code>contains</code> checks <code>endOfWord</code>. Without that
+flag a trie holding only "cargo" would report that it contains "car", "carg" and "ca" — every prefix
+becomes a false member. It is the standard trie bug, and the tests pin the distinction:</p>
+
+<pre class="language-java"><code class="language-java">        Check.isTrue(!trie.contains("ca"), "a prefix that was never inserted is not a word");
+        Check.isTrue(trie.startsWith("ca"), "but it IS a prefix");</code></pre>
+
+<h2>⚠️ Do not use a trie for exact lookup</h2>
+
+<p>The claim you will read is that a trie gives O(m) lookup in the length of the word, independent of
+how many words it holds — implying it beats a <code>HashSet</code>.</p>
+
+<p>It does not. Hashing a string <strong>also</strong> reads every character, so
+<code>HashSet.contains</code> is O(m) too. And the <code>HashSet</code> does it with one pass over
+contiguous memory and one array index, where the trie does m separate <code>HashMap</code> lookups
+and m pointer dereferences to scattered nodes.</p>
+
+<p><strong>For "does this word exist", a <code>HashSet</code> is simpler and faster.</strong>
+Choosing a trie there is the classic case of picking the clever structure over the right one.</p>
+
+<h2>What a trie is actually for</h2>
+
+<p>Prefix questions — the ones a hash set cannot answer at all without scanning everything.</p>
+
+<pre class="language-java"><code class="language-java">    /** Autocomplete: every word under a prefix. This is what a trie is actually for. */
+    public List&lt;String&gt; wordsWithPrefix(String prefix) {
+        List&lt;String&gt; out = new ArrayList&lt;&gt;();
+        Node start = find(prefix);
+        if (start != null) {
+            collect(start, new StringBuilder(prefix), out);
+        }
+        out.sort(String::compareTo);   // deterministic, since HashMap iteration order is not
+        return out;
+    }</code></pre>
+
+<p>Walk to the prefix node, then collect every word beneath it. The cost is O(m + number of
+matches) — you never look at a word that does not match. A <code>HashSet</code> would have to test
+every element it holds.</p>
+
+<pre class="language-java"><code class="language-java">    private void collect(Node node, StringBuilder path, List&lt;String&gt; out) {
+        if (node.endOfWord) {
+            out.add(path.toString());
+        }
+        for (Map.Entry&lt;Character, Node&gt; e : node.children.entrySet()) {
+            path.append(e.getKey());
+            collect(e.getValue(), path, out);
+            path.deleteCharAt(path.length() - 1);   // backtrack, or the paths concatenate
+        }
+    }</code></pre>
+
+<p>That <code>deleteCharAt</code> is the backtracking step and the easiest line to omit. One
+<code>StringBuilder</code> is shared across the whole traversal, so after descending into a child you
+must undo the character before trying the next sibling. Leave it out and the paths concatenate into
+nonsense.</p>
+
+<pre class="language-java"><code class="language-java">        Check.eq(trie.wordsWithPrefix("car").toString(), "[car, care, cargo]", "autocomplete");
+        Check.eq(trie.wordsWithPrefix("do").toString(), "[do, dog]", "prefix that is also a word");
+        Check.eq(trie.wordsWithPrefix("").toString(), "[car, care, cargo, do, dog]", "empty prefix is everything");</code></pre>
+
+<h2>Trie against HashSet</h2>
+
+<table>
+<thead><tr><th>Question</th><th>Trie</th><th><code>HashSet</code></th></tr></thead>
+<tbody>
+<tr><td>Does this word exist?</td><td>O(m)</td><td><strong>O(m), faster constant</strong></td></tr>
+<tr><td>Any word starting with "car"?</td><td><strong>O(m)</strong></td><td>O(n·m) — scan everything</td></tr>
+<tr><td>All words starting with "car"?</td><td><strong>O(m + matches)</strong></td><td>O(n·m)</td></tr>
+<tr><td>Words in sorted order</td><td><strong>free</strong> — traverse in order</td><td>O(n log n) sort</td></tr>
+<tr><td>Memory</td><td>higher — a node per character</td><td>lower</td></tr>
+</tbody>
+</table>
+
+<h2>Where they are used</h2>
+
+<ul>
+<li><strong>Autocomplete and typeahead</strong> — the canonical case.</li>
+<li><strong>Spell checkers</strong> — walk the trie allowing a bounded number of edits.</li>
+<li><strong>IP routing</strong> — longest-prefix matching on address bits.</li>
+<li><strong>Word games</strong> — Boggle and Scrabble solvers prune a search the moment the current
+path stops being a prefix of any word, which is the trie doing real work.</li>
+</ul>
+
+<p>A <strong>radix tree</strong> (or Patricia trie) compresses chains of single-child nodes into one
+node holding a whole substring, which cuts the memory cost substantially on sparse data. It is the
+same idea with the obvious inefficiency removed.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>One node per character; shared prefixes are stored once.</li>
+<li><code>endOfWord</code> is what separates a word from a prefix — omit it and every prefix
+matches.</li>
+<li>For exact lookup, use a <code>HashSet</code>. A trie is not faster there.</li>
+<li>Use one for prefix queries, which a set cannot answer.</li>
+<li>Backtrack the path buffer when collecting, or the results concatenate.</li>
+<li>A <code>Map</code> of children handles alphabets a 26-slot array cannot.</li>
+</ul>

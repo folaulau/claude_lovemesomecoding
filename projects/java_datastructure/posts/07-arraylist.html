@@ -1,0 +1,140 @@
+<p><code>ArrayList</code> is an array, a size, and a rule for what to do when the array fills up.
+That is the whole class. Writing it is the shortest route to understanding why
+<code>add</code> is O(1) when the resize inside it is obviously O(n).</p>
+
+<h2>The two fields</h2>
+
+<pre class="language-java"><code class="language-java">    private Object[] items;
+    private int size;</code></pre>
+
+<p><strong>Capacity is not size.</strong> <code>items.length</code> is how many elements there is
+room for; <code>size</code> is how many there actually are. The slots between them exist and are
+<code>null</code>. Every bug in a hand-written list comes from confusing the two.</p>
+
+<h2>Appending</h2>
+
+<pre class="language-java"><code class="language-java">    /** Amortised O(1). The resize is O(n) but happens on a vanishing fraction of calls. */
+    public void add(E item) {
+        if (size == items.length) {
+            grow();
+        }
+        items[size++] = item;
+    }
+
+    private void grow() {
+        // Doubling is the whole trick. See the class comment.
+        items = Arrays.copyOf(items, items.length * 2);
+    }</code></pre>
+
+<h2>Why doubling makes it O(1)</h2>
+
+<p>This is the part worth being able to derive rather than recite.</p>
+
+<p>Start with capacity 1 and add n elements. Copies happen at capacity 1, 2, 4, 8, … and each
+copies that many elements. The total copying work is:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">1 + 2 + 4 + 8 + ... + n/2 + n  =  2n - 1</code></pre>
+
+<p>That is the geometric series, and it sums to <strong>less than 2n</strong> — linear in total, not
+quadratic. Spread over n adds, that is under 2 copies per add: a constant. Hence
+<strong>amortised O(1)</strong>.</p>
+
+<p>Now grow by <em>one</em> instead. Every add copies everything, so the total is 1 + 2 + 3 + … + n
+= n(n+1)/2, which is <strong>O(n²)</strong>. Same class, same interface, and building a
+million-element list goes from instant to hours.</p>
+
+<p>The growth schedule is asserted, not assumed:</p>
+
+<pre class="language-java"><code class="language-java">        DynamicArray&lt;String&gt; list = new DynamicArray&lt;&gt;(2);
+        list.add("a");
+        list.add("b");
+        Check.eq(list.capacity(), 2, "capacity before growth");
+        list.add("c");
+        Check.eq(list.capacity(), 4, "capacity doubles, not +1");</code></pre>
+
+<p>And at the other end of the scale — ten doublings from 1 gets you to 1024:</p>
+
+<pre class="language-java"><code class="language-java">        DynamicArray&lt;Integer&gt; counted = new DynamicArray&lt;&gt;(1);
+        for (int i = 0; i &lt; 1024; i++) {
+            counted.add(i);
+        }
+        Check.eq(counted.capacity(), 1024, "1 doubled ten times");</code></pre>
+
+<p><small>The JDK's own <code>ArrayList</code> grows by 50%, not 100% — the series still converges,
+so it is still amortised O(1), and it wastes less memory on large lists.</small></p>
+
+<h2>Insert and remove in the middle</h2>
+
+<pre class="language-java"><code class="language-java">    /** O(n) - every element from index onwards shifts up one slot. */
+    public void add(int index, E item) {
+        checkIndexForAdd(index);
+        if (size == items.length) {
+            grow();
+        }
+        System.arraycopy(items, index, items, index + 1, size - index);
+        items[index] = item;
+        size++;
+    }</code></pre>
+
+<p>Removal is the mirror image, and contains the one line people leave out:</p>
+
+<pre class="language-java"><code class="language-java">    /** O(n) for the same reason as insert: the tail closes the gap. */
+    @SuppressWarnings("unchecked")
+    public E remove(int index) {
+        checkIndex(index);
+        E removed = (E) items[index];
+        System.arraycopy(items, index + 1, items, index, size - index - 1);
+        // Null the vacated slot. Without this the array keeps a reference to an object nobody
+        // can reach any more, and it never becomes garbage - a real leak in a long-lived list.
+        items[--size] = null;
+        return removed;
+    }</code></pre>
+
+<p><strong>That <code>= null</code> is a real memory leak if omitted.</strong> After the shift, the
+last slot still holds a reference to an object the list no longer contains. It is past
+<code>size</code>, so no caller can ever see it — and it is reachable from the array, so the
+collector will never free it. The list "works" perfectly while quietly pinning objects. The JDK's
+<code>ArrayList.remove</code> has the identical line for the identical reason.</p>
+
+<h2>Size against capacity, in practice</h2>
+
+<p>Two consequences worth knowing:</p>
+
+<ul>
+<li><strong>Pre-size it when you know the count.</strong> <code>new ArrayList&lt;&gt;(10_000)</code>
+skips every intermediate copy. It changes capacity, not size — the list is still empty.</li>
+<li><strong>A list never shrinks on its own.</strong> Add a million elements and remove them all
+and the backing array is still a million long. <code>trimToSize()</code> exists for that, and is
+almost never called.</li>
+</ul>
+
+<h2>ArrayList or LinkedList?</h2>
+
+<table>
+<thead><tr><th>Operation</th><th><code>ArrayList</code></th><th><code>LinkedList</code></th></tr></thead>
+<tbody>
+<tr><td><code>get(i)</code></td><td><strong>O(1)</strong></td><td>O(n)</td></tr>
+<tr><td><code>add</code> at the end</td><td><strong>O(1)*</strong></td><td>O(1)</td></tr>
+<tr><td><code>add(0, x)</code></td><td>O(n)</td><td><strong>O(1)</strong></td></tr>
+<tr><td>Memory per element</td><td><strong>one reference</strong></td><td>a node — about 24 bytes</td></tr>
+<tr><td>Iteration speed</td><td><strong>fast</strong> — contiguous</td><td>slow — pointer chasing</td></tr>
+</tbody>
+</table>
+
+<p><strong>Use <code>ArrayList</code>.</strong> The theoretical O(1) front insertion is real but
+rarely what an application does, and it is paid for at every read and every iteration. If you truly
+need cheap insertion at both ends, <code>ArrayDeque</code> beats both.</p>
+
+<p>The classic disaster is calling <code>get(i)</code> in a loop over a
+<code>LinkedList</code>: each call walks from the head, so the loop is O(n²) while looking exactly
+like the <code>ArrayList</code> version that is O(n).</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Capacity is room; size is contents. They are not the same number.</li>
+<li>Doubling makes append amortised O(1); growing by one makes it O(n²).</li>
+<li>Null the vacated slot on removal, or the list leaks.</li>
+<li>Pre-size when you know the count; lists never shrink by themselves.</li>
+<li>Reach for <code>ArrayList</code> by default.</li>
+</ul>

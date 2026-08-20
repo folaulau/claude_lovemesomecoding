@@ -1,0 +1,270 @@
+<p>Two questions, and beginners merge them into one:</p>
+
+<ul>
+<li><strong>Authentication</strong> — who are you?</li>
+<li><strong>Authorization</strong> — are you allowed to do <em>that</em>?</li>
+</ul>
+
+<p>They fail differently and they are checked in different places. Confusing them is how a system
+ends up correctly identifying a user and then letting them read somebody else's order.</p>
+
+<h2>Storing passwords</h2>
+
+<p>Assume your database will leak. Design for the day it does.</p>
+
+<p>Never store a password. Store a <strong>slow</strong> hash of it — bcrypt, scrypt or Argon2 —
+and let the library handle the salt.</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * BCrypt deliberately makes hashing slow, which is the point: it makes brute-forcing a
+ * stolen password table expensive. Never store a password with a fast hash such as MD5
+ * or SHA-256.
+ */
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}</code></pre>
+
+<p>Read that comment carefully, because it is the counter-intuitive bit. MD5 and SHA-256 are not
+"weak" hashes in the usual sense — they are <em>fast</em>, and fast is the flaw. A GPU tries billions
+of fast hashes per second against a leaked table. Bcrypt is deliberately engineered to take
+milliseconds, which is invisible on one login and ruinous across a billion guesses.</p>
+
+<p>The <strong>salt</strong> is random per password, stored alongside the hash, and it is what stops
+one precomputed table from cracking every account at once. Bcrypt does this for you — which is the
+real argument for using the library rather than assembling this yourself.</p>
+
+<h2>Sessions or tokens?</h2>
+
+<table>
+<thead><tr><th></th><th>Session cookie</th><th>Token (JWT)</th></tr></thead>
+<tbody>
+<tr><td>Where state lives</td><td>On the server</td><td>In the token itself</td></tr>
+<tr><td>Scaling across servers</td><td>Needs shared session storage</td><td>Nothing to share</td></tr>
+<tr><td>Revoking access</td><td>Delete the session — instant</td><td><strong>Cannot</strong>, until it expires</td></tr>
+<tr><td>Works well for</td><td>Server-rendered web apps</td><td>APIs with several clients</td></tr>
+<tr><td>Main risk</td><td>CSRF</td><td>Theft — anyone holding it is you</td></tr>
+</tbody>
+</table>
+
+<p>Neither is "better". The demo app is an API called by a React app, an Angular app and Swagger, so
+it is stateless and token-based. A server-rendered site with one frontend should use sessions and
+save itself the trouble.</p>
+
+<h2>What a JWT actually is</h2>
+
+<p>Three base64 chunks separated by dots: a header, a payload of claims, and a signature. The
+signature proves <em>we</em> issued it and nobody edited it.</p>
+
+<pre class="language-java"><code class="language-java">public String generateToken(User user) {
+    Instant now = Instant.now();
+    Instant expiry = now.plusSeconds(properties.jwt().expirationMinutes() * 60);
+
+    return Jwts.builder()
+            .subject(user.getEmail())
+            .claim(CLAIM_ROLE, user.getRole().name())
+            .claim(CLAIM_USER_ID, user.getId())
+            .issuedAt(Date.from(now))
+            .expiration(Date.from(expiry))
+            .signWith(key)
+            .compact();
+}</code></pre>
+
+<p>Three consequences people get wrong:</p>
+
+<ul>
+<li><strong>Signed is not encrypted.</strong> Anyone holding the token can read every claim — paste
+one into <a href="https://jwt.io">jwt.io</a> and look. Never put anything secret in there.</li>
+<li><strong>You cannot revoke it.</strong> There is no server-side record to delete, so a stolen
+token works until it expires. That is the price of statelessness. Mitigate with short
+lifetimes plus a refresh token; do not pretend the problem is not there.</li>
+<li><strong>Verify the signature server-side, every request.</strong> An unverified token is just a
+string the caller wrote, and "decode the claims and trust them" is a real vulnerability that ships
+regularly.</li>
+</ul>
+
+<p>And validate the key at startup rather than on first use:</p>
+
+<pre class="language-java"><code class="language-java">@PostConstruct
+void init() {
+    byte[] keyBytes = properties.jwt().secret().getBytes(StandardCharsets.UTF_8);
+    // HS256 requires at least 256 bits. Failing loudly at startup beats discovering a weak
+    // key in production.
+    if (keyBytes.length &lt; 32) {
+        throw new IllegalStateException(
+                "pizza.jwt.secret must be at least 32 characters for HS256 (got " + keyBytes.length + ")");
+    }
+    this.key = Keys.hmacShaKeyFor(keyBytes);
+}</code></pre>
+
+<h2>The rules run in order, and first match wins</h2>
+
+<p>Every request passes through a chain of filters before it reaches your code. Somewhere in that
+chain is a list of rules mapping paths to requirements — and <strong>the order of that list is
+security-critical</strong>.</p>
+
+<pre class="language-java"><code class="language-java">.authorizeHttpRequests(auth -&gt; auth
+        .requestMatchers("/api/auth/register", "/api/auth/login")
+        .permitAll()
+
+        // ---- public menu ---------------------------------------------------
+        .requestMatchers(HttpMethod.GET, "/api/products/**", "/api/toppings/**", "/api/crusts/**")
+        .permitAll()
+
+        // ---- orders --------------------------------------------------------
+        // Specific first: order history needs a real account.
+        .requestMatchers(HttpMethod.GET, "/api/orders/mine")
+        .authenticated()
+        // Placing an order must NOT require a login — this is guest checkout.
+        .requestMatchers(HttpMethod.POST, "/api/orders")
+        .permitAll()
+
+        // ---- admin ---------------------------------------------------------
+        .requestMatchers("/api/admin/**")
+        .hasRole("ADMIN")
+
+        // Default deny. Anything not listed above needs authentication, so a new
+        // endpoint is closed until someone deliberately opens it.
+        .anyRequest()
+        .authenticated())</code></pre>
+
+<p>Two things to take from this.</p>
+
+<p><strong>Specific before general.</strong> If a broad <code>permitAll()</code> on
+<code>/api/orders/**</code> came first, the <code>/api/orders/mine</code> rule below it would never
+be evaluated and every customer's order history would be public. Nothing warns you. The endpoint
+just works, for everyone.</p>
+
+<p><strong>End with default deny.</strong> <code>anyRequest().authenticated()</code> means the next
+endpoint someone adds is closed until they deliberately open it. The alternative — default allow —
+means the next endpoint someone adds is public until they remember to protect it, and one day they
+will not.</p>
+
+<p>Note also the comments marking deliberate trade-offs: reading one order is public so a guest can
+see their confirmation page, and the code says so, along with the limitation that follows from it.
+An intentional hole that is written down is a decision; the same hole undocumented is a bug waiting
+to be discovered by someone else.</p>
+
+<h2>Authorization is not just about the endpoint</h2>
+
+<p>This is the most commonly shipped access-control bug, and it passes every test that only checks
+"is the user logged in".</p>
+
+<p><code>GET /api/orders/42</code> — the caller is authenticated, so the endpoint rule allows it.
+But is order 42 <em>theirs</em>? If you do not check ownership, any logged-in user can read every
+order by changing the number. It is called <strong>insecure direct object reference</strong>, and the
+fix is a rule: <strong>never look something up by an id from the request without checking that this
+caller may see it.</strong></p>
+
+<p>Two structural defences are visible in the demo app. Endpoints that mean "the signed-in caller"
+carry no id at all — <code>/api/me/**</code> and <code>/api/orders/mine</code> derive the user from
+the token, so there is nothing in the path to swap. And public identifiers are UUIDs rather than
+sequential integers, so they cannot be walked. The second is a mitigation, not a control:
+unguessable is not the same as protected.</p>
+
+<h2>Defence in depth: guard the method too</h2>
+
+<p>URL rules protect one entry point. A service is a bean that any future controller, scheduled job
+or message listener can inject — so put the check on the method as well:</p>
+
+<pre class="language-java"><code class="language-java">/**
+ * Every method here carries @PreAuthorize("hasRole('ADMIN')") even though SecurityConfig
+ * already restricts /api/admin/** to admins. That is not belt-and-braces for its own sake:
+ * URL rules protect one entry point, and this service is a bean that any future controller,
+ * scheduled job or message listener can inject. The annotation travels with the method, so
+ * the guard cannot be left behind when the caller changes.
+ *
+ * ⚠️ Being proxy-based, it has the same blind spot as @Transactional and @Cacheable:
+ * a call from another method inside THIS class skips the check entirely.
+ */
+@Override
+@PreAuthorize("hasRole('ADMIN')")
+@Transactional(readOnly = true)
+public List&lt;AdminUserDTO&gt; getAllUsers() {
+    return userDAO.findAllForAdmin();
+}</code></pre>
+
+<p>That warning is <a href="/backend-dev/backend-dev-what-to-learn-in-a-framework">the proxy rule</a>
+again, and here it is a security hole rather than a performance one.</p>
+
+<h2>Do not leak information in your errors</h2>
+
+<pre class="language-java"><code class="language-java">@ExceptionHandler(AuthenticationException.class)
+public ResponseEntity&lt;ApiError&gt; handleAuthentication(AuthenticationException ex, HttpServletRequest request) {
+    // Deliberately vague: saying "no such user" vs "wrong password" tells an attacker which
+    // email addresses are registered.
+    ApiError error = new ApiError(HttpStatus.UNAUTHORIZED, "Invalid email or password", request.getRequestURI());
+    return ResponseEntity.status(error.getStatus()).body(error);
+}</code></pre>
+
+<p>"No account with that email" is a free account-enumeration API. The same reasoning applies to
+token parsing: the demo app's <code>JwtService.parse</code> returns null for malformed, forged
+<em>and</em> expired tokens alike, because distinguishing them only helps someone probing the
+implementation.</p>
+
+<h2>Logging in with Google — OAuth2 in one paragraph</h2>
+
+<p>OAuth2 login means you never see the user's Google password. You redirect them to Google, Google
+authenticates them and redirects back with a code, your server exchanges that code for the user's
+profile, and you then issue <em>your own</em> token as usual. The provider handles authentication;
+authorization is still entirely yours. Worked example in
+<a href="/spring-boot/spring-boot-oauth2">Spring Boot – OAuth2</a>.</p>
+
+<h2>Secrets</h2>
+
+<p>Never in git. Not in a properties file you commit, not in a comment, not "temporarily". Git
+remembers, and rotating a leaked key is far more work than never leaking it.</p>
+
+<pre class="language-properties"><code class="language-properties"># Stripe keys are NEVER committed. Put real test keys in
+# application-local.properties (gitignored) or set the env vars below.
+pizza.stripe.secret-key=${STRIPE_SECRET_KEY:}
+pizza.stripe.publishable-key=${STRIPE_PUBLISHABLE_KEY:}
+pizza.stripe.webhook-secret=${STRIPE_WEBHOOK_SECRET:}</code></pre>
+
+<p>Environment variables locally; a secret manager in production —
+<a href="/aws/aws-secrets-manager">AWS Secrets Manager</a>, Vault or your platform's equivalent. And
+if a key does reach a repository, rotate it. Deleting the commit is not enough.</p>
+
+<h2>The short list worth knowing by name</h2>
+
+<table>
+<thead><tr><th>Attack</th><th>What it is</th><th>Defence</th></tr></thead>
+<tbody>
+<tr><td><strong>SQL injection</strong></td><td>Input that changes the query's structure</td>
+<td>Bind parameters. Never concatenate.</td></tr>
+<tr><td><strong>Broken access control</strong></td><td>Reading someone else's record by changing an id</td>
+<td>Check ownership on every lookup</td></tr>
+<tr><td><strong>XSS</strong></td><td>Attacker's script runs in another user's browser</td>
+<td>Escape on output; treat stored text as data</td></tr>
+<tr><td><strong>CSRF</strong></td><td>Another site makes the browser send an authenticated request</td>
+<td>CSRF tokens — a cookie-auth problem, not a bearer-token one</td></tr>
+<tr><td><strong>Mass assignment</strong></td><td>Caller sets a field you never exposed, e.g. their role</td>
+<td>Separate request and response DTOs</td></tr>
+<tr><td><strong>Trusting client data</strong></td><td>Price or permission arrives in the request body</td>
+<td>Server decides; the client only chooses</td></tr>
+</tbody>
+</table>
+
+<p>One note on that CSRF row, because disabling CSRF protection is widely copy-pasted without the
+reasoning:</p>
+
+<pre class="language-java"><code class="language-java">// Safe to disable ONLY because this API is stateless and token-based: there is no
+// session cookie for a cross-site request to ride on. Never do this for a
+// cookie-authenticated app.
+.csrf(csrf -&gt; csrf.disable())</code></pre>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Authentication is who; authorization is what you may do. Different questions, different places.</li>
+<li>Slow hash for passwords — bcrypt, scrypt, Argon2. Fast hashes are the flaw.</li>
+<li>Sessions for server-rendered apps, tokens for APIs. A JWT is readable and cannot be revoked.</li>
+<li>Rules are ordered and first match wins. Specific before general, and end with default deny.</li>
+<li>Never look something up by a request id without checking ownership.</li>
+<li>Guard the service method too — URL rules protect one entry point.</li>
+<li>Vague auth errors. Detailed ones enumerate your users.</li>
+<li>Secrets from the environment. If one reaches git, rotate it.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-caching-async-and-messaging">caching, async work and
+messaging</a> — three ways to stop making the caller wait.</p>

@@ -1,0 +1,240 @@
+<p>JavaScript is the only language a browser runs, so you are going to learn it whether you like it
+or not. But the subset that matters in a component app is not the subset a beginner course
+teaches. Nobody spends their day on <code>for</code> loops and string methods. They spend it on
+immutable updates, async, modules, and describing the shape of data that arrived from somewhere
+else.</p>
+
+<p>This post names that subset. The language itself is
+<a href="/javascript">19 posts over here</a>; this is what to prioritise and why.</p>
+
+<h2 id="the-parts-that-carry-a-component-app">The parts that carry a component app</h2>
+
+<h3 id="updating-without-mutating">Updating without mutating</h3>
+
+<p>This is the single biggest habit change coming from most other languages. Frameworks decide
+what to redraw by asking "is this a different object than last time?". Change an object in place
+and the answer is no, so nothing re-renders and you get the classic bug where the data is right
+and the screen is wrong.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// Mutates: same array reference, so React sees no change and does not re-render.
+items.push(newItem);
+
+// Replaces: a new array, so the change is visible.
+const next = [...items, newItem];</code></pre>
+
+<p>The three you will write constantly — add, replace one, remove one:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const added   = [...items, newItem];
+const updated = items.map((i) => (i.id === target.id ? { ...i, quantity: 2 } : i));
+const removed = items.filter((i) => i.id !== target.id);</code></pre>
+
+<p>The demo app's Redux catalogue has exactly this helper, used for products, toppings and
+crusts:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/** Insert if new, replace if already present — the same shape for all three collections. */
+function upsert&lt;T extends { id: UUID }&gt;(list: T[], item: T): T[] {
+  return list.some((existing) =&gt; existing.id === item.id)
+    ? list.map((existing) =&gt; (existing.id === item.id ? item : existing))
+    : [...list, item];
+}</code></pre>
+
+<p>Note the trap: the spread is <strong>shallow</strong>. <code>{ ...order }</code> gives you a new
+order whose <code>items</code> array is still the original one. Nested updates need spreading at
+every level you change — which is one honest argument for Redux Toolkit, whose reducers let you
+write mutating-looking code and produce immutable results underneath.</p>
+
+<h3 id="the-async-model">The async model, which is what makes a spinner possible</h3>
+
+<p>JavaScript runs your code on one thread. If that thread is busy, nothing renders and nothing
+responds to clicks. Everything slow — network, timers, file reads — therefore returns a
+<strong>promise</strong>: a placeholder for a value that is not here yet.</p>
+
+<pre class="language-typescript"><code class="language-typescript">const response = await api.post&lt;AuthenticationResponse&gt;(path, body);</code></pre>
+
+<p>Three things to actually understand, rather than memorise:</p>
+
+<ul>
+<li><code>await</code> does not block the browser. It suspends <em>this function</em> and lets
+everything else carry on. That is why the page still scrolls while a request is in flight.</li>
+<li>An <code>async</code> function always returns a promise, even when you return a plain value.
+Forgetting to <code>await</code> a call gives you a promise where you wanted a number, and it will
+not error — it will just render <code>[object Promise]</code>.</li>
+<li>A rejected promise with no <code>catch</code> is an unhandled rejection. In a UI that is a
+button that spins forever.</li>
+</ul>
+
+<p>The shape you will write hundreds of times is try/catch/finally, because
+<code>finally</code> is what guarantees the spinner stops whichever way it went:</p>
+
+<pre class="language-typescript"><code class="language-typescript">setLoading(true);
+setError(null);
+try {
+  const response = await api.post&lt;AuthenticationResponse&gt;(path, body);
+  tokenStore.set(response.token);
+  setUser(response.user);
+} catch (err) {
+  const message =
+    err instanceof ApiError ? err.message : 'Could not reach the server. Is the API running?';
+  setError(message);
+  throw err;
+} finally {
+  setLoading(false);
+}</code></pre>
+
+<p>Also worth knowing: <code>Promise.all</code> to run independent requests concurrently instead
+of one after another, and <code>AbortController</code> to cancel one whose answer you no longer
+want — <a href="/frontend-dev/frontend-dev-talking-to-the-backend">post 7</a>.
+<a href="/javascript/javascript-promise">Promises in depth.</a></p>
+
+<h3 id="modules">Modules</h3>
+
+<p>Every file is a module with its own scope. Only what you export is visible, and only what you
+import is loaded. That last part is not just tidiness — it is what lets the bundler drop unused
+code and split your app into chunks (<a href="/frontend-dev/frontend-dev-build-and-deployment">post
+12</a>).</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type RootState = ReturnType&lt;typeof store.getState&gt;;</code></pre>
+
+<p>Prefer named exports. They are greppable and they survive a rename; a default export can be
+imported under any name at all, so the same component ends up called three different things across
+a codebase.</p>
+
+<h3 id="destructuring-and-defaults">Destructuring, defaults, and the two operators worth
+learning</h3>
+
+<pre class="language-typescript"><code class="language-typescript">const { method = 'GET', body, auth = false, signal } = options;</code></pre>
+
+<p>That single line pulls four fields out and supplies two defaults. You will read it in every
+codebase you ever open.</p>
+
+<p>The two operators people confuse:</p>
+
+<ul>
+<li><code>??</code> — nullish coalescing. Falls through only on <code>null</code> or
+<code>undefined</code>.</li>
+<li><code>||</code> — falls through on any falsy value, which includes <code>0</code> and
+<code>''</code>.</li>
+</ul>
+
+<p>For anything numeric that is a real bug: <code>price || 10</code> turns a legitimately free item
+into ten dollars, while <code>price ?? 10</code> does not. And <code>?.</code> optional chaining
+short-circuits instead of throwing on a missing object — which matters constantly with API data
+that has optional fields.</p>
+
+<h2 id="typescript-and-why-it-is-worth-it">TypeScript, and why it is worth it</h2>
+
+<p>TypeScript is JavaScript plus type annotations, checked at build time and then erased. The
+browser never sees a type. The point is that the class of bug it catches is exactly the class of
+bug frontend code is most prone to: <em>the data was not the shape I assumed</em>.</p>
+
+<h3 id="type-the-boundary-first">Type the boundary first</h3>
+
+<p>If you do nothing else, type the API responses. That is where your assumptions and reality
+diverge. The demo app keeps one file for it, and says why:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/**
+ * Shared domain types.
+ *
+ * These mirror the Spring Boot API's DTOs exactly. Keeping one file as the contract means that if
+ * the shapes drift, TypeScript fails the build instead of the UI failing at runtime.
+ */</code></pre>
+
+<p>"Fails the build instead of failing at runtime" is the entire value proposition in one
+sentence.</p>
+
+<h3 id="unions-beat-strings">Unions beat strings</h3>
+
+<pre class="language-typescript"><code class="language-typescript">export type OrderStatus =
+  | 'PENDING_PAYMENT'
+  | 'PAID'
+  | 'PREPARING'
+  | 'COMPLETED'
+  | 'CANCELLED';</code></pre>
+
+<p>Now a typo is a compile error, autocomplete offers the five real values, and if you add a sixth
+the compiler can point at every <code>switch</code> that no longer covers them all. As
+<code>string</code>, all of that is on you.</p>
+
+<p>The same idea names intent even when the underlying type is just text:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type UUID = string;</code></pre>
+
+<h3 id="model-loading-state-as-a-union">Model loading state as a union</h3>
+
+<p>A very common beginner shape is three independent fields — <code>data</code>,
+<code>loading</code>, <code>error</code> — which permits nonsense combinations like loading and
+errored at once, and forces every render to defend against them. A discriminated union makes the
+impossible states unrepresentable:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Remote&lt;T&gt; =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'ready'; data: T };</code></pre>
+
+<p>Switch on <code>status</code> and TypeScript narrows the type inside each branch, so
+<code>data</code> only exists where it actually exists.</p>
+
+<h3 id="errors-can-carry-structure">Errors can carry structure</h3>
+
+<p>A thrown <code>Error</code> with a string message loses everything the API told you. The demo
+app subclasses it so a form can render field-level messages:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/** An error carrying the API's structured body, so callers can show field-level messages. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: ApiErrorBody | null;
+
+  /** Field errors as a lookup, for rendering next to inputs. */
+  fieldErrors(): Record&lt;string, string&gt; {
+    const result: Record&lt;string, string&gt; = {};
+    for (const sub of this.body?.errors ?? []) {
+      if (sub.field) result[sub.field] = sub.message;
+    }
+    return result;
+  }
+}</code></pre>
+
+<p>Note <code>this.body?.errors ?? []</code> — optional chaining and nullish coalescing doing real
+work on a field the API may omit.</p>
+
+<h3 id="derive-types-do-not-declare-them-twice">Derive types, do not declare them twice</h3>
+
+<p>Any type you write out by hand next to a value can drift from it. Derive it instead and it
+cannot:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type RootState = ReturnType&lt;typeof store.getState&gt;;
+export type AppDispatch = typeof store.dispatch;</code></pre>
+
+<p>Add a Redux slice and <code>RootState</code> grows on its own.</p>
+
+<h3 id="any-is-a-loss">`any` is a loss, `unknown` is a question</h3>
+
+<p><code>any</code> switches the checker off for that value and everything downstream of it — one
+<code>any</code> at a boundary quietly untypes half a feature. <code>unknown</code> says "I do not
+know yet", and forces a check before use. The demo app parses responses as <code>unknown</code>
+before deciding what they are, which is the honest description of a JSON body that has just
+arrived over a network.</p>
+
+<h2 id="what-to-skip-for-now">What to skip for now</h2>
+
+<table class="table table-bordered">
+<thead><tr><th>Skip</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Deep <code>this</code> and <code>bind</code> rules</td><td>Arrow functions and hooks removed most of the need. Still worth <a href="/javascript/javascript-this-keyword">reading once</a> for interviews.</td></tr>
+<tr><td>Prototypes and <code>class</code> hierarchies</td><td>Modern frontend is functions and plain objects. You need <code>class</code> to subclass <code>Error</code> and little else.</td></tr>
+<tr><td>Advanced conditional/mapped types</td><td>Library-author territory. You will read them long before you need to write them.</td></tr>
+<tr><td>Decorators, generators, proxies</td><td>Real, rare, and not on the path to a first job.</td></tr>
+<tr><td>jQuery</td><td>Only if you inherit it.</td></tr>
+</tbody>
+</table>
+
+<h2 id="the-one-thing-to-take-from-this-post">The one thing to take from this post</h2>
+
+<p>Learn immutable updates until they are reflex, and type the boundary where data enters your app.
+Those two habits prevent most of the bugs you would otherwise spend your first year debugging —
+the screen that will not update, and the crash on a field that was <code>null</code> this
+time.</p>
+
+<p>Next: <a href="/frontend-dev/frontend-dev-what-to-learn-in-a-framework-as-a-frontend-engineer">What
+to Learn in a Framework</a>.</p>

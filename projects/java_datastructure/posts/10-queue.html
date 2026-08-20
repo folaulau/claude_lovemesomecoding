@@ -1,0 +1,133 @@
+<p>A queue is first in, first out: add at one end, remove from the other. Simple to describe, and
+the obvious implementation is wrong in a way that is worth seeing.</p>
+
+<h2>The obvious version, and why it is O(n)</h2>
+
+<p>Put the elements in an array, add at the end, remove from index 0 — and shift everything down one
+to close the gap. That dequeue is <strong>O(n)</strong>, and draining a queue of n elements becomes
+O(n²). It is the standard way a hand-rolled queue goes wrong.</p>
+
+<h2>The circular buffer</h2>
+
+<p>Nothing has to move. Keep the array still and let two indices chase each other around it, wrapping
+with a modulo.</p>
+
+<pre class="language-java"><code class="language-java">    private Object[] items;
+    private int head;  // index of the next element to come out
+    private int size;</code></pre>
+
+<pre class="language-java"><code class="language-java">    /** O(1) amortised. */
+    public void enqueue(E item) {
+        if (size == items.length) {
+            grow();
+        }
+        items[(head + size) % items.length] = item;
+        size++;
+    }
+
+    /** O(1) - nothing shifts, the head simply moves on. */
+    @SuppressWarnings("unchecked")
+    public E dequeue() {
+        if (size == 0) {
+            throw new NoSuchElementException("queue is empty");
+        }
+        E item = (E) items[head];
+        items[head] = null;
+        head = (head + 1) % items.length;
+        size--;
+        return item;
+    }</code></pre>
+
+<p>Storing <code>head</code> and <code>size</code> rather than <code>head</code> and
+<code>tail</code> is deliberate. With two indices, a full queue and an empty queue both have
+<code>head == tail</code> and you need a spare slot or a flag to tell them apart. Keeping
+<code>size</code> removes the ambiguity entirely.</p>
+
+<h2>⚠️ The growth bug</h2>
+
+<p>This is the one worth the whole post. When the buffer is full and the contents have
+<em>wrapped</em>, the logical order and the physical order are different:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">physical:  [ 4 ][ 5 ][ 2 ][ 3 ]
+                       ^head
+logical:     2, 3, 4, 5</code></pre>
+
+<p><code>Arrays.copyOf</code> preserves the <em>physical</em> layout, so the queue comes back
+reordered. The fix is to copy element by element in logical order and reset the head:</p>
+
+<pre class="language-java"><code class="language-java">    private void grow() {
+        Object[] bigger = new Object[items.length * 2];
+        for (int i = 0; i &lt; size; i++) {
+            bigger[i] = items[(head + i) % items.length];
+        }
+        items = bigger;
+        head = 0;
+    }</code></pre>
+
+<p>What makes this bug nasty is that it cannot happen until the buffer has wrapped <em>and</em> then
+filled. Every small test passes. So the test does it deliberately:</p>
+
+<pre class="language-java"><code class="language-java">        // Now head is 1 and the next enqueue wraps to index 0.
+        q.enqueue(4);
+        Check.eq(q.toString(), "[2, 3, 4]", "enqueue wraps around");
+        Check.eq(q.size(), 3, "size after wrap");
+
+        // Force a grow while the contents are wrapped - the case the naive copy breaks.
+        q.enqueue(5);
+        Check.eq(q.toString(), "[2, 3, 4, 5]", "grow unrolls the wrap in order");</code></pre>
+
+<p>This is the concrete version of the advice from
+<a href="/data-structure-algorithm/data-structure-algorithm-get-started">the first post</a>: test
+the ugly states, not the happy path.</p>
+
+<h2>Queue against stack</h2>
+
+<table>
+<thead><tr><th></th><th>Queue</th><th>Stack</th></tr></thead>
+<tbody>
+<tr><td>Order</td><td>FIFO — oldest first</td><td>LIFO — newest first</td></tr>
+<tr><td>Add / remove</td><td>opposite ends</td><td>the same end</td></tr>
+<tr><td>Traversal</td><td><a href="/data-structure-algorithm/data-structure-algorithm-breadth-first-search">BFS</a> — level by level</td><td><a href="/data-structure-algorithm/data-structure-algorithm-depth-first-search">DFS</a> — one path down</td></tr>
+</tbody>
+</table>
+
+<p>That last row is the one to hold on to. BFS and DFS are the <em>same algorithm</em>; the only
+difference is which of these two you put the frontier in.</p>
+
+<h2>In Java</h2>
+
+<pre class="language-java"><code class="language-java">Queue&lt;String&gt; queue = new ArrayDeque&lt;&gt;();
+queue.add("first");
+queue.add("second");
+queue.remove();   // "first"</code></pre>
+
+<p><code>ArrayDeque</code> is a circular buffer exactly like the one above, and is the right default.
+Two notes: it rejects <code>null</code> (because <code>poll()</code> returns <code>null</code> to
+mean "empty", so a null element would be ambiguous), and it is not thread-safe — for a producer and
+consumer on different threads you want <code>ArrayBlockingQueue</code> or
+<code>ConcurrentLinkedQueue</code>.</p>
+
+<p>Each operation comes in two flavours, and the difference is what happens when the queue is
+empty or full:</p>
+
+<table>
+<thead><tr><th>Do</th><th>Throws</th><th>Returns a value</th></tr></thead>
+<tbody>
+<tr><td>Insert</td><td><code>add</code></td><td><code>offer</code></td></tr>
+<tr><td>Remove</td><td><code>remove</code></td><td><code>poll</code></td></tr>
+<tr><td>Examine</td><td><code>element</code></td><td><code>peek</code></td></tr>
+</tbody>
+</table>
+
+<p>A <code>Deque</code> is a double-ended queue — add and remove at both ends — which is why one
+class serves as both a queue and a stack.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>FIFO, and both ends are O(1) — if you use a circular buffer.</li>
+<li>Shifting on dequeue is the O(n) mistake.</li>
+<li>Growing a wrapped buffer must unroll it in logical order.</li>
+<li>Track <code>head</code> and <code>size</code>, not <code>head</code> and <code>tail</code>.</li>
+<li><code>ArrayDeque</code> for both queues and stacks; no <code>null</code> elements.</li>
+</ul>

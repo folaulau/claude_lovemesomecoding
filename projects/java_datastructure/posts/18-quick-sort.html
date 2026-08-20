@@ -1,0 +1,143 @@
+<p>Quick sort picks a pivot, partitions the array so everything smaller is on the left and
+everything larger on the right, then recurses on both sides. It sorts in place and is usually the
+fastest sort in practice — with a worst case that is worth understanding before you trust it.</p>
+
+<h2>The idea</h2>
+
+<p>After one partition, the pivot is in its <strong>final</strong> position. Everything left of it
+is smaller, everything right is larger. Neither side ever needs to look at the other again.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">[ 5  3  8  1  9  2 ]        pivot = 5
+[ 3  1  2 ][5][ 8  9 ]      5 is now permanently correct
+  \_____/       \__/        recurse into each side independently</code></pre>
+
+<p>Compare <a href="/data-structure-algorithm/data-structure-algorithm-merge-sort">merge sort</a>,
+which does its work in the <em>combine</em> step. Quick sort does all of it in the
+<em>divide</em> step, and its combine is nothing at all — which is why it needs no extra array.</p>
+
+<h2>Partitioning</h2>
+
+<pre class="language-java"><code class="language-java">        int pivot = a[high];
+        int boundary = low;
+        for (int i = low; i &lt; high; i++) {
+            if (a[i] &lt; pivot) {
+                swap(a, i, boundary++);
+            }
+        }
+        swap(a, boundary, high);
+        return boundary;</code></pre>
+
+<p>This is the Lomuto scheme. <code>boundary</code> marks the end of the "smaller than pivot"
+region; anything smaller is swapped into it. One pass, O(n), no extra memory.</p>
+
+<h2>⚠️ The worst case is the input you are most likely to get</h2>
+
+<p>Quick sort is O(n log n) when the pivot lands near the middle, splitting the array roughly in
+half. It degrades to <strong>O(n²)</strong> when the pivot is consistently the smallest or largest
+element, because then one side holds n−1 elements and the recursion has n levels instead of
+log n.</p>
+
+<p>With a fixed pivot — always <code>a[high]</code>, as in every simple version — that happens on
+<strong>already-sorted input</strong>. Which is not an exotic case: it is what you get from a
+database ordered by id, an append-only log, or anything already sorted by something correlated.
+The naive quick sort is at its worst on the most ordinary data there is.</p>
+
+<pre class="language-java"><code class="language-java">        // A fixed pivot (always a[high]) makes ALREADY-SORTED input the O(n^2) worst case -
+        // which is the input you are most likely to be handed. Median-of-three costs three
+        // comparisons and removes that.
+        int mid = low + (high - low) / 2;
+        if (a[mid] &lt; a[low]) {
+            swap(a, low, mid);
+        }
+        if (a[high] &lt; a[low]) {
+            swap(a, low, high);
+        }
+        if (a[high] &lt; a[mid]) {
+            swap(a, mid, high);
+        }
+        swap(a, mid, high);</code></pre>
+
+<p>Median-of-three takes the middle value of the first, middle and last elements. On sorted input
+that is the true median, giving a perfect split. Three comparisons buy immunity to the most common
+bad case.</p>
+
+<p>It is not a guarantee — an adversary who knows your pivot rule can still construct O(n²) input,
+which is a real denial-of-service consideration for a server sorting user data. Randomising the
+pivot removes even that.</p>
+
+<h2>⚠️ Bounding the stack</h2>
+
+<pre class="language-java"><code class="language-java">    private static void quickSort(int[] a, int low, int high) {
+        while (low &lt; high) {
+            int p = partition(a, low, high);
+            // Recurse into the SMALLER side and loop on the larger. This caps stack depth at
+            // O(log n) even on input that would otherwise degrade - without it, a sorted array
+            // plus a bad pivot is a StackOverflowError, not merely a slow sort.
+            if (p - low &lt; high - p) {
+                quickSort(a, low, p - 1);
+                low = p + 1;
+            } else {
+                quickSort(a, p + 1, high);
+                high = p - 1;
+            }
+        }
+    }</code></pre>
+
+<p>Two techniques in six lines. <strong>Recurse into the smaller side</strong>, which is at most half
+the array, so the depth is at most log₂ n. Then <strong>loop on the larger side</strong> instead of
+recursing — a manual tail-call elimination, since
+<a href="/data-structure-algorithm/data-structure-algorithm-recursion">Java will not do it for
+you</a>.</p>
+
+<p>Without this, a degenerate partition means n stack frames: at a million elements the naive
+version is not slow, it <em>crashes</em>. And this is asserted, not asserted-to-be-true:</p>
+
+<pre class="language-java"><code class="language-java">        // Sorted input used to blow the stack with a fixed pivot. 100k elements proves it does not.
+        int[] ascending = new int[100_000];
+        for (int i = 0; i &lt; ascending.length; i++) {
+            ascending[i] = i;
+        }
+        quickSort(ascending);
+        Check.eq(ascending[0], 0, "100k sorted input does not overflow the stack");</code></pre>
+
+<h2>Why it beats merge sort in practice</h2>
+
+<p>Identical average complexity, but quick sort:</p>
+
+<ul>
+<li><strong>sorts in place</strong> — no O(n) buffer, no copying between arrays;</li>
+<li><strong>partitions sequentially</strong>, which is exactly the access pattern
+<a href="/data-structure-algorithm/data-structure-algorithm-memory">caches and prefetchers</a>
+reward;</li>
+<li><strong>has a smaller constant factor</strong> — swapping in place beats copying out and back.</li>
+</ul>
+
+<p>The complexity table says they are equal. The hardware does not.</p>
+
+<h2>Not stable</h2>
+
+<p>Partitioning swaps elements across the array, so equal elements can end up in either order. That
+is the one thing merge sort has that this does not, and it is why Java uses quick sort for
+primitives and merge sort for objects.</p>
+
+<h2>What the library actually does</h2>
+
+<p><code>Arrays.sort(int[])</code> is a <strong>dual-pivot quicksort</strong> — two pivots, three
+partitions — which does fewer swaps on typical data. It also switches to insertion sort on small
+subarrays, because insertion sort's tiny constant beats quick sort's below about 44 elements.</p>
+
+<p>Introsort, used in C++ and elsewhere, goes further: it counts recursion depth and switches to
+heap sort if it goes past ~2·log n. That converts the O(n²) worst case into a guaranteed
+O(n log n) while keeping quick sort's speed on ordinary input. It is the best of both, and worth
+naming if someone asks how you would make quick sort safe.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>Partition, then recurse — the pivot lands in its final place.</li>
+<li>In place, cache-friendly, usually the fastest in practice.</li>
+<li>O(n²) worst case, and a fixed pivot triggers it on sorted input.</li>
+<li>Median-of-three or a random pivot fixes the common case.</li>
+<li>Recurse into the smaller side and loop on the larger to cap the stack at O(log n).</li>
+<li>Not stable — which is why Java only uses it for primitives.</li>
+</ul>

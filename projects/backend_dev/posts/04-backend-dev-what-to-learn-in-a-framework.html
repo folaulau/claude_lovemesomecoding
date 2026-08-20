@@ -1,0 +1,251 @@
+<p>Spring Boot has thousands of classes. Django, Rails, Laravel, ASP.NET and Express are all large
+in the same way. You will use a small and surprisingly stable part of any of them, and it is
+<em>the same part</em> in all of them — which is why moving between frameworks is much easier than
+learning your first one.</p>
+
+<p>This post is that part: seven things to be able to do, in the order you need them. Every example
+is Spring Boot 4.1, but check the list against whatever you are using and the mapping will be
+obvious.</p>
+
+<h2>What a framework is actually for</h2>
+
+<p>A library is code you call. A framework is code that calls <em>you</em>. You write a method,
+annotate it, and something you did not write decides when to run it, what to pass it, and what to do
+with what it returns.</p>
+
+<p>That inversion is the whole idea, and everything below is a consequence of it. It also explains
+the frustration of the first few weeks: when your code does not run, there is no call site to put a
+breakpoint on. Learning where the framework's decision points are <em>is</em> learning the
+framework.</p>
+
+<h2>1. Start a project and add a dependency</h2>
+
+<p>For Spring Boot, <a href="https://start.spring.io">start.spring.io</a> generates the project. What
+you actually need to understand is the build file, because that is where every "it worked on my
+machine" argument ends up.</p>
+
+<p>Know these three things:</p>
+
+<ul>
+<li><strong>A starter pulls in a stack, not a library.</strong> Adding
+<code>spring-boot-starter-data-jpa</code> brings Hibernate, a connection pool, the transaction
+manager and their configuration. One line, thirty jars — that is intended.</li>
+<li><strong>Versions come from a parent or a BOM.</strong> That is why most dependencies in a Boot
+project have no <code>&lt;version&gt;</code>: the parent has already chosen a set that works
+together. Overriding one version by hand is how you get a runtime
+<code>NoSuchMethodError</code>.</li>
+<li><strong>Transitive dependencies exist.</strong> You depend on things you never named. When two
+of them want different versions of a third, you get to arbitrate.</li>
+</ul>
+
+<h2>2. Configuration and profiles</h2>
+
+<p>Your app runs on your laptop, in a test pipeline, in staging and in production. The code is
+identical; the database URL, the credentials and the log level are not.</p>
+
+<p>The rule: <strong>one artifact, many configurations.</strong> Never build a separate jar per
+environment — then the thing you tested is not the thing you shipped.</p>
+
+<p>In Boot, settings live in <code>application.properties</code>, with
+<code>application-&lt;profile&gt;.properties</code> layered on top when that profile is active:</p>
+
+<pre class="language-properties"><code class="language-properties"># application.properties — the defaults everyone gets
+server.port=8085
+spring.jpa.hibernate.ddl-auto=validate
+pizza.pricing.tax-rate=0.085
+pizza.pricing.delivery-fee=3.99
+
+# Stripe keys are NEVER committed. Put real test keys in
+# application-local.properties (gitignored) or set the env vars below.
+pizza.stripe.secret-key=${STRIPE_SECRET_KEY:}</code></pre>
+
+<p>Two details in that snippet are worth copying. <code>${STRIPE_SECRET_KEY:}</code> reads an
+environment variable and falls back to empty — that is how a secret gets in without ever being in
+git. And <code>ddl-auto=validate</code> makes the app refuse to start if the code and the database
+have drifted apart, which is a loud failure at boot instead of a silent mismatch found in
+production.</p>
+
+<p><strong>Then bind the settings into typed objects rather than reading them one string at a
+time.</strong> This is the single highest-value configuration habit:</p>
+
+<pre class="language-java"><code class="language-java">@Validated
+@ConfigurationProperties(prefix = "pizza")
+public record PizzaProperties(
+        @Valid Pricing pricing,
+        @Valid Jwt jwt,
+        @Valid Stripe stripe,
+        @Valid Cors cors,
+        @Valid Storage storage,
+        @Valid Mail mail) {
+
+    public record Pricing(
+            @DecimalMin("0.0") @DecimalMax("1.0") BigDecimal taxRate,
+            @DecimalMin("0.0") BigDecimal deliveryFee) {}
+
+    public record Jwt(@NotBlank @Size(min = 32) String secret, @Positive long expirationMinutes) {}
+}</code></pre>
+
+<p>Why it is worth the class: <code>@Validated</code> checks those constraints
+<strong>while the application is starting</strong>. A missing or nonsensical value fails the boot
+with a message naming the property. The version this replaced read nine separate values by hand, and
+a missing JWT secret became a null field — so the first person to log in got a
+<code>NullPointerException</code> from deep inside a JWT library. Two of those values were also
+declared in two different classes, with nothing checking that they still agreed.</p>
+
+<h2>3. Dependency injection</h2>
+
+<p>Your service needs a repository. Rather than constructing one, you declare that you need one and
+the framework supplies it.</p>
+
+<pre class="language-java"><code class="language-java">@Service
+@RequiredArgsConstructor
+public class JwtService {
+
+    private final PizzaProperties properties;   // supplied at startup
+    ...
+}</code></pre>
+
+<p>Lombok's <code>@RequiredArgsConstructor</code> generates the constructor from the
+<code>final</code> fields; Spring sees one constructor and injects into it.</p>
+
+<p>This is not fashion. It buys three concrete things:</p>
+
+<ul>
+<li><strong>You can test the class.</strong> Pass a fake in the constructor. If the class built its
+own dependency with <code>new</code>, there would be no seam.</li>
+<li><strong>Wiring lives in one place</strong> instead of being scattered across every call site.</li>
+<li><strong>Lifecycles are managed.</strong> One connection pool, shared, created once — not one per
+object that wanted a connection.</li>
+</ul>
+
+<p><strong>Prefer constructor injection over field injection.</strong> A <code>final</code> field set
+by a constructor cannot be null and cannot be reassigned, and the constructor signature makes it
+obvious when a class has grown eight dependencies and should be split. The full case is in
+<a href="/spring-boot/spring-boot-dependency-injection">Spring Boot – Dependency Injection</a>.</p>
+
+<h2>4. The path from URL to your method</h2>
+
+<p>You need a mental model of what happens between the request arriving and your code running,
+because that is where you will be debugging.</p>
+
+<ol>
+<li>The embedded server accepts the connection and hands it to a thread.</li>
+<li>Filters run — CORS, then security. A request can be rejected here and never reach you.</li>
+<li>The framework matches the method and path to one of your methods.</li>
+<li>The JSON body is deserialised into an object and validated.</li>
+<li><strong>Your method runs.</strong></li>
+<li>The returned object is serialised back to JSON with a status code.</li>
+<li>If anything threw, an exception handler turns it into an error response.</li>
+</ol>
+
+<pre class="language-java"><code class="language-java">@Tag(name = "Products", description = "Menu browsing (public)")
+@RequestMapping("/api/products")
+@RestController
+@Slf4j
+public class ProductRestController {
+
+    @Autowired
+    private ProductService productService;
+
+    @Operation(summary = "List the active menu, optionally filtered by type")
+    @GetMapping
+    public ResponseEntity&lt;List&lt;ProductDTO&gt;&gt; getProducts(@RequestParam(required = false) ProductType type) {
+        log.info("GET /api/products type={}", type);
+        List&lt;ProductDTO&gt; products = type == null ? productService.getMenu() : productService.getByType(type);
+        return new ResponseEntity&lt;&gt;(products, OK);
+    }
+}</code></pre>
+
+<p>Nothing in that method opens a socket, parses JSON or writes a status line. That is step 1, 4 and
+6 done for you. Learning where steps 2 and 7 are configured is most of what "learning the framework"
+means in practice.</p>
+
+<h2>5. The three layers, and why they are not bureaucracy</h2>
+
+<table>
+<thead><tr><th>Layer</th><th>Job</th><th>Must not</th></tr></thead>
+<tbody>
+<tr><td><strong>Controller</strong></td><td>Speak HTTP. Bind the request, return a status.</td>
+<td>Contain business rules</td></tr>
+<tr><td><strong>Service</strong></td><td>The actual rules. Owns the transaction boundary.</td>
+<td>Know that HTTP exists</td></tr>
+<tr><td><strong>Repository / DAO</strong></td><td>Talk to the database.</td>
+<td>Make decisions</td></tr>
+</tbody>
+</table>
+
+<p>The test for whether you have this right: <strong>could a scheduled job call your service?</strong>
+If the rules are in the controller, no — you would have to duplicate them, and the copy will drift.
+In the demo app a message listener, a scheduled job and three controllers all call the same
+services, which is only possible because none of those services knows what a request is.</p>
+
+<h2>6. Cross-cutting behaviour is annotations — and they are all the same mechanism</h2>
+
+<p>Transactions, caching, security, async, retries, timing. You do not write these; you annotate a
+method and the framework wraps it.</p>
+
+<pre class="language-java"><code class="language-java">@Override
+@Cacheable(value = CacheConfig.MENU_CACHE, keyGenerator = "methodAwareKeyGenerator")
+@Transactional(readOnly = true)
+public List&lt;ProductDTO&gt; getMenu() {
+    log.debug("Getting the active menu");
+    return mapper.mapProductsToProductDTOs(productDAO.findActiveMenu());
+}</code></pre>
+
+<p>Two annotations replace a cache lookup, a cache write, a transaction begin, a commit and a
+rollback handler.</p>
+
+<h2>7. The proxy rule — learn this one properly</h2>
+
+<p>Spring implements all of the above by wrapping your bean in a <strong>proxy</strong>. Calls from
+other beans go through the proxy and get the behaviour. A call from one method of a class to
+another method of the <em>same</em> class does not — it goes straight to the target and skips the
+wrapper entirely.</p>
+
+<pre class="language-java"><code class="language-java">public void a() { b(); }   // b() is NOT advised - internal call, no proxy involved
+public void b() { ... }    // advised only when some OTHER bean calls it</code></pre>
+
+<p>Which means, silently and with no error at all:</p>
+
+<ul>
+<li>a <code>@Transactional</code> method called from a sibling runs with <strong>no
+transaction</strong>;</li>
+<li>a <code>@Cacheable</code> method called internally <strong>always hits the database</strong>;</li>
+<li>an <code>@Async</code> method called internally runs <strong>on the caller's thread</strong>;</li>
+<li>a <code>@PreAuthorize</code> method called internally is <strong>not checked at all</strong>.</li>
+</ul>
+
+<p><strong>If an annotation appears to be doing nothing, look for a self-invocation before you look
+at anything else.</strong> The fix is to move the annotated method onto another bean — where it
+usually belonged anyway.</p>
+
+<h2>How to tell a framework problem from your own bug</h2>
+
+<p>Almost always it is your bug. Before assuming otherwise:</p>
+
+<ul>
+<li><strong>Read the whole stack trace</strong>, especially the last <em>"Caused by"</em>. The real
+error is at the bottom.</li>
+<li><strong>Check the startup log.</strong> Boot reports which port it bound, which profiles are
+active and which auto-configurations ran. Half of "it does not work" is the wrong profile.</li>
+<li><strong>Check for a self-invocation</strong> — see above.</li>
+<li><strong>Read the reference documentation, not a 2018 blog post.</strong> Spring Security 7
+removed the configuration style that most search results still show, so those examples do not even
+compile.</li>
+</ul>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>A framework calls you. Learning it means learning where its decision points are.</li>
+<li>One artifact, many configurations. Secrets come from the environment, never from git.</li>
+<li>Bind configuration into validated, typed objects so a bad value fails at startup.</li>
+<li>Constructor injection, so the class stays testable and its dependencies stay visible.</li>
+<li>Controller speaks HTTP, service holds the rules, repository talks to the database. Ask: could a
+scheduled job call this service?</li>
+<li>Cross-cutting behaviour is annotations, all built on proxies — so self-invocation silently
+skips every one of them.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-apis-and-http">HTTP and API design</a> — the contract you
+hand to everyone else.</p>

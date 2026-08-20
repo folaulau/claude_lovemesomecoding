@@ -1,0 +1,159 @@
+<p>A backend engineer builds the part of an application that runs on a server: the data, the rules,
+and the interface other programs call to reach both.</p>
+
+<p>That sentence is true and almost useless. It describes what you produce, not what the job feels
+like or what you are actually held responsible for. This post is the useful version — the job
+described by what lands in your queue.</p>
+
+<h2>What you own</h2>
+
+<p>Four things. Everything else is negotiable; these are yours.</p>
+
+<h3>1. The contract</h3>
+
+<p>Other people's code calls yours. A web app, a mobile app, another team's service, a scheduled
+job. What you expose — the URLs, the fields, the status codes, the errors — is a promise, and once
+someone depends on it you cannot quietly change it. Designing that promise so it survives the next
+six features is a real skill and it is
+<a href="/backend-dev/backend-dev-apis-and-http">post 5 of this track</a>.</p>
+
+<h3>2. The data</h3>
+
+<p>You decide what gets stored, in what shape, and what "correct" means for it. A frontend bug shows
+a wrong number and you refresh the page. A backend bug writes a wrong number and it is still wrong
+next year. Data outlives every other decision in the system, including the language it was written
+in.</p>
+
+<h3>3. Correctness when things happen at once</h3>
+
+<p>This is the part that separates backend work from most other programming, and it is rarely
+taught. Your code does not run once. It runs a thousand times concurrently, on several machines, and
+two of those runs are about to touch the same row.</p>
+
+<p>The classic version: two people click "buy" on the last item at the same instant. Both requests
+read <em>stock = 1</em>, both decide it is fine, both write <em>stock = 0</em>, and you have sold two
+of something you had one of. Nothing crashed. No test failed. You will find out from a customer.</p>
+
+<h3>4. What happens at 3am</h3>
+
+<p>If it breaks at night, someone has to be able to tell what broke and why. That is not an ops
+concern bolted on afterwards — it is a property of code you either wrote in or did not, and it is
+<a href="/backend-dev/backend-dev-deployment-and-observability">post 10</a>.</p>
+
+<h2>Where the line is</h2>
+
+<p>Titles vary wildly between companies. Roughly:</p>
+
+<table>
+<thead><tr><th>They handle</th><th>You handle</th></tr></thead>
+<tbody>
+<tr><td><strong>Frontend</strong> — what it looks like, what happens on click, browser state</td>
+<td>What the data <em>is</em>, and the API they call to get it</td></tr>
+<tr><td><strong>DevOps / SRE</strong> — the cluster, the pipeline, the network, the alerts</td>
+<td>An app that can be deployed, configured and observed by those tools</td></tr>
+<tr><td><strong>DBA</strong> (if there is one) — backups, replication, tuning the server</td>
+<td>The schema, the indexes your queries need, and the queries themselves</td></tr>
+<tr><td><strong>Data engineering</strong> — warehouses, pipelines, analytics</td>
+<td>The transactional data they read <em>from</em></td></tr>
+<tr><td><strong>QA</strong> — exploratory and end-to-end testing</td>
+<td>Unit and integration tests, which are part of the change, not a later step</td></tr>
+</tbody>
+</table>
+
+<p>At a small company you are all of these. That is not a warning — it is the fastest way to learn,
+because you get to see which decisions cost you later.</p>
+
+<h2>A real ticket, start to finish</h2>
+
+<p><em>"Customers should be able to check out without creating an account."</em></p>
+
+<p>Guest checkout. Sounds like a frontend change. It is almost entirely backend, and it touches most
+of this track:</p>
+
+<ol>
+<li><strong>Ask what it means.</strong> If there is no account, where does the confirmation email go?
+Answer: the request must carry one. That is a new required field, and now it is a schema question.</li>
+<li><strong>Change the model.</strong> An order currently points at a user. Now it points at a user
+<em>or</em> carries a guest email — and exactly one of the two must be present.</li>
+<li><strong>Change the security rules.</strong> <code>POST /api/orders</code> has to stop requiring a
+token. Order <em>history</em> must keep requiring one, or every guest sees everybody's orders.</li>
+<li><strong>Validate.</strong> A missing guest email is a 400 with a message a human can read, not a
+null pointer four layers down.</li>
+<li><strong>Write the migration.</strong> The column has to be added to a table with live rows in
+it, without downtime.</li>
+<li><strong>Test both paths.</strong> Signed-in checkout still works; guest checkout works; a guest
+cannot read someone else's order.</li>
+<li><strong>Deploy</strong> and watch the error rate.</li>
+</ol>
+
+<p>Here is step 2 and step 4 as they actually appear in the demo app — the whole "one of the two"
+rule, in the first lines of the method that creates an order:</p>
+
+<pre class="language-java"><code class="language-java">@Override
+@Transactional
+public OrderCreateResponseDTO createOrder(OrderCreateDTO dto, String userEmail) {
+    // Guest checkout is the null-user path. A signed-in order attaches the account instead.
+    User user = userEmail == null ? null : userDAO.findByEmail(userEmail).orElse(null);
+
+    if (user == null &amp;&amp; (dto.guestEmail() == null || dto.guestEmail().isBlank())) {
+        throw ApiException.badRequest("An email address is required to check out as a guest");
+    }
+    if (dto.orderType() == OrderType.DELIVERY
+            &amp;&amp; (dto.addressLine1() == null || dto.addressLine1().isBlank())) {
+        throw ApiException.badRequest("A delivery address is required for delivery orders");
+    }
+
+    // Every figure below comes from the database, never from the request.
+    PricingService.PricedOrder priced = pricingService.price(dto);
+    ...
+}</code></pre>
+
+<p>Four lines of business rule, stated once, in the place that cannot be bypassed. Note the last
+comment. That is step 4 of the ticket nobody wrote down, and it is the difference between an
+e-commerce API and a free pizza dispenser.</p>
+
+<h2>The rule that comment is protecting</h2>
+
+<p><strong>Never trust the client.</strong> Not the browser, not the mobile app, not the other team's
+service — even when your own team wrote all three.</p>
+
+<p>A request is just bytes on a socket. Anybody can send any bytes. If the price of a pizza arrives
+in the request body, then the price of a pizza is whatever the sender says it is, and someone will
+eventually notice. In the demo app the request chooses <em>which</em> product and <em>which</em>
+size; every figure is then read from the <code>product_size</code> table by the server.</p>
+
+<p>The general form: <strong>the client chooses, the server decides.</strong> Identity, prices,
+permissions, timestamps and ids are all server-side facts. Validation in the browser is a courtesy
+to honest users; it is not a security control, because it runs on a machine you do not own.</p>
+
+<h2>What the day actually looks like</h2>
+
+<p>Less typing than you expect. A rough shape:</p>
+
+<ul>
+<li><strong>Reading code</strong> — most of your time, most days. You will spend far longer
+understanding a system than adding to it.</li>
+<li><strong>Working out what was actually asked for.</strong> The guest checkout ticket above was one
+sentence and had at least three unstated decisions in it. Finding those before you build is the
+highest-value thing you do all week.</li>
+<li><strong>Writing and testing the change.</strong></li>
+<li><strong>Reviewing other people's changes</strong>, and having yours reviewed.</li>
+<li><strong>Investigating something that is behaving oddly in production</strong>, usually with logs
+and a database client.</li>
+</ul>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>You own the contract, the data, correctness under concurrency, and being able to debug it at
+3am.</li>
+<li>Data outlives everything. Get the shape right before you get the feature done.</li>
+<li>The client chooses; the server decides. Prices, permissions and identity are never taken from a
+request.</li>
+<li>Concurrency is the thing that will surprise you. Your code runs many times at once, and two of
+those runs are about to touch the same row.</li>
+<li>A one-sentence ticket usually hides three decisions. Ask before you build.</li>
+</ul>
+
+<p>Next: <a href="/backend-dev/backend-dev-java-and-the-jvm">the Java you actually need</a> before
+touching a framework.</p>

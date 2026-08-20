@@ -1,0 +1,146 @@
+<p>Binary search halves the search space at every comparison. A billion sorted elements take about
+thirty steps. It is also, famously, harder to write correctly than it looks.</p>
+
+<h2>Why log n is so good</h2>
+
+<table>
+<thead><tr><th>Elements</th><th>Linear search</th><th>Binary search</th></tr></thead>
+<tbody>
+<tr><td>100</td><td>100</td><td>7</td></tr>
+<tr><td>1,000</td><td>1,000</td><td>10</td></tr>
+<tr><td>1,000,000</td><td>1,000,000</td><td>20</td></tr>
+<tr><td>1,000,000,000</td><td>1,000,000,000</td><td>30</td></tr>
+</tbody>
+</table>
+
+<p>Doubling the data adds <strong>one</strong> comparison. That is what logarithmic means, and it is
+why sorted data is worth so much.</p>
+
+<h2>The precondition</h2>
+
+<p><strong>The array must be sorted.</strong> Not "should be" — on unsorted input binary search
+returns a wrong answer rather than failing, which is the worst kind of bug. Sorting costs
+O(n log n), so binary search pays off when you search the same data many times, and not when you
+sort just to search once.</p>
+
+<h2>The implementation, and its three traps</h2>
+
+<pre class="language-java"><code class="language-java">    public static int binarySearch(int[] sorted, int target) {
+        int low = 0;
+        int high = sorted.length - 1;
+
+        while (low &lt;= high) {
+            // NOT (low + high) / 2. On a large array that sum overflows int and goes negative,
+            // and the negative index throws. Java's own Arrays.binarySearch carried this bug
+            // until 2006. Subtracting first cannot overflow.
+            int mid = low + (high - low) / 2;
+
+            if (sorted[mid] == target) {
+                return mid;
+            }
+            if (sorted[mid] &lt; target) {
+                low = mid + 1;   // mid + 1, not mid, or a two-element range loops forever
+            } else {
+                high = mid - 1;
+            }
+        }
+        return -1;
+    }</code></pre>
+
+<p><strong>Trap 1 — the midpoint overflow.</strong> <code>(low + high) / 2</code> is the obvious
+spelling and it is wrong. Once <code>low + high</code> exceeds <code>Integer.MAX_VALUE</code> it
+wraps negative, and <code>sorted[negative]</code> throws. This was in the JDK's own
+<code>Arrays.binarySearch</code> for nine years, and in Jon Bentley's <em>Programming Pearls</em>
+before that. It needs an array of over a billion elements to trigger, which is why it survived so
+long — and why the test states it as arithmetic instead of allocating one:</p>
+
+<pre class="language-java"><code class="language-java">        // The overflow case, stated as an arithmetic fact rather than by allocating 2bn ints.
+        int low = 1_500_000_000;
+        int high = 2_000_000_000;
+        Check.isTrue(low + high &lt; 0, "low + high really does overflow");
+        Check.isTrue(low + (high - low) / 2 &gt; 0, "the safe form does not");</code></pre>
+
+<p><strong>Trap 2 — the infinite loop.</strong> Writing <code>low = mid</code> instead of
+<code>low = mid + 1</code> hangs forever on a two-element range: integer division rounds down, so
+<code>mid</code> stays equal to <code>low</code> and nothing shrinks. Always exclude the element you
+just rejected.</p>
+
+<p><strong>Trap 3 — the boundary.</strong> <code>while (low &lt;= high)</code>, not
+<code>&lt;</code>. With <code>&lt;</code>, a range of one element is never examined, so the target
+is missed whenever it happens to be last. The tests check both ends and a one-element array
+precisely because that is where this shows up.</p>
+
+<h2>The variant that is actually useful</h2>
+
+<p>Plain binary search answers "is it there". Far more often you want "where does it
+<em>belong</em>":</p>
+
+<pre class="language-java"><code class="language-java">    public static int lowerBound(int[] sorted, int target) {
+        int low = 0;
+        int high = sorted.length;   // one PAST the end, deliberately
+        while (low &lt; high) {
+            int mid = low + (high - low) / 2;
+            if (sorted[mid] &lt; target) {
+                low = mid + 1;
+            } else {
+                high = mid;         // mid might be the answer, so do not exclude it
+            }
+        }
+        return low;
+    }</code></pre>
+
+<p>This returns the first index whose value is ≥ target — an insertion point, the start of a range,
+"the first element greater than x". Notice all three differences from the version above:
+<code>high</code> starts one past the end, the loop is <code>&lt;</code> not <code>&lt;=</code>, and
+the else branch keeps <code>mid</code> rather than excluding it. Each follows from the fact that
+<code>mid</code> may itself be the answer.</p>
+
+<pre class="language-java"><code class="language-java">        Check.eq(lowerBound(sorted, 5), 2, "lowerBound on an exact match");
+        Check.eq(lowerBound(sorted, 4), 2, "lowerBound between values");
+        Check.eq(lowerBound(sorted, 0), 0, "lowerBound below everything");
+        Check.eq(lowerBound(sorted, 99), 6, "lowerBound above everything");</code></pre>
+
+<p>It never returns "not found" — it returns where the value would go, which is strictly more
+information.</p>
+
+<h2>Recursive or iterative</h2>
+
+<pre class="language-java"><code class="language-java">        return sorted[mid] &lt; target
+                ? binarySearchRecursive(sorted, target, mid + 1, high)
+                : binarySearchRecursive(sorted, target, low, mid - 1);</code></pre>
+
+<p>Identical O(log n) time, but O(log n) stack instead of O(1). Since log₂ of a billion is thirty,
+the stack is never the problem here — it is a rare case where recursion costs essentially nothing.
+Prefer whichever reads better; the iterative form is more common.</p>
+
+<h2>Use the library</h2>
+
+<pre class="language-java"><code class="language-java">int index = Arrays.binarySearch(sorted, target);</code></pre>
+
+<p>One subtlety worth knowing: on a miss it returns <code>-(insertionPoint) - 1</code> — a negative
+number encoding where the value <em>would</em> go. The <code>-1</code> offset exists because
+insertion point 0 would otherwise be indistinguishable from a hit at index 0. So
+<code>(-result) - 1</code> recovers the insertion point, which is <code>lowerBound</code> by another
+name.</p>
+
+<p><code>Collections.binarySearch</code> does the same for lists, and
+<code>TreeMap</code>'s <code>floorKey</code>, <code>ceilingKey</code>, <code>headMap</code> and
+<code>tailMap</code> are the same idea on a tree.</p>
+
+<h2>Beyond arrays</h2>
+
+<p>Binary search works on anything with a monotonic yes/no answer, not just sorted arrays. "What is
+the smallest capacity that finishes the job in time?" — if capacity 10 works then 11 works, so the
+answers form a sorted sequence of false…false, true…true and you can binary search the
+<em>answer</em>. Recognising that pattern is what the technique is really worth.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+<li>O(log n): doubling the data costs one more comparison.</li>
+<li>The array must already be sorted, or the answer is silently wrong.</li>
+<li><code>low + (high - low) / 2</code>, always.</li>
+<li>Exclude the rejected element, or it loops forever.</li>
+<li><code>lowerBound</code> answers a better question than "is it there".</li>
+<li>Anything with a monotonic predicate can be binary searched.</li>
+</ul>
