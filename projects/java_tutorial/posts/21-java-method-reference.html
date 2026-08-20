@@ -1,0 +1,212 @@
+<p>A method reference is a lambda with the noise removed. When a lambda does nothing but call one
+existing method, <code>::</code> lets you name that method instead of describing the call.</p>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("ana", "bo");
+
+names.stream().map(s -&gt; s.toUpperCase()).toList();     // lambda
+names.stream().map(String::toUpperCase).toList();      // method reference — identical
+</code></pre>
+
+<p>They compile to the same thing — the method reference is not faster, and it is not a different
+mechanism. It is the same lambda with the parameter name and the call syntax removed, which is worth
+doing only when that removal makes the line easier to read.</p>
+
+<p>This post covers the four forms, because the third one looks wrong the first time you meet it, and
+then the rule for choosing between a reference and a lambda.</p>
+
+<h2>1. Static method</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; numbers = List.of("1", "2", "3");
+
+System.out.println(numbers.stream().map(s -&gt; Integer.parseInt(s)).toList());  // lambda
+System.out.println(numbers.stream().map(Integer::parseInt).toList());         // [1, 2, 3]
+
+System.out.println(List.of(1, 2, 3).stream().reduce(0, Integer::sum));        // 6
+</code></pre>
+
+<p><code>ClassName::staticMethod</code>. The argument becomes the method's argument. This is the
+straightforward case.</p>
+
+<h2>2. Instance method of a particular object</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo");
+
+names.forEach(n -&gt; System.out.println(n));      // lambda
+names.forEach(System.out::println);             // bound to the System.out object
+
+String prefix = "Order-";
+System.out.println(names.stream().map(prefix::concat).toList());   // [Order-Ana, Order-Bo]
+</code></pre>
+
+<p><code>object::method</code>. The object is fixed — <code>System.out</code> here — and the stream
+element becomes the argument. This is called a <em>bound</em> reference because the receiver is
+already decided.</p>
+
+<h2>3. Instance method of an arbitrary object</h2>
+
+<p>This is the one that confuses people:</p>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Christopher", "Bo");
+
+System.out.println(names.stream().map(s -&gt; s.toUpperCase()).toList());   // lambda
+System.out.println(names.stream().map(String::toUpperCase).toList());    // [CHRISTOPHER, BO]
+
+System.out.println(names.stream().map(String::length).toList());         // [11, 2]
+System.out.println(names.stream().sorted(String::compareToIgnoreCase).toList());
+</code></pre>
+
+<p><code>String::toUpperCase</code> looks like a static call, and <code>toUpperCase</code> is not
+static. The rule: <strong>the first argument becomes the receiver.</strong>
+<code>String::toUpperCase</code> means "take a String and call <code>toUpperCase</code> on it" — the
+stream element is not passed <em>to</em> the method, it is the object the method is called
+<em>on</em>.</p>
+
+<p>Compare with form 2 and the difference is which part is fixed:</p>
+
+<table>
+<thead><tr><th>Form</th><th>Written</th><th>Means</th></tr></thead>
+<tbody>
+<tr><td>Bound (2)</td><td><code>prefix::concat</code></td><td><code>s -&gt;
+prefix.concat(s)</code> — receiver fixed, element is the argument</td></tr>
+<tr><td>Unbound (3)</td><td><code>String::toUpperCase</code></td><td><code>s -&gt;
+s.toUpperCase()</code> — element is the receiver</td></tr>
+</tbody>
+</table>
+
+<p>With a two-argument functional interface, the first becomes the receiver and the second the
+argument:</p>
+
+<pre class="language-java"><code class="language-java">BiFunction&lt;String, String, Boolean&gt; starts = String::startsWith;
+System.out.println(starts.apply("hello world", "hello"));    // true — "hello world".startsWith("hello")
+</code></pre>
+
+<h2>4. Constructor</h2>
+
+<pre class="language-java"><code class="language-java">record Person(String name) { }
+
+class Demo {
+    void run() {
+        List&lt;String&gt; names = List.of("Ana", "Bo");
+
+        System.out.println(names.stream().map(n -&gt; new Person(n)).toList());   // lambda
+        System.out.println(names.stream().map(Person::new).toList());          // constructor ref
+
+        Supplier&lt;List&lt;String&gt;&gt; maker = ArrayList::new;
+        System.out.println(maker.get().size());                                 // 0
+
+        List&lt;String&gt; copy = names.stream()
+                .collect(Collectors.toCollection(ArrayList::new));
+        System.out.println(copy.size());                                        // 2
+    }
+}
+</code></pre>
+
+<p><code>ClassName::new</code>. The compiler picks the constructor whose parameters match the
+functional interface, so <code>Person::new</code> works for a one-argument <code>Function</code> and
+<code>ArrayList::new</code> works for a no-argument <code>Supplier</code>.</p>
+
+<h2>When a method reference is clearer</h2>
+
+<p>The test is narrow and worth applying literally: <strong>use a method reference when the lambda's
+entire body is one call and the arguments pass straight through, unchanged and in order.</strong></p>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("ana", "bo");
+
+// Yes — pure pass-through
+names.stream().map(String::toUpperCase).toList();
+names.forEach(System.out::println);
+
+// No — the argument is transformed first, so a reference cannot express it
+names.stream().map(s -&gt; s.toUpperCase() + "!").toList();
+
+// No — the arguments are reordered
+BiFunction&lt;String, String, Boolean&gt; reversed = (a, b) -&gt; b.startsWith(a);
+System.out.println(reversed.apply("he", "hello"));    // true
+</code></pre>
+
+<p>The point is readability, not brevity for its own sake. <code>String::toUpperCase</code> is easier
+to read than <code>s -&gt; s.toUpperCase()</code> because there is no invented variable name to
+follow. But a method reference that forces the reader to work out which form it is has cost more than
+it saved.</p>
+
+<h2>Comparators, where they pay off most</h2>
+
+<p>Sorting is where method references genuinely transform readability, because
+<code>Comparator</code>'s factory methods are built to take them:</p>
+
+<pre class="language-java"><code class="language-java">record Person(String name, String city, int age) { }
+
+class Demo {
+    void run() {
+        List&lt;Person&gt; people = new ArrayList&lt;&gt;(List.of(
+                new Person("Cy", "Seattle", 35),
+                new Person("Ana", "Nuku'alofa", 30),
+                new Person("Bo", "Seattle", 30)));
+
+        people.sort(Comparator.comparing(Person::name));
+        people.sort(Comparator.comparingInt(Person::age).reversed());
+
+        // Sort by age, then break ties by name
+        people.sort(Comparator.comparingInt(Person::age).thenComparing(Person::name));
+        System.out.println(people.stream().map(Person::name).toList());   // [Ana, Bo, Cy]
+
+        // Nulls last, without writing the null checks yourself
+        people.sort(Comparator.comparing(Person::city, Comparator.nullsLast(Comparator.naturalOrder())));
+    }
+}
+</code></pre>
+
+<p>Written out as lambdas, that <code>thenComparing</code> chain becomes a multi-line
+<code>compare</code> method with an <code>if</code> in it. The method-reference version says what the
+sort key is and nothing else — and it is the form you will see in nearly all modern Java.</p>
+
+<h2>What they cannot do</h2>
+
+<p>Two limits worth knowing before you go looking for a syntax that does not exist:</p>
+
+<ul>
+<li><strong>No arguments can be supplied.</strong> <code>Integer::parseInt</code> is fine;
+"parseInt with radix 16" is not expressible — write the lambda.</li>
+<li><strong>No overload disambiguation.</strong> If two overloads both fit the functional interface,
+the reference is ambiguous and the compiler says so. A lambda with explicit parameter types resolves
+it.</li>
+</ul>
+
+<p>There is also a common surprise: <code>this::method</code> and <code>super::method</code> are both
+legal and useful inside a class, referring to the current object's method — the bound form from
+section 2, with <code>this</code> as the fixed receiver.</p>
+
+<h2>Extracting a method to get one</h2>
+
+<p>The best use of method references is often to give a piece of logic a name:</p>
+
+<pre class="language-java"><code class="language-java">record Order(String id, double total, boolean paid) { }
+
+class Report {
+    // A predicate with a name is documentation the compiler checks
+    static boolean isLargeUnpaid(Order o) {
+        return !o.paid() &amp;&amp; o.total() &gt; 100;
+    }
+
+    void run() {
+        List&lt;Order&gt; orders = List.of(
+                new Order("a", 250, false),
+                new Order("b", 50, false));
+
+        // Inline: the reader has to parse the condition
+        System.out.println(orders.stream().filter(o -&gt; !o.paid() &amp;&amp; o.total() &gt; 100).count());
+
+        // Named: the reader gets the intent
+        System.out.println(orders.stream().filter(Report::isLargeUnpaid).count());   // 1
+    }
+}
+</code></pre>
+
+<p>This also makes the condition testable on its own and reusable in the three other places that will
+eventually need it.</p>
+
+<h2>Next</h2>
+
+<p><code>findFirst()</code> returned an <code>Optional</code> back in
+<a href="/java/java-stream">post 20</a> without explanation.
+<a href="/java/java-optional">Optional</a> is next.</p>

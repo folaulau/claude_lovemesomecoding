@@ -1,0 +1,206 @@
+<p>An exception is Java's way of saying "I cannot continue, and here is exactly why". Handling them
+well is mostly about restraint: catching only what you can actually do something about, and never
+hiding what you cannot.</p>
+
+<h2><code>try</code>, <code>catch</code>, <code>finally</code></h2>
+
+<pre class="language-java"><code class="language-java">void parse(String input) {
+    try {
+        int value = Integer.parseInt(input);
+        System.out.println(value * 2);
+    } catch (NumberFormatException e) {
+        System.out.println("not a number: " + input);
+    } finally {
+        System.out.println("this runs either way");
+    }
+}
+</code></pre>
+
+<p>The <code>try</code> block holds code that might fail. The <code>catch</code> runs only if the
+named exception is thrown. The <code>finally</code> runs whichever happens — including when the
+<code>try</code> returns early — which is why it was traditionally used for cleanup.</p>
+
+<p>You can catch several types, most specific first, or combine them:</p>
+
+<pre class="language-java"><code class="language-java">void handle(String input) {
+    try {
+        System.out.println(Integer.parseInt(input.strip()));
+    } catch (NumberFormatException | NullPointerException e) {
+        System.out.println("bad input: " + e.getMessage());
+    }
+}
+</code></pre>
+
+<p>Order matters: a <code>catch</code> for a parent type placed before a child type makes the child
+unreachable, and the compiler rejects it.</p>
+
+<h2>try-with-resources</h2>
+
+<p>Anything holding a file handle, socket or connection must be closed. Doing that in
+<code>finally</code> is verbose and easy to get wrong, so do not:</p>
+
+<pre class="language-java"><code class="language-java">void read(Path path) throws IOException {
+    try (BufferedReader reader = Files.newBufferedReader(path)) {
+        System.out.println(reader.readLine());
+    }   // closed automatically, even if an exception was thrown
+}
+</code></pre>
+
+<p>Any resource declared in the parentheses is closed automatically, in reverse order, before any
+<code>catch</code> runs. It works for anything implementing <code>AutoCloseable</code>, including
+your own classes. <strong>Use it for every resource</strong> — there is no case where the manual
+<code>finally</code> version is better.</p>
+
+<h2>Checked versus unchecked</h2>
+
+<p>This split is unique to Java and it is the part people argue about.</p>
+
+<table>
+<thead><tr><th></th><th>Checked</th><th>Unchecked</th></tr></thead>
+<tbody>
+<tr><td>Extends</td><td><code>Exception</code></td><td><code>RuntimeException</code></td></tr>
+<tr><td>Compiler</td><td>forces you to catch or declare it</td><td>ignores it</td></tr>
+<tr><td>Means</td><td>"this can fail for reasons outside your control"</td><td>"someone made a
+programming mistake"</td></tr>
+<tr><td>Examples</td><td><code>IOException</code>, <code>SQLException</code></td><td><code>NullPointerException</code>,
+<code>IllegalArgumentException</code></td></tr>
+</tbody>
+</table>
+
+<pre class="language-java"><code class="language-java">// Checked: the compiler will not let you ignore this
+void mustHandle(Path path) throws IOException {      // declare it...
+    Files.readString(path);
+}
+
+void orCatchIt(Path path) {
+    try {                                            // ...or handle it
+        Files.readString(path);
+    } catch (IOException e) {
+        System.out.println("could not read: " + e.getMessage());
+    }
+}
+
+// Unchecked: no declaration needed, no compiler involvement
+void mayThrow(int divisor) {
+    System.out.println(10 / divisor);                // ArithmeticException if 0
+}
+</code></pre>
+
+<p>The practical guidance: <strong>throw unchecked exceptions for programming errors</strong> — a null
+argument, an invalid state, a number that should have been positive. Reserve checked exceptions for
+genuinely recoverable conditions where the caller has a real decision to make.</p>
+
+<h2>Throwing your own</h2>
+
+<pre class="language-java"><code class="language-java">class InsufficientFundsException extends RuntimeException {
+    private final double shortfall;
+
+    InsufficientFundsException(double shortfall) {
+        super("short by " + shortfall);
+        this.shortfall = shortfall;
+    }
+
+    double getShortfall() { return shortfall; }
+}
+
+class Account {
+    private double balance = 50;
+
+    void withdraw(double amount) {
+        if (amount &lt;= 0) {
+            throw new IllegalArgumentException("amount must be positive, got " + amount);
+        }
+        if (amount &gt; balance) {
+            throw new InsufficientFundsException(amount - balance);
+        }
+        balance -= amount;
+    }
+}
+</code></pre>
+
+<p>Two things that make an exception useful. <strong>Put the values in the message</strong> — "amount
+must be positive, got -5" tells you what happened; "invalid amount" starts a debugging session. And
+<strong>carry data as a field</strong> when the caller needs to act on it, as
+<code>getShortfall()</code> does here.</p>
+
+<p>Before writing a custom exception, check whether a standard one fits.
+<code>IllegalArgumentException</code>, <code>IllegalStateException</code> and
+<code>UnsupportedOperationException</code> cover most cases and every Java developer already knows
+them.</p>
+
+<h2>The four ways to handle one badly</h2>
+
+<p><strong>1. Swallowing it.</strong> The worst thing in this post:</p>
+
+<pre class="language-java"><code class="language-java">void terrible(String input) {
+    try {
+        Integer.parseInt(input);
+    } catch (NumberFormatException e) {
+        // nothing here
+    }
+}
+</code></pre>
+
+<p>The failure happened, the evidence is destroyed, and the program continues with wrong data. An
+empty <code>catch</code> is almost never right. If an exception genuinely is expected and ignorable,
+say so in a comment — the comment is what distinguishes a decision from an oversight.</p>
+
+<p><strong>2. Catching <code>Exception</code> to be safe.</strong> It also catches the bugs you
+needed to see, and everything below it in the hierarchy.</p>
+
+<p><strong>3. Losing the cause.</strong> When you wrap an exception, pass the original in:</p>
+
+<pre class="language-java"><code class="language-java">class DataAccessException extends RuntimeException {
+    DataAccessException(String message, Throwable cause) {
+        super(message, cause);              // keep the original
+    }
+}
+
+class Repo {
+    void load(Path path) {
+        try {
+            Files.readString(path);
+        } catch (IOException e) {
+            // throw new DataAccessException("load failed");        // stack trace lost
+            throw new DataAccessException("load failed for " + path, e);   // "Caused by:" preserved
+        }
+    }
+}
+</code></pre>
+
+<p>Dropping the cause is how you end up with a stack trace that points at your wrapper and says
+nothing about the actual failure. <a href="/java/java-debugging">Post 26</a> shows what
+"Caused by" gives you.</p>
+
+<p><strong>4. Using exceptions for control flow.</strong> They are expensive — building a stack trace
+is real work — and they hide the logic. If a condition is normal, test for it with an
+<code>if</code>.</p>
+
+<h2>Where to catch</h2>
+
+<p>The most useful rule in the post: <strong>catch an exception only where you can do something
+about it.</strong> Logging and rethrowing at every level produces the same error five times in the
+log and helps nobody.</p>
+
+<p>In practice that means most methods declare or propagate, and one place near the top — a request
+handler, a job runner, <code>main</code> — catches, records it once with full detail, and turns it
+into whatever the caller should see.</p>
+
+<pre class="language-java"><code class="language-java">class Runner {
+    void run() {
+        try {
+            doWork();
+        } catch (Exception e) {                 // the ONE place this is reasonable
+            System.err.println("job failed: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    void doWork() { }
+}
+</code></pre>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-date">Dates and times</a> is next — the modern API, and why you must not use
+the two classes most search results will show you.</p>

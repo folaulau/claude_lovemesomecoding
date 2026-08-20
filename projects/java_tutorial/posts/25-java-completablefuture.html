@@ -1,0 +1,213 @@
+<p><code>CompletableFuture</code> runs work on another thread and lets you describe what should happen
+when it finishes — without blocking to wait for it. It is how you stop making a caller wait for three
+slow things in sequence when they could happen at once.</p>
+
+<h2>Starting work</h2>
+
+<pre class="language-java"><code class="language-java">CompletableFuture&lt;String&gt; future = CompletableFuture.supplyAsync(() -&gt; {
+    return "result";                         // runs on another thread
+});
+
+CompletableFuture&lt;Void&gt; sideEffect = CompletableFuture.runAsync(() -&gt; {
+    System.out.println("logging something"); // no return value
+});
+
+System.out.println(future.join());           // blocks until done -> result
+</code></pre>
+
+<p><code>supplyAsync</code> when you want a value back, <code>runAsync</code> when you do not. Both
+return immediately; the work happens elsewhere.</p>
+
+<p><code>join()</code> waits for the answer. Note that calling it straight away, as above, gains you
+nothing — you have started a thread and then blocked on it. The value comes from doing something else
+in between, or from chaining.</p>
+
+<h2>Chaining what happens next</h2>
+
+<pre class="language-java"><code class="language-java">CompletableFuture&lt;Integer&gt; pipeline = CompletableFuture
+        .supplyAsync(() -&gt; "42")
+        .thenApply(Integer::parseInt)                // transform the result
+        .thenApply(n -&gt; n * 2);                      // and again
+
+System.out.println(pipeline.join());                 // 84
+
+CompletableFuture&lt;Void&gt; consumed = CompletableFuture
+        .supplyAsync(() -&gt; "done")
+        .thenAccept(System.out::println)             // consume it, return nothing
+        .thenRun(() -&gt; System.out.println("finished"));   // ignore the value entirely
+</code></pre>
+
+<p>None of those <code>thenX</code> calls blocks. They register what to do when the previous stage
+completes, and return a new future representing the stage after that.</p>
+
+<h2><code>thenApply</code> versus <code>thenCompose</code></h2>
+
+<p>The distinction people get wrong. Use <code>thenApply</code> when your function returns a plain
+value, and <code>thenCompose</code> when it returns <em>another future</em>:</p>
+
+<pre class="language-java"><code class="language-java">class Service {
+    CompletableFuture&lt;String&gt; findUserId(String email) {
+        return CompletableFuture.supplyAsync(() -&gt; "user-1");
+    }
+
+    CompletableFuture&lt;String&gt; loadProfile(String userId) {
+        return CompletableFuture.supplyAsync(() -&gt; "profile of " + userId);
+    }
+
+    void run() {
+        // Wrong shape: a future of a future
+        CompletableFuture&lt;CompletableFuture&lt;String&gt;&gt; nested =
+                findUserId("a@b.com").thenApply(this::loadProfile);
+
+        // Right: flattened
+        CompletableFuture&lt;String&gt; flat =
+                findUserId("a@b.com").thenCompose(this::loadProfile);
+
+        System.out.println(flat.join());        // profile of user-1
+    }
+}
+</code></pre>
+
+<p>If you know <a href="/java/java-stream">streams</a>, this is exactly <code>map</code> versus
+<code>flatMap</code>, and for the same reason.</p>
+
+<h2>Running several at once</h2>
+
+<p>This is where the real gain is. Three calls that each take a second take one second in total, not
+three:</p>
+
+<pre class="language-java"><code class="language-java">class Dashboard {
+    CompletableFuture&lt;String&gt; fetchProfile() { return CompletableFuture.supplyAsync(() -&gt; "profile"); }
+    CompletableFuture&lt;String&gt; fetchOrders() { return CompletableFuture.supplyAsync(() -&gt; "orders"); }
+    CompletableFuture&lt;String&gt; fetchOffers() { return CompletableFuture.supplyAsync(() -&gt; "offers"); }
+
+    void run() {
+        CompletableFuture&lt;String&gt; profile = fetchProfile();   // all three start now
+        CompletableFuture&lt;String&gt; orders = fetchOrders();
+        CompletableFuture&lt;String&gt; offers = fetchOffers();
+
+        CompletableFuture.allOf(profile, orders, offers).join();   // wait for all
+
+        System.out.println(profile.join() + " " + orders.join() + " " + offers.join());
+    }
+}
+</code></pre>
+
+<p>Start every future <em>before</em> joining any of them. Calling <code>fetchProfile().join()</code>
+on one line and <code>fetchOrders().join()</code> on the next runs them in sequence and throws away
+the entire point.</p>
+
+<p><code>allOf</code> returns <code>CompletableFuture&lt;Void&gt;</code>, so you collect the individual
+results afterwards — by then they are all complete, so <code>join()</code> returns instantly. There
+is also <code>anyOf</code>, which completes as soon as the first one does.</p>
+
+<p>To combine exactly two, <code>thenCombine</code> is tidier:</p>
+
+<pre class="language-java"><code class="language-java">CompletableFuture&lt;Integer&gt; a = CompletableFuture.supplyAsync(() -&gt; 20);
+CompletableFuture&lt;Integer&gt; b = CompletableFuture.supplyAsync(() -&gt; 22);
+
+System.out.println(a.thenCombine(b, Integer::sum).join());     // 42
+</code></pre>
+
+<h2>Exceptions</h2>
+
+<p>An exception inside a stage skips every subsequent stage and surfaces at the end, so handle it
+where you can do something useful:</p>
+
+<pre class="language-java"><code class="language-java">CompletableFuture&lt;String&gt; recovered = CompletableFuture
+        .&lt;String&gt;supplyAsync(() -&gt; { throw new IllegalStateException("boom"); })
+        .exceptionally(e -&gt; "fallback");                // only runs on failure
+
+System.out.println(recovered.join());                   // fallback
+
+CompletableFuture&lt;String&gt; both = CompletableFuture
+        .supplyAsync(() -&gt; "ok")
+        .handle((value, error) -&gt; error != null ? "failed" : value.toUpperCase());
+
+System.out.println(both.join());                        // OK
+</code></pre>
+
+<p><code>exceptionally</code> handles only the failure case; <code>handle</code> receives both the
+value and the error and runs either way. <code>whenComplete</code> is the third option — it observes
+both without changing the result, which is what you want for logging.</p>
+
+<p>Note that <code>join()</code> wraps whatever went wrong in a <code>CompletionException</code>, so
+the exception you catch is not the one you threw. Use <code>getCause()</code> to reach it.</p>
+
+<h2>Pass your own executor</h2>
+
+<p>Every example above uses the default, which is the shared <code>ForkJoinPool.commonPool()</code>.
+That pool is sized for CPU-bound work and is shared with parallel streams across your whole
+application. Blocking it on network calls will starve everything else:</p>
+
+<pre class="language-java"><code class="language-java">class Service {
+    void run() {
+        ExecutorService pool = Executors.newFixedThreadPool(10);
+        try {
+            CompletableFuture&lt;String&gt; f =
+                    CompletableFuture.supplyAsync(() -&gt; "io result", pool);   // your pool
+            System.out.println(f.join());
+        } finally {
+            pool.shutdown();                     // always shut it down
+        }
+    }
+}
+</code></pre>
+
+<p>The rule: <strong>for anything that waits on I/O, pass your own executor.</strong> Leave the common
+pool for short CPU-bound work.</p>
+
+<p>On Java 21 and later there is a better option for I/O — a virtual thread executor, which creates a
+cheap thread per task rather than sharing a small pool:</p>
+
+<pre class="language-java"><code class="language-java">class Service {
+    void run() {
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            CompletableFuture&lt;String&gt; f = CompletableFuture.supplyAsync(() -&gt; "io result", pool);
+            System.out.println(f.join());
+        }
+    }
+}
+</code></pre>
+
+<p>Virtual threads are cheap enough that blocking one costs almost nothing, which removes most of the
+reason to build elaborate async pipelines in the first place.</p>
+
+<h2>Timeouts, and the one you must not forget</h2>
+
+<p>A future that never completes will keep a caller waiting forever. Since Java 9 there is a built-in
+answer:</p>
+
+<pre class="language-java"><code class="language-java">CompletableFuture&lt;String&gt; slow = CompletableFuture.supplyAsync(() -&gt; "eventually");
+
+System.out.println(slow.completeOnTimeout("default", 2, TimeUnit.SECONDS).join());
+
+CompletableFuture&lt;String&gt; strict = CompletableFuture
+        .supplyAsync(() -&gt; "eventually")
+        .orTimeout(2, TimeUnit.SECONDS)                 // fails with TimeoutException instead
+        .exceptionally(e -&gt; "gave up");
+
+System.out.println(strict.join());
+</code></pre>
+
+<p><code>completeOnTimeout</code> substitutes a fallback value; <code>orTimeout</code> fails the
+future so an <code>exceptionally</code> stage can decide. Either is better than the third option,
+which is waiting indefinitely.</p>
+
+<h2>The three things that go wrong</h2>
+
+<ul>
+<li><strong>Blocking immediately.</strong> <code>supplyAsync(...).join()</code> on one line is a
+thread handoff and a wait, which is slower than just calling the method. The gain comes from starting
+several, or from returning the future to a caller who will use it later.</li>
+<li><strong>Sequential joins.</strong> Joining each future before starting the next serialises work
+you meant to parallelise. Start them all, then join.</li>
+<li><strong>Swallowed failures.</strong> A future whose result nobody joins and which has no
+<code>exceptionally</code> or <code>whenComplete</code> fails silently — no stack trace anywhere.
+Always terminate a chain with something that observes the outcome.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>That completes the modern-Java section. The last four posts are about working like a professional,
+starting with <a href="/java/java-debugging">debugging</a>.</p>

@@ -1,0 +1,190 @@
+<p>A record is a class whose job is to carry data. You declare the components; the compiler writes
+the constructor, the accessors, <code>equals</code>, <code>hashCode</code> and <code>toString</code>.
+One line replaces about sixty.</p>
+
+<h2>The sixty lines it replaces</h2>
+
+<pre class="language-java"><code class="language-java">// The old way — and this is the SHORT version, with toString omitted
+final class PointOld {
+    private final int x;
+    private final int y;
+
+    PointOld(int x, int y) {
+        this.x = x;
+        this.y = y;
+    }
+
+    int getX() { return x; }
+    int getY() { return y; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof PointOld other)) return false;
+        return x == other.x &amp;&amp; y == other.y;
+    }
+
+    @Override
+    public int hashCode() { return Objects.hash(x, y); }
+}
+
+// The same thing
+record Point(int x, int y) { }
+</code></pre>
+
+<p>Every one of those hand-written members is a place a bug can hide — an <code>equals</code> that
+forgets a field, a <code>hashCode</code> that disagrees with it. The generated versions cannot drift,
+because adding a component regenerates all of them.</p>
+
+<h2>Using one</h2>
+
+<pre class="language-java"><code class="language-java">record Point(int x, int y) { }
+
+class Demo {
+    void run() {
+        Point p = new Point(3, 4);
+
+        System.out.println(p.x());              // 3 — accessor is x(), NOT getX()
+        System.out.println(p);                  // Point[x=3, y=4] — a real toString
+
+        Point same = new Point(3, 4);
+        System.out.println(p.equals(same));     // true — value equality, generated
+        System.out.println(p == same);          // false — still two objects
+
+        Set&lt;Point&gt; points = new HashSet&lt;&gt;();
+        points.add(p);
+        System.out.println(points.contains(same));   // true — hashCode agrees with equals
+    }
+}
+</code></pre>
+
+<p>Note the accessor name: <code>x()</code>, not <code>getX()</code>. Records deliberately break the
+JavaBean convention. Most frameworks — Jackson, Spring, JPA to a point — understand records now, but
+it is worth knowing when something reflective cannot find your getter.</p>
+
+<p>That <code>HashSet</code> line is the practical payoff. As
+<a href="/java/java-collections">post 16</a> showed, a class without <code>equals</code> and
+<code>hashCode</code> goes into a hash-based collection and never comes back out. A record cannot have
+that bug.</p>
+
+<h2>Validation with a compact constructor</h2>
+
+<p>Records are not just dumb holders. A <em>compact constructor</em> lets you validate or normalise
+before the fields are assigned:</p>
+
+<pre class="language-java"><code class="language-java">record Order(String id, int quantity, double price) {
+
+    Order {                                          // no parameter list, no assignments
+        if (id == null || id.isBlank()) {
+            throw new IllegalArgumentException("id required");
+        }
+        if (quantity &lt;= 0) {
+            throw new IllegalArgumentException("quantity must be positive, got " + quantity);
+        }
+        id = id.strip();                             // reassigning the parameter normalises it
+    }
+
+    double total() {                                 // ordinary methods are fine
+        return quantity * price;
+    }
+
+    static Order single(String id, double price) {   // static factories too
+        return new Order(id, 1, price);
+    }
+}
+</code></pre>
+
+<p>Two things to notice. There is no parameter list and no <code>this.id = id;</code> — the compiler
+adds the assignments after your block runs. And assigning to the parameter inside the block changes
+what gets stored, which is how you normalise input.</p>
+
+<p>This makes a record a genuinely good domain type: an <code>Order</code> that exists is an
+<code>Order</code> whose invariants hold.</p>
+
+<h2>What records cannot do</h2>
+
+<p>The restrictions are deliberate, and each one follows from "this is a transparent carrier of its
+components":</p>
+
+<ul>
+<li><strong>Components are final.</strong> There are no setters and there cannot be.</li>
+<li><strong>No extending.</strong> A record cannot extend a class and cannot be extended — it is
+implicitly <code>final</code>. It <em>can</em> implement interfaces.</li>
+<li><strong>No extra instance fields.</strong> Everything a record holds is in its component list.
+Static fields are allowed.</li>
+</ul>
+
+<pre class="language-java"><code class="language-java">interface Shape { double area(); }
+
+record Circle(double radius) implements Shape {      // interfaces: yes
+    @Override public double area() { return Math.PI * radius * radius; }
+}
+
+record Config(String name) {
+    static final String DEFAULT = "none";            // static field: fine
+    // private int cached;                           // instance field: will not compile
+}
+</code></pre>
+
+<h2>Shallow immutability — the trap</h2>
+
+<p>A record's components cannot be reassigned. That does not make the objects they point at
+immutable, which is the same distinction <code>final</code> has in
+<a href="/java/java-static-and-final-keywords">post 14</a>:</p>
+
+<pre class="language-java"><code class="language-java">record Team(String name, List&lt;String&gt; members) { }
+
+class Demo {
+    void run() {
+        List&lt;String&gt; members = new ArrayList&lt;&gt;(List.of("Ana"));
+        Team team = new Team("Ops", members);
+
+        members.add("Bo");                          // modifying the list from outside
+        System.out.println(team.members());         // [Ana, Bo] — the record "changed"
+    }
+}
+</code></pre>
+
+<p>Defend against it in the compact constructor by copying:</p>
+
+<pre class="language-java"><code class="language-java">record Team(String name, List&lt;String&gt; members) {
+    Team {
+        members = List.copyOf(members);             // immutable snapshot, taken on construction
+    }
+}
+</code></pre>
+
+<p><code>List.copyOf</code> both copies and makes the result unmodifiable, so neither the caller nor
+anyone holding the accessor's result can change it afterwards.</p>
+
+<h2>When to use one</h2>
+
+<p><strong>Use a record</strong> for DTOs and API request or response bodies, for value objects
+(money, coordinates, an identifier), for a method that needs to return two things, for keys in a
+<code>Map</code> or <code>Set</code>, and for test data.</p>
+
+<p><strong>Use a class</strong> when the object has mutable state, when it needs to extend something,
+when it has behaviour rather than data, or when it has to hide its internal representation — a record
+is transparent by design, and its component list is part of its public API forever.</p>
+
+<p>A short local record declared inside a method is also allowed, and it is often the tidiest way to
+group intermediate values in a stream pipeline without polluting the package with a type nobody else
+needs:</p>
+
+<pre class="language-java"><code class="language-java">class Report {
+    void summarise(List&lt;String&gt; names) {
+        record Scored(String name, int length) { }        // visible only in this method
+
+        names.stream()
+                .map(n -&gt; new Scored(n, n.length()))
+                .sorted(Comparator.comparingInt(Scored::length))
+                .forEach(s -&gt; System.out.println(s.name() + " " + s.length()));
+    }
+}
+</code></pre>
+
+<h2>Next</h2>
+
+<p>Records pair naturally with the other Java 17 addition for modelling data.
+<a href="/java/java-sealed-class">Sealed classes</a> is next — saying "these are the only kinds", and
+getting the compiler to hold you to it.</p>

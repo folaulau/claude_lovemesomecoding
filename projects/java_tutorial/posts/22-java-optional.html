@@ -1,0 +1,213 @@
+<p><code>Optional&lt;T&gt;</code> is a container that either holds a value or is empty. Its purpose is
+not to eliminate <code>null</code> — it is to move "there might be nothing here" out of your head and
+into the type signature, where the compiler and the next reader can both see it.</p>
+
+<h2>The problem it solves</h2>
+
+<pre class="language-java"><code class="language-java">record Customer(String name) { }
+
+class Repo {
+    // What does this return when there is no such customer? Nothing says.
+    Customer findByIdOld(String id) {
+        return null;
+    }
+
+    // This one tells you, in the signature, before you write a line
+    Optional&lt;Customer&gt; findById(String id) {
+        return Optional.empty();
+    }
+}
+</code></pre>
+
+<p>Nothing forces a caller of <code>findByIdOld</code> to consider the null case. The Javadoc might
+mention it; nobody reads it, and the <code>NullPointerException</code> arrives in production. The
+second signature makes the caller acknowledge the empty case to get at the value at all.</p>
+
+<h2>Creating one</h2>
+
+<pre class="language-java"><code class="language-java">Optional&lt;String&gt; present = Optional.of("value");        // throws if you pass null
+Optional&lt;String&gt; empty = Optional.empty();
+Optional&lt;String&gt; maybe = Optional.ofNullable(null);     // empty if null, otherwise present
+
+System.out.println(present.isPresent());                 // true
+System.out.println(empty.isEmpty());                     // true
+System.out.println(maybe.isEmpty());                     // true
+</code></pre>
+
+<p><code>Optional.of</code> versus <code>ofNullable</code> matters: <code>of</code> throws on
+<code>null</code>, which is what you want when the value genuinely cannot be null and a null means a
+bug. Use <code>ofNullable</code> at the boundary with code that might hand you one.</p>
+
+<h2>Getting the value out</h2>
+
+<p>There is a right way and a wrong way, and the wrong way is the one that looks most obvious:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String expensiveDefault() {
+        return "computed";                                 // pretend this hits a database
+    }
+
+    void run() {
+        Optional&lt;String&gt; name = Optional.of("Folau");
+        Optional&lt;String&gt; none = Optional.empty();
+
+        // Wrong: get() throws NoSuchElementException on empty — you have swapped
+        // one exception for another and gained nothing.
+        System.out.println(name.get());
+
+        // Right: say what happens when it is empty
+        System.out.println(none.orElse("unknown"));                    // unknown
+        System.out.println(none.orElseGet(this::expensiveDefault));    // lazy — only if empty
+        // none.orElseThrow(() -&gt; new IllegalStateException("required"));
+
+        name.ifPresent(n -&gt; System.out.println("hello " + n));         // hello Folau
+        none.ifPresentOrElse(
+                n -&gt; System.out.println("hello " + n),
+                () -&gt; System.out.println("nobody here"));              // nobody here
+    }
+}
+</code></pre>
+
+<p><code>orElse</code> versus <code>orElseGet</code> is a real distinction:
+<code>orElse(expensive())</code> evaluates its argument <strong>every time</strong>, even when the
+Optional has a value, because arguments are evaluated before the call.
+<code>orElseGet(() -&gt; expensive())</code> runs only when empty. Use <code>orElse</code> for
+constants and <code>orElseGet</code> for anything computed.</p>
+
+<p><strong>If you are calling <code>get()</code>, you have probably missed the point.</strong> Its use
+is legitimate only after a check the compiler cannot see, and even then <code>orElseThrow()</code>
+with no argument reads better.</p>
+
+<h2>Chaining — where it actually pays off</h2>
+
+<p>The real benefit is not the null check; it is that <code>map</code> and <code>flatMap</code> let
+you keep working without unwrapping:</p>
+
+<pre class="language-java"><code class="language-java">record Address(String city) { }
+record Customer(String name, Address address) { }
+
+class Repo {
+    Optional&lt;Customer&gt; findById(String id) {
+        return Optional.of(new Customer("Folau", new Address("Nuku'alofa")));
+    }
+
+    String cityOf(String id) {
+        return findById(id)
+                .map(Customer::address)          // Optional&lt;Address&gt;
+                .map(Address::city)              // Optional&lt;String&gt;
+                .map(String::toUpperCase)
+                .orElse("unknown");              // NUKU'ALOFA
+    }
+}
+</code></pre>
+
+<p>Any step being empty short-circuits the rest and produces <code>"unknown"</code>. The nested-null
+version of that method is four <code>if</code> statements deep.</p>
+
+<p><code>filter</code> works as you would expect, and <code>flatMap</code> is for when the function
+itself returns an <code>Optional</code> — without it you would get a
+<code>Optional&lt;Optional&lt;T&gt;&gt;</code>:</p>
+
+<pre class="language-java"><code class="language-java">Optional&lt;String&gt; name = Optional.of("Folau");
+
+System.out.println(name.filter(n -&gt; n.length() &gt; 3).isPresent());   // true
+System.out.println(name.filter(n -&gt; n.length() &gt; 30).isPresent());  // false
+
+Optional&lt;String&gt; nested = name.flatMap(n -&gt; Optional.of(n.toLowerCase()));
+System.out.println(nested.orElse("none"));                           // folau
+
+System.out.println(name.stream().count());                           // 1 — bridges to streams
+</code></pre>
+
+<h2><code>or</code>, and combining two sources</h2>
+
+<p>A pattern that comes up constantly: try one lookup, fall back to another, and only then give up.
+<code>or</code> chains Optionals without unwrapping any of them:</p>
+
+<pre class="language-java"><code class="language-java">class Lookup {
+    Optional&lt;String&gt; fromCache(String key) { return Optional.empty(); }
+    Optional&lt;String&gt; fromDatabase(String key) { return Optional.of("from-db"); }
+
+    String resolve(String key) {
+        return fromCache(key)
+                .or(() -&gt; fromDatabase(key))       // only called if the cache missed
+                .orElse("not found");              // from-db
+    }
+}
+</code></pre>
+
+<p>Like <code>orElseGet</code>, the supplier is lazy — the database is not touched when the cache
+hits. Written with <code>if</code> statements this is six lines and an intermediate variable.</p>
+
+<h2>It is not a null check with extra steps</h2>
+
+<p>A common misuse is wrapping a value purely to test it, which is longer than the thing it
+replaced:</p>
+
+<pre class="language-java"><code class="language-java">String input = "value";
+
+// Pointless — you already have the value in hand
+if (Optional.ofNullable(input).isPresent()) {
+    System.out.println(input.length());
+}
+
+// Just check it
+if (input != null) {
+    System.out.println(input.length());
+}
+</code></pre>
+
+<p>Optional earns its place at an <strong>API boundary</strong> — as the return type of a method whose
+caller genuinely might get nothing. Inside a method, where you can see the assignment three lines up,
+a plain null check is clearer and cheaper. Reaching for <code>isPresent()</code> followed by
+<code>get()</code> is the same mistake in a different shape: that pair is an <code>if</code> statement
+wearing a costume, and <code>map</code>, <code>filter</code> or <code>ifPresent</code> is what the
+type was built for.</p>
+
+<h2>The three places Optional does not belong</h2>
+
+<p>Optional was designed for one job — a return type that might have nothing — and using it elsewhere
+causes more problems than it solves.</p>
+
+<p><strong>1. Not as a field.</strong> It is not serialisable, it adds an object per field, and a
+null <code>Optional</code> field is the worst of both worlds:</p>
+
+<pre class="language-java"><code class="language-java">class Bad {
+    private Optional&lt;String&gt; nickname;      // no — and this can itself be null
+}
+
+class Good {
+    private String nickname;                 // may be null internally
+
+    Optional&lt;String&gt; getNickname() {         // Optional at the boundary, where callers see it
+        return Optional.ofNullable(nickname);
+    }
+}
+</code></pre>
+
+<p><strong>2. Not as a method parameter.</strong> It forces every caller to wrap, and they can still
+pass <code>null</code>. Use an overload instead — one method with the parameter, one without.</p>
+
+<p><strong>3. Not for collections.</strong> An empty <code>List</code> already means "nothing here".
+<code>Optional&lt;List&lt;T&gt;&gt;</code> gives callers two empty cases to handle instead of one.</p>
+
+<h2>Where you will meet it</h2>
+
+<pre class="language-java"><code class="language-java">List&lt;String&gt; names = List.of("Ana", "Bo");
+
+System.out.println(names.stream().filter(n -&gt; n.startsWith("B")).findFirst().orElse("none"));
+System.out.println(names.stream().max(Comparator.naturalOrder()).orElse("none"));
+
+Map&lt;String, Integer&gt; ages = Map.of("Ana", 30);
+System.out.println(Optional.ofNullable(ages.get("Bo")).orElse(0));   // 0
+</code></pre>
+
+<p>The stream API returns <code>Optional</code> from every operation that might find nothing, which
+is where most people first encounter it. Note that <code>Map.get</code> still returns
+<code>null</code> — for compatibility — so wrapping it, or using <code>getOrDefault</code>, is on
+you.</p>
+
+<h2>Next</h2>
+
+<p>Records have appeared in nearly every post as a one-line data class.
+<a href="/java/java-record">Records</a> is next, properly.</p>

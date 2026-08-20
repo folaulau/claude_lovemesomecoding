@@ -125,6 +125,7 @@ import java.util.function.*;
 import java.util.stream.*;
 import java.time.*;
 import java.time.format.*;
+import java.time.temporal.*;
 import java.math.*;
 import java.io.*;
 import java.nio.file.*;
@@ -134,11 +135,32 @@ import java.util.concurrent.atomic.*;
 
 # Statements that only make sense at class level would break the method wrapper,
 # and a `package` line breaks the fixed file name. Detect and handle.
-PACKAGE_LINE = re.compile(r'^\s*package\s+[\w.]+\s*;\s*$', re.M)
+PACKAGE_LINE = re.compile(r'^[ \t]*package[ \t]+[\w.]+[ \t]*;[ \t]*(?://.*)?$', re.M)
 # Group 1 captures everything after `import` so it can be re-emitted above the
 # wrapper class. It MUST capture — without the group, findall returns whole lines
 # and the wrapper emits `import import java.util.List;;`.
-IMPORT_LINE = re.compile(r'^[ \t]*import[ \t]+((?:static[ \t]+)?[\w.*]+)[ \t]*;[ \t]*$', re.M)
+# The trailing `(?://.*)?` matters: a post routinely annotates an import with a
+# line comment, and without it that line survives the strip and becomes the
+# "first meaningful line" the fragment's kind is decided from.
+IMPORT_LINE = re.compile(
+    r'^[ \t]*import[ \t]+((?:static[ \t]+)?[\w.*]+)[ \t]*;[ \t]*(?://.*)?$', re.M)
+
+
+def first_meaningful_line(body: str) -> str:
+    """The first line that is not blank, a comment, or an annotation.
+
+    This is what the fragment's kind is decided from. Looking at the whole block
+    with a set of regexes does not work: an anonymous class inside a statement
+    puts `public int compare(...)` in the middle of what is plainly a run of
+    statements, and any "does a member declaration appear anywhere" test then
+    wraps the block as a class body and it will not compile.
+    """
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("//", "/*", "*", "@")):
+            continue
+        return line
+    return ""
 
 
 def wrap(code: str, index: int, jdk: str | None = None) -> tuple[str, str]:
@@ -151,7 +173,6 @@ def wrap(code: str, index: int, jdk: str | None = None) -> tuple[str, str]:
     feature", which is a false alarm about the checker rather than the post. So
     only a block explicitly pinned to 25 is allowed to be a compact source file.
     """
-    # A sample's own imports have to move above the wrapper's class.
     own_imports = IMPORT_LINE.findall(code)
     body = IMPORT_LINE.sub("", code)
     # A package line cannot coexist with a fixed output path; drop it, it never
@@ -159,48 +180,41 @@ def wrap(code: str, index: int, jdk: str | None = None) -> tuple[str, str]:
     body = PACKAGE_LINE.sub("", body)
     imports = PREAMBLE + "".join(f"import {i};\n" for i in own_imports) if own_imports else PREAMBLE
 
-    if TOP_LEVEL_TYPE.search(body) and COMPACT_SOURCE.search(body):
-        # A type declaration AND loose methods alongside it. javac 25 reads that
-        # as a compact source file and demands a main method; javac 21 rejects the
-        # loose methods outright. Nesting the lot inside a class is legal in both
-        # — nested records and classes are fine — and preserves what the sample
-        # is demonstrating.
-        return (imports + "abstract class Snippet" + str(index) + " {\n" + body + "\n}\n",
-                "class body (type + loose methods)")
+    def in_class(reason):
+        return (imports + "abstract class Snippet" + str(index) + " {\n" + body + "\n}\n", reason)
 
-    if TOP_LEVEL_TYPE.search(body):
-        # Already a compilation unit. Every top-level type must be non-public or
-        # match the file name, so strip `public` from top-level declarations.
+    def as_statements(reason):
+        return (imports + "abstract class Snippet" + str(index) + " {\n"
+                "  void run() throws Exception {\n" + body + "\n  }\n}\n", reason)
+
+    first = first_meaningful_line(body)
+
+    # 1. Starts with a type declaration -> already a compilation unit. Unless it
+    #    ALSO has loose methods beside it, which javac 25 reads as a compact
+    #    source file and javac 21 rejects outright; nesting the lot in a class is
+    #    legal in both.
+    if TOP_LEVEL_TYPE.match(first):
+        if COMPACT_SOURCE.search(body):
+            return in_class("class body (type + loose methods)")
+        # Every top-level type must be non-public or match the file name.
         body = re.sub(r'^(\s*)public(\s+(?:final\s+|abstract\s+|sealed\s+|non-sealed\s+)*'
                       r'(?:class|interface|enum|record|@interface)\s)', r'\1\2', body, flags=re.M)
         return imports + body, "as-is"
 
-    # Before COMPACT_SOURCE: a modifier means it is a member, and `static void
-    # main()` wrapped in a class compiles just as well as it would standalone.
-    # But a `final` local followed by loose statements is NOT a class body.
-    if MEMBER_DECL.search(body) and not METHOD_DECL.search(body) and BARE_CALL.search(body):
-        return (imports + "abstract class Snippet" + str(index) + " {\n"
-                "  void run() throws Exception {\n" + body + "\n  }\n}\n",
-                "statements (final locals)")
-
-    if MEMBER_DECL.search(body):
-        return (imports + "abstract class Snippet" + str(index) + " {\n" + body + "\n}\n",
-                "class body")
-
-    if jdk == "25" and COMPACT_SOURCE.search(body):
-        # A Java 25 compact source file. Compile untouched — wrapping it in
-        # anything is precisely what breaks it.
+    # 2. A Java 25 compact source file — only ever when the post pinned it.
+    if jdk == "25" and COMPACT_SOURCE.match(first):
         return imports + body, "compact source (as-is)"
 
-    if COMPACT_SOURCE.search(body):
-        # A bare method with no modifier: a fragment. Give it a class to live in.
-        return (imports + "abstract class Snippet" + str(index) + " {\n" + body + "\n}\n",
-                "class body")
+    # 3. Starts with a member declaration, or a bare method that is a fragment.
+    #    `final` is the ambiguous one: legal on a field AND on a local. If the
+    #    block declares no method at all but does call one, they are locals.
+    if MEMBER_DECL.match(first) or COMPACT_SOURCE.match(first):
+        if not METHOD_DECL.search(body) and BARE_CALL.search(body):
+            return as_statements("statements (final locals)")
+        return in_class("class body")
 
-    # Bare statements. `void m()` rather than `main` so a `return;` is legal and
-    # a sample declaring its own main does not collide.
-    return (imports + "abstract class Snippet" + str(index) + " {\n"
-            "  void run() throws Exception {\n" + body + "\n  }\n}\n", "statements")
+    # 4. Anything else is a run of statements. This is the common case.
+    return as_statements("statements")
 
 
 def extract(entry) -> list[dict]:
