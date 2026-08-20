@@ -1,0 +1,232 @@
+<p>Threads let a program do several things at once. They also introduce a class of bug that is
+intermittent, unreproducible and dependent on timing — which is why the most useful advice about
+concurrency is to use the highest-level tool that solves your problem.</p>
+
+<h2>Starting a thread</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws InterruptedException {
+        Thread thread = new Thread(() -&gt; System.out.println("on another thread"));
+        thread.start();                      // start(), never run()
+        thread.join();                       // wait for it to finish
+
+        // Java 21: a virtual thread, and the same API
+        Thread virtual = Thread.ofVirtual().start(() -&gt; System.out.println("virtual"));
+        virtual.join();
+    }
+}
+</code></pre>
+
+<p><code>start()</code> creates a thread and runs the task on it. <code>run()</code> just calls the
+method on the current thread — a mistake that produces code which looks threaded, works perfectly,
+and is entirely sequential.</p>
+
+<h2>You will rarely do that</h2>
+
+<p>Managing threads by hand is the assembly language of concurrency. An
+<code>ExecutorService</code> handles creation, reuse and shutdown:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws Exception {
+        try (ExecutorService pool = Executors.newFixedThreadPool(4)) {
+            Future&lt;Integer&gt; future = pool.submit(() -&gt; 21 * 2);
+            System.out.println(future.get());        // 42, blocking until ready
+
+            List&lt;Callable&lt;String&gt;&gt; tasks = List.of(
+                    () -&gt; "one", () -&gt; "two", () -&gt; "three");
+            for (Future&lt;String&gt; f : pool.invokeAll(tasks)) {
+                System.out.println(f.get());
+            }
+        }   // AutoCloseable since Java 19 — waits for tasks, then shuts down
+    }
+}
+</code></pre>
+
+<p>Sizing the pool: roughly the number of cores for CPU-bound work, and much larger for I/O-bound
+work — or, on Java 21, <a href="/java/java-21-virtual-threads">virtual threads</a>, which remove the
+question entirely.</p>
+
+<h2>The actual problem: shared mutable state</h2>
+
+<pre class="language-java"><code class="language-java">class Counter {
+    private int count = 0;
+
+    void increment() {
+        count++;            // NOT atomic: read, add, write — three steps
+    }
+
+    int get() { return count; }
+}
+
+class Demo {
+    void run() throws Exception {
+        Counter counter = new Counter();
+        try (ExecutorService pool = Executors.newFixedThreadPool(4)) {
+            for (int i = 0; i &lt; 10_000; i++) {
+                pool.submit(counter::increment);
+            }
+        }
+        System.out.println(counter.get());   // almost never 10000
+    }
+}
+</code></pre>
+
+<p><code>count++</code> looks like one operation and is three. Two threads can read the same value,
+both add one, and both write back — one increment vanishes. This is a <strong>race condition</strong>,
+and it is the defining hazard of shared state.</p>
+
+<h2>Four ways to fix it, best first</h2>
+
+<p><strong>1. Do not share mutable state.</strong> The only fix that scales. Give each thread its own
+data and combine results at the end — which is what a
+<a href="/java/java-8-streams">stream</a> collector does:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        long count = IntStream.range(0, 10_000).parallel().filter(n -&gt; n % 2 == 0).count();
+        System.out.println(count);           // 5000, always — nothing is shared
+    }
+}
+</code></pre>
+
+<p><strong>2. Use an atomic or a concurrent collection.</strong> Correct, fast, and no locking to get
+wrong:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws Exception {
+        AtomicInteger counter = new AtomicInteger();
+        ConcurrentHashMap&lt;String, Integer&gt; map = new ConcurrentHashMap&lt;&gt;();
+
+        try (ExecutorService pool = Executors.newFixedThreadPool(4)) {
+            for (int i = 0; i &lt; 10_000; i++) {
+                pool.submit(() -&gt; {
+                    counter.incrementAndGet();
+                    map.merge("hits", 1, Integer::sum);
+                });
+            }
+        }
+        System.out.println(counter.get());   // 10000, reliably
+        System.out.println(map.get("hits")); // 10000
+    }
+}
+</code></pre>
+
+<p><strong>3. Synchronise.</strong> A lock lets one thread at a time into a block:</p>
+
+<pre class="language-java"><code class="language-java">class SafeCounter {
+    private int count = 0;
+    private final Object lock = new Object();
+
+    void increment() {
+        synchronized (lock) {                // a private lock, not `this`
+            count++;
+        }
+    }
+
+    int get() {
+        synchronized (lock) {                // reads need it too — see below
+            return count;
+        }
+    }
+}
+</code></pre>
+
+<p><strong>4. <code>volatile</code>, for visibility only.</strong> Worth understanding because it is
+routinely misused:</p>
+
+<pre class="language-java"><code class="language-java">class Worker {
+    private volatile boolean running = true;   // guarantees other threads SEE the change
+
+    void stop() { running = false; }
+
+    void loop() {
+        while (running) {
+            // without volatile this loop may never see stop() and spin forever
+        }
+    }
+}
+</code></pre>
+
+<p><code>volatile</code> guarantees visibility, not atomicity. A <code>volatile int</code> still
+breaks under <code>++</code>. Use it for a flag one thread writes and others read, and nothing
+else.</p>
+
+<h2>Visibility, and why reads need locking too</h2>
+
+<p>The counter-intuitive part. Without synchronisation, one thread's write may never become visible to
+another — the JVM and CPU are allowed to cache values in registers and reorder instructions. That is
+why <code>get()</code> above is synchronised even though reading an <code>int</code> is atomic:
+atomicity is not the issue, visibility is.</p>
+
+<h2>Deadlock</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    private final Object a = new Object();
+    private final Object b = new Object();
+
+    void first() {
+        synchronized (a) {
+            synchronized (b) { }             // thread 1: a then b
+        }
+    }
+
+    void second() {
+        synchronized (b) {
+            synchronized (a) { }             // thread 2: b then a — deadlock
+        }
+    }
+}
+</code></pre>
+
+<p>Two threads each hold what the other wants, and neither ever proceeds. The fix is a
+<strong>consistent lock ordering</strong> everywhere, or holding one lock at a time. When it happens
+in production, <code>jstack</code> names the threads and the locks — see
+<a href="/java/java-debugging">Debugging</a>.</p>
+
+<h2>Interruption, done properly</h2>
+
+<p>One idiom worth getting right, because getting it wrong silently breaks cancellation. Catching
+<code>InterruptedException</code> <em>clears</em> the thread's interrupt flag, so code further up the
+stack can no longer tell that cancellation was requested:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    // Wrong: the interrupt is swallowed and the caller never learns of it
+    void bad() {
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            // nothing
+        }
+    }
+
+    // Right: restore the flag before moving on
+    void good() {
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted", e);
+        }
+    }
+}
+</code></pre>
+
+<p>Either rethrow the exception or restore the flag — never neither. This is the concurrency-specific
+form of the <a href="/java/java-exception-handling">swallowed exception</a>, and it is why a task
+sometimes refuses to stop when its executor is shut down.</p>
+
+<h2>The rules</h2>
+
+<ul>
+<li><strong>Prefer immutability.</strong> An object that cannot change is automatically thread-safe.</li>
+<li><strong>Prefer the highest-level tool</strong> — a parallel stream, an executor, a concurrent
+collection — over threads and locks.</li>
+<li><strong>Keep synchronised blocks small</strong>, and never do I/O inside one.</li>
+<li><strong>Document thread-safety</strong> on any class meant to be shared. If it is not safe, say
+so.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-advanced-regex">Regex</a> is next — pattern matching on text, and how to keep
+it readable.</p>

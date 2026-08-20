@@ -1,0 +1,200 @@
+<p>Streams have had a fixed set of intermediate operations since Java 8 — <code>filter</code>,
+<code>map</code>, <code>flatMap</code>, <code>distinct</code>, <code>sorted</code>, and a handful
+more. You could add your own terminal operation with a <code>Collector</code>, but there was no way to
+add an intermediate one. Gatherers are that missing extension point.</p>
+
+<h2>The gap</h2>
+
+<p>Some transformations simply could not be expressed. Grouping elements into batches of three,
+producing a running total, or removing duplicates by a key rather than by
+<code>equals</code> — all of these meant dropping out of the stream, doing it with a loop, and
+starting a new stream:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    // Batching, the pre-gatherer way
+    List&lt;List&lt;Integer&gt;&gt; batches(List&lt;Integer&gt; items, int size) {
+        List&lt;List&lt;Integer&gt;&gt; result = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; items.size(); i += size) {
+            result.add(new ArrayList&lt;&gt;(items.subList(i, Math.min(i + size, items.size()))));
+        }
+        return result;
+    }
+}
+</code></pre>
+
+<p>The reason for the gap is that these operations are <em>stateful</em> — each element's output
+depends on what came before it. <code>map</code> and <code>filter</code> look at one element in
+isolation, which is what makes them easy to parallelise and easy to define.</p>
+
+<h2>The built-in gatherers</h2>
+
+<p>Finalised in Java 24 and available in 25. Four cover most of what people were missing:</p>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        var numbers = List.of(1, 2, 3, 4, 5);
+
+        // Fixed-size batches — the last one is short
+        System.out.println(numbers.stream().gather(Gatherers.windowFixed(2)).toList());
+        // [[1, 2], [3, 4], [5]]
+
+        // Overlapping windows
+        System.out.println(numbers.stream().gather(Gatherers.windowSliding(2)).toList());
+        // [[1, 2], [2, 3], [3, 4], [4, 5]]
+
+        // Running totals — one output per input
+        System.out.println(numbers.stream()
+                .gather(Gatherers.scan(() -&gt; 0, Integer::sum)).toList());
+        // [1, 3, 6, 10, 15]
+
+        // Fold to a single value, as a stream of one
+        System.out.println(numbers.stream()
+                .gather(Gatherers.fold(() -&gt; 0, Integer::sum)).toList());
+        // [15]
+    }
+}
+</code></pre>
+
+<p>Each of those four returns a stream, so the pipeline continues afterwards — that is the whole
+point. <code>windowFixed</code> is the one you will reach for most — batching records for a bulk insert or
+an API that takes a limited number of ids per call is a genuinely common job.</p>
+
+<p><code>scan</code> versus <code>fold</code> is the distinction worth fixing in your head:
+<code>scan</code> emits every intermediate result, <code>fold</code> emits only the final one.</p>
+
+<h2>Writing your own</h2>
+
+<p>The interface has an initialiser, an integrator and an optional finisher. The integrator receives
+the state, an element, and a downstream to push results into — and returns <code>false</code> to stop
+the stream early:</p>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Demo {
+    // Keep the first element for each key — "distinct by", which Stream never had
+    static &lt;T, K&gt; Gatherer&lt;T, ?, T&gt; distinctBy(Function&lt;T, K&gt; keyFn) {
+        return Gatherer.ofSequential(
+                HashSet&lt;K&gt;::new,
+                (seen, element, downstream) -&gt; {
+                    if (seen.add(keyFn.apply(element))) {
+                        downstream.push(element);
+                    }
+                    return true;                 // keep going
+                });
+    }
+
+    void run() {
+        record Person(String name, String city) { }
+        var people = List.of(
+                new Person("Ana", "Seattle"),
+                new Person("Bo", "Seattle"),
+                new Person("Cy", "Nuku'alofa"));
+
+        System.out.println(people.stream()
+                .gather(distinctBy(Person::city))
+                .map(Person::name)
+                .toList());                      // [Ana, Cy]
+    }
+}
+</code></pre>
+
+<p><code>Gatherer.ofSequential</code> is the right factory whenever the operation depends on element
+order, which stateful operations usually do. The plain <code>Gatherer.of</code> takes an extra
+combiner and can run in parallel.</p>
+
+<p>Returning <code>false</code> from the integrator short-circuits — that is how you would build a
+<code>takeUntil</code> that stops at the first match:</p>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Demo {
+    static &lt;T&gt; Gatherer&lt;T, ?, T&gt; takeUntil(Predicate&lt;T&gt; stop) {
+        return Gatherer.ofSequential(
+                () -&gt; null,
+                (state, element, downstream) -&gt; {
+                    downstream.push(element);
+                    return !stop.test(element);   // false ends the stream
+                });
+    }
+
+    void run() {
+        System.out.println(List.of(1, 2, 3, 4, 5).stream()
+                .gather(takeUntil(n -&gt; n &gt;= 3))
+                .toList());                        // [1, 2, 3]
+    }
+}
+</code></pre>
+
+<h2>Composing them</h2>
+
+<p>Gatherers chain, both with each other and with ordinary stream operations, which is what makes
+them feel like part of the API rather than an escape hatch:</p>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        var numbers = List.of(1, 2, 3, 4, 5, 6, 7, 8);
+
+        System.out.println(numbers.stream()
+                .filter(n -&gt; n % 2 == 0)                    // ordinary operation
+                .gather(Gatherers.windowFixed(2))           // gatherer
+                .map(window -&gt; window.stream().mapToInt(Integer::intValue).sum())
+                .toList());                                  // [6, 14]
+
+        // Two gatherers back to back
+        System.out.println(numbers.stream()
+                .gather(Gatherers.scan(() -&gt; 0, Integer::sum))
+                .gather(Gatherers.windowFixed(3))
+                .toList());
+        // [[1, 3, 6], [10, 15, 21], [28, 36]]
+    }
+}
+</code></pre>
+
+<p>There is also <code>andThen</code>, which fuses two gatherers into one so a reusable pipeline
+fragment can be passed around as a single value:</p>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        var pipeline = Gatherers.&lt;Integer&gt;windowFixed(2)
+                .andThen(Gatherers.scan(() -&gt; 0, (acc, window) -&gt;
+                        acc + window.stream().mapToInt(Integer::intValue).sum()));
+
+        System.out.println(List.of(1, 2, 3, 4).stream().gather(pipeline).toList());
+        // [3, 10]
+    }
+}
+</code></pre>
+
+<h2>Gatherer or Collector?</h2>
+
+<table>
+<thead><tr><th></th><th>Gatherer</th><th>Collector</th></tr></thead>
+<tbody>
+<tr><td>Position</td><td>intermediate — stream in, stream out</td><td>terminal — stream in, value
+out</td></tr>
+<tr><td>Called with</td><td><code>.gather(...)</code></td><td><code>.collect(...)</code></td></tr>
+<tr><td>Can short-circuit</td><td>yes</td><td>no</td></tr>
+<tr><td>Chainable after</td><td>yes — more stream operations follow</td><td>no — the stream is
+finished</td></tr>
+</tbody>
+</table>
+
+<p>The practical test: if you want to keep operating on the results, you want a gatherer. If you are
+producing the final answer, you want a <a href="/java/java-8-collectors-class">collector</a>. The
+<code>distinctBy</code> example above works precisely because the stream continues afterwards.</p>
+
+<h2>Do you need one?</h2>
+
+<p>Mostly not. The built-in operations cover ordinary work, and a custom gatherer is more machinery
+than a loop for a one-off job. They earn their place when you have a genuinely reusable stateful
+transformation — batching, deduplicating by key, rate-limiting a stream — that several call sites
+want, and where dropping out of the pipeline would break a chain that otherwise reads well.</p>
+
+<p>The wider point is that streams are no longer a closed set of operations. That was the main
+structural complaint about the API for a decade, and it is now answered.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-25-flexible-constructors">Flexible Constructor Bodies</a> is next — validating
+an argument before calling <code>super()</code>.</p>

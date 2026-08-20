@@ -1,0 +1,224 @@
+<p>A regular expression describes a pattern of text. Java's support lives in
+<code>java.util.regex</code>, and the hardest part is not the syntax — it is knowing when a regex is
+the right tool and keeping the ones you write readable.</p>
+
+<h2>The three ways in</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String text = "order-1099";
+
+        // 1. String methods — convenient, recompile the pattern every call
+        System.out.println(text.matches("order-\\d+"));            // true
+        System.out.println(text.replaceAll("\\d+", "#"));          // order-#
+        System.out.println("a1b2c3".split("\\d").length);          // 3
+
+        // 2. Pattern + Matcher — compile once, reuse
+        Pattern pattern = Pattern.compile("order-(\\d+)");
+        Matcher matcher = pattern.matcher(text);
+        if (matcher.matches()) {
+            System.out.println(matcher.group(1));                  // 1099
+        }
+    }
+}
+</code></pre>
+
+<p><strong>Compile the pattern once</strong> if it is used more than occasionally. A
+<code>Pattern</code> is immutable and thread-safe, so it belongs in a <code>static final</code> field;
+a <code>Matcher</code> is neither and must be created per use.</p>
+
+<p>Note <code>matches()</code> requires the <em>whole</em> string to match, while
+<code>find()</code> looks for a match anywhere. Confusing the two is the most common first mistake.</p>
+
+<h2>The syntax you will actually use</h2>
+
+<table>
+<thead><tr><th>Pattern</th><th>Matches</th></tr></thead>
+<tbody>
+<tr><td><code>.</code></td><td>any character except a newline</td></tr>
+<tr><td><code>\d</code> <code>\w</code> <code>\s</code></td><td>digit, word character,
+whitespace</td></tr>
+<tr><td><code>\D</code> <code>\W</code> <code>\S</code></td><td>the negation of each</td></tr>
+<tr><td><code>[abc]</code> <code>[^abc]</code> <code>[a-z]</code></td><td>one of, none of, a
+range</td></tr>
+<tr><td><code>*</code> <code>+</code> <code>?</code></td><td>zero or more, one or more, zero or
+one</td></tr>
+<tr><td><code>{2}</code> <code>{2,}</code> <code>{2,5}</code></td><td>exactly, at least, between</td></tr>
+<tr><td><code>^</code> <code>$</code></td><td>start and end of input</td></tr>
+<tr><td><code>\b</code></td><td>a word boundary</td></tr>
+<tr><td><code>(...)</code> <code>(?:...)</code></td><td>a capturing group, a non-capturing
+group</td></tr>
+<tr><td><code>|</code></td><td>either side</td></tr>
+</tbody>
+</table>
+
+<p>In Java every backslash is doubled, because the string literal consumes one before the regex engine
+sees it. <code>\d</code> in a pattern is <code>"\\d"</code> in source — and it is the single most
+common source of confusion when copying a pattern from elsewhere.</p>
+
+<p><a href="/java/java-17-text-blocks">Text blocks</a> do not change this; they are not raw
+strings.</p>
+
+<h2>Groups</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        Pattern pattern = Pattern.compile("(\\d{4})-(\\d{2})-(\\d{2})");
+        Matcher matcher = pattern.matcher("due 2026-08-20 exactly");
+
+        if (matcher.find()) {
+            System.out.println(matcher.group());      // 2026-08-20 — group 0 is the whole match
+            System.out.println(matcher.group(1));     // 2026
+            System.out.println(matcher.group(3));     // 20
+            System.out.println(matcher.start());      // 4 — where it matched
+        }
+    }
+}
+</code></pre>
+
+<p>Numbered groups are fragile: insert a group at the front and every number shifts. Name them
+instead, which is both safer and self-documenting:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        Pattern pattern = Pattern.compile("(?&lt;year&gt;\\d{4})-(?&lt;month&gt;\\d{2})-(?&lt;day&gt;\\d{2})");
+        Matcher matcher = pattern.matcher("2026-08-20");
+
+        if (matcher.matches()) {
+            System.out.println(matcher.group("year") + "/" + matcher.group("month"));  // 2026/08
+        }
+    }
+}
+</code></pre>
+
+<h2>Finding every match</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        Pattern pattern = Pattern.compile("\\b\\w+@\\w+\\.\\w+\\b");
+        String text = "mail ana@example.com or bo@test.org today";
+
+        // Iterating
+        Matcher matcher = pattern.matcher(text);
+        while (matcher.find()) {
+            System.out.println(matcher.group());
+        }
+
+        // Or as a stream, since Java 9
+        System.out.println(pattern.matcher(text).results()
+                .map(MatchResult::group)
+                .toList());                    // [ana@example.com, bo@test.org]
+    }
+}
+</code></pre>
+
+<h2>Greedy, and the bug it causes</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String html = "&lt;b&gt;bold&lt;/b&gt; and &lt;i&gt;italic&lt;/i&gt;";
+
+        Matcher greedy = Pattern.compile("&lt;(.+)&gt;").matcher(html);
+        if (greedy.find()) {
+            System.out.println(greedy.group());   // the ENTIRE string — .+ took everything
+        }
+
+        Matcher lazy = Pattern.compile("&lt;(.+?)&gt;").matcher(html);
+        if (lazy.find()) {
+            System.out.println(lazy.group());     // &lt;b&gt; — stops at the first &gt;
+        }
+    }
+}
+</code></pre>
+
+<p>Quantifiers are greedy by default: they take as much as possible and give back only if the match
+fails. Adding <code>?</code> makes them lazy. When a pattern matches far more than you intended, this
+is nearly always why.</p>
+
+<h2>Catastrophic backtracking</h2>
+
+<p>Worth knowing by name, because it turns a validator into a denial-of-service vector. A pattern with
+nested quantifiers can take exponential time on input that <em>almost</em> matches:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        // (a+)+ against a long run of a's followed by something else:
+        // the engine tries every way of splitting the a's before giving up.
+        Pattern dangerous = Pattern.compile("(a+)+b");
+
+        // Safe: no nested quantifier, one way to match
+        Pattern safe = Pattern.compile("a+b");
+        System.out.println(safe.matcher("aaab").matches());   // true
+    }
+}
+</code></pre>
+
+<p>The rule: avoid a quantifier applied to a group that already contains one. If a regex is validating
+user input, either keep it simple or bound the input length first.</p>
+
+<h2>Replacing with a computed value</h2>
+
+<p>Two replacement methods are worth knowing beyond the literal form. Backreferences let the
+replacement reuse captured groups, and <code>Matcher.replaceAll</code> can take a function:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        // $1, $2 refer to captured groups; ${name} to named ones
+        System.out.println("2026-08-20".replaceAll(
+                "(\\d{4})-(\\d{2})-(\\d{2})", "$3/$2/$1"));      // 20/08/2026
+
+        // A function, when the replacement has to be computed — Java 9+
+        Pattern pattern = Pattern.compile("\\d+");
+        System.out.println(pattern.matcher("a1 b22 c333")
+                .replaceAll(m -&gt; String.valueOf(m.group().length())));   // a1 b2 c3
+    }
+}
+</code></pre>
+
+<p>One trap in the literal form: <code>$</code> and <code>\</code> are special in the
+<em>replacement</em> string too. If the replacement comes from user input or a variable, wrap it in
+<code>Matcher.quoteReplacement</code>, or a stray <code>$1</code> in the data becomes a group
+reference. The same applies to patterns — <code>Pattern.quote</code> escapes a string you want
+matched literally.</p>
+
+<h2>Useful flags</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        System.out.println(Pattern.compile("hello", Pattern.CASE_INSENSITIVE)
+                .matcher("HELLO").matches());                         // true
+
+        // MULTILINE: ^ and $ match at each line, not just the whole input
+        System.out.println(Pattern.compile("^b", Pattern.MULTILINE)
+                .matcher("a\nb").find());                             // true
+
+        // DOTALL: . also matches newlines
+        System.out.println(Pattern.compile("a.b", Pattern.DOTALL)
+                .matcher("a\nb").matches());                          // true
+    }
+}
+</code></pre>
+
+<h2>When not to use a regex</h2>
+
+<p>Regex is the wrong tool more often than it is the right one:</p>
+
+<ul>
+<li><strong>Do not parse HTML, XML or JSON with it.</strong> They are not regular languages. Use a
+parser.</li>
+<li><strong>Do not validate email addresses with it.</strong> The correct pattern is thousands of
+characters. Check for an <code>@</code> with something on both sides and send a confirmation
+email.</li>
+<li><strong>Prefer plain <code>String</code> methods</strong> when they fit —
+<code>contains</code>, <code>startsWith</code> and <code>split</code> on a literal are clearer and
+faster than a pattern.</li>
+</ul>
+
+<p>When you do write one, name it and comment it. A <code>static final Pattern</code> called
+<code>ORDER_ID</code> with a line explaining the format is maintainable; the same expression inline
+is a puzzle for whoever reads it next.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-advanced-database">Database access</a> is next — JDBC, and the things that
+matter regardless of which framework sits on top of it.</p>

@@ -1,0 +1,195 @@
+<p>Java's cryptography lives in <code>javax.crypto</code> and <code>java.security</code>. The single
+most important thing to know about it is that you should use it as little as possible: reach for a
+proven library or a managed service, and treat the raw API as something you need to <em>read</em>
+rather than write.</p>
+
+<p>This post covers the parts you will meet, and the defaults that make them safe.</p>
+
+<h2>Hashing a password — not encryption</h2>
+
+<p>The most common cryptographic job in an application, and the one people get wrong first. Passwords
+must be <strong>hashed</strong>, never encrypted: encryption is reversible, and there is no legitimate
+reason to be able to recover a user's password.</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void wrong(String password) throws Exception {
+        // MD5 and SHA-1 are broken. Plain SHA-256 is not broken, but it is FAST —
+        // which is exactly wrong for passwords, because it is fast for the attacker too.
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] hash = digest.digest(password.getBytes(StandardCharsets.UTF_8));
+        System.out.println(hash.length);        // 32 — and trivially brute-forced
+    }
+}
+</code></pre>
+
+<p>Use a <strong>deliberately slow</strong> algorithm designed for passwords: bcrypt, scrypt or
+Argon2. Each embeds a random salt and a cost factor you can raise as hardware improves.</p>
+
+<pre class="language-java"><code class="language-java">// With Spring Security's BCryptPasswordEncoder, or jBCrypt:
+//
+//   PasswordEncoder encoder = new BCryptPasswordEncoder(12);
+//   String stored = encoder.encode(rawPassword);       // salt is inside the hash
+//   boolean ok = encoder.matches(rawPassword, stored); // constant-time comparison
+//
+// Never compare hashes with equals() — use the library's matches().
+</code></pre>
+
+<p>If you need PBKDF2 from the JDK alone, it is available via
+<code>SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")</code> with a high iteration count. bcrypt
+or Argon2 is a better answer.</p>
+
+<h2>Symmetric encryption — AES</h2>
+
+<p>One key encrypts and decrypts. This is what you use for data at rest.</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws Exception {
+        // A real key, from a secure random source
+        KeyGenerator generator = KeyGenerator.getInstance("AES");
+        generator.init(256);
+        SecretKey key = generator.generateKey();
+
+        // A fresh random IV for EVERY message — never reused, never hardcoded
+        byte[] iv = new byte[12];
+        SecureRandom.getInstanceStrong().nextBytes(iv);
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
+        byte[] encrypted = cipher.doFinal("secret".getBytes(StandardCharsets.UTF_8));
+
+        Cipher decipher = Cipher.getInstance("AES/GCM/NoPadding");
+        decipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(128, iv));
+        System.out.println(new String(decipher.doFinal(encrypted), StandardCharsets.UTF_8));
+    }
+}
+</code></pre>
+
+<p>Three details carry almost all of the security:</p>
+
+<ul>
+<li><strong>Use GCM, not ECB.</strong> <code>Cipher.getInstance("AES")</code> silently defaults to
+ECB, which encrypts identical blocks to identical output — the shape of the data survives
+encryption. GCM is <em>authenticated</em>: it also detects tampering.</li>
+<li><strong>A fresh random IV per message.</strong> Reusing an IV with GCM is catastrophic, not
+merely weak. The IV is not secret and is normally stored alongside the ciphertext.</li>
+<li><strong><code>SecureRandom</code>, never <code>Random</code>.</strong>
+<a href="/java/java-21-other-improvements"><code>Random</code></a> is predictable by design.</li>
+</ul>
+
+<h2>Asymmetric encryption — RSA</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(2048);
+        KeyPair pair = generator.generateKeyPair();
+
+        // Encrypt with the PUBLIC key, decrypt with the PRIVATE one
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+        cipher.init(Cipher.ENCRYPT_MODE, pair.getPublic());
+        byte[] encrypted = cipher.doFinal("secret".getBytes(StandardCharsets.UTF_8));
+
+        cipher.init(Cipher.DECRYPT_MODE, pair.getPrivate());
+        System.out.println(new String(cipher.doFinal(encrypted), StandardCharsets.UTF_8));
+    }
+}
+</code></pre>
+
+<p>RSA can only encrypt data smaller than its key, so it is not used for bulk data. The real pattern —
+what TLS does — is to generate a random AES key, encrypt the data with AES, and encrypt only that key
+with RSA.</p>
+
+<h2>Signing</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(KeyPair pair) throws Exception {
+        byte[] message = "transfer 100".getBytes(StandardCharsets.UTF_8);
+
+        Signature signer = Signature.getInstance("SHA256withRSA");
+        signer.initSign(pair.getPrivate());
+        signer.update(message);
+        byte[] signature = signer.sign();
+
+        Signature verifier = Signature.getInstance("SHA256withRSA");
+        verifier.initVerify(pair.getPublic());
+        verifier.update(message);
+        System.out.println(verifier.verify(signature));      // true
+    }
+}
+</code></pre>
+
+<p>Signing proves who sent something and that it was not altered — the private key signs, the public
+key verifies. It is the reverse direction from encryption, and it is what a JWT's signature does.</p>
+
+<h2>Encoding is not encryption</h2>
+
+<p>A distinction worth stating plainly, because Base64 gets mistaken for security surprisingly
+often:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        String secret = "password123";
+
+        String encoded = Base64.getEncoder().encodeToString(
+                secret.getBytes(StandardCharsets.UTF_8));
+        System.out.println(encoded);                            // cGFzc3dvcmQxMjM=
+
+        String decoded = new String(Base64.getDecoder().decode(encoded),
+                StandardCharsets.UTF_8);
+        System.out.println(decoded);                            // password123 — no key needed
+    }
+}
+</code></pre>
+
+<p>Base64 is a way of representing bytes as text so they survive transport. It takes no key and hides
+nothing. Its legitimate use in cryptography is <em>after</em> encryption, to turn ciphertext into
+something you can put in JSON or a header — which is exactly why encrypted values often look
+Base64-encoded and why that appearance proves nothing.</p>
+
+<p>The same applies to a JWT: its payload is Base64, readable by anyone. The signature is what makes
+it trustworthy, not the encoding.</p>
+
+<h2>Comparing secrets</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    boolean check(byte[] expected, byte[] actual) {
+        // Wrong: returns as soon as bytes differ, so how long it takes leaks
+        // how much of the value was correct.
+        // return Arrays.equals(expected, actual);
+
+        return MessageDigest.isEqual(expected, actual);   // constant time
+    }
+}
+</code></pre>
+
+<p>This is a timing attack, and it is subtle enough to be worth knowing by name. Use
+<code>MessageDigest.isEqual</code> for tokens, signatures and API keys.</p>
+
+<h2>Where the keys live</h2>
+
+<p>The hardest part of cryptography is not the algorithms, it is key management. A perfectly
+implemented cipher with the key committed next to it protects nothing.</p>
+
+<ul>
+<li><strong>Never in source control.</strong> Not in a properties file, not in a constant.</li>
+<li><strong>Use a secret manager</strong> — AWS KMS or Secrets Manager, Vault, or the platform's
+equivalent. Better still, let it do the encryption so the key never reaches your process.</li>
+<li><strong>Plan for rotation</strong> before you need it. Store a key identifier with the ciphertext
+so old data stays readable after a rotation.</li>
+</ul>
+
+<h2>The rules</h2>
+
+<ul>
+<li><strong>Do not design your own scheme.</strong> Use a well-reviewed library.</li>
+<li><strong>Hash passwords, encrypt data</strong> — they are different problems.</li>
+<li><strong>Prefer authenticated encryption</strong> (GCM), so tampering is detected.</li>
+<li><strong>Use TLS for data in transit</strong> and let the platform handle it.</li>
+<li><strong>Take the defaults seriously.</strong> <code>Cipher.getInstance("AES")</code> compiles and
+is insecure — the API will not stop you.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-advanced-eclipse-hot-keys">Eclipse hot keys</a> is next — the shortcuts worth
+committing to memory.</p>

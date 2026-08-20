@@ -1,0 +1,140 @@
+<p>Java 21 to 25 is the smallest LTS-to-LTS step Java has had. Nothing significant was removed from
+the API, the language changes are additive, and most applications move by changing one number. This
+post covers what to check anyway.</p>
+
+<h2>The one-line version</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;properties&gt;
+    &lt;maven.compiler.release&gt;25&lt;/maven.compiler.release&gt;
+&lt;/properties&gt;
+</code></pre>
+
+<p>Upgrade build plugins and dependencies first, on 21. Then switch the JDK, run the tests, run the
+application. For most projects that is the whole exercise.</p>
+
+<p>Use <code>release</code> rather than <code>source</code> and <code>target</code>, as in every other
+upgrade. It verifies that you only call APIs that exist in the version you are targeting, which the
+older pair does not — with those, code compiles happily against the new JDK's library and then fails
+at runtime on an older one. That failure mode is worst precisely when you are shipping a jar someone
+else runs.</p>
+
+<h2>What actually breaks</h2>
+
+<p><strong>1. Bytecode libraries, again.</strong> The class-file version goes to 69, so anything
+reading or generating class files needs a version that understands it — ASM, ByteBuddy, CGLib, and
+everything built on them. The symptom is the same as every previous upgrade:</p>
+
+<pre class="language-text"><code class="language-text">java.lang.IllegalArgumentException: Unsupported class file major version 69
+</code></pre>
+
+<p>The fix is a dependency upgrade. This should get better over time: the
+<a href="/java/java-25-other-improvements">Class-File API</a> in the JDK exists precisely so libraries
+stop needing an urgent release after each LTS.</p>
+
+<p><strong>2. The security manager is permanently gone.</strong> Java 17 deprecated it, 18 disabled it
+by default, and from 24 it cannot be re-enabled at all. <code>System.setSecurityManager</code> throws
+<code>UnsupportedOperationException</code>. If anything still calls it, that is a design change rather
+than a flag.</p>
+
+<p><strong>3. String templates, if you previewed them.</strong> They were removed in 23. Code using
+them will not compile. Rewrite with <code>formatted</code>:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    String message(String name, int count) {
+        return "Hello %s, you have %d orders".formatted(name, count);
+    }
+}
+</code></pre>
+
+<p><strong>4. Dynamic agent loading.</strong> Still a warning, now louder, and heading toward
+requiring <code>-XX:+EnableDynamicAgentLoading</code>. Mockito's inline mock maker is the usual
+source; upgrading Mockito is the fix.</p>
+
+<p><strong>5. 32-bit x86 is gone.</strong> Relevant only on old hardware, but a hard stop if it
+applies, since there is no 32-bit build to fall back to.</p>
+
+<h2>What to check before you commit to it</h2>
+
+<p>The realistic blocker is not the JDK, it is your framework. Check that your major dependencies
+declare Java 25 support rather than assuming forward compatibility works — it usually does, and the
+exceptions are exactly the bytecode-manipulating libraries above.</p>
+
+<pre class="language-bash"><code class="language-bash"># Anything reaching into JDK internals, or built for an old target
+jdeps --jdk-internals --multi-release 25 target/myapp.jar
+
+# What is behind
+mvn versions:display-dependency-updates
+</code></pre>
+
+<h2>Language changes you can adopt gradually</h2>
+
+<p>An upgrade does not require rewriting anything, and it is worth being deliberate about the order.
+Change the JDK in one commit; adopt features in later ones. A bisect through a commit that does both
+tells you nothing.</p>
+
+<p>What becomes available between 21 and 25, roughly in order of how likely you are to want it:</p>
+
+<table>
+<thead><tr><th>Feature</th><th>Standard in</th><th>Worth adopting when</th></tr></thead>
+<tbody>
+<tr><td>Unnamed variables (<code>_</code>)</td><td>22</td><td>immediately — it costs nothing and
+clarifies ignored values</td></tr>
+<tr><td><a href="/java/java-25-stream-gatherers">Stream gatherers</a></td><td>24</td><td>you have a
+stateful stream operation written as a loop</td></tr>
+<tr><td><a href="/java/java-25-flexible-constructors">Flexible constructors</a></td><td>25</td><td>you
+have static validator methods feeding <code>super()</code></td></tr>
+<tr><td>Module imports</td><td>25</td><td>scripting; rarely in application code</td></tr>
+<tr><td><a href="/java/java-25-simplified-java">Compact source files</a></td><td>25</td><td>teaching
+and scratch files, not applications</td></tr>
+<tr><td>Scoped values</td><td>25</td><td>you use virtual threads and
+<code>ThreadLocal</code></td></tr>
+</tbody>
+</table>
+
+<p>The first row is the one to take seriously. <code>_</code> in a <code>catch</code> block that
+genuinely ignores its exception is a small, immediate readability win across an entire codebase, and
+it needs no design thought.</p>
+
+<h2>Things you can turn on afterwards</h2>
+
+<p>None of these are required, and each is a separate change from the upgrade itself:</p>
+
+<pre class="language-bash"><code class="language-bash"># Smaller object headers — often 10-20% less heap on object-heavy applications
+java -XX:+UseCompactObjectHeaders -jar myapp.jar
+
+# Cache startup work between runs — helps short-lived processes most
+java -XX:AOTCache=app.aot -jar myapp.jar
+</code></pre>
+
+<p>Test compact object headers under load before adopting it. It changes no behaviour, but it changes
+memory layout, and anything measuring heap usage will report different numbers.</p>
+
+<h2>Coming from further back</h2>
+
+<p>If you are on 8, 11 or 17, do not jump straight here. The disruptive change in the whole range is
+strong encapsulation, and it lands in 17 — see the
+<a href="/java/java-17-migration-guide">Java 17 guide</a>. Getting to 17 first isolates it from
+everything else, and the hops from 17 to 21 to 25 are each far smaller.</p>
+
+<p>The exception is a small application with few dependencies and good tests, where going straight to
+25 is genuinely fine. The number of versions you are skipping matters much less than the number of
+dependencies you have.</p>
+
+<h2>Is it worth it?</h2>
+
+<p>Less urgently than any previous LTS upgrade, and that is a good sign rather than a bad one.
+Java 21 is well supported and will be for years.</p>
+
+<p>Move if you want <a href="/java/java-25-simplified-java">compact source files</a> for teaching or
+scripting, <a href="/java/java-25-stream-gatherers">gatherers</a> for a stateful stream operation you
+keep hand-rolling, scoped values because <code>ThreadLocal</code> is hurting under virtual threads,
+or compact object headers because memory is your constraint.</p>
+
+<p>Otherwise, schedule it rather than rushing it. The most valuable thing about this release is that
+it does not force anyone's hand — which, for anyone who lived through the Java 8 to 11 migration, is
+the whole point.</p>
+
+<h2>Next</h2>
+
+<p>That completes the version-by-version tour. <a href="/java/java-advanced-generics">Generics</a> is
+next, opening the advanced section — topics that are not tied to any one release.</p>

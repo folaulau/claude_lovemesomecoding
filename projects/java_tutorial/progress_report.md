@@ -1,6 +1,11 @@
 # Java Tutorial track — progress report
 
-**Status:** ✅ **PUBLISHED TO PROD** — live at https://lovemesomecoding.com/java
+**Status:** ✅ PUBLISHED, then **SUPERSEDED** by `projects/java_merge` on 2026-08-20
+
+> `/java-8` and `/java-advanced` were folded into `/java` later the same day, taking it from 29
+> posts to 64. Eight of the 29 posts below lost their slug to an incoming duplicate — their content
+> was adopted under the winning slug, and the old URLs 301. **`projects/java_merge/` is the current
+> record for `/java`;** this file documents how the 29-post track was built.
 **Started:** 2026-08-20
 **Where it lands:** https://lovemesomecoding.com/java
 

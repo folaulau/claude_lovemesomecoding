@@ -1,0 +1,213 @@
+<p>Generics let a class or method work with a type supplied by the caller, checked at compile time.
+<code>List&lt;String&gt;</code> is the everyday face of it. Writing your own is less common, and
+understanding erasure explains most of the surprising rules.</p>
+
+<h2>What they buy you</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        // Before generics: everything was Object, and every read needed a cast
+        List raw = new ArrayList();
+        raw.add("hello");
+        raw.add(42);                                  // nothing stops this
+        String first = (String) raw.get(0);
+        // String second = (String) raw.get(1);       // ClassCastException at RUNTIME
+
+        List&lt;String&gt; typed = new ArrayList&lt;&gt;();
+        typed.add("hello");
+        // typed.add(42);                             // compile error — caught immediately
+        String value = typed.get(0);                  // no cast needed
+        System.out.println(value);
+    }
+}
+</code></pre>
+
+<p>Two gains: mistakes move from runtime to compile time, and casts disappear. A raw
+<code>List</code> still compiles today, with a warning — treat that warning as an error.</p>
+
+<h2>Generic classes and methods</h2>
+
+<pre class="language-java"><code class="language-java">// A class parameterised by one type
+class Box&lt;T&gt; {
+    private T contents;
+
+    void put(T item) { this.contents = item; }
+    T get() { return contents; }
+}
+
+class Demo {
+    // A generic METHOD — the &lt;T&gt; before the return type declares the parameter
+    static &lt;T&gt; List&lt;T&gt; firstTwo(List&lt;T&gt; items) {
+        return items.subList(0, Math.min(2, items.size()));
+    }
+
+    void run() {
+        Box&lt;String&gt; box = new Box&lt;&gt;();
+        box.put("hello");
+        System.out.println(box.get().length());       // typed, no cast
+
+        System.out.println(firstTwo(List.of(1, 2, 3)));   // [1, 2] — T inferred as Integer
+    }
+}
+</code></pre>
+
+<p>The convention is single letters: <code>T</code> for type, <code>E</code> for element,
+<code>K</code>/<code>V</code> for key and value, <code>R</code> for result.</p>
+
+<h2>Bounded types</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    // T must be Comparable, so compareTo is available inside
+    static &lt;T extends Comparable&lt;T&gt;&gt; T max(List&lt;T&gt; items) {
+        T best = items.get(0);
+        for (T item : items) {
+            if (item.compareTo(best) &gt; 0) {
+                best = item;
+            }
+        }
+        return best;
+    }
+
+    void run() {
+        System.out.println(max(List.of(3, 1, 4)));          // 4
+        System.out.println(max(List.of("Ana", "Bo")));      // Bo
+    }
+}
+</code></pre>
+
+<p><code>extends</code> here means "is or extends" and works for interfaces too. Without the bound,
+<code>T</code> is only known to be an <code>Object</code> and <code>compareTo</code> would not
+compile.</p>
+
+<h2>Wildcards, and PECS</h2>
+
+<p>This is the part that confuses people, and one rule resolves most of it. Start with the surprise:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        List&lt;Integer&gt; numbers = List.of(1, 2, 3);
+        // List&lt;Number&gt; widened = numbers;      // does NOT compile
+    }
+}
+</code></pre>
+
+<p>A <code>List&lt;Integer&gt;</code> is not a <code>List&lt;Number&gt;</code>, even though an
+<code>Integer</code> is a <code>Number</code>. If it were, you could add a <code>Double</code> to it
+through the wider reference and break the original list.</p>
+
+<p>Wildcards restore the flexibility safely:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    // PRODUCER: reads from the list. `? extends` accepts Integer, Double, any Number.
+    static double sum(List&lt;? extends Number&gt; numbers) {
+        double total = 0;
+        for (Number n : numbers) {
+            total += n.doubleValue();
+        }
+        return total;                       // cannot ADD to numbers — see below
+    }
+
+    // CONSUMER: writes into the list. `? super` accepts List&lt;Integer&gt;, List&lt;Number&gt;, List&lt;Object&gt;.
+    static void addNumbers(List&lt;? super Integer&gt; target) {
+        target.add(1);
+        target.add(2);                      // cannot READ a specific type out
+    }
+
+    void run() {
+        System.out.println(sum(List.of(1, 2.5)));       // 3.5
+
+        List&lt;Number&gt; target = new ArrayList&lt;&gt;();
+        addNumbers(target);
+        System.out.println(target);                      // [1, 2]
+    }
+}
+</code></pre>
+
+<p><strong>PECS: Producer Extends, Consumer Super.</strong> If the parameter produces values you read,
+use <code>? extends</code>. If it consumes values you write, use <code>? super</code>. If it does
+both, use a plain type parameter.</p>
+
+<p>The restrictions follow from safety. With <code>? extends Number</code> the compiler knows every
+element is a <code>Number</code> but not which subtype the list actually holds — so reading is safe
+and adding is not. With <code>? super Integer</code> the reverse holds.</p>
+
+<h2>Erasure, and what it explains</h2>
+
+<p>Generics exist only at compile time. The compiler checks the types, inserts casts, and then
+<em>erases</em> the type arguments — at runtime a <code>List&lt;String&gt;</code> is just a
+<code>List</code>. This was done so generic code could run on older JVMs, and it explains a set of
+rules that otherwise look arbitrary:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(Object value) {
+        List&lt;String&gt; a = new ArrayList&lt;&gt;();
+        List&lt;Integer&gt; b = new ArrayList&lt;&gt;();
+
+        // 1. Same class at runtime
+        System.out.println(a.getClass() == b.getClass());    // true
+
+        // 2. Cannot test a type argument
+        if (value instanceof List&lt;?&gt; list) {                 // fine — wildcard only
+            System.out.println(list.size());
+        }
+        // if (value instanceof List&lt;String&gt; s) { }          // does not compile
+
+        // 3. Cannot create an array of a generic type
+        // T[] array = new T[10];                            // does not compile
+    }
+}
+</code></pre>
+
+<p>A fourth consequence: you cannot overload two methods whose parameters differ only by type
+argument, because after erasure they have the same signature.</p>
+
+<h2>Keeping the type at runtime</h2>
+
+<p>When you genuinely need the type argument after erasure, the standard trick is to pass the class
+object alongside it:</p>
+
+<pre class="language-java"><code class="language-java">class Repository&lt;T&gt; {
+    private final Class&lt;T&gt; type;
+
+    Repository(Class&lt;T&gt; type) {
+        this.type = type;                    // the one thing erasure cannot take away
+    }
+
+    T cast(Object value) {
+        return type.cast(value);             // checked, and no unchecked warning
+    }
+
+    String describe() {
+        return "repository of " + type.getSimpleName();
+    }
+}
+
+class Demo {
+    void run() {
+        Repository&lt;String&gt; repo = new Repository&lt;&gt;(String.class);
+        System.out.println(repo.describe());          // repository of String
+        System.out.println(repo.cast("hello").length());   // 5
+    }
+}
+</code></pre>
+
+<p>This is why so many framework APIs take a <code>Class&lt;T&gt;</code> parameter that looks
+redundant — <code>objectMapper.readValue(json, Person.class)</code> is exactly this pattern. The
+method cannot know <code>T</code> at runtime, so you hand it the evidence.</p>
+
+<h2>The practical rules</h2>
+
+<ul>
+<li><strong>Never use a raw type.</strong> If you do not care what is in it, write
+<code>List&lt;?&gt;</code>, not <code>List</code> — the wildcard keeps the type checking.</li>
+<li><strong>Apply PECS to parameters</strong>, and use plain type parameters for return types.
+Wildcards in a return type push the problem onto every caller.</li>
+<li><strong>Do not suppress warnings without a comment</strong> saying why the cast is safe.</li>
+<li><strong>Prefer generic methods to generic classes</strong> when only one method needs the
+parameter.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-advanced-multithreading">Multithreading</a> is next — running code on more than
+one thread, and the ways that goes wrong.</p>

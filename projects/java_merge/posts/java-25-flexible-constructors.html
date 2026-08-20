@@ -1,0 +1,229 @@
+<p>Until Java 25, <code>super()</code> or <code>this()</code> had to be the very first statement in a
+constructor. Nothing could run before it. Flexible constructor bodies lift that restriction, which
+means you can finally validate an argument before handing it to the superclass.</p>
+
+<h2>The restriction</h2>
+
+<pre class="language-java"><code class="language-java">class Account {
+    Account(double balance) {
+        System.out.println("creating with " + balance);
+    }
+}
+
+class SavingsAccount extends Account {
+    private final double rate;
+
+    SavingsAccount(double balance, double rate) {
+        super(balance);                      // had to be first
+        this.rate = rate;
+    }
+}
+</code></pre>
+
+<p>That rule existed for a good reason: the superclass must be fully initialised before the subclass
+touches anything, or a method call could observe a half-built object. But it was stricter than it
+needed to be, because plenty of useful work touches no fields at all.</p>
+
+<h2>The workaround it replaces</h2>
+
+<p>Validating an argument before <code>super()</code> meant a static helper method — a pattern
+everyone recognised and nobody liked:</p>
+
+<pre class="language-java"><code class="language-java">class Account {
+    Account(double balance) { }
+}
+
+class SavingsAccount extends Account {
+    private final double rate;
+
+    SavingsAccount(double balance, double rate) {
+        super(validate(balance));            // a static call is legal in the argument
+        this.rate = rate;
+    }
+
+    private static double validate(double balance) {
+        if (balance &lt; 0) {
+            throw new IllegalArgumentException("balance cannot be negative: " + balance);
+        }
+        return balance;
+    }
+}
+</code></pre>
+
+<p>It works, and it forces the validation into a static method that returns its argument — which is an
+odd shape, and awkward when several parameters need checking or when the checks depend on each
+other.</p>
+
+<h2>The change</h2>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Account {
+    Account(double balance) { }
+}
+
+class SavingsAccount extends Account {
+    private final double rate;
+
+    SavingsAccount(double balance, double rate) {
+        if (balance &lt; 0) {
+            throw new IllegalArgumentException("balance cannot be negative: " + balance);
+        }
+        if (rate &lt; 0 || rate &gt; 1) {
+            throw new IllegalArgumentException("rate must be between 0 and 1: " + rate);
+        }
+        super(balance);                      // now legal after the checks
+        this.rate = rate;
+    }
+}
+</code></pre>
+
+<p>The statements before <code>super()</code> are called the <em>prologue</em>. Everything after it is
+the epilogue, and behaves exactly as before.</p>
+
+<h2>What the prologue may not do</h2>
+
+<p>The safety guarantee is preserved, and it is preserved by a rule that is easy to state:
+<strong>before <code>super()</code> runs, you may not touch the instance under construction.</strong></p>
+
+<p>So the prologue cannot read or write a field, call an instance method, or use <code>this</code> in
+any way. It can:</p>
+
+<ul>
+<li>read and validate the constructor's parameters</li>
+<li>declare and compute local variables</li>
+<li>throw</li>
+<li>call static methods</li>
+</ul>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Base {
+    Base(int value) { }
+}
+
+class Child extends Base {
+    private int field = 10;
+
+    Child(int input) {
+        int doubled = input * 2;             // local variable: fine
+        if (doubled &gt; 100) {                 // validation: fine
+            throw new IllegalArgumentException("too large");
+        }
+        // System.out.println(field);        // NOT allowed — reads the instance
+        // helper();                         // NOT allowed — instance method
+        super(doubled);
+        System.out.println(field);           // fine here
+    }
+
+    void helper() { }
+}
+</code></pre>
+
+<p>That restriction is why the feature is safe: nothing can observe the object before its superclass
+has finished with it, which was the whole reason for the original rule.</p>
+
+<h2>Doing real work in the prologue</h2>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Config {
+    Config(Map&lt;String, String&gt; settings) { }
+}
+
+class TypedConfig extends Config {
+    private final int port;
+
+    TypedConfig(String raw) {
+        // Parse once, use twice — impossible before, without parsing twice
+        // or hiding it in a static method
+        Map&lt;String, String&gt; parsed = new HashMap&lt;&gt;();
+        for (String pair : raw.split(",")) {
+            String[] parts = pair.split("=", 2);
+            if (parts.length == 2) {
+                parsed.put(parts[0].strip(), parts[1].strip());
+            }
+        }
+        int parsedPort = Integer.parseInt(parsed.getOrDefault("port", "8080"));
+
+        super(parsed);
+        this.port = parsedPort;
+    }
+}
+</code></pre>
+
+<p>This is the case the feature really improves. Deriving several values from one argument previously
+meant either computing it twice — once for <code>super()</code>, once for the field — or a static
+method returning a container.</p>
+
+<h2>It also works with <code>this()</code></h2>
+
+<!-- jdk:25 -->
+<pre class="language-java"><code class="language-java">class Order {
+    private final String id;
+    private final int quantity;
+
+    Order(String id, int quantity) {
+        this.id = id;
+        this.quantity = quantity;
+    }
+
+    Order(String id) {
+        if (id == null || id.isBlank()) {
+            throw new IllegalArgumentException("id required");
+        }
+        this(id.strip(), 1);                 // delegation, after validation
+    }
+}
+</code></pre>
+
+<h2>The bug it helps prevent</h2>
+
+<p>There is a second, subtler benefit. The original rule forced a whole class of initialisation into
+the epilogue, and combined with inheritance that produces one of Java's classic traps — a superclass
+constructor calling an overridable method:</p>
+
+<pre class="language-java"><code class="language-java">class Base {
+    Base() {
+        describe();                  // calls the OVERRIDE, before Child's fields are set
+    }
+
+    void describe() {
+        System.out.println("base");
+    }
+}
+
+class Child extends Base {
+    private final String name = "child";
+
+    @Override
+    void describe() {
+        System.out.println(name.length());   // NullPointerException: name is still null
+    }
+}
+</code></pre>
+
+<p>That throws, because <code>Base</code>'s constructor runs first and <code>name</code> has not been
+assigned yet. It is a genuinely confusing failure — a <code>final</code> field with an initialiser,
+observed as null.</p>
+
+<p>Flexible constructors do not remove this trap, and it is worth knowing they do not. What they do is
+remove one of the reasons people reached for the pattern in the first place: needing the subclass to
+contribute something before the superclass ran. Now the subclass can compute it in the prologue and
+pass it up as an argument, which is the correct shape.</p>
+
+<p>The underlying advice stands regardless, and it is the one from
+<a href="/java/java-oop">OOP</a>: do not call an overridable method from a constructor. Make it
+<code>final</code>, or <code>private</code>, or do not call it.</p>
+
+<h2>Does it matter?</h2>
+
+<p>It is a small, unglamorous change and it removes a real annoyance. The static-validator pattern was
+in a great deal of code and nobody wrote it because they wanted to.</p>
+
+<p>The broader value is for <a href="/java/java-17-records">records</a> and value-based classes, where
+the argument for validating in the constructor is strongest — a record's compact constructor already
+allowed this, and inheritance-based classes were the outlier. Failing fast with a clear message, as
+the <a href="/java/java-best-practices">best practices</a> post argues, is much easier when the
+language does not fight the shape of the check.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-25-other-improvements">Other Java 25 improvements</a> is next.</p>

@@ -1,0 +1,186 @@
+<p>Logging is what you have instead of a debugger when the problem happened at 3am on a server you
+cannot attach to. Java's logging landscape has a confusing number of libraries; the arrangement that
+matters is simple once you see it.</p>
+
+<h2>The facade and the implementation</h2>
+
+<p>There are two layers, and conflating them is the source of most logging confusion:</p>
+
+<table>
+<thead><tr><th>Layer</th><th>What it is</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td><strong>Facade</strong></td><td>the API your code calls</td><td><strong>SLF4J</strong>,
+commons-logging</td></tr>
+<tr><td><strong>Implementation</strong></td><td>what actually writes the
+output</td><td><strong>Logback</strong>, Log4j 2, java.util.logging</td></tr>
+</tbody>
+</table>
+
+<p><strong>Write against SLF4J.</strong> Your code depends on the facade; the application chooses the
+implementation at deployment. That is why a library must never bundle an implementation — it takes
+the choice away from the application using it.</p>
+
+<pre class="language-java"><code class="language-java">class OrderService {
+    // In a real project: org.slf4j.Logger / LoggerFactory
+    // private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
+    void placeOrder(String orderId, double total) {
+        // log.info("placing order id={} total={}", orderId, total);
+        System.out.println("placing order id=" + orderId + " total=" + total);
+    }
+}
+</code></pre>
+
+<p>The logger is <code>private static final</code> and named after its class — one per class, created
+once, and the class name is what lets you filter by package later.</p>
+
+<h2>Parameterised messages</h2>
+
+<p>The <code>{}</code> placeholders are not cosmetic:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(String orderId, Object order) {
+        // Concatenation happens ALWAYS, even when debug logging is switched off
+        // log.debug("order " + orderId + " is " + order.toString());
+
+        // Placeholders are substituted only if the level is enabled
+        // log.debug("order {} is {}", orderId, order);
+    }
+}
+</code></pre>
+
+<p>In the first form, the string is built and <code>toString()</code> is called on every call, then
+thrown away if debug is disabled. In a hot loop that is measurable, and it is free to avoid.</p>
+
+<h2>Levels, used properly</h2>
+
+<ul>
+<li><strong>ERROR</strong> — something failed and needs a human. If nobody would act on it, it is not
+an error.</li>
+<li><strong>WARN</strong> — recovered, but odd. A retry succeeded; a config value was missing and a
+default was used.</li>
+<li><strong>INFO</strong> — milestones. Startup, shutdown, a completed job. Not every request.</li>
+<li><strong>DEBUG</strong> — detail you switch on to diagnose something.</li>
+<li><strong>TRACE</strong> — everything, rarely enabled.</li>
+</ul>
+
+<p>The failure mode is logging everything at INFO. When every line is INFO, filtering by level tells
+you nothing and the signal is gone.</p>
+
+<h2>Logging an exception</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(Exception e) {
+        // Wrong: throws away the stack trace and every "Caused by"
+        // log.error("failed: " + e.getMessage());
+
+        // Right: the exception goes LAST, with no placeholder
+        // log.error("could not place order id={}", "A-1099", e);
+    }
+}
+</code></pre>
+
+<p>SLF4J treats a trailing <code>Throwable</code> specially and prints the full trace — including the
+<code>Caused by</code> chain that <a href="/java/java-debugging">Debugging</a> shows is usually where
+the real failure is. Logging only <code>getMessage()</code> is the most common logging mistake there
+is.</p>
+
+<h2>Configuration</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- logback.xml on the classpath --&gt;
+&lt;configuration&gt;
+    &lt;appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender"&gt;
+        &lt;encoder&gt;
+            &lt;pattern&gt;%d{HH:mm:ss} %-5level [%thread] %logger{36} - %msg%n&lt;/pattern&gt;
+        &lt;/encoder&gt;
+    &lt;/appender&gt;
+
+    &lt;!-- Noisy library, quietened; your own code kept verbose --&gt;
+    &lt;logger name="org.hibernate" level="WARN"/&gt;
+    &lt;logger name="com.lovemesomecoding" level="DEBUG"/&gt;
+
+    &lt;root level="INFO"&gt;
+        &lt;appender-ref ref="CONSOLE"/&gt;
+    &lt;/root&gt;
+&lt;/configuration&gt;
+</code></pre>
+
+<p>Levels are set per logger name, and names are hierarchical — <code>org.hibernate</code> covers
+everything beneath it. That is the mechanism you use to silence a chatty dependency without silencing
+yourself.</p>
+
+<h2>Structured logging</h2>
+
+<p>If logs go to a searchable system, JSON output is far more useful than text, because fields become
+queryable rather than needing a regex. MDC attaches context to every line on the current thread:</p>
+
+<pre class="language-java"><code class="language-java">class RequestHandler {
+    void handle(String requestId, String userId) {
+        // MDC.put("requestId", requestId);
+        // MDC.put("userId", userId);
+        try {
+            // every log line in this request now carries both fields
+            process();
+        } finally {
+            // MDC.clear();          // essential: the thread is reused
+        }
+    }
+
+    void process() { }
+}
+</code></pre>
+
+<p>The <code>finally</code> is not optional. On a pooled thread, values left in the MDC leak into the
+next request and attribute one user's logs to another. Note that MDC is
+<code>ThreadLocal</code>-based, which is worth remembering when adopting
+<a href="/java/java-21-virtual-threads">virtual threads</a>.</p>
+
+<h2>Which implementation, and the bridge problem</h2>
+
+<p>Logback and Log4j 2 are both good. Logback is the default in Spring Boot and needs no thought;
+Log4j 2 has an asynchronous appender that measurably outperforms it under very high volume. For most
+applications the choice does not matter.</p>
+
+<p>What does matter is ending up with <em>two</em>. Dependencies pull in whatever facade they were
+written against — commons-logging, java.util.logging, Log4j 1 — and the result is log lines
+disappearing because half your libraries are writing somewhere you are not looking.</p>
+
+<p>The fix is a bridge: a stub that implements the old API and forwards to SLF4J.</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;!-- Redirect other logging APIs into SLF4J, then out through one implementation --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.slf4j&lt;/groupId&gt;
+    &lt;artifactId&gt;jcl-over-slf4j&lt;/artifactId&gt;      &lt;!-- commons-logging --&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.slf4j&lt;/groupId&gt;
+    &lt;artifactId&gt;jul-to-slf4j&lt;/artifactId&gt;        &lt;!-- java.util.logging --&gt;
+&lt;/dependency&gt;
+</code></pre>
+
+<p>Two rules keep this sane: exactly one implementation on the classpath, and a bridge for every other
+API. SLF4J prints a warning at startup when it finds multiple implementations — that warning is worth
+reading rather than scrolling past, because it means your logging configuration is a coin toss.</p>
+
+<h2>A word on Log4Shell</h2>
+
+<p>In 2021, a vulnerability in Log4j 2 let attackers execute arbitrary code by getting a crafted
+string into a log message. It was as severe as vulnerabilities get, and the lesson generalises:
+<strong>logging libraries are code that processes untrusted input.</strong> Keep them patched, and be
+wary of any logging feature that interprets message content.</p>
+
+<h2>What makes a log useful</h2>
+
+<ul>
+<li><strong>Identifiers.</strong> "Order failed" is useless; "order failed id=A-1099 customer=C-42"
+finds the record.</li>
+<li><strong>The exception object</strong>, not its message.</li>
+<li><strong>No secrets.</strong> Passwords, tokens and card numbers must never be logged, and logs
+are often less protected than the database.</li>
+<li><strong>Never <code>System.out.println</code>.</strong> No level, no timestamp, no filtering, and
+no way to turn it off.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-advanced-encryption-and-decryption">Encryption and decryption</a> is next.</p>

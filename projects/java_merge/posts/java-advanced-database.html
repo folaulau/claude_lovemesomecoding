@@ -1,0 +1,187 @@
+<p>JDBC is the API every Java database access sits on — Hibernate, Spring Data, jOOQ and every ORM
+eventually call it. You will rarely write it directly, and knowing what it does is what lets you
+diagnose the layers above it.</p>
+
+<h2>The shape</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() throws SQLException {
+        String url = "jdbc:postgresql://localhost:5432/shop";
+
+        try (Connection connection = DriverManager.getConnection(url, "user", "password");
+             PreparedStatement statement =
+                     connection.prepareStatement("SELECT id, name FROM customers WHERE active = ?")) {
+
+            statement.setBoolean(1, true);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    System.out.println(rows.getLong("id") + " " + rows.getString("name"));
+                }
+            }
+        }
+    }
+}
+</code></pre>
+
+<p>Four objects: a <code>Connection</code> to the database, a <code>PreparedStatement</code> holding
+the SQL, a <code>ResultSet</code> to walk the rows, and <code>DriverManager</code> to make the
+connection.</p>
+
+<p>Every one of them must be closed, which is why try-with-resources is not optional here. A leaked
+connection does not fail immediately — it fails an hour later when the pool is exhausted, which is a
+much harder problem to trace. Note also that parameter indexes start at <strong>1</strong>, not 0.</p>
+
+<h2>Always use a PreparedStatement</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    // NEVER do this
+    void unsafe(Connection connection, String name) throws SQLException {
+        String sql = "SELECT * FROM customers WHERE name = '" + name + "'";
+        try (Statement statement = connection.createStatement()) {
+            statement.executeQuery(sql);
+        }
+    }
+
+    // Always do this
+    void safe(Connection connection, String name) throws SQLException {
+        try (PreparedStatement statement =
+                     connection.prepareStatement("SELECT * FROM customers WHERE name = ?")) {
+            statement.setString(1, name);
+            statement.executeQuery();
+        }
+    }
+}
+</code></pre>
+
+<p>Pass <code>'; DROP TABLE customers; --</code> as <code>name</code> to the first method and the
+database does exactly what it was told. That is <strong>SQL injection</strong>, and it remains one of
+the most common serious vulnerabilities because the unsafe version is the one that looks
+simpler.</p>
+
+<p>A <code>PreparedStatement</code> sends the SQL and the values separately, so a value can never be
+read as SQL. It is also faster — the database parses the statement once and reuses the plan. There is
+no case where string concatenation is the better choice.</p>
+
+<h2>Writing, and transactions</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void transfer(Connection connection, long from, long to, BigDecimal amount)
+            throws SQLException {
+
+        connection.setAutoCommit(false);            // off by default is ON — one commit per statement
+        try (PreparedStatement debit = connection.prepareStatement(
+                     "UPDATE accounts SET balance = balance - ? WHERE id = ?");
+             PreparedStatement credit = connection.prepareStatement(
+                     "UPDATE accounts SET balance = balance + ? WHERE id = ?")) {
+
+            debit.setBigDecimal(1, amount);
+            debit.setLong(2, from);
+            debit.executeUpdate();
+
+            credit.setBigDecimal(1, amount);
+            credit.setLong(2, to);
+            credit.executeUpdate();
+
+            connection.commit();                    // both, or neither
+        } catch (SQLException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(true);
+        }
+    }
+}
+</code></pre>
+
+<p>This is the reason transactions exist. Without <code>setAutoCommit(false)</code> each
+<code>executeUpdate</code> commits on its own, and a failure between them leaves money debited from
+one account and credited to none.</p>
+
+<p><code>BigDecimal</code> rather than <code>double</code>, for the reason the
+<a href="/java/java-data-types">data types</a> post gives.</p>
+
+<h2>Batching</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void insertAll(Connection connection, List&lt;String&gt; names) throws SQLException {
+        try (PreparedStatement statement =
+                     connection.prepareStatement("INSERT INTO customers (name) VALUES (?)")) {
+
+            for (String name : names) {
+                statement.setString(1, name);
+                statement.addBatch();               // queue, do not send
+            }
+            int[] results = statement.executeBatch();   // one round trip
+            System.out.println(results.length + " rows inserted");
+        }
+    }
+}
+</code></pre>
+
+<p>A thousand individual inserts means a thousand network round trips. Batching sends them together
+and is routinely an order of magnitude faster. It is the first thing to reach for when a bulk import
+is slow.</p>
+
+<h2>Connection pooling</h2>
+
+<p>Opening a connection is expensive — a TCP handshake, authentication, session setup. Doing it per
+request is one of the most common causes of a slow application.</p>
+
+<p>A pool keeps connections open and hands them out. <code>DriverManager.getConnection</code> as shown
+above is for examples; real applications use a <code>DataSource</code> backed by a pool such as
+HikariCP, and <code>connection.close()</code> then returns it to the pool rather than closing it.
+Nothing else about the code changes, which is the point of the interface.</p>
+
+<h2>Reading results safely</h2>
+
+<p>Two <code>ResultSet</code> details that cause real bugs. First, <code>getInt</code> and friends
+return <code>0</code> for a SQL <code>NULL</code> rather than throwing, so a null column silently
+becomes a zero:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run(ResultSet rows) throws SQLException {
+        int discount = rows.getInt("discount");
+        if (rows.wasNull()) {                       // the only way to tell 0 from NULL
+            System.out.println("no discount set");
+        }
+
+        // Or use the object form, which returns null properly
+        Integer maybe = rows.getObject("discount", Integer.class);
+        System.out.println(maybe == null ? "none" : maybe.toString());
+    }
+}
+</code></pre>
+
+<p>Second, prefer column names to indexes. <code>rows.getString(2)</code> breaks silently the day
+someone reorders the <code>SELECT</code>; <code>rows.getString("name")</code> does not.</p>
+
+<p>And avoid <code>SELECT *</code> in application code for the same reason — the column set becomes
+whatever the table happens to have, so adding a column changes what your query returns.</p>
+
+<h2>The N+1 problem</h2>
+
+<p>Worth knowing here because it is an ORM symptom with a JDBC cause. Loading 100 customers and then
+their orders one customer at a time issues 101 queries. The fix is one query with a join, or a
+batched fetch.</p>
+
+<p>When an ORM-backed page is mysteriously slow, turn on SQL logging and count the statements. It is
+almost always this.</p>
+
+<h2>What to take from it</h2>
+
+<ul>
+<li><strong>Close everything</strong>, with try-with-resources.</li>
+<li><strong>Parameterise every value.</strong> No exceptions.</li>
+<li><strong>Be explicit about transaction boundaries</strong> — know what commits and when.</li>
+<li><strong>Batch bulk writes</strong>, and pool connections.</li>
+<li><strong>Watch the query count</strong>, not just the query time.</li>
+</ul>
+
+<p>Every one of those still applies when a framework is writing the JDBC for you. The framework
+removes the boilerplate, not the semantics.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-advanced-log4j">Logging</a> is next — recording what happened, in a form that
+is useful at 3am.</p>

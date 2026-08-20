@@ -149,6 +149,17 @@ import java.text.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.concurrent.locks.*;
+import java.util.random.*;
+import java.util.regex.*;
+import java.sql.*;
+// A single-type import beats an on-demand one, which resolves the java.sql.Date
+// vs java.util.Date clash the wildcards above would otherwise create — the very
+// ambiguity the date-time post is about. A snippet wanting the SQL one qualifies
+// it in full, exactly as real code has to.
+import java.util.Date;
+import java.security.*;
+import javax.crypto.*;
+import javax.crypto.spec.*;
 """
 
 # Statements that only make sense at class level would break the method wrapper,
@@ -160,8 +171,11 @@ PACKAGE_LINE = re.compile(r'^[ \t]*package[ \t]+[\w.]+[ \t]*;[ \t]*(?://.*)?$', 
 # The trailing `(?://.*)?` matters: a post routinely annotates an import with a
 # line comment, and without it that line survives the strip and becomes the
 # "first meaningful line" the fragment's kind is decided from.
+# `static` and Java 25's `module` are both recognised so the line is hoisted above
+# the wrapper class rather than surviving into the body, where it would be parsed
+# as a statement and taken as the block's "first meaningful line".
 IMPORT_LINE = re.compile(
-    r'^[ \t]*import[ \t]+((?:static[ \t]+)?[\w.*]+)[ \t]*;[ \t]*(?://.*)?$', re.M)
+    r'^[ \t]*import[ \t]+((?:(?:static|module)[ \t]+)?[\w.*]+)[ \t]*;[ \t]*(?://.*)?$', re.M)
 
 
 def first_meaningful_line(body: str) -> str:

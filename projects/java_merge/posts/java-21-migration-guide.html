@@ -1,0 +1,147 @@
+<p>Java 17 to 21 is the easiest LTS upgrade in years. Nothing significant was removed, the language
+changes are additive, and most applications move with a version bump and a test run. This post covers
+the few things that do bite.</p>
+
+<p>If you are coming from Java 8 or 11 rather than 17, read the
+<a href="/java/java-17-migration-guide">Java 17 guide</a> first — strong encapsulation lands there and
+it is the one genuinely disruptive change in the whole range.</p>
+
+<h2>Start here</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;properties&gt;
+    &lt;maven.compiler.release&gt;21&lt;/maven.compiler.release&gt;
+&lt;/properties&gt;
+</code></pre>
+
+<p>Use <code>release</code> rather than <code>source</code> and <code>target</code>. It additionally
+verifies you are only calling APIs that exist in the version you target, which
+<code>source</code>/<code>target</code> does not — that difference lets code compile and then fail at
+runtime on an older JVM.</p>
+
+<p>Then upgrade build plugins and dependencies before switching the JDK, for the same reason as
+every other upgrade: a failure with one variable changed has one possible cause.</p>
+
+<h2>The things that actually break</h2>
+
+<p><strong>1. Bytecode manipulation libraries.</strong> Anything that reads or generates class files
+must understand the class-file version, and 21 bumps it to 65. Older versions of ASM, ByteBuddy,
+CGLib and everything built on them — Mockito, Hibernate, older Spring — fail with errors like
+<code>Unsupported class file major version 65</code>.</p>
+
+<p>The fix is always a dependency upgrade, never a workaround. This is the single most common Java 21
+upgrade failure.</p>
+
+<p><strong>2. Dynamic agent loading warnings.</strong> Tools that attach to a running JVM now warn,
+and a future release will require a flag:</p>
+
+<pre class="language-text"><code class="language-text">WARNING: A Java agent has been loaded dynamically
+WARNING: Dynamic loading of agents will be disallowed by default in a future release
+</code></pre>
+
+<p>Mockito's inline mock maker is the usual source. It is a warning today; adding
+<code>-XX:+EnableDynamicAgentLoading</code> silences it, and upgrading Mockito is better.</p>
+
+<p><strong>3. Finalization.</strong> Deprecated for removal, and now disableable. If any class
+overrides <code>finalize()</code>, replace it — <code>AutoCloseable</code> plus try-with-resources
+does the job properly, and deterministically.</p>
+
+<p><strong>4. The security manager.</strong> Disabled by default since Java 18. If you were relying
+on it, it needs re-enabling explicitly and a plan, because it is going away.</p>
+
+<h2>Virtual threads: adopt them deliberately</h2>
+
+<p>The headline feature is opt-in, which is worth stressing. Upgrading to 21 does not put anything on
+<a href="/java/java-21-virtual-threads">virtual threads</a>; you enable them.</p>
+
+<p>Before you do, audit two things:</p>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    private final Object lock = new Object();
+
+    // Pins the carrier thread — blocking inside synchronized defeats the point
+    void risky() throws Exception {
+        synchronized (lock) {
+            Thread.sleep(100);            // or a database call, or an HTTP request
+        }
+    }
+
+    private final ReentrantLock better = new ReentrantLock();
+
+    void fine() throws Exception {
+        better.lock();
+        try {
+            Thread.sleep(100);
+        } finally {
+            better.unlock();
+        }
+    }
+}
+</code></pre>
+
+<p>And check for thread pools sized on the assumption that threads are expensive. A fixed pool of 200
+in front of virtual threads reintroduces exactly the queueing you switched to remove.</p>
+
+<p><code>ThreadLocal</code> is the other thing to review: harmless with 200 threads, and a million
+objects with a million virtual threads.</p>
+
+<h2>Framework support</h2>
+
+<p>Most of the effort in an LTS upgrade goes into dependencies rather than your own code, so it is
+worth knowing roughly where the ecosystem sits before starting.</p>
+
+<p>Spring Boot 3.x targets Java 17 as a minimum and supports 21 fully, including a property that puts
+request handling on virtual threads. Anything still on Spring Boot 2.x is on a line that stopped at
+Java 17 and predates Jakarta EE 9's <code>javax</code> to <code>jakarta</code> rename — that migration
+is a much bigger job than the JDK upgrade, and it should be done first and separately.</p>
+
+<p>Hibernate, Jackson, Mockito, JUnit 5 and the major build tools all support 21. The libraries most
+likely to hold you up are small, unmaintained ones doing something clever with bytecode or
+reflection, which is the same set that caused trouble at 17.</p>
+
+<p>A quick way to find them before you start:</p>
+
+<pre class="language-bash"><code class="language-bash"># Anything compiled for an old target, or reaching into JDK internals
+jdeps --jdk-internals --multi-release 21 target/myapp.jar
+
+# What is out of date
+mvn versions:display-dependency-updates
+</code></pre>
+
+<h2>A useful flag while testing</h2>
+
+<pre class="language-bash"><code class="language-bash"># Report every time a virtual thread pins its carrier, with a stack trace
+java -Djdk.tracePinnedThreads=full -jar myapp.jar
+</code></pre>
+
+<p>Run your load tests with that on. It names the exact <code>synchronized</code> blocks that need
+attention, which is far better than guessing from a throughput graph.</p>
+
+<h2>What you get</h2>
+
+<p>Beyond virtual threads: <a href="/java/java-21-pattern-matching-switch">pattern matching for
+switch</a>, <a href="/java/java-21-record-patterns">record patterns</a>,
+<a href="/java/java-21-sequenced-collections">sequenced collections</a>, generational ZGC, and
+another round of general performance work.</p>
+
+<p>There is also a support argument. Java 17's free public updates are winding down and 21 is the
+current baseline for most frameworks — Spring Boot 3.2 onwards, in particular, treats 21 as a
+first-class target and needs it for its virtual thread support.</p>
+
+<h2>The order that works</h2>
+
+<ol>
+<li>On Java 17, upgrade build plugins. Then dependencies, especially anything touching bytecode.</li>
+<li>Switch the JDK and set <code>release</code> to 21. Run the tests, then run the application.</li>
+<li>Only then start using new language features, so a bisect stays meaningful.</li>
+<li>Adopt virtual threads last, as a separate change, with the pinning flag on and a load test.</li>
+</ol>
+
+<p>Step four is the one people merge into step two and regret. Turning on virtual threads changes the
+performance characteristics of the whole application; doing it in the same commit as a JDK upgrade
+means any regression has two candidate causes.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-25-simplified-java">Module imports and simple source files</a> is next, opening
+the Java 25 section — starting with the change that finally makes a first Java program one line
+long.</p>

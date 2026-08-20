@@ -1,0 +1,154 @@
+<p>Java 25 is the current LTS. The features with their own posts —
+<a href="/java/java-25-simplified-java">compact source files</a>,
+<a href="/java/java-25-stream-gatherers">gatherers</a> and
+<a href="/java/java-25-flexible-constructors">flexible constructors</a> — are the visible ones. This
+collects what else arrived between 21 and 25.</p>
+
+<h2>Scoped values</h2>
+
+<p>A replacement for <code>ThreadLocal</code>, and the reason it exists is
+<a href="/java/java-21-virtual-threads">virtual threads</a>. A <code>ThreadLocal</code> is fine with
+two hundred threads and a memory problem with a million:</p>
+
+<pre class="language-java"><code class="language-java">class Context {
+    // The old way: mutable, inherited by child threads, and freed only when the
+    // thread dies — which for a pooled thread may be never.
+    private static final ThreadLocal&lt;String&gt; USER = new ThreadLocal&lt;&gt;();
+
+    void handle(String user) {
+        USER.set(user);
+        try {
+            process();
+        } finally {
+            USER.remove();          // forget this and you have a leak
+        }
+    }
+
+    void process() {
+        System.out.println(USER.get());
+    }
+}
+</code></pre>
+
+<p>A scoped value is immutable and bound for a defined region, so there is nothing to remove and no
+way to leak it — the binding ends when the block does:</p>
+
+<pre class="language-java"><code class="language-java">// ScopedValue, standard in Java 25
+// private static final ScopedValue&lt;String&gt; USER = ScopedValue.newInstance();
+//
+// void handle(String user) {
+//     ScopedValue.where(USER, user).run(this::process);
+// }                                   // binding ends here, automatically
+//
+// void process() {
+//     System.out.println(USER.get());
+// }
+</code></pre>
+
+<p>The other gain is that it is cheap to share with child threads, which matters when a request fans
+out across many virtual threads and each needs the same request id or user.</p>
+
+<h2>Compact object headers</h2>
+
+<pre class="language-bash"><code class="language-bash">java -XX:+UseCompactObjectHeaders -jar myapp.jar
+</code></pre>
+
+<p>Every Java object carries a header. Shrinking it from 12 bytes to 8 sounds trivial until you
+consider an application holding tens of millions of small objects — reported heap reductions are
+commonly in the 10-20% range, with a corresponding drop in GC work.</p>
+
+<p>It is opt-in in 25 and expected to become the default. Worth testing if memory is your
+constraint; it changes no behaviour, only layout.</p>
+
+<h2>Structured concurrency</h2>
+
+<p>Still previewing, and worth watching. It gives a task that spawns subtasks a defined lifetime: if
+one subtask fails, its siblings are cancelled, and the parent cannot exit before they finish.</p>
+
+<p>That is the guarantee unstructured thread-spawning never gave you. Virtual threads made fanning
+out cheap; structured concurrency is what makes it safe. Together they are the argument for the pair
+of releases.</p>
+
+<h2>Smaller additions</h2>
+
+<pre class="language-java"><code class="language-java">class Demo {
+    void run() {
+        // Java 22: Math.clamp had arrived in 21; the ceilDiv family rounds out integer maths
+        System.out.println(Math.ceilDiv(7, 2));        // 4 — not 3
+        System.out.println(Math.floorDiv(-7, 2));      // -4 — not -3
+        System.out.println(Math.clamp(150, 0, 100));   // 100
+
+        // Character and String remain the most-added-to classes
+        System.out.println("hello".indexOf('l', 0, 5));   // 2 — bounded search
+    }
+}
+</code></pre>
+
+<p><code>ceilDiv</code> is more useful than it looks: computing "how many pages of size 20" is
+<code>Math.ceilDiv(total, 20)</code>, replacing the <code>(total + 19) / 20</code> idiom that is
+correct and unreadable.</p>
+
+<h2>The Class-File API</h2>
+
+<p>Standard in 24, and it matters more than its audience size suggests. The JDK now has its own API
+for reading and writing class files, replacing the ASM library that almost every framework bundled a
+copy of:</p>
+
+<pre class="language-java"><code class="language-java">// java.lang.classfile — read a class file without a third-party library
+// ClassModel model = ClassFile.of().parse(Path.of("Target.class"));
+// for (MethodModel method : model.methods()) {
+//     System.out.println(method.methodName().stringValue());
+// }
+</code></pre>
+
+<p>The problem it solves is one you have probably hit indirectly. Every LTS bumps the class-file
+version, and every library doing bytecode work needed a new ASM release to understand it — which is
+exactly why <code>Unsupported class file major version</code> is the most common failure in a
+<a href="/java/java-21-migration-guide">Java 21 upgrade</a>.</p>
+
+<p>With the API in the JDK, it is versioned with the JDK and cannot lag behind it. You will not call
+it directly; you benefit when Spring, Hibernate and Mockito stop needing an urgent release after each
+LTS.</p>
+
+<h2>Vector API, still previewing</h2>
+
+<p>Now in its umpteenth preview round, the Vector API expresses computations that compile to SIMD
+instructions — doing arithmetic on eight floats at once rather than one. It is waiting on Project
+Valhalla, so it has been previewing for years and will continue to. Relevant to numerical and
+image-processing code, and safely ignorable otherwise.</p>
+
+<h2>What was removed or restricted</h2>
+
+<ul>
+<li><strong>The security manager is permanently disabled.</strong> It cannot be re-enabled from Java
+24 onwards. Anything depending on it needs a different design.</li>
+<li><strong>String templates are gone</strong> — previewed in 21, removed in 23. Do not adopt them;
+see <a href="/java/java-21-other-improvements">the Java 21 notes</a>.</li>
+<li><strong>32-bit x86 support is gone.</strong> Only relevant if you are on very old
+hardware.</li>
+<li><strong>Dynamic agent loading warns loudly</strong> and moves closer to requiring a flag.</li>
+</ul>
+
+<h2>Performance, without changing anything</h2>
+
+<p>Worth stating because it is the least discussed reason to upgrade. Between 21 and 25 there have
+been steady improvements to the collectors, to string handling, to the JIT's escape analysis, and to
+startup time.</p>
+
+<p>Ahead-of-time class loading and linking, added in 24, caches the work done during JVM startup so a
+subsequent run skips it. For a short-lived process — a CLI tool, a serverless function — that is a
+meaningful fraction of total runtime, and it needs no code changes.</p>
+
+<h2>Should you be on 25?</h2>
+
+<p>For a new project, yes — start on the current LTS. For an existing one, the honest answer is that
+21 is a perfectly good place to be and the gap to 25 is smaller than any previous LTS-to-LTS step.</p>
+
+<p>The arguments for moving are compact object headers if memory is tight, scoped values if you have
+adopted virtual threads and are fighting <code>ThreadLocal</code>, and the support window. The
+argument against is simply that 21 is well supported and there is no urgency. That is a much more
+comfortable position than the one Java 8 users were in.</p>
+
+<h2>Next</h2>
+
+<p><a href="/java/java-25-migration-guide">The Java 25 migration guide</a> is next.</p>

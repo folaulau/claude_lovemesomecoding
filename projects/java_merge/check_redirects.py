@@ -18,7 +18,7 @@ or against the live site after deploying:
 import argparse
 import json
 import sys
-import urllib.request
+import subprocess
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -53,13 +53,19 @@ def main() -> int:
     failures = []
 
     if args.live:
+        # curl, not urllib: this machine's Python has no CA bundle, so urlopen
+        # fails every HTTPS request with CERTIFICATE_VERIFY_FAILED and the check
+        # reports 53 false failures.
         for old, new in sorted(redirects_expected.items()):
             url = "https://lovemesomecoding.com" + old
-            req = urllib.request.Request(url, method="GET")
             try:
-                with urllib.request.urlopen(req) as r:
-                    final = r.url.replace("https://lovemesomecoding.com", "")
-                    code = r.status
+                r = subprocess.run(
+                    ["curl", "-sL", "-o", "/dev/null",
+                     "-w", "%{http_code} %{url_effective}", url],
+                    capture_output=True, text=True, timeout=30)
+                code_str, _, effective = r.stdout.strip().partition(" ")
+                code = int(code_str)
+                final = effective.replace("https://lovemesomecoding.com", "")
             except Exception as e:  # noqa: BLE001
                 failures.append(f"{old}: {e}")
                 continue
