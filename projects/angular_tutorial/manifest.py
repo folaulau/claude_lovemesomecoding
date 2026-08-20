@@ -360,12 +360,13 @@ _TRACK = [
         "slug": "angular-state-management",
         "title": "Angular – State Management",
         "state": "new",
-        "tags": ["angular", "signals", "state-management"],
+        "tags": ["angular", "signals", "ngrx", "state-management"],
         "excerpt": (
             "Most Angular apps do not need a state library, and the ones that do should be able to "
-            "say why. Component state versus shared state, a signal-based store service in about "
-            "thirty lines, when NgRx or the NgRx Signal Store starts paying for itself, and how to "
-            "keep server state and UI state from tangling."
+            "say why. The demo app splits it deliberately: signal-based services injected from the "
+            "root for the customer screens, NgRx for the admin section. What each is good at, what "
+            "`createFeature` buys you, and why registering the store on a lazy route keeps it out "
+            "of everyone else's download."
         ),
     },
     {
