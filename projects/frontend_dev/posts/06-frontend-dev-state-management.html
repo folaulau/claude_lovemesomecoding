@@ -1,0 +1,207 @@
+<p>Ask a frontend engineer what they spend their time on and the honest answer is deciding where
+values live. Nearly every bug that makes a UI feel broken — the badge that says 3 when the drawer
+shows 2, the button that re-enables while the request is still running, the tab that thinks you
+are still signed in — is the same bug: one fact stored in two places, and the two disagreed.</p>
+
+<p>This post is about picking a home for each piece of state, and about the honest criteria for
+moving it when the first choice stops working.</p>
+
+<h2 id="the-five-kinds-of-state">The five kinds of state</h2>
+
+<p>They are not interchangeable, and most arguments about state libraries are really people
+talking about different rows of this table:</p>
+
+<table class="table table-bordered">
+<thead><tr><th>Kind</th><th>Example</th><th>Usually lives</th></tr></thead>
+<tbody>
+<tr><td><strong>Local UI</strong></td><td>Is this drawer open? What is typed in this box?</td><td>In the component.</td></tr>
+<tr><td><strong>Shared app</strong></td><td>Who is signed in. What is in the cart.</td><td>Context or a store.</td></tr>
+<tr><td><strong>Server data</strong></td><td>The menu. This customer's orders.</td><td>A cache — it is a copy, and it goes stale.</td></tr>
+<tr><td><strong>URL</strong></td><td>Which product page. Which filter. Page 3.</td><td>The URL itself.</td></tr>
+<tr><td><strong>Form</strong></td><td>Half-filled fields, which ones are invalid.</td><td>The form.</td></tr>
+</tbody>
+</table>
+
+<p>The two most commonly misplaced are the middle and the fourth. Server data put in a global store
+gets treated as if it were true forever, when it is a snapshot that was true when it arrived. And
+state that belongs in the URL — a filter, a tab, a page number — put in a component means the back
+button breaks and nobody can share a link to what they are looking at.</p>
+
+<h2 id="the-escalation-ladder">The escalation ladder</h2>
+
+<p>Start at the top and only move down when you have an actual reason. Every step costs
+indirection.</p>
+
+<h3 id="1-local-state">1. Local state</h3>
+
+<p>If one component needs it, it lives there. Most state never leaves this step and that is
+healthy.</p>
+
+<h3 id="2-lift-it-up">2. Lift it up</h3>
+
+<p>When two siblings need the same value, move it to their nearest common parent and pass it down.
+The demo app does this with the cart drawer's open/closed flag, and says why in the code:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// The drawer's open/closed state lives here because both the navbar (which opens it) and the
+// drawer itself need it. This is "lifting state up" — the cart CONTENTS are in context, but
+// this piece of purely-visual state is not worth putting there.
+const [cartOpen, setCartOpen] = useState(false);</code></pre>
+
+<p>Note the distinction being drawn: the cart's <em>contents</em> are shared app state, but
+"is the drawer showing" is just UI, and shoving it into a global store because it is nearby is how
+stores become junk drawers.</p>
+
+<h3 id="3-context">3. Context</h3>
+
+<p>Lifting stops being reasonable when the value has to be threaded through six components that do
+not care about it — prop drilling. Context lets any descendant read it directly:</p>
+
+<blockquote><p>The cart is needed by the navbar badge, the menu page, the cart drawer and checkout.
+Threading it through props would mean passing it through every component in between ("prop
+drilling"). Context lets any descendant read it directly.</p></blockquote>
+
+<p>Two things to know before you reach for it:</p>
+
+<ul>
+<li><strong>Split contexts by how often they change.</strong> One giant context means a cart change
+re-renders everything that only cares about the logged-in user. The demo app keeps auth, menu,
+cart and toasts separate <em>for exactly that reason</em>.</li>
+<li><strong>Memoise the value you provide.</strong> A fresh object literal in the provider is a new
+reference on every render, so every consumer re-renders regardless of whether anything
+changed.</li>
+</ul>
+
+<h3 id="4-a-reducer">4. A reducer</h3>
+
+<p>When the updates become a set of named operations rather than "set this value" — especially when
+several of them depend on the previous state — move the logic into a reducer:</p>
+
+<pre class="language-tsx"><code class="language-tsx">type CartAction =
+  | { type: 'ADD_ITEM'; payload: CartItem }
+  | { type: 'REMOVE_ITEM'; payload: { lineId: string } }
+  | { type: 'SET_QUANTITY'; payload: { lineId: string; quantity: number } }
+  | { type: 'SET_ORDER_TYPE'; payload: { orderType: OrderType } }
+  | { type: 'HYDRATE'; payload: CartState }
+  | { type: 'CLEAR' };</code></pre>
+
+<p>This is a discriminated union doing real work. TypeScript narrows the payload from the
+<code>type</code>, so the reducer's switch is checked exhaustively — add an action, forget to
+handle it, and the build fails rather than the cart quietly not updating.</p>
+
+<p>The other win is testability. A reducer is a pure function: given a state and an action, return
+the next state. You can test the whole cart's behaviour without rendering anything.</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function cartReducer(state: CartState, action: CartAction): CartState {</code></pre>
+
+<p>And the constraint that never goes away — the reducer must <em>return new objects</em> rather
+than mutating, because reference comparison is what tells the framework to redraw. That is
+<a href="/frontend-dev/frontend-dev-javascript-and-typescript">post 4</a> again.</p>
+
+<h3 id="5-a-store">5. A store</h3>
+
+<p>Redux, Zustand, MobX and friends. You have earned one when several screens share a growing
+amount of state, the updates are genuinely asynchronous, and you need to be able to see the
+sequence of changes to debug it.</p>
+
+<h2 id="the-most-useful-example-in-this-post">The most useful example in this post</h2>
+
+<p>The demo app uses <strong>both</strong>, and the reason is a better guide than any blog
+argument. Its customer-facing half runs on context and <code>useReducer</code>. Its admin half runs
+on Redux Toolkit. From <code>src/store/index.ts</code>:</p>
+
+<blockquote><p>The customer-facing side of this app uses React Context and useReducer, and does so
+happily: four small, independent, mostly-read contexts (auth, menu, cart, toasts).</p>
+<p>The admin side is a different problem. Several screens share a growing amount of state, the
+updates are genuinely asynchronous, and the thing you most want while debugging a report that
+disagrees with the orders table is a time-travelling log of every action. That is what Redux is
+for, and it is why the split runs along that line rather than through the middle of a
+feature.</p></blockquote>
+
+<p>Three things worth extracting from that:</p>
+
+<ol>
+<li><strong>The line runs between problems, not down the middle of a feature.</strong> Mixed
+approaches are fine; a feature half in a store and half in context is not.</li>
+<li><strong>"Mostly-read and rarely changing" is the profile context is good at.</strong> Lots of
+churn shared by lots of consumers is the profile it is bad at.</li>
+<li><strong>The deciding factor was debuggability</strong> — being able to replay what happened —
+not code style.</li>
+</ol>
+
+<p>There is a fourth, and it is the kind of thing that only shows up in a real codebase:</p>
+
+<blockquote><p>NOTE the store is created here but only PROVIDED inside AdminLayout, which is a lazy
+route. Redux therefore ships in the admin chunk and costs the 99% of visitors who never open
+/admin exactly nothing. Putting &lt;Provider&gt; in main.tsx would have pulled it into the entry
+bundle.</p></blockquote>
+
+<p>Where you mount a provider is a bundle-size decision as well as an architectural one.
+<a href="/frontend-dev/frontend-dev-performance-and-accessibility">Post 10.</a></p>
+
+<h2 id="server-data-is-not-really-state">Server data is not really state</h2>
+
+<p>The biggest shift in frontend practice over the last few years: data fetched from an API is a
+<em>cache</em>, not state. It arrived at a moment, it can be stale, someone else may have changed
+it, and two components asking for it should not produce two requests.</p>
+
+<p>Once you see it that way, the list of things you need is not "a store" but: deduplication,
+caching, revalidation, and a shared loading and error state. Libraries like TanStack Query exist to
+supply exactly that list, and they remove most of what people used to put in Redux.</p>
+
+<p>The demo app does it by hand once, deliberately, and points at what that costs:</p>
+
+<blockquote><p>The menu, toppings and crusts are needed by the menu page, the builder modal and the
+admin screen. They change rarely and are identical for every visitor, so fetching them once here
+beats each component fetching for itself — three components mounting would otherwise mean three
+identical round trips.</p>
+<p>This is where a data library like TanStack Query would normally go. Doing it by hand once is
+worth seeing first: the loading flag, the error branch, and the cleanup are exactly what such a
+library gives you for free.</p></blockquote>
+
+<p>Do it by hand once. Then use the library.</p>
+
+<h2 id="the-url-is-state-too">The URL is state too</h2>
+
+<p>If a value should survive a refresh, be shareable as a link, and work with the back button, it
+belongs in the URL — not in a component. Which product, which tab, which filter, which page.
+Getting this wrong is the difference between an app that feels like a website and one that feels
+like it is fighting the browser.
+<a href="/frontend-dev/frontend-dev-routing-and-forms">Post 8.</a></p>
+
+<h2 id="questions-that-decide-it">Questions that decide it</h2>
+
+<table class="table table-bordered">
+<thead><tr><th>Ask</th><th>If yes</th></tr></thead>
+<tbody>
+<tr><td>Can I compute this from state I already have?</td><td>Do that. Do not store it — derived state that is stored is state that can disagree.</td></tr>
+<tr><td>Should it survive a refresh or be shareable?</td><td>The URL, or storage.</td></tr>
+<tr><td>Did it come from the server?</td><td>Treat it as a cache. Reach for a data library.</td></tr>
+<tr><td>Does exactly one component use it?</td><td>Keep it local.</td></tr>
+<tr><td>Do two siblings use it?</td><td>Lift it to the parent.</td></tr>
+<tr><td>Is it threaded through components that do not care?</td><td>Context.</td></tr>
+<tr><td>Are updates a set of named operations on previous state?</td><td>A reducer.</td></tr>
+<tr><td>Do many screens share it, change it asynchronously, and need debugging?</td><td>A store.</td></tr>
+</tbody>
+</table>
+
+<h2 id="the-mistakes-that-cost-the-most">The mistakes that cost the most</h2>
+
+<ul>
+<li><strong>Storing derived values.</strong> Keeping <code>items</code> and
+<code>itemCount</code> guarantees a moment where they disagree. Compute the count.</li>
+<li><strong>Reaching for a global store on day one.</strong> You will put everything in it,
+including the drawer flag.</li>
+<li><strong>One enormous context.</strong> Every change re-renders everything.</li>
+<li><strong>Duplicating server data into a store and editing the copy.</strong> Now there are two
+truths and the server's is the one that counts.</li>
+<li><strong>Mutating instead of replacing.</strong> The data updates and the screen does not.</li>
+</ul>
+
+<h2 id="the-one-thing-to-take-from-this-post">The one thing to take from this post</h2>
+
+<p>Every value should have exactly one home, and you should be able to say what it is. Start local,
+escalate only when something concrete forces you to, and remember that data from the server is a
+cache with an expiry date rather than a fact. Get that right and a whole category of "the UI is out
+of sync" bugs simply never happens.</p>
+
+<p>Next: <a href="/frontend-dev/frontend-dev-talking-to-the-backend">Talking to the Backend</a>.</p>

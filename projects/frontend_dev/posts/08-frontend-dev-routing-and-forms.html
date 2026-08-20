@@ -1,0 +1,223 @@
+<p>Two topics in one post because they are the two places a single-page app most often stops feeling
+like the web. Routing is what keeps the back button, the address bar and shareable links working
+once JavaScript is drawing the pages. Forms are where your users actually touch the app, and where
+the most careless code in most codebases tends to be.</p>
+
+<h2 id="the-url-is-state">The URL is state</h2>
+
+<p>The rule from <a href="/frontend-dev/frontend-dev-state-management">post 6</a>, restated because
+it is the whole reason routing matters: if a value should survive a refresh, be shareable as a
+link, and work with the back button, it belongs in the URL.</p>
+
+<p>Which product is open. Which tab. Which filter. Page 3. Put those in component state instead and
+you have quietly broken things every user expects — someone bookmarks a filtered list and gets the
+unfiltered one, someone presses back and leaves the app entirely.</p>
+
+<h2 id="routes-map-urls-to-screens">Routes map URLs to screens</h2>
+
+<p>A router matches the current path and renders the matching screen, and it changes the URL
+without a full page load — so the app keeps its state and does not re-download everything.</p>
+
+<pre class="language-tsx"><code class="language-tsx">              &lt;Route path="/" element={&lt;HomePage /&gt;} /&gt;
+              &lt;Route path="/menu" element={&lt;MenuPage /&gt;} /&gt;
+              &lt;Route path="/checkout" element={&lt;CheckoutPage /&gt;} /&gt;
+              &lt;Route path="/order-confirmation/:orderId" element={&lt;OrderConfirmationPage /&gt;} /&gt;
+              &lt;Route path="/login" element={&lt;LoginPage /&gt;} /&gt;</code></pre>
+
+<p>The <code>:orderId</code> segment is a parameter — the screen reads it and fetches that order.
+That is the URL carrying state, exactly as above.</p>
+
+<p>Always define a catch-all. Without one, a typo'd URL renders nothing at all, which reads as a
+broken app rather than a wrong address:</p>
+
+<pre class="language-tsx"><code class="language-tsx">              &lt;Route
+                path="*"
+                element={
+                  &lt;div className="container py-5 text-center"&gt;
+                    &lt;h1 className="h4"&gt;Page not found&lt;/h1&gt;
+                  &lt;/div&gt;
+                }
+              /&gt;</code></pre>
+
+<h3 id="nested-layouts">Nested layouts</h3>
+
+<p>Sections that share a shell — an admin area with its own sidebar — nest. The parent renders the
+chrome plus an outlet, and the children render into it:</p>
+
+<pre class="language-tsx"><code class="language-tsx">              &lt;Route
+                path="/admin"
+                element={
+                  &lt;ProtectedRoute requireAdmin&gt;
+                    &lt;AdminLayout /&gt;
+                  &lt;/ProtectedRoute&gt;
+                }
+              &gt;
+                {/* `index` is the route shown at /admin itself. */}
+                &lt;Route index element={&lt;AdminReportsPage /&gt;} /&gt;
+                &lt;Route path="products" element={&lt;AdminProductsPage /&gt;} /&gt;
+                &lt;Route path="toppings" element={&lt;AdminToppingsPage /&gt;} /&gt;</code></pre>
+
+<p>The demo app makes a structural point about this that is worth internalising:</p>
+
+<blockquote><p>Guarding the PARENT means every admin page inherits the check — a new tab cannot be
+added unprotected by accident.</p></blockquote>
+
+<p>That is security by construction rather than by discipline. If each child carried its own guard,
+the fifteenth one added in a hurry would eventually be missing it.</p>
+
+<h2 id="guarded-routes">Guarded routes, and the two bugs everyone ships</h2>
+
+<p>A guard wraps a page and sends unauthorised visitors somewhere else. It is easy to write and
+easy to write with two specific bugs in it.</p>
+
+<pre class="language-tsx"><code class="language-tsx">  if (!isAuthenticated) {
+    return &lt;Navigate to="/login" state={{ from: location }} replace /&gt;;
+  }
+
+  if (requireAdmin &amp;&amp; !isAdmin) {
+    return &lt;Navigate to="/" replace /&gt;;
+  }</code></pre>
+
+<p><strong>Bug one: the flash of the login page on refresh.</strong> If the app is still checking a
+stored token, <code>isAuthenticated</code> is briefly false — and a perfectly valid admin gets
+bounced to the sign-in screen. You need a third state, not a boolean:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  if (initialising) {
+    return (
+      &lt;div className="text-center py-5"&gt;
+        &lt;Spinner animation="border" variant="danger" role="status"&gt;
+          &lt;span className="visually-hidden"&gt;Checking your session…&lt;/span&gt;
+        &lt;/Spinner&gt;
+      &lt;/div&gt;
+    );
+  }</code></pre>
+
+<p><strong>Bug two: the back button bouncing.</strong> <code>replace</code> swaps the current
+history entry instead of adding one. Without it, pressing Back after signing in returns you to the
+redirect, which immediately redirects you forward again — a loop the user cannot escape.</p>
+
+<p>And the courtesy that separates a good app from an irritating one: remember where they were
+going. The guard stashes the attempted location, and the login page reads it back:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  const redirectTo =
+    (location.state as { from?: { pathname: string } } | null)?.from?.pathname ?? '/';</code></pre>
+
+<p>One last thing, and the demo app is blunt about it in a comment on the guard itself:</p>
+
+<blockquote><p>NOTE: this is a usability guard, not a security control. Anyone can edit client-side
+JavaScript. The real enforcement is the backend rejecting requests without a valid ADMIN
+token.</p></blockquote>
+
+<p>That is <a href="/frontend-dev/frontend-dev-auth-and-security">post 9</a> in one sentence.</p>
+
+<h2 id="links-not-onclick">Links, not onClick</h2>
+
+<p>Navigation belongs in an anchor. A <code>&lt;div onClick={() =&gt; navigate('/menu')}&gt;</code>
+cannot be middle-clicked, cannot be opened in a new tab, is not focusable, is not announced as a
+link, and is invisible to a crawler. Routers give you a link component that renders a real
+<code>&lt;a href&gt;</code> and intercepts the click — use it.</p>
+
+<h2 id="forms">Forms</h2>
+
+<h3 id="controlled-inputs">Controlled inputs</h3>
+
+<p>The framework holds the value and the input renders from it. One source of truth, so validation,
+formatting and resetting all work on the same data.</p>
+
+<pre class="language-tsx"><code class="language-tsx">              &lt;Form.Control
+                id={`${formId}-email`}
+                type="email"
+                required
+                value={email}
+                onChange={(e) =&gt; setEmail(e.target.value)}
+                autoComplete="username"
+              /&gt;</code></pre>
+
+<p>Three attributes there are doing unglamorous, important work. <code>type="email"</code> gets a
+better mobile keyboard and free format checking. <code>required</code> is browser-level validation
+with no code. <code>autoComplete="username"</code> is what lets a password manager fill the form —
+get this wrong and you have quietly made signing in harder for a large number of people.</p>
+
+<h3 id="labels-that-actually-work">Labels that actually work</h3>
+
+<pre class="language-tsx"><code class="language-tsx">                &lt;Form.Label htmlFor={`${formId}-email`}&gt;Email&lt;/Form.Label&gt;</code></pre>
+
+<p>The id is generated rather than hard-coded, because the same form can appear twice on a page and
+duplicate ids break the association silently. A label wired up properly gives you three things at
+once: clicking it focuses the input, a screen reader announces the field, and a test can find it by
+its label. That last one is why <a href="/frontend-dev/frontend-dev-testing">post 11</a> can write
+<code>getByLabel('Email')</code>.</p>
+
+<h3 id="submitting">Submitting</h3>
+
+<pre class="language-tsx"><code class="language-tsx">  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    try {
+      await login(email, password);
+      navigate(redirectTo, { replace: true });
+    } catch {
+      // The error message is already surfaced through AuthContext; nothing to do here.
+    }
+  }</code></pre>
+
+<p>Use a real <code>&lt;form&gt;</code> with a submit handler rather than a button with an onClick.
+That is what makes Enter submit, and it is what browsers recognise as a login form.
+<code>preventDefault</code> stops the browser doing its own full-page navigation.</p>
+
+<p>And disable the submit button while the request is in flight, or a double-click places two
+orders:</p>
+
+<pre class="language-tsx"><code class="language-tsx">            &lt;Button type="submit" variant="primary" className="w-100" disabled={loading}&gt;
+              {loading ? 'Signing in…' : 'Sign in'}
+            &lt;/Button&gt;</code></pre>
+
+<h2 id="validation-happens-three-times">Validation happens in three places</h2>
+
+<table class="table table-bordered">
+<thead><tr><th>Where</th><th>What for</th><th>Trustworthy?</th></tr></thead>
+<tbody>
+<tr><td><strong>The browser</strong> — <code>required</code>, <code>type</code>, <code>min</code></td><td>Instant feedback, free</td><td>No</td></tr>
+<tr><td><strong>Your code</strong> — on change or on submit</td><td>Rules the browser cannot express; better messages</td><td>No</td></tr>
+<tr><td><strong>The server</strong></td><td>Actually enforcing it</td><td><strong>Yes</strong> — the only one</td></tr>
+</tbody>
+</table>
+
+<p>Client validation is a user-experience feature. Anyone can open developer tools and send whatever
+they like straight to your API, so every rule that matters must exist on the server too. This is
+not duplication to be eliminated — the two have different jobs.
+<a href="/backend-dev/backend-dev-apis-and-http">The backend side of it.</a></p>
+
+<h3 id="showing-a-server-error-on-the-right-field">Showing a server error on the right field</h3>
+
+<p>The server rejects an email that is already registered. That belongs under the email box, not in
+a banner. This is what the structured error from
+<a href="/frontend-dev/frontend-dev-talking-to-the-backend">post 7</a> was for:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  /** Field errors as a lookup, for rendering next to inputs. */
+  fieldErrors(): Record&lt;string, string&gt; {</code></pre>
+
+<p>Catch the error, call it, and render each message beside its field.</p>
+
+<h3 id="when-to-show-the-error">When to show it</h3>
+
+<p>Validating on every keystroke tells someone their email is invalid after they have typed one
+character, which is nagging. The pattern that feels right: validate a field when it loses focus,
+switch to live validation for a field that has already errored so they can see it become correct,
+and validate everything on submit.</p>
+
+<h2 id="when-to-reach-for-a-form-library">When to reach for a form library</h2>
+
+<p>Hand-rolled state is fine for a login box. By the time a form has fifteen fields, cross-field
+rules, arrays of repeated groups and a schema you also want to validate against on the server, a
+library (React Hook Form, plus Zod for the schema) is less code and fewer re-renders. Do not start
+there for two inputs.</p>
+
+<h2 id="the-one-thing-to-take-from-this-post">The one thing to take from this post</h2>
+
+<p>Keep the browser's own behaviour rather than reimplementing it. Real links, real forms, real
+labels, real submit — you get history, keyboard support, autofill, password managers and screen
+reader support for free. And guard the parent route, never each child, so the next page added
+cannot be the one that forgot.</p>
+
+<p>Next: <a href="/frontend-dev/frontend-dev-auth-and-security">Authentication and Security in the
+Browser</a>.</p>

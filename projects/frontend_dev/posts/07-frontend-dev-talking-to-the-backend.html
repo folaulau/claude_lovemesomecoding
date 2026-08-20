@@ -1,0 +1,234 @@
+<p>Almost every screen you build is downstream of an API. A beginner writes the request, gets the
+data, renders it, and calls the feature done. The feature is about a third done, because a single
+request has four possible outcomes and only one of them is the one they handled.</p>
+
+<table class="table table-bordered">
+<thead><tr><th>Outcome</th><th>What the user should see</th></tr></thead>
+<tbody>
+<tr><td>It worked</td><td>The data. Or an empty state, if there is none.</td></tr>
+<tr><td>It is still going</td><td>A loading state that does not shift the layout when it resolves.</td></tr>
+<tr><td>The server said no</td><td>What went wrong, in their language, and what to do about it.</td></tr>
+<tr><td>The request never arrived</td><td>Offline, DNS, timeout, CORS. Not the same as the server saying no.</td></tr>
+</tbody>
+</table>
+
+<p>This post is about building that properly once instead of badly forty times.</p>
+
+<h2 id="build-one-api-layer">Build one API layer</h2>
+
+<p>The single highest-value structural decision in a frontend codebase is that components do not
+call <code>fetch</code>. One module owns it. The demo app states the reason at the top of its
+file:</p>
+
+<blockquote><p>The single place the frontend talks to the backend. Everything goes through
+<code>request()</code> so there is exactly one implementation of: where the API lives, how the auth
+token is attached, and how an error response becomes a thrown Error. Calling <code>fetch</code>
+directly from components would scatter all three.</p></blockquote>
+
+<p>Those three responsibilities are exactly the ones you do not want duplicated. Change the base
+URL, add a header, or decide that 401 should log the user out, and with a layer you edit one
+file.</p>
+
+<h3 id="where-the-api-lives">Where the API lives</h3>
+
+<pre class="language-typescript"><code class="language-typescript">const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8085';</code></pre>
+
+<p>One line, environment-driven, with a local default so a fresh clone runs without configuration.
+Hard-coding this in components is the thing that makes an app impossible to deploy anywhere but
+the machine it was written on.</p>
+
+<h3 id="one-request-function">One request function</h3>
+
+<pre class="language-typescript"><code class="language-typescript">async function request&lt;T&gt;(path: string, options: RequestOptions = {}): Promise&lt;T&gt; {
+  const { method = 'GET', body, auth = false, signal } = options;
+
+  const headers: Record&lt;string, string&gt; = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+
+  if (auth) {
+    const token = tokenStore.get();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${BASE_URL}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
+  });</code></pre>
+
+<p>Two details worth stealing. <code>auth</code> is opt-in per call, because public endpoints — the
+menu, guest checkout — do not need a token and sending one anyway leaks it further than necessary.
+And <code>signal</code> is threaded through, which is what makes cancellation possible below.</p>
+
+<p>Then a thin, typed surface over it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const api = {
+  get: &lt;T&gt;(path: string, opts?: Omit&lt;RequestOptions, 'method' | 'body'&gt;) =&gt;
+    request&lt;T&gt;(path, { ...opts, method: 'GET' }),
+  post: &lt;T&gt;(path: string, body?: unknown, opts?: Omit&lt;RequestOptions, 'method' | 'body'&gt;) =&gt;
+    request&lt;T&gt;(path, { ...opts, method: 'POST', body }),</code></pre>
+
+<p>Call sites read as <code>api.get&lt;User&gt;('/api/auth/me', { auth: true })</code> — the type
+of what comes back is stated once, at the place that knows it.</p>
+
+<h2 id="fetch-does-not-throw-on-404">`fetch` does not throw on 404</h2>
+
+<p>This is the single most common mistake, and it is a design decision in the browser rather than a
+bug. <code>fetch</code> rejects only when the request could not be <em>made</em> — offline, DNS
+failure, CORS. A perfectly delivered 500 is a fulfilled promise with <code>ok: false</code>.</p>
+
+<p>Which means this, which looks completely reasonable, renders your error page as if it were
+data:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const data = await fetch(url).then((r) =&gt; r.json());</code></pre>
+
+<p>You have to check explicitly:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  if (!response.ok) {
+    const errorBody = parsed as ApiErrorBody | null;
+    throw new ApiError(
+      response.status,
+      errorBody?.message ?? `Request failed with ${response.status}`,
+      errorBody,
+    );
+  }</code></pre>
+
+<p>Two smaller traps in the same function, both of which produce confusing crashes:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  // 204 No Content has no body to parse — reading it as JSON would throw.
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  const text = await response.text();
+  const parsed = text ? (JSON.parse(text) as unknown) : null;</code></pre>
+
+<p>Read the body as text first and parse only if there is any. Calling <code>.json()</code> on an
+empty response throws a parse error that has nothing to do with the actual problem, and sends you
+hunting in the wrong place.</p>
+
+<h2 id="make-errors-renderable">Make errors renderable</h2>
+
+<p>An error whose entire payload is a string forces every caller to show a generic banner. A good
+API returns structure — which field, and what was wrong with it — and your error type should carry
+it through:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class ApiError extends Error {
+  readonly status: number;
+  readonly body: ApiErrorBody | null;
+
+  /** Field errors as a lookup, for rendering next to inputs. */
+  fieldErrors(): Record&lt;string, string&gt; {
+    const result: Record&lt;string, string&gt; = {};
+    for (const sub of this.body?.errors ?? []) {
+      if (sub.field) result[sub.field] = sub.message;
+    }
+    return result;
+  }
+}</code></pre>
+
+<p>Now a form can put "must be at least 8 characters" under the password box instead of shouting
+"Validation failed" at the top of the page.</p>
+
+<p>Having <code>status</code> also lets callers distinguish cases that need different UI. Roughly:</p>
+
+<table class="table table-bordered">
+<thead><tr><th>Status</th><th>Means</th><th>Do</th></tr></thead>
+<tbody>
+<tr><td>400 / 422</td><td>Your input was rejected</td><td>Show it against the fields.</td></tr>
+<tr><td>401</td><td>Not signed in, or the token expired</td><td>Clear it and send them to login.</td></tr>
+<tr><td>403</td><td>Signed in, not allowed</td><td>Say so. Do not offer login again.</td></tr>
+<tr><td>404</td><td>Not there</td><td>Often a real screen, not an error banner.</td></tr>
+<tr><td>409</td><td>Conflict — someone else changed it</td><td>Refetch and let them retry.</td></tr>
+<tr><td>429</td><td>Rate limited</td><td>Back off, and say when to try again.</td></tr>
+<tr><td>5xx</td><td>Their bug</td><td>Generic message plus a retry. Report it.</td></tr>
+</tbody>
+</table>
+
+<p><a href="/backend-dev/backend-dev-apis-and-http">The backend track's post on API design</a>
+covers why a server chooses each of these — worth reading, because arguing for a better response
+shape is part of this job.</p>
+
+<h2 id="loading-error-and-empty-in-the-component">Loading, error and empty, in the component</h2>
+
+<p>The layer gives you data or throws. The component turns that into the four states. The shape
+that guarantees the spinner always stops:</p>
+
+<pre class="language-tsx"><code class="language-tsx">      setLoading(true);
+      setError(null);
+      try {
+        const response = await api.post&lt;AuthenticationResponse&gt;(path, body);
+        tokenStore.set(response.token);
+        setUser(response.user);
+      } catch (err) {
+        const message =
+          err instanceof ApiError ? err.message : 'Could not reach the server. Is the API running?';
+        setError(message);
+        // Rethrow so the calling form can react to failure (e.g. keep the user on the page).
+        throw err;
+      } finally {
+        setLoading(false);
+      }</code></pre>
+
+<p>Three things are deliberate. <code>finally</code> means no early return or rethrow can leave the
+button spinning. The <code>instanceof</code> check separates "the server said no" from "the server
+was not there" — genuinely different messages, and the second one is usually your own API not
+running. And it <em>rethrows</em>, so the caller can also react, rather than swallowing the failure
+and silently navigating on.</p>
+
+<h2 id="cancel-what-you-no-longer-need">Cancel what you no longer need</h2>
+
+<p>A request whose answer is no longer wanted is worse than wasted — it can land after a newer one
+and overwrite fresher data with staler data. That is the race behind "the search results flicker
+back to my previous query".</p>
+
+<pre class="language-tsx"><code class="language-tsx">  useEffect(() =&gt; {
+    const controller = new AbortController();</code></pre>
+
+<p>...and the cleanup that makes it work:</p>
+
+<pre class="language-tsx"><code class="language-tsx">    void restoreSession();
+    return () =&gt; controller.abort();
+  }, []);</code></pre>
+
+<p>The demo app spells out why this is not optional in development either:</p>
+
+<blockquote><p>In React 18+ StrictMode every effect runs twice in development; without cleanup you
+get two in-flight requests and the slower one can win, overwriting fresher state. Aborting on
+unmount also prevents setting state on a component that is no longer mounted.</p></blockquote>
+
+<h2 id="do-not-serialise-independent-requests">Do not serialise independent requests</h2>
+
+<p>Three <code>await</code>s in a row take as long as all three added together. If they do not
+depend on each other, run them at once with <code>Promise.all</code> and wait for the slowest
+instead of the sum. The demo app fetches products, toppings and crusts that way — three round trips
+in the time of one.</p>
+
+<h2 id="cors-in-one-paragraph">CORS, in one paragraph</h2>
+
+<p>You will hit this on day one of any local setup. The browser refuses to let JavaScript on
+<code>localhost:5173</code> read a response from <code>localhost:8085</code> unless that server
+explicitly allows the origin. It is enforced in the browser, on the <em>response</em> — which is
+why the request often shows up fine in the server's logs while your code sees nothing. Two
+consequences: it cannot be fixed from the frontend, and a browser extension that disables it is
+hiding a problem you will meet again in production. The fix is a header on the API. For anything
+non-trivial the browser also sends a preflight <code>OPTIONS</code> first, so the server has to
+answer that too.</p>
+
+<h2 id="what-to-reach-for-once-this-is-boring">What to reach for once this is boring</h2>
+
+<p>Everything above is per-call. The moment two components want the same data you also want
+deduplication, caching, background revalidation and shared loading state — and that is a library's
+job, not yours. TanStack Query is the common answer for React. Build the layer by hand once so you
+know what the library is doing for you, then let it.</p>
+
+<h2 id="the-one-thing-to-take-from-this-post">The one thing to take from this post</h2>
+
+<p>Route every request through one module, and remember that <code>fetch</code> only rejects when
+the request never happened — a 500 is a successful promise. Those two facts, plus handling all four
+outcomes instead of one, is most of the difference between a demo and something you would put in
+front of customers.</p>
+
+<p>Next: <a href="/frontend-dev/frontend-dev-routing-and-forms">Routing, Forms and
+Validation</a>.</p>

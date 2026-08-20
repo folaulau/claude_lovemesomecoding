@@ -1,0 +1,196 @@
+<p>Start from the fact that decides everything else in this post: <strong>every line of code you ship
+to the browser is public, and every request it makes can be forged.</strong> Your bundle can be
+read, your JavaScript can be edited live, and anyone can send whatever they like straight to your
+API with a command-line tool and no browser involved.</p>
+
+<p>So a frontend cannot enforce anything. What it can do is make the right thing easy, keep secrets
+it was given from leaking, and not hand attackers a way in. That is a real job — it is just not the
+job of being the security boundary.</p>
+
+<h2 id="the-frontend-is-not-the-security-boundary">The frontend is not the security boundary</h2>
+
+<p>The demo app hides the admin area behind a role check, and says plainly what that check is
+worth:</p>
+
+<blockquote><p>NOTE: this is a usability guard, not a security control. Anyone can edit client-side
+JavaScript. The real enforcement is the backend rejecting requests without a valid ADMIN
+token.</p></blockquote>
+
+<p>Hiding the button is good product design — do not show people things they cannot do. It is worth
+zero as protection. The test for whether you have understood this: if someone deleted your entire
+frontend and called your API directly, would anything bad happen? If yes, the problem is on the
+server. <a href="/backend-dev/backend-dev-auth-and-security">The backend track's post</a> is the
+other half of this and worth reading straight after.</p>
+
+<p>Corollaries people get wrong:</p>
+
+<ul>
+<li><strong>Never filter sensitive data in the browser.</strong> If the API returns every user's
+record and you render only one, you have leaked all of them — the response is right there in the
+network tab.</li>
+<li><strong>Never trust a price the client sent.</strong> Re-read it from the database. The demo
+app's backend re-prices every cart on every read for exactly this reason.</li>
+<li><strong>A hidden field is not hidden.</strong> Neither is a disabled button.</li>
+</ul>
+
+<h2 id="how-login-actually-works">How login actually works</h2>
+
+<p>The token flow, in five steps:</p>
+
+<ol>
+<li>The user submits credentials to <code>POST /api/auth/login</code>.</li>
+<li>The server checks them against a hash and returns a token plus the user.</li>
+<li>The browser stores the token.</li>
+<li>Every subsequent request attaches it: <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+<li>The server verifies its signature and expiry on every request, and decides what this caller may
+do.</li>
+</ol>
+
+<p>Step 4 is one place, in the API layer, never in a component:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  if (auth) {
+    const token = tokenStore.get();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }</code></pre>
+
+<p>Note it is opt-in per call. Public endpoints do not need a token, and not sending one is one
+fewer place it can leak.</p>
+
+<h3 id="a-jwt-is-signed-not-secret">A JWT is signed, not secret</h3>
+
+<p>The most common misunderstanding about tokens. A JWT is base64 — anyone holding it can read its
+contents, including the user id and role, without any key at all. The signature stops it being
+<em>modified</em>, not read. So: never put anything in a token you would not show the user, and
+never trust a role you decoded client-side for anything but deciding what to render.</p>
+
+<h2 id="where-to-put-the-token">Where to put the token</h2>
+
+<p>This is the real decision, and both answers are defensible. The demo app writes the trade-off
+directly into the code rather than pretending there is a winner:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const tokenStore = {
+  get: (): string | null =&gt; localStorage.getItem(TOKEN_KEY),
+  set: (token: string) =&gt; localStorage.setItem(TOKEN_KEY, token),
+  clear: () =&gt; localStorage.removeItem(TOKEN_KEY),
+};</code></pre>
+
+<blockquote><p>⚠️ localStorage is readable by any JavaScript on the page, so a single XSS bug leaks
+the token. It is used here because it is simple, survives a refresh, and works identically for the
+React and Angular builds. A production app would prefer an HttpOnly cookie, which JavaScript cannot
+read at all — at the cost of needing a CSRF story.</p></blockquote>
+
+<table class="table table-bordered">
+<thead><tr><th></th><th><code>localStorage</code></th><th>HttpOnly cookie</th></tr></thead>
+<tbody>
+<tr><td>Readable by JS</td><td>Yes — one XSS bug and it is gone</td><td>No</td></tr>
+<tr><td>Sent automatically</td><td>No, you attach it</td><td>Yes — which is what enables CSRF</td></tr>
+<tr><td>Needs CSRF protection</td><td>No</td><td>Yes — SameSite, and usually a token</td></tr>
+<tr><td>Survives refresh</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Cross-origin API</td><td>Straightforward</td><td>Needs CORS credentials configured</td></tr>
+</tbody>
+</table>
+
+<p>Neither option protects you if you have XSS — with a cookie the attacker cannot steal the token,
+but they can make requests as the user from your page, which is usually enough. The honest summary:
+<strong>HttpOnly cookies are the better default; not having XSS is what actually matters.</strong>
+And <code>sessionStorage</code> is not a security upgrade, it just forgets sooner.</p>
+
+<h2 id="restoring-a-session">Restoring a session on refresh</h2>
+
+<p>A stored token proves nothing — it may be expired or revoked. The only way to know is to ask:</p>
+
+<pre class="language-tsx"><code class="language-tsx">      try {
+        const me = await api.get&lt;User&gt;('/api/auth/me', { auth: true, signal: controller.signal });
+        setUser(me);
+      } catch {
+        // Expired or invalid — drop it rather than leaving a dead token around.
+        if (!controller.signal.aborted) tokenStore.clear();
+      } finally {
+        if (!controller.signal.aborted) setInitialising(false);
+      }</code></pre>
+
+<p>The comment above it states the principle: <em>/api/auth/me is the source of truth rather than
+anything cached in the browser.</em> Never decide someone is signed in because there is a string in
+localStorage.</p>
+
+<p>This is also where the <code>initialising</code> flag from
+<a href="/frontend-dev/frontend-dev-routing-and-forms">post 8</a> comes from — the guard must wait
+for this check, or it redirects a valid session to the login page.</p>
+
+<h2 id="logout-and-expiry">Logout, and the token that dies mid-session</h2>
+
+<p>Logging out means clearing the token and the user, and — importantly — clearing anything else
+personal you cached. Leaving the previous customer's order history in memory for the next person on
+a shared machine is a real leak.</p>
+
+<p>Expiry mid-session is the case people forget. The user is happily clicking and suddenly
+everything returns 401. Handle it centrally in the API layer: on 401, clear the token and send them
+to login with a message saying the session expired. Handling it per call site guarantees some call
+site does not.</p>
+
+<h2 id="xss">XSS, which is the one that will actually get you</h2>
+
+<p>Cross-site scripting is attacker JavaScript running on your page, with all your user's
+privileges. It reads localStorage, it makes authenticated requests, it rewrites the page.</p>
+
+<p>The good news: modern frameworks escape interpolated values by default, so
+<code>{userName}</code> renders <code>&lt;script&gt;</code> as visible text rather than a script.
+You mostly get this for free — and you lose it the moment you deliberately opt out.</p>
+
+<p>The escape hatches to treat as red flags:</p>
+
+<ul>
+<li><code>dangerouslySetInnerHTML</code> in React, <code>v-html</code> in Vue,
+<code>innerHTML</code> anywhere. If you must render HTML from elsewhere, sanitise it first with a
+real library such as DOMPurify — not a regex.</li>
+<li>Putting user input into a <code>href</code> without checking the scheme.
+<code>javascript:</code> URLs execute.</li>
+<li><code>eval</code>, <code>new Function</code>, and passing strings to
+<code>setTimeout</code>.</li>
+<li>Injecting a third-party script tag with a value that came from a URL parameter.</li>
+</ul>
+
+<h2 id="csrf">CSRF, in one paragraph</h2>
+
+<p>If your auth rides on a cookie, the browser attaches it to requests your app did not make —
+including one triggered by a form on someone else's site. That is cross-site request forgery. The
+defences are <code>SameSite</code> on the cookie (largely default now), a CSRF token the attacker
+cannot read, and never using GET for anything that changes data. If you send a token in an
+<code>Authorization</code> header instead, CSRF does not apply, because the attacker's page cannot
+add that header — which is the one genuine advantage of the localStorage approach.</p>
+
+<h2 id="the-rest-of-the-checklist">The rest of the checklist</h2>
+
+<table class="table table-bordered">
+<thead><tr><th>Item</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><strong>HTTPS everywhere</strong></td><td>Otherwise the token is readable in transit. Non-negotiable.</td></tr>
+<tr><td><strong>No secrets in the bundle</strong></td><td>Anything in your frontend build is public. See <a href="/frontend-dev/frontend-dev-build-and-deployment">post 12</a> — this is the mistake that leaks API keys.</td></tr>
+<tr><td><strong>Content-Security-Policy</strong></td><td>Tells the browser which script sources are allowed. Turns many XSS bugs into a blocked request.</td></tr>
+<tr><td><strong>Audit dependencies</strong></td><td><code>npm audit</code> in CI. A compromised package runs with your app's full privileges.</td></tr>
+<tr><td><strong><code>rel="noopener"</code></strong></td><td>On <code>target="_blank"</code> links, so the opened page cannot touch yours. Modern browsers default it; older ones do not.</td></tr>
+<tr><td><strong>Do not log tokens</strong></td><td>They end up in error-reporting tools and support screenshots.</td></tr>
+<tr><td><strong>Same error for wrong password and unknown email</strong></td><td>Different messages let someone enumerate who has an account. The demo app's tests assert this.</td></tr>
+</tbody>
+</table>
+
+<p>That last one is worth seeing, because it is a security property expressed as a test:</p>
+
+<pre class="language-tsx"><code class="language-tsx">test('an unknown email fails the same way — no account enumeration', async ({ page }) =&gt; {</code></pre>
+
+<h2 id="what-not-to-build-yourself">What not to build yourself</h2>
+
+<p>Password hashing, password reset flows, multi-factor, OAuth, session management. These are
+solved, the failure modes are subtle, and the cost of getting one wrong is everything. Use your
+backend framework's implementation or an identity provider. Your job on the frontend is the login
+form, the token handling, the guards, and not leaking anything.</p>
+
+<h2 id="the-one-thing-to-take-from-this-post">The one thing to take from this post</h2>
+
+<p>Assume an attacker has your entire frontend source, has deleted every guard in it, and is calling
+your API directly — because they can. Everything the frontend does is user experience. The security
+lives on the server, and the most valuable thing you can personally do about it is not shipping an
+XSS hole.</p>
+
+<p>Next: <a href="/frontend-dev/frontend-dev-performance-and-accessibility">Performance and
+Accessibility</a>.</p>

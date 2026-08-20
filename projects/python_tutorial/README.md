@@ -1,10 +1,10 @@
-# Java Tutorial
+# Python Tutorial
 
 ## About
-- this tutorial is for Java tutorial
+- this tutorial is for Python tutorial
 
 ## Requirements
-- update java backend dev posts on https://lovemesomecoding.com/java
+- update java backend dev posts on https://lovemesomecoding.com/python
 - keep posts to the point.
 - update all posts in the tutorial.
 - update posts and keep content to the point and not too lengthy if they don't have to.

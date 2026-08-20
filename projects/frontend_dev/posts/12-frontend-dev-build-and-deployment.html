@@ -1,0 +1,192 @@
+<p>The code you write is not the code a browser runs. Between them sits a build step, and after it
+sits the question of how those files reach a person on the other side of the world. Both are
+usually somebody else's problem right up until the day they are yours — and the failure modes are
+specific enough that knowing them is worth an hour.</p>
+
+<h2 id="what-a-build-tool-does">What a build tool actually does</h2>
+
+<p>Browsers cannot run TypeScript or JSX, do not want a thousand separate module requests, and have
+no idea what <code>import styles from './x.scss'</code> means. The build tool resolves all of
+that:</p>
+
+<table class="table table-bordered">
+<thead><tr><th>Job</th><th>What it means</th></tr></thead>
+<tbody>
+<tr><td><strong>Transform</strong></td><td>TypeScript and JSX become JavaScript. Types are erased — the browser never sees one.</td></tr>
+<tr><td><strong>Bundle</strong></td><td>Follow the import graph and produce a few files instead of hundreds.</td></tr>
+<tr><td><strong>Split</strong></td><td>Cut the graph at each dynamic <code>import()</code> so rarely-used code is a separate chunk.</td></tr>
+<tr><td><strong>Tree-shake</strong></td><td>Drop exports nothing imports. Only works because ES modules are statically analysable.</td></tr>
+<tr><td><strong>Minify</strong></td><td>Shorten names, strip whitespace and comments.</td></tr>
+<tr><td><strong>Hash</strong></td><td>Put a content hash in each filename, which is what makes caching safe.</td></tr>
+<tr><td><strong>Process assets</strong></td><td>Compile Sass, inline small images, copy the rest.</td></tr>
+</tbody>
+</table>
+
+<p>Configuration for a modern tool is close to nothing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export default defineConfig({
+  plugins: [react()],
+})</code></pre>
+
+<p>That is the demo app's entire Vite config. If you have met older Webpack configurations running
+to hundreds of lines, this is the thing that changed.</p>
+
+<h3 id="dev-server-versus-build">The dev server is not the build</h3>
+
+<p>These are two different code paths, which is why "works locally, broken in production" is such a
+common sentence. The dev server serves modules to the browser more or less as-is for instant
+startup and hot reloading; the production build does the whole bundle-minify-hash pipeline.
+Optimisations, environment variables and dead-code elimination can all behave differently.</p>
+
+<p><strong>Always run the production build locally before you ship</strong> — <code>npm run
+build &amp;&amp; npm run preview</code>. It takes thirty seconds and catches the class of bug that
+otherwise gets found by users.</p>
+
+<h2 id="environment-variables-are-not-secret">Environment variables are not secret</h2>
+
+<p>The most expensive misunderstanding in frontend deployment, and it leaks API keys constantly.</p>
+
+<p>A frontend environment variable is <strong>substituted into your bundle at build time</strong>.
+It is then a string in a public JavaScript file that anybody can read. It is configuration, not a
+secret.</p>
+
+<pre class="language-typescript"><code class="language-typescript">const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8085';</code></pre>
+
+<p>That is a fine use: it changes per environment and is not sensitive — the URL is visible in the
+network tab regardless. Build tools deliberately require a prefix (<code>VITE_</code>,
+<code>NEXT_PUBLIC_</code>) so that exposing a variable is an explicit act rather than an
+accident.</p>
+
+<table class="table table-bordered">
+<thead><tr><th>Fine in a frontend variable</th><th>Never</th></tr></thead>
+<tbody>
+<tr><td>API base URL</td><td>Database credentials</td></tr>
+<tr><td>Publishable/public keys (e.g. Stripe's <code>pk_</code>)</td><td>Secret keys (<code>sk_</code>) — this is the classic leak</td></tr>
+<tr><td>Feature flags</td><td>Third-party API tokens</td></tr>
+<tr><td>Environment name, build version</td><td>Anything you would not print on a billboard</td></tr>
+</tbody>
+</table>
+
+<p>The rule: if it must stay secret, it lives on a server and the browser asks that server. There
+is no frontend-only way to keep a secret. The corollary is that a build is per-environment — the
+same artifact cannot be promoted from staging to production if the API URL was baked in, unless you
+fetch configuration at runtime instead.</p>
+
+<h2 id="deploying-a-static-frontend">Deploying a static frontend</h2>
+
+<p>A built SPA is a folder of static files. There is no server to run, which makes hosting cheap
+and fast: the files go in object storage, a CDN puts copies near your users, and that is the whole
+architecture. This site is deployed that way and costs well under a dollar a month.</p>
+
+<h3 id="cache-headers-and-the-two-rules">Cache headers, and the two rules that matter</h3>
+
+<p>Content hashing is what makes aggressive caching safe. Because
+<code>index-a3f9c2.js</code> changes its name whenever its contents change, it can be cached
+forever — a new deploy produces a new name rather than a stale file.</p>
+
+<table class="table table-bordered">
+<thead><tr><th>File</th><th>Cache-Control</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Hashed assets — JS, CSS, images</td><td><code>max-age=31536000, immutable</code></td><td>The name changes when the content does.</td></tr>
+<tr><td><code>index.html</code></td><td><code>no-cache</code></td><td>It names the hashed files. Cache it and users get last week's app.</td></tr>
+</tbody>
+</table>
+
+<p>Getting these backwards is the classic deploy bug: everything looks fine for you and users see
+the old version until they hard-refresh. And if you use a CDN, remember it holds its own copy —
+invalidate it on deploy, or the new files sit in the bucket unread.</p>
+
+<h3 id="the-spa-fallback">The SPA fallback, which everybody forgets once</h3>
+
+<p>Your router handles <code>/orders</code> in the browser. But a user who pastes that URL, or
+refreshes on it, sends a request for <code>/orders</code> to the server — and there is no file
+there. You get a 404 on every deep link while the app works perfectly if you navigate from the home
+page.</p>
+
+<p>The fix is to configure the host to serve <code>index.html</code> for any path that does not
+match a file. Every static host has a name for this — rewrite rule, fallback document,
+<code>try_files</code> — and it is a one-line setting. It is also the single most common
+frontend deployment bug, so check deep links explicitly after your first deploy anywhere new.</p>
+
+<h3 id="the-other-kinds-of-frontend">When it is not just static files</h3>
+
+<table class="table table-bordered">
+<thead><tr><th>Approach</th><th>What runs</th><th>Good for</th></tr></thead>
+<tbody>
+<tr><td><strong>SPA</strong> (this app)</td><td>Nothing — static files</td><td>Apps behind a login, where SEO is irrelevant</td></tr>
+<tr><td><strong>SSG</strong> — static generation</td><td>Nothing; HTML built ahead of time</td><td>Content sites. Fast and cheap, needs a rebuild to change</td></tr>
+<tr><td><strong>SSR</strong> — server rendering</td><td>A Node server per request</td><td>SEO plus fresh data. Next.js, Nuxt, SvelteKit</td></tr>
+</tbody>
+</table>
+
+<p>An SPA sends an empty page and fills it in with JavaScript. That is fine for a dashboard and bad
+for a public product page a crawler should read — which is the actual reason the frameworks in the
+third row exist.</p>
+
+<h2 id="a-pipeline-worth-having">A pipeline worth having</h2>
+
+<p>Automate the sequence so it is identical every time and nobody deploys from a laptop with
+uncommitted changes.</p>
+
+<p>On every pull request, in this order — cheapest first, so quick failures fail quickly:</p>
+
+<ol>
+<li><strong>Install</strong> dependencies from the lockfile, so CI builds what you built.</li>
+<li><strong>Lint.</strong> Seconds.</li>
+<li><strong>Typecheck.</strong> The demo app exposes this separately as <code>tsc -b
+--noEmit</code>, because the dev server does not typecheck — it strips types and carries on. A type
+error can sit in your working app for a week.</li>
+<li><strong>Unit and component tests.</strong></li>
+<li><strong>Build.</strong> A build failure must never first appear during a deploy.</li>
+<li><strong>End-to-end tests</strong> against the built output.</li>
+</ol>
+
+<p>Then on merge to the main branch: build, upload, set the cache headers, invalidate the CDN, and
+verify. That last step deserves emphasis — a deploy script that does not check its own result will
+happily report success having uploaded nothing.</p>
+
+<h3 id="things-worth-adding-once">Things worth adding once</h3>
+
+<ul>
+<li><strong>A bundle-size check</strong> that fails the build if the entry chunk grows past a
+threshold. Bundles do not blow up in one commit; they creep.</li>
+<li><strong>A Lighthouse run</strong> for performance and accessibility scores
+(<a href="/frontend-dev/frontend-dev-performance-and-accessibility">post 10</a>).</li>
+<li><strong><code>npm audit</code></strong> for known vulnerabilities
+(<a href="/frontend-dev/frontend-dev-auth-and-security">post 9</a>).</li>
+<li><strong>A preview deploy per pull request</strong>, so reviewers click the change instead of
+imagining it. This is the single biggest quality-of-life improvement on most teams.</li>
+</ul>
+
+<h2 id="after-it-is-live">After it is live</h2>
+
+<p>You cannot fix what you never hear about. Users do not file bug reports; they leave.</p>
+
+<ul>
+<li><strong>Error reporting</strong> — Sentry or similar, catching unhandled errors and rejections
+with a stack trace. Upload your source maps or every trace is minified gibberish. Do not serve
+source maps publicly unless you are happy publishing your source.</li>
+<li><strong>Real user metrics</strong> — the numbers from
+<a href="/frontend-dev/frontend-dev-performance-and-accessibility">post 10</a>, measured on real
+devices rather than your laptop.</li>
+<li><strong>A way back.</strong> Deploys break. Being able to roll back in one command is worth
+more than any amount of pre-release checking. With hashed static files this is usually just
+re-uploading the previous build.</li>
+<li><strong>An error boundary</strong> so one component's crash shows a message instead of a blank
+white page.</li>
+</ul>
+
+<p>The backend track's <a href="/backend-dev/backend-dev-deployment-and-observability">post on
+deployment and observability</a> covers the same ideas from the server side, where the tooling is
+richer and the stakes are usually higher.</p>
+
+<h2 id="the-one-thing-to-take-from-this-post">The one thing to take from this post</h2>
+
+<p>Nothing in your frontend build is secret, and nothing about your dev server proves your
+production build works. Run the real build locally before you ship, get the two cache rules the
+right way round, configure the SPA fallback before someone pastes a deep link into Slack — and make
+sure that when it does break, you hear about it from a tool rather than from a customer.</p>
+
+<p>That is the end of the track. Back to <a href="/frontend-dev/frontend-dev-get-started">Get
+Started</a> for the map, or across to <a href="/backend-dev">Backend Development</a> for the other
+half of the same app.</p>

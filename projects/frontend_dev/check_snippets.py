@@ -52,7 +52,24 @@ SKIP_LANGS = {"bash", "shell", "http", "text", "plaintext", "diff", "yaml", "jso
 
 # Lines written for the page rather than lifted, each checked by hand once.
 # Keep this list short and justified — it is the escape hatch, not the norm.
-ALLOWED = set()
+ALLOWED = {
+    # Post 4 teaches the three immutable-update idioms in the abstract, over a
+    # generic `items`, before showing the app's real `upsert` helper that uses
+    # them. Deliberately not tied to a domain type.
+    "const next = [...items, newItem];",
+    "const added   = [...items, newItem];",
+    "const updated = items.map((i) => (i.id === target.id ? { ...i, quantity: 2 } : i));",
+    "const removed = items.filter((i) => i.id !== target.id);",
+    # Post 4's `Remote<T>` union is the shape being ARGUED FOR as an alternative
+    # to three independent fields. The app models loading state per-context
+    # rather than with this generic, so it exists only on the page.
+    "| { status: 'error'; message: string }",
+    "| { status: 'ready'; data: T };",
+    # Post 7 shows this as the ANTI-pattern — fetch does not reject on 404, so
+    # this renders an error body as if it were data. It must not appear in the
+    # app, and finding it there would be the bug.
+    "const data = await fetch(url).then((r) => r.json());",
+}
 
 
 def normalise(line: str, lang: str) -> str:

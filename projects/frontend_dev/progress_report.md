@@ -1,6 +1,6 @@
 # Frontend Dev track — progress report
 
-**Status:** IN PROGRESS — writing
+**Status:** PUBLISHED — live on prod, 2026-08-20
 **Started:** 2026-08-20
 **Where it lands:** https://lovemesomecoding.com/frontend-dev
 
@@ -45,7 +45,7 @@ which leaves `/frontend-dev` a stub next to `/react` (27), `/css` (21), `/javasc
 | Track size | **12** — 2 rewritten + 10 new | |
 | Snippets | Lifted from `pizza-react-frontend` | Per `CLAUDE.md`. Real React 19 / TS / Vite / Redux Toolkit / React Router 7 code, verified by `check_snippets.py`. |
 | Dates | 2026-08-01 … 2026-08-23, 2 days apart, at **12:00** | See the hour-collision note below. |
-| Publish | **Seed local → Folau reviews → prod** | Folau, 2026-08-20. |
+| Publish | **Seed local → Folau reviews → prod** | Folau, 2026-08-20. Published to prod same day on his go-ahead. |
 | Nav | No change needed | `src/lib/nav.ts:57` already maps `frontend-dev` → "Frontend Development" under "Software Engineering". |
 
 ### The 12:00 stamp is deliberate
@@ -148,6 +148,7 @@ Copied from `projects/backend_dev/` and repointed at the React app:
 | `check_content.py` | Every code sample round-trips the normaliser byte-for-byte, and comes out in the exact `<pre class="language-X"><code class="language-X">` shape the build-time Prism highlighter matches. Compares sources, never lengths. |
 | `check_links.py` | HTML is well-formed, and every internal href resolves to a real category or post — including the 10 live `/backend-dev/...` targets. |
 | `check_snippets.py` | Every substantial code line in every post exists in `pizza-react-frontend` source. Corpus repointed from `*.java` to `*.ts/*.tsx/*.scss/*.json`. |
+| `verify_track.spec.ts` | Playwright delivery check against the built site: the archive lists all 12 in order, every post renders with a real outline and anchored headings, **both 2019 URLs still resolve to the rewritten posts**, code is highlighted, cross-track `/backend-dev` links work, and each post links to the next. |
 | `seed.py` | Writes through the backend's own service layer so the derived indexes stay consistent. `--force-dates` needed once, because both rewritten posts carry 2019 dates and `upsert_post` never overwrites an existing date. |
 
 ## Log
@@ -160,3 +161,28 @@ Copied from `projects/backend_dev/` and repointed at the React app:
 - **2026-08-20** — Coordinated with that session on the shared-index race. Moved the hour from
   09:00 to 12:00 on its advice (09:00 already holds 62 posts).
 - **2026-08-20** — Project scaffolded, manifest written.
+- **2026-08-20** — All 12 posts written. 16,989 words, 64 code blocks, every block
+  highlighted. Verification: `check_content.py` (all samples round-trip byte-for-byte),
+  `check_links.py` (82 internal links resolve, including the 10 live `/backend-dev` targets),
+  `check_snippets.py` (119 code lines, all present in `pizza-react-frontend`).
+- **2026-08-20** — Reset the local tree from prod first (it was 26 objects behind; diffed both
+  trees to confirm the sync was purely additive and destroyed nothing). Seeded local with
+  `--force-dates`: 583 → 593 posts, `/frontend-dev` count 12. Cross-checked the derived indexes —
+  44/44 category counts agree, by-category matches posts.json, all 12 in the search index.
+- **2026-08-20** — Built the site: `verify-build.mjs` passed 593/593 posts, 44/44 categories,
+  index cross-check 44/44. Playwright delivery check (`verify_track.spec.ts`) — 6/6 pass.
+- **2026-08-20** — **PUBLISHED.** Seeded prod 583 → 593, `/frontend-dev` count 12. Prod indexes
+  cross-checked before building: 44/44 category counts agree, by-category matches posts.json, all
+  12 in the search index. `npm run deploy` — verify-build 593/593 posts and 44/44 categories, 1571
+  files to S3, CloudFront function republished (41 redirects, 2.8 KB of the 10 KB limit),
+  invalidation `IA5LN952211IPCNV7X84BZBPN9` completed, edge verified serving build `394b0bd`.
+  All 12 URLs return 200 live, all 12 in `sitemap.xml`, and both 2019 URLs serve rewritten bodies
+  with zero `boldgrid-section` wrappers. `verify_track.spec.ts` re-run against
+  https://lovemesomecoding.com — 6/6 pass.
+
+## Follow-ups
+
+- `/frontend-dev` is 12 new/changed URLs. Worth resubmitting `sitemap.xml` to Search Console —
+  which is already an open item in `CLAUDE.md` and now has more reason to happen.
+- The two rewritten 2019 slugs keep their URLs but their content changed completely. Expect
+  Search Console to re-crawl and re-rank them; that is the intended trade.
