@@ -58,7 +58,7 @@ VERSIONS = {
 }
 
 # Lesson 1 is stamped START_DATE and each following lesson is STEP_DAYS later,
-# so the pager reads lesson 1 -> lesson 29. Re-base the whole track by editing
+# so the pager reads lesson 1 -> lesson 28. Re-base the whole track by editing
 # these two values; nothing else needs to change.
 START_DATE = datetime(2026, 5, 28, 9, 0, 0)
 STEP_DAYS = 3
@@ -154,8 +154,8 @@ _TRACK = [
         "excerpt": (
             "Angular 17 replaced `*ngIf`, `*ngFor` and `*ngSwitch` with built-in block syntax, and "
             "the old directives are on the way out. `@if` / `@else`, `@for` with its mandatory "
-            "`track` and its `@empty` block, `@switch`, and what to do when you meet the "
-            "structural-directive form in an older codebase."
+            "`track` and its `@empty` block, `@switch`, `@let`, and what to do when you meet the "
+            "structural-directive form in an older codebase — as the demo app's navbar still does."
         ),
     },
     {
@@ -190,8 +190,9 @@ _TRACK = [
         "excerpt": (
             "A directive is a component without a template — behaviour you attach to an element "
             "you did not write. The built-in attribute directives, writing your own with "
-            "`@Directive`, `host` bindings and listeners, and `hostDirectives` for composing "
-            "behaviour without inheritance."
+            "`@Directive` and an attribute selector, why the work belongs in `afterNextRender` "
+            "rather than the constructor, input transforms with `booleanAttribute`, and where "
+            "`host` bindings and `hostDirectives` fit."
         ),
     },
     {
@@ -233,14 +234,14 @@ _TRACK = [
     },
     {
         "slug": "angular-computed-effect",
-        "title": "Angular – computed, effect and linkedSignal",
+        "title": "Angular – computed and effect",
         "state": "new",
         "tags": ["angular", "signals", "reactivity"],
         "excerpt": (
             "Derived state without the bugs. `computed()` for values that follow from other "
-            "signals, `effect()` for the side effects that must run when they change — and the "
-            "rule about not writing to signals inside one — plus `linkedSignal()` for state that "
-            "is derived but still needs to be locally overridable."
+            "signals — cart totals, the filtered menu — and `effect()` for the side effects that "
+            "must run when they change, including its `onCleanup` and the rule about not writing "
+            "to signals inside one. Where `linkedSignal()` fits, and why this app never needed it."
         ),
     },
     {
@@ -250,9 +251,10 @@ _TRACK = [
         "tags": ["angular", "components", "lifecycle"],
         "excerpt": (
             "The hooks Angular calls on your component and the order they fire in: `ngOnInit`, "
-            "`ngOnChanges`, `ngAfterViewInit`, `ngOnDestroy` and the rest. Which ones you still "
-            "need now that signals and `effect()` cover most of what they used to, and how "
-            "`DestroyRef` and `takeUntilDestroyed` replace the manual unsubscribe boilerplate."
+            "`ngOnChanges`, `ngAfterViewInit`, `ngOnDestroy` and the rest. The striking thing about "
+            "the demo app is how few it uses — one `ngOnInit` in thirty components — because "
+            "signals, `effect`, `afterRenderEffect` and `DestroyRef` cover what they used to. This "
+            "lesson is mostly about which ones you can now stop reaching for."
         ),
     },
     # -------------------------------------------------- services, DI and data
@@ -299,10 +301,11 @@ _TRACK = [
         "state": "new",
         "tags": ["angular", "rxjs", "reactivity"],
         "excerpt": (
-            "Signals took over state, but observables still own events over time. The operators "
-            "that actually earn their place — `map`, `filter`, `switchMap`, `debounceTime`, "
-            "`catchError`, `shareReplay` — why `switchMap` is the right answer for a search box, "
-            "and how `toSignal` and `toObservable` let the two models meet."
+            "Signals took over state, but observables still own events over time. Built around one "
+            "worked example — the menu search box — where `toObservable`, `debounceTime`, "
+            "`distinctUntilChanged`, `switchMap` and `catchError` each fix a specific bug, and "
+            "`toSignal` hands the result back to the template. Why `switchMap` and not `mergeMap` "
+            "is the difference between correct and subtly wrong."
         ),
     },
     # ---------------------------------------------------------------- routing
@@ -325,9 +328,10 @@ _TRACK = [
         "tags": ["angular", "router", "security", "performance"],
         "excerpt": (
             "Keeping signed-out visitors out of the admin area, and keeping the admin area out of "
-            "everyone else's download. Functional `CanActivate` and `CanMatch` guards, "
-            "`CanDeactivate` for unsaved forms, resolvers for data a route cannot render without, "
-            "and `loadComponent` / `loadChildren` lazy loading with proof in the build output."
+            "everyone else's download. Functional `CanActivate` guards that return a `UrlTree`, "
+            "`CanDeactivate` for the checkout page's unpaid order — including how returning a "
+            "promise lets it ask in a modal instead of `window.confirm` — and `loadComponent` / "
+            "`loadChildren` lazy loading with proof in the build output."
         ),
     },
     # ------------------------------------------------------------------ forms
@@ -375,34 +379,23 @@ _TRACK = [
         "state": "new",
         "tags": ["angular", "testing"],
         "excerpt": (
-            "Testing a component, a service and an HTTP call. `TestBed` and `ComponentFixture`, "
-            "what `fixture.detectChanges()` is for, testing a service in isolation with fakes, "
-            "`HttpTestingController` for asserting on requests, and where end-to-end tests take "
-            "over from unit tests."
+            "Testing a pipe, a directive, a guard and an HTTP interceptor. When you need `TestBed` "
+            "and when `new MyPipe()` is the better test, hosting a directive to exercise its "
+            "selector, `HttpTestingController` and why `verify()` matters, driving a debounced "
+            "search with fake timers, and where Playwright takes over from unit tests."
         ),
     },
     {
         "slug": "angular-performance",
-        "title": "Angular – Change Detection, OnPush, Zoneless and @defer",
+        "title": "Angular – Change Detection, OnPush and Zoneless",
         "state": "new",
         "tags": ["angular", "performance", "change-detection"],
         "excerpt": (
             "Why an Angular app gets slow and what to do about it. How change detection actually "
-            "works, what `OnPush` changes, the zoneless mode signals made possible, `@defer` for "
-            "loading a heavy component only when it is needed, and measuring with Angular DevTools "
-            "instead of guessing."
-        ),
-    },
-    {
-        "slug": "angular-ssr",
-        "title": "Angular – Server-Side Rendering and Hydration",
-        "state": "new",
-        "tags": ["angular", "ssr", "performance"],
-        "excerpt": (
-            "What `ng add @angular/ssr` sets up and whether you want it. Server-side rendering "
-            "versus prerendering versus a plain SPA, full and incremental hydration, the browser "
-            "APIs that are not there on the server and how to guard against them, and the SEO and "
-            "first-paint case for turning it on."
+            "works, what `OnPush` changes, and the zoneless mode signals made possible — the demo "
+            "app runs with no zone.js at all and `OnPush` on every one of its components. Where "
+            "`@defer` fits, route-level code splitting, and measuring with Angular DevTools rather "
+            "than guessing."
         ),
     },
     {

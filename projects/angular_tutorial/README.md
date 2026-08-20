@@ -21,14 +21,19 @@ projects/angular_tutorial/
   progress_report.md status, decisions and the full topic table — read this first
 ```
 
-## Status: scaffolded, bodies blocked
+## Status: ready to author
 
-The 29-post topic table, the manifest and the tooling are done. **No post body is written**, because
-every snippet must come from `lovemesomecoding_demo_project/pizza/pizza-angular-frontend` and that
-directory is still empty (Phase 7 of the pizza demo). `check_content.py` validates the manifest
-today; `seed.py` refuses to run until every file exists.
+The 28-post topic table, the manifest and the tooling are done, and the demo app is built. Every
+snippet comes from `lovemesomecoding_demo_project/pizza/pizza-angular-frontend` (Angular 21.2,
+TypeScript 5.9, Bootstrap 5 + Sass, NgRx 21, standalone and zoneless).
 
-`progress_report.md` holds the topic table and the decisions.
+**No post body is written yet — that is the remaining job.**
+
+Four examples the track needed were added to the app and are covered by new unit tests: an
+`Autofocus` directive, a debounced menu search, a `CanDeactivate` guard on checkout, and a Vitest
+suite. One lesson (SSR) was cut rather than risk `ng add @angular/ssr` on a working app.
+
+`progress_report.md` holds the topic table, the decisions and the full audit.
 
 ## Commands
 
