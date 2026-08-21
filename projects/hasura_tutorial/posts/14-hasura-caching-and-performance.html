@@ -1,0 +1,134 @@
+<p>Hasura generates good SQL. That does not make your API fast, because the query it generates still
+has to run against your database, and the shapes GraphQL makes easy are not always the shapes
+Postgres finds cheap.</p>
+
+<h2>Look at the SQL first</h2>
+
+<p>Before tuning anything, see what is actually running:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST http://localhost:8081/v1/graphql/explain \
+  -H 'x-hasura-admin-secret: stayhub-admin-secret' \
+  -d '{"query":{"query":"query { properties(limit:2){ title host { firstName } } }"}}'</code></pre>
+
+<p>You get the generated SQL and the plan Postgres chose:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Aggregate  (cost=5.19..5.20 rows=1 width=32)
+  ->  Nested Loop Left Join  (cost=0.01..5.16 rows=2 width=63)
+        ->  Limit  (cost=0.00..0.45 rows=2 width=1766)
+              ->  Seq Scan on properties  (cost=0.00..3.14 rows=14 width=1766)
+        ->  Memoize  (cost=0.01..3.11 rows=1 width=32)
+              Cache Key: properties.host_id</code></pre>
+
+<p>A sequential scan on fourteen rows is correct &mdash; an index would be slower. The same plan on
+fourteen million rows is the whole problem. Always explain against realistic data volumes; a
+development database tells you almost nothing about which plans will hold.</p>
+
+<h2>Indexes are where the wins are</h2>
+
+<p>Hasura exposes every column to <code>where</code> and <code>orderBy</code>, which means clients
+can filter on columns you never indexed. The fix is ordinary database work:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX idx_properties_city_status ON properties (city, status);
+CREATE INDEX idx_bookings_property_dates ON bookings (property_id, check_in, check_out);
+CREATE INDEX idx_properties_title_trgm ON properties USING gin (title gin_trgm_ops);</code></pre>
+
+<p>That last one matters more than people expect. <code>_ilike: "%villa%"</code> is a leading
+wildcard, and no B-tree index can serve it &mdash; it is a full scan every time. A trigram index can.
+If you have exposed <code>_ilike</code> on a large table and not added one, that is likely your
+slowest query.</p>
+
+<p>Foreign keys are worth checking too: Postgres indexes the primary key side automatically but
+<em>not</em> the referencing column, so <code>bookings.property_id</code> needs an explicit index for
+the nested lookups in lesson 5 to stay cheap.</p>
+
+<h2>Depth costs more than it looks</h2>
+
+<p>Nesting multiplies. Twenty listings, each with their bookings, each with a guest is not
+twenty-one queries &mdash; lesson 5 showed it is one &mdash; but it is one query assembling a lot of
+JSON. Add pagination at every level, not just the top:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(limit: 20) {
+    title
+    bookings(limit: 5, orderBy: {checkIn: DESC}) {
+      checkIn
+      guest { firstName }
+    }
+  }
+}</code></pre>
+
+<h2>Limits are the real protection</h2>
+
+<p>The single most effective thing you can do is a row limit on every public role&rsquo;s select
+permission:</p>
+
+<pre class="language-python"><code class="language-python">perm["limit"] = 100</code></pre>
+
+<p>Without it, <code>query { properties }</code> with no arguments returns the entire table. That is
+how a GraphQL endpoint becomes a denial-of-service vector against its own database, and it needs no
+malice &mdash; one developer testing in the console will do it.</p>
+
+<p>Hasura also supports depth and node limits, and rate limiting per role. <strong>Those are
+Enterprise and Cloud features</strong> &mdash; see the note below. The permission row limit is not,
+and it is available to everyone.</p>
+
+<h2>RESTified endpoints</h2>
+
+<p>Not every client wants GraphQL, and every GraphQL request is a POST with a body &mdash; which no
+HTTP cache or CDN will cache. Hasura can pin a saved query to a URL:</p>
+
+<pre class="language-bash"><code class="language-bash">GET /api/rest/properties/seattle</code></pre>
+
+<p>You get a normal REST endpoint backed by a fixed, reviewed query. Two real benefits: the response
+is cacheable by ordinary infrastructure, and the query text is fixed, so clients cannot ask for
+something more expensive than you intended. Good for public, high-traffic, read-only endpoints.</p>
+
+<h2>Response caching</h2>
+
+<p class="note"><strong>Community Edition.</strong> The engine this track runs against reports <code>server_type: ce</code>. The features named below as Enterprise or Cloud were <strong>not</strong> demonstrated here &mdash; they are described from the documentation and labelled, rather than shown running.</p>
+
+<p>Hasura can cache query responses with a directive:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query PopularListings @cached(ttl: 120) {
+  properties(where: {status: {_eq: "PUBLISHED"}}, orderBy: {ratingAverage: DESC}, limit: 20) {
+    title
+    city
+    ratingAverage
+  }
+}</code></pre>
+
+<p>The cache key includes the session variables, so two roles never share an entry &mdash; which is
+the correctness property that makes it safe with row-level permissions.</p>
+
+<p><code>@cached</code>, allow-lists, rate limiting and read-replica routing are
+<strong>Enterprise and Cloud</strong>. On Community Edition your caching options are in front of
+Hasura: a CDN over RESTified endpoints, or a cache in your own client layer.</p>
+
+<h2>Connection pooling</h2>
+
+<p>The failure that arrives first in production, and it is not a query problem. Every Hasura replica
+holds its own pool. Three replicas at fifty connections each is a hundred and fifty against a
+Postgres that probably allows a hundred.</p>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_PG_CONNECTIONS: "50"</code></pre>
+
+<p>Size it as <em>replicas &times; connections &lt; max_connections</em>, leaving room for your
+application and for migrations. Under real pressure, put PgBouncer in front &mdash; and then keep
+Hasura&rsquo;s own pool small, because two pools stacked on each other is worse than either.</p>
+
+<h2>Performance in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>The architectural difference is <strong>push-down</strong>. A v3 connector declares which
+operations it can perform natively, and the engine delegates as much as possible to the data source
+&mdash; including <strong>authorization</strong>, which v2 could not push down. Permission filters
+become part of the source&rsquo;s own query rather than something applied on top.</p>
+
+<p>Caching in v3 is delivered <strong>via plugins</strong> rather than a built-in directive, and
+API limits are marked work in progress. One thing moves in your favour: <strong>read replicas are no
+longer an Enterprise feature</strong> in DDN.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 15 covers what to turn off before this faces the internet.</p>

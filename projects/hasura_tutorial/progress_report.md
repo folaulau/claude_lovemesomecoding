@@ -1,7 +1,8 @@
 # Hasura tutorial track — progress report
 
-**Status:** SCAFFOLDED — survey done, decisions agreed, pipeline fixed and tooling built and
-tested. Next: the four demo-app additions, then 20 post bodies.
+**Status:** WRITTEN — all 20 post bodies exist, pass every check, and are seeded to the **local**
+tree. NOT published to prod. Outstanding: the four StayHub additions, which four posts describe but
+which do not exist in the demo app yet.
 **Started:** 2026-08-21
 **Where it lands:** https://lovemesomecoding.com/hasura
 
@@ -54,8 +55,27 @@ and v3 and show each item and how they are different in v3"*. See **The comparis
 | `check_content.py` | ✅ built, and each of its four track rules test-fired |
 | `check_snippets.py` | ✅ built; matching, drift detection and v3 exclusion all test-fired |
 | `seed.py` | ✅ built, dry-runs clean against the local tree |
-| Demo app (StayHub) | ✅ exists, runs, answers live; ⬜ four additions needed |
-| Post bodies | ⬜ 0 of 20 |
+| Demo app (StayHub) | ✅ exists, runs, answers live; ⬜ four additions still needed |
+| Post bodies | ✅ **20 of 20**, 17,375 words, 121 code blocks (27 GraphQL) |
+| Seeded to `local` | ✅ archive holds 20, dates in reading order |
+| Published to `prod` | ⬜ **not done** — deliberate, see below |
+
+### ⚠️ Four posts describe StayHub surfaces that do not exist yet
+
+The decision on 2026-08-21 was to add an Action, an event trigger, a subscription and an insert
+permission to StayHub and quote them. **That app work was never done.** The four posts were written
+anyway, from StayHub's real schema, roles and design decisions:
+
+| Post | What it shows | Status |
+|---|---|---|
+| `hasura-mutation` | insert permission with `check` + `set` presets | shape is correct, **not applied to StayHub** |
+| `hasura-subscription` | Apollo `GraphQLWsLink` split-link wiring | **not built in the React app** |
+| `hasura-action` | Action → FastAPI `createBooking` | **no such Action or endpoint** |
+| `hasura-triggers` | event trigger on `bookings` | **no such trigger** |
+
+None of them claims to be running output, and `check_snippets.py` classifies their blocks as
+illustrative rather than app-verified. But they are the four least-verified posts in the track and
+should be either built-and-checked or explicitly framed as designs before prod.
 
 ### What the tooling proved on the way in
 
@@ -428,6 +448,17 @@ archive interleaves nine 2026 posts with eleven 2020 ones and the pager reads no
   doc-derived, and the four missing surfaces get added to StayHub.
 - **2026-08-21** — Fixed the `graphql` pipeline gap in both repos and verified it end to end
   (normaliser + Prism), backend tests still green at 95%.
+- **2026-08-21** — Wrote all 20 post bodies (17,375 words, 121 code blocks). Queried the running
+  engine rather than writing from memory, which caught two errors before they shipped: the argument
+  is `orderBy` with `ASC`/`DESC` (not `order_by`/`asc`) because `naming_convention` is on, and an
+  unauthenticated request for `bookings` returns `field 'bookings' not found in type: 'query_root'`
+  — permissions shape the schema per role rather than filtering a shared one. That second finding
+  became the spine of lessons 1, 4 and 9. Captured real generated SQL (a `LEFT OUTER JOIN LATERAL`)
+  and a real query plan for the relationships and performance lessons.
+  Three checks fired during writing and all three were real: a missing v3 heading in lesson 1, a
+  missing v3 heading in lesson 19, a missing docs-date in lesson 20. `check_snippets.py` also caught
+  a simplified compose block in lesson 2 that had drifted from the real file — replaced with a
+  faithful quote using `...` elisions. Seeded all 20 to the local tree.
 - **2026-08-21** — README gained the comparison-table requirement. Read Hasura's official
   feature-availability matrix, DDN glossary and quickstart, and built the 33-row table as data in
   `manifest.py` plus `render_table.py` to render it. **Two facts this project had recorded wrong

@@ -1,0 +1,142 @@
+<p>Hasura does not log anyone in. It has no user table, no password field and no session store. What
+it does is <em>verify a token somebody else issued</em> and read a few claims out of it. Getting that
+division right is most of the work, and misunderstanding it is where the confusion starts.</p>
+
+<h2>The division of labour</h2>
+
+<p>Your application owns identity: registration, passwords, sessions, password resets, multi-factor.
+When somebody signs in, your service issues a signed token. From then on Hasura&rsquo;s only question
+is <em>who does this token claim to be, and is the signature valid?</em></p>
+
+<p>In the demo app that means one JWT secret shared between two services. FastAPI signs; Hasura
+verifies. One login, two APIs, no second session concept.</p>
+
+<h2>JWT mode</h2>
+
+<p>Set one variable and the engine starts verifying tokens:</p>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_JWT_SECRET: '{"type":"HS256","key":"dev-only-change-me-in-any-real-deployment"}'</code></pre>
+
+<p>HS256 is a shared secret &mdash; the same string signs and verifies, so both services must have
+it. For anything real, prefer RS256 with a public key, or better, point Hasura at your identity
+provider&rsquo;s JWKS endpoint so keys rotate without a redeploy:</p>
+
+<pre class="language-json"><code class="language-json">{"type":"RS256","jwk_url":"https://your-idp.example.com/.well-known/jwks.json"}</code></pre>
+
+<h3>The claims Hasura needs</h3>
+
+<p>A token is not enough on its own &mdash; it has to carry Hasura&rsquo;s claims, under a namespace
+key:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "sub": "8f14e45f-ceea-467a-9f0e-b1c8d2c93a10",
+  "exp": 1787000000,
+  "https://hasura.io/jwt/claims": {
+    "x-hasura-default-role": "host",
+    "x-hasura-allowed-roles": ["customer", "host"],
+    "x-hasura-user-id": "8f14e45f-ceea-467a-9f0e-b1c8d2c93a10",
+    "x-hasura-is-host": "true"
+  }
+}</code></pre>
+
+<p>Three rules, each of which costs somebody an afternoon:</p>
+
+<p><strong>Every claim value must be a string.</strong> Including ids and booleans. Hasura compares
+session variables as text, so a numeric <code>x-hasura-user-id</code> silently fails to match a
+filter that works everywhere else. Note <code>"true"</code>, not <code>true</code>.</p>
+
+<p><strong><code>allowed_roles</code> is a list because one person is several things.</strong> A host
+is also a guest. The default role applies when the client says nothing; the client can request
+another with an <code>x-hasura-role</code> header, and Hasura rejects anything not in this list.</p>
+
+<p><strong>The namespace key is exact.</strong> <code>https://hasura.io/jwt/claims</code> is the
+default. It is configurable, but changing it buys nothing and breaks every example you will read.</p>
+
+<h3>The role you must not name <code>admin</code></h3>
+
+<p>The demo app calls its staff role <code>staff</code>, and the reason is worth internalising:
+<code>admin</code> is <strong>reserved</strong>. It is the role the admin secret grants, it always
+has unrestricted access, and any attempt to declare a permission for it is rejected with
+<em>cannot define permission for admin role</em>.</p>
+
+<p>Mint tokens with <code>x-hasura-default-role: admin</code> and you have created users whose
+permissions can never be written, so every one of their queries is denied. The error names the role
+but not the fact that the role is special.</p>
+
+<p>A JWT can never carry real admin access either, which is the point: full access requires the
+secret, not a token.</p>
+
+<h2>Webhook mode</h2>
+
+<p>The alternative. Instead of verifying a token itself, Hasura forwards the request headers to an
+endpoint you run, which replies with the session variables:</p>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_AUTH_HOOK: http://auth-service:4000/hasura-auth</code></pre>
+
+<pre class="language-json"><code class="language-json">{"X-Hasura-User-Id":"8f14e45f-...","X-Hasura-Role":"customer"}</code></pre>
+
+<p>Use it when sessions are opaque &mdash; cookies, revocable tokens, anything needing a database
+lookup to resolve. The cost is a network hop on every request, so cache the response with the
+<code>Cache-Control</code> header Hasura honours, or the auth service becomes the bottleneck.</p>
+
+<h2>Nobody at all</h2>
+
+<p>A request with no <code>Authorization</code> header is not automatically rejected. It is assigned
+a role:</p>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous</code></pre>
+
+<p>This is how the demo app serves published listings to visitors. It names a role and grants nothing
+on its own &mdash; permissions are still declared in metadata. Leave it unset and unauthenticated
+requests are refused outright, which is right for an internal API and wrong for a public site.</p>
+
+<h2>The admin secret</h2>
+
+<p><code>HASURA_GRAPHQL_ADMIN_SECRET</code> is not authentication. There is no user behind it. It is
+a master key that bypasses every rule you write, and it exists for the console, migrations and
+server-side scripts.</p>
+
+<p>It must never reach a browser. Every frontend in the demo app sends a JWT; grep the source for the
+secret and you find nothing. If you are tempted to use it in a client &ldquo;just for now&rdquo;, you
+are one deploy away from publishing your database.</p>
+
+<h2>Authentication in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 moves this out of environment variables and into metadata, in the <code>globals</code>
+subgraph:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: AuthConfig
+version: v3
+definition:
+  mode:
+    jwt:
+      claimsConfig:
+        namespace:
+          claimsFormat: Json
+          location: "/claims.jwt.hasura.io"
+      key:
+        fixed:
+          algorithm: HS256
+          key:
+            valueFromEnv: AUTH_SECRET</code></pre>
+
+<p>Both JWT and webhook modes carry over. Authentication is configured once at
+<strong>supergraph level</strong> &mdash; every subgraph shares it &mdash; while authorization stays
+per-subgraph. That split is deliberate: one identity, many independently-owned permission sets.</p>
+
+<h3>There is no admin secret in v3</h3>
+
+<p>The most consequential difference in the whole track. DDN has <strong>no
+<code>HASURA_GRAPHQL_ADMIN_SECRET</code> and no built-in unrestricted role behind it</strong>. API
+access uses a Cloud PAT sent as a <code>cloud_pat</code> header.</p>
+
+<p>Every v2 habit built on that secret needs another answer before you migrate: seeding scripts,
+console access, CI that applies metadata, the &ldquo;just use admin&rdquo; shortcut in a test suite.
+None of them have a direct translation, and nothing announces this loudly.</p>
+
+<h2>Next</h2>
+
+<p>Authentication says who you are. Lesson 9 covers what that lets you see &mdash; and it is the most
+important chapter in the track.</p>

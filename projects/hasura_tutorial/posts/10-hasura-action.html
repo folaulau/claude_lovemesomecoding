@@ -1,0 +1,160 @@
+<p>An Action is how anything Hasura cannot generate gets into the same GraphQL schema. You declare a
+type, point it at an HTTP endpoint you own, and it appears alongside the generated fields. Clients
+never learn there were two systems.</p>
+
+<h2>Why not just call the REST endpoint?</h2>
+
+<p>You can, and plenty of good architectures do &mdash; the demo app calls its own API directly for
+bookings. The case for an Action is that the client stops caring where anything lives. One endpoint,
+one auth header, one client library, and the boundary between generated and custom becomes an
+implementation detail you can move later.</p>
+
+<p>The case against is a hop and a layer of indirection. If your frontend already talks to your API
+happily, an Action buys less than it looks.</p>
+
+<h2>Declaring one</h2>
+
+<p>An Action is a type signature plus a URL:</p>
+
+<pre class="language-graphql"><code class="language-graphql">type Mutation {
+  createBooking(
+    propertyId: uuid!
+    checkIn: date!
+    checkOut: date!
+    guests: Int!
+  ): CreateBookingOutput
+}
+
+type CreateBookingOutput {
+  bookingId: uuid!
+  total: numeric!
+  status: String!
+}</code></pre>
+
+<p>Hasura sends your handler a POST with a fixed envelope:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "action": { "name": "createBooking" },
+  "input": {
+    "propertyId": "89c69134-...",
+    "checkIn": "2026-09-14",
+    "checkOut": "2026-09-18",
+    "guests": 2
+  },
+  "session_variables": {
+    "x-hasura-role": "customer",
+    "x-hasura-user-id": "8f14e45f-..."
+  },
+  "request_query": "mutation { createBooking(...) { bookingId } }"
+}</code></pre>
+
+<p><code>session_variables</code> is the important field. Hasura has already verified the JWT, so
+your handler does not re-verify anything &mdash; it trusts those values, because only Hasura can
+reach it. That is a real assumption: the handler must not be publicly routable, or anyone can post
+whatever session variables they like.</p>
+
+<p>A handler in FastAPI:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/actions/create-booking")
+def create_booking(payload: dict):
+    user_id = payload["session_variables"]["x-hasura-user-id"]
+    args = payload["input"]
+
+    try:
+        booking = booking_service.create(
+            guest_public_id=user_id,
+            property_public_id=args["propertyId"],
+            check_in=args["checkIn"],
+            check_out=args["checkOut"],
+            guests=args["guests"],
+        )
+    except DatesUnavailable as exc:
+        # Hasura turns this shape into a GraphQL error.
+        return JSONResponse(status_code=400, content={"message": str(exc), "code": "dates-taken"})
+
+    return {"bookingId": str(booking.public_id), "total": booking.total, "status": booking.status}</code></pre>
+
+<h3>Errors</h3>
+
+<p>Return a non-2xx with <code>{"message": ..., "code": ...}</code> and Hasura converts it into a
+normal GraphQL error. Return a 2xx and whatever you send must match the declared output type exactly
+&mdash; a missing field is a schema violation the client sees as a confusing null, so keep the output
+type and the handler in sync.</p>
+
+<h3>Forwarding client headers</h3>
+
+<p>There is a &ldquo;forward client headers to webhook&rdquo; option. Turning it on passes the
+caller&rsquo;s original headers through &mdash; useful when the handler needs the raw
+<code>Authorization</code> token to call a third-party API on the user&rsquo;s behalf.</p>
+
+<p>Leave it off unless you need it. On, your handler receives whatever the client sent, and code that
+reads a header without checking which ones are trustworthy is how a session variable gets spoofed.
+The <code>session_variables</code> block is the trustworthy source; forwarded headers are not.</p>
+
+<h2>Permissions</h2>
+
+<p>Actions have their own permissions, and they are role-level rather than row-level &mdash; a role
+may call the Action or it may not. There is no filter, because Hasura does not know what your handler
+is going to do.</p>
+
+<p>Remember to grant them. A newly created Action is callable by nobody but <code>admin</code>, and
+the resulting error looks like the field does not exist &mdash; which, per lesson 9, is exactly what
+Hasura does for anything a role has no permission on.</p>
+
+<h2>Relationships to Action results</h2>
+
+<p>The feature that makes Actions feel native. If your Action returns a
+<code>bookingId</code>, you can define a relationship from the output type to the
+<code>bookings</code> table and query straight through it:</p>
+
+<pre class="language-graphql"><code class="language-graphql">mutation {
+  createBooking(propertyId: $p, checkIn: $in, checkOut: $out, guests: 2) {
+    bookingId
+    booking {
+      total
+      property { title city }
+    }
+  }
+}</code></pre>
+
+<p>Custom logic runs, and the result joins back into the generated graph in the same round trip.</p>
+
+<h2>Actions in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>Actions do not exist in v3 under that name. The replacement is a <strong>Command</strong> backed
+by a <strong>lambda connector</strong>, and the difference is more than naming.</p>
+
+<p>In v2 you host a webhook somewhere and describe its shape to Hasura. In v3 you write a function in
+TypeScript, Python or Go <em>inside the project</em>, and the connector exposes it:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: Command
+version: v1
+definition:
+  name: createBooking
+  outputType: CreateBookingOutput!
+  arguments:
+    - name: propertyId
+      type: Uuid!
+    - name: guests
+      type: Int!
+  source:
+    dataConnectorName: business_logic
+    dataConnectorCommand:
+      procedure: createBooking
+  graphql:
+    rootFieldName: createBooking
+    rootFieldKind: Mutation</code></pre>
+
+<p>Access is governed by <code>CommandPermissions</code>, and a <code>Relationship</code> can target
+a Command &mdash; so the join-back-to-the-graph trick above survives the move.</p>
+
+<p>The practical upshot: no separate service to deploy and keep in sync, and the type signature is
+derived from your function rather than hand-declared twice. The cost is that your business logic now
+lives inside the supergraph project, which is a different repository layout than most teams have
+today.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 11 covers the other direction: an API that already speaks GraphQL.</p>

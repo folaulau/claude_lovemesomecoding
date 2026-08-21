@@ -1,0 +1,128 @@
+<p>Hasura is a single stateless binary in a container, which makes deployment simpler than most
+services and hides the two things that actually bite: connection pooling and metadata consistency
+across replicas.</p>
+
+<h2>The environment that matters</h2>
+
+<p>A production configuration is mostly a list of things turned off:</p>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_DATABASE_URL: postgres://hasura_app:...@db.internal:5432/stayhub
+HASURA_GRAPHQL_ADMIN_SECRET: ${ADMIN_SECRET}
+HASURA_GRAPHQL_JWT_SECRET: '{"type":"RS256","jwk_url":"https://idp.example.com/.well-known/jwks.json"}'
+HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+
+HASURA_GRAPHQL_ENABLE_CONSOLE: "false"
+HASURA_GRAPHQL_DEV_MODE: "false"
+HASURA_GRAPHQL_ENABLED_LOG_TYPES: startup, http-log, webhook-log
+HASURA_GRAPHQL_CORS_DOMAIN: "https://app.example.com"
+
+HASURA_GRAPHQL_PG_CONNECTIONS: "25"
+HASURA_GRAPHQL_PG_TIMEOUT: "180"</code></pre>
+
+<h2>Kubernetes</h2>
+
+<pre class="language-yaml"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hasura
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: hasura
+          image: hasura/graphql-engine:v2.42.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 30
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { memory: "1Gi" }</code></pre>
+
+<p>The engine is stateless &mdash; metadata lives in Postgres, not on disk &mdash; so replicas scale
+horizontally with no coordination. That is the good news.</p>
+
+<h3>The pool arithmetic</h3>
+
+<p>The bad news is that each replica opens its own pool. Three replicas at twenty-five connections is
+seventy-five, plus your application, plus migrations, against a
+<code>max_connections</code> that is often one hundred.</p>
+
+<p>Size it deliberately: <em>replicas &times; HASURA_GRAPHQL_PG_CONNECTIONS + everything else &lt;
+max_connections</em>. Autoscaling makes this worse, because the replica count is no longer a number
+you chose &mdash; set the pool from the <em>maximum</em> replica count, not the current one.</p>
+
+<p>Beyond a few replicas, put PgBouncer in transaction mode in front, and then keep Hasura&rsquo;s
+own pool small. Two stacked pools each trying to manage the same scarce resource is worse than
+either alone.</p>
+
+<h2>Metadata across replicas</h2>
+
+<p>Metadata is in the database, so all replicas read the same thing &mdash; but they cache it in
+memory. Apply a change and the replica you happened to talk to has it; the others do not until they
+reload.</p>
+
+<p>For a rolling deploy this resolves itself, because new pods read fresh metadata at boot. For a
+metadata-only change with no image change, it does not. Either apply and then restart the deployment,
+or call <code>reload_metadata</code> and let it propagate. A brief window where two replicas serve
+different schemas is otherwise a genuinely confusing bug.</p>
+
+<h2>Zero-downtime schema changes</h2>
+
+<p>The same expand-and-contract discipline as any database, with metadata as an extra step:</p>
+
+<p><strong>Adding</strong> is safe in any order that puts the column before the metadata. Add the
+column, apply metadata, deploy clients.</p>
+
+<p><strong>Removing</strong> must run backwards, over two releases. First remove the field from
+metadata so no client can request it and deploy that. Only once nothing references it, drop the
+column. Dropping first leaves metadata referencing a missing column, and the engine boots with that
+object inconsistent &mdash; silently dropping part of your API.</p>
+
+<p><strong>Renaming</strong> is add, backfill, migrate clients, remove. There is no atomic rename
+across a running fleet.</p>
+
+<h2>Hasura Cloud</h2>
+
+<p>The managed option. You get pooling, autoscaling, metrics, tracing, caching, allow-lists and rate
+limiting without running any of it &mdash; and several of those are Enterprise features you cannot
+self-host on Community Edition at all.</p>
+
+<p>The trade is the usual one: less operational surface, less control, and a bill that scales with
+traffic. For a small team whose Hasura is load-bearing, the honest comparison is not
+&ldquo;free versus paid&rdquo; but &ldquo;paid versus the cost of somebody owning pooling, upgrades
+and observability&rdquo;.</p>
+
+<h2>Deployment in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 splits the deployment into two halves, and this is the most important thing to understand
+before committing.</p>
+
+<p>The <strong>data plane</strong> &mdash; the v3 engine and the connectors &mdash; is open source and
+can run on your own infrastructure. The <strong>control plane</strong>, which handles builds,
+endpoints, authentication and analytics, is <strong>closed source and commercial</strong>. There is
+no v2-style &ldquo;pull the image and run it, entirely yours&rdquo; deployment of the whole
+product.</p>
+
+<p><strong>Private DDN</strong> is the offering for running the data plane in your own cloud while
+the control plane stays managed &mdash; the answer for data-residency and network-isolation
+requirements.</p>
+
+<p>Deployment itself becomes promotion rather than release:</p>
+
+<pre class="language-bash"><code class="language-bash">ddn supergraph build create</code></pre>
+
+<p>Each build is immutable with its own endpoint, so &ldquo;deploying&rdquo; is pointing traffic at a
+build you have already tested. Read replicas, incidentally, are included rather than being an
+Enterprise feature as in v2.</p>
+
+<h2>Next</h2>
+
+<p>Lessons 18 and 19 are the v3 deep dive; lesson 20 is the interview.</p>

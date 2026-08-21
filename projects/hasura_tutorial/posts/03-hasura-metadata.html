@@ -1,0 +1,134 @@
+<p>Hasura&rsquo;s schema is not in your database and not in your application code. It lives in
+<strong>metadata</strong>, and understanding that one fact explains most of the product &mdash;
+including why two developers clicking in a console will eventually ship different APIs.</p>
+
+<h2>What metadata actually is</h2>
+
+<p>Your database has tables, columns and foreign keys. Metadata is everything Hasura layers on top:
+which tables are exposed, what they are called in GraphQL, which relationships exist, which roles can
+see which rows and columns, what Actions and triggers are configured.</p>
+
+<p>Nothing you do in the console changes your database. Tracking a table adds a metadata entry.
+Adding a permission adds a metadata entry. Drop the metadata and your data is untouched &mdash; you
+just have no API.</p>
+
+<p>You can read all of it:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST http://localhost:8081/v1/metadata \
+  -H 'x-hasura-admin-secret: stayhub-admin-secret' \
+  -d '{"type":"export_metadata","args":{}}'</code></pre>
+
+<p>What comes back is one JSON document describing the whole API. Trimmed to a single table:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "sources": [
+    {
+      "name": "default",
+      "kind": "postgres",
+      "tables": [
+        {
+          "table": { "schema": "public", "name": "properties" },
+          "object_relationships": [ { "name": "host" } ],
+          "array_relationships": [ { "name": "bookings" }, { "name": "images" } ],
+          "select_permissions": [
+            { "role": "anonymous", "permission": { "columns": ["title", "city"], "filter": {} } }
+          ]
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+<p>That document <em>is</em> your API. It is the thing worth version-controlling.</p>
+
+<h2>The console is a trap at team size</h2>
+
+<p>Clicking in the console is the right way to learn and a bad way to run a project. It writes
+directly to the running engine&rsquo;s metadata, which means the change exists only on that engine
+until somebody exports it. Two developers each add a permission, each exports, and one silently
+overwrites the other.</p>
+
+<p>The fix is to treat metadata as source. Two ways to do it.</p>
+
+<h3>The Hasura CLI</h3>
+
+<p>The official route keeps metadata as a tree of YAML files:</p>
+
+<pre class="language-bash"><code class="language-bash">hasura metadata export      # engine  -> files
+hasura metadata apply       # files   -> engine
+hasura metadata diff        # what differs
+hasura metadata reload      # re-read after a schema change</code></pre>
+
+<p>You get <code>metadata/databases/</code>, <code>metadata/actions.yaml</code> and friends. Commit
+them, review them in pull requests, apply them in CI.</p>
+
+<h3>Metadata as a program</h3>
+
+<p>The demo app this track uses does something different: its metadata is a Python module that builds
+the document and posts it to the metadata API. It needs no extra binary installed, and it means the
+interesting part &mdash; permission rules &mdash; can be written once and reused across roles instead
+of copy-pasted per table.</p>
+
+<pre class="language-python"><code class="language-python">PUBLISHED_ONLY = {"_and": [{"status": {"_eq": "PUBLISHED"}}, {"deleted": {"_eq": False}}]}
+NOTHING_HIDDEN = {}</code></pre>
+
+<p>Then apply it in one call:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST http://localhost:8081/v1/metadata \
+  -H 'x-hasura-admin-secret: stayhub-admin-secret' \
+  -d '{"type":"replace_metadata","args":{ ... }}'</code></pre>
+
+<p><code>replace_metadata</code> is exactly what it says. It does not merge &mdash; whatever is not in
+the document you send stops existing. That is the property you want from a source of truth, and it is
+also how people lose an Action they added by hand in the console last week.</p>
+
+<h2>Inconsistent metadata</h2>
+
+<p>Metadata can reference things that are no longer there. Drop a column that a permission lists and
+the engine starts up with that object marked inconsistent.</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST http://localhost:8081/v1/metadata \
+  -H 'x-hasura-admin-secret: stayhub-admin-secret' \
+  -d '{"type":"get_inconsistent_metadata","args":{}}'</code></pre>
+
+<p>This is the first thing to check when a field vanishes from your schema after a deploy. The engine
+does not refuse to start; it drops the broken object and serves the rest, which is helpful in
+production and confusing if you do not know to look.</p>
+
+<h2>Metadata in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 takes the same idea considerably further. Metadata is no longer a live document you mutate
+through an API &mdash; it is a set of <code>.hml</code> files you edit and compile. HML is Hasura
+Metadata Language, an extension of YAML.</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: Model
+version: v1
+definition:
+  name: Properties
+  objectType: Properties
+  source:
+    dataConnectorName: my_connector
+    collection: properties
+  graphql:
+    selectMany:
+      queryRootField: properties</code></pre>
+
+<p>Instead of applying, you build:</p>
+
+<pre class="language-bash"><code class="language-bash">ddn supergraph build local        # local development
+ddn supergraph build create       # a real, immutable build</code></pre>
+
+<p>Each build is <strong>immutable</strong> and gets its own unique GraphQL endpoint, so you can test
+one before promoting it. The whole class of &ldquo;somebody applied metadata to production by
+accident&rdquo; problems goes away, because applying is no longer the operation.</p>
+
+<p>The other change is division. In v2 metadata is one document for the whole engine. In v3 it is
+split across <strong>subgraphs</strong> &mdash; self-contained domains with their own metadata,
+permissions and repository &mdash; composed into a supergraph. Global concerns like
+<code>AuthConfig</code> and <code>GraphqlConfig</code> live in a <code>globals</code> subgraph.</p>
+
+<h2>Next</h2>
+
+<p>Metadata is the how. Lesson 4 covers what it buys you: the query language you get for free.</p>

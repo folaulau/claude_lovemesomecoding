@@ -1,0 +1,166 @@
+<p>The fastest way to a working Hasura is Docker Compose: the engine in one service, Postgres in
+another, both up with one command. This lesson gets that running, explains the parts of it that
+regularly go wrong, and ends with a real query.</p>
+
+<h2>The compose file</h2>
+
+<p>Two services. Postgres holds the data; Hasura reads it.</p>
+
+<pre class="language-yaml"><code class="language-yaml">services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: stayhub-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: stayhub
+      POSTGRES_PASSWORD: stayhub
+      POSTGRES_DB: stayhub
+    ports:
+      - "5433:5432"
+    volumes:
+      - stayhub-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stayhub -d stayhub"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  hasura:
+    image: hasura/graphql-engine:v2.42.0
+    container_name: stayhub-hasura
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    environment:
+      HASURA_GRAPHQL_DATABASE_URL: postgres://stayhub:stayhub@postgres:5432/stayhub
+      HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
+      HASURA_GRAPHQL_DEV_MODE: "true"
+...
+      HASURA_GRAPHQL_ADMIN_SECRET: stayhub-admin-secret
+...
+      HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+      HASURA_GRAPHQL_EXPERIMENTAL_FEATURES: naming_convention
+      HASURA_GRAPHQL_DEFAULT_NAMING_CONVENTION: graphql-default</code></pre>
+
+<p class="note">Lines shown as <code>...</code> are elided &mdash; the real file also sets log types
+and a JWT secret, which lessons 16 and 8 cover.</p>
+
+<h3>The port mistake everybody makes once</h3>
+
+<p>Look at those two ports carefully. Postgres is published on the host as <code>5433</code>, because
+<code>5432</code> was already taken by a native install. But the connection string Hasura uses says
+<code>5432</code>.</p>
+
+<p>Both are right. <code>"5433:5432"</code> means <em>host 5433 maps to container 5432</em>. Hasura
+is inside the compose network, so it reaches Postgres by service name on the container&rsquo;s own
+port. The 5433 shift only exists for tools on your machine. Putting 5433 in
+<code>HASURA_GRAPHQL_DATABASE_URL</code> produces a connection refused that looks like a credentials
+problem, and people lose an hour to it.</p>
+
+<p>So: <code>psql</code> on your laptop connects to <code>localhost:5433</code>; Hasura connects to
+<code>postgres:5432</code>.</p>
+
+<h3>The healthcheck is not decoration</h3>
+
+<p>Hasura crashes on boot if Postgres is not accepting connections yet, and Compose starts both at
+once. <code>depends_on: condition: service_healthy</code> holds the engine back until
+<code>pg_isready</code> succeeds.</p>
+
+<p>Note the check uses a command the image actually ships. A curl-based healthcheck on an image
+without curl reports unhealthy forever while the service works perfectly &mdash; and Compose then
+blames the wrong container.</p>
+
+<h2>The admin secret</h2>
+
+<p><code>HASURA_GRAPHQL_ADMIN_SECRET</code> is the single most important variable here, and it is
+worth being blunt about what it is.</p>
+
+<p>There is <strong>no username</strong>. That one string is the entire credential, and it grants the
+built-in <code>admin</code> role, which bypasses every permission rule you will ever write. It
+belongs in the console, in server-side scripts, and nowhere else. If it reaches a browser bundle you
+have handed every visitor unrestricted read and write access to your database.</p>
+
+<p>Without it set, an unprotected engine is open to anyone who can reach the port. Set it from the
+first run, not later.</p>
+
+<h2>Starting it</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d
+curl -s http://localhost:8081/healthz          # OK
+curl -s http://localhost:8081/v1/version       # {"server_type":"ce","version":"v2.42.0"}</code></pre>
+
+<p><code>server_type: ce</code> is Community Edition. Worth checking early, because several features
+people expect &mdash; response caching, allow-lists, rate limiting &mdash; are Enterprise and Cloud
+only, and finding that out during a launch is unpleasant.</p>
+
+<p>The console is at <code>http://localhost:8081</code>. It will ask for the admin secret.</p>
+
+<h2>Your first query</h2>
+
+<p>Tables are not exposed until you say so. In the console, open <strong>Data</strong>, find your
+tables and track them. Then, from <strong>API</strong>:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(limit: 2) {
+    title
+    city
+    pricePerNight
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{"data":{"properties":[
+  {"title":"Modern Condo, Downtown Skyline","city":"Seattle","pricePerNight":198.00},
+  {"title":"Historic Adobe near the Plaza","city":"Santa Fe","pricePerNight":225.00}]}}</code></pre>
+
+<p>The same thing over HTTP, which is all the console is doing:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST http://localhost:8081/v1/graphql \
+  -H 'x-hasura-admin-secret: stayhub-admin-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"query { properties(limit:2) { title city pricePerNight } }"}'</code></pre>
+
+<h3>Why the fields are camelCase</h3>
+
+<p>The database columns are <code>price_per_night</code> and <code>first_name</code>. The API returns
+<code>pricePerNight</code> and <code>firstName</code> because of one setting:</p>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_EXPERIMENTAL_FEATURES: naming_convention
+HASURA_GRAPHQL_DEFAULT_NAMING_CONVENTION: graphql-default</code></pre>
+
+<p>Decide this on day one. It changes every field name in the API, so turning it on later is a
+breaking change for every client. It also changes arguments &mdash; with it on, sorting is
+<code>orderBy</code> and not <code>order_by</code>, which is a surprise when you copy an example
+from documentation written without it.</p>
+
+<h2>Installing v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 installs a CLI rather than pulling an image. Docker Compose v2.20 or later is required.</p>
+
+<pre class="language-bash"><code class="language-bash">curl -L https://graphql-engine-cdn.hasura.io/ddn/cli/v4/get.sh | bash
+ddn doctor</code></pre>
+
+<p>Then you scaffold a project instead of configuring a container:</p>
+
+<pre class="language-bash"><code class="language-bash">ddn supergraph init mysupergraph
+ddn connector init my_connector -i        # choose hasura/postgres, give it the URL
+ddn connector introspect my_connector
+ddn model add my_connector '*'
+ddn supergraph build local
+ddn run docker-start</code></pre>
+
+<p>The difference worth noticing is where the configuration lives. In v2 it is environment variables
+on a running container plus state inside the engine. In v3 it is files in a directory that you commit
+&mdash; and <code>ddn model add</code> is the equivalent of clicking &ldquo;track&rdquo;.</p>
+
+<p>One thing does not transfer: there is <strong>no admin secret in v3</strong>. The credential model
+is different, and every script you have that authenticates with one needs a different answer. Lesson
+18 covers that in full.</p>
+
+<h2>Next</h2>
+
+<p>You have an engine serving a schema you never designed. Lesson 3 explains where that schema
+actually lives &mdash; because it is not in your database, and it is not in your code.</p>

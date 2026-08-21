@@ -1,0 +1,168 @@
+<p>Track a table and you get a query language over it &mdash; filtering, sorting, pagination,
+aggregation and nesting &mdash; without writing a resolver. This lesson is that language, with real
+responses from a running engine.</p>
+
+<h2>Selecting</h2>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(limit: 2) {
+    title
+    city
+    pricePerNight
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{"data":{"properties":[
+  {"title":"Modern Condo, Downtown Skyline","city":"Seattle","pricePerNight":198.00},
+  {"title":"Historic Adobe near the Plaza","city":"Santa Fe","pricePerNight":225.00}]}}</code></pre>
+
+<h2>Filtering with <code>where</code></h2>
+
+<p>Every column gets a set of comparison operators.</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(where: {city: {_eq: "Seattle"}}) { title pricePerNight }
+}</code></pre>
+
+<p>The common ones:</p>
+
+<pre class="language-graphql"><code class="language-graphql">{city:          {_eq: "Seattle"}}
+{pricePerNight: {_lte: 250}}
+{city:          {_in: ["Seattle", "Maui"]}}
+{title:         {_ilike: "%villa%"}}      # case-insensitive
+{deletedAt:     {_isNull: true}}
+{status:        {_neq: "DRAFT"}}</code></pre>
+
+<p>Combine them with <code>_and</code>, <code>_or</code> and <code>_not</code>:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(
+    where: {
+      _and: [
+        {city: {_eq: "Seattle"}},
+        {pricePerNight: {_lte: 250}},
+        {_not: {roomType: {_eq: "SHARED"}}}
+      ]
+    }
+  ) { title pricePerNight roomType }
+}</code></pre>
+
+<p>Several conditions in one object are already <code>_and</code>-ed, so
+<code>{city: {_eq: "Seattle"}, bedrooms: {_gte: 2}}</code> means both. You need explicit
+<code>_and</code> only when you want two conditions on the <em>same</em> field.</p>
+
+<h2>Sorting and pagination</h2>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(orderBy: {ratingAverage: DESC}, limit: 2) {
+    title
+    city
+    ratingAverage
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{"data":{"properties":[
+  {"title":"Oceanfront Villa, Private Steps to Sand","city":"Maui","ratingAverage":4.98},
+  {"title":"Lakefront A-Frame","city":"Lake Tahoe","ratingAverage":4.96}]}}</code></pre>
+
+<h3>The argument name depends on a setting</h3>
+
+<p>That is <code>orderBy</code> with an uppercase <code>DESC</code>, and most examples you will find
+online say <code>order_by: {rating_average: desc}</code>. Both are correct &mdash; for different
+engines.</p>
+
+<p>With <code>naming_convention</code> set to <code>graphql-default</code>, Hasura camelCases field
+names <em>and</em> arguments and uppercases enum values. Without it you get the database&rsquo;s
+snake_case throughout. Copying a snippet from documentation written under the other convention
+produces <code>'properties' has no argument named 'order_by'</code>, which reads like a version
+problem and is not one.</p>
+
+<p>Sort by several columns in order:</p>
+
+<pre class="language-graphql"><code class="language-graphql">properties(orderBy: [{city: ASC}, {pricePerNight: DESC}])</code></pre>
+
+<p>Paginate with <code>limit</code> and <code>offset</code>. Offset pagination gets slow and can skip
+rows when data changes underneath it, so for long lists prefer keyset pagination &mdash; sort by
+something unique and ask for rows after the last one you saw:</p>
+
+<pre class="language-graphql"><code class="language-graphql">properties(where: {createdAt: {_lt: $lastSeen}}, orderBy: {createdAt: DESC}, limit: 20)</code></pre>
+
+<h2>Aggregates</h2>
+
+<p>Every tracked table gets an <code>Aggregate</code> field alongside it.</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  propertiesAggregate {
+    aggregate {
+      count
+      avg { pricePerNight }
+    }
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{"data":{"propertiesAggregate":{"aggregate":{
+  "count":12,"avg":{"pricePerNight":261.6666666666667}}}}}</code></pre>
+
+<p><code>min</code>, <code>max</code>, <code>sum</code> and <code>stddev</code> work the same way, and
+aggregates accept the same <code>where</code> as the plain field. You can also return
+<code>nodes</code> alongside <code>aggregate</code> to get the count and the page in one request
+&mdash; which is exactly what a paginated list UI needs.</p>
+
+<h2>Variables</h2>
+
+<p>Never interpolate values into a query string. Use variables &mdash; they are typed, cacheable, and
+they keep the query text stable, which matters later for allow-lists.</p>
+
+<pre class="language-graphql"><code class="language-graphql">query Search($city: String!, $max: numeric!) {
+  properties(where: {_and: [{city: {_eq: $city}}, {pricePerNight: {_lte: $max}}]}) {
+    title
+    pricePerNight
+  }
+}</code></pre>
+
+<p>Note <code>numeric</code>. Hasura&rsquo;s scalar names come from Postgres types, so a
+<code>numeric</code> column is not <code>Float</code> and a <code>timestamptz</code> is
+<code>timestamptz</code>. Guessing <code>Float</code> gets a type error.</p>
+
+<h2>The thing that is not in the schema</h2>
+
+<p>Run this unauthenticated and it fails:</p>
+
+<pre class="language-json"><code class="language-json">{"errors":[{"message":"field 'bookings' not found in type: 'query_root'",
+  "extensions":{"path":"$.selectionSet.bookings","code":"validation-failed"}}]}</code></pre>
+
+<p>Not &ldquo;permission denied&rdquo;, and not an empty list. Permissions shape the schema per role,
+so a role with no permission on <code>bookings</code> has no such field. Keep it in mind while
+querying: what you can see depends entirely on who the engine thinks you are.</p>
+
+<h2>Queries in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>The query language is deliberately close &mdash; Hasura describes the generated v3 schema as
+compatible with v2 schemas &mdash; but where the capability comes from is different. In v2 every
+column is filterable and sortable because the engine generated it. In v3 you declare it.</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: BooleanExpressionType
+version: v1
+definition:
+  name: PropertiesBoolExp
+  operand:
+    object:
+      type: Properties
+      comparableFields:
+        - fieldName: city
+          booleanExpressionType: StringBoolExp
+        - fieldName: pricePerNight
+          booleanExpressionType: NumericBoolExp</code></pre>
+
+<p>Sorting has its own object, <code>OrderByExpression</code>, and aggregation has
+<code>AggregateExpression</code>. Aggregates in v3 are marked connector-dependent: what you get
+depends on what the connector implements, rather than being guaranteed by the engine.</p>
+
+<p>That is more verbose, and the trade is deliberate &mdash; you say which fields are filterable
+instead of exposing every column to every predicate by default.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 5 covers the part that makes this worth using: relationships.</p>

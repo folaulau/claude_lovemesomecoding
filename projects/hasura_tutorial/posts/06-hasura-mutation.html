@@ -1,0 +1,142 @@
+<p>Track a table and you get <code>insert</code>, <code>update</code> and <code>delete</code>
+alongside the query fields. This lesson covers how they work &mdash; and then the harder question
+they raise, which is which writes belong in Hasura at all.</p>
+
+<h2>The generated mutations</h2>
+
+<p>Each table gets a bulk form and a <code>_one</code> form:</p>
+
+<pre class="language-graphql"><code class="language-graphql">mutation {
+  insertBookingsOne(object: {
+    propertyId: "89c69134-...",
+    checkIn: "2026-09-14",
+    checkOut: "2026-09-18",
+    guests: 2
+  }) {
+    publicId
+    total
+    status
+  }
+}</code></pre>
+
+<p><code>returning</code> is the part people miss coming from REST. The mutation gives you back the
+row it just wrote, including database-generated columns &mdash; ids, defaults, computed totals
+&mdash; so you rarely need a follow-up read:</p>
+
+<pre class="language-graphql"><code class="language-graphql">mutation {
+  updateProperties(
+    where: {publicId: {_eq: $id}},
+    _set: {status: "PUBLISHED"}
+  ) {
+    affectedRows
+    returning { publicId title status }
+  }
+}</code></pre>
+
+<p>Note <code>_set</code>. There are also <code>_inc</code> for numbers and, on JSON columns,
+<code>_append</code> and <code>_deleteKey</code>.</p>
+
+<h3>Upserts</h3>
+
+<pre class="language-graphql"><code class="language-graphql">mutation {
+  insertPropertyAmenities(
+    objects: [{propertyId: $p, amenityId: $a}],
+    onConflict: {constraint: property_amenities_pkey, updateColumns: []}
+  ) { affectedRows }
+}</code></pre>
+
+<p><code>updateColumns: []</code> is the idiom for &ldquo;insert if missing, otherwise do
+nothing&rdquo;. The constraint name is the real Postgres constraint, so it has to exist &mdash; a
+unique index is what makes an upsert possible, not the syntax.</p>
+
+<h3>Transactions</h3>
+
+<p>Several mutations in <em>one</em> request run in a single transaction and roll back together.
+Several separate requests do not, regardless of how quickly you send them.</p>
+
+<pre class="language-graphql"><code class="language-graphql">mutation BookAndPay {
+  booking: insertBookingsOne(object: {...}) { publicId }
+  payment: insertPaymentsOne(object: {...}) { publicId }
+}</code></pre>
+
+<p>That is a genuine guarantee and it is also the limit of what Hasura will do for you: it is one
+database transaction, not a distributed one. If the second step is charging a card, no amount of
+GraphQL makes that atomic with the insert.</p>
+
+<h2>Write permissions</h2>
+
+<p>Insert permissions have two features that select permissions do not, and they matter more:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "role": "customer",
+  "permission": {
+    "columns": ["property_id", "check_in", "check_out", "guests"],
+    "check": {"property": {"status": {"_eq": "PUBLISHED"}}},
+    "set": {"guest_id": "x-hasura-user-id"}
+  }
+}</code></pre>
+
+<p>The <strong>check</strong> validates what is being written. The <strong>preset</strong>
+(<code>set</code>) forces a column from a session variable, and the column must not be in the
+allowed list &mdash; that is the whole point. If the client can supply <code>guest_id</code>, the
+client can book as somebody else. Preset from the token and it cannot, because the value never comes
+from the request.</p>
+
+<p>This is also why the columns list on a write permission should be as short as you can make it.
+Every column a client may set is a column they may set to something you did not anticipate.</p>
+
+<h2>Which writes belong here?</h2>
+
+<p>This is the real content of the lesson, and the demo app answers it with a deliberate no.</p>
+
+<p>StayHub reads everything through Hasura and writes almost nothing through it. Creating a booking
+goes to its own API instead, because creating a booking is not an insert. It is: check the dates are
+still free, recompute the price server-side, take a payment, write the row, index it for search, and
+email a confirmation &mdash; with the whole thing failing cleanly if the card is declined.</p>
+
+<p>You can push some of that into Postgres with constraints and triggers. You should not push all of
+it, and the moment you try, your business rules live in three places and your database is doing
+network I/O.</p>
+
+<p>A workable rule: <strong>if the write is a fact, Hasura is fine. If the write is a
+decision, put it behind your own endpoint.</strong> Marking a listing as a favourite is a fact.
+Confirming a booking is a decision.</p>
+
+<p>When you take the second path you have two good options, and lesson 10 covers the first: an
+<strong>Action</strong> puts your endpoint in the same GraphQL schema, so clients never learn there
+were two systems. The other is simply a REST call, which is what StayHub does.</p>
+
+<h2>Mutations in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>The biggest structural difference: in v3 mutations are marked
+<strong>connector-dependent</strong>. The engine does not guarantee them &mdash; the connector has to
+implement them. A read-only connector gives you a read-only model, which is a real answer rather than
+a gap.</p>
+
+<p>Alongside that, v3 adds <strong>native mutations</strong>, which v2 had no equivalent of (v2 had
+native <em>queries</em> only). And custom write logic becomes a <code>Command</code>:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: Command
+version: v1
+definition:
+  name: createBooking
+  outputType: Booking!
+  arguments:
+    - name: propertyId
+      type: Uuid!
+  source:
+    dataConnectorName: business_logic
+    dataConnectorCommand:
+      procedure: createBooking
+  graphql:
+    rootFieldName: createBooking
+    rootFieldKind: Mutation</code></pre>
+
+<p>Which is the same architectural advice this lesson gives for v2, made explicit by the product:
+generated writes for facts, a Command for decisions.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 7 keeps a query open and lets the server push.</p>

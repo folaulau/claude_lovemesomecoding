@@ -1,0 +1,115 @@
+<p>A development Hasura and a production Hasura differ by a handful of settings, and the gap between
+them is the difference between an API and an open database. This is the checklist.</p>
+
+<h2>Turn the console off</h2>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_ENABLE_CONSOLE: "false"
+HASURA_GRAPHQL_DEV_MODE: "false"</code></pre>
+
+<p>The console is served by the engine itself and it is an administrative interface on your public
+endpoint. It requires the admin secret, so this is defence in depth rather than the only lock &mdash;
+but there is no reason to serve it, and running the console locally against a production endpoint
+through the CLI is the better workflow anyway.</p>
+
+<p><code>DEV_MODE</code> is the more urgent one. With it on, errors include internal detail &mdash;
+including generated SQL &mdash; in the response. That is a schema disclosure you do not want, and it
+is on by default in most compose files people copy.</p>
+
+<h2>Restrict introspection</h2>
+
+<p>Introspection lets a client download your entire schema. For a public API that is a feature; for a
+private one it is a map.</p>
+
+<pre class="language-json"><code class="language-json">{
+  "type": "set_graphql_schema_introspection_options",
+  "args": {"disabled_for_roles": ["anonymous", "customer"]}
+}</code></pre>
+
+<p>Be honest about what this buys. It is obfuscation, not access control &mdash; permissions are what
+stop somebody reading data, and a determined attacker can guess field names. Disable it because there
+is no reason to publish the map, not because it protects you.</p>
+
+<h2>Look after the admin secret</h2>
+
+<p>It bypasses every rule you have written. Practical rules:</p>
+
+<p><strong>Never in a client.</strong> Not in a frontend bundle, not in a mobile app, not in a
+&ldquo;temporary&rdquo; debug build. Anything shipped to a device is public.</p>
+
+<p><strong>From a secret store, not a compose file.</strong> Development fixtures checked in on
+purpose are fine and should be obviously throwaway; production values come from the environment.</p>
+
+<p><strong>Rotate it.</strong> It is a single static string with unrestricted access and no
+expiry.</p>
+
+<p>Hasura also supports scoped admin-secret alternatives in its paid tiers, but on Community Edition
+this one string is the whole story &mdash; treat it accordingly.</p>
+
+<h2>Least privilege at the database</h2>
+
+<p>The control people most often skip. Hasura connects as a Postgres user, and if that user is a
+superuser then a metadata mistake has no floor under it.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE USER hasura_app WITH PASSWORD '...';
+GRANT USAGE ON SCHEMA public TO hasura_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO hasura_app;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO hasura_app;</code></pre>
+
+<p>Hasura needs its own schema for event-trigger bookkeeping, so give it one and let it own that.
+What it should not have is DDL rights on your application schema, unless you have deliberately chosen
+the Hasura-owns-migrations model from lesson 13.</p>
+
+<h2>The unauthorized role is a decision</h2>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous</code></pre>
+
+<p>Set, every unauthenticated request runs as that role. Unset, they are refused. Both are correct in
+different products &mdash; the mistake is inheriting the setting without deciding.</p>
+
+<p>If you do set it, audit that role&rsquo;s permissions specifically and regularly. It is the one
+role every visitor on the internet gets for free, and it is the one people forget when adding a table
+&mdash; a new select permission granted to &ldquo;all roles&rdquo; includes this one.</p>
+
+<h2>CORS</h2>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_CORS_DOMAIN: "https://app.example.com, https://admin.example.com"</code></pre>
+
+<p>Default is <code>*</code>. Narrow it. CORS does not stop a server-side attacker &mdash; it is a
+browser control &mdash; but leaving it open removes a barrier for no benefit.</p>
+
+<h2>Allow-lists and rate limiting</h2>
+
+<p class="note"><strong>Community Edition.</strong> The engine this track runs against reports <code>server_type: ce</code>. The features named below as Enterprise or Cloud were <strong>not</strong> demonstrated here &mdash; they are described from the documentation and labelled, rather than shown running.</p>
+
+<p>An <strong>allow-list</strong> restricts the endpoint to a set of approved query documents.
+Anything else is rejected, which converts your GraphQL API into something closer to a fixed set of
+operations &mdash; a strong control for a first-party app where you ship the queries yourself.</p>
+
+<p><strong>Rate limiting</strong> and API limits (depth, node count, request size) cap what a single
+role or client can ask for.</p>
+
+<p>Both are <strong>Enterprise and Cloud</strong> features. On Community Edition, the equivalents
+live in front of the engine: rate limiting at your ingress or CDN, and RESTified endpoints from
+lesson 14 as a poor-man&rsquo;s allow-list, since they pin the query text.</p>
+
+<h2>Security in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>Two changes stand out.</p>
+
+<p><strong>There is no admin secret.</strong> The single most powerful credential in a v2 deployment
+does not exist in DDN &mdash; API access uses a Cloud PAT sent as a <code>cloud_pat</code> header.
+Most of the section above about protecting and rotating that secret becomes a different problem
+rather than a solved one.</p>
+
+<p><strong>Allow-lists move to plugins.</strong> They remain available but are implemented
+differently, as are caching and RESTified endpoints. API limits are marked work in progress, so
+if rate limiting is a control you rely on, check its status before migrating.</p>
+
+<p>The permission model itself &mdash; the thing actually keeping data safe &mdash; carries over
+intact as <code>TypePermissions</code> and <code>ModelPermissions</code>.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 16 covers knowing what your API is doing once real traffic arrives.</p>

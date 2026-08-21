@@ -1,0 +1,127 @@
+<p>Everything so far assumed a console and a running engine. This lesson is about how a schema change
+gets from your laptop to production without anybody clicking anything &mdash; and about the awkward
+question of who owns the schema when your application already runs its own migrations.</p>
+
+<h2>Three directories</h2>
+
+<p>The Hasura CLI keeps a project as files:</p>
+
+<pre class="language-bash"><code class="language-bash">hasura init stayhub-hasura --endpoint http://localhost:8081
+
+migrations/     # SQL: the database schema itself
+metadata/       # YAML: tracked tables, relationships, permissions, actions
+seeds/          # SQL: reference data</code></pre>
+
+<p>The distinction matters. <strong>Migrations</strong> change the database. <strong>Metadata</strong>
+changes the API over it. They are separate directories because they are separate concerns &mdash; and
+they are deployed together because a permission referring to a column that does not exist yet is a
+broken deploy.</p>
+
+<pre class="language-bash"><code class="language-bash">hasura migrate create add_cancellation_reason --from-server
+hasura metadata export
+hasura migrate apply --database-name default
+hasura metadata apply
+hasura metadata reload</code></pre>
+
+<h3>Order is not negotiable</h3>
+
+<p><strong>Migrations first, then metadata.</strong> Metadata that references a new column fails to
+apply if the column is not there yet, and the failure leaves you with a half-configured API.</p>
+
+<p>Going the other way &mdash; dropping a column &mdash; the order reverses: remove it from metadata
+first, then drop it. Otherwise the engine boots with inconsistent metadata and quietly drops the
+broken object, which is lesson 3&rsquo;s failure mode arriving in production.</p>
+
+<h2>Who owns the schema?</h2>
+
+<p>Here is the real question, and most tutorials skip it.</p>
+
+<p>The demo app runs <strong>Alembic</strong>. Its models are SQLAlchemy, its migrations are Python,
+and its schema is owned by the backend. Hasura reads that database but did not create it.</p>
+
+<p>Running <code>hasura migrate</code> as well would mean two tools writing DDL to the same database
+with two separate version tables, and no coordination between them. That is a genuinely bad time.</p>
+
+<p>So pick one owner:</p>
+
+<p><strong>If Hasura is the only writer of DDL</strong> &mdash; a Hasura-first project with no
+significant backend &mdash; use <code>hasura migrate</code> for everything. It is coherent and the
+tooling is designed for it.</p>
+
+<p><strong>If an application owns the schema</strong> &mdash; which is the common case, and the demo
+app&rsquo;s case &mdash; let it keep ownership. Use Alembic, Flyway or Prisma for DDL, and use Hasura
+<em>only</em> for metadata:</p>
+
+<pre class="language-bash"><code class="language-bash">alembic upgrade head          # the schema
+hasura metadata apply         # the API over it
+hasura metadata reload        # re-read the new columns</code></pre>
+
+<p>Do not half-do this. A <code>migrations/</code> directory that is sometimes authoritative is worse
+than not having one.</p>
+
+<h2>A pipeline</h2>
+
+<pre class="language-yaml"><code class="language-yaml">name: deploy-hasura
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Hasura CLI
+        run: curl -L https://github.com/hasura/graphql-engine/raw/stable/cli/get.sh | bash
+
+      - name: Apply the schema
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Apply metadata
+        run: |
+          hasura metadata apply \
+            --endpoint "$HASURA_ENDPOINT" --admin-secret "$HASURA_ADMIN_SECRET"
+          hasura metadata reload \
+            --endpoint "$HASURA_ENDPOINT" --admin-secret "$HASURA_ADMIN_SECRET"
+        env:
+          HASURA_ENDPOINT: ${{ secrets.HASURA_ENDPOINT }}
+          HASURA_ADMIN_SECRET: ${{ secrets.HASURA_ADMIN_SECRET }}</code></pre>
+
+<p>Two things to add before you trust it. Run <code>hasura metadata diff</code> on pull requests so a
+reviewer sees the API change, not just the YAML. And check
+<code>get_inconsistent_metadata</code> after applying &mdash; the apply can succeed while leaving
+objects inconsistent, and you want the pipeline to fail rather than the API to quietly shrink.</p>
+
+<h2>CI/CD in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 replaces apply-in-place with build-and-promote:</p>
+
+<pre class="language-bash"><code class="language-bash">ddn supergraph build create</code></pre>
+
+<p>Each build is <strong>immutable</strong> and gets its own unique GraphQL endpoint. You can point a
+test suite at a build before anything else sees it, then promote it. The entire category of
+&ldquo;somebody applied metadata to production&rdquo; disappears, because applying is no longer the
+operation.</p>
+
+<h3>And migrations are no longer Hasura&rsquo;s job</h3>
+
+<p><code>hasura migrate</code> has <strong>no v3 successor</strong>. Schema migration belongs to your
+own tool, and you tell Hasura about the result by re-introspecting:</p>
+
+<pre class="language-bash"><code class="language-bash">alembic upgrade head
+ddn connector introspect my_connector
+ddn model add my_connector new_table
+ddn supergraph build create</code></pre>
+
+<p>For teams who use the v2 CLI to version schema and metadata together, this is a real workflow
+change. For teams already in the second camp above &mdash; application owns DDL, Hasura owns metadata
+&mdash; v3 simply makes official the split you already had.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 14 covers making it fast.</p>

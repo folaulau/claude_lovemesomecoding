@@ -1,0 +1,122 @@
+<p>The questions Hasura interviews actually ask, answered the way you would say them out loud. Most
+of them are really testing whether you have run this in production or only followed a tutorial.</p>
+
+<h2>How does Hasura generate an API without resolvers?</h2>
+
+<p>It reads your database schema &mdash; tables, columns, types, foreign keys &mdash; and generates a
+GraphQL schema from it, then compiles each incoming query directly to SQL. There is no resolver layer
+because there is nothing to resolve: one GraphQL query becomes one SQL statement.</p>
+
+<p>The follow-up is usually <em>where does the configuration live?</em> Answer: metadata, which is
+neither in your database nor in your code, and which you should keep in version control.</p>
+
+<h2>What happens when a role has no permission on a table?</h2>
+
+<p>The best-signal question in the set. The wrong answer is &ldquo;it returns an empty list&rdquo; or
+&ldquo;a permission error&rdquo;.</p>
+
+<p>What actually happens: <strong>the field does not exist</strong>. Permissions shape the schema per
+role, so introspection shows that role a smaller API and the query fails validation with
+<code>field 'bookings' not found in type: 'query_root'</code>. Access is not filtered out of a shared
+schema &mdash; each role gets its own.</p>
+
+<h2>Do permissions cascade through relationships?</h2>
+
+<p>No, and this catches people. Being allowed to read <code>properties</code> does not grant the
+related <code>host</code> row; every table is evaluated independently. It is the safe default, and it
+is why a nested field silently disappears for one role. The fix is a permission on the child
+table.</p>
+
+<p>Related: roles do not inherit either. A <code>host</code> gets nothing from
+<code>customer</code>&rsquo;s rules. Flat, verbose, and impossible to grant something by accident
+through a hierarchy.</p>
+
+<h2>Why can&rsquo;t I name my admin role <code>admin</code>?</h2>
+
+<p>Because <code>admin</code> is reserved &mdash; it is what the admin secret grants, it always has
+unrestricted access, and declaring a permission for it is rejected. Name your staff role something
+else. A JWT can never carry real admin access, which is the point: full access requires the secret,
+not a token.</p>
+
+<h2>Is a nested query n+1?</h2>
+
+<p>No. A nested relationship compiles to a lateral join inside a single SQL statement, and Postgres
+assembles the JSON. You can prove it with the <code>/v1/graphql/explain</code> endpoint.</p>
+
+<p>The honest caveat, which is what a good interviewer wants: a <strong>remote</strong> relationship
+&mdash; joining to another service &mdash; genuinely can be n+1, because it is a network call. Hasura
+batches where the remote supports it; if the remote only exposes a single-item field, twenty rows
+mean twenty calls.</p>
+
+<h2>How do you handle logic Hasura can&rsquo;t express?</h2>
+
+<p>Two routes. An <strong>Action</strong> puts your own HTTP endpoint into the same GraphQL schema,
+so clients see one API. A <strong>remote schema</strong> merges an existing GraphQL service in.</p>
+
+<p>The stronger answer adds where the line is: if a write is a <em>fact</em>, the generated mutation
+is fine. If it is a <em>decision</em> &mdash; check availability, price it, take payment, send a
+confirmation &mdash; put it behind your own endpoint. Do not push business rules into database
+triggers to keep everything inside Hasura.</p>
+
+<h2>What does an event trigger guarantee?</h2>
+
+<p><strong>At least once</strong>, not exactly once. The event is written in the same transaction as
+the data change, so it cannot be lost or fire for a rolled-back transaction &mdash; but delivery is
+retried, so your handler must be idempotent, and <strong>ordering is not guaranteed</strong>.</p>
+
+<p>Mention that the payload carries both <code>old</code> and <code>new</code>, which is what lets you
+react to a transition rather than a state.</p>
+
+<h2>How do you keep a client from taking the database down?</h2>
+
+<p>A row <code>limit</code> on every public role&rsquo;s select permission. Without one,
+<code>query { properties }</code> with no arguments returns the whole table.</p>
+
+<p>Then: indexes on whatever you have exposed to <code>where</code> and <code>orderBy</code> &mdash;
+including a trigram index if you exposed <code>_ilike</code>, since a leading wildcard cannot use a
+B-tree. Depth and rate limits exist but are Enterprise. And connection pooling, which is the thing
+that actually falls over first.</p>
+
+<h2>What do you turn off before production?</h2>
+
+<p>The question that separates people who have shipped it. Console off, dev mode off &mdash; dev mode
+leaks generated SQL in error responses. Introspection restricted for public roles. CORS narrowed from
+<code>*</code>. The admin secret out of every client and rotated. A least-privilege database user
+rather than a superuser. And an audit of the unauthorized role, because that is the one every visitor
+on the internet gets for free.</p>
+
+<h2>What is the difference between v2 and v3 (DDN)?</h2>
+
+<p class="note"><strong>On this answer.</strong> The v3 details below come from the official Hasura DDN documentation as read on <strong>2026-08-21</strong>. Feature availability in DDN is still moving, so check the current matrix before quoting it in an interview.</p>
+
+<p>They are different products, not two releases of one. v2 is a single engine configured through a
+console with metadata applied to it live. v3 (DDN) is a supergraph compiled from <code>.hml</code>
+files over native data connectors, driven by a CLI, producing immutable builds.</p>
+
+<p>The three specifics that show you have actually looked:</p>
+
+<p><strong>There is no admin secret in v3.</strong> API access uses a Cloud PAT.</p>
+
+<p><strong>Cron triggers do not exist</strong> and event triggers are still work in progress, so
+scheduled work has to move out before migrating.</p>
+
+<p><strong>Database migrations are no longer Hasura&rsquo;s job.</strong> <code>hasura migrate</code>
+has no successor; you use your own tool and re-introspect.</p>
+
+<p>The concepts survive &mdash; roles, row filters, field allowlists, session variables,
+relationships. The syntax does not.</p>
+
+<h2>Would you use Hasura for this project?</h2>
+
+<p>The one where &ldquo;yes, obviously&rdquo; is the weak answer. Good reasons to: a read-heavy
+product over a well-modelled relational schema, where a permission model expressed once beats
+resolvers written many times.</p>
+
+<p>Good reasons not to: heavy write-side business logic, a schema that is not relational, or a team
+with nobody willing to own database performance &mdash; because Hasura makes it very easy to ask
+expensive questions, and the database is where those land.</p>
+
+<h2>That is the track</h2>
+
+<p>Twenty lessons, both products, every v2 example run against a real engine. If you want to see the
+whole v2-to-v3 mapping in one place, it is the table in lesson 18.</p>

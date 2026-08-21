@@ -1,0 +1,113 @@
+<p>Hasura sits between your clients and your database, which makes it the best place in the stack to
+find out why something is slow &mdash; and a place where the default logging tells you almost
+nothing useful.</p>
+
+<h2>Choose your log types</h2>
+
+<p>The engine emits several categories and you pick which are on:</p>
+
+<pre class="language-yaml"><code class="language-yaml">HASURA_GRAPHQL_ENABLED_LOG_TYPES: startup, http-log, webhook-log, websocket-log, query-log
+HASURA_GRAPHQL_LOG_LEVEL: info</code></pre>
+
+<p>What each is worth:</p>
+
+<p><code>startup</code> &mdash; on always. It reports inconsistent metadata at boot, which is lesson
+3&rsquo;s silent failure becoming visible.</p>
+
+<p><code>http-log</code> &mdash; one line per request with status and duration. This is your access
+log.</p>
+
+<p><code>query-log</code> &mdash; the GraphQL document and the generated SQL. The most useful of the
+lot for debugging and the most expensive: it logs query text on every request. Worth having in
+staging permanently and in production when you are hunting something.</p>
+
+<p><code>webhook-log</code> &mdash; Action and event-trigger calls. When emails stop going out, this
+is where the failure is, not in your application logs.</p>
+
+<p><code>websocket-log</code> &mdash; subscription connect and disconnect. The place to confirm the
+token-expiry problem from lesson 7.</p>
+
+<h3>Reading an http-log line</h3>
+
+<pre class="language-json"><code class="language-json">{
+  "type": "http-log",
+  "detail": {
+    "operation": {
+      "query_execution_time": 0.0234,
+      "request_id": "b1b7...",
+      "user_vars": {"x-hasura-role": "customer"},
+      "operation_name": "SearchListings"
+    },
+    "http_info": {"status": 200, "url": "/v1/graphql"}
+  }
+}</code></pre>
+
+<p>Two fields do most of the work. <code>operation_name</code> is only there if your clients
+<strong>name their operations</strong> &mdash; and without it every line says <code>null</code> and
+you cannot tell which query is slow. Name every query and mutation in your client. It costs nothing
+and it is the difference between an actionable log and noise.</p>
+
+<p><code>request_id</code> is what ties a GraphQL request to the Action it triggered and to your
+backend&rsquo;s own logs. Propagate it.</p>
+
+<h2>Health and metrics</h2>
+
+<pre class="language-bash"><code class="language-bash">curl -s http://localhost:8081/healthz         # OK
+curl -s http://localhost:8081/v1/version     # {"server_type":"ce","version":"v2.42.0"}</code></pre>
+
+<p><code>/healthz</code> is what your orchestrator should probe. Note that it reports the engine, not
+the database &mdash; an engine that has lost Postgres can still answer <code>OK</code> briefly, so
+pair it with a real query for a deep check.</p>
+
+<p>A Prometheus metrics endpoint exists on the paid tiers. On Community Edition, build your
+dashboards from the structured logs &mdash; every one is JSON, so shipping them to Loki, Elastic or
+CloudWatch and aggregating <code>query_execution_time</code> by <code>operation_name</code> gets you
+most of the value.</p>
+
+<h2>Tracing across the boundary</h2>
+
+<p>The question that matters in production is usually &ldquo;where did those two seconds go?&rdquo;
+&mdash; and for a request that hits an Action, the answer spans two services.</p>
+
+<p>Hasura forwards trace context on Action and event-trigger calls. If your handler continues the
+trace rather than starting a new one, you get a single span tree covering the GraphQL request, the
+SQL, the webhook and whatever the webhook did. If it does not, you get two unrelated traces and the
+correlation is manual.</p>
+
+<p>The cheap version, if you have no tracing at all: log <code>request_id</code> on both sides. It is
+not a flame graph but it answers the question.</p>
+
+<h2>What to actually watch</h2>
+
+<p>Four things, roughly in order of how often they are the answer:</p>
+
+<p><strong>Slow operations by name.</strong> Aggregate <code>query_execution_time</code> by
+<code>operation_name</code> and watch the 95th percentile, not the mean. One expensive nested query
+hides completely in an average.</p>
+
+<p><strong>Connection pool saturation.</strong> Requests queuing for a connection look like slow
+queries but are not &mdash; see lesson 14. If latency rises across <em>every</em> operation at once,
+suspect the pool before the SQL.</p>
+
+<p><strong>Event-trigger failures.</strong> They retry silently and then stop. Watch
+<code>webhook-log</code> for non-2xx, and check the processed-events table.</p>
+
+<p><strong>Inconsistent metadata after deploys.</strong> Query
+<code>get_inconsistent_metadata</code> in your pipeline and fail the deploy on a non-empty result.
+Otherwise the API shrinks quietly and you find out from a customer.</p>
+
+<h2>Observability in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 treats this as a first-class part of the product rather than a log configuration. The DDN
+console includes traces and analytics directly, and observability is a documented section of the
+platform rather than a set of environment variables.</p>
+
+<p>The immutable-build model helps in a way that is easy to overlook: because every build has a
+unique endpoint and an identity, a regression can be attributed to a specific build rather than to
+&ldquo;some metadata change last Tuesday&rdquo;.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 17 puts it somewhere that is not your laptop.</p>

@@ -1,0 +1,217 @@
+<p>In v3 the metadata <em>is</em> the product. There is no console to click and no engine holding
+state &mdash; there is a directory of <code>.hml</code> files that compile into an API. This lesson
+walks every object kind by modelling the same booking schema the v2 half of this track uses.</p>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output.</p>
+
+<h2>The v3 (DDN) object kinds</h2>
+
+<ul><li><code>DataConnectorLink</code></li><li><code>ObjectType</code></li><li><code>Model</code></li><li><code>Command</code></li><li><code>Relationship</code></li><li><code>BooleanExpressionType</code></li><li><code>AggregateExpression</code></li><li><code>OrderByExpression</code></li><li><code>TypePermissions</code></li><li><code>ModelPermissions</code></li><li><code>CommandPermissions</code></li><li><code>GraphqlConfig</code></li><li><code>AuthConfig</code></li><li><code>CompatibilityConfig</code></li><li><code>EnginePlugins</code></li></ul>
+
+<p>That is more moving parts than v2, and the reason is consistent throughout: v2 generated
+capabilities from your database, v3 makes you declare them. More to write, less that appears without
+you asking.</p>
+
+<h2>Connecting the source</h2>
+
+<p>Everything starts from a <code>DataConnectorLink</code>, which is what introspection produces:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: DataConnectorLink
+version: v1
+definition:
+  name: my_connector
+  url:
+    readWriteUrls:
+      read:
+        valueFromEnv: MY_CONNECTOR_READ_URL
+      write:
+        valueFromEnv: MY_CONNECTOR_WRITE_URL
+  schema:
+    version: v0.1</code></pre>
+
+<p>You rarely hand-write this. <code>ddn connector introspect</code> maintains it.</p>
+
+<h2>Types and models</h2>
+
+<p>An <code>ObjectType</code> describes a shape. It is deliberately independent of where the data
+lives, which is what lets one type be served by different connectors:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: ObjectType
+version: v1
+definition:
+  name: Properties
+  fields:
+    - name: publicId
+      type: Uuid!
+    - name: title
+      type: String!
+    - name: city
+      type: String!
+    - name: pricePerNight
+      type: Decimal!
+    - name: status
+      type: String!
+  graphql:
+    typeName: Properties
+  dataConnectorTypeMapping:
+    - dataConnectorName: my_connector
+      dataConnectorObjectType: properties
+      fieldMapping:
+        publicId: { column: { name: public_id } }
+        pricePerNight: { column: { name: price_per_night } }</code></pre>
+
+<p><code>fieldMapping</code> is where snake_case becomes camelCase. In v2 that was one environment
+variable applied globally; in v3 it is explicit per field &mdash; more typing, and no surprises about
+what a field is called.</p>
+
+<p>A <code>Model</code> makes the type queryable:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: Model
+version: v1
+definition:
+  name: Properties
+  objectType: Properties
+  source:
+    dataConnectorName: my_connector
+    collection: properties
+  filterExpressionType: PropertiesBoolExp
+  orderByExpression: PropertiesOrderBy
+  graphql:
+    selectMany:
+      queryRootField: properties
+    selectUniques:
+      - queryRootField: propertiesByPublicId
+        uniqueIdentifier: [publicId]</code></pre>
+
+<p><code>selectUniques</code> has no v2 equivalent worth naming: it generates a root field that
+returns exactly one row, typed as such, rather than a list you index into.</p>
+
+<h2>Declaring what a query can do</h2>
+
+<p>In v2, tracking a table made every column filterable and sortable. In v3 those are objects.</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: BooleanExpressionType
+version: v1
+definition:
+  name: PropertiesBoolExp
+  operand:
+    object:
+      type: Properties
+      comparableFields:
+        - fieldName: city
+          booleanExpressionType: StringBoolExp
+        - fieldName: pricePerNight
+          booleanExpressionType: DecimalBoolExp
+      comparableRelationships:
+        - relationshipName: host
+  logicalOperators: { enable: true }
+  isNull: { enable: true }
+  graphql:
+    typeName: PropertiesBoolExp</code></pre>
+
+<p>Note <code>comparableRelationships</code> &mdash; that is what makes
+<code>where: {host: {...}}</code> possible, and it is opt-in. <code>OrderByExpression</code> and
+<code>AggregateExpression</code> follow the same pattern for sorting and aggregation.</p>
+
+<p>The upside is real: a column you did not list cannot be used to probe your data with a range
+scan, and aggregation over a sensitive field is not exposed by default.</p>
+
+<h2>Relationships</h2>
+
+<pre class="language-yaml"><code class="language-yaml">kind: Relationship
+version: v1
+definition:
+  name: host
+  sourceType: Properties
+  target:
+    model:
+      name: Users
+      relationshipType: Object
+  mapping:
+    - source:
+        fieldPath: [{ fieldName: hostId }]
+      target:
+        modelField: [{ fieldName: id }]</code></pre>
+
+<p>Change <code>relationshipType</code> to <code>Array</code> for the many side. The capability worth
+repeating: the target may live in a different connector or a different subgraph, which no v2
+relationship could do.</p>
+
+<h2>Permissions, in two objects</h2>
+
+<p><code>TypePermissions</code> governs fields:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: TypePermissions
+version: v1
+definition:
+  typeName: Properties
+  permissions:
+    - role: anonymous
+      output:
+        allowedFields: [publicId, title, city, pricePerNight, status]
+    - role: staff
+      output:
+        allowedFields: [publicId, title, city, pricePerNight, status, addressLine1, postalCode]</code></pre>
+
+<p><code>ModelPermissions</code> governs rows:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: ModelPermissions
+version: v1
+definition:
+  modelName: Properties
+  permissions:
+    - role: anonymous
+      select:
+        filter:
+          fieldComparison:
+            field: status
+            operator: _eq
+            value:
+              literal: PUBLISHED
+    - role: host
+      select:
+        filter:
+          relationship:
+            name: host
+            predicate:
+              fieldComparison:
+                field: publicId
+                operator: _eq
+                value:
+                  sessionVariable: x-hasura-user-id</code></pre>
+
+<p>Everything from lesson 9 survives &mdash; roles, row filters, field allowlists, session variables,
+filters that walk relationships. The split by <em>what is protected</em> rather than by operation is
+arguably clearer, and it is certainly more verbose.</p>
+
+<h2>Business logic</h2>
+
+<p>A <code>Command</code> is v3&rsquo;s Action: a function on a connector, exposed as a field.
+Governed by <code>CommandPermissions</code>, and a <code>Relationship</code> can target it, so its
+result joins back into the graph.</p>
+
+<h2>The global objects</h2>
+
+<p>Three live in the <code>globals</code> subgraph and apply to the whole supergraph:
+<code>AuthConfig</code> (lesson 8), <code>GraphqlConfig</code> &mdash; which holds the naming and
+schema conventions that were environment variables in v2 &mdash; and
+<code>CompatibilityConfig</code>, which pins engine behaviour to a date so an upgrade cannot silently
+change your API&rsquo;s semantics. There is no v2 equivalent of that last one, and it is a good
+idea.</p>
+
+<p><code>EnginePlugins</code> is the extension point, and it matters more than it sounds: caching,
+allow-lists and RESTified endpoints are all delivered as plugins in v3 rather than built in.</p>
+
+<h2>Is v3&rsquo;s verbosity worth it?</h2>
+
+<p>For one Postgres database and one team, honestly, often not &mdash; v2 gives you the same API from
+a fraction of the configuration.</p>
+
+<p>It starts paying when there is more than one source or more than one team. Declared capabilities
+review well in a pull request, subgraphs give teams real boundaries, and immutable builds make
+promotion safe. That is the trade v3 is making, and it is worth taking on those terms rather than
+because the number is higher.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 20 closes the track with the questions interviews ask.</p>

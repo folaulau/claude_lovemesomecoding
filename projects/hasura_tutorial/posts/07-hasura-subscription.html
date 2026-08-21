@@ -1,0 +1,134 @@
+<p>A subscription in Hasura is a query you keep open. Same syntax, same permissions, same
+relationships &mdash; but instead of one response the server pushes a new one whenever the result
+changes. That framing is worth holding onto, because it explains both the power and the cost.</p>
+
+<h2>The same query, held open</h2>
+
+<pre class="language-graphql"><code class="language-graphql">subscription BookingStatus($id: uuid!) {
+  bookings(where: {publicId: {_eq: $id}}) {
+    publicId
+    status
+    checkIn
+    checkOut
+  }
+}</code></pre>
+
+<p>Change that row in the database &mdash; from anywhere, including <code>psql</code> &mdash; and
+every client watching it receives the new result. Nothing published an event; Hasura noticed the
+result changed.</p>
+
+<h2>Live queries and how they scale</h2>
+
+<p>The obvious implementation is polling per client, and that would fall over immediately. Hasura
+does something smarter: it <strong>multiplexes</strong>. Subscriptions with the same query text but
+different variables are batched into one database query, run on an interval, and the results fanned
+back out.</p>
+
+<p>Two consequences you should plan around:</p>
+
+<p><strong>Updates are on an interval, not instantaneous.</strong> The default refetch is one second.
+Hasura is not tailing the write-ahead log &mdash; it re-runs the query. For a booking status that is
+perfect; for a trading feed it is not what you want.</p>
+
+<p><strong>Query text is the batching key.</strong> A thousand clients running the same subscription
+with different ids is one efficient query. A thousand clients each with slightly different query text
+is a thousand queries. This is a strong reason to keep subscription documents in a shared module
+rather than building them per component.</p>
+
+<h3>Streaming subscriptions</h3>
+
+<p>The other flavour. A live query sends the whole current result each time; a
+<strong>streaming</strong> subscription sends only rows after a cursor, which is what you want for an
+append-only feed like a chat log or an audit trail:</p>
+
+<pre class="language-graphql"><code class="language-graphql">subscription NewMessages($after: timestamptz!) {
+  messagesStream(
+    batchSize: 20,
+    cursor: {initialValue: {createdAt: $after}, ordering: ASC}
+  ) { id body createdAt }
+}</code></pre>
+
+<p>Use a live query for &ldquo;what is the current state of this thing&rdquo;, and a stream for
+&ldquo;what has happened since I last looked&rdquo;.</p>
+
+<h2>Wiring it into React</h2>
+
+<p>Subscriptions run over WebSockets, so the client needs a second link alongside HTTP. The demo app
+builds its Apollo client like this for queries:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const httpLink = new HttpLink({
+  uri: import.meta.env.VITE_HASURA_URL ?? 'http://localhost:8081/v1/graphql',
+})</code></pre>
+
+<p>Adding subscriptions means splitting traffic by operation type &mdash; queries and mutations over
+HTTP, subscriptions over the socket:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { GraphQLWsLink } from '@apollo/client/link/subscriptions'
+import { createClient } from 'graphql-ws'
+import { getMainDefinition } from '@apollo/client/utilities'
+import { split } from '@apollo/client'
+
+const wsLink = new GraphQLWsLink(createClient({
+  url: 'ws://localhost:8081/v1/graphql',
+  connectionParams: () => ({
+    headers: { Authorization: `Bearer ${localStorage.getItem('token') ?? ''}` },
+  }),
+}))
+
+const splitLink = split(
+  ({ query }) => {
+    const def = getMainDefinition(query)
+    return def.kind === 'OperationDefinition' && def.operation === 'subscription'
+  },
+  wsLink,
+  httpLink,
+)</code></pre>
+
+<h3>The auth handshake that trips everyone up</h3>
+
+<p>This is the part that costs an evening. An HTTP request carries its <code>Authorization</code>
+header every time. A WebSocket authenticates <strong>once, at connection</strong>, through
+<code>connectionParams</code>.</p>
+
+<p>Two things follow. First, the header must go in <code>connectionParams</code> and not in the
+link&rsquo;s HTTP headers, where it is simply ignored. Second, and less obviously: when the token is
+refreshed, the open socket keeps using the old one. It was authenticated at connect time and nothing
+re-reads the header. Tokens expire, the subscription quietly stops updating, and no error appears in
+the UI.</p>
+
+<p>The fix is to close and reopen the socket on token change. Make
+<code>connectionParams</code> a function &mdash; as above, not an object &mdash; so it is re-evaluated
+on each reconnect rather than captured once.</p>
+
+<h2>Permissions apply exactly as they do to queries</h2>
+
+<p>A subscription is a query, so the role&rsquo;s row filter and column allowlist apply unchanged. A
+customer subscribing to <code>bookings</code> sees their own, because
+<code>OWN_BOOKING</code> is evaluated on every refetch. You do not write separate rules, and you
+cannot accidentally push a row a client is not allowed to read.</p>
+
+<h2>Should you use one?</h2>
+
+<p>Often, no. A subscription holds a socket open per client and re-runs a query on an interval
+forever. For a page somebody looks at for ten seconds, refetching on focus is cheaper and simpler.</p>
+
+<p>Reach for a subscription when the data changes <em>while the user is watching</em> and staleness
+is confusing or costly: a booking being confirmed, an order moving through a kitchen, a document
+someone else is editing. For everything else, a query with a sensible refetch is the boring right
+answer.</p>
+
+<h2>Subscriptions in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>Subscriptions are supported in DDN. <strong>Streaming subscriptions are marked work in
+progress</strong>, so the append-only-feed pattern above is the one to check before depending on it
+in v3.</p>
+
+<p>As with everything else in v3, the capability is declared rather than generated &mdash; a model
+exposes a subscription root field in its <code>graphql</code> block, and
+<code>ModelPermissions</code> governs what it can return, exactly as it governs a query.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 8 backs up to the question all of this depends on: who is the caller?</p>

@@ -1,0 +1,149 @@
+<p>Relationships are what make a Hasura API worth having. Without them you have a slightly
+convenient way to select rows; with them, one round trip returns a listing, its host, its photos and
+its amenities, correctly joined, with permissions applied at every level.</p>
+
+<h2>Two kinds</h2>
+
+<p><strong>Object relationships</strong> point at one row &mdash; a property has one host.
+<strong>Array relationships</strong> point at many &mdash; a property has many bookings. The
+distinction is which side of the foreign key you are standing on.</p>
+
+<p>From the demo app&rsquo;s live metadata:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "table": { "name": "properties" },
+  "object_relationships": [ { "name": "host" } ],
+  "array_relationships": [ { "name": "bookings" }, { "name": "images" },
+                           { "name": "propertyAmenities" } ]
+}</code></pre>
+
+<p>Which produces exactly the query you would hope for:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(orderBy: {ratingAverage: DESC}, limit: 2) {
+    title
+    city
+    ratingAverage
+    host { firstName isHost }
+    images(limit: 1) { url }
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{"data":{"properties":[
+  {"title":"Oceanfront Villa, Private Steps to Sand","city":"Maui","ratingAverage":4.98,
+   "host":{"firstName":"Marcus","isHost":true},
+   "images":[{"url":"https://images.unsplash.com/photo-1613490493576-..."}]},
+  {"title":"Lakefront A-Frame","city":"Lake Tahoe","ratingAverage":4.96,
+   "host":{"firstName":"Priya","isHost":true},
+   "images":[{"url":"https://images.unsplash.com/photo-1449844908441-..."}]}]}}</code></pre>
+
+<h2>Foreign keys suggest, they do not decide</h2>
+
+<p>When you track a table with foreign keys, Hasura offers the relationships it can infer and names
+them after the tables. You can rename them, and you should &mdash; <code>host</code> reads better
+than <code>user</code> even though the column is <code>host_id</code> pointing at
+<code>users</code>.</p>
+
+<p>You can also create a relationship where <em>no</em> foreign key exists, by telling Hasura which
+columns to join on. Useful across schemas or against legacy tables that never had constraints. The
+cost is that nothing enforces referential integrity &mdash; you have described a join, not a
+guarantee.</p>
+
+<h2>Filtering by a related table</h2>
+
+<p>Relationships work inside <code>where</code>, in both directions. Listings whose host is a
+verified host:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(where: {host: {isHost: {_eq: true}}}) { title }
+}</code></pre>
+
+<p>And through an array relationship, where the semantics matter. <code>_some</code>,
+<code>_every</code> and <code>_none</code> ask different questions:</p>
+
+<pre class="language-graphql"><code class="language-graphql">properties(where: {bookings: {status: {_eq: "CONFIRMED"}}})          # at least one
+properties(where: {bookings: {_none: {status: {_eq: "CANCELLED"}}}}) # not a single one</code></pre>
+
+<p>The plain form means &ldquo;at least one&rdquo;. If you meant &ldquo;every booking is
+confirmed&rdquo; you must say <code>_every</code>, and the difference is easy to ship by accident.</p>
+
+<h2>Is this n+1?</h2>
+
+<p>No, and you can prove it. Hasura has an explain endpoint that shows the SQL it generates:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST http://localhost:8081/v1/graphql/explain \
+  -H 'x-hasura-admin-secret: stayhub-admin-secret' \
+  -d '{"query":{"query":"query { properties(limit:2){ title host { firstName } } }"}}'</code></pre>
+
+<p>The nested <code>host</code> comes back as a lateral join inside <strong>one</strong> statement:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT coalesce(json_agg("root"), '[]') AS "root"
+FROM (
+  SELECT row_to_json(...) AS "root"
+  FROM (SELECT * FROM "public"."properties" WHERE ('true') LIMIT 2) AS "_root.base"
+  LEFT OUTER JOIN LATERAL (
+    SELECT row_to_json(...) AS "host"
+    FROM (SELECT * FROM "public"."users"
+          WHERE (("_root.base"."host_id") = ("id")) LIMIT 1) AS "_root.or.host.base"
+  ) AS "_root.or.host" ON ('true')
+) AS "_root"</code></pre>
+
+<p>And the plan Postgres chose for it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Aggregate  (cost=5.19..5.20 rows=1 width=32)
+  ->  Nested Loop Left Join  (cost=0.01..5.16 rows=2 width=63)
+        ->  Limit  (cost=0.00..0.45 rows=2 width=1766)
+              ->  Seq Scan on properties  (cost=0.00..3.14 rows=14 width=1766)
+        ->  Memoize  (cost=0.01..3.11 rows=1 width=32)
+              Cache Key: properties.host_id</code></pre>
+
+<p>One query, one round trip, and the JSON assembled in the database. This is the single strongest
+argument for Hasura over a hand-written resolver layer, where n+1 is the default failure and avoiding
+it is work.</p>
+
+<p>It is not a licence to nest without thought. Depth multiplies rows, and a three-level nest across
+large tables is still a large query &mdash; see lesson 14.</p>
+
+<h2>Permissions do not cascade</h2>
+
+<p>This one has teeth. Being allowed to read <code>properties</code> does <strong>not</strong> grant
+you the related <code>host</code> row. Each table&rsquo;s permissions are evaluated on their own, so
+a role that can see listings but has no select permission on <code>users</code> gets no
+<code>host</code> field at all.</p>
+
+<p>That is the safe default &mdash; access is never granted implicitly by a join &mdash; and it is
+also why a nested field mysteriously vanishes for one role. The fix is a permission on the child
+table, not on the relationship.</p>
+
+<h2>Relationships in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 makes a relationship an explicit metadata object rather than an entry on a table:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: Relationship
+version: v1
+definition:
+  name: host
+  sourceType: Properties
+  target:
+    model:
+      name: Users
+      relationshipType: Object
+  mapping:
+    - source:
+        fieldPath:
+          - fieldName: hostId
+      target:
+        modelField:
+          - fieldName: id</code></pre>
+
+<p>The capability gained is the interesting part. A v2 relationship joins two tables in the same
+database. A v3 <code>Relationship</code> can span <strong>different connectors and different
+subgraphs</strong> &mdash; a Postgres listing related to a row in another team&rsquo;s service, or to
+a result from a REST API, resolved as one field. That is the supergraph idea made concrete, and it is
+the thing v2 relationships genuinely could not do.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 6 turns to writes, and the question of which ones belong in Hasura at all.</p>

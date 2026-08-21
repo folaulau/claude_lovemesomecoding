@@ -1,0 +1,119 @@
+<p>An Action brings a REST endpoint into your schema. A <strong>remote schema</strong> brings an
+entire existing GraphQL API into it &mdash; every type and field it exposes, merged into one graph
+that clients query as though it were all yours.</p>
+
+<h2>Adding one</h2>
+
+<p>You give Hasura a URL and it introspects:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "type": "add_remote_schema",
+  "args": {
+    "name": "payments",
+    "definition": {
+      "url_from_env": "PAYMENTS_GRAPHQL_URL",
+      "timeout_seconds": 30,
+      "forward_client_headers": true,
+      "headers": [{"name": "X-Internal-Key", "value_from_env": "PAYMENTS_KEY"}]
+    }
+  }
+}</code></pre>
+
+<p><code>url_from_env</code> rather than a literal, so the same metadata works across environments
+&mdash; the same reasoning as any other config, and easy to forget when clicking through a
+console.</p>
+
+<h2>The problem that shows up immediately</h2>
+
+<p>Two schemas merged into one namespace collide. If both define <code>User</code>, or both expose a
+root field called <code>orders</code>, Hasura refuses to merge and tells you so.</p>
+
+<p>The blunt fix is a namespace, which prefixes everything from the remote:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  payments {
+    invoice(id: $id) { total status }
+  }
+}</code></pre>
+
+<p>It is not elegant, and it is much better than the alternative &mdash; renaming types in a service
+you may not own to satisfy a gateway. Decide the namespacing convention before you add the second
+remote, not after.</p>
+
+<h2>Remote relationships</h2>
+
+<p>This is the feature worth the trouble. A remote schema alone gives you two APIs at one URL, which
+is convenient but shallow. A <strong>remote relationship</strong> joins a database row to a field on
+another service:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  bookings(where: {publicId: {_eq: $id}}) {
+    publicId
+    checkIn
+    total
+    invoice {          # <- lives in the payments service
+      status
+      paidAt
+    }
+  }
+}</code></pre>
+
+<p>You define it by mapping a column to an argument &mdash; <code>bookings.invoice_id</code> feeds
+the remote&rsquo;s <code>invoice(id:)</code>. Hasura resolves the table rows first, then calls the
+remote with the ids it found.</p>
+
+<h3>This one <em>is</em> n+1</h3>
+
+<p>Be clear-eyed here, because it contradicts lesson 5. Database relationships compile to a single
+SQL statement with a lateral join. A <strong>remote</strong> relationship cannot &mdash; it is a
+network call to another service.</p>
+
+<p>Hasura batches where the remote supports it, but if the remote exposes only
+<code>invoice(id:)</code> and no <code>invoices(ids:)</code>, twenty bookings mean twenty calls. Ask
+for a batch field on the remote before you ship a list view that uses one.</p>
+
+<h2>Auth across the boundary</h2>
+
+<p>Two independent decisions, and conflating them is the usual mistake.</p>
+
+<p><code>forward_client_headers</code> passes the caller&rsquo;s headers to the remote, so the remote
+does its own authentication with the user&rsquo;s token. The static <code>headers</code> list sends
+service credentials instead, so the remote trusts Hasura and knows nothing about the user.</p>
+
+<p>Pick deliberately. Forwarding means the remote enforces its own permissions &mdash; safer, and it
+requires the remote to understand your tokens. Service credentials mean Hasura is the only gate, so
+anything you did not restrict is exposed. Hasura&rsquo;s own permissions apply to
+<em>whether a role may query the remote at all</em>, not to individual fields inside it.</p>
+
+<h2>Apollo Federation</h2>
+
+<p>Hasura can also participate in a federated graph as a subgraph, rather than being the gateway. If
+your organisation already runs a federation router, that is usually the better fit &mdash; Hasura
+does what it is good at over your database, and the router owns composition.</p>
+
+<h2>In v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>This is the topic where v3 changes most, because in v3 it stops being a bolt-on and becomes the
+architecture.</p>
+
+<p>There is no &ldquo;remote schema&rdquo; feature. An existing GraphQL API is reached through the
+<strong>GraphQL connector</strong> &mdash; the same mechanism as any other data source. Postgres has
+a connector, your REST service has a connector, another GraphQL API has a connector; nothing is
+privileged.</p>
+
+<p>Composition then happens through <strong>subgraphs</strong>. Each is a self-contained domain with
+its own connectors, metadata, permissions and repository, and the supergraph is their composition.
+The collision problem the namespace hack solved in v2 is handled structurally: subgraphs are separate
+namespaces by construction.</p>
+
+<p>Crucially, a v3 <code>Relationship</code> can cross connectors and subgraphs, so the
+booking-to-invoice join above is an ordinary relationship rather than a special kind. It is the same
+declaration whether the target is a table in the same database or a service another team owns.</p>
+
+<p>Apollo Federation remains supported.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 12 covers running code when data changes.</p>

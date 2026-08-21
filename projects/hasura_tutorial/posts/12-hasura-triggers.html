@@ -1,0 +1,136 @@
+<p>Two features, one idea: run code when something happens, without anybody polling. <strong>Event
+triggers</strong> fire on insert, update or delete. <strong>Scheduled triggers</strong> fire on a
+cron or at a one-off future time. Both call a webhook you own and retry it if it fails.</p>
+
+<p>This is also the lesson with the most awkward v3 news in the track, so read to the end before
+designing anything around it.</p>
+
+<h2>Event triggers</h2>
+
+<p>A trigger watches a table and posts to your endpoint when a row changes:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "type": "create_event_trigger",
+  "args": {
+    "name": "booking_confirmed",
+    "table": {"schema": "public", "name": "bookings"},
+    "webhook_from_env": "BOOKING_WEBHOOK_URL",
+    "update": {"columns": ["status"]},
+    "retry_conf": {"num_retries": 5, "interval_sec": 10, "timeout_sec": 60}
+  }
+}</code></pre>
+
+<p><code>"update": {"columns": ["status"]}</code> is doing real work. Without it the trigger fires on
+<em>every</em> update to the table &mdash; including the ones your own handler causes, which is how
+you build an infinite loop on your first afternoon.</p>
+
+<p>The payload gives you both versions of the row:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "event": {
+    "op": "UPDATE",
+    "data": {
+      "old": {"status": "PENDING", "public_id": "..."},
+      "new": {"status": "CONFIRMED", "public_id": "..."}
+    },
+    "session_variables": {"x-hasura-role": "customer", "x-hasura-user-id": "..."}
+  },
+  "delivery_info": {"current_retry": 0, "max_retries": 5},
+  "trigger": {"name": "booking_confirmed"}
+}</code></pre>
+
+<p><code>old</code> and <code>new</code> together are what let you react to a
+<em>transition</em> rather than a state &mdash; &ldquo;became confirmed&rdquo;, not &ldquo;is
+confirmed&rdquo;. Checking only <code>new</code> is the second classic bug.</p>
+
+<h3>What it guarantees</h3>
+
+<p>Delivery is <strong>at least once</strong>. Hasura writes the event to a table inside its own
+schema in the same transaction as your data change, then delivers it asynchronously and retries on
+failure.</p>
+
+<p>Two things follow, and both matter more than the configuration above:</p>
+
+<p><strong>Your handler must be idempotent.</strong> Not &ldquo;should be&rdquo;. A timeout that
+succeeded server-side gets retried, so the same event arrives twice. Key off the event id, or make
+the operation naturally repeatable. A handler that charges a card or sends an email without a
+de-duplication key will eventually do it twice.</p>
+
+<p><strong>Ordering is not guaranteed.</strong> Two rapid updates can arrive out of order. If order
+matters, carry a version or timestamp in the row and ignore anything older than what you have already
+processed.</p>
+
+<p>What you do get is durability: because the event is written in the same transaction as the data,
+an event cannot be lost by the engine restarting, and it cannot fire for a transaction that rolled
+back.</p>
+
+<h3>Inspecting failures</h3>
+
+<p>Failed events do not vanish. They sit in Hasura&rsquo;s schema with their attempt history, visible
+in the console under the trigger&rsquo;s <strong>Processed Events</strong> and
+<strong>Invocation Logs</strong>, and re-deliverable from there.</p>
+
+<p>Worth knowing before an incident, because the first symptom is usually &ldquo;the emails stopped
+going out&rdquo; with nothing in your application logs at all &mdash; the failure is on
+Hasura&rsquo;s side of the call.</p>
+
+<h2>Scheduled triggers</h2>
+
+<p>Same delivery machinery, different clock. A <strong>cron trigger</strong> runs on a schedule:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "type": "create_cron_trigger",
+  "args": {
+    "name": "expire_unpaid_bookings",
+    "webhook": "{{BOOKING_WEBHOOK_URL}}/expire",
+    "schedule": "*/15 * * * *",
+    "include_in_metadata": true,
+    "retry_conf": {"num_retries": 3}
+  }
+}</code></pre>
+
+<p>And a <strong>one-off scheduled event</strong> runs once at a time you choose &mdash; scheduled
+when the booking is made, to remind the guest the day before check-in. That is the more interesting
+half, and the part a plain cron in your infrastructure does not give you.</p>
+
+<p><code>include_in_metadata: true</code> puts the trigger in exported metadata so it is version
+controlled. Set it false and the schedule exists only on that engine, which is a surprise for the
+next person.</p>
+
+<h2>Triggers in v3 (DDN) &mdash; read this before you plan</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>This is the sharpest discontinuity between the two products, and it is not advertised loudly.</p>
+
+<p><strong>Event triggers are marked work in progress.</strong> They are not gone from the roadmap,
+and they are not available now.</p>
+
+<p><strong>Cron triggers are not supported at all.</strong> No replacement, no equivalent object.</p>
+
+<p>If you run reconciliation jobs, digest emails, nightly cleanups or reminder scheduling off
+Hasura&rsquo;s scheduler today, that work has to move somewhere else before you can migrate. Do not
+plan a v3 migration on the assumption these will land in time.</p>
+
+<h3>What to do instead</h3>
+
+<p>Three options, in rough order of how much they change:</p>
+
+<p><strong>Emit events from the service that writes.</strong> If a write already goes through your
+own API &mdash; and per lesson 6 the interesting ones should &mdash; publish the event there rather
+than having the database tell you about it afterwards. This is the most portable answer and it works
+identically in v2 and v3.</p>
+
+<p><strong>Listen to Postgres directly.</strong> Logical replication with a change-data-capture tool
+gives you the same at-least-once stream Hasura was giving you, independent of the API layer.</p>
+
+<p><strong>Use your platform&rsquo;s scheduler.</strong> For the cron half this is the honest answer:
+a Kubernetes CronJob, a cloud scheduler, or whatever your infrastructure already runs. You lose the
+one-off scheduled event convenience and have to build that yourself.</p>
+
+<p>Worth saying plainly: if triggers are load-bearing in your v2 installation, they are a genuine
+reason to stay on v2 for now, and that is a legitimate decision rather than a failure to keep up.</p>
+
+<h2>Next</h2>
+
+<p>Part 5 starts with getting all of this from your laptop to production.</p>

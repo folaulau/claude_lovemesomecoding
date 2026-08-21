@@ -1,0 +1,166 @@
+<p>This is the most important lesson here, because a mistake in authentication is a bug and a mistake
+in authorization is a data breach. Hasura&rsquo;s permission model is genuinely good, and it has
+three traps that catch people who assume it works like a framework they already know.</p>
+
+<h2>Permissions shape the schema</h2>
+
+<p>Start with the idea everything else follows from. Ask for bookings without a token:</p>
+
+<pre class="language-json"><code class="language-json">{"errors":[{"message":"field 'bookings' not found in type: 'query_root'",
+  "extensions":{"code":"validation-failed"}}]}</code></pre>
+
+<p>Not &ldquo;denied&rdquo;. Not empty. <strong>The field does not exist.</strong> Hasura builds a
+separate schema per role, so a role with no permission on a table has no such table &mdash;
+introspection shows them a smaller API. Access is not filtered out of a shared schema; the schema
+itself is per-role.</p>
+
+<h2>The four parts of a permission</h2>
+
+<p>A select permission answers four questions: which role, which rows, which columns, and how many at
+once.</p>
+
+<pre class="language-python"><code class="language-python">def _select(columns: list[str], filter_: dict, *, limit: int | None = None) -> dict:
+    perm = {"columns": columns, "filter": filter_, "allow_aggregations": True}
+    if limit is not None:
+        perm["limit"] = limit
+    return perm</code></pre>
+
+<h3>Columns are an allowlist</h3>
+
+<p>Anything you list is readable by that role. Anything you omit is invisible. This makes the column
+list the single most dangerous line in a metadata file:</p>
+
+<pre class="language-python"><code class="language-python">USER_PUBLIC_COLUMNS = [
+    "public_id", "first_name", "last_name", "avatar_url", "host_bio", "is_host", "created_at",
+]
+USER_SELF_COLUMNS = USER_PUBLIC_COLUMNS + ["email", "role"]</code></pre>
+
+<p><code>password_hash</code> is not there, and never can be. Adding a column to that list publishes
+it. There is no second check.</p>
+
+<p>The same reasoning applies to less obvious fields. The demo app deliberately excludes
+<code>address_line1</code> and <code>postal_code</code> from the public listing columns &mdash; a
+booking site reveals the exact address only after booking, and publishing it tells the world which
+houses are empty next week.</p>
+
+<h3>Rows are a boolean expression</h3>
+
+<p>The filter is the same expression language as <code>where</code>, evaluated per row:</p>
+
+<pre class="language-python"><code class="language-python">PUBLISHED_ONLY = {"_and": [{"status": {"_eq": "PUBLISHED"}}, {"deleted": {"_eq": False}}]}
+NOTHING_HIDDEN = {}</code></pre>
+
+<p>An empty filter means every row.</p>
+
+<h3>Session variables make it per-user</h3>
+
+<p>Claims from the token are available inside the filter, which is how one rule serves every user:</p>
+
+<pre class="language-python"><code class="language-python">OWN_PROPERTY = {"host": {"public_id": {"_eq": "X-Hasura-User-Id"}}}
+OWN_BOOKING = {"guest": {"public_id": {"_eq": "X-Hasura-User-Id"}}}
+BOOKING_AT_OWN_PROPERTY = {"property": OWN_PROPERTY}</code></pre>
+
+<p>Notice these walk relationships. &ldquo;The booking whose property&rsquo;s host is me&rdquo; is
+expressible without duplicating <code>host_id</code> onto every child table &mdash; the filter
+traverses, so the schema stays normalised.</p>
+
+<h3>The limit is a safety valve</h3>
+
+<p>Without a row limit, <code>query { properties }</code> with no arguments returns the entire table.
+That is the classic way a GraphQL endpoint becomes a denial-of-service vector against its own
+database. Set one on every public role.</p>
+
+<h2>Three traps</h2>
+
+<h3>1. <code>admin</code> is reserved</h3>
+
+<p>You cannot declare permissions for it. Hasura rejects the attempt with <em>cannot define
+permission for admin role</em>. Name your staff role something else &mdash; the demo app uses
+<code>staff</code> &mdash; or you will create a role whose rules can never exist.</p>
+
+<h3>2. Roles do not inherit</h3>
+
+<p>A <code>host</code> does not get <code>customer</code>&rsquo;s permissions. Hasura roles are flat.
+Every role declares its rules in full, which is verbose and is also the point: a permission can never
+be granted by accident through a hierarchy somebody edited elsewhere.</p>
+
+<h3>3. Permissions do not cascade through relationships</h3>
+
+<p>Being allowed to read <code>properties</code> does not grant the related <code>host</code> row.
+Each table is evaluated independently. This is why a nested field silently disappears for one role
+&mdash; and the fix is a permission on the child table, not on the relationship.</p>
+
+<h2>The soft-delete trap</h2>
+
+<p>Worth its own section because it shipped a real bug. &ldquo;Staff see everything&rdquo; sounds
+like an empty filter. On a soft-deleting table it is not:</p>
+
+<pre class="language-python"><code class="language-python">NOT_DELETED = {"deleted": {"_eq": False}}</code></pre>
+
+<p>A deleted row is gone as far as the product is concerned, and <code>{}</code> shows it. In the
+demo app the admin console counted listings that had been removed while the REST endpoint, which
+filters <code>deleted = false</code> in SQL, did not. Two totals for the same number, both plausible,
+one wrong.</p>
+
+<p>This is the Hasura shape of a classic problem: the ORM applies the flag automatically, and
+anything written by hand &mdash; SQL or a permission rule &mdash; has to say so itself.</p>
+
+<h2>Insert, update and delete</h2>
+
+<p>Write permissions add two ideas. A <strong>check</strong> validates rows being written (as opposed
+to the <strong>filter</strong>, which selects rows being read), and <strong>preset</strong> values
+force a column from a session variable:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "role": "customer",
+  "permission": {
+    "columns": ["property_id", "check_in", "check_out", "guests"],
+    "check": {"guest": {"public_id": {"_eq": "X-Hasura-User-Id"}}},
+    "set": {"guest_id": "x-hasura-user-id"}
+  }
+}</code></pre>
+
+<p>Presets are the important half. Leave <code>guest_id</code> in the client&rsquo;s hands and
+somebody books on another person&rsquo;s behalf; preset it from the token and they cannot, because
+the value never comes from the request.</p>
+
+<h2>Authorization in v3 (DDN)</h2>
+
+<p class="note"><strong>On the v3 sections.</strong> Everything marked v3 (DDN) is taken from the official Hasura DDN documentation as read on <strong>2026-08-21</strong> and was not run locally &mdash; it shows configuration, never claimed output. The v2 material was executed against a running engine.</p>
+
+<p>v3 splits one v2 permission into two objects, by what is being protected.
+<code>TypePermissions</code> covers fields:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: TypePermissions
+version: v1
+definition:
+  typeName: Users
+  permissions:
+    - role: anonymous
+      output:
+        allowedFields: [publicId, firstName, avatarUrl, isHost]</code></pre>
+
+<p>And <code>ModelPermissions</code> covers rows:</p>
+
+<pre class="language-yaml"><code class="language-yaml">kind: ModelPermissions
+version: v1
+definition:
+  modelName: Properties
+  permissions:
+    - role: anonymous
+      select:
+        filter:
+          fieldComparison:
+            field: status
+            operator: _eq
+            value:
+              literal: PUBLISHED</code></pre>
+
+<p>Commands get <code>CommandPermissions</code>. The concepts survive intact &mdash; roles, row
+filters, field allowlists, session variables &mdash; and the mechanics change completely. One further
+difference: permissions are declared <strong>per subgraph</strong>, so each team owns the rules for
+its own domain rather than everything living in a single document.</p>
+
+<h2>Next</h2>
+
+<p>Lesson 10 covers what to do when a request needs to do something Hasura cannot generate.</p>
