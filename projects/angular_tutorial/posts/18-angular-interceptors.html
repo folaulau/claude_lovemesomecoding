@@ -1,0 +1,80 @@
+<p>An interceptor is a function every outgoing request passes through. It is the one place that
+knows where the API lives, how the token is attached, and how a failure becomes a typed error.</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const apiInterceptor: HttpInterceptorFn = (req, next) =&gt; {</code></pre>
+
+<p>Registered once, at bootstrap:</p>
+
+<pre class="language-typescript"><code class="language-typescript">provideHttpClient(withFetch(), withInterceptors([apiInterceptor])),</code></pre>
+
+<h2>Why an interceptor and not a wrapper function</h2>
+
+<p>The React app hand-writes a <code>request()</code> wrapper around <code>fetch</code> that does
+the same three jobs. The difference is <strong>reach</strong>: a wrapper only helps code that
+remembers to call it, and nothing stops a component calling <code>fetch</code> directly and skipping
+all three. An interceptor is wired into <code>HttpClient</code> itself, so there is no way to make a
+request that bypasses it.</p>
+
+<h2>Requests are immutable</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const authorised = req.clone({
+  url: `${environment.apiBaseUrl}${req.url}`,
+  setHeaders: token ? { Authorization: `Bearer ${token}` } : {},
+});</code></pre>
+
+<p>⚠️ <code>req.url = …</code> does nothing at all, <em>silently</em>. Every change goes through
+<code>clone()</code>, which is why both edits are made in one call.</p>
+
+<h2>Only touch your own API</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const isOurApi = req.url.startsWith('/api/');
+if (!isOurApi) return next(req);</code></pre>
+
+<p>This is a security boundary, not tidiness. A request for an asset, or to Stripe, must pass
+through untouched — <strong>sending your bearer token to a third party would be a credential
+leak</strong>. An interceptor sees every request the app makes, including ones to other origins, so
+the check has to be explicit.</p>
+
+<p>Its own unit test asserts exactly that: with a token stored, a request to
+<code>api.stripe.com</code> carries no <code>Authorization</code> header.</p>
+
+<h2>Attach the token unconditionally</h2>
+
+<p>The token is attached whenever one exists, rather than per-call as the React app does with an
+<code>auth: true</code> flag. The behaviour is the same — a guest has no token to send — and it
+removes a class of bug where a protected endpoint is called without the flag and 401s.</p>
+
+<p>Guest checkout still works, because <code>POST /api/orders</code> is deliberately open and the
+server associates the order with an account only when a valid token happens to be present.</p>
+
+<h2>Convert the error once</h2>
+
+<pre class="language-typescript"><code class="language-typescript">return next(authorised).pipe(
+  catchError((error: HttpErrorResponse) =&gt;</code></pre>
+
+<p>Every caller downstream — a component, a service, an NgRx effect — then handles exactly one
+error type and can read <code>fieldErrors()</code> off it without first unpicking Angular's transport
+wrapper.</p>
+
+<p>The conversion also translates the case that produces the worst message. Status <code>0</code>
+means the request never reached the server at all — the API is down, or CORS rejected it — and saying
+so beats <em>"Http failure response for …: 0 Unknown Error"</em>.</p>
+
+<h2>Order matters</h2>
+
+<p>Interceptors run in the order given to <code>withInterceptors</code>, wrapping each other like
+middleware: the first sees the request first and the response last. An interceptor that adds auth
+must run before one that logs the final request; a retry interceptor must sit outside the one that
+converts errors, or it will retry on a type it no longer recognises. With one interceptor this does
+not come up — with three it is the first thing to check when something behaves oddly.</p>
+
+<h2>The class-based form</h2>
+
+<p>You will meet <code>@Injectable()</code> classes implementing <code>HttpInterceptor</code>,
+registered through the <code>HTTP_INTERCEPTORS</code> multi-provider. It still works. A plain
+function needs neither, and can still use <code>inject()</code> if it wants a service.</p>
+
+<h2>What is next</h2>
+
+<p>The RxJS that survives in a signals-first app, and the one place it is unambiguously the right
+tool.</p>

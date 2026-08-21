@@ -1,0 +1,117 @@
+<p>A reactive form is defined in the class. The template binds to it, rather than being the
+source of truth.</p>
+
+<pre class="language-typescript"><code class="language-typescript">readonly form = this.fb.nonNullable.group({
+  customerName: ['', Validators.required],
+  email: ['', [Validators.required, Validators.email]],
+  phone: [''],
+  addressLine1: [''],
+  city: [''],
+  state: [''],
+  postalCode: ['', Validators.pattern(/^\d{5}$/)],
+});</code></pre>
+
+<pre class="language-markup"><code class="language-markup">&lt;form id="checkout-form" [formGroup]="form" (ngSubmit)="createOrder()"&gt;</code></pre>
+
+<p>Each entry is <code>[initialValue, validators]</code>. It needs
+<code>ReactiveFormsModule</code> in the component's imports.</p>
+
+<h2>nonNullable</h2>
+
+<p><code>this.fb.nonNullable.group</code> rather than <code>this.fb.group</code>, and it is worth
+being deliberate about.</p>
+
+<p>By default a control's type is <code>string | null</code>, because <code>reset()</code> sets
+it back to <code>null</code>. That single <code>| null</code> then propagates into every piece of code
+that reads the value. <code>nonNullable</code> makes <code>reset()</code> restore the initial value
+instead, so the type is just <code>string</code>.</p>
+
+<p>This is the payoff of typed forms, which arrived in Angular 14. Before that every value was
+<code>any</code> and a typo in a control name was a runtime surprise.
+<code>form.controls.customerName</code> is now checked at build time.</p>
+
+<h2>Reading and writing</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const { customerName, email, phone } = this.form.getRawValue();</code></pre>
+
+<p><code>getRawValue()</code> rather than <code>.value</code>, because <code>.value</code> omits
+disabled controls. If a field is disabled and you still need its value, that difference is the bug.</p>
+
+<pre class="language-typescript"><code class="language-typescript">this.form.patchValue({</code></pre>
+
+<p><code>patchValue</code> updates the keys you give it; <code>setValue</code> requires every
+control and throws otherwise — occasionally what you want, as a check that the shape still
+matches.</p>
+
+<h2>Conditional validation</h2>
+
+<p>This is the thing template-driven forms cannot do. Checkout's address fields are required only
+when the order is a delivery <em>and</em> no saved address was chosen:</p>
+
+<pre class="language-typescript"><code class="language-typescript">for (const control of [addressLine1, city, state]) {
+  control.setValidators(required ? [Validators.required] : []);
+  control.updateValueAndValidity({ emitEvent: false });
+}</code></pre>
+
+<p>Two details that are easy to get wrong.</p>
+
+<p><strong><code>setValidators</code> replaces the list</strong>; it does not add to it. Which is
+why the postal code re-states its pattern in both branches — dropping it in the "not required" case
+would let a delivery address through with a malformed ZIP.</p>
+
+<p><strong>Validators are not re-run until you ask.</strong> <code>updateValueAndValidity()</code>
+is what applies them. Without it, switching from delivery to carryout leaves the street address
+required and the form permanently invalid — with no visible reason.
+<code>{ emitEvent: false }</code> stops that recalculation from firing
+<code>valueChanges</code> and re-entering the effect that triggered it.</p>
+
+<h2>FormArray</h2>
+
+<p>For a <em>list</em> of controls rather than named ones:</p>
+
+<pre class="language-typescript"><code class="language-typescript">sizes: this.fb.array(
+  SIZES.map((size) =&gt;
+    this.fb.nonNullable.group({
+      size: [size],
+      price: [0, [Validators.required, Validators.min(0.01)]],
+    }),
+  ),
+),</code></pre>
+
+<p>The admin product editor uses it for the three size prices. React manages the same thing as an
+array in state plus an index-based setter; here the array is part of the form, so validation and
+dirty-tracking come with it.</p>
+
+<h2>Showing errors at the right moment</h2>
+
+<pre class="language-typescript"><code class="language-typescript">invalid(control: 'customerName' | 'email' | 'addressLine1' | 'city' | 'state' | 'postalCode'): boolean {
+  return this.submitted() &amp;&amp; this.form.controls[control].invalid;
+}</code></pre>
+
+<p>Errors appear only after a submit has been attempted. That is one of the two defensible
+policies — the other is on blur, using <code>touched</code>. What is not defensible is showing them
+while the user is still typing into an empty form.</p>
+
+<h2>Server errors</h2>
+
+<p>Client validation is a convenience; the server is the authority, and it will reject things the
+browser could not know about. A 400 with per-field messages needs mapping back onto controls, which
+is the other reason non-trivial forms are reactive: there is an object to map onto.</p>
+
+<p>The pizza app keeps those in a <code>fieldErrors</code> signal alongside the form rather than
+in the controls themselves, so a server error clears on the next submit instead of fighting the
+client-side validators.</p>
+
+<h2>Custom validators</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export function noLeadingZero(control: AbstractControl): ValidationErrors | null {
+  return String(control.value).startsWith('0') ? { leadingZero: true } : null;
+}</code></pre>
+
+<p>A function returning <code>null</code> for valid, or an object describing what is wrong. Async
+validators — checking an email is not taken — return an observable of the same, and the control is in
+a <code>pending</code> state while it runs.</p>
+
+<h2>What is next</h2>
+
+<p>Where state lives once an app has more of it than one component can hold.</p>

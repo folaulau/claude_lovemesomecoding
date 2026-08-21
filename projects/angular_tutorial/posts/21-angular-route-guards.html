@@ -1,0 +1,125 @@
+<p>Two jobs that sound unrelated and are both configured on the route: keeping people out of
+pages they should not see, and keeping code out of bundles that do not need it.</p>
+
+<h2>CanActivate</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export const authGuard: CanActivateFn = async (_route, state) =&gt; {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+
+  await auth.whenReady();
+
+  return auth.isAuthenticated() ? true : signIn(router, state.url);
+};</code></pre>
+
+<p>A guard runs <strong>before</strong> the route's component is created. That is the meaningful
+difference from React Router, where <code>&lt;ProtectedRoute&gt;</code> is itself a component: it has
+to render, read auth state, and then return a <code>&lt;Navigate&gt;</code> — which is why the React
+version needs an <code>initialising</code> spinner to avoid bouncing a valid admin on the frame
+before the token check finishes.</p>
+
+<p>Here the guard simply <strong>awaits</strong>. A <code>CanActivateFn</code> may return a
+boolean, a <code>UrlTree</code>, or a promise or observable of either, so the router holds the
+navigation until the answer is known and the bad frame never exists.</p>
+
+<h3>Return a UrlTree, not a navigate()</h3>
+
+<pre class="language-typescript"><code class="language-typescript">function signIn(router: Router, returnUrl: string): UrlTree {
+  return router.createUrlTree(['/login'], { queryParams: { returnUrl } });
+}</code></pre>
+
+<p>Returning a <code>UrlTree</code> tells the router to <strong>replace</strong> this navigation,
+so pressing Back after signing in does not bounce the user straight back to the redirect. Calling
+<code>router.navigate()</code> instead starts a second navigation while the first is still being
+decided, which works and leaves a history entry you did not want.</p>
+
+<p>The attempted URL rides along in the query string so the login page can send the user back
+where they were going.</p>
+
+<h3>Guard the parent</h3>
+
+<pre class="language-typescript"><code class="language-typescript">{
+  path: 'admin',
+  canActivate: [adminGuard],
+  loadChildren: () =&gt; import('./admin/admin.routes').then((m) =&gt; m.ADMIN_ROUTES),
+},</code></pre>
+
+<p>The guard is on the parent, so every admin screen inherits it and a new tab cannot be added
+unprotected by accident.</p>
+
+<p>⚠️ <strong>A guard is a usability control, not a security control.</strong> Anyone can edit
+client-side JavaScript. The real enforcement is the backend rejecting requests without a valid ADMIN
+token, and the app has API tests asserting exactly that.</p>
+
+<h2>CanDeactivate</h2>
+
+<p>The counterpart, on the way out. It is handed the live component instance, which is the whole
+point — only the component knows whether there is anything worth stopping for:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const confirmLeaveGuard: CanDeactivateFn&lt;ConfirmsNavigation&gt; = (component) =&gt;
+  component.canDeactivate();</code></pre>
+
+<p>The component answers:</p>
+
+<pre class="language-typescript"><code class="language-typescript">canDeactivate(): boolean | Promise&lt;boolean&gt; {
+  if (this.paid() || !this.created()) return true;
+  return new Promise&lt;boolean&gt;((resolve) =&gt; this.leaveResolver.set(resolve));
+}</code></pre>
+
+<p>Two decisions in there are worth copying.</p>
+
+<p><strong>It guards the unpaid order, not a dirty form.</strong> Once checkout's step 1 POSTs,
+there is a real <code>PENDING_PAYMENT</code> row in the database holding that cart; walking away
+strands it. A half-typed form is not worth interrupting anyone for.</p>
+
+<p><strong>It returns a promise</strong>, which holds the navigation open while a modal asks. No
+<code>window.confirm</code>: that cannot be styled, freezes the tab, and cannot be driven through the
+UI by a test.</p>
+
+<p>⚠️ And the trap: <strong>the guard runs <em>during</em> <code>router.navigate()</code></strong>,
+so the "this navigation is fine" flag has to be set before the call, not after —</p>
+
+<pre class="language-typescript"><code class="language-typescript">this.paid.set(true);
+this.cart.clear();
+await this.router.navigate(['/order-confirmation', orderId]);</code></pre>
+
+<p>— or the "abandon your order?" modal pops on the way to the success page.</p>
+
+<p>Note also what <code>CanDeactivate</code> does <strong>not</strong> cover: a reload, a closed
+tab or a typed URL never reach the router. Guarding those needs a <code>beforeunload</code> listener,
+and browsers deliberately allow it to show only their own generic message.</p>
+
+<h3>The other two</h3>
+
+<p><code>CanMatch</code> decides whether a route is even <em>considered</em>, so two routes can
+share a path and be selected by role — and, unlike <code>CanActivate</code>, it can prevent a lazy
+chunk being downloaded at all. <code>Resolve</code> fetches data before the route activates, trading
+a spinner for a slower navigation. Neither is in the pizza app, which is worth noticing: its lazy
+guard is cheap and its pages fetch their own data.</p>
+
+<h2>Lazy loading</h2>
+
+<pre class="language-typescript"><code class="language-typescript">loadComponent: () =&gt; import('./pages/home/home').then((m) =&gt; m.Home),</code></pre>
+
+<p><code>loadComponent</code> is <code>React.lazy</code> — the route's code becomes its own chunk,
+fetched the first time someone navigates there. The difference is that Angular needs no
+<code>&lt;Suspense&gt;</code> wrapper: the router holds the navigation until the chunk lands.</p>
+
+<p><code>loadChildren</code> does the same for a whole route file. Everything under
+<code>/admin</code> is behind one, so six admin screens <em>and</em> NgRx <em>and</em> its effects
+live in a chunk only an admin ever downloads.</p>
+
+<p>The customer pages are lazy too, and that is worth a word. In React they are static imports,
+because a route component there is just a function and code-splitting each one is a deliberate act
+with a <code>&lt;Suspense&gt;</code> cost. In Angular the split is one line per route and the router
+already handles the wait — so the cheap thing and the right thing are the same thing.</p>
+
+<h3>Check it worked</h3>
+
+<p><code>ng build</code> lists the chunks by name. If a route you expected to be lazy is not in
+that list, something is importing it eagerly — usually a stray <code>import</code> of the component
+in a shared file, which defeats the split silently.</p>
+
+<h2>What is next</h2>
+
+<p>Forms: the two systems Angular offers, and which to reach for.</p>

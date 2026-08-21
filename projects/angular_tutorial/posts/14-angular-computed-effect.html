@@ -1,0 +1,116 @@
+<p>Most state in an application is not stored; it is worked out from state that is. Signals have
+a dedicated tool for that, and using it removes a whole category of bug.</p>
+
+<h2>computed()</h2>
+
+<pre class="language-typescript"><code class="language-typescript">readonly totals = computed(() =&gt; calculateTotals(this._items(), this._orderType()));
+readonly itemCount = computed(() =&gt; this.totals().itemCount);</code></pre>
+
+<p>The cart's totals are <strong>derived, never stored</strong>. There is one source of truth —
+the items and the order type — and the subtotal, tax, delivery fee and total are all functions of
+it. A stored total is a second source of truth that can disagree with the first, and eventually
+will.</p>
+
+<p>Two properties matter:</p>
+
+<p><strong>Dependencies are tracked automatically.</strong> Reading <code>this._items()</code>
+inside the function is what subscribes it. There is no dependency array, so there is no way to
+forget one — which is the failure mode <code>useMemo</code> is famous for.</p>
+
+<p><strong>It is lazy and cached.</strong> The function does not run when the dependencies change;
+it runs when someone next <em>reads</em> the computed, and only if a dependency actually changed
+since. Nothing reading <code>totals()</code> means <code>calculateTotals</code> never runs. And
+<code>itemCount</code> computed from <code>totals</code> — a computed reading a computed — is
+entirely normal.</p>
+
+<p>⚠️ <strong>A computed must be pure.</strong> No writing to signals, no HTTP calls, no
+<code>console.log</code> you rely on. It may be skipped, or run at a moment you did not predict,
+because the framework decides when. Anything with a side effect belongs in an
+<code>effect</code>.</p>
+
+<h2>effect()</h2>
+
+<p>An effect runs a side effect when the signals it read last time change:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const ref = effect(() =&gt; {
+  if (this.menu.loading()) return;
+
+  // Read the catalogue now, while inside the reactive context, then leave it.
+  const products = this.menu.products();
+  const crusts = this.menu.crusts();</code></pre>
+
+<p>Again there is no dependency array — reading <code>menu.loading()</code> is what subscribes
+it. That is the whole API.</p>
+
+<p>Effects run <strong>after</strong> change detection, and they are batched: several signals
+changing in one tick produce one run.</p>
+
+<h3>onCleanup</h3>
+
+<p>The effect callback receives a cleanup registrar, which runs before the next run and on
+destroy. The cart uses it to debounce writes to the server:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const timer = setTimeout(() =&gt; void this.save(items, orderType), 300);
+onCleanup(() =&gt; clearTimeout(timer));</code></pre>
+
+<p>Clicking "+" three times quickly is one write, not three: each change cancels the pending
+timer before scheduling a new one. It is the return-a-function cleanup of a React
+<code>useEffect</code>, under a different name.</p>
+
+<h3>Cleanup of the effect itself</h3>
+
+<pre class="language-typescript"><code class="language-typescript">this.destroyRef.onDestroy(() =&gt; ref.destroy());</code></pre>
+
+<p>An effect created in a component or service's <em>injection context</em> — a field initialiser
+or the constructor — is destroyed with it automatically. This one is created inside a method called
+from the constructor, so it is tied to the service's lifetime explicitly. If you ever call
+<code>effect()</code> outside an injection context you must pass an injector or keep the handle;
+otherwise it outlives its owner.</p>
+
+<h2>The rule about writing to signals</h2>
+
+<p>Writing to a signal inside an effect is where infinite loops come from: the write changes a
+signal, which re-triggers the effect, which writes again. Angular used to throw on this by default.
+It is now allowed and still worth avoiding — if an effect writes a signal, ask whether the value is
+actually <em>derived</em>, in which case it wants to be a <code>computed</code>.</p>
+
+<p>The cart shows the disciplined version of the unavoidable case. Its effects need flags, and
+those flags are <strong>plain fields, not signals</strong>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/** Guards the hydrate effect. A plain field, so setting it cannot re-trigger the effect. */
+private hydrationStarted = false;</code></pre>
+
+<p>The comment says exactly why. Reading a signal inside an effect subscribes to it, so guarding
+on a signal and then setting it would schedule the effect to run a second time only to discover it
+has nothing left to do. The same reasoning applies to the cart id:</p>
+
+<pre class="language-typescript"><code class="language-typescript">private cartId: string | null = cartIdStore.get();</code></pre>
+
+<p>The persist effect needs the current cart id but must not re-run when it is assigned — that
+would fire an extra PUT immediately after the cart is created. A signal read inside an effect becomes
+a dependency; a plain field does not. It is the direct equivalent of a <code>useRef</code>, for
+exactly the same reason.</p>
+
+<h2>Which one to reach for</h2>
+
+<p><strong>Deriving a value? <code>computed</code>.</strong> Always, and it is almost always what
+you want.</p>
+
+<p><strong>Reaching outside Angular? <code>effect</code>.</strong> Writing to
+<code>localStorage</code>, syncing to a server, driving a third-party library, logging.</p>
+
+<p>If you are reaching for an effect to keep one piece of state in step with another, that is the
+signal to stop: the second piece is derived, and a <code>computed</code> will do it without the
+synchronisation bug you are about to write.</p>
+
+<h3>linkedSignal</h3>
+
+<p>The case that genuinely falls between them: a value derived from another, but locally
+overridable — a selected size that follows the product until the user picks one. <code>computed</code>
+cannot do it because it is read-only, and an effect writing a signal is the bug above.
+<code>linkedSignal</code> is built for it. The pizza app never needed one, which is worth knowing:
+most apps do not.</p>
+
+<h2>What is next</h2>
+
+<p>The lifecycle hooks — and, more usefully, how few of them you still need.</p>

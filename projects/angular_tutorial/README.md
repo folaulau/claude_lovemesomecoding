@@ -18,6 +18,7 @@ projects/angular_tutorial/
   posts/NN-slug.html the post bodies, plain semantic HTML   <- EMPTY, see below
   seed.py            writes the category and posts into a content tree
   check_content.py   proves the normaliser round-trips every code sample (no AWS needed)
+  check_snippets.py  proves every quoted snippet still matches the demo app (no AWS needed)
   progress_report.md status, decisions and the full topic table — read this first
 ```
 
@@ -27,8 +28,13 @@ The 28-post topic table, the manifest and the tooling are done, and the demo app
 snippet comes from `lovemesomecoding_demo_project/pizza/pizza-angular-frontend` (Angular 21.2,
 TypeScript 5.9, Bootstrap 5 + Sass, NgRx 21, standalone and zoneless).
 
-**1 of 28 post bodies written** (`angular-component`, lesson 4 — the one indexed URL, chosen first
-so the house style is settled before 27 posts inherit it). The other 27 are the remaining job.
+**All 28 post bodies written**, seeded to the local tree and verified rendering.
+
+⚠️ **Only lessons 4 and 5 are on prod.** The other 26 exist locally and have not been reviewed.
+Publishing them is `seed.py --env prod --write` plus a frontend deploy.
+
+Lesson 1's lesson index is **generated from `manifest.POSTS`**, so adding or reordering a lesson
+means re-running the generator rather than hand-editing a list that will drift.
 
 Four examples the track needed were added to the app and are covered by new unit tests: an
 `Autofocus` directive, a debounced menu search, a `CanDeactivate` guard on checkout, and a Vitest
@@ -43,6 +49,10 @@ Run from the repo root. `check_content.py` needs no AWS credentials; `seed.py` d
 ```bash
 # Verify the manifest and any written content
 lovemesomecoding_backend/.venv/bin/python projects/angular_tutorial/check_content.py
+
+# Verify every quoted snippet still matches the demo app. Run BOTH — they check
+# different things, and only this one goes stale on its own.
+python3 projects/angular_tutorial/check_snippets.py
 
 # Dry run — reports create/update per post and writes nothing
 AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/angular_tutorial/seed.py --env local

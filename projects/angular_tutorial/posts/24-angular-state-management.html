@@ -1,0 +1,122 @@
+<p>Most Angular applications do not need a state library, and the ones that do should be able to
+say why. The pizza app splits the question down the middle, deliberately: signal services for the
+customer screens, NgRx for the admin section.</p>
+
+<h2>Level 1 — component state</h2>
+
+<p>State used by one component stays in it. Which modal is open, what is typed in a field, which
+tab is selected:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/** `null` means the builder is closed. One piece of state, not two. */
+readonly selectedProduct = signal&lt;Product | null&gt;(null);</code></pre>
+
+<p>Moving this anywhere else buys nothing and costs indirection. Even the admin screens, which
+have a store available, keep their modal and form state in component signals.</p>
+
+<h2>Level 2 — a service holding signals</h2>
+
+<p>State shared by several components goes in a root-provided service:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable({ providedIn: 'root' })
+export class CartService {</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">readonly items = this._items.asReadonly();
+readonly orderType = this._orderType.asReadonly();
+readonly hydrated = this._hydrated.asReadonly();</code></pre>
+
+<p>Private writable signals, public read-only views, and every change through a method. That is a
+complete state-management solution in about thirty lines, and it covers the entire customer-facing
+half of this application: auth, menu, cart, toasts.</p>
+
+<p><strong>This is the level most applications should stop at.</strong> It gives shared state,
+derived values, and a single place where the rules live. What it does not give is a transaction log
+of what happened — and that, not "shared state", is what a store is actually for.</p>
+
+<h2>Level 3 — NgRx</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export const catalogFeature = createFeature({</code></pre>
+
+<p>The admin section uses four features: <code>catalog</code> (products, toppings and crusts —
+one domain, one feature), <code>orders</code>, <code>reports</code>, <code>users</code>.</p>
+
+<p><strong>Feature boundaries follow the domain, not the screen.</strong> Products, toppings and
+crusts get one feature between them even though they have a tab each, because they are one thing that
+changes together: adding a topping should be visible to the product editor without either page
+knowing the other exists.</p>
+
+<p>NgRx keeps actions, reducer and effects as three visible things. Redux Toolkit's
+<code>createSlice</code> generates the actions from the reducer names and hides the wiring — more
+ceremony here, and a shorter path from a bug to the line that caused it.</p>
+
+<h3>⚠️ NgRx does not use Immer</h3>
+
+<p>This is the trap when moving from Redux Toolkit. <code>state.items.push(x)</code> in an RTK
+reducer is a draft write that Immer turns into a new object. In NgRx it is <strong>a real
+mutation</strong> — a genuine bug. Every branch of an NgRx reducer returns a new object.</p>
+
+<h3>Knowing whether a dispatch worked</h3>
+
+<p>A component dispatches and gets nothing back. RTK answers this with
+<code>.unwrap()</code>; NgRx has no equivalent, so the app awaits the success or failure
+<em>action</em> — <code>store/outcome.ts</code>. It has its own ordering trap: subscribe before
+dispatching, or a synchronous failure is emitted before anyone is listening.</p>
+
+<h3>⚠️ An error is not serialisable</h3>
+
+<p>An <code>ApiError</code> does not survive a trip through a store — the class is lost and with
+it <code>fieldErrors()</code>. It is flattened to <code>{message, fieldErrors}</code> before becoming
+an action. The React app hits precisely the same wall with RTK.</p>
+
+<h2>Where the store is provided</h2>
+
+<p>This is the decision the whole app is arranged around:</p>
+
+<pre class="language-typescript"><code class="language-typescript">return makeEnvironmentProviders([
+  provideState(catalogFeature),
+  provideState(ordersFeature),
+  provideState(reportsFeature),
+  provideState(usersFeature),
+  provideEffects(catalogEffects, ordersEffects, reportsEffects, usersEffects),
+]);</code></pre>
+
+<p>Those are attached to the <code>/admin</code> route rather than to
+<code>app.config.ts</code>, which does two jobs. Architecturally, the customer pages cannot reach
+this state even by accident — the split is enforced by the injector rather than by everyone
+remembering it. Practically, <code>/admin</code> is lazy, so every reducer, selector, effect and
+action string arrives only when an admin opens it.</p>
+
+<h3>⚠️ What will not move</h3>
+
+<pre class="language-typescript"><code class="language-typescript">provideStore(),</code></pre>
+
+<p><code>provideStore()</code> has to be at the root. Put it on the route with the features and
+the app compiles, serves, and then dies on the first admin navigation with <code>NG0201: No provider
+found for _Store</code>, thrown from <code>EffectsRunner_Factory</code>. <code>EffectsRunner</code>
+is <code>providedIn: 'root'</code> and injects the Store, so it resolves from the root injector,
+where a route-provided store does not exist. Nothing fails at build time.</p>
+
+<p>The honest accounting: that root <code>provideStore()</code> costs the entry bundle 15.9 kB
+raw, 4.4 kB over the wire — measured by building with and without it. Everything admin-specific stays
+lazy. React's version, where <code>&lt;Provider&gt;</code> inside a lazy <code>AdminLayout</code>
+keeps every last byte out of the entry bundle, is the cleaner split, and Angular cannot quite match
+it here.</p>
+
+<h3>makeEnvironmentProviders, not an array</h3>
+
+<p>⚠️ Returning a plain array of <code>EnvironmentProviders</code> and spreading it into a route's
+<code>providers</code> looks equivalent and is not: the nested array does not register, and the first
+component to <code>inject(Store)</code> fails with the same <code>NG0201</code> at runtime.</p>
+
+<h2>Choosing</h2>
+
+<p>Start at level 1. Move to level 2 when a second component needs the same state — which is a
+service and some signals, and is where most applications should stay.</p>
+
+<p>Reach for level 3 when you want the things a store actually provides: a serialisable record of
+every change, time-travel debugging, effects as declarative pipelines, and a shape that stays legible
+when a dozen people work on it. "Our state is complicated" is not the trigger. "We cannot tell what
+changed this, or in what order" is.</p>
+
+<h2>What is next</h2>
+
+<p>Testing all of the above.</p>

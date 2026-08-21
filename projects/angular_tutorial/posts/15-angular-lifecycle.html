@@ -1,0 +1,118 @@
+<p>Angular calls a fixed set of methods on your component as it is created, updated and destroyed.
+The list is worth knowing. What is more useful is knowing how few of them modern Angular still needs
+— the pizza app has <strong>one</strong> <code>ngOnInit</code> across thirty components, and no other
+lifecycle hook at all.</p>
+
+<h2>The hooks, in order</h2>
+
+<p><code>ngOnChanges</code> — an input changed. Receives a <code>SimpleChanges</code> bag, fires
+for every input at once, and runs before <code>ngOnInit</code>.</p>
+
+<p><code>ngOnInit</code> — once, after the first inputs are set.</p>
+
+<p><code>ngDoCheck</code> — every change-detection pass. Almost never what you want.</p>
+
+<p><code>ngAfterContentInit</code> / <code>ngAfterContentChecked</code> — projected content is
+ready.</p>
+
+<p><code>ngAfterViewInit</code> / <code>ngAfterViewChecked</code> — the component's own template
+and children are in the DOM.</p>
+
+<p><code>ngOnDestroy</code> — being torn down. Historically where every unsubscribe went.</p>
+
+<p>Each is a method you declare; implementing the matching interface —
+<code>implements OnInit</code> — is optional and worth doing, because a typo in the method name is
+otherwise silent.</p>
+
+<h2>The one that survives: ngOnInit</h2>
+
+<p>A component's constructor runs before its inputs are set. So anything that depends on an input
+cannot go there:</p>
+
+<pre class="language-typescript"><code class="language-typescript">ngOnInit(): void {
+  void this.poll();
+}</code></pre>
+
+<p>⚠️ This is not a style preference. <strong>Reading a required input from the constructor throws
+<code>NG0950</code> at runtime</strong>, with nothing failing at build time. The input is assigned
+after construction, and the constructor is simply too early.</p>
+
+<p>There is no React equivalent to this gap, because there is none to have: props are an argument
+to the function, so they exist before the body runs.</p>
+
+<h2>What replaced the rest</h2>
+
+<h3>ngOnChanges is now computed</h3>
+
+<pre class="language-typescript"><code class="language-typescript">readonly isPizza = computed(() =&gt; this.product().type === 'PIZZA');
+readonly cheapest = computed(() =&gt; Math.min(...this.product().sizes.map((s) =&gt; s.price)));</code></pre>
+
+<p>An <code>input()</code> is a signal, so anything derived from it can be a
+<code>computed</code>, which recalculates when <em>that</em> input changes and not when any other
+does. <code>ngOnChanges</code> fires for all of them and hands you a bag to unpick — strictly worse
+for the job it was built for.</p>
+
+<h3>ngAfterViewInit is now afterNextRender</h3>
+
+<pre class="language-typescript"><code class="language-typescript">afterNextRender(() =&gt; {
+  if (this.appAutofocus()) this.host.nativeElement.focus();
+});</code></pre>
+
+<p><code>afterNextRender</code> runs once after the DOM is written;
+<code>afterRenderEffect</code> is its reactive sibling, re-running when a signal it read changes —
+which is what the modal uses to re-focus its close button each time it reopens.</p>
+
+<p>Both are also <strong>SSR-safe</strong>: they do not run on the server, where there is no DOM.
+<code>ngAfterViewInit</code> does, which is a common source of "<code>ResizeObserver</code> is not
+defined" during server rendering.</p>
+
+<h3>ngOnDestroy is now DestroyRef</h3>
+
+<pre class="language-typescript"><code class="language-typescript">const destroyRef = inject(DestroyRef);
+
+afterNextRender(() =&gt; {
+  const observer = new ResizeObserver(([entry]) =&gt; {
+    const next = Math.round(entry.contentRect.width);
+    if (next &gt; 0) width.set(next);
+  });
+
+  observer.observe(host.nativeElement);
+  destroyRef.onDestroy(() =&gt; observer.disconnect());
+});</code></pre>
+
+<p>This is the real gain, and it is not about syntax. <code>DestroyRef</code> can be injected
+<strong>anywhere there is an injection context</strong> — including inside a plain function like this
+one, which is not a component and has no lifecycle of its own to hook.</p>
+
+<p>That is what lets the whole behaviour be packaged as a function a component calls, with its
+setup and its teardown sitting <em>next to each other</em>. With <code>ngOnDestroy</code>, the
+observer would have to be created in one method and disconnected in another, on a component that
+does not otherwise care, with a field between them holding the reference. Every leak in that pattern
+comes from the distance between those two lines.</p>
+
+<p>For observables, the same idea has a dedicated operator:</p>
+
+<pre class="language-typescript"><code class="language-typescript">source$.pipe(takeUntilDestroyed()).subscribe(handler);</code></pre>
+
+<p>It unsubscribes when the injection context is destroyed, replacing the
+<code>destroy$ = new Subject()</code> plus <code>takeUntil(this.destroy$)</code> plus
+<code>ngOnDestroy</code> ritual that used to appear in every second Angular component.</p>
+
+<h2>Effects have their own lifetime</h2>
+
+<p>An <code>effect</code> created in an injection context is destroyed with its owner, so most
+effects need no teardown at all. Where the handle is kept, the cleanup is explicit:</p>
+
+<pre class="language-typescript"><code class="language-typescript">this.destroyRef.onDestroy(() =&gt; ref.destroy());</code></pre>
+
+<h2>The summary worth remembering</h2>
+
+<p>Reach for <code>ngOnInit</code> when you need an input at startup. Reach for
+<code>afterNextRender</code> when you need the DOM. Reach for <code>DestroyRef</code> to clean up.
+Everything else the hooks used to do is better done by <code>computed</code> and
+<code>effect</code>, which is why a modern Angular component usually has none of them.</p>
+
+<h2>What is next</h2>
+
+<p>Services and dependency injection — the <code>inject()</code> that has been quietly doing the
+work in every file so far.</p>

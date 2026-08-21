@@ -1,0 +1,111 @@
+<p>Change detection is Angular deciding which templates to re-render. Understanding it is the
+difference between an app that stays fast and one that mysteriously does not.</p>
+
+<h2>How it used to work</h2>
+
+<p>Angular could not know what had changed, so Zone.js patched every async API in the browser —
+<code>setTimeout</code>, every event listener, every XHR — and after anything happened, Angular
+re-checked the <strong>entire component tree</strong> and diffed the results against the last
+render.</p>
+
+<p>It worked, and it did work proportional to the size of your application rather than the size of
+the change. A <code>mousemove</code> listener could trigger a full-tree check per pixel.</p>
+
+<h2>OnPush</h2>
+
+<pre class="language-typescript"><code class="language-typescript">changeDetection: ChangeDetectionStrategy.OnPush,</code></pre>
+
+<p><code>OnPush</code> tells Angular to skip this component unless an input reference changed, a
+signal it read changed, or an event fired inside it. Every one of the thirty components in the pizza
+app sets it.</p>
+
+<p>The React comparison is exact and instructive. <code>ProductCard</code>'s React counterpart is
+wrapped in <code>React.memo</code>, and the menu page has to wrap its <code>onSelect</code> handler in
+<code>useCallback</code> for the memo to hit at all — an inline arrow would be a new function identity
+every render and the comparison would never succeed.</p>
+
+<p><code>OnPush</code> needs neither. A handler bound with <code>(selected)="…"</code> is not an
+input, so it cannot invalidate anything. <strong>There is no <code>useCallback</code> in Angular
+because there is nothing for it to fix.</strong></p>
+
+<p>⚠️ The one thing <code>OnPush</code> punishes is mutation. If you mutate an object passed as an
+input, the reference is unchanged and the child never re-renders. Replace, do not mutate — the same
+rule signals impose.</p>
+
+<h2>Zoneless</h2>
+
+<p>Signals know exactly which templates read them, which makes Zone.js unnecessary. The pizza app
+has <strong>no zone.js installed at all</strong>.</p>
+
+<p>The practical gains: about 13 kB less JavaScript, no monkey-patching of browser APIs at
+startup, cleaner stack traces, and better interop with anything outside Angular. The cost is that
+change detection now only happens for reasons Angular can see — a signal write, an event binding, an
+async pipe — so state held in a plain field and mutated from a callback will not repaint. In practice
+that means "put state in signals", which you wanted anyway.</p>
+
+<h2>@defer</h2>
+
+<p>Block syntax for loading part of a template lazily:</p>
+
+<pre class="language-markup"><code class="language-markup">@defer (on viewport) {
+  &lt;app-revenue-chart [data]="revenue()" /&gt;
+} @placeholder {
+  &lt;div class="chart-skeleton"&gt;&lt;/div&gt;
+} @loading (minimum 200ms) {
+  &lt;app-spinner /&gt;
+}</code></pre>
+
+<p>The component inside becomes its own chunk, fetched when the trigger fires. Triggers include
+<code>on idle</code> (the default), <code>on viewport</code>, <code>on interaction</code>,
+<code>on hover</code>, <code>on timer</code>, and <code>when</code> with an expression.
+<code>@placeholder</code> shows before, <code>@loading</code> during, <code>@error</code> if the
+fetch fails.</p>
+
+<p><code>minimum 200ms</code> on the loading block prevents the flicker of a spinner that appears
+and vanishes within a frame — worth setting nearly always.</p>
+
+<p>The pizza app does not use <code>@defer</code>. Its heavy things are whole routes, and those
+are already lazy — which is the more common answer. <code>@defer</code> earns its place when
+something expensive sits <em>inside</em> a route the user needs immediately: a chart below the fold,
+a rich editor behind a tab.</p>
+
+<h2>Route-level splitting</h2>
+
+<pre class="language-typescript"><code class="language-typescript">loadChildren: () =&gt; import('./admin/admin.routes').then((m) =&gt; m.ADMIN_ROUTES),</code></pre>
+
+<p>This is where the real wins are, and they are measurable. The admin area — six screens, NgRx,
+ten effects — is a chunk that only an admin ever downloads.</p>
+
+<h2>track, again</h2>
+
+<pre class="language-markup"><code class="language-markup">@for (product of visibleProducts(); track product.id) {</code></pre>
+
+<p>Worth restating in a performance lesson: without stable identity, a reordered list is destroyed
+and rebuilt rather than moved, losing focus, scroll position and any state inside those components.
+This is the most common list-performance bug in any framework, and Angular now makes it a compile
+error to omit the answer.</p>
+
+<h2>Measuring</h2>
+
+<p><strong>Angular DevTools</strong> has a profiler that shows which components were checked and
+how long each took. That is the tool for "why is this slow" — not guesswork, and not adding
+<code>OnPush</code> everywhere and hoping.</p>
+
+<p><strong><code>ng build</code></strong> prints every chunk with its raw and transferred size.
+Read it after any change to routing or providers: a route you expected to be lazy that is not in the
+list means something is importing it eagerly.</p>
+
+<p><strong>Budgets</strong> in <code>angular.json</code> fail the build when a bundle grows past a
+threshold, which is how you find out about a regression before your users do. That is the next
+lesson.</p>
+
+<h2>The order to do things in</h2>
+
+<p>Put state in signals. Set <code>OnPush</code> everywhere — it is free and it is a habit. Lazy
+load routes. Then, and only then, measure before optimising anything else. Most Angular performance
+problems in a signals-first zoneless app are not change detection at all; they are a request that
+should have been cancelled, or a list that should have been paginated.</p>
+
+<h2>What is next</h2>
+
+<p>Getting it into production.</p>

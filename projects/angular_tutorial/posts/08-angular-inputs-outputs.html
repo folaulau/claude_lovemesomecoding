@@ -1,0 +1,117 @@
+<p>Data goes down through inputs; events come back up through outputs. That is the entire
+contract between a parent and a child, and Angular now expresses both as functions rather than
+decorators.</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class Modal {
+  readonly open = input(false);
+  readonly size = input&lt;'md' | 'lg'&gt;('md');
+  readonly scrollable = input(false);
+  readonly spreadFooter = input(false);
+  readonly ariaLabel = input&lt;string | null&gt;(null);</code></pre>
+
+<p>Used from the parent, those are ordinary property bindings:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;app-cart-drawer [open]="cartOpen()" (closed)="cartOpen.set(false)" /&gt;</code></pre>
+
+<h2>input()</h2>
+
+<p>The argument to <code>input()</code> is the default, and the type is usually inferred from it.
+When there is no sensible default, or the type is wider than the default suggests, give it
+explicitly — <code>input&lt;'md' | 'lg'&gt;('md')</code> above.</p>
+
+<p><strong>An input is a signal.</strong> That is the important part. You read it by calling it,
+and reading it inside a template or a <code>computed</code> subscribes to it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">readonly isPizza = computed(() =&gt; this.product().type === 'PIZZA');
+readonly cheapest = computed(() =&gt; Math.min(...this.product().sizes.map((s) =&gt; s.price)));</code></pre>
+
+<p>Those recompute when <code>product</code> changes and at no other time. With the old
+<code>@Input()</code> decorator the equivalent was <code>ngOnChanges</code>, a method that fires for
+<em>every</em> input with a bag of <code>SimpleChanges</code> to unpick.</p>
+
+<p>Inputs are read-only from inside the component. There is no setter — the parent owns the
+value, and a child that could rewrite its own input would make the data flow impossible to follow.
+When a child genuinely needs to propose a change, that is what an output, or
+<code>model()</code>, is for.</p>
+
+<h3>input.required()</h3>
+
+<pre class="language-typescript"><code class="language-typescript">readonly product = input.required&lt;Product&gt;();</code></pre>
+
+<p>No default, and the type is not <code>Product | undefined</code>. Omit the binding and the
+<strong>build</strong> fails, naming the component — not an undefined at runtime three screens
+later.</p>
+
+<p>⚠️ One trap, and it has cost time in this app already: <strong>a required input is not
+readable from the constructor.</strong> It is assigned after construction, so reading one there
+throws <code>NG0950</code> at runtime with nothing failing at build time. Read it in
+<code>ngOnInit</code>, or in an <code>effect</code>, or in a <code>computed</code> — anywhere that
+runs later.</p>
+
+<h3>Input transforms</h3>
+
+<p>An input can convert what it receives. The most common case is a boolean attribute, where the
+value arrives as the empty string:</p>
+
+<pre class="language-typescript"><code class="language-typescript">readonly appAutofocus = input(true, { transform: booleanAttribute });</code></pre>
+
+<p>That is what lets <code>appAutofocus</code> on its own mean <em>true</em> while
+<code>[appAutofocus]="false"</code> means false. Angular ships <code>booleanAttribute</code> and
+<code>numberAttribute</code>; a transform is just a function, so anything with the right shape
+works. The declared type stays <code>boolean</code>, so nothing downstream has to think about the
+coercion.</p>
+
+<h2>output()</h2>
+
+<pre class="language-typescript"><code class="language-typescript">readonly closed = output&lt;void&gt;();</code></pre>
+
+<p>The parent binds it like a DOM event, and <code>$event</code> is whatever was emitted:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;app-product-card [product]="product" (selected)="selectedProduct.set($event)" /&gt;</code></pre>
+
+<p>Inside the child, <code>emit()</code> sends it:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;button type="button" class="btn btn-sm btn-primary" (click)="selected.emit(product())"&gt;
+  {{ isPizza() ? 'Build it' : 'Add' }}
+&lt;/button&gt;</code></pre>
+
+<p><code>output&lt;void&gt;()</code> is the "something happened, there is no payload" case —
+<code>closed.emit()</code> with no argument. An output is not a signal; it is a stream of events, and
+that distinction is the right one. State is a value you can read at any time; an event is a thing
+that happened once.</p>
+
+<p>It replaces <code>@Output() closed = new EventEmitter&lt;void&gt;()</code>. The practical
+gains: no <code>EventEmitter</code> import, no way to subscribe to it by accident inside the
+component, and automatic cleanup when the component is destroyed.</p>
+
+<h2>model(), and two-way binding on your own component</h2>
+
+<p>When a value should flow both ways, <code>model()</code> is an input and an output at
+once:</p>
+
+<pre class="language-typescript"><code class="language-typescript">readonly value = model('');        // an input `value` AND an output `valueChange`</code></pre>
+
+<pre class="language-markup"><code class="language-markup">&lt;app-search-box [(value)]="term" /&gt;</code></pre>
+
+<p>The banana-in-a-box works because Angular looks for an output named after the input with
+<code>Change</code> appended, and <code>model()</code> declares both. Unlike a plain input, a
+<code>model()</code> is writable from inside the component — <code>this.value.set('…')</code> — and
+the write propagates to the parent.</p>
+
+<p>There is no <code>model()</code> in the pizza app. Every child there either takes a value or
+reports an event, and none needs to do both, so reaching for it would be ceremony. It is worth
+knowing about and worth being slightly suspicious of: two-way binding makes a component convenient
+and makes the direction of data harder to see.</p>
+
+<h2>Naming</h2>
+
+<p>Inputs and outputs are part of a component's public API and read best as such. Inputs are
+nouns — <code>product</code>, <code>open</code>, <code>size</code>. Outputs are things that happened,
+not handlers: <code>closed</code>, <code>selected</code>. Angular even warns if you prefix an output
+with <code>on</code>, because the binding already supplies that at the call site — the parent writes
+<code>(closed)</code>, and <code>(onClosed)</code> would read as <code>onOnClosed</code>.</p>
+
+<h2>What is next</h2>
+
+<p>A component that wraps content it does not own: <code>&lt;ng-content&gt;</code>, named slots,
+and the templates the modal is built from.</p>

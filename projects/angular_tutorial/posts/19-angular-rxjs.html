@@ -1,0 +1,123 @@
+<p>Signals took over state. That is most of what an application holds, so most Angular code no
+longer touches RxJS at all. What signals do <em>not</em> model is a sequence of events over time —
+and that is where observables still win outright.</p>
+
+<p>The distinction is worth stating plainly. A signal always has a value you can read right now.
+An observable is a stream: it may emit nothing, or many things, or fail, and it needs subscribing to.
+State is a value. Search-as-you-type is a stream.</p>
+
+<h2>One worked example</h2>
+
+<p>The menu search box is the one place in the pizza app where RxJS is unambiguously the right
+tool. The pipeline starts and ends in signals and is an observable only in the middle:</p>
+
+<pre class="language-markup"><code class="language-markup">searchTerm (signal)  -&gt;  toObservable  -&gt;  operators  -&gt;  toSignal  -&gt;  template</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">private readonly searchState = toSignal(
+  toObservable(this.searchTerm).pipe(
+    debounceTime(SEARCH_DEBOUNCE_MS),
+    map((term) =&gt; term.trim()),
+    distinctUntilChanged(),
+    switchMap((term) =&gt; {
+      if (term.length &lt; MIN_SEARCH_LENGTH) return of(IDLE);
+
+      return this.api
+        .get&lt;Product[]&gt;(`/api/search/products?q=${encodeURIComponent(term)}`)
+        .pipe(
+          map((results): SearchState =&gt; ({ loading: false, results })),
+          catchError(() =&gt; of&lt;SearchState&gt;({ loading: false, results: [] })),
+          startWith&lt;SearchState&gt;({ loading: true, results: null }),
+        );
+    }),
+  ),
+  { initialValue: IDLE },
+);</code></pre>
+
+<p>Every operator there is fixing a specific bug. That is the standard to hold RxJS to — if you
+cannot name the bug an operator prevents, it should not be in the pipeline.</p>
+
+<h2>What each one buys</h2>
+
+<p><strong><code>debounceTime(300)</code></strong> — one request when the typing stops, not one
+per keystroke.</p>
+
+<p><strong><code>map(trim)</code> then <code>distinctUntilChanged()</code></strong> — "pep " and
+"pep" are the same search, and re-typing the same term after a backspace does not refetch.</p>
+
+<p><strong><code>switchMap</code></strong> — the important one. If the response for "pep" is
+still in flight when "pepp" is typed, <code>switchMap</code> <em>unsubscribes</em> from it: the
+request is cancelled and its result can never arrive late and overwrite the newer one.</p>
+
+<p>That out-of-order bug is the single best argument for RxJS in an app otherwise built on
+signals. It is real, it is intermittent, and it is miserable to debug — a slow response for a short
+query landing after a fast response for a long one, so the list shows results for a term the user has
+already finished editing. The React app solves the same problem with an
+<code>AbortController</code> by hand.</p>
+
+<p><strong><code>startWith</code> inside the <code>switchMap</code></strong> — emits the loading
+state for <em>this</em> request, so a cancelled request's spinner is cancelled with it. Putting it
+outside would leave the spinner on after a cancellation.</p>
+
+<p><strong><code>catchError</code></strong> — returns an empty result rather than killing the
+stream. ⚠️ An error that escapes here would <em>complete</em> the observable, and the search box
+would go dead for the rest of the page's life. That is the classic RxJS foot-gun, and it is why
+<code>catchError</code> is inside the <code>switchMap</code>: it recovers the inner request without
+tearing down the outer stream.</p>
+
+<h2>The flattening operators</h2>
+
+<p><code>switchMap</code> is one of four, and choosing wrongly is where most RxJS bugs live:</p>
+
+<p><strong><code>switchMap</code></strong> — cancel the previous. Search, autocomplete, anything
+where only the latest matters.</p>
+
+<p><strong><code>mergeMap</code></strong> — run them all concurrently, in whatever order they
+finish. Wrong for search; right for independent uploads.</p>
+
+<p><strong><code>concatMap</code></strong> — queue them, strictly in order. Right when each
+request depends on the last having landed.</p>
+
+<p><strong><code>exhaustMap</code></strong> — ignore new ones while one is running. The correct
+answer for a submit button, where a double-click should not create two orders.</p>
+
+<h2>The bridge</h2>
+
+<pre class="language-typescript"><code class="language-typescript">import { toObservable, toSignal } from '@angular/core/rxjs-interop';</code></pre>
+
+<p><code>toSignal</code> subscribes for you and unsubscribes when the injection context is
+destroyed, so there is no cleanup to write. It needs an <code>initialValue</code> unless the
+observable emits synchronously — without one the signal's type includes
+<code>undefined</code>.</p>
+
+<p><code>toObservable</code> goes the other way, turning a signal into a stream so operators can
+be applied to it. Both live in <code>@angular/core/rxjs-interop</code> and exist precisely so you do
+not have to pick one model for the whole app.</p>
+
+<h2>Where else it survives</h2>
+
+<p><code>HttpClient</code> returns observables, so every request is one — usually converted
+immediately with <code>firstValueFrom</code> or <code>toSignal</code>.</p>
+
+<p>NgRx effects are built on them, and the admin store uses <code>switchMap</code> and
+<code>catchError</code> for exactly the reasons above.</p>
+
+<p>That is close to the whole list. The operators actually worth learning first are the ones in
+this lesson — <code>map</code>, <code>filter</code>, <code>debounceTime</code>,
+<code>distinctUntilChanged</code>, <code>switchMap</code>, <code>catchError</code>,
+<code>startWith</code> — plus <code>shareReplay</code> when several subscribers must share one
+request. The library has hundreds. You will not need most of them.</p>
+
+<h2>Proving it works</h2>
+
+<p>Cancellation is invisible from the rendered output, so the spec asserts on it directly:</p>
+
+<pre class="language-typescript"><code class="language-typescript">expect(first.cancelled).toBe(true);
+expect(second.cancelled).toBe(false);</code></pre>
+
+<p><code>HttpTestingController</code> exposes <code>cancelled</code>, which is the only direct
+evidence that <code>switchMap</code> unsubscribed rather than letting both requests run. Asserting on
+the final results cannot tell "cancelled the stale request" from "got lucky with the ordering".</p>
+
+<h2>What is next</h2>
+
+<p>Turning URLs into components: the router.</p>

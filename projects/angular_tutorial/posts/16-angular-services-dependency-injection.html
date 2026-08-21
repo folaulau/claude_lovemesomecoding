@@ -1,0 +1,134 @@
+<p>A service is a class that holds logic or state which does not belong to any one component.
+Dependency injection is how components get hold of one. It is the part of Angular that most repays
+understanding properly, because it is used everywhere and it is barely visible.</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable({ providedIn: 'root' })
+export class ApiService {
+  private readonly http = inject(HttpClient);
+
+  get&lt;T&gt;(path: string): Observable&lt;T&gt; {
+    return this.http.get&lt;T&gt;(path);
+  }</code></pre>
+
+<h2>providedIn: 'root'</h2>
+
+<p>Two things at once.</p>
+
+<p><strong>It registers the service</strong> with the root injector, so anything can inject it
+without a providers array anywhere.</p>
+
+<p><strong>It makes the service a singleton</strong>, and that is what makes shared state work.
+<code>CartService</code> holds the cart in signals; every component that injects it gets the
+<em>same instance</em>, so there is no provider component and no position in a tree to get right.
+React's four nested providers in <code>main.tsx</code> have an order that matters whenever one
+consumes another. Angular's four services do not.</p>
+
+<p>It is also <strong>tree-shakeable</strong>: if nothing injects the service, it is not in the
+bundle. That is the advantage over the older <code>providers: [ApiService]</code> on a module, where
+registering a service guaranteed shipping it.</p>
+
+<h2>inject()</h2>
+
+<pre class="language-typescript"><code class="language-typescript">private readonly api = inject(ApiService);
+private readonly menu = inject(MenuService);
+private readonly destroyRef = inject(DestroyRef);</code></pre>
+
+<p><code>inject()</code> is the modern form. The older constructor-parameter style still
+works:</p>
+
+<pre class="language-typescript"><code class="language-typescript">constructor(private api: ApiService) {}   // the old way; still valid</code></pre>
+
+<p>Prefer <code>inject()</code>, for a reason beyond taste: it works in places that have no
+constructor to put a parameter in — functional guards, functional interceptors, and plain functions
+like <code>observedWidth</code>. It also composes, which is what makes a helper function able to
+inject <code>DestroyRef</code> on its caller's behalf.</p>
+
+<h3>The injection context</h3>
+
+<p>The one rule with teeth: <strong><code>inject()</code> only works inside an injection
+context</strong> — a field initialiser, a constructor, a factory, or a functional guard or
+interceptor. Call it from a click handler or a <code>setTimeout</code> and it throws
+<code>NG0203</code>.</p>
+
+<p>In practice this is not a constraint, because injecting into a field is what you want anyway.
+When you genuinely need it later, capture <code>inject(Injector)</code> early and use
+<code>runInInjectionContext</code>.</p>
+
+<h2>What a service is for</h2>
+
+<p>The pizza app's services divide cleanly, and the division is worth copying.</p>
+
+<p><code>ApiService</code> is <strong>stateless</strong> — a typed wrapper over
+<code>HttpClient</code>. <code>AuthService</code>, <code>CartService</code>,
+<code>MenuService</code> and <code>ToastService</code> are <strong>stateful</strong>: they hold
+signals and are the reason those signals are shared.</p>
+
+<pre class="language-typescript"><code class="language-typescript">readonly isAuthenticated = computed(() =&gt; this._user() !== null);
+readonly isAdmin = computed(() =&gt; this._user()?.role === 'ADMIN');</code></pre>
+
+<p>Note what that gives you. A component asks <code>auth.isAdmin()</code> and gets an answer
+derived from one source of truth, rather than each component keeping its own copy of "am I an
+admin".</p>
+
+<h2>The injector hierarchy</h2>
+
+<p>Providers form a tree. When a component asks for a dependency, Angular looks in that
+component's injector, then its parent's, and up to the root — the first match wins.</p>
+
+<p><code>providedIn: 'root'</code> puts one instance at the top, which is what you want for
+almost everything. Providing a service on a <strong>route</strong> gives every component under that
+route its own instance, destroyed when you navigate away. The pizza app uses exactly that for NgRx:
+the store's feature slices are provided on the <code>/admin</code> route, so they ship in the lazy
+admin chunk instead of in everyone's bundle.</p>
+
+<p>Providing a service on a <strong>component</strong> gives each instance of that component its
+own copy — occasionally right, usually a surprise for anyone expecting shared state.</p>
+
+<h2>Injecting something that is not a class</h2>
+
+<p>DI keys on the type. A string or a config object has no type to key on, so it needs an
+<code>InjectionToken</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const API_BASE_URL = new InjectionToken&lt;string&gt;('API_BASE_URL');
+
+// provide it
+{ provide: API_BASE_URL, useValue: 'http://localhost:8085' }
+
+// inject it
+private readonly baseUrl = inject(API_BASE_URL);</code></pre>
+
+<p>The pizza app has none, and the reason is instructive: its one piece of configuration is a
+build-time constant, so it is a plain import instead.</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const environment = {
+  production: true,
+  apiBaseUrl: 'http://localhost:8085',</code></pre>
+
+<p>The CLI swaps this file for <code>environment.development.ts</code> via
+<code>fileReplacements</code> in <code>angular.json</code>. A token would buy the ability to swap the
+value at runtime or in a test — worth it when you need it, ceremony when you do not.</p>
+
+<p>⚠️ Everything in that file ships to the browser. Only the <strong>publishable</strong> Stripe
+key belongs there.</p>
+
+<h2>Why this matters for testing</h2>
+
+<p>Because dependencies arrive through the injector rather than being constructed, a test can
+replace one:</p>
+
+<pre class="language-typescript"><code class="language-typescript">TestBed.configureTestingModule({
+  providers: [
+    provideRouter([]),
+    provideHttpClient(),
+    provideHttpClientTesting(),
+    { provide: MenuService, useValue: menuServiceStub([PEPPERONI, PEPSI]) },
+  ],
+});</code></pre>
+
+<p>That is the menu page's own spec swapping the real <code>MenuService</code> for a stub. No
+mocking library, no module interception — just a different provider for the same token.</p>
+
+<h2>What is next</h2>
+
+<p>The service every other service is built on: <code>HttpClient</code>, and the
+<code>httpResource</code> that replaces most of the code you would write around it.</p>

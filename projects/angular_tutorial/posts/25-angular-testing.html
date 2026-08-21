@@ -1,0 +1,131 @@
+<p>Angular projects ship with a unit test runner and, usually, an end-to-end one alongside. The
+pizza app uses <strong>Vitest</strong> for units and <strong>Playwright</strong> for flows through the
+UI. What follows is the useful half: what to test where, and the mechanics that are not obvious.</p>
+
+<h2>The cheapest correct test</h2>
+
+<pre class="language-typescript"><code class="language-typescript">describe('MoneyPipe', () =&gt; {
+  const pipe = new MoneyPipe();
+
+  it('formats a number as US currency', () =&gt; {
+    expect(pipe.transform(14.5)).toBe('$14.50');
+  });</code></pre>
+
+<p>A pipe is a class with one method. Nothing about it needs Angular running, so
+<code>new MoneyPipe()</code> and a call is the whole test — milliseconds rather than tens of them.</p>
+
+<p><strong>Reach for <code>TestBed</code> when you need Angular's injector or its rendering, and
+not before.</strong> Most services and every pure pipe need neither.</p>
+
+<h2>TestBed</h2>
+
+<pre class="language-typescript"><code class="language-typescript">TestBed.configureTestingModule({
+  providers: [
+    provideRouter([]),
+    provideHttpClient(),
+    provideHttpClientTesting(),
+    { provide: MenuService, useValue: menuServiceStub([PEPPERONI, PEPSI]) },
+  ],
+});</code></pre>
+
+<p><code>TestBed</code> builds a miniature application: an injector you configure, and a place to
+create components. Because dependencies arrive through DI, swapping a real service for a stub is one
+provider — no mocking library, no module interception.</p>
+
+<p>⚠️ <strong>Order matters.</strong> <code>provideHttpClientTesting()</code> must come
+<em>after</em> <code>provideHttpClient()</code>, because it replaces the backend the first installed.
+Reversed, the real backend wins and your tests hit the network.</p>
+
+<h2>Testing HTTP</h2>
+
+<pre class="language-typescript"><code class="language-typescript">it('attaches the bearer token when one is stored', () =&gt; {
+  tokenStore.set('a-test-token');
+
+  http.get('/api/me/orders').subscribe();
+
+  const req = httpMock.expectOne(`${environment.apiBaseUrl}/api/me/orders`);
+  expect(req.request.headers.get('Authorization')).toBe('Bearer a-test-token');
+});</code></pre>
+
+<p><code>HttpTestingController</code> hands you every request as an object to assert on, which is
+what makes an interceptor — otherwise invisible plumbing — directly testable.</p>
+
+<pre class="language-typescript"><code class="language-typescript">afterEach(() =&gt; {
+  httpMock.verify();</code></pre>
+
+<p><strong><code>verify()</code> is the part people leave out and then regret.</strong> It fails
+the test if a request was made that no expectation consumed, which is how you discover the component
+firing a second request you never knew about.</p>
+
+<h2>Testing a directive</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Component({
+  imports: [Autofocus],
+  template: `
+    &lt;input id="plain" /&gt;
+    &lt;input id="focused" appAutofocus /&gt;
+  `,
+})
+class EnabledHost {}</code></pre>
+
+<p>A directive has no template of its own, so there is nothing to instantiate directly. A
+throwaway host component in the spec file uses it the way a real template would — which also exercises
+the <strong>selector</strong>. A directive whose selector is misspelled still passes a test that news
+up the class by hand; it does not pass this one.</p>
+
+<pre class="language-typescript"><code class="language-typescript">const fixture = TestBed.createComponent(EnabledHost);
+fixture.detectChanges();
+await fixture.whenStable();</code></pre>
+
+<p><code>await fixture.whenStable()</code> is load-bearing here: the directive focuses inside
+<code>afterNextRender</code>, so asserting immediately after <code>createComponent</code> checks
+before it has happened and fails for the wrong reason.</p>
+
+<h2>Testing a functional guard</h2>
+
+<pre class="language-typescript"><code class="language-typescript">return TestBed.runInInjectionContext(() =&gt;</code></pre>
+
+<p>A functional guard is just a function, but it may call <code>inject()</code> — so it has to run
+inside an injection context. That is the whole trick, and it is why a guard cannot simply be called
+like an ordinary function in a test.</p>
+
+<h2>Testing time</h2>
+
+<p>The search pipeline debounces for 300 ms. Waiting it out in every assertion would make the
+suite slow enough that people stop running it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">vi.useFakeTimers();</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">expect(first.cancelled).toBe(true);
+expect(second.cancelled).toBe(false);</code></pre>
+
+<p>And <code>req.cancelled</code> is the only direct evidence that <code>switchMap</code>
+unsubscribed rather than letting both requests run. Asserting on the final rendered results cannot
+distinguish "cancelled the stale request" from "got lucky with the ordering" — the test would pass
+either way, which makes it worthless for the thing it exists to check.</p>
+
+<h2>Two gotchas paid for already</h2>
+
+<p><strong>A stub must cover the whole component tree, not just the component.</strong> The menu
+page's spec stubs <code>MenuService</code>, but its template renders the pizza builder, which injects
+<code>CartService</code>, which reads <code>menu.crusts()</code> in an effect. A four-member stub
+failed inside change detection with <code>this.menu.crusts is not a function</code> — a stack trace
+pointing at <code>CartService</code> for a spec about the menu page.</p>
+
+<p><strong>Fixtures need their real shape.</strong> <code>ProductCard</code> maps over
+<code>product.sizes</code>; a trimmed object literal fails deep inside a child template rather than in
+the spec that wrote it.</p>
+
+<h2>Where end-to-end takes over</h2>
+
+<p>Unit tests answer "does this piece behave". They cannot answer "can somebody actually order a
+pizza". The Playwright suite drives every flow through the real UI against the real backend — browse,
+cart, auth, checkout, orders, profile, admin — plus the API guards that are not observable through
+the UI at all.</p>
+
+<p>It runs <strong>serially</strong>, because it is integration testing against one backend and
+one database, and tests must clean up what they create or one failure poisons every later run.</p>
+
+<h2>What is next</h2>
+
+<p>Why an Angular app gets slow, and what change detection is actually doing.</p>

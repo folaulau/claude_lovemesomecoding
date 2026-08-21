@@ -1,6 +1,6 @@
 # Angular tutorial track — progress report
 
-**Status:** AUTHORING — 1 of 28 post bodies written and previewed. Demo app built, gaps closed.
+**Status:** DRAFT COMPLETE — all 28 written, seeded locally and verified. Lessons 4–5 are LIVE on prod; the other 26 are not.
 **Started:** 2026-08-20
 **Where it lands:** https://lovemesomecoding.com/angular
 
@@ -22,10 +22,10 @@ Every code sample comes from `lovemesomecoding_demo_project/pizza/pizza-angular-
 |---|---|
 | Topic table | ✅ 28 lessons, agreed |
 | `manifest.py` | ✅ every lesson has slug, title, tags, excerpt, computed date |
-| `seed.py` / `check_content.py` | ✅ both run clean |
+| `seed.py` / `check_content.py` / `check_snippets.py` | ✅ all three run clean |
 | Content pipeline | ✅ `scss` support added (see below) |
 | Demo app | ✅ built, and the four missing examples added |
-| Post bodies | 🟡 **1 of 28** — `angular-component` written, seeded to the local tree and rendered at `:3000` |
+| Post bodies | ✅ **28 of 28** written and rendering; **only 4 and 5 are on prod** |
 
 ## The demo app
 
@@ -97,7 +97,7 @@ except where marked.
 | 4 | `angular-component` | **rewrite** | `product-card`, `app-footer` (no logic at all), `app.ts` |
 | 5 | `angular-templates` | new | `product-card`, `home.html` |
 | 6 | `angular-events` | new | `login`, `pizza-builder-modal`, `(keydown.escape)` in `modal.ts` |
-| 7 | `angular-control-flow` | new | `menu-page.html`, `cart-drawer.html`; the one surviving `*ngIf` in `app-navbar.html` |
+| 7 | `angular-control-flow` | new | `menu-page.html`, `home.html` (`@else`), `cart-drawer.html` + `orders.html` (`@empty`) |
 | 8 | `angular-inputs-outputs` | new | `modal.ts` (`input`/`output`), `Autofocus` (`booleanAttribute` transform) |
 | 9 | `angular-content-projection` | new | `modal.ts` — three named slots via `select` |
 | 10 | `angular-directives` | new | **`core/autofocus.directive.ts`** (added) |
@@ -212,9 +212,209 @@ Added while writing this. `seed.py` refuses to run while any file is missing —
 publishing, useless for drafting — so `--only <slugs>` seeds a subset for preview. It does not make
 the track publishable.
 
+## Lesson 5 — `angular-templates` (written 2026-08-21)
+
+1210 words, 11 headings, 13 code blocks. Covers the four bindings as a set, then interpolation,
+property vs **attribute** binding (including `[attr.x]="… : null"` removing the attribute),
+class/style bindings with the `[style.width.%]` unit suffix, two-way, template reference variables,
+`@let`, and the expression restrictions.
+
+## `check_snippets.py` — the check that was missing
+
+Written after lesson 5, because `check_content.py` proves a post's HTML round-trips and says
+**nothing** about whether a quoted snippet is still true. A post can round-trip perfectly while
+quoting a component that was refactored a month ago.
+
+It searches every code block for a contiguous match in the demo app, ignoring indentation (fragments
+are dedented when quoted) and ignoring comments (the house style quotes the app minus its
+`ANGULAR CONCEPT:` blocks). Blocks matching nothing are reported as `illustrative` rather than
+failing — many are three-line examples written for the lesson. It fails only on the drift signature:
+the opening lines match somewhere but the whole block does not.
+
+**It immediately caught two things I had got wrong**, neither of which any other check would have
+found:
+
+- Lesson 4 quoted `export class ProductCard { }` — an empty body the app does not have.
+- Lesson 5 quoted the price `<span>` as a standalone line, when in the app it sits inside a
+  `from …` wrapper.
+
+Two design notes paid for while writing it:
+
+- **The elision marker must be a line that is exactly `...`**, never the bare substring —
+  `Math.min(...xs)` and every other spread operator would split a block in half.
+- **A shared first line is not drift.** `import { Component } from '@angular/core';` opens half the
+  app and every invented example alike; the threshold is three matching opening lines.
+
+Current state: 15 blocks verbatim from the app, 6 illustrative — and all 6 are genuinely invented
+(the `Greeting` component, the binding cheat-sheet, the `<img>` comparison, the `[(ngModel)]`
+expansion, the old `@NgModule`).
+
+## Correction: there is no `*ngIf` in the demo app
+
+An early audit reported one surviving `*ngIf` in `app-navbar.html`. There is not. The match was
+inside a COMMENT — "unlike the old `*ngIf` it needs no import" — and grep does not know the
+difference. The app uses block control flow exclusively.
+
+Consequence for lesson 7: the legacy syntax is shown as an illustrative block, clearly labelled as
+what NOT to write, rather than quoted from the app. `check_snippets.py` classifies it correctly.
+
+## Lessons 6–8 (written 2026-08-21)
+
+| # | Slug | Words | Blocks | From the app | Illustrative |
+|---|------|-------|--------|---|---|
+| 6 | `angular-events` | ~900 | 7 | 7 | 0 |
+| 7 | `angular-control-flow` | ~1100 | 9 | 6 | 3 |
+| 8 | `angular-inputs-outputs` | ~1000 | 10 | 8 | 2 |
+
+Every illustrative block is something the app deliberately does not contain — `@switch`, the aliased
+`$index` form, the old `*ngIf`/`*ngFor`, and the two `model()` examples — so each is presented as an
+example rather than as a quote. That distinction is the point of `check_snippets.py`.
+
+Content notes worth keeping:
+
+- Lesson 6 explains `$any($event.target).value` in the menu search rather than quietly using it. It
+  is a real trade the app makes — `EventTarget` has no `value`, and the correct alternative is a
+  narrowing handler in the class.
+- Lesson 6 makes the `(ngSubmit)` vs `(submit)` point sharply: the latter reloads the page.
+- Lesson 7 leads on `track` being **mandatory**, which is the biggest practical difference from
+  `*ngFor` and the reason a whole family of performance complaints went away.
+- Lesson 8 carries the `NG0950` warning from `pizza/CLAUDE.md` — a required input is not readable
+  from a constructor.
+
+## Lessons 9–12 (written 2026-08-21)
+
+| # | Slug | Words | From the app | Illustrative |
+|---|------|-------|---|---|
+| 9 | `angular-content-projection` | 551 | 3 | 3 |
+| 10 | `angular-directives` | 555 | 4 | 2 |
+| 11 | `angular-pipes` | 680 | 4 | 1 |
+| 12 | `angular-styles` | 730 | 6 | 0 |
+
+Running total: **53 blocks verbatim from the app, 17 illustrative.**
+
+Lesson 12 is the first to use `language-scss`, which makes it the end-to-end test of the pipeline
+fix: it renders as `scss` with `$pizza-red` tokenised as a variable and `@use` as a keyword, not
+flattened to `plaintext`. The fix works.
+
+Content notes:
+
+- Lesson 9 explains the two things that surprise people about projection: content is created in the
+  CALLER's context, and it is created even when the slot is not rendered.
+- Lesson 12 leads on the Sass-variable vs custom-property distinction, because it is the most
+  useful idea in the app's stylesheet — build-time value versus runtime value — and carries the
+  `:host { display: block }` chart bug from `pizza/CLAUDE.md`.
+- Lesson 11 states plainly that the app uses `| async` zero times, and why: state is signals, so
+  there is no subscription for it to manage.
+
+## `check_snippets.py` scanned too little
+
+It only looked at `src/`, so a block quoted from **`angular.json` was never verified** — it was
+silently reported as `illustrative` instead. Now it scans the whole project (minus `node_modules`,
+`dist`, `.angular`, build and report output).
+
+The moment it did, it failed on that block: the post wrote `],` where `angular.json` has `]`, since
+`styles` is the last key in `options`. A one-character error, invisible to every other check, in a
+block presented as a quote. Fixed.
+
+**Lesson: a checker's scope is part of the checker.** Silently classifying an unverifiable block as
+"illustrative" is the failure mode to watch for — it looks like a pass.
+
+## Lessons 13–15 — Part 3, reactivity (written 2026-08-21)
+
+| # | Slug | Words | From the app | Illustrative |
+|---|------|-------|---|---|
+| 13 | `angular-signals` | 648 | 3 | 2 |
+| 14 | `angular-computed-effect` | 856 | 6 | 0 |
+| 15 | `angular-lifecycle` | 709 | 5 | 1 |
+
+Running total: **67 blocks verbatim from the app, 20 illustrative.**
+
+`cart.service.ts` carries this part almost single-handedly, and it is the best-commented file in the
+app. The three ideas the lessons take from it:
+
+- **Totals are derived, never stored.** One source of truth; a stored total is a second one that can
+  disagree and eventually will.
+- **`onCleanup` debounces the server write.** Clicking "+" three times is one PUT, not three,
+  because each change cancels the pending timer.
+- **The effect guards are plain fields, not signals** — `hydrationStarted`, `cartId`. Reading a
+  signal inside an effect subscribes to it, so guarding on a signal and then setting it schedules a
+  second run that has nothing to do. The file's own comments call this the equivalent of `useRef`.
+
+Lesson 15's angle is that the app has **one `ngOnInit` across thirty components and no other hook at
+all**, so the lesson is mostly about what replaced them: `computed` for `ngOnChanges`,
+`afterNextRender` for `ngAfterViewInit`, `DestroyRef` for `ngOnDestroy`. The `DestroyRef` argument
+worth keeping is that it can be injected in a plain function — `observedWidth` in `chart-size.ts`
+puts the `ResizeObserver` setup and its `disconnect()` on adjacent lines, which is the leak that
+pattern exists to prevent. It also carries the `NG0950` warning from `pizza/CLAUDE.md`.
+
+## Lessons 16–19 — Part 4, services and data (written 2026-08-21)
+
+| # | Slug | Words | From the app | Illustrative |
+|---|------|-------|---|---|
+| 16 | `angular-services-dependency-injection` | 810 | 5 | 2 |
+| 17 | `angular-http-client` | 650 | 6 | 1 |
+| 18 | `angular-interceptors` | 557 | 5 | 0 |
+| 19 | `angular-rxjs` | 795 | 3 | 1 |
+
+Running total: **86 blocks verbatim from the app, 24 illustrative.**
+
+Lesson 19 is the payoff for adding the menu search: it is built entirely around that one pipeline,
+naming the specific bug each operator prevents, and it closes by quoting the spec's
+`expect(first.cancelled).toBe(true)` — the only direct evidence `switchMap` cancels, since
+cancellation is invisible from the rendered output. Had the gap not been closed in the app, this
+lesson would have been prose.
+
+Other notes:
+
+- Lesson 16 has no `InjectionToken` from the app because there isn't one, and says so: the app's
+  only configuration is a build-time constant, so it is a plain import. A token buys runtime or
+  test-time swapping — worth it when needed, ceremony when not.
+- Lesson 17 leads with the two `fetch` differences that actually catch people: an observable is
+  COLD (a discarded `get()` makes no request), and a non-2xx is an error rather than a response to
+  inspect. It carries the `hasValue()` gotcha in full.
+- Lesson 18 frames the `startsWith('/api/')` check as a security boundary rather than tidiness —
+  an interceptor sees requests to every origin, so sending the bearer token to Stripe is one
+  missing check away. The app's own spec asserts exactly that.
+
+## Lessons 20–28 and 1–3 — the rest of the track (written 2026-08-21)
+
+The track is now complete in draft. Lessons 1–3 were written **last, deliberately**: lesson 1 is the
+track index, and its lesson list is **generated from `manifest.POSTS`** rather than typed, so it
+cannot drift from the manifest. Verified: 28 links, correct order, none broken, none missing.
+
+### Verification of the whole track
+
+Every one of the 28 pages: HTTP 200, no `plaintext` code block, headings anchored, **4,210
+highlighted tokens** in total. `check_content.py` reports *every code sample round-trips
+byte-for-byte*; `check_snippets.py` reports **145 blocks verbatim from the demo app, 30
+illustrative** — and every illustrative one is something the app deliberately does not contain.
+
+Two more real errors the drift checker caught while finishing, neither findable any other way:
+
+- Lesson 2 quoted `angularCompilerOptions` closing with `}` where `tsconfig.json` has `},`.
+- Lesson 12 quoted the `styles` array closing with `],` where `angular.json` has `]`.
+
+Both were one character, in blocks presented to readers as quotes.
+
+### Deliberate shapes worth not "fixing"
+
+- **`angular-interview-questions` has zero code blocks.** It is spoken answers, and adding snippets
+  would work against what it is for.
+- **`angular-get-started` has only two.** It is the index plus orientation.
+- **Post length varies 590–1467 words.** Length follows the topic: templates genuinely is a bigger
+  subject than forms-the-template-driven-kind. The README says keep posts to the point.
+
+## Gotcha: a new post 404s until `next dev` restarts
+
+`npm run dev` runs `sync-content.sh` **once, at startup**. Seeding a new post while the server is
+running leaves it 404ing at `:3000` — the content is in S3 but not in the local `content/` tree, and
+the dynamic route was generated without it. Restart the dev server after every `seed.py --only`.
+Editing an existing post does not need this; adding one does.
+
 ## Next steps
 
-1. Re-base `manifest.START_DATE` so lesson 28 lands on the intended publish date.
+1. **Read the drafts.** 26 of 28 have never been reviewed by a human.
+2. Re-base `manifest.START_DATE` so lesson 28 lands on the intended publish date.
 2. Author `posts/`, running `check_content.py` as each lands. Snippets copied verbatim from the app.
 3. Seed `--env local --write`, review at `:3000`.
 4. Seed `--env prod --write --force-dates` (the flag is needed **once**, for `angular-component`),

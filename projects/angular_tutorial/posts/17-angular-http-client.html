@@ -1,0 +1,109 @@
+<p>Every real application is mostly API calls. Angular ships a client for them, and it is
+provided once at bootstrap:</p>
+
+<pre class="language-typescript"><code class="language-typescript">provideHttpClient(withFetch(), withInterceptors([apiInterceptor])),</code></pre>
+
+<p><code>withFetch()</code> puts it on the Fetch API rather than <code>XMLHttpRequest</code>.
+<code>withInterceptors()</code> takes the functions every request passes through — the next lesson.</p>
+
+<h2>The basic shape</h2>
+
+<pre class="language-typescript"><code class="language-typescript">get&lt;T&gt;(path: string): Observable&lt;T&gt; {
+  return this.http.get&lt;T&gt;(path);
+}
+
+post&lt;T&gt;(path: string, body?: unknown): Observable&lt;T&gt; {
+  return this.http.post&lt;T&gt;(path, body ?? null);
+}</code></pre>
+
+<p>Two things to notice, because both differ from <code>fetch</code>.</p>
+
+<p><strong>It returns an observable, not a promise.</strong> Nothing is sent until something
+subscribes — an observable is <em>cold</em>. A <code>get()</code> whose result is discarded makes no
+request at all, which is a genuine "why is nothing happening" moment the first time.</p>
+
+<p><strong>JSON is parsed for you</strong>, and typed by the generic. There is no
+<code>await res.json()</code> step, and no <code>res.ok</code> check either: a non-2xx status is an
+<em>error</em> on the observable rather than a successful response you have to inspect. That last
+point is the one people miss when moving from <code>fetch</code>.</p>
+
+<h2>Getting a value out</h2>
+
+<p>Three ways, and the app uses all three deliberately.</p>
+
+<p><strong><code>firstValueFrom</code></strong> when the calling code is already async:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const [addresses, methods] = await Promise.all([
+  firstValueFrom(this.profileApi.listAddresses()),
+  firstValueFrom(this.profileApi.listPaymentMethods()),
+]);</code></pre>
+
+<p>Two independent requests, so they run concurrently rather than one after the other.</p>
+
+<p><strong><code>toSignal</code></strong> when the result should drive a template — covered in
+the RxJS lesson. <strong><code>| async</code></strong> in the template, which is the historical way
+and which this app never uses.</p>
+
+<h2>httpResource</h2>
+
+<p>This is the interesting one, and it is what the menu is built on:</p>
+
+<pre class="language-typescript"><code class="language-typescript">private readonly productsResource = httpResource&lt;Product[]&gt;(() =&gt; '/api/products', {
+  defaultValue: [],
+});</code></pre>
+
+<p>It gives back signals for the value, the loading state and the error; it cancels an in-flight
+request when the URL changes; and it re-fetches on <code>reload()</code>. The React app's
+<code>MenuContext</code> writes all of that by hand — a loading flag, an error branch, an
+<code>AbortController</code>, and a cleanup function — and its own comment says this is where a data
+library would normally go. Angular ships the library.</p>
+
+<p><strong>The URL is a function, not a string</strong>, and that is the point: read a signal
+inside it and the resource re-fetches whenever that signal changes. These three depend on nothing, so
+they fetch once and then only on demand.</p>
+
+<p>⚠️ <code>httpResource</code> is marked <code>@experimental</code> in Angular 21. It is used
+here because it is exactly the concept the file exists to teach, and because this app pins its
+versions. Weigh that label before copying it into production.</p>
+
+<h3>The gotcha that cost a blank page</h3>
+
+<pre class="language-typescript"><code class="language-typescript">readonly products = computed(() =&gt;
+  this.productsResource.hasValue() ? this.productsResource.value() : [],
+);</code></pre>
+
+<p><strong>Reading <code>resource.value()</code> THROWS while the resource is in an error
+state</strong> — a <code>ResourceValueError</code> — even with <code>defaultValue: []</code> set. The
+default covers loading and idle, not failure.</p>
+
+<p>Left unguarded, a backend that is down does not render the carefully computed "Could not load
+the menu" alert; it throws inside the template and blanks the page. <code>hasValue()</code> is the
+guard, and it is why these are <code>computed</code> rather than the resource's own signal.</p>
+
+<h2>Deriving loading and error</h2>
+
+<pre class="language-typescript"><code class="language-typescript">readonly loading = computed(
+  () =&gt;
+    this.productsResource.isLoading() ||
+    this.toppingsResource.isLoading() ||
+    this.crustsResource.isLoading(),
+);</code></pre>
+
+<p>Three requests, fired concurrently — <code>Promise.all</code> without writing one — and the
+screen is "loading" until all three land, because a menu with crusts but no pizzas is not a menu
+anyone can use.</p>
+
+<h2>Query parameters</h2>
+
+<p><code>HttpClient</code> takes a <code>params</code> option, which encodes for you:</p>
+
+<pre class="language-typescript"><code class="language-typescript">this.http.get&lt;Product[]&gt;('/api/products', { params: { type: 'PIZZA' } });</code></pre>
+
+<p>Building the string by hand is fine when it is one value and you encode it, as the menu search
+does with <code>encodeURIComponent</code>. For anything conditional, the options object is safer.</p>
+
+<h2>Where error handling goes</h2>
+
+<p>Not here. Every request in this app passes through one interceptor that converts failures into
+a single <code>ApiError</code> type, so no service or component unpicks Angular's transport wrapper.
+That is the next lesson.</p>
