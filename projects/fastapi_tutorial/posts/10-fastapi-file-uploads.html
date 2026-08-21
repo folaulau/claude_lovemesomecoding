@@ -1,0 +1,448 @@
+<p>An upload endpoint is where user input stops being JSON your models can validate and starts being
+arbitrary bytes headed for your disk. It is the endpoint most likely to be written quickly and the
+one most worth writing carefully. This lesson builds StayHub's, guard by guard, with a test firing
+each one.</p>
+
+<h2>The three-line version, and what is wrong with it</h2>
+
+<pre class="language-python"><code class="language-python">@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    content = await file.read()
+    Path("uploads", file.filename).write_bytes(content)
+    return {"filename": file.filename}</code></pre>
+
+<p>That works, and it has four separate problems:</p>
+
+<ul>
+  <li><code>await file.read()</code> loads the entire upload into memory. One 2&nbsp;GB request is
+      2&nbsp;GB of RSS, and ten concurrent ones kill the process.</li>
+  <li>There is no size limit at all.</li>
+  <li><code>file.filename</code> is attacker-controlled, and
+      <code>"../../app/main.py"</code> is a valid string.</li>
+  <li>Nothing checks what the bytes actually are, so this happily stores an executable.</li>
+</ul>
+
+<p>Each of those has a fix, and none costs much.</p>
+
+<h2>UploadFile, and why the route is async</h2>
+
+<pre class="language-python"><code class="language-python">@router.post("/property-image/{public_id}", response_model=UploadResponse)
+async def upload_property_image(
+    public_id: uuid.UUID,
+    host: HostUser,
+    db: DbSession,
+    file: UploadFile = File(...),
+) -&gt; UploadResponse:
+    """Upload one photo for a listing you own.
+
+    ⚠️ `async def` here, unlike most routes in this app, because `UploadFile`'s read methods are
+    async &mdash; awaiting them in a sync route is not possible, and reading `file.file` directly blocks
+    the event loop for the length of the upload.
+    """</code></pre>
+
+<p><code>UploadFile</code> is a <code>SpooledTemporaryFile</code>: small uploads stay in memory,
+large ones spill to a temporary file on disk automatically. So the framework has already solved the
+memory problem &mdash; right up until you call <code>await file.read()</code> with no argument and
+pull the whole thing back into a bytes object.</p>
+
+<p>Multipart parsing needs <code>python-multipart</code> installed. Without it the error arrives at
+<em>import</em> time rather than on the first request, which is the friendlier failure.</p>
+
+<p>Note also that this route takes <code>host: HostUser</code> and checks ownership before doing
+anything else. An upload endpoint without authentication is an open file host, and they get found
+remarkably quickly.</p>
+
+<h2>Guard 1: the declared type</h2>
+
+<pre class="language-python"><code class="language-python">ALLOWED_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}</code></pre>
+
+<p>An <strong>allow-list, not a block-list</strong>. A block-list is a promise to have thought of
+every dangerous type, which nobody can keep &mdash; and the list of things a browser will execute
+grows over time.</p>
+
+<p>The dictionary does double duty: it decides what is acceptable and supplies the extension, so
+the extension can never come from the client.</p>
+
+<pre class="language-python"><code class="language-python">    if file.content_type not in ALLOWED_TYPES:
+        raise ApiException(
+            f"Upload a JPEG, PNG or WebP image. That file says it is {file.content_type!r}."
+        )</code></pre>
+
+<p>"says it is" is doing deliberate work in that message, because the next guard exists precisely
+because the file is only claiming.</p>
+
+<h2>Guard 2: what the bytes actually are</h2>
+
+<pre class="language-python"><code class="language-python">def _sniff(head: bytes) -&gt; str | None:
+    """Identify the format from the file's own first bytes.
+
+    ⚠️ `UploadFile.content_type` is just the Content-Type the CLIENT put in the multipart part.
+    It is not detected, not validated, and trivially forged &mdash; `curl -F 'file=@shell.php;
+    type=image/png'` sets it to whatever you like. Checking only that header is the same as not
+    checking.
+    """</code></pre>
+
+<p>This is the guard that matters. <code>content_type</code> is a claim typed by the client, and
+forging it is one <code>curl</code> flag:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -F 'file=@shell.php;type=image/png' localhost:8000/api/v1/uploads/property-image/$ID</code></pre>
+
+<p>Real formats announce themselves in their first bytes:</p>
+
+<pre class="language-python"><code class="language-python">MAGIC = {
+    b"\xff\xd8\xff": "image/jpeg",
+    b"\x89PNG\r\n\x1a\n": "image/png",
+}</code></pre>
+
+<pre class="language-python"><code class="language-python">    head = await file.read(32)
+    sniffed = _sniff(head)
+    if sniffed is None or sniffed != file.content_type:
+        raise ApiException("That file is not the image type it claims to be.")
+    await file.seek(0)</code></pre>
+
+<p>Three details. Only 32 bytes are read, which is enough for any signature and cheap. The sniffed
+type must <strong>match</strong> the declared one rather than merely be some image &mdash;
+otherwise a PNG labelled JPEG passes, and something downstream that trusts the extension is
+wrong. And <code>await file.seek(0)</code> rewinds, or the copy below starts 32 bytes in and writes
+a corrupt file.</p>
+
+<p>WebP is handled separately because its signature is a container rather than a fixed prefix:</p>
+
+<pre class="language-python"><code class="language-python">    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"</code></pre>
+
+<p>A production service would use <code>python-magic</code> or Pillow rather than a hand-rolled
+table. Sniffing four formats by hand is fine; sniffing forty is somebody else's solved problem. And
+if the files are images you will re-encode anyway, decoding and re-saving through Pillow is the
+strongest guarantee available &mdash; whatever comes out is definitely an image.</p>
+
+<h2>Guard 3: the filename</h2>
+
+<pre class="language-python"><code class="language-python">    filename = f"{uuid.uuid4().hex}{ALLOWED_TYPES[file.content_type]}"
+    target = target_dir / filename</code></pre>
+
+<p>The client's filename is never used to build a path:</p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ The client's filename is NEVER used to build the path. `file.filename` is attacker
+    # controlled and "../../app/main.py" is a valid string. A generated uuid plus an extension
+    # taken from OUR allow-list means the path cannot be influenced at all.</code></pre>
+
+<p>Sanitising it is the tempting alternative and a worse one &mdash; every sanitiser has a bypass,
+and the list of things to strip includes null bytes, encoded separators, Windows device names and
+reserved characters that differ per filesystem. Generating the name removes the question.</p>
+
+<p>It also fixes a mundane bug for free: two people uploading <code>photo.jpg</code> no longer
+overwrite each other.</p>
+
+<p>Keep the original in the database if you need to show it &mdash; as data, never as a path.</p>
+
+<h2>Guard 4: size, checked while writing</h2>
+
+<pre class="language-python"><code class="language-python">    size = 0
+    try:
+        with target.open("wb") as out:
+            while chunk := await file.read(CHUNK):
+                size += len(chunk)
+                if size &gt; settings.max_upload_bytes:
+                    raise ApiException(
+                        f"That image is larger than "
+                        f"{settings.max_upload_bytes // (1024 * 1024)} MB."
+                    )
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()</code></pre>
+
+<p>Streamed a megabyte at a time, so memory use is constant regardless of upload size.</p>
+
+<p>The size is checked <strong>during</strong> the write, not before it, and that is not fussiness:
+there is no trustworthy length available up front. <code>Content-Length</code> is a claim, and a
+chunked upload does not send one at all. Counting what you actually receive is the only number that
+cannot lie.</p>
+
+<p>And the <code>except</code> block matters as much as the check. Aborting mid-stream leaves a
+partial file on disk &mdash; half an image is still bytes, and the next request would serve it. One
+<code>unlink</code> in the failure path is the difference between a rejected upload and a slow disk
+leak, five megabytes at a time.</p>
+
+<p>A limit belongs at the edge too. nginx's <code>client_max_body_size</code> rejects an oversized
+request before it reaches Python at all, which is much cheaper. The application-level check stays
+regardless, because the proxy configuration is not the application's guarantee.</p>
+
+<h2>Every guard, fired</h2>
+
+<p>A security control that has never been observed to reject anything is a comment:</p>
+
+<pre class="language-python"><code class="language-python">    def test_a_forged_content_type(self, client, listing):
+        """The guard that matters: a PHP payload labelled image/png.
+
+        Checking only `file.content_type` accepts this, because that header is whatever the client
+        typed. Sniffing the leading bytes is what catches it.
+        """
+        r = post(client, listing, NOT_AN_IMAGE, "shell.png", "image/png")
+        assert r.status_code == 400
+        assert "not the image type it claims" in r.json()["message"]</code></pre>
+
+<p>The fixtures are the smallest thing that is genuinely each format:</p>
+
+<pre class="language-python"><code class="language-python">PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+WEBP = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 64
+NOT_AN_IMAGE = b"&lt;?php system($_GET['c']); ?&gt;"</code></pre>
+
+<p>Then one test per guard, including the ones easy to forget:</p>
+
+<pre class="language-python"><code class="language-python">    def test_the_stored_name_is_generated_not_the_clients(self, client, listing):
+        body = post(client, listing, PNG, "my holiday photo.png", "image/png").json()
+        assert "holiday" not in body["filename"]
+        assert body["filename"].endswith(".png")</code></pre>
+
+<pre class="language-python"><code class="language-python">    def test_an_oversize_upload_leaves_no_partial_file(self, client, listing):
+        post(client, listing, PNG + b"\x00" * (settings.max_upload_bytes + 1), "b.png", "image/png")
+        stored = Path(settings.upload_dir) / str(listing.public_id)
+        assert not any(stored.iterdir()) if stored.exists() else True</code></pre>
+
+<p>One thing these tests have to do that the rest of the suite does not: clean up. Files written to
+disk are outside the database transaction, so the rollback does not undo them:</p>
+
+<pre class="language-python"><code class="language-python">    shutil.rmtree(Path(settings.upload_dir) / str(listing.public_id), ignore_errors=True)</code></pre>
+
+<h2>Several files, and files beside fields</h2>
+
+<p>A list of uploads is a list annotation:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/property-images/{public_id}")
+async def upload_many(
+    public_id: uuid.UUID,
+    host: HostUser,
+    db: DbSession,
+    files: list[UploadFile] = File(...),
+):
+    if len(files) &gt; 10:
+        raise ApiException("Upload up to 10 images at a time.")
+    ...</code></pre>
+
+<p>Bound the count explicitly. The per-file size limit does nothing about a thousand small files,
+and "how many" is a separate question from "how big".</p>
+
+<p>Mixing a file with ordinary fields needs <code>Form</code>, because the whole body is now
+multipart rather than JSON:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/property-image/{public_id}")
+async def upload_with_caption(
+    public_id: uuid.UUID,
+    host: HostUser,
+    file: UploadFile = File(...),
+    alt_text: Annotated[str, Form(max_length=255)] = "",
+    is_cover: Annotated[bool, Form()] = False,
+):
+    ...</code></pre>
+
+<p>You cannot combine <code>Form</code> with a pydantic body model &mdash; a request has one body
+and one encoding. When the metadata is complex, the usual shape is two calls: upload the file, get
+an id back, then PATCH the record with the details as JSON. StayHub does exactly that, which is why
+its upload endpoint returns a URL and its listing update takes image records separately.</p>
+
+<h2>Where the bytes actually go</h2>
+
+<pre class="language-python"><code class="language-python">    target_dir = Path(settings.upload_dir) / str(prop.public_id)
+    target_dir.mkdir(parents=True, exist_ok=True)</code></pre>
+
+<p>One directory per listing rather than one flat pile. Two reasons, both practical: deleting a
+listing becomes one <code>rmtree</code>, and filesystems get unhappy long before you expect when a
+single directory holds hundreds of thousands of entries.</p>
+
+<p>At larger scale the usual scheme is a hashed prefix &mdash; <code>ab/cd/abcd1234…</code> &mdash;
+which keeps any one directory small without needing a natural grouping. Object storage makes the
+question mostly moot, since a bucket has no directories, only key prefixes.</p>
+
+<p>The response hands back a URL rather than a path:</p>
+
+<pre class="language-python"><code class="language-python">    return UploadResponse(
+        url=f"/static/uploads/{prop.public_id}/{filename}",
+        filename=filename,
+        content_type=file.content_type,
+        size_bytes=size,
+    )</code></pre>
+
+<p>Returning a filesystem path would leak your directory layout and give the client something it
+cannot use. A URL is the only form that survives moving to a CDN later.</p>
+
+<h2>What a determined uploader will try</h2>
+
+<p>Worth knowing the shape of the attacks the guards above are actually for.</p>
+
+<p><strong>A polyglot file.</strong> Valid PNG header, valid PHP body &mdash; passes a magic-byte
+check and executes if anything ever runs it as code. Sniffing does not stop this; not executing
+uploads does. Serve them from a different origin as static files, never from a directory your
+application interprets.</p>
+
+<p><strong>SVG.</strong> It is an image and also a document that can contain
+<code>&lt;script&gt;</code>. Rendered inline from your own origin, it is stored XSS. StayHub's
+allow-list excludes it deliberately; if you must accept it, sanitise it with something like
+<code>bleach</code> and serve it with
+<code>Content-Disposition: attachment</code>.</p>
+
+<p><strong>A decompression bomb.</strong> A small file that expands enormously when decoded &mdash;
+a 10&nbsp;KB PNG that is 50,000 by 50,000 pixels. The size limit passes; the image library
+allocates gigabytes. If you process images, cap the dimensions before decoding: Pillow's
+<code>Image.MAX_IMAGE_PIXELS</code> exists for exactly this.</p>
+
+<p><strong>Metadata.</strong> Photographs carry EXIF, which routinely includes GPS coordinates. On
+a listings site that means publishing the exact location of somebody's home, from a field nobody
+looked at. Stripping EXIF on upload is one line with Pillow and worth doing by default.</p>
+
+<p>The pattern across all four: <strong>the file being the right type does not make its contents
+safe.</strong> Validate the type, then treat the bytes as hostile anyway.</p>
+
+<h2>Deleting, and the path that reaches out</h2>
+
+<p>A delete endpoint takes the filename from the URL, so it is a path-traversal target:</p>
+
+<pre class="language-python"><code class="language-python">    base = (Path(settings.upload_dir) / str(prop.public_id)).resolve()
+    target = (base / filename).resolve()
+    if not target.is_relative_to(base):
+        raise NotFoundException("Image not found.")</code></pre>
+
+<p>Resolve both sides and check containment. That is the check that actually holds; string-matching
+for <code>".."</code> does not, because of encodings, symlinks and <code>"....//"</code>, which
+collapses to <code>"../"</code> under a naive strip:</p>
+
+<pre class="language-python"><code class="language-python">        for attempt in ["..%2F..%2F.env", "....//....//.env", "%2e%2e%2f.env"]:
+            r = client.delete(f"/api/v1/uploads/property-image/{listing.public_id}/{attempt}")
+            assert r.status_code == 404, attempt
+        assert Path(".env").exists()</code></pre>
+
+<p>The last assertion is the one that makes the test mean something: the file it was reaching for
+is still there.</p>
+
+<h2>Serving what you stored</h2>
+
+<pre class="language-python"><code class="language-python">    ⚠️ In production a request for a static file should never reach Python. nginx, a CDN or S3
+    serves these; uvicorn doing it burns a worker on a job the kernel does better. It is here so
+    the demo runs with one command.</code></pre>
+
+<p>Two rules for serving uploads, both about the same danger. Serve them from a
+<strong>different origin</strong> &mdash; a separate domain or a bucket &mdash; so that anything
+that does slip through cannot run as your site. And send <code>Content-Disposition:
+attachment</code> plus <code>X-Content-Type-Options: nosniff</code> for anything not displayed
+inline, so a browser downloads it rather than deciding for itself what it is.</p>
+
+<h2>Progress, and slow clients</h2>
+
+<p>Two operational realities that only show up with real users on real connections.</p>
+
+<p><strong>A slow upload occupies a worker for its whole duration.</strong> Someone on a poor mobile
+connection sending 5&nbsp;MB can hold a connection for a minute, and a handful of those consume
+capacity that has nothing to do with your code being fast. This is what a reverse proxy is for:
+nginx buffers the request and hands it to the application complete, so the application deals with
+5&nbsp;MB arriving instantly rather than a trickle over sixty seconds.</p>
+
+<p><strong>Timeouts have to allow for it.</strong> A proxy read timeout of 30 seconds rejects a
+legitimate upload from a slow connection, and the client sees a 504 it cannot interpret. Upload
+endpoints usually need their own, longer, timeout &mdash; which is another argument for keeping
+them on their own path prefix.</p>
+
+<p>Reporting progress needs the browser rather than the server. <code>fetch</code> cannot report
+upload progress at all; <code>XMLHttpRequest</code> can:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const xhr = new XMLHttpRequest()
+xhr.upload.addEventListener('progress', (e) =&gt; {
+  if (e.lengthComputable) setPercent(Math.round((e.loaded / e.total) * 100))
+})
+xhr.open('POST', `${API}/api/v1/uploads/property-image/${id}`)
+xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+xhr.send(formData)</code></pre>
+
+<p>Nothing on the server side is involved. It is worth knowing because "add an upload progress bar"
+sounds like an API change and is not.</p>
+
+<h2>What the database should store</h2>
+
+<p>The endpoint writes bytes and returns a URL; something still has to record that the listing has
+an image. StayHub keeps that separate:</p>
+
+<pre class="language-python"><code class="language-python">class PropertyImage(Base, TimestampMixin):
+    __tablename__ = "property_images"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    property_id: Mapped[int] = mapped_column(
+        ForeignKey("properties.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    alt_text: Mapped[str | None] = mapped_column(String(255))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_cover: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)</code></pre>
+
+<p>A URL rather than a path, so moving to a CDN changes stored values rather than code.
+<code>sort_order</code> so the gallery has a defined order. And <code>is_cover</code>, because "the
+first one" is not a decision anybody made.</p>
+
+<p>That split creates the one consistency problem uploads always have: <strong>the file and the row
+are two writes to two systems.</strong> Either can succeed alone.</p>
+
+<p>An orphaned file wastes disk and is otherwise harmless. A row pointing at a file that does not
+exist is a broken image on a page. So write the file first and the row second &mdash; failing in the
+direction that is merely untidy rather than visibly broken. Then sweep periodically for files with
+no row, exactly as lesson 11's index reconciliation does: pick which system is the truth and make
+repair cheap.</p>
+
+<h2>The whole endpoint, in order</h2>
+
+<p>Assembled, the flow is short enough to hold in your head, and the ordering is deliberate at every
+step:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">1. authenticate            HostUser — an open upload endpoint gets found
+2. authorize               the listing exists and is yours, else 404
+3. check the declared type against an allow-list
+4. read 32 bytes, sniff, require a MATCH, seek(0)
+5. generate a filename     never the client's
+6. stream in 1 MiB chunks, counting as you go
+7. abort over the limit, and unlink the partial file
+8. close the upload
+9. return a URL            never a path</code></pre>
+
+<p>Steps 1 and 2 come first because everything after them costs something. Rejecting an
+unauthenticated upload before reading a byte is the difference between a cheap 401 and a 5&nbsp;MB
+transfer you then throw away.</p>
+
+<p>Step 4 before step 6 because sniffing is 32 bytes and streaming is the whole file. Cheap checks
+first is a general principle and unusually visible here.</p>
+
+<p>And step 7 exists because step 6 can fail halfway. Every guard that rejects <em>during</em> an
+operation needs a matching cleanup, or the rejection leaves debris.</p>
+
+<h2>Local disk is the part that does not survive</h2>
+
+<p>Everything above is unchanged in production except where the bytes go. Local disk fails on two
+counts: it does not survive a container restart, and it is not shared between replicas &mdash; so an
+image uploaded to instance A is a 404 from instance B.</p>
+
+<p>The usual answer is object storage, and the endpoint barely changes:</p>
+
+<pre class="language-python"><code class="language-python"># the streaming loop above is unchanged — only the destination differs.
+# instead of `with target.open("wb") as out: ... out.write(chunk)`:
+
+buffer = io.BytesIO()
+...
+buffer.seek(0)
+s3.upload_fileobj(buffer, settings.bucket, f"listings/{prop.public_id}/{filename}")</code></pre>
+
+<p>Every guard survives; only the destination moves. For genuinely large files, swap the buffer for
+a <code>MultipartUpload</code> so the bytes never accumulate anywhere &mdash; the chunk loop is
+already the right shape for it.</p>
+
+<p>The better pattern at scale skips your server entirely: issue a <strong>presigned URL</strong>
+and let the browser upload straight to the bucket. Bandwidth never touches your API, and a slow
+upload stops occupying a worker. The trade is that your validation no longer sees the bytes &mdash;
+so the checks move to a post-upload hook, and the presigned URL itself has to carry a content-type
+and size condition.</p>
+
+<p>Next: <strong>background tasks</strong> &mdash; the other thing an upload endpoint usually wants,
+and the framework feature most often mistaken for a job queue.</p>

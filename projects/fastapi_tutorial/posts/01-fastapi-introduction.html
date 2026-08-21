@@ -1,0 +1,526 @@
+<p>FastAPI reads the type hints you were going to write anyway and uses them to validate incoming
+requests, serialise outgoing responses, and generate an OpenAPI document with interactive
+documentation attached. One annotation does all three jobs. That is the whole pitch, and it is
+worth being precise about what it does and does not mean before spending eighteen lessons on it.</p>
+
+<h2>What you actually get</h2>
+
+<p>Here is a complete endpoint. Nothing has been elided:</p>
+
+<pre class="language-python"><code class="language-python">from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+
+class Quote(BaseModel):
+    nights: int = Field(ge=1, le=365)
+    nightly_rate: float = Field(gt=0)
+
+
+@app.post("/quote")
+def quote(payload: Quote) -&gt; dict:
+    return {"total": payload.nights * payload.nightly_rate}</code></pre>
+
+<p>That is a working JSON API. Send it something valid and it answers:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST localhost:8000/quote \
+  -H 'Content-Type: application/json' \
+  -d '{"nights": 3, "nightly_rate": 129.50}'</code></pre>
+
+<pre class="language-json"><code class="language-json">{"total":388.5}</code></pre>
+
+<p>Send it something wrong and you did not have to write the error:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST localhost:8000/quote \
+  -H 'Content-Type: application/json' \
+  -d '{"nights": 0, "nightly_rate": 129.50}'</code></pre>
+
+<pre class="language-json"><code class="language-json">{"detail":[{"type":"greater_than_equal","loc":["body","nights"],
+  "msg":"Input should be greater than or equal to 1","input":0,
+  "ctx":{"ge":1}}]}</code></pre>
+
+<p>A 422, naming the field, the rule it broke, and the value it received. The <code>ge=1</code> that
+produced it is also the documentation, and also the type the editor autocompletes against. This is
+the idea the whole framework is built on: <strong>declare the shape once, and let it be enforcement,
+documentation and typing simultaneously.</strong></p>
+
+<h2>The type hints it depends on</h2>
+
+<p>Everything above rests on annotations, so it is worth being sure of the four forms that appear
+constantly. If these are already familiar, skip ahead.</p>
+
+<pre class="language-python"><code class="language-python">from typing import Annotated
+
+# 1. Plain types. FastAPI converts and validates against these.
+def f(listing_id: int, city: str, rate: float, live: bool): ...
+
+# 2. Collections, parameterised. Python 3.9+ uses the builtins directly &mdash;
+#    typing.List and typing.Dict are the old spelling and no longer needed.
+def g(tags: list[str], counts: dict[str, int]): ...
+
+# 3. Optional, spelled with `|`. Python 3.10+ replaces Optional[str].
+#    ⚠️ `| None` makes it nullable; the `= None` is what makes it OPTIONAL.
+def h(state: str | None = None): ...
+
+# 4. Annotated: a type PLUS metadata. The type still reads first, and the
+#    extra argument is what FastAPI inspects for rules.
+def i(q: Annotated[str, Query(max_length=200)] = None): ...</code></pre>
+
+<p>The third one catches people. <code>state: str | None</code> with no default is a
+<em>required</em> parameter that is allowed to be null &mdash; the caller must send it, and may
+send <code>null</code>. Adding <code>= None</code> is what makes it possible to omit. The
+distinction is invisible in Python and very visible in a 422.</p>
+
+<p>The fourth is the form to standardise on. <code>Annotated</code> keeps the type where a reader
+expects it and hangs the framework's metadata off the side, which means the same function is still
+readable &mdash; and still callable &mdash; outside FastAPI. The older style put
+<code>Query(...)</code> in the default slot, which works but quietly makes the default value a
+<code>Query</code> object to anyone calling the function directly. Lesson 2 goes into this
+properly; StayHub uses <code>Annotated</code> throughout.</p>
+
+<p>None of this is checked at runtime by Python itself. Annotations are inert metadata; FastAPI
+reads them deliberately and acts on them. That is why a type hint here does something, while the
+same hint in an ordinary function does nothing at all.</p>
+
+<h2>What it does not do</h2>
+
+<p>Tutorials tend to stop at the paragraph above, which leaves a misleading impression. FastAPI is
+a <em>web layer</em>. It has no opinion about, and no help for:</p>
+
+<ul>
+  <li><strong>Your database.</strong> There is no ORM, no models, no migrations. SQLAlchemy and
+      Alembic are separate choices you wire up yourself &mdash; lesson 6.</li>
+  <li><strong>Project structure.</strong> The docs show one file. What happens at forty endpoints
+      is left to you, and it is the question people get wrong most often &mdash; lesson 4.</li>
+  <li><strong>Background work.</strong> <code>BackgroundTasks</code> exists, but it is not a queue
+      and does not pretend to be &mdash; lesson 11.</li>
+  <li><strong>Admin interfaces, templating, sessions, CSRF.</strong> Django ships these. FastAPI
+      does not.</li>
+</ul>
+
+<p>It is also worth saying plainly: <strong>FastAPI is not fast because it is async.</strong> The
+name and the benchmarks encourage that reading, and it leads directly to the most common
+performance mistake in the framework &mdash; writing <code>async def</code> everywhere and then
+making a blocking call inside it. Lesson 12 measures what async actually buys, including a case in
+this very codebase where the concurrent version is <strong>two and a half times slower</strong>.</p>
+
+<h2>Why not Flask, or Django?</h2>
+
+<p>All three are reasonable. They solve different problems, and the honest comparison is narrower
+than the marketing on any of them.</p>
+
+<p>Here is the same endpoint in Flask, written to the same standard &mdash; validating input and
+returning a useful error:</p>
+
+<pre class="language-python"><code class="language-python">from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+
+@app.post("/quote")
+def quote():
+    data = request.get_json(silent=True) or {}
+
+    nights = data.get("nights")
+    if not isinstance(nights, int) or not 1 &lt;= nights &lt;= 365:
+        return jsonify(error="nights must be an integer between 1 and 365"), 422
+
+    rate = data.get("nightly_rate")
+    if not isinstance(rate, (int, float)) or rate &lt;= 0:
+        return jsonify(error="nightly_rate must be greater than 0"), 422
+
+    return jsonify(total=nights * rate)</code></pre>
+
+<p>Fifteen lines against seven, and the fifteen are the ones that rot. The rules now live in
+imperative checks rather than in a declaration, so nothing can read them &mdash; no documentation
+is generated, no editor knows the shape, and the next field added is another four lines somebody
+has to remember to write. Flask has extensions that close this gap; the point is that FastAPI's
+version <em>is</em> the type hint you would have written regardless.</p>
+
+<p>Where each one earns its place:</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>FastAPI</th><th>Flask</th><th>Django</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Best at</td><td>JSON APIs</td><td>small apps, total control</td><td>full web apps</td></tr>
+    <tr><td>Validation</td><td>built in, from type hints</td><td>an extension, by hand</td><td>forms / DRF serializers</td></tr>
+    <tr><td>API docs</td><td>generated, always current</td><td>an extension</td><td>an extension (DRF)</td></tr>
+    <tr><td>ORM</td><td>none &mdash; bring your own</td><td>none &mdash; bring your own</td><td>included, excellent</td></tr>
+    <tr><td>Admin UI</td><td>none</td><td>none</td><td>included, the killer feature</td></tr>
+    <tr><td>Async</td><td>native</td><td>bolted on</td><td>partial</td></tr>
+    <tr><td>Learning curve</td><td>low, if you know type hints</td><td>lowest</td><td>highest</td></tr>
+  </tbody>
+</table>
+
+<p>The short version: if the thing you are building serves HTML to browsers and needs an admin
+interface, Django will save you months and this is the wrong framework. If it serves JSON to a
+frontend or to other services, FastAPI is very hard to beat. StayHub &mdash; the app this track
+uses &mdash; is the second kind: two React apps talk to it, and it never renders a page.</p>
+
+<h2>About the speed claims</h2>
+
+<p>FastAPI's benchmarks are real but frequently misread. What they measure is framework overhead
+&mdash; the microseconds between a request arriving and your function being called. FastAPI is fast
+there because Starlette is fast and pydantic v2's validation core is compiled Rust.</p>
+
+<p>That overhead is almost never what makes an API slow. A single unindexed query, or one N+1 in a
+list endpoint, costs more than the framework will spend all day. Choosing FastAPI for throughput
+and then writing the data layer carelessly is the standard way to end up with a slow application
+built on a fast framework.</p>
+
+<p>Lesson 6 covers the N+1 problem, and lesson 12 puts an actual number on the async question.</p>
+
+<h2>Installing it</h2>
+
+<pre class="language-bash"><code class="language-bash">python3 -m venv .venv
+source .venv/bin/activate
+pip install "fastapi==0.115.5" "uvicorn[standard]==0.32.1"</code></pre>
+
+<p>Two packages, and the second one is the server. FastAPI itself does not listen on a port &mdash;
+it builds an ASGI application object, and something else runs it. Uvicorn is that something.</p>
+
+<p>The <code>[standard]</code> extra pulls in <code>uvloop</code> and <code>httptools</code>, which
+are the parts that make it quick. Installing plain <code>uvicorn</code> works and is measurably
+slower, for no saving worth having.</p>
+
+<p>Save the code above as <code>main.py</code> and run it:</p>
+
+<pre class="language-bash"><code class="language-bash">uvicorn main:app --reload --port 8000</code></pre>
+
+<p><code>main:app</code> is <code>module:variable</code> &mdash; the file, then the name of the
+<code>FastAPI()</code> object inside it. Getting this wrong is most people's first error, and the
+message is clear enough: <code>Could not import module "main"</code>.</p>
+
+<h2>Building something slightly real</h2>
+
+<p>One endpoint does not show much. Here is a small API with the four things almost every endpoint
+is made of &mdash; a path parameter, query parameters, a request body, and a chosen status code.
+Each gets a lesson of its own; this is to show what the shape looks like before the detail.</p>
+
+<pre class="language-python"><code class="language-python">from datetime import date
+from typing import Annotated
+
+from fastapi import FastAPI, Query, status
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Tiny Listings")
+
+LISTINGS = {
+    1: {"title": "Sunlit Loft in the Mission", "city": "San Francisco", "rate": 189.0},
+    2: {"title": "Quiet Studio near Zilker Park", "city": "Austin", "rate": 122.0},
+}
+
+
+class BookingRequest(BaseModel):
+    check_in: date
+    check_out: date
+    guests: int = Field(default=1, ge=1, le=16)
+
+
+@app.get("/listings")
+def list_listings(
+    city: str | None = None,
+    max_rate: Annotated[float | None, Query(gt=0, alias="maxRate")] = None,
+):
+    """Query parameters, because they are optional filters on a collection."""
+    results = LISTINGS.values()
+    if city:
+        results = [r for r in results if r["city"].lower() == city.lower()]
+    if max_rate:
+        results = [r for r in results if r["rate"] &lt;= max_rate]
+    return list(results)
+
+
+@app.get("/listings/{listing_id}")
+def get_listing(listing_id: int):
+    """A path parameter, because it identifies WHICH listing."""
+    return LISTINGS[listing_id]
+
+
+@app.post("/listings/{listing_id}/bookings", status_code=status.HTTP_201_CREATED)
+def create_booking(listing_id: int, payload: BookingRequest):
+    """A body, because it carries the data being created."""
+    nights = (payload.check_out - payload.check_in).days
+    return {"listing": LISTINGS[listing_id]["title"], "nights": nights}</code></pre>
+
+<p>Three things there are worth noticing now.</p>
+
+<p><strong><code>listing_id: int</code> does real work.</strong> A path segment is a string; that
+annotation converts it and rejects what will not convert:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:8000/listings/abc | head -c 120</code></pre>
+
+<pre class="language-json"><code class="language-json">{"detail":[{"type":"int_parsing","loc":["path","listing_id"],
+  "msg":"Input should be a valid integer, unable to parse string as an integer"}]}</code></pre>
+
+<p><strong><code>check_in: date</code> parses the string for you.</strong> Send
+<code>"2027-03-01"</code> and the function receives a real <code>datetime.date</code>, which is why
+subtracting the two just works:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -X POST localhost:8000/listings/1/bookings   -H 'Content-Type: application/json'   -d '{"check_in": "2027-03-01", "check_out": "2027-03-04", "guests": 2}'</code></pre>
+
+<pre class="language-json"><code class="language-json">{"listing":"Sunlit Loft in the Mission","nights":3}</code></pre>
+
+<p><strong>FastAPI decided what each parameter <em>is</em> without being told.</strong> A name that
+matches a <code>{placeholder}</code> in the path is a path parameter; a pydantic model is the body;
+anything else is a query parameter. That inference is convenient and occasionally surprising, which
+is why lesson 2 spends time on making it explicit with <code>Annotated</code>.</p>
+
+<h2>What /docs is really reading</h2>
+
+<p>Open <code>http://localhost:8000/docs</code> and there is a Swagger UI listing your endpoint,
+with the constraints filled in and a working "Try it out" button. Nothing generated that page from
+comments or a config file. It is rendering this, which FastAPI serves at
+<code>/openapi.json</code>:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "components": {
+    "schemas": {
+      "Quote": {
+        "type": "object",
+        "required": ["nights", "nightly_rate"],
+        "properties": {
+          "nights": {"type": "integer", "maximum": 365, "minimum": 1},
+          "nightly_rate": {"type": "number", "exclusiveMinimum": 0}
+        }
+      }
+    }
+  }
+}</code></pre>
+
+<p>That <code>minimum: 1</code> is the same <code>ge=1</code> from the model. The OpenAPI document
+is derived, not maintained, which is what stops it going stale &mdash; the usual failure of
+hand-written API docs.</p>
+
+<p>It is also machine-readable, so it generates clients. Point any OpenAPI generator at that URL
+and you get a typed SDK for free. That single fact is worth more on a real project than the
+interactive page most people think is the feature.</p>
+
+<p>There are two renderings of the same document. <code>/docs</code> is Swagger UI, which is
+interactive &mdash; you can send requests from it. <code>/redoc</code> is ReDoc, which is read-only
+and considerably nicer to hand to somebody who just needs to understand the API. Both are free and
+both stay current.</p>
+
+<p>Shaping it is worth ten minutes, and mostly happens for free. This is a real StayHub endpoint,
+unedited:</p>
+
+<pre class="language-python"><code class="language-python">router = APIRouter(prefix="/bookings", tags=["bookings"])
+...
+@router.post("/quote", response_model=PriceBreakdown)
+def quote(payload: QuoteRequest, db: DbSession) -&gt; PriceBreakdown:
+    """What would this stay cost? Creates nothing.
+
+    Runs the same pricing code the booking runs, so a quote is always honoured.
+    """
+    _, breakdown = BookingService(db).quote(payload)
+    return breakdown</code></pre>
+
+<p><code>tags=["bookings"]</code> on the router puts every endpoint under it in one "bookings"
+group. The docstring's first line becomes the endpoint's description and the rest renders as
+markdown underneath it. <code>response_model</code> documents the response shape, which is how a
+generated client knows the return type. Not one of those lines was written for the documentation
+&mdash; they are all doing another job first.</p>
+
+<p>Where the generated text is not good enough, <code>summary=</code> overrides the heading and
+<code>description=</code> the body, both on the decorator. Reach for them when the docstring is
+aimed at maintainers rather than callers.</p>
+
+<p>One endpoint in StayHub opts out entirely &mdash; the Stripe webhook is declared with
+<code>include_in_schema=False</code>, because it is called by Stripe and nobody else, and listing
+it in public documentation invites people to try.</p>
+
+<h2>How a request actually travels</h2>
+
+<p>Understanding this early saves a lot of confusion later, because several things that look like
+bugs are really questions about ordering.</p>
+
+<p>First, what ASGI is. WSGI &mdash; the interface Flask and Django were built on &mdash; is a
+function that takes a request and returns a response. One request occupies one worker for its whole
+life, and there is no vocabulary in the protocol for anything that arrives later. ASGI replaces
+that with a coroutine over three arguments:</p>
+
+<pre class="language-python"><code class="language-python">async def app(scope, receive, send):
+    """Every ASGI application, including yours, is ultimately this shape."""
+    assert scope["type"] == "http"
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"text/plain")]})
+    await send({"type": "http.response.body", "body": b"hello"})</code></pre>
+
+<p><code>scope</code> is the connection's metadata, <code>receive</code> pulls incoming events and
+<code>send</code> pushes outgoing ones. Because the response goes out as a series of events rather
+than a single return value, streaming and long-lived connections stop being special cases. You will
+not write this by hand &mdash; but every middleware layer below is one of these wrapping another,
+which is why the ordering rules work the way they do.</p>
+
+<p>Uvicorn parses the HTTP request into an ASGI <code>scope</code> and hands it to your app object.
+Your app is not one thing but a stack of layers wrapped around a router:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">uvicorn
+  └─ ServerErrorMiddleware          catches anything that escapes everything else
+     └─ your middleware             CORS, logging, request ids …  (outermost = added LAST)
+        └─ ExceptionMiddleware      runs your @app.exception_handler(...) handlers
+           └─ router                path matching
+              └─ dependencies       Depends(...) resolved here
+                 └─ your function</code></pre>
+
+<p>Two consequences that bite real projects, both covered later:</p>
+
+<ul>
+  <li><code>app.add_middleware()</code> <strong>inserts at the front</strong>, so the last one you
+      add is the outermost layer &mdash; the reverse of how the calls read. Lesson 13.</li>
+  <li>A handler registered for bare <code>Exception</code> does <em>not</em> live with the other
+      handlers. It becomes <code>ServerErrorMiddleware</code>'s handler, outside everything, which
+      has consequences nobody expects. Lesson 8.</li>
+</ul>
+
+<p>The other thing worth knowing now: when your endpoint is a plain <code>def</code>, FastAPI runs
+it in a worker thread so it cannot block the event loop. When it is <code>async def</code>, it runs
+directly on the loop and blocking it is entirely your problem. That one-word choice gets its own
+lesson.</p>
+
+<h2>The application every example comes from</h2>
+
+<p>Code samples in this track are not invented. They are taken from <strong>StayHub</strong>, a
+working short-let booking API &mdash; the write side of an Airbnb-style app, with listings,
+availability, server-side pricing, bookings that cannot double-book, Stripe payments and a staff
+console. It runs, and it has a hundred passing tests.</p>
+
+<p>That matters more than it sounds. An invented example can be quietly wrong forever. Code lifted
+from a running application with a test suite is wrong <em>loudly</em>, and the snippets in these
+posts are checked against their source files automatically.</p>
+
+<p>Its shape, because a few examples later will only make sense against it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                 ┌── writes ──&gt; FastAPI ──&gt; Postgres
+   React apps ───┤                              │
+                 ├── reads  ──&gt; Hasura ─────────┘
+                 └── search ──&gt; FastAPI ──&gt; Elasticsearch</code></pre>
+
+<p>Every create, update and delete goes through FastAPI &mdash; which is what makes server-side
+pricing and the availability rules impossible to bypass. Most reads come from a GraphQL layer, with
+one deliberate exception: <code>GET /api/v1/search</code>, because the point of maintaining a
+search index is to answer that question without touching the database.</p>
+
+<p>Here is its application entry point &mdash; the real one, minus its comments:</p>
+
+<pre class="language-python"><code class="language-python">app = FastAPI(
+    title=settings.app_name,
+    version="1.0.0",
+    description=(
+        "StayHub &mdash; the WRITE side of an Airbnb-style app.\n\n"
+        "Every create, update and delete lives here. Reads come from Hasura GraphQL "
+        "(http://localhost:8081) with ONE deliberate exception: `GET /api/v1/search`, which "
+        "queries Elasticsearch. Both accept the same JWT this API issues."
+    ),
+    lifespan=lifespan,
+    docs_url="/docs",
+)</code></pre>
+
+<p>And its health check, which is a small example of a habit worth forming &mdash; it reports each
+dependency separately, because "is it up?" is not the question anyone has at 3am:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:8000/health</code></pre>
+
+<pre class="language-json"><code class="language-json">{"status":"ok","database":true,"elasticsearch":true}</code></pre>
+
+<h2>Starting up and shutting down</h2>
+
+<p>Most applications need something to happen once at boot &mdash; open a connection pool, warm a
+cache, check that a dependency is reachable &mdash; and something to happen on the way out. That is
+the <code>lifespan</code> argument, and StayHub's is a good example because of what it refuses to
+do:</p>
+
+<pre class="language-python"><code class="language-python">@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if es_available():
+        try:
+            ensure_index(get_es())
+            logger.info("Elasticsearch index ready")
+        except Exception:
+            logger.exception("Could not prepare the search index &mdash; search will be degraded")
+    else:
+        logger.warning(
+            "Elasticsearch is not reachable at %s &mdash; search will return 503 until it is",
+            settings.elasticsearch_url,
+        )
+    yield</code></pre>
+
+<p>Everything before <code>yield</code> runs at startup, everything after it at shutdown. The
+shape is an async context manager, so cleanup and setup sit in one function instead of two
+decorated ones.</p>
+
+<p>The judgement in it is worth copying. Preparing the search index is wrapped in a
+<code>try</code> that only logs. If Elasticsearch is slow to start &mdash; and it always is, it is
+a JVM &mdash; a hard failure here means the entire API is down because <em>search</em> is not
+ready, when everything except search would have worked fine. A boot-time dependency check should
+generally degrade, not refuse.</p>
+
+<h2>When it does not work</h2>
+
+<p>Four errors account for most first sessions.</p>
+
+<p><strong><code>Could not import module "main"</code></strong> &mdash; you are not in the
+directory containing <code>main.py</code>, or you passed a filename. It is
+<code>main:app</code>, not <code>main.py:app</code>.</p>
+
+<p><strong><code>Error loading ASGI app. Attribute "app" not found</code></strong> &mdash; the
+variable is called something else. The part after the colon is the name of the
+<code>FastAPI()</code> object, not a convention.</p>
+
+<p><strong>A 422 you did not expect on a POST</strong> &mdash; nine times in ten the request had no
+<code>Content-Type: application/json</code>, so the body was never parsed as JSON. The error names
+<code>["body"]</code> as the location, which is the tell.</p>
+
+<p><strong>The browser reports a CORS error from your React app</strong> &mdash; FastAPI serves no
+CORS headers by default. Lesson 13 covers the middleware, and one trap in particular: allowing
+credentials forbids the <code>"*"</code> origin, and the browser's message about it is useless.</p>
+
+<h2>Versions</h2>
+
+<p>Every command and every snippet in this track was run against these, on one machine, on one day.
+FastAPI moves quickly and pydantic v1 examples are still all over the internet; if something here
+does not behave as described, check this list first.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">python              3.12.4
+fastapi             0.115.5
+starlette           0.41.3
+pydantic            2.10.3
+pydantic-settings   2.6.1
+SQLAlchemy          2.0.36
+alembic             1.14.0
+uvicorn             0.32.1
+psycopg             3.2.3
+postgres            16.15</code></pre>
+
+<h2>The lessons, in order</h2>
+
+<p>The first three cover the framework itself. Four to nine build a real application around it.
+Ten to thirteen are the things production asks for that tutorials skip. The last four ship it.</p>
+
+<ol>
+  <li><strong>What it is and why it exists</strong> &mdash; you are here.</li>
+  <li><strong>Routes, parameters and status codes</strong> &mdash; turning a request into arguments.</li>
+  <li><strong>Pydantic models and validation</strong> &mdash; the type system doing the work.</li>
+  <li><strong>Project structure</strong> &mdash; what happens after the single file stops working.</li>
+  <li><strong>Dependency injection</strong> &mdash; the feature the framework is built on.</li>
+  <li><strong>SQLAlchemy, sessions and migrations</strong> &mdash; a real data layer.</li>
+  <li><strong>Designing the REST API</strong> &mdash; resources, PATCH, pagination.</li>
+  <li><strong>One error shape for the whole API</strong>.</li>
+  <li><strong>Authentication and authorization</strong> &mdash; JWTs, and who may call what.</li>
+  <li><strong>File uploads without the holes</strong>.</li>
+  <li><strong>Background tasks and their limits</strong>.</li>
+  <li><strong>async def or def, and how to tell</strong> &mdash; with measurements.</li>
+  <li><strong>Middleware, ordering and CORS</strong>.</li>
+  <li><strong>Testing the whole stack</strong>.</li>
+  <li><strong>Logging, health checks and request tracing</strong>.</li>
+  <li><strong>Containerising it properly</strong>.</li>
+  <li><strong>Getting it into production</strong>.</li>
+  <li><strong>Interview questions</strong>.</li>
+</ol>
+
+<p>Next: <strong>routes and parameters</strong> &mdash; how a URL, a query string and a JSON body
+become typed Python arguments, and the handful of declarations that cover almost everything you
+will need.</p>

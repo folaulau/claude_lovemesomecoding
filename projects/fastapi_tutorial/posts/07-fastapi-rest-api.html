@@ -1,0 +1,459 @@
+<p>The previous lessons cover the mechanics. This one is about the decisions &mdash; what the URLs
+should be, which verb does what, what a response should and should not contain, and how to return
+a page of results without the pager lying. These are the choices a client lives with, and they are
+the expensive ones to change later.</p>
+
+<h2>Resources, not procedures</h2>
+
+<p>The first instinct is usually to name endpoints after the code behind them. That produces a
+remote procedure call with a URL:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">POST /getPropertyById
+POST /createNewBooking
+POST /updatePropertyPrice
+POST /doCancelBooking</code></pre>
+
+<p>The alternative is to name the <em>thing</em> and let the verb say what is being done to it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">GET    /properties/{id}
+POST   /bookings
+PATCH  /properties/{id}
+POST   /bookings/{id}/cancel</code></pre>
+
+<p>The practical gains are concrete rather than aesthetic. Caches and proxies understand that
+<code>GET</code> is safe to repeat and cache; they cannot know that about
+<code>POST /getPropertyById</code>. Anyone who has used another REST API can guess your URLs.
+And the set stays small &mdash; four verbs against a noun rather than a new endpoint per operation.</p>
+
+<p>Plural nouns for collections, consistently. <code>/properties/{id}</code> reads as "the
+properties collection, this one", and mixing <code>/property/{id}</code> with
+<code>/bookings</code> guarantees someone gets it wrong at three in the morning.</p>
+
+<h2>PATCH, not PUT</h2>
+
+<p><code>PUT</code> replaces a resource; <code>PATCH</code> modifies part of it. The difference
+matters more than it sounds:</p>
+
+<pre class="language-python"><code class="language-python">@router.patch("/{public_id}", response_model=PropertyResponse)
+def update_property(
+    public_id: UUID, payload: PropertyUpdateRequest, user: CurrentUser, db: DbSession
+) -&gt; PropertyResponse:
+    """PATCH, not PUT: only the fields present in the body are changed."""
+    return PropertyResponse.model_validate(PropertyService(db).update(public_id, user, payload))</code></pre>
+
+<p>With <code>PUT</code>, a client that wants to change a price must send the whole listing back
+&mdash; title, description, amenities, images, everything. If it fetched that object thirty seconds
+ago and somebody edited the description in between, the write silently reverts it. That is a lost
+update, and it happens without anybody doing anything wrong.</p>
+
+<p><code>PATCH</code> avoids it by sending only what changed, which is why the update model has
+every field optional:</p>
+
+<pre class="language-python"><code class="language-python">class PropertyUpdateRequest(ApiModel):
+    """Every field optional &mdash; this is a PATCH, and `None` means "leave it alone".
+
+    That is also why status is not here: publishing is a transition with rules, not a field
+    assignment. It gets its own endpoint.
+    """</code></pre>
+
+<p>There is a wrinkle worth knowing: with everything optional, <code>None</code> means both "leave
+it alone" and "set it to null". StayHub reads it as the first, which makes explicitly nulling a
+field impossible through PATCH. When you need both, <code>model_fields_set</code> tells you which
+keys were actually present in the request as opposed to defaulted.</p>
+
+<h2>Some changes are not field assignments</h2>
+
+<p>This is the design point people miss, and the one that keeps an API honest.</p>
+
+<p>A listing has a <code>status</code>. It is tempting to let clients PATCH it. StayHub does not,
+and instead gives the transition its own endpoint:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/{public_id}/publish", response_model=PropertyResponse)
+def publish_property(public_id: UUID, user: CurrentUser, db: DbSession) -&gt; PropertyResponse:
+    """Go live. Checks the listing is complete, then indexes it into Elasticsearch."""
+    return PropertyResponse.model_validate(PropertyService(db).publish(public_id, user))
+
+
+@router.post("/{public_id}/unpublish", response_model=PropertyResponse)
+def unpublish_property(public_id: UUID, user: CurrentUser, db: DbSession) -&gt; PropertyResponse:
+    """Back to draft and out of search. Existing bookings are untouched."""
+    return PropertyResponse.model_validate(PropertyService(db).unpublish(public_id, user))</code></pre>
+
+<p>Publishing is not "set a column to PUBLISHED". It checks the listing is complete, then writes it
+into the search index. Unpublishing removes it from search and deliberately leaves existing
+bookings alone. Neither is expressible as a field assignment, and exposing the field would let a
+client skip all of it.</p>
+
+<p>The signal to watch for: <strong>if changing a field has preconditions or side effects, it is an
+action, not a field.</strong> Cancelling a booking is the same shape &mdash; there is a deadline,
+and the dates have to be released &mdash; so it is <code>POST /bookings/{id}/cancel</code> and the
+status is read-only in the response.</p>
+
+<p>Purists dislike the verb in the URL. The alternative is a client that has to know the business
+rules, which is worse. A sub-resource action on a noun is a widely used and perfectly defensible
+compromise.</p>
+
+<h2>response_model is a security boundary</h2>
+
+<p>It looks like a formatting convenience. It is the thing standing between your database columns
+and the internet.</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/{public_id}", response_model=PropertyResponse)</code></pre>
+
+<p>FastAPI filters the return value through that model. A field not on the model does not appear,
+even if the object you returned has it. So the default changes direction: <strong>a new column is
+private until somebody deliberately exposes it</strong>, rather than public the moment it is
+added.</p>
+
+<p>StayHub's listing response omits the street address, and its nested host omits the email:</p>
+
+<pre class="language-python"><code class="language-python">class PropertyHostResponse(ApiModel):
+    """The slice of a host a guest is allowed to see. Note the absence of `email`."""
+
+    public_id: UUID
+    first_name: str
+    avatar_url: str | None = None
+    host_bio: str | None = None</code></pre>
+
+<p>Returning the ORM object directly would publish the host's email, their password hash, their
+role and their soft-delete flag. Not because anyone decided to &mdash; because nobody decided not
+to.</p>
+
+<h2>Pagination that does not lie</h2>
+
+<p>A list endpoint that returns a bare list has nowhere to put the total, so the client cannot
+render "page 3 of 12" or even know whether to show a Next button. By the time you notice, the
+endpoint is public and changing its shape is a breaking change.</p>
+
+<p>An envelope solves it, and a generic one solves it once:</p>
+
+<pre class="language-python"><code class="language-python">class Page(ApiModel, Generic[T]):
+    items: list[T]
+    total: int
+    page: int
+    page_size: int
+
+    @property
+    def pages(self) -&gt; int:
+        return (self.total + self.page_size - 1) // self.page_size if self.page_size else 0
+
+    @classmethod
+    def of(cls, items: list[T], total: int, params: PageParams) -&gt; "Page[T]":
+        return cls(items=items, total=total, page=params.page, page_size=params.page_size)</code></pre>
+
+<p><code>Page[AdminUserRow]</code> produces a distinct schema in the OpenAPI document, so a
+generated client gets a real type rather than <code>any</code>. That is the payoff for making it
+generic rather than writing a bespoke envelope per endpoint.</p>
+
+<pre class="language-json"><code class="language-json">{"items":[{"publicId":"c6f21f71-...","email":"guest@stayhub.test","firstName":"Sam",
+  "lastName":"Okafor","role":"CUSTOMER","isHost":false,
+  "createdAt":"2026-08-21T06:17:32.571844Z"}],
+ "total":4,"page":1,"pageSize":2}</code></pre>
+
+<h3>Two ways a pager goes wrong</h3>
+
+<p><strong>The count and the query must carry the same filters.</strong> It is easy to build the
+filtered page and then count the whole table &mdash; the rows look right, the pager is silently
+wrong, and nothing errors:</p>
+
+<pre class="language-python"><code class="language-python">    """Browse accounts.
+
+    ⚠️ The COUNT and the SELECT must carry the SAME filters. It is easy to build the filtered page
+    and then count the whole table — the rows look right, the pager is silently wrong, and nothing
+    errors. Both are built from `conditions` below for exactly that reason.
+    """</code></pre>
+
+<p>Building one list of conditions and using it twice makes the mistake hard to make:</p>
+
+<pre class="language-python"><code class="language-python">    total = db.execute(select(func.count(User.id)).where(*conditions)).scalar_one()</code></pre>
+
+<p><strong>LIMIT/OFFSET without ORDER BY is undefined.</strong> Postgres makes no promise about row
+order without one, so the same page-2 request can return rows already seen on page 1:</p>
+
+<pre class="language-python"><code class="language-python">    rows = db.execute(
+        select(User)
+        .where(*conditions)
+        .order_by(User.id.desc())
+        .limit(page.page_size)
+        .offset(page.offset)
+    ).scalars().all()</code></pre>
+
+<p>Order by something <strong>unique</strong>. Sorting by <code>created_at</code> alone is not
+enough when two rows share a timestamp &mdash; their relative order is still undefined, and they
+can swap between requests. Add the primary key as a tiebreaker.</p>
+
+<p>One more thing OFFSET does badly: it gets slower as the offset grows, because the database still
+produces and discards every skipped row. It is fine for an admin console and wrong for an infinite
+scroll over millions of rows, where keyset pagination &mdash; "give me the next 20 after this id"
+&mdash; is the right tool.</p>
+
+<h3>The whole endpoint, assembled</h3>
+
+<p>Put the pieces together and a paginated, filtered list endpoint is about twenty lines &mdash;
+most of it the conditions:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/users", response_model=Page[AdminUserRow])
+def list_users(
+    _: AdminUser,
+    db: DbSession,
+    page: PageQuery,
+    q: str | None = Query(default=None, max_length=200, description="Matches email or name"),
+    is_host: bool | None = Query(default=None, alias="isHost"),
+) -&gt; Page[AdminUserRow]:</code></pre>
+
+<pre class="language-python"><code class="language-python">    return Page.of([AdminUserRow.model_validate(u) for u in rows], total, page)</code></pre>
+
+<p>The signature carries the contract &mdash; staff only, a bounded page, two optional filters
+&mdash; and the body carries the query. Adding a third filter is one parameter and one condition,
+and the pagination, the bounds and the envelope all come along unchanged.</p>
+
+<p>Note the response row is its own model rather than the full user:</p>
+
+<pre class="language-python"><code class="language-python">class AdminUserRow(ApiModel):
+    public_id: UUID
+    email: str
+    first_name: str
+    last_name: str
+    role: str
+    is_host: bool
+    created_at: datetime</code></pre>
+
+<p>A list row and a detail view want different amounts of data. Reusing the detail model for lists
+means every row carries fields nobody renders, which on a page of a hundred is real bytes for
+nothing &mdash; and any nested relationship it declares is a query per row unless you eager-load it.</p>
+
+<h2>Filtering</h2>
+
+<p>Filters are query parameters, optional, and each one appends a condition:</p>
+
+<pre class="language-python"><code class="language-python">    conditions = [User.deleted.is_(False)]
+    if q:
+        pattern = f"%{q}%"
+        conditions.append(
+            User.email.ilike(pattern)
+            | User.first_name.ilike(pattern)
+            | User.last_name.ilike(pattern)
+        )
+    if is_host is not None:
+        conditions.append(User.is_host.is_(is_host))</code></pre>
+
+<p>Two details. <code>if is_host is not None</code>, not <code>if is_host</code> &mdash; otherwise
+<code>?isHost=false</code> is indistinguishable from not sending it, and filtering for non-hosts
+becomes impossible.</p>
+
+<p>And <code>ilike</code> here is SQLAlchemy building a <em>parameterised</em> LIKE, not string
+interpolation. An f-string in a where clause is how SQL injection gets in. The pattern's
+<code>%</code> characters are part of the bound value, not part of the statement:</p>
+
+<pre class="language-python"><code class="language-python">    def test_a_quote_in_the_query_is_a_value_not_syntax(self, client):
+        """Parameterised, not interpolated. If this 500s, a string is being built into SQL."""
+        r = client.get("/api/v1/admin/users?q=%27%20OR%201%3D1%20--")
+        assert r.status_code == 200
+        assert r.json()["total"] == 0</code></pre>
+
+<h2>Sorting</h2>
+
+<p>Accept a small closed set of sorts, never a raw column name. This is StayHub's:</p>
+
+<pre class="language-python"><code class="language-python">    sort: str = Query(default="relevance", pattern="^(relevance|price_asc|price_desc|rating)$"),</code></pre>
+
+<p>The temptation is <code>?sortBy=price_per_night&amp;order=desc</code>, mapped straight onto a
+column. Two problems. It exposes your schema as your API, so a column rename is a breaking change.
+And unless every value is validated against an allow-list, it is an injection point &mdash;
+<code>order_by</code> takes a string.</p>
+
+<p>A closed set also lets a sort mean something the database does not: <code>relevance</code> is a
+search score, not a column, and <code>rating</code> can mean "rating, then number of reviews as a
+tiebreaker" without the client knowing.</p>
+
+<h2>Caching, which is mostly free</h2>
+
+<p>Two headers do most of the work, and REST's verb discipline is what makes them usable at all
+&mdash; a proxy can cache <code>GET /properties/{id}</code> precisely because GET is defined as
+safe.</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/amenities", response_model=list[AmenityResponse])
+def list_amenities(db: DbSession) -&gt; list[AmenityResponse]:
+    """The amenity vocabulary, for the listing form and the search filter panel.
+
+    A read on the write service, deliberately: it is a tiny static lookup, and routing it through
+    Hasura would mean the listing form needs a GraphQL client just for this.
+    """</code></pre>
+
+<p>That endpoint returns a vocabulary that changes perhaps twice a year and is fetched on every
+page load of the listing form. A <code>Cache-Control: public, max-age=3600</code> on it removes
+those requests entirely:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/amenities", response_model=list[AmenityResponse])
+def list_amenities(db: DbSession, response: Response):
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    ...</code></pre>
+
+<p><code>ETag</code> is the other half, for data that changes unpredictably: return a hash of the
+representation, and a client that sends it back as <code>If-None-Match</code> gets a
+<strong>304 Not Modified</strong> with no body. You still do the work of producing the answer, but
+you do not send it &mdash; worth it when responses are large.</p>
+
+<p>The rule that matters: <strong>never cache anything user-specific as
+<code>public</code></strong>. A shared proxy caching one guest's <code>/bookings/mine</code> and
+serving it to another is a data breach delivered by an optimisation. Use
+<code>Cache-Control: private</code> for anything behind a token, or no caching at all.</p>
+
+<h2>How deep to nest</h2>
+
+<p>Nesting expresses ownership, and one level of it is almost always enough:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">GET  /properties/{id}/bookings        one level — fine
+GET  /hosts/{id}/properties/{pid}/bookings/{bid}/payments    four — do not</code></pre>
+
+<p>By the time a URL has four ids, three of them are redundant &mdash; a payment id already
+identifies its booking, its property and its host. Nest one level to scope a collection, then use
+the top-level resource for anything with an id of its own:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">GET  /bookings/availability/{property_id}     scoped by property
+GET  /bookings/{public_id}                    identified on its own</code></pre>
+
+<p>StayHub goes further and uses a filter rather than nesting for a host's view of their own
+bookings: <code>GET /bookings/hosting</code> rather than
+<code>/hosts/{id}/bookings</code>. The host is the authenticated caller, so putting their id in the
+URL adds nothing and invites somebody to try another one.</p>
+
+<h2>Version from the first day</h2>
+
+<pre class="language-python"><code class="language-python">app.include_router(api_router, prefix=settings.api_v1_prefix)</code></pre>
+
+<p>One line, and it buys the ability to run <code>/api/v2</code> beside <code>/api/v1</code> when a
+breaking change becomes unavoidable. Retrofitting a version prefix once clients exist means every
+one of them changes on the same day.</p>
+
+<p>What counts as breaking is narrower than people assume. <strong>Adding</strong> an optional
+field, a new endpoint, or a new enum value a client can ignore is safe. <strong>Removing or
+renaming</strong> a field, changing a type, making an optional field required, or changing a status
+code is not. The asymmetry is worth internalising, because it means most evolution needs no new
+version at all.</p>
+
+<h2>Repeat-safety</h2>
+
+<p>Networks retry. A client that times out and retries a <code>POST /bookings</code> may create two
+bookings, and it will not know it did.</p>
+
+<p><code>GET</code>, <code>PUT</code> and <code>DELETE</code> are idempotent by definition;
+<code>POST</code> is not. StayHub gets away with it because the exclusion constraint makes a
+duplicate booking for the same dates impossible &mdash; the retry gets a 409 rather than a second
+row. That is worth noticing as a pattern: <strong>a uniqueness constraint on something the client
+already knows is the cheapest idempotency you can get.</strong></p>
+
+<p>When the operation has no natural unique key, the general answer is an
+<code>Idempotency-Key</code> header: the client generates one per logical operation, the server
+stores it with the result, and a repeat returns the stored result instead of acting again. Stripe's
+API is the reference implementation, and it is worth copying if you take payments.</p>
+
+<h2>When a collection is not a list endpoint</h2>
+
+<p>StayHub has both <code>GET /properties/mine</code> and <code>GET /search</code>, and they look
+like the same kind of thing. They are not, and the split is worth understanding because most
+applications eventually need it.</p>
+
+<pre class="language-python"><code class="language-python">"""`GET /search` &mdash; the one read that does not come from Hasura (decision D2).
+
+Everything else the frontends read is a GraphQL query. This is not, because the whole point of
+maintaining an Elasticsearch index is to answer that question without touching Postgres, and
+Hasura reads Postgres.
+"""</code></pre>
+
+<p>A <strong>list</strong> endpoint answers "the rows matching these exact filters", from the
+system of record, exactly. A <strong>search</strong> endpoint answers "the things most relevant to
+this", from an index, approximately &mdash; with ranking, fuzzy matching and a relevance score.</p>
+
+<p>They differ in ways that show up in the API. Search results are ranked, so
+<code>sort=relevance</code> is a real option that a database list cannot offer. Search is eventually
+consistent, because the index is updated after the write. And search has a hard ceiling: the default
+<code>from + size</code> window is capped at 10,000 results, which is why deep pagination is not
+free there:</p>
+
+<pre class="language-python"><code class="language-python">    # Elasticsearch's default `from + size` window is capped at 10,000 results. Past that you need
+    # `search_after`; a demo never gets there, but the cap is why deep pagination is not free.
+    page: int = Field(default=1, ge=1, le=100)</code></pre>
+
+<p>Trying to serve both from one endpoint means one of the two is done badly. Keep them separate
+and let each be honest about what it is.</p>
+
+<h2>Bulk operations</h2>
+
+<p>Sooner or later a client wants to change twenty things at once, and twenty round trips is the
+wrong answer. The design question is what happens when three of them fail.</p>
+
+<p>The shape that causes least pain accepts a list and returns a result per item, with a
+<strong>207-style</strong> body rather than a single status:</p>
+
+<pre class="language-json"><code class="language-json">{"results": [
+  {"id": "a1b2...", "ok": true},
+  {"id": "c3d4...", "ok": false, "error": {"message": "Listing not found.", "fieldErrors": {}}},
+  {"id": "e5f6...", "ok": true}
+]}</code></pre>
+
+<p>The alternative &mdash; all-or-nothing in one transaction &mdash; is simpler and right when the
+items are genuinely one unit of work. It is wrong when they are independent, because one bad id
+then rejects nineteen good changes and the client has no way to know which one was the problem.</p>
+
+<p>Whichever you choose, <strong>bound the list</strong>. A bulk endpoint with no maximum is a way
+to ask the server to do unbounded work in one request, and the timeout it eventually produces looks
+like an outage rather than a rejected request.</p>
+
+<h2>Documenting it for somebody else</h2>
+
+<p>The OpenAPI document is generated, so the question is not whether to write documentation but how
+much to shape what is already there.</p>
+
+<p>Three things repay the effort. <strong>Tags</strong>, so endpoints group by resource rather than
+appearing in one flat list. <strong>Docstrings</strong>, whose first line becomes the summary and
+whose body renders as markdown &mdash; which is where a rule like "creates nothing" or a
+<code>⚠️</code> about what a parameter does not do belongs. And <strong>the error responses a caller
+must branch on</strong>, since FastAPI can only infer the success case.</p>
+
+<p>Application-level metadata is worth five minutes once:</p>
+
+<pre class="language-python"><code class="language-python">app = FastAPI(
+    title=settings.app_name,
+    version="1.0.0",
+    description=(
+        "StayHub &mdash; the WRITE side of an Airbnb-style app.\n\n"
+        "Every create, update and delete lives here. Reads come from Hasura GraphQL "
+        "(http://localhost:8081) with ONE deliberate exception: `GET /api/v1/search`, which "
+        "queries Elasticsearch. Both accept the same JWT this API issues."
+    ),
+    lifespan=lifespan,
+    docs_url="/docs",
+)</code></pre>
+
+<p>That description is doing real work. It tells a new consumer which API answers which question
+&mdash; the single thing about this system that is not guessable from the endpoint list, and the
+thing they would otherwise have to be told in a conversation.</p>
+
+<p>One decision to make deliberately: whether <code>/docs</code> is public.
+<code>FastAPI(docs_url=None, redoc_url=None)</code> turns it off, which is right for an internal
+API where the route list is not something you want to publish. Behind authentication is the middle
+option, and it needs a custom route since the built-in one has no dependency hook.</p>
+
+<h2>Small decisions worth making once</h2>
+
+<ul>
+  <li><strong>404 rather than 403 for somebody else's resource.</strong> A 403 confirms the id
+      exists, which on a guessable identifier is a slow enumeration. StayHub's admin API is the
+      exception &mdash; a documented surface whose existence is not a secret.</li>
+  <li><strong>Return the updated object</strong> from a PATCH or an action, not
+      <code>204 No Content</code>. It saves the client a follow-up GET and removes a window where
+      its copy is stale.</li>
+  <li><strong>Soft-delete returns 200 with a message</strong>, not 204, when something remains true
+      afterwards worth saying &mdash; StayHub's returns <code>{"message": "Listing removed."}</code>.</li>
+  <li><strong>Dates as ISO 8601 strings, always UTC.</strong> Let the client localise. A naive
+      datetime in an API is a bug that only appears in another timezone.</li>
+  <li><strong>Money as a decimal string</strong>, not a float. <code>"797.40"</code>, not
+      <code>797.4</code>.</li>
+  <li><strong>Reads that need a rule are still reads.</strong> StayHub's <code>/properties/mine</code>
+      returns drafts, so it needs "only your own rows" &mdash; that makes it an endpoint rather
+      than something a generic query layer can serve.</li>
+</ul>
+
+<p>Next: <strong>one error shape for the whole API</strong> &mdash; because everything above
+assumes failures are as well designed as successes, and by default they are not.</p>

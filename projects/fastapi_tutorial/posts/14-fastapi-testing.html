@@ -1,0 +1,422 @@
+<p>FastAPI is unusually easy to test, mostly because dependency injection puts a seam everywhere you
+need one. This lesson covers the two levels that matter &mdash; rules tested directly, and the whole
+stack tested through HTTP &mdash; how to run against a real database without leaving a trace, and a
+class of bug that only the second level can find.</p>
+
+<h2>Two levels, and how to choose</h2>
+
+<p>StayHub's suite splits by what is under test rather than by module, and the split is
+informative:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">tests/
+├── conftest.py                 shared fixtures — the rollback session
+├── test_pricing.py             a pure function, no database
+├── test_cancellation_policy.py a pure function, no database
+├── test_booking_service.py     service rules, real database
+├── test_security.py            JWT and hashing
+├── test_api_admin.py           through HTTP — pagination, authorization
+├── test_api_uploads.py         through HTTP — every upload guard
+└── test_api_middleware.py      through HTTP — things only the stack can show</code></pre>
+
+<p>The rule of thumb: <strong>test a rule at the lowest level that can express it.</strong> Pricing
+is a pure function, so testing it through HTTP would add a database, a token and a router to a test
+about arithmetic &mdash; slower, and it fails for more reasons than the one you care about.</p>
+
+<p>What genuinely needs HTTP is narrower than people assume: status codes, headers, serialisation,
+authentication and authorization, and anything that lives in configuration. That last category is
+the one worth the effort, and it is covered at the end.</p>
+
+<h2>A database, and no trace</h2>
+
+<p>The awkward question is what to test against. Mocking the session means testing your mocks; a
+separate test database means more setup. StayHub takes a third option:</p>
+
+<pre class="language-python"><code class="language-python">@pytest.fixture
+def db() -&gt; Session:
+    """A session whose work is always rolled back.
+
+    ⚠️ The rollback is bound to an OUTER transaction on the connection, not to the session. Code
+    under test calls `db.commit()` — that commits the session's nested work, but the outer
+    transaction here still owns it, so the final rollback undoes everything regardless.
+    """
+    connection = engine.connect()
+    transaction = connection.begin()
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
+    try:
+        yield session
+    finally:
+        session.close()
+        transaction.rollback()
+        connection.close()</code></pre>
+
+<p>This is the most useful fixture in the file, so it is worth understanding rather than copying.</p>
+
+<p>A transaction is opened on the <em>connection</em>. The session is bound to that connection with
+<code>join_transaction_mode="create_savepoint"</code>, so when code under test calls
+<code>commit()</code> &mdash; and it does, because services commit &mdash; that releases a savepoint
+inside the outer transaction rather than making anything durable. The final
+<code>transaction.rollback()</code> discards all of it.</p>
+
+<p>What you get: real Postgres, real constraints, real SQL, and nothing left behind. The exclusion
+constraint that prevents double-booking is genuinely exercised, which a mock could never do. Verify
+it if you doubt it &mdash; a row count before and after a full run is unchanged.</p>
+
+<p>The trade is that tests share one database and cannot run in parallel against it. For a suite
+that finishes in under three seconds, that is a good deal.</p>
+
+<h2>Fixtures that do not collide</h2>
+
+<pre class="language-python"><code class="language-python">@pytest.fixture
+def host(db) -&gt; User:
+    user = User(
+        email=f"host-{datetime.now(UTC).timestamp()}@stayhub.test",
+        password_hash="x", first_name="Test", last_name="Host",
+        role=UserRole.CUSTOMER, is_host=True,
+    )
+    db.add(user)
+    db.flush()
+    return user</code></pre>
+
+<p>Three details worth copying. The email carries a timestamp, so a unique constraint cannot fire
+even if something did leak between runs. <code>password_hash="x"</code> because this test does not
+care about hashing and bcrypt is deliberately slow &mdash; hashing a real password in every fixture
+adds seconds to the suite for nothing. And <code>flush()</code> rather than <code>commit()</code>,
+so the row has an id and stays inside the transaction.</p>
+
+<p>Bookings are placed far in the future for a related reason:</p>
+
+<pre class="language-python"><code class="language-python">        check_in = TODAY + timedelta(days=400 + i * 3)  # far out, so nothing collides with seed data</code></pre>
+
+<p>The database has seed data in it. A test booking landing on the same dates as a fixture booking
+hits the real exclusion constraint and fails for a reason that has nothing to do with the test.</p>
+
+<h2>Through HTTP</h2>
+
+<p><code>TestClient</code> runs the whole ASGI stack in-process &mdash; no server, no port, no
+network:</p>
+
+<pre class="language-python"><code class="language-python">@pytest.fixture
+def client(db, admin) -&gt; TestClient:
+    """A client whose requests run inside the test's transaction, authenticated as `admin`."""
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: admin
+    yield TestClient(app)
+    app.dependency_overrides.clear()</code></pre>
+
+<p>Two overrides and you have a real HTTP client that runs inside the test's transaction and is
+authenticated as a user the test created &mdash; no login, no password hashing, no token. The
+application is untouched; there is no test flag anywhere in it.</p>
+
+<p>The first override is the one people get subtly wrong:</p>
+
+<pre class="language-python"><code class="language-python">    # Yield the SAME session the fixtures wrote into. Handing the route a fresh SessionLocal
+    # instead would put it outside this transaction, so it would not see the rows above — and the
+    # test would fail with an empty page that looks like a broken query.</code></pre>
+
+<h3>Two ways overrides silently do nothing</h3>
+
+<pre class="language-python"><code class="language-python">⚠️ The override targets the FUNCTION OBJECT, not its name or its path. `app.dependency_overrides`
+is a plain dict keyed by the callable itself, so importing `get_db` from a different module than
+the app did — or overriding `deps.get_current_user` when routes actually depend on the
+`CurrentUser` alias built from it — silently does nothing. The test then hits the real dependency,
+which usually fails in a way that looks like a bug in the route.</code></pre>
+
+<p>There is no error and no warning &mdash; the key simply never matches. If an override appears to
+have no effect, check you are overriding the same object the application imported.</p>
+
+<p>The second is leakage:</p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ Always clear. The dict lives on the app object, which is module-level and shared by every
+    # test file in the run — a leftover override leaks into unrelated tests as a phantom failure.</code></pre>
+
+<p>Clear in a fixture teardown or a <code>finally</code>, never at the end of a test body, where a
+failed assertion skips it and poisons everything after.</p>
+
+<h2>Testing what refuses</h2>
+
+<p>Overrides make negative authorization tests almost free, and they are the ones people skip:</p>
+
+<pre class="language-python"><code class="language-python">    def test_a_non_admin_is_refused(self, db, admin):
+        """The override is what makes this cheap to test: swap in a plain customer and the same
+        route must now refuse."""</code></pre>
+
+<pre class="language-python"><code class="language-python">            assert TestClient(app).get("/api/v1/admin/users").status_code == 403</code></pre>
+
+<pre class="language-python"><code class="language-python">            assert TestClient(app).get("/api/v1/admin/users").status_code == 401</code></pre>
+
+<p>A test that a route works when you are allowed fails loudly in development. A test that it
+refuses when you are not is the only thing standing between a missing decorator and a data breach,
+and nothing else will catch it.</p>
+
+<p>The same applies to every guard. StayHub's upload tests are one per rejection &mdash; forged
+content type, oversize, path traversal &mdash; on the principle that a security control never
+observed to reject anything is a comment.</p>
+
+<h2>The bugs only this level can see</h2>
+
+<p>This is the argument for API-level tests, and it is not "more coverage".</p>
+
+<pre class="language-python"><code class="language-python">⚠️ The bug was invisible to every service-level test in this suite, because it was not in any
+service — it was in the ORDER two middlewares were registered in. Nothing below `TestClient`
+can see it.</code></pre>
+
+<p>Middleware order, CORS headers, exception handler registration, response model filtering,
+serialisation, status codes &mdash; none of those live in a function you can call. They live in the
+assembled application, and the only way to test an assembled application is to send it a
+request:</p>
+
+<pre class="language-python"><code class="language-python">    def test_a_500_still_carries_cors_headers(self, client, probe_routes):
+        """⚠️ THE regression test. Reordering the two add_middleware calls in main.py breaks this
+        and nothing else in the suite."""
+        r = client.get("/__test/boom", headers={"Origin": ORIGIN})
+        assert r.status_code == 500
+        assert r.headers.get("access-control-allow-origin") == ORIGIN</code></pre>
+
+<p>Two things make that test work. <code>raise_server_exceptions=False</code> makes
+<code>TestClient</code> behave like a real server and return the 500 instead of re-raising it into
+the test &mdash; with the default, the assertions are unreachable. And the probe routes are
+registered on the <em>real</em> app:</p>
+
+<pre class="language-python"><code class="language-python">    """Two routes that exist only for these tests.
+
+    Registered on the real `app` so they go through the real middleware stack — a second app
+    assembled by hand would be testing a copy of the configuration rather than the configuration.
+    """</code></pre>
+
+<p>They are removed afterwards, because a stray <code>/__test</code> route in a later run's OpenAPI
+schema is exactly the leftover the suite exists to avoid:</p>
+
+<pre class="language-python"><code class="language-python">    app.router.routes = [
+        r for r in app.router.routes if not getattr(r, "path", "").startswith("/__test")
+    ]</code></pre>
+
+<h2>A test that lied</h2>
+
+<p>Worth telling, because the failure is not obvious and the fix is a technique.</p>
+
+<p>An access-log line was coming out with <code>request_id="-"</code> instead of the real id. The
+first replacement test used pytest's <code>caplog</code> and asserted on
+<code>record.request_id</code> &mdash; and it <strong>passed even with the bug reintroduced</strong>.</p>
+
+<p>The reason: a <code>LogRecord</code> is one object shared by every handler. The application's own
+root handler carries a filter that stamps the id onto the record, and it ran <em>before</em>
+caplog's handler saw it. The test was reading the filter's work and reporting it as the
+middleware's.</p>
+
+<p>The honest version removes the confound by replacing the root handlers for the duration:</p>
+
+<pre class="language-python"><code class="language-python">    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())  # NOTE: no RequestIdFilter, on purpose
+
+    root = logging.getLogger()
+    saved, saved_level = root.handlers[:], root.level
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+    try:
+        yield stream
+    finally:
+        root.handlers, root.level = saved, saved_level</code></pre>
+
+<p>Now nothing can annotate the record behind the assertion's back, and the JSON captured is
+genuinely what the middleware produced.</p>
+
+<p>The general lesson is bigger than logging: <strong>a test that passes when you break the thing it
+tests is worse than no test</strong>, because it is also a claim that the thing is covered. The only
+way to know is to break it deliberately and watch the test fail.</p>
+
+<h2>Async tests</h2>
+
+<p><code>TestClient</code> handles async routes without any ceremony &mdash; it runs the event loop
+for you. To test an async function directly, you need a plugin:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">pytest-asyncio==0.24.0</code></pre>
+
+<pre class="language-python"><code class="language-python">asyncio_default_fixture_loop_scope = function</code></pre>
+
+<p>That setting in <code>pytest.ini</code> is not optional in the sense that matters: without it
+pytest-asyncio emits a deprecation warning about a default that is changing, and setting it
+explicitly is the fix the warning asks for. Pinning the loop scope also avoids a class of confusing
+failure where an async fixture and an async test end up on different event loops.</p>
+
+<h2>Faking what you do not own</h2>
+
+<p>Some dependencies should not be exercised in a test at all &mdash; a payment provider, an email
+service, an SMS gateway. Three approaches, and the choice matters more than it looks.</p>
+
+<p><strong>Override the dependency</strong>, when the boundary is already a dependency. This is the
+cleanest option and the reason to route external clients through <code>Depends</code> in the first
+place:</p>
+
+<pre class="language-python"><code class="language-python">app.dependency_overrides[get_stripe] = lambda: FakeStripe()</code></pre>
+
+<p><strong>Write to a stand-in</strong>, when the side effect is small. StayHub's notifications do
+this &mdash; "sending" writes a JSON file, so a test asserts a file appeared and reads it:</p>
+
+<pre class="language-python"><code class="language-python">    OUTBOX.mkdir(exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+    path = OUTBOX / f"{stamp}-{to.replace('@', '_at_')}.json"</code></pre>
+
+<p>That is often the least effort for the most confidence: the real code path runs end to end, and
+the assertion is on its actual output rather than on a mock having been called.</p>
+
+<p><strong>Monkeypatch</strong>, as the last resort, when the call is buried and not injected. It
+works and it couples the test to the implementation's import structure, so it breaks when somebody
+moves a function that still behaves identically.</p>
+
+<p>The rule worth holding: <strong>assert on outcomes, not on calls.</strong>
+<code>mock.assert_called_once_with(...)</code> passes when the function is called correctly and
+does the wrong thing. Asserting that a booking is now <code>CONFIRMED</code> tests what you care
+about.</p>
+
+<h2>Test data that does not fight you</h2>
+
+<p>Fixtures accumulate, and there are two shapes that keep them manageable.</p>
+
+<p><strong>A factory function with sensible defaults</strong>, so each test states only what it
+cares about:</p>
+
+<pre class="language-python"><code class="language-python">def make_listing(db, host, **overrides) -&gt; Property:
+    defaults = dict(
+        title="Test Listing", description="x", city="Testville",
+        country="United States", price_per_night=Decimal("100.00"),
+        max_guests=4, status=PropertyStatus.PUBLISHED,
+    )
+    prop = Property(host_id=host.id, **{**defaults, **overrides})
+    db.add(prop)
+    db.flush()
+    return prop</code></pre>
+
+<p>A test about guest limits then writes <code>make_listing(db, host, max_guests=2)</code>, and the
+one relevant value is the only one visible. Compare that with a fixture where every field is spelled
+out and the significant one is buried among twelve.</p>
+
+<p><strong>Helpers that encode the awkward parts</strong>, so nobody has to remember them:</p>
+
+<pre class="language-python"><code class="language-python">def book(db, listing, guest, start_offset: int, nights: int, status=BookingStatus.CONFIRMED):
+    check_in = TODAY + timedelta(days=start_offset)
+    check_out = check_in + timedelta(days=nights)</code></pre>
+
+<p>Offsets from today rather than fixed dates, because a test with hardcoded 2026 dates starts
+failing in 2027 &mdash; and a booking in the past is rejected by a rule that has nothing to do with
+what is being tested.</p>
+
+<h2>What makes a suite stay fast</h2>
+
+<p>StayHub's hundred tests run in under three seconds against a real Postgres. Four things keep it
+there, and losing any one of them is how suites become the thing people skip.</p>
+
+<p><strong>No hashing in fixtures.</strong> <code>password_hash="x"</code>, because bcrypt is
+deliberately slow and only the auth tests care.</p>
+
+<p><strong>Transactions rather than truncation.</strong> A rollback is nearly free; deleting and
+re-seeding tables between tests is not.</p>
+
+<p><strong>Session-scoped clients where the state allows.</strong> The middleware tests share one
+<code>TestClient</code>, because none of them writes anything.</p>
+
+<p><strong>The database stays warm.</strong> Tests run against a container that is already up, so
+nothing pays startup cost per run.</p>
+
+<p>The thing to protect is the habit, not the number. A suite that takes ten seconds gets run on
+every save; one that takes four minutes gets run before a commit, if that.</p>
+
+<h2>Coverage that means something</h2>
+
+<pre class="language-bash"><code class="language-bash">pytest -q --cov=app --cov-report=term-missing</code></pre>
+
+<p>Coverage is a good tool for finding what you forgot and a bad target to optimise. A suite that
+calls every line and asserts nothing reports 100%.</p>
+
+<p>The lines actually worth chasing are the ones nothing exercises by accident: error branches,
+authorization refusals, the <code>except</code> that cleans up a partial file. Those are exactly the
+paths that never run in development, so a coverage report is genuinely useful for finding them
+&mdash; just do not confuse the number with the confidence.</p>
+
+<h2>Testing the database rules themselves</h2>
+
+<p>Running against real Postgres buys one thing a mock never can: the constraints are live. That
+makes a class of test possible that is otherwise theoretical.</p>
+
+<pre class="language-python"><code class="language-python">"""Booking rules against the real database &mdash; availability, and the exclusion constraint."""</code></pre>
+
+<p>The interesting one is the race. The application checks availability, then inserts; two requests
+can both pass the check. The only thing that stops the second is the database, so the test asserts
+the database stops it &mdash; by inserting directly, bypassing the friendly check entirely:</p>
+
+<pre class="language-python"><code class="language-python">from sqlalchemy.exc import IntegrityError</code></pre>
+
+<p>That test fails if somebody drops the constraint while leaving the application check in place
+&mdash; which is exactly the change that looks harmless and reintroduces double-booking under
+load.</p>
+
+<p>The general principle: <strong>test the guarantee at the layer that provides it.</strong> The
+service's job is a readable message; the constraint's job is correctness under concurrency. Testing
+only the first leaves the second unverified, and it is the one that matters.</p>
+
+<h2>Flakiness, and where it comes from</h2>
+
+<p>Four causes account for nearly all of it, and all four are avoidable by construction.</p>
+
+<p><strong>Shared state between tests.</strong> A leftover <code>dependency_overrides</code> entry,
+a file on disk, a row that was committed. The rollback fixture handles the database; anything
+outside it needs explicit cleanup.</p>
+
+<p><strong>Time.</strong> A test with hardcoded dates starts failing on a particular day. Offsets
+from <code>TODAY</code> do not:</p>
+
+<pre class="language-python"><code class="language-python">TODAY = datetime.now(UTC).date()</code></pre>
+
+<p><strong>Ordering assumptions.</strong> A test asserting that the first result is a particular row
+depends on a query having an <code>ORDER BY</code>. If the code under test does not have one, the
+test is asserting a coincidence.</p>
+
+<p><strong>Collisions with seed data.</strong> Timestamped emails and far-future dates exist for
+this reason &mdash; the database is not empty, and a real unique constraint does not care that you
+are testing.</p>
+
+<p>When something does go flaky, running the suite in a different order is the fastest
+discriminator. If it only fails after a particular test, it is shared state; if it fails in
+isolation, it is time or ordering.</p>
+
+<h2>What a good suite looks like from outside</h2>
+
+<p>Four properties, and each one is a decision rather than an accident.</p>
+
+<p><strong>It runs in seconds.</strong> A suite that takes minutes gets run before a commit; one
+that takes seconds gets run on every save, which is where its value actually comes from.</p>
+
+<p><strong>A failure names the behaviour.</strong>
+<code>test_a_500_still_carries_cors_headers</code> tells you what broke from the summary line
+alone.</p>
+
+<p><strong>It leaves nothing behind.</strong> Rollbacks for the database, explicit cleanup for
+anything outside it, and overrides cleared. A suite that pollutes is a suite whose failures are
+sometimes about the previous run.</p>
+
+<p><strong>Every important test has been watched failing.</strong> This is the one people skip and
+the one that decides whether the rest is real. A test that passes when you break the thing it tests
+is worse than no test, because it also carries a claim of coverage.</p>
+
+<p>StayHub's grew from 58 to 100 while this track was written, and the additions were almost
+entirely the second level &mdash; API-level tests for things no service test could see. That ratio
+is worth noticing: the service tests were already good, and the gap was everything that lives in
+how the application is assembled rather than in what its functions do.</p>
+
+<h2>Habits</h2>
+
+<ul>
+  <li><strong>Name the behaviour, not the function.</strong>
+      <code>test_a_500_still_carries_cors_headers</code> tells you what broke when it fails;
+      <code>test_middleware_2</code> does not.</li>
+  <li><strong>One reason to fail per test.</strong> A test asserting six things reports the first
+      and hides the rest.</li>
+  <li><strong>Clean up anything outside the transaction.</strong> Files, indexes, caches &mdash;
+      the rollback does not reach them.</li>
+  <li><strong>Test the refusals.</strong> They are the ones that matter and the ones nobody
+      writes.</li>
+  <li><strong>Watch every important test fail once</strong>, deliberately, before trusting it.</li>
+</ul>
+
+<p>Next: <strong>logging, health checks and request tracing</strong> &mdash; how to find out what an
+application is doing when it is running somewhere you cannot attach a debugger.</p>

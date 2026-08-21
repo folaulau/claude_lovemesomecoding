@@ -1,0 +1,505 @@
+<p>Successes get designed. Failures get whatever the framework does by default, which is three
+different shapes depending on what went wrong. This lesson makes every failure leave as the same
+JSON body, so a client needs exactly one error parser &mdash; and covers a trap in FastAPI's
+exception handling that produced a genuine bug in the application these posts are drawn from.</p>
+
+<h2>What you get by default</h2>
+
+<p>Out of the box, three different errors produce three different bodies:</p>
+
+<pre class="language-json"><code class="language-json">// HTTPException(404, "Not found")
+{"detail": "Not found"}
+
+// a validation failure
+{"detail":[{"type":"greater_than_equal","loc":["body","guests"],
+  "msg":"Input should be greater than or equal to 1","input":0,"ctx":{"ge":1}}]}
+
+// an unhandled exception
+Internal Server Error          // plain text, not JSON</code></pre>
+
+<p><code>detail</code> is a string in one, a list of objects in another, and the third is not JSON
+at all. A frontend has to branch on all three, and it will get it wrong &mdash; usually by rendering
+<code>[object Object]</code> to a user.</p>
+
+<p>The fix is to decide the shape yourself. StayHub's is two fields, and every failure in the
+application produces it:</p>
+
+<pre class="language-python"><code class="language-python">def _body(message: str, field_errors: dict[str, str] | None = None) -&gt; dict:
+    return {"message": message, "fieldErrors": field_errors or {}}</code></pre>
+
+<p><code>message</code> is always safe to show a user. <code>fieldErrors</code> maps a field name to
+a message, and is empty for errors that are not about a field. A client renders the message as a
+toast and, if <code>fieldErrors</code> has anything in it, puts each entry next to its input. One
+branch, and it is on a field being present rather than on the error's type.</p>
+
+<h2>Exceptions the service layer can raise</h2>
+
+<p>The base carries a status code and optional field errors:</p>
+
+<pre class="language-python"><code class="language-python">class ApiException(Exception):
+    """Raised anywhere in the service layer; turned into a response by the handler below."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = status.HTTP_400_BAD_REQUEST,
+        field_errors: dict[str, str] | None = None,
+    ) -&gt; None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.field_errors = field_errors or {}</code></pre>
+
+<p>And the common cases get names, so a service says what it means rather than picking a number:</p>
+
+<pre class="language-python"><code class="language-python">class NotFoundException(ApiException):
+    def __init__(self, message: str = "Not found") -&gt; None:
+        super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
+
+
+class ConflictException(ApiException):
+    """The request was well formed but the world says no &mdash; e.g. those dates are taken."""
+
+    def __init__(self, message: str) -&gt; None:
+        super().__init__(message, status_code=status.HTTP_409_CONFLICT)</code></pre>
+
+<p>The important property is that these are <strong>not</strong> <code>HTTPException</code>. A
+service raising <code>HTTPException</code> is a service that only works inside a web request &mdash;
+it cannot be called from a CLI command, a scheduled job or a test without dragging FastAPI along.
+A domain exception is portable, and the web layer decides what a given failure means over HTTP.</p>
+
+<p><code>ConflictException</code>'s docstring is the one worth internalising. "The request was well
+formed but the world says no" is a category most APIs collapse into 400, and it is genuinely
+different: nothing about the request can be fixed, the client should retry or show the user what
+changed.</p>
+
+<h2>The handlers</h2>
+
+<pre class="language-python"><code class="language-python">    @app.exception_handler(ApiException)
+    async def _api_exception(_: Request, exc: ApiException) -&gt; JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code, content=_body(exc.message, exc.field_errors)
+        )</code></pre>
+
+<p>One handler covers the whole hierarchy, because FastAPI matches on the exception class and its
+subclasses. Adding a new exception type needs no new handler.</p>
+
+<p>The validation handler does more work, and it is the one that pays for itself daily:</p>
+
+<pre class="language-python"><code class="language-python">    @app.exception_handler(RequestValidationError)
+    async def _validation(_: Request, exc: RequestValidationError) -&gt; JSONResponse:
+        fields: dict[str, str] = {}
+        for err in exc.errors():
+            location = [part for part in err["loc"] if part not in ("body", "query", "path")]
+            fields[".".join(str(p) for p in location) or "_"] = err["msg"]
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=_body("Please check the highlighted fields.", fields),
+        )</code></pre>
+
+<p>Pydantic's <code>loc</code> is a tuple: <code>("body", "images", 2, "url")</code>. That is
+precise and useless to a form, which needs a key it can match against an input. Dropping the source
+prefix and joining the rest turns it into <code>"images.2.url"</code> &mdash; a path a client can
+act on:</p>
+
+<pre class="language-json"><code class="language-json">{"message":"Please check the highlighted fields.",
+ "fieldErrors":{"guests":"Input should be greater than or equal to 1",
+                "images.2.url":"String should have at most 500 characters"}}</code></pre>
+
+<p>The <code>or "_"</code> handles a whole-body error, where stripping the prefix leaves nothing.</p>
+
+<h2>Never return the reason</h2>
+
+<pre class="language-python"><code class="language-python">        logger.exception("Unhandled error", exc_info=exc)
+        return unhandled_response()</code></pre>
+
+<p>Log the real cause, return a generic one. A stack trace in a response body is a gift to whoever
+is probing the API &mdash; it names your framework, your file paths, your ORM and frequently a
+query with a table name in it.</p>
+
+<p>The same reasoning shows up in messages that are deliberately vague. A login failure never says
+which half was wrong, because "no such account" and "wrong password" together are an account
+enumeration tool. Registration is the one place that must admit an email is taken, and that is a
+considered exception rather than an oversight.</p>
+
+<h2>⚠️ The trap: a handler for bare Exception is not where you think</h2>
+
+<p>This one produced a real bug, and it is invisible in the source.</p>
+
+<p>Starlette does not put a handler registered for bare <code>Exception</code> in the same place as
+the others. Specific handlers live in <code>ExceptionMiddleware</code>, the <strong>innermost</strong>
+layer &mdash; inside CORS, inside everything. A handler for <code>Exception</code> instead becomes
+<code>ServerErrorMiddleware</code>'s handler, the <strong>outermost</strong> layer of the entire
+stack:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ServerErrorMiddleware      <- your @app.exception_handler(Exception) lives HERE
+  └─ CORSMiddleware
+     └─ your other middleware
+        └─ ExceptionMiddleware   <- every other handler lives here
+           └─ router</code></pre>
+
+<p>A response built out there has already skipped every user middleware on the way back. Measured
+against StayHub before the fix:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">unhandled 500 ->  X-Request-ID absent   Access-Control-Allow-Origin absent
+handled   404 ->  X-Request-ID present  Access-Control-Allow-Origin present</code></pre>
+
+<p>The consequence is not cosmetic. A browser shown a 500 with no
+<code>Access-Control-Allow-Origin</code> reports a <em>CORS failure</em> and never exposes the body,
+so the frontend's error parser never saw the message the API had carefully written. Every server
+error looked like a network problem.</p>
+
+<p>The fix is to catch it somewhere <em>inside</em> CORS. StayHub's request middleware converts it
+and returns the response itself:</p>
+
+<pre class="language-python"><code class="language-python">            response = unhandled_response()
+            response.headers[REQUEST_ID_HEADER] = request_id
+            response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.1f}"
+            request_id_ctx.reset(token)
+            return response</code></pre>
+
+<p>Because it <em>returns</em> rather than re-raises, CORSMiddleware &mdash; which is outside it
+&mdash; sees an ordinary response and adds its headers. The body still comes from one place:</p>
+
+<pre class="language-python"><code class="language-python">UNHANDLED_MESSAGE = "Something went wrong on our end."
+
+
+def unhandled_response() -&gt; JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content=_body(UNHANDLED_MESSAGE)
+    )</code></pre>
+
+<p>The <code>@app.exception_handler(Exception)</code> stays registered as a backstop for anything
+that escapes before the middleware is reached. Two paths, one body.</p>
+
+<h2>Documenting the failures</h2>
+
+<p>FastAPI infers the success response from <code>response_model</code>, and knows nothing about
+the errors. Left alone, <code>/docs</code> shows a 200 and a 422 and implies that is the whole
+story.</p>
+
+<p>Declaring the shape once makes it visible:</p>
+
+<pre class="language-python"><code class="language-python">class ErrorBody(ApiModel):
+    """Documents the shape produced by core/exceptions.py, so it shows up in Swagger."""
+
+    message: str
+    field_errors: dict[str, str] = {}</code></pre>
+
+<p>Then attach it where it matters &mdash; per route, per router, or globally:</p>
+
+<pre class="language-python"><code class="language-python">@router.post(
+    "",
+    response_model=BookingResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        409: {"model": ErrorBody, "description": "Those dates are no longer available"},
+        404: {"model": ErrorBody, "description": "Listing not found"},
+    },
+)</code></pre>
+
+<p>That is not decoration. A generated client reads it and produces a typed error branch; without
+it, every failure is an untyped blob. The 409 in particular is the one a caller must handle
+deliberately, and an undocumented 409 is a caller that treats it as a generic failure and retries
+forever.</p>
+
+<p>Do not enumerate every possible code on every route. Document the ones a client has to
+<em>act</em> differently on.</p>
+
+<h2>Is HTTPException ever fine?</h2>
+
+<p>Yes &mdash; in the web layer, for something that is genuinely an HTTP concern:</p>
+
+<pre class="language-python"><code class="language-python">@app.get("/legacy")
+def legacy():
+    raise HTTPException(status_code=410, detail="This endpoint was removed in v2.")</code></pre>
+
+<p>"This URL is gone" is not a domain rule. Nothing in a service layer needs to know about it, and
+inventing a <code>GoneException</code> for one route is ceremony.</p>
+
+<p>The line worth holding: <strong>routes may raise <code>HTTPException</code>; services may
+not.</strong> If you do use it alongside a custom shape, register a handler for it too, or you have
+reintroduced the two-shapes problem for exactly the errors you thought were trivial:</p>
+
+<pre class="language-python"><code class="language-python">@app.exception_handler(StarletteHTTPException)
+async def _http_exception(_: Request, exc: StarletteHTTPException) -&gt; JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content=_body(str(exc.detail)))</code></pre>
+
+<p>That also catches the 404 Starlette raises for an unmatched route, which otherwise returns
+<code>{"detail":"Not Found"}</code> &mdash; the one error most likely to reach a confused
+client.</p>
+
+<h2>Translating errors from below</h2>
+
+<p>Errors from a library are rarely fit to return. The pattern is to catch, classify and re-raise as
+a domain exception:</p>
+
+<pre class="language-python"><code class="language-python">        except IntegrityError as exc:
+            self.db.rollback()
+            if _is_overlap_violation(exc):
+                raise ConflictException(
+                    "Those dates were just booked by someone else."
+                ) from exc
+            raise</code></pre>
+
+<p>Three things are right here. It inspects <em>which</em> constraint failed rather than assuming,
+so an unrelated integrity error is not mislabelled as a date clash. It re-raises anything it does
+not recognise, rather than swallowing it. And <code>from exc</code> preserves the original as
+<code>__cause__</code>, so the logged traceback still shows the Postgres error underneath the
+friendly message.</p>
+
+<p>Without this, a booking race is a 500. With it, it is a 409 saying exactly what happened.</p>
+
+<h2>Messages worth writing</h2>
+
+<p>An error message is a piece of interface. Compare:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">"Invalid request"
+"Booking validation failed: constraint violation on field guests"
+
+"This place sleeps up to 4 guests."
+"This booking can no longer be cancelled — the deadline was 02 Sep 2026,
+ 2 days before check-in."</code></pre>
+
+<p>The second pair tell the user what the rule is and what to do. The first pair tell them
+something went wrong and leave them to guess. Both cost the same to write:</p>
+
+<pre class="language-python"><code class="language-python">            raise ApiException(
+                f"This booking can no longer be cancelled &mdash; the deadline was {deadline:%d %b %Y}, "
+                f"{settings.cancellation_cutoff_days} days before check-in."
+            )</code></pre>
+
+<p>Two rules keep them safe. <strong>Say what the rule is, not what the code did</strong> &mdash;
+"constraint violation" is your problem, not theirs. And <strong>never interpolate anything the user
+did not already know</strong>; a message that helpfully includes another account's email is a leak
+wearing a friendly face.</p>
+
+<h2>Where an error is allowed to be a lie</h2>
+
+<p>One deliberate case, mentioned in earlier lessons and worth stating plainly here:</p>
+
+<pre class="language-python"><code class="language-python">        if booking.guest_id != actor.id and actor.role != "ADMIN":
+            raise NotFoundException("Booking not found.")</code></pre>
+
+<p>That booking exists. The caller is being told it does not, because a 403 would confirm the id is
+real &mdash; and on a guessable identifier, a 403/404 difference is an enumeration oracle. The
+honest status code leaks; the misleading one does not.</p>
+
+<p>Use it for resources owned by someone else. Do not use it for permissions on a documented
+surface: StayHub's admin API returns a straight 403, because its existence is not a secret and
+pretending it is only confuses staff.</p>
+
+<h2>Which errors a client should retry</h2>
+
+<p>The status code is a contract about what to do next, and getting it wrong makes clients behave
+badly in ways you never see.</p>
+
+<table>
+  <thead><tr><th>Code</th><th>Retry?</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>400 / 422</td><td>never</td><td>the request is wrong; sending it again changes nothing</td></tr>
+    <tr><td>401</td><td>after refreshing the token</td><td>a retry with the same token loops</td></tr>
+    <tr><td>403</td><td>never</td><td>permissions will not change on their own</td></tr>
+    <tr><td>404</td><td>never</td><td>&mdash;</td></tr>
+    <tr><td>409</td><td>only after re-reading state</td><td>the world moved; the client must look again</td></tr>
+    <tr><td>429</td><td>yes, after <code>Retry-After</code></td><td>that is what the header is for</td></tr>
+    <tr><td>500</td><td>yes, with backoff</td><td>may be transient</td></tr>
+    <tr><td>503</td><td>yes, with backoff</td><td>explicitly temporary</td></tr>
+  </tbody>
+</table>
+
+<p>The two worth being careful about are 400 and 500. Returning 400 for a server-side failure means
+clients never retry something that would have succeeded. Returning 500 for a bad request means
+clients retry something that can never succeed, and your error rate becomes their retry loop.</p>
+
+<p>The rule of thumb: <strong>4xx means the caller must change something; 5xx means we must.</strong>
+A validation failure caused by our own bad default is a 5xx, however much it looks like a 400.</p>
+
+<h2>Errors you can actually find again</h2>
+
+<p>An error body that is safe to show a user is, by design, not enough to debug with. The bridge is
+a correlation id returned to the client and logged with the failure:</p>
+
+<pre class="language-python"><code class="language-python">            logger.exception(
+                "%s %s failed after %.1fms",
+                request.method,
+                request.url.path,
+                elapsed_ms,
+                extra={
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": 500,
+                    "duration_ms": round(elapsed_ms, 1),
+                },
+            )</code></pre>
+
+<p>The same id goes back on the response as <code>X-Request-ID</code>. A user reporting "it broke"
+can be asked for it, or a frontend can display it on its error screen, and one search finds the
+exact request with its full traceback. Without that, "a 500 at about four o'clock" is the entire
+bug report.</p>
+
+<p><code>logger.exception</code> rather than <code>logger.error</code> &mdash; it attaches the
+traceback automatically. Lesson 15 covers making these lines machine-readable.</p>
+
+<h2>A note on Problem Details</h2>
+
+<p>There is a standard for this: <strong>RFC 9457</strong> (formerly 7807), which defines a JSON
+body with <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code> and
+<code>instance</code>, served as <code>application/problem+json</code>.</p>
+
+<pre class="language-json"><code class="language-json">{"type":"https://example.com/probs/dates-taken",
+ "title":"Those dates are no longer available",
+ "status":409,
+ "detail":"2027-03-01 to 2027-03-04 overlaps an existing booking.",
+ "instance":"/api/v1/bookings"}</code></pre>
+
+<p>It is worth knowing and worth using if your API is consumed by parties you do not control,
+because a standard shape means their tooling already understands it. StayHub uses its own two-field
+body instead, for a specific reason: <code>fieldErrors</code> maps directly onto form inputs, and
+that is what its two React apps actually need. Problem Details has no first-class notion of
+per-field errors.</p>
+
+<p>Either is defensible. What is not defensible is three shapes, which is what you get by making no
+decision at all.</p>
+
+<h2>Test the error paths</h2>
+
+<p>Errors are the least-exercised code in most applications and the most-seen by users. They
+deserve tests:</p>
+
+<pre class="language-python"><code class="language-python">    def test_it_returns_the_standard_error_body(self, client, probe_routes):
+        r = client.get("/__test/boom")
+        assert r.status_code == 500
+        assert r.json() == {"message": "Something went wrong on our end.", "fieldErrors": {}}
+
+    def test_it_never_leaks_the_exception(self, client, probe_routes):
+        r = client.get("/__test/boom")
+        assert "RuntimeError" not in r.text
+        assert "deliberate" not in r.text
+        assert "Traceback" not in r.text</code></pre>
+
+<p>The second is a security test written as an assertion about a string, which is the right level
+&mdash; it fails if anybody changes the handler to be more helpful.</p>
+
+<p>And the regression test for the trap above, which is the reason any of this is written down:</p>
+
+<pre class="language-python"><code class="language-python">    def test_a_500_still_carries_cors_headers(self, client, probe_routes):
+        """⚠️ THE regression test. Reordering the two add_middleware calls in main.py breaks this
+        and nothing else in the suite."""
+        r = client.get("/__test/boom", headers={"Origin": ORIGIN})
+        assert r.status_code == 500
+        assert r.headers.get("access-control-allow-origin") == ORIGIN</code></pre>
+
+<p>That test was verified by reintroducing the bug: swapping the two middleware registrations fails
+it and nothing else. A regression test nobody has watched fail is a guess.</p>
+
+<h2>What the other side does with it</h2>
+
+<p>The shape only pays off if a client can act on it mechanically. One parser, used everywhere:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type ApiError = { message: string; fieldErrors: Record&lt;string, string&gt; }
+
+export async function request&lt;T&gt;(path: string, init?: RequestInit): Promise&lt;T&gt; {
+  const res = await fetch(`${API}${path}`, init)
+  if (res.ok) return res.json()
+
+  // Every failure from this API has the same two fields — including the 500s,
+  // which is only true because the middleware catches them inside CORS.
+  const err: ApiError = await res.json().catch(() =&gt; ({
+    message: 'Something went wrong.', fieldErrors: {},
+  }))
+  throw Object.assign(new Error(err.message), {
+    status: res.status,
+    fieldErrors: err.fieldErrors,
+    requestId: res.headers.get('X-Request-ID'),
+  })
+}</code></pre>
+
+<p>A form then does the obvious thing: show <code>message</code> as a toast, and hand
+<code>fieldErrors</code> to the form library to render beside each input. No branching on status
+codes to work out where the message is.</p>
+
+<p>The <code>.catch()</code> matters. It is the one place a non-JSON body can still arrive &mdash;
+a 502 from a load balancer, a 413 from nginx before the request ever reached Python. Those are not
+yours to shape, so the client needs a fallback regardless.</p>
+
+<h2>Failing at startup</h2>
+
+<p>One class of error is not a response at all. If a required setting is missing or a dependency is
+unreachable, the question is whether to refuse to start.</p>
+
+<p>The distinction worth drawing: <strong>refuse for things that make the application wrong,
+degrade for things that make it partial.</strong></p>
+
+<p>A missing JWT secret means every token is signed with a default that is public knowledge &mdash;
+refuse. Typed settings do this for free, since a field with no default cannot be constructed
+without a value.</p>
+
+<p>A slow search cluster means search does not work yet. Everything else does, so refusing is the
+wrong call:</p>
+
+<pre class="language-python"><code class="language-python">    ⚠️ Creating the search index here must NOT be able to stop the app booting. If Elasticsearch
+    is slow to start &mdash; and it always is, it is a JVM &mdash; a hard failure here means the API is down
+    because *search* is not ready. Everything except search works fine without it.</code></pre>
+
+<p>The endpoint then owns its own degradation, and says so honestly rather than returning an empty
+list that looks like "no results":</p>
+
+<pre class="language-python"><code class="language-python">    if not es_available():</code></pre>
+
+<p>A 503 with a real message tells the client to retry. Zero results tells it there is nothing to
+find, which is a lie that ends up in a bug report about missing listings.</p>
+
+<h2>Errors that are not exceptions</h2>
+
+<p>One shape worth knowing, because it applies where exceptions do not fit: an operation that
+partially succeeds.</p>
+
+<p>Raising means abandoning the whole request, which is right when nothing useful happened and
+wrong for a bulk operation where nineteen of twenty items worked. There the failures are
+<em>data</em>, not control flow:</p>
+
+<pre class="language-python"><code class="language-json">{"results": [
+  {"id": "a1b2...", "ok": true},
+  {"id": "c3d4...", "ok": false, "error": {"message": "Listing not found.", "fieldErrors": {}}}
+]}</code></pre>
+
+<p>Note the per-item error reuses the same two-field body. That is the discipline paying off: one
+shape, whether it is the whole response or nested inside one.</p>
+
+<p>The same reasoning covers a slower case &mdash; work that fails after the response has been sent.
+A background task has no caller to raise to, so its failure is a log line and, if it matters, a row
+somewhere recording that the thing did not happen. Lesson 11 covers why that changes how the task is
+written.</p>
+
+<h2>Making failures easy to reproduce</h2>
+
+<p>A useful habit when adding a new error: add the route that triggers it, in the test suite, at the
+same time.</p>
+
+<pre class="language-python"><code class="language-python">    @app.get("/__test/boom", include_in_schema=False)
+    def _boom():
+        raise RuntimeError("deliberate &mdash; testing the unhandled path")</code></pre>
+
+<p><code>include_in_schema=False</code> keeps it out of the documentation, and the fixture removes
+it afterwards. Having a deliberate way to produce each class of failure is what makes the handler
+testable at all &mdash; and it is how the CORS-on-500 bug was found, fixed and then locked in.</p>
+
+<h2>The checklist</h2>
+
+<ul>
+  <li>One body shape, everywhere. Decide it, then never produce another.</li>
+  <li>Domain exceptions in services; <code>HTTPException</code> stays in the web layer, if at all.</li>
+  <li>Flatten validation errors into <code>field &rarr; message</code>.</li>
+  <li>Log the cause, return a generic message, never a traceback.</li>
+  <li>Catch a bare <code>Exception</code> <em>inside</em> your middleware, not only via
+      <code>@app.exception_handler(Exception)</code>.</li>
+  <li>Translate library errors into domain ones, and re-raise what you do not recognise.</li>
+  <li>404 for somebody else's resource; 403 only where the surface is public knowledge.</li>
+  <li>Write messages a user can act on.</li>
+</ul>
+
+<p>Next: <strong>authentication and authorization</strong> &mdash; where most of these exceptions
+get raised, and the JWT behind them.</p>

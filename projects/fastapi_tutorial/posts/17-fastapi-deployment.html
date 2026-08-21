@@ -1,0 +1,417 @@
+<p>You have an image that runs. Getting it in front of users adds a handful of concerns the previous
+lessons deliberately left alone: what sits in front of it, where configuration comes from, when
+migrations run, and how to replace a running version without dropping requests.</p>
+
+<h2>The shape of it</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">          TLS terminated here
+              │
+  internet ──▶ load balancer ──▶ reverse proxy ──▶ [ uvicorn: 4 workers ]  × N containers
+                                   (nginx)              │
+                                                        ├──▶ Postgres  (pgbouncer)
+                                                        ├──▶ Redis
+                                                        └──▶ object storage</code></pre>
+
+<p>Some of those collapse depending on where you deploy &mdash; a managed platform is often load
+balancer and proxy in one, and a small service may skip nginx entirely. The concerns do not
+disappear; something still has to own them.</p>
+
+<h2>Workers, and the number that bites</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]</code></pre>
+
+<p>A uvicorn process is one event loop on one core, however async the code. Workers are separate
+processes and are how you use more than one core.</p>
+
+<p>Start around <code>2 × cores</code> and tune against real traffic. What you must not do is pick
+the number in isolation, because each worker carries its own connection pool:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">connections = containers × workers × (pool_size + max_overflow)
+
+  3 containers × 4 workers × (5 + 10)  =  180
+  Postgres default max_connections     =  100      <-- exhausted</code></pre>
+
+<p>The failure arrives all at once under load, as <code>FATAL: sorry, too many clients
+already</code>. Three fixes, usually combined: lower the pool, raise the database limit, or put
+<strong>PgBouncer</strong> in front so many application connections share few database ones. The
+last is the standard answer above a few instances &mdash; with the caveat that transaction-mode
+pooling breaks prepared statements and session state, so it needs
+<code>prepare_threshold=0</code> on psycopg.</p>
+
+<p>Memory is the other constraint. Each worker is a full Python process, so four workers is roughly
+four times the resident memory of one. A container limit that fits one worker comfortably will get
+four of them OOM-killed.</p>
+
+<h2>Behind a proxy</h2>
+
+<p>nginx (or its managed equivalent) does the things uvicorn should not: TLS, buffering slow
+clients, request size limits, serving static files, and timeouts.</p>
+
+<pre class="language-nginx"><code class="language-nginx">server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    # ⚠️ Rejects an oversized upload before it ever reaches Python. The application still
+    # enforces its own limit — this is the cheap first line, not the guarantee.
+    client_max_body_size 5m;
+
+    location / {
+        proxy_pass http://api:8000;
+
+        # ⚠️ Without these the app sees nginx as the client: every request appears to come
+        # from 127.0.0.1, over http, addressed to the internal host.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Long enough for a real request, short enough that a stuck one is not held forever.
+        proxy_read_timeout 30s;
+    }
+}</code></pre>
+
+<p>Setting those headers is only half of it. Uvicorn ignores them unless told to trust them:</p>
+
+<pre class="language-bash"><code class="language-bash">uvicorn app.main:app --host 0.0.0.0 --proxy-headers --forwarded-allow-ips='*'</code></pre>
+
+<p>Without <code>--proxy-headers</code>, every log line records the proxy's IP, rate limiting keyed
+on client address limits <em>everyone</em> together, and any URL the application generates comes out
+as <code>http://</code> &mdash; which breaks OAuth redirects and produces mixed-content warnings.</p>
+
+<p><code>--forwarded-allow-ips='*'</code> means "trust the header from anyone", which is safe only
+when nothing can reach the app except the proxy. If the container port is exposed, a client can
+forge <code>X-Forwarded-For</code> and become any IP it likes. Name the proxy's address
+instead.</p>
+
+<p>If the API is served under a path prefix &mdash; <code>/api</code> on a shared domain &mdash;
+uvicorn needs <code>--root-path /api</code>, or the OpenAPI document advertises URLs without it and
+the docs page cannot call anything.</p>
+
+<h2>Configuration and secrets</h2>
+
+<pre class="language-python"><code class="language-python">    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="STAYHUB_",
+        extra="ignore",
+    )</code></pre>
+
+<p>The <code>.env</code> file is a development convenience. In production the environment carries
+the values, and the loading order works in your favour: a real environment variable overrides the
+file, so the same image runs anywhere with different variables and no rebuild.</p>
+
+<p>One change worth making for production. StayHub's settings have defaults for everything, which
+makes the demo runnable with no configuration:</p>
+
+<pre class="language-python"><code class="language-python">    jwt_secret: str = "dev-only-change-me-in-any-real-deployment-0123456789"</code></pre>
+
+<p>A deployed service should drop that default entirely. With no default, a missing value is a
+<code>ValidationError</code> at startup &mdash; the container fails to boot and the rollout stops.
+With one, it starts happily and signs every token with a value published in your repository.
+<strong>Fail loudly at boot rather than quietly forever.</strong></p>
+
+<p>Secrets come from the platform's secret store &mdash; AWS Secrets Manager, Kubernetes secrets,
+your PaaS's variables &mdash; and never from the image. Lesson 16 covered why: layers are additive,
+so a secret copied in at any point stays readable even if a later layer deletes it.</p>
+
+<h2>Migrations are a deploy step</h2>
+
+<p>The tempting version runs them in the entrypoint. It works with one replica and races with
+several &mdash; they all start at once and all run <code>alembic upgrade head</code>
+simultaneously.</p>
+
+<p>Run them once, before the new version starts serving:</p>
+
+<pre class="language-bash"><code class="language-bash">alembic upgrade head          # a job, a pre-deploy hook, or a one-off task
+# then roll out the new image</code></pre>
+
+<p>Which raises the constraint that governs schema changes: <strong>during a rollout, old and new
+code are both running against one database.</strong> A migration that drops a column the old
+version still selects breaks the half of your fleet that has not been replaced yet.</p>
+
+<p>The way out is to make every change backwards-compatible, in two deploys:</p>
+
+<table>
+  <thead><tr><th>Change</th><th>Deploy 1</th><th>Deploy 2</th></tr></thead>
+  <tbody>
+    <tr><td>Add a column</td><td>add it nullable, write to it</td><td>make it required</td></tr>
+    <tr><td>Remove a column</td><td>stop reading it</td><td>drop it</td></tr>
+    <tr><td>Rename a column</td><td>add the new one, write both</td><td>read new, drop old</td></tr>
+  </tbody>
+</table>
+
+<p>Two more things to check before a migration meets a production table. <code>ALTER TABLE</code>
+takes locks &mdash; adding an indexed column to a large table can block writes for the duration
+&mdash; so build indexes with <code>CREATE INDEX CONCURRENTLY</code>, which Alembic will not
+generate for you. And <strong>never edit an applied migration</strong>: it means two databases
+claiming the same version with different schemas, and nothing will tell you.</p>
+
+<h2>Rolling out without dropping requests</h2>
+
+<p>Three things have to be true, and they are usually all missing at once.</p>
+
+<p><strong>Readiness must actually mean ready.</strong> The orchestrator sends traffic when the
+probe passes, so a probe that answers before the database pool is warm sends real users into
+errors. StayHub's health check reports each dependency separately, which is what makes it usable
+here:</p>
+
+<pre class="language-json"><code class="language-json">{"status":"ok","database":true,"elasticsearch":true}</code></pre>
+
+<p>Note the judgement encoded in <code>status</code>: no database is <code>degraded</code>, no
+search is not. Only the first should stop traffic &mdash; treating a slow search cluster as
+unreadiness takes down an API that was working.</p>
+
+<p><strong>Shutdown must be graceful.</strong> On <code>SIGTERM</code>, uvicorn stops accepting new
+connections and waits for in-flight requests to finish. That only works if the signal reaches it:
+a shell-form <code>CMD</code> puts <code>/bin/sh</code> at PID 1 and it does not forward signals, so
+the container is killed after the grace period with requests still in flight. Exec form &mdash;
+<code>CMD ["uvicorn", ...]</code> &mdash; makes uvicorn PID 1 and fixes it.</p>
+
+<p><code>lifespan</code> shutdown code runs at that point, which is where connections and clients
+get closed:</p>
+
+<pre class="language-python"><code class="language-python">    yield</code></pre>
+
+<p>Everything after the <code>yield</code> is shutdown. Keep it fast &mdash; the orchestrator's
+grace period is finite, typically 30 seconds.</p>
+
+<p><strong>The load balancer needs to stop first.</strong> Deregistration is not instantaneous, so
+a container that exits the moment it receives <code>SIGTERM</code> can still be sent requests for a
+second or two. The usual fix is a <code>preStop</code> hook that sleeps briefly before shutdown
+begins &mdash; unglamorous and the difference between a clean deploy and a handful of 502s each
+time.</p>
+
+<h2>What runs the container</h2>
+
+<p>The image is the same everywhere; what supervises it is not, and the choice changes what you
+have to build yourself.</p>
+
+<table>
+  <thead><tr><th>Platform</th><th>You still own</th></tr></thead>
+  <tbody>
+    <tr><td>A VM with compose</td><td>TLS, restarts, rollout, monitoring &mdash; everything</td></tr>
+    <tr><td>A PaaS (Render, Fly, App Runner)</td><td>the app; it does TLS, probes, rollout</td></tr>
+    <tr><td>ECS / Cloud Run</td><td>task definitions and networking</td></tr>
+    <tr><td>Kubernetes</td><td>a great deal, in exchange for control</td></tr>
+    <tr><td>Lambda via Mangum</td><td>cold starts, and a 15-minute ceiling</td></tr>
+  </tbody>
+</table>
+
+<p>The honest advice is to take the highest-level option that fits. A managed platform gives you
+readiness probes, rolling deploys, TLS and log aggregation on day one; Kubernetes gives you all of
+that as configuration you write and maintain. That is worth it at a certain size and expensive
+before it.</p>
+
+<p>The serverless option deserves a specific note, because FastAPI runs there via an adapter:</p>
+
+<pre class="language-python"><code class="language-python">from mangum import Mangum
+
+handler = Mangum(app)</code></pre>
+
+<p>Three things change. Cold starts add latency to the first request after idle, which for a Python
+image is often over a second. Connection pooling does not work the way it does in a long-lived
+process &mdash; each concurrent invocation is its own environment, so a proxy like RDS Proxy or
+PgBouncer stops being optional. And background tasks are unreliable: the runtime may freeze the
+environment as soon as the response is returned, so anything queued after it may simply not run.</p>
+
+<h2>A deploy pipeline that is worth having</h2>
+
+<p>Four steps cover most of it, and the ordering is the interesting part:</p>
+
+<pre class="language-yaml"><code class="language-yaml">jobs:
+  test:
+    steps:
+      - run: pytest -q --cov=app
+      - run: ruff check app tests
+
+  build:
+    needs: test
+    steps:
+      - run: docker build --platform linux/amd64 -t $REGISTRY/api:$GITHUB_SHA .
+      - run: docker push $REGISTRY/api:$GITHUB_SHA
+
+  migrate:
+    needs: build
+    steps:
+      - run: alembic upgrade head
+
+  deploy:
+    needs: migrate
+    steps:
+      - run: deploy $REGISTRY/api:$GITHUB_SHA</code></pre>
+
+<p>Tests before build, so a broken image is never produced. Migrations after build and before
+deploy, so the schema is ready when the new code arrives &mdash; and because they are
+backwards-compatible, the old code keeps working in the gap. Tagged by commit, so the deploy step
+and a later rollback name the same artefact.</p>
+
+<p>Two things worth adding once the basics work. A <strong>smoke test</strong> against the deployed
+URL, so a green pipeline means the thing actually answers rather than that the deploy command
+exited zero. And a <strong>manual approval</strong> before production, which costs nothing and
+catches the deploy nobody meant to trigger.</p>
+
+<h2>Rolling back</h2>
+
+<p>The most valuable property of the pipeline above is that rollback is one command:</p>
+
+<pre class="language-bash"><code class="language-bash">deploy $REGISTRY/api:$PREVIOUS_SHA</code></pre>
+
+<p>Which works for code and does not work for schema. A migration that dropped a column cannot be
+undone by deploying an older image &mdash; the data is gone. That is the real reason for the
+two-deploy discipline above: expand, deploy, contract, so there is always a version of the schema
+both releases can run against.</p>
+
+<p>Alembic's <code>downgrade</code> is worth writing and worth distrusting. It is fine for
+reversing an added column; it cannot recover data a destructive migration removed. The reliable
+answer for the destructive kind is a backup taken immediately before, and knowing how long a
+restore takes &mdash; which is a number worth measuring before you need it rather than during.</p>
+
+<h2>When it works locally and not in the cluster</h2>
+
+<p>The same short list explains most of these, in rough order of frequency.</p>
+
+<ol>
+  <li><strong>Bound to the wrong interface.</strong> Missing <code>--host 0.0.0.0</code>. Everything
+      looks healthy and nothing arrives.</li>
+  <li><strong>A hostname that only exists on your machine.</strong> <code>localhost:5433</code> in
+      a container is that container. Service names and container-side ports, always.</li>
+  <li><strong>A missing environment variable.</strong> With a default, it starts and misbehaves;
+      without one, it fails at boot, which is what you want.</li>
+  <li><strong>CORS.</strong> The deployed frontend's origin is not the localhost one in your
+      allowlist. Exact match &mdash; scheme, host and port.</li>
+  <li><strong>Migrations not run.</strong> <code>relation "bookings" does not exist</code>.</li>
+  <li><strong>Connection pool exhausted.</strong> Fine with one worker locally, not with twelve.</li>
+  <li><strong>Timeouts.</strong> A request that takes 40 seconds locally meets a 30-second proxy
+      timeout and returns 504 &mdash; from the proxy, so your logs show nothing at all.</li>
+  <li><strong>Wheels for the wrong platform.</strong> Building on an Apple Silicon machine for an
+      x86 cluster produces an image that dies at import. Use
+      <code>--platform linux/amd64</code>, and check with <code>file</code> on a compiled
+      <code>.so</code>.</li>
+</ol>
+
+<p>The first diagnostic in every case is the same: <code>docker logs</code>, or the platform's
+equivalent. Which only helps if <code>PYTHONUNBUFFERED=1</code> is set &mdash; without it, a
+crashing process loses whatever was still buffered, and you get an empty log for the one event you
+needed to see.</p>
+
+<h2>Scale in the right order</h2>
+
+<p>When it is slow, the useful order is roughly the inverse of how tempting each option is.</p>
+
+<p><strong>Find the actual bottleneck first.</strong> Duration percentiles per route, from lesson
+15. It is nearly always one endpoint and nearly always the database.</p>
+
+<p><strong>Then indexes and N+1.</strong> A missing index or one lazy relationship in a list
+endpoint costs more than the framework spends all day. Lesson 6 covers both.</p>
+
+<p><strong>Then caching.</strong> Anything computed repeatedly and changing rarely &mdash; the
+amenity vocabulary, a search facet. Redis, or HTTP caching headers if a proxy can do it for you.</p>
+
+<p><strong>Then more processes.</strong> Workers within a container, then more containers, watching
+the connection arithmetic each time.</p>
+
+<p><strong>Then read replicas</strong>, and only if reads genuinely dominate &mdash; replication lag
+means a write followed immediately by a read can return stale data, which surprises users in ways
+that are hard to explain.</p>
+
+<p>Reaching for horizontal scale before the profile is a way to pay more money for the same
+latency. Four containers running the same N+1 query serve four times the traffic at exactly the
+same speed per request.</p>
+
+<h2>Turning off what should not be public</h2>
+
+<p>A few defaults are right for development and wrong once the API is reachable.</p>
+
+<pre class="language-python"><code class="language-python"># the FastAPI(...) call from lesson 1, with three arguments made conditional:
+    docs_url="/docs" if settings.expose_docs else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if settings.expose_docs else None,</code></pre>
+
+<p>Whether to publish the documentation is a real decision rather than an obvious one. A public API
+should &mdash; it is how people integrate. An internal one probably should not, since the OpenAPI
+document is a complete map of your surface including parameter names and constraints. Making it a
+setting means the answer can differ per environment without a code change.</p>
+
+<p>The same applies to <code>/metrics</code>, which leaks traffic volumes and error rates, and to
+anything that reports versions. Stack traces are already handled &mdash; lesson 8's handler returns
+a generic message &mdash; but it is worth confirming <code>debug=True</code> is nowhere near a
+deployed application, because Starlette's debug page renders the traceback and local variables into
+the response.</p>
+
+<h2>Rate limiting, which nothing does for you</h2>
+
+<p>FastAPI has none built in, and the endpoints that need it are predictable: login, registration,
+password reset, anything expensive, anything that sends a message.</p>
+
+<p>Login is the important one. bcrypt makes offline cracking expensive and does nothing about online
+guessing, and the deliberately vague "email or password is incorrect" means an attacker learns
+nothing per attempt except by volume &mdash; so volume is what has to be limited.</p>
+
+<p>Two places to do it. At the edge, where nginx or a WAF rejects before the request costs anything:</p>
+
+<pre class="language-nginx"><code class="language-nginx">limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+
+location /api/v1/auth/login {
+    limit_req zone=login burst=3 nodelay;
+    proxy_pass http://api:8000;
+}</code></pre>
+
+<p>Or in the application, as a dependency, when the limit needs to know something the proxy does not
+&mdash; per user rather than per IP, or per plan. The counter must live in Redis rather than process
+memory, because workers share nothing: an in-process limit of five is five <em>per worker</em>, so
+four workers means twenty.</p>
+
+<p>Return <strong>429</strong> with a <code>Retry-After</code> header, so a well-behaved client backs
+off instead of hammering.</p>
+
+<h2>Backups, and the part people skip</h2>
+
+<p>Managed databases take automated backups, which is the easy half. The half that matters is
+whether a restore works, and how long it takes.</p>
+
+<p>Three numbers worth knowing before you need them: how far back the backups reach, how long a full
+restore takes, and how much data a restore would lose &mdash; the gap between the last backup and
+the failure. All three are measurable in an afternoon and unknowable during an incident.</p>
+
+<p>The one to actually rehearse is the restore. A backup that has never been restored is a file, not
+a backup, and the failure modes &mdash; a missing extension, an incompatible version, a permission
+that was never captured &mdash; only appear when you try.</p>
+
+<h2>The first week in production</h2>
+
+<p>Three things worth doing once traffic is real, none of which can be done in advance.</p>
+
+<p><strong>Look at the latency distribution, not the average.</strong> The p99 is usually a
+surprise, and it usually points at one endpoint doing something the others do not &mdash; an N+1, a
+missing index, a third-party call nobody timed.</p>
+
+<p><strong>Read the error log rather than counting it.</strong> A rate tells you whether something
+changed; reading the lines tells you what people are actually hitting. Frequently it is a client
+sending something you did not anticipate, which is a validation message worth improving rather than
+a bug.</p>
+
+<p><strong>Check the numbers you guessed.</strong> Worker count, pool size, timeouts and container
+memory were all chosen before there was evidence. Now there is: connection pool usage against its
+ceiling, memory against the limit, and whether any request is anywhere near the proxy timeout.</p>
+
+<p>The one measurement that repays itself fastest is the pool. It is invisible until it is
+exhausted, and then everything fails at once &mdash; so knowing you are at 30% rather than 90% is
+the difference between a planned change and an incident.</p>
+
+<h2>Before the first deploy</h2>
+
+<ul>
+  <li>Secrets from the environment, no defaults, nothing in the image.</li>
+  <li><code>--host 0.0.0.0</code>, <code>--proxy-headers</code>, workers set deliberately.</li>
+  <li>Connection arithmetic checked against <code>max_connections</code>.</li>
+  <li>Migrations as a separate step, backwards-compatible.</li>
+  <li>Readiness probe that means ready; exec-form <code>CMD</code> so <code>SIGTERM</code>
+      arrives.</li>
+  <li>JSON logs with a request id, going somewhere you can search.</li>
+  <li>TLS, a body size limit and timeouts at the proxy.</li>
+  <li><code>/docs</code> and <code>/metrics</code> either protected or disabled &mdash;
+      <code>FastAPI(docs_url=None)</code> if the API is not public.</li>
+  <li>A rollback you have actually tried.</li>
+</ul>
+
+<p>Next: <strong>interview questions</strong> &mdash; the whole track compressed into the questions
+a FastAPI role actually asks.</p>

@@ -1,0 +1,408 @@
+<p><code>BackgroundTasks</code> runs work after the response has been sent. That is the entire
+feature, and it buys exactly one thing: the caller is not kept waiting. It is also the FastAPI
+feature most often mistaken for a job queue, and the gap between what it does and what people
+assume it does is where the outages live.</p>
+
+<h2>Using it</h2>
+
+<p>Ask for it by type, then hand it a callable and its arguments:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
+def create_booking(
+    payload: BookingCreateRequest, user: CurrentUser, db: DbSession, background: BackgroundTasks
+) -&gt; BookingResponse:
+    """Hold the dates. The booking is PENDING until payment succeeds.
+
+    ⚠️ The body carries no price. Every figure is computed server-side from the listing.
+    """
+    booking = BookingService(db).create(user, payload)</code></pre>
+
+<pre class="language-python"><code class="language-python">    background.add_task(notification_service.send_booking_confirmation, booking.public_id)
+    return _to_response(booking)</code></pre>
+
+<p><code>add_task</code> does not call the function. It appends it to a list Starlette walks after
+the response is written. The guest sees their booking immediately; the email is sent a moment
+later, and its latency is invisible to them.</p>
+
+<p>Note <em>when</em> the task is queued &mdash; after <code>create()</code> has returned:</p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ Queued AFTER create() returned, never before. A task added earlier still runs even if
+    # create() then raises — Starlette runs whatever is on the response's task list, and a failed
+    # request that emails "your dates are held" is worse than no email at all.</code></pre>
+
+<p>Queue after the work succeeds, never before. The ordering looks arbitrary and is not.</p>
+
+<h2>The trap: it half-works</h2>
+
+<p>The obvious way to write that call is to pass the object you already have:</p>
+
+<pre class="language-python"><code class="language-python">background.add_task(send_booking_confirmation, booking)   # ⚠️ do not</code></pre>
+
+<p>It will appear to work. Here is why it does not.</p>
+
+<p>A dependency with <code>yield</code> runs its teardown <strong>before</strong> background tasks.
+Measured on FastAPI 0.115.5:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">1. dep: open
+2. route body
+3. dep: CLOSED      <- get_db's `finally: db.close()`
+4. background task ran</code></pre>
+
+<p>So by the time the task runs, the request's session is closed and every object loaded from it is
+detached. What makes this genuinely dangerous is that it fails <em>selectively</em>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">booking.total          -> OK, Decimal('797.40')
+booking.property.title -> DetachedInstanceError</code></pre>
+
+<p>A column that was already loaded survives &mdash; StayHub sets
+<code>expire_on_commit=False</code>, so attributes are not invalidated on commit. The first
+relationship that was <em>not</em> loaded raises, because reading it needs a query and there is no
+session to issue one.</p>
+
+<p>Put that together and the failure mode is brutal: the version that passes the object passes a
+test that checks the total, ships, and breaks the day somebody adds the property name to the email
+&mdash; after the response has already gone out with a 200, where nobody is looking.</p>
+
+<h3>The fix is in the signature</h3>
+
+<pre class="language-python"><code class="language-python">def send_booking_confirmation(booking_public_id: UUID) -&gt; None:</code></pre>
+
+<p>Take a plain value. Then open a session that belongs to the task:</p>
+
+<pre class="language-python"><code class="language-python">    with SessionLocal() as db:
+        booking = db.execute(
+            select(Booking)
+            .where(Booking.public_id == booking_public_id)
+            .options(selectinload(Booking.property), selectinload(Booking.guest))
+        ).scalar_one_or_none()</code></pre>
+
+<p>The relationships are eager-loaded in that one query, precisely because there is no session to
+lazy-load from later &mdash; and because the alternative is three more round trips per email.</p>
+
+<p><strong>Rule: a background task takes ids and strings, never ORM objects, and opens its own
+session.</strong> That removes the entire category rather than working around one instance of
+it.</p>
+
+<h2>Nobody is left to return an error to</h2>
+
+<pre class="language-python"><code class="language-python">        if booking is None:
+            # Not an error worth raising. The booking can legitimately be gone by now, and there
+            # is nobody left to return a 404 to — the response was sent long ago.
+            logger.warning("Booking %s vanished before its email was sent", booking_public_id)
+            return</code></pre>
+
+<p>This is the mental shift a background task requires. There is no caller. Raising accomplishes
+nothing a log line does not, and an unhandled exception in a task is <strong>invisible</strong>
+&mdash; the response already went out with a 200, so no monitoring based on status codes will ever
+see it.</p>
+
+<p>Two consequences. Every task should catch its own failures and log them with enough context to
+act on. And a task must tolerate the world having moved: the row it was given may be gone, already
+processed, or changed. Write them to be re-runnable and to no-op when there is nothing to do.</p>
+
+<h2>Sync or async task</h2>
+
+<p>Both work, and the difference matters:</p>
+
+<pre class="language-python"><code class="language-python">background.add_task(sync_function, booking_id)    # runs in the threadpool
+background.add_task(async_function, booking_id)   # runs on the event loop</code></pre>
+
+<p>A plain <code>def</code> task is dispatched to the threadpool, so blocking in it is safe. An
+<code>async def</code> task runs on the event loop, so a blocking call inside it stalls
+<em>every</em> request in the process &mdash; and it does so after the response, where it looks like
+unrelated slowness elsewhere.</p>
+
+<p>StayHub's notification functions are plain <code>def</code>, because they do blocking database
+and file work. That is the right default: <strong>if the task blocks, make it
+<code>def</code>.</strong> Reserve <code>async def</code> for tasks that genuinely await.</p>
+
+<h2>What it is not</h2>
+
+<pre class="language-python"><code class="language-python">It is NOT a job queue, and the difference is not academic:
+
+  * no retry           — a provider blip loses the email
+  * no persistence     — a deploy or a crash mid-task loses it too
+  * no back-pressure   — a burst of requests is a burst of concurrent tasks
+  * no visibility      — nothing anywhere records that it was meant to happen</code></pre>
+
+<p>Each of those is worth sitting with.</p>
+
+<p><strong>No retry.</strong> The email provider returns a 503; the task raises; the email is gone.
+Nothing will ever try again.</p>
+
+<p><strong>No persistence.</strong> Tasks live in the process's memory. A deploy that restarts the
+container mid-task loses it silently, and deploys happen at exactly the times traffic is
+highest.</p>
+
+<p><strong>No back-pressure.</strong> A thousand requests queue a thousand tasks. There is no
+worker pool bounding how many run, no rate limit, and nothing to shed load &mdash; the process
+simply takes on more work while still serving traffic.</p>
+
+<p><strong>No visibility.</strong> No queue depth, no dead-letter, no record that a task existed.
+When somebody asks whether the email was sent, the only answer is a log search.</p>
+
+<h2>So when is it the right tool?</h2>
+
+<p>The test is a single question: <strong>if this silently never happens, is that acceptable?</strong></p>
+
+<table>
+  <thead><tr><th>Work</th><th>Use</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Audit log line</td><td>BackgroundTasks</td><td>nice to have, cheap, no consequence</td></tr>
+    <tr><td>Cache warm</td><td>BackgroundTasks</td><td>recomputes anyway</td></tr>
+    <tr><td>Search index update</td><td>BackgroundTasks</td><td>a reindex is the repair path</td></tr>
+    <tr><td>Cleaning a temp file</td><td>BackgroundTasks</td><td>a sweeper catches strays</td></tr>
+    <tr><td>Booking confirmation email</td><td>borderline</td><td>a queue in production</td></tr>
+    <tr><td>Password reset email</td><td><strong>queue</strong></td><td>the user is waiting for it</td></tr>
+    <tr><td>Payment capture</td><td><strong>queue</strong></td><td>money</td></tr>
+    <tr><td>Video transcode</td><td><strong>queue</strong></td><td>minutes of CPU, needs its own workers</td></tr>
+    <tr><td>Anything hourly</td><td><strong>scheduler</strong></td><td>not triggered by a request at all</td></tr>
+  </tbody>
+</table>
+
+<p>StayHub's confirmation email is on the borderline and lives here because it is a demo. The
+money-side equivalent deliberately does not: payment confirmation arrives as a Stripe
+<strong>webhook</strong>, a real HTTP callback with the provider's own retries behind it. That
+contrast is the lesson in one application &mdash; the thing that must happen does not use
+<code>BackgroundTasks</code>.</p>
+
+<h2>What a queue gives you</h2>
+
+<p>The shape barely changes at the call site:</p>
+
+<pre class="language-python"><code class="language-python">background.add_task(send_booking_confirmation, booking.public_id)   # in-process
+send_booking_confirmation.delay(str(booking.public_id))             # Celery
+queue.enqueue(send_booking_confirmation, str(booking.public_id))    # RQ</code></pre>
+
+<p>What changes is everything behind it. The task is serialised into a broker &mdash; Redis,
+RabbitMQ, SQS &mdash; where it survives a restart. Separate worker processes consume it, so heavy
+work does not compete with request handling and can be scaled independently. Failures retry with
+backoff and eventually land in a dead-letter queue you can inspect.</p>
+
+<p>Note the argument in both queue versions is a <em>string</em>, not a UUID. Anything crossing a
+broker must serialise, which enforces the discipline the in-process version only recommends: you
+could not pass an ORM object if you tried.</p>
+
+<p>The cost is real &mdash; a broker to run, workers to deploy, and a second place code can fail.
+For a small application that is a lot of machinery for one email. The honest progression is to start
+with <code>BackgroundTasks</code>, and move the moment something crosses the "must happen"
+line.</p>
+
+<h3>The middle option</h3>
+
+<p>Between the two sits a pattern worth knowing, because it needs no new infrastructure: write the
+intent to your own database in the same transaction as the work, then process it separately.</p>
+
+<pre class="language-python"><code class="language-python">class OutboxEntry(Base, TimestampMixin):
+    __tablename__ = "outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(60), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)</code></pre>
+
+<p>Because the row is written in the booking's own transaction, "the booking exists" and "we owe an
+email" become atomic &mdash; which is something neither <code>BackgroundTasks</code> nor an
+external queue can offer. A <code>BackgroundTasks</code> job then tries it immediately for latency,
+and a periodic sweep catches whatever failed. Persistence and retry, at the cost of one table.</p>
+
+<h2>Testing tasks</h2>
+
+<p>The awkwardness is that <code>TestClient</code> runs background tasks, which is usually what you
+want &mdash; but it means a test hitting a route also sends email.</p>
+
+<p>Three approaches, in order of preference. <strong>Test the task directly</strong>, as a plain
+function, which is most of the value for none of the ceremony. <strong>Override the dependency
+that produces the side effect</strong> if it has one. Or <strong>assert on the queued
+tasks</strong> without running them:</p>
+
+<pre class="language-python"><code class="language-python">def test_creating_a_booking_queues_its_confirmation(db, guest, listing):
+    background = BackgroundTasks()
+    create_booking(payload, guest, db, background)
+
+    assert len(background.tasks) == 1
+    assert background.tasks[0].func is notification_service.send_booking_confirmation</code></pre>
+
+<p>Calling the route function directly and inspecting <code>background.tasks</code> asserts the
+wiring without the side effect. It is also the test that would have caught the
+"queued before the work" ordering mistake.</p>
+
+<p>StayHub's own tasks write to a directory rather than sending mail, which makes the end-to-end
+version cheap &mdash; the test asserts a file appeared and reads it. A stand-in like that is often
+the least effort for the most confidence.</p>
+
+<h2>Work that is not triggered by a request</h2>
+
+<p><code>BackgroundTasks</code> is attached to a response, so it can only ever run because somebody
+called an endpoint. A whole category of work is not like that: expiring stale bookings, nightly
+reports, sweeping temporary files, retrying an outbox.</p>
+
+<p>Three options, in increasing order of seriousness.</p>
+
+<p><strong>A loop in the lifespan</strong>, for something small in a single-instance
+deployment:</p>
+
+<pre class="language-python"><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async def sweep():
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                expire_stale_bookings()
+            except Exception:
+                logger.exception("sweep failed")
+
+    task = asyncio.create_task(sweep())
+    yield
+    task.cancel()</code></pre>
+
+<p>Note the <code>try</code> inside the loop. Without it, one failure ends the loop permanently and
+nothing says so &mdash; the sweep just silently stops happening. Note also the reference is held and
+cancelled on shutdown; a forgotten task can be garbage-collected mid-flight.</p>
+
+<p>The catch is that this runs in <em>every</em> worker and <em>every</em> replica. Four workers
+across three containers is twelve concurrent sweeps.</p>
+
+<p><strong>An external scheduler</strong> &mdash; cron, a Kubernetes CronJob, your platform's
+scheduled tasks &mdash; invoking a management command. Runs once regardless of how many replicas
+exist, which is usually the deciding factor.</p>
+
+<p><strong>Celery beat or APScheduler with a shared lock</strong>, when the schedule itself needs to
+be dynamic or per-tenant.</p>
+
+<p>Whichever you choose, make the job idempotent and make it safe to run twice at once. At some
+point it will be.</p>
+
+<h2>A second example: keeping the index fresh</h2>
+
+<p>Email is the obvious case. A more instructive one is StayHub's search index, which is updated
+from application code on every write:</p>
+
+<pre class="language-python"><code class="language-python">    """Rebuild the Elasticsearch index from Postgres.
+
+    The repair path for the sync's one weakness: it is not transactional, so a crash between a
+    commit and an index call leaves the two out of step. Postgres is the source of truth, so a
+    rebuild is always safe.
+    """</code></pre>
+
+<p>That docstring contains the whole design. Indexing is a good candidate for a background task
+&mdash; the write should not wait for it, and a search result being a second stale is fine. But it
+is <strong>not transactional</strong>: the database commit and the index update can disagree if the
+process dies between them.</p>
+
+<p>The answer is not to make it transactional, which is not possible across two systems. It is to
+name one of them the source of truth and provide a repair path. Postgres is authoritative, so a
+full reindex always fixes any drift, and it is exposed as an endpoint staff can call.</p>
+
+<p><strong>That pattern generalises.</strong> Any background task that touches a second system has
+this problem. Rather than trying to make two writes atomic, decide which one is the truth and make
+reconciliation cheap and repeatable.</p>
+
+<h2>What runs, and in what order</h2>
+
+<p>Worth being precise, because the ordering explains most surprises.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">1. dependencies resolve
+2. route body runs                    -> tasks queued here
+3. response is serialised
+4. yield-dependency teardown          -> the session closes
+5. response is SENT to the client
+6. background tasks run, IN ORDER, one after another</code></pre>
+
+<p>Three consequences fall out of that list.</p>
+
+<p><strong>Tasks are sequential, not concurrent.</strong> Three tasks of two seconds each is six
+seconds of work after the response. That is usually fine &mdash; nobody is waiting &mdash; but it
+does mean a slow task delays the ones queued behind it, and under load they accumulate.</p>
+
+<p><strong>A task that raises stops the ones after it.</strong> Starlette runs them in order and
+does not catch for you, so the second failing means the third never runs. That alone is a reason to
+wrap each task's body in its own <code>try</code>.</p>
+
+<p><strong>Every task on the list runs, even if the route raised after queuing it.</strong> Which is
+the ordering rule from the top of this lesson, and the reason to queue after the work rather than
+before.</p>
+
+<h2>Dependencies inside tasks</h2>
+
+<p>A background task is a plain function; nothing injects into it. So anything it needs, it acquires
+itself:</p>
+
+<pre class="language-python"><code class="language-python">    with SessionLocal() as db:</code></pre>
+
+<p>That is the shape for everything, not only sessions. Settings come from the module-level
+<code>settings</code> object, which is cached and safe. A shared client held on
+<code>app.state</code> is not reachable, so either pass what it needs or reach for the module-level
+singleton instead.</p>
+
+<p>If a task genuinely needs several injected things, that is a signal it should be a service method
+the route calls with what it already has &mdash; and the task becomes a thin wrapper that acquires a
+session and calls it. Which is exactly what
+<code>send_booking_confirmation</code> is.</p>
+
+<h2>Observing them</h2>
+
+<p>The hardest thing about background tasks is that they are invisible by default: no status code,
+no response, nothing in an access log. Two cheap habits fix most of that.</p>
+
+<p><strong>Log the start and the outcome</strong>, with the id the task was given, so the work can
+be found from the same request id as the endpoint that queued it:</p>
+
+<pre class="language-python"><code class="language-python">    logger.info("Email queued for %s: %s", to, subject, extra={"recipient": to})</code></pre>
+
+<p>⚠️ One caveat specific to this: the <code>ContextVar</code> holding the request id has usually
+been reset by the time a task runs, so the correlation is not automatic. If you need it, capture the
+id in the route and pass it as an argument &mdash; the same discipline as everything else the task
+needs.</p>
+
+<p><strong>Count them.</strong> A counter of tasks started and tasks failed, from lesson 15's
+metrics, turns "did the emails go out?" into a graph rather than a log search. It is also the only
+way to notice the failure mode where a provider quietly starts rejecting everything.</p>
+
+<h2>Choosing a queue, when you need one</h2>
+
+<p>Three options dominate, and the differences are practical rather than philosophical.</p>
+
+<table>
+  <thead><tr><th></th><th>Celery</th><th>RQ</th><th>SQS / cloud</th></tr></thead>
+  <tbody>
+    <tr><td>Broker</td><td>Redis or RabbitMQ</td><td>Redis</td><td>managed</td></tr>
+    <tr><td>Scheduling</td><td>built in (beat)</td><td>an add-on</td><td>separate service</td></tr>
+    <tr><td>Retries / backoff</td><td>rich</td><td>basic</td><td>built in</td></tr>
+    <tr><td>Complexity</td><td>high</td><td>low</td><td>medium</td></tr>
+    <tr><td>Operational load</td><td>you run the broker</td><td>you run Redis</td><td>none</td></tr>
+  </tbody>
+</table>
+
+<p>RQ is the honest first step for a Python service that already has Redis: a few lines, a worker
+process, and persistence plus retries. Celery is the right answer once you need scheduling,
+chained tasks, priorities or routing, and it is genuinely more to operate. A managed queue removes
+the broker from your responsibilities and adds a network hop and a bill.</p>
+
+<p>Whichever it is, the boundary you should design for is the same: <strong>tasks take serialisable
+arguments and are idempotent.</strong> Get that right with <code>BackgroundTasks</code> and moving
+to a queue is changing one line at each call site. Get it wrong &mdash; passing objects, assuming
+exactly-once &mdash; and the move is a rewrite.</p>
+
+<h2>The decision, in one paragraph</h2>
+
+<p>Use <code>BackgroundTasks</code> when the work is genuinely optional, fast, and cheap to lose:
+warming a cache, updating a search index that has a rebuild path, writing an audit line, tidying a
+temporary file. Use a queue when losing the work costs something a user or an accountant would
+notice. And whichever you use, take ids rather than objects, open your own session, catch your own
+exceptions, and write the task so running it twice is harmless &mdash; because at some point it
+will.</p>
+
+<h2>Two habits worth forming</h2>
+
+<p><strong>Make tasks idempotent.</strong> With retries, "exactly once" is not on offer; "at least
+once" is. A task that sends an email should record that it did, so a retry after a partial failure
+does not send a second one.</p>
+
+<p><strong>Keep them small and specific.</strong> One task that sends an email, another that
+updates the index &mdash; not one that does both. A combined task that fails halfway has no good
+retry, because retrying repeats the half that worked.</p>
+
+<p>Next: <strong>async def or def</strong> &mdash; the same "which one blocks" question that decided
+how these tasks are written, with measurements.</p>

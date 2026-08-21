@@ -1,0 +1,495 @@
+<p>FastAPI ships no database layer, which is a feature rather than an omission &mdash; it means the
+choice is yours and nothing is hidden. This lesson builds the layer StayHub actually uses:
+SQLAlchemy 2.0 with typed models, one session per request, a repository layer, Alembic for
+migrations, and the two performance problems that catch everyone.</p>
+
+<h2>Engine, session, and the difference</h2>
+
+<p>The <strong>engine</strong> is created once per process and owns the connection pool. The
+<strong>session</strong> is created per request and owns a unit of work.</p>
+
+<pre class="language-python"><code class="language-python">engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    echo=False,
+)
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)</code></pre>
+
+<p>Three of those arguments are doing real work.</p>
+
+<p><strong><code>pool_pre_ping=True</code></strong> checks a pooled connection is alive before
+handing it out. Without it, a connection the database closed while idle &mdash; a nightly restart, a
+firewall timeout, a failover &mdash; surfaces as a random "server closed the connection
+unexpectedly" on some unlucky request rather than being quietly replaced. It costs one trivial
+round trip per checkout and removes a whole category of flaky.</p>
+
+<p><strong><code>expire_on_commit=False</code></strong> matters specifically in FastAPI. With the
+default, SQLAlchemy marks every object stale after <code>commit()</code>, so reading an attribute
+triggers a refresh query. Serialising the response happens <em>after</em> the route returns, which
+is sometimes after the session has closed &mdash; and the error you get is
+<code>DetachedInstanceError</code> pointing at a perfectly innocent attribute access in a response
+model.</p>
+
+<p><strong><code>autoflush=False</code></strong> stops SQLAlchemy silently issuing pending INSERTs
+before each query. Autoflush is convenient and makes it hard to reason about when statements
+actually run; explicit <code>flush()</code> is easier to debug.</p>
+
+<h2>Typed models</h2>
+
+<p>SQLAlchemy 2.0's declarative style uses real annotations, so the model is a type your editor
+understands:</p>
+
+<pre class="language-python"><code class="language-python">class Base(DeclarativeBase):
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+class TimestampMixin:
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )</code></pre>
+
+<p><code>server_default=func.now()</code> rather than a Python default: the database stamps the
+time, so rows written by a migration or a psql session get one too. <code>onupdate</code> is the
+Python-side counterpart for updates.</p>
+
+<p>Mixins are the right tool for columns every table shares. StayHub has three, and the second one
+is a decision rather than a convenience:</p>
+
+<pre class="language-python"><code class="language-python">class PublicIdMixin:
+    """A UUID the API exposes, alongside the BIGINT primary key the database joins on.
+
+    Two ids per row is deliberate. Integers make fast, small foreign keys; a sequential integer in
+    a URL also tells the world how many rows you have and invites `/properties/1`, `/properties/2`.
+    The UUID is the only id that ever leaves the process.
+    """</code></pre>
+
+<pre class="language-python"><code class="language-python">class SoftDeleteMixin:
+    """Rows are flagged, never removed — a booking's history references them forever."""
+
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)</code></pre>
+
+<h3>Column types that matter</h3>
+
+<p>Three choices in StayHub's models are worth copying deliberately.</p>
+
+<p><strong>Money is <code>Numeric</code>, never <code>Float</code>:</strong></p>
+
+<pre class="language-python"><code class="language-python">    price_per_night: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    cleaning_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0"), nullable=False)</code></pre>
+
+<p><code>Numeric(10, 2)</code> is exact decimal arithmetic in the database and gives you a Python
+<code>Decimal</code> back. A <code>Float</code> column is binary floating point at both ends, where
+<code>0.1 + 0.2</code> is not <code>0.3</code>. Coordinates get the same treatment for the same
+reason &mdash; a round trip through a float turns <code>37.7749</code> into
+<code>37.774899999999995</code>.</p>
+
+<p><strong>Enums are stored as <code>VARCHAR</code>, not as native Postgres enums:</strong></p>
+
+<pre class="language-python"><code class="language-python">"""Domain enums.
+
+These are plain `str` enums stored as VARCHAR, not Postgres ENUM types. A native ENUM needs an
+`ALTER TYPE` migration to add a value and cannot easily drop one; the check constraint is worth
+less than the ability to change your mind. Hasura also exposes VARCHAR far more simply.
+"""</code></pre>
+
+<p>That is a genuine trade rather than a rule. A native enum gives you database-level validation; a
+VARCHAR gives you the ability to add a status without an <code>ALTER TYPE</code> that locks the
+table. For a schema still moving, the second is usually worth more.</p>
+
+<p><strong>Denormalise deliberately, and say why:</strong></p>
+
+<pre class="language-python"><code class="language-python">    rating_average: Mapped[Decimal] = mapped_column(Numeric(3, 2), default=Decimal("0"), nullable=False)
+    rating_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)</code></pre>
+
+<p>Those are derived values, kept on the row and recomputed when a review lands. Search results
+show a rating on every card, and computing it per card is the classic subquery-per-row that makes a
+listing page slow. Denormalisation is a cache with the usual cache problem &mdash; it can go stale
+&mdash; so it needs one place that owns updating it.</p>
+
+<h2>Relationships</h2>
+
+<p>A one-to-many is declared on both sides, with <code>back_populates</code> naming the other:</p>
+
+<pre class="language-python"><code class="language-python">    host: Mapped["User"] = relationship(back_populates="properties")
+    images: Mapped[list["PropertyImage"]] = relationship(
+        back_populates="property",
+        cascade="all, delete-orphan",
+        order_by="PropertyImage.sort_order",
+    )
+    amenities: Mapped[list["Amenity"]] = relationship(secondary=property_amenities)
+    bookings: Mapped[list["Booking"]] = relationship(back_populates="property")</code></pre>
+
+<p><code>cascade="all, delete-orphan"</code> on <code>images</code> says an image has no life of its
+own: remove it from the list and the row goes. That is right for images and would be badly wrong for
+<code>bookings</code>, which is why only one of them has it.</p>
+
+<p><code>order_by</code> on the relationship means the list arrives sorted without every caller
+remembering to. Small, and it removes a whole class of "the photos are in a different order on this
+page" bug.</p>
+
+<p>Many-to-many uses an association table. When the join carries no data of its own, a plain
+<code>Table</code> is the right shape rather than a mapped class:</p>
+
+<pre class="language-python"><code class="language-python">property_amenities = Table(
+    "property_amenities",
+    Base.metadata,
+    Column("property_id", ForeignKey("properties.id", ondelete="CASCADE"), primary_key=True),
+    Column("amenity_id", ForeignKey("amenities.id", ondelete="CASCADE"), primary_key=True),
+)</code></pre>
+
+<p>Give it a mapped class the moment it needs a column of its own &mdash; when it was added, who
+added it &mdash; because at that point it is an entity rather than a join.</p>
+
+<h3>Name your constraints</h3>
+
+<pre class="language-python"><code class="language-python">NAMING_CONVENTION = {
+    "ix": "ix_%(column_0_label)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}</code></pre>
+
+<p>Set this on day one. Without it Postgres invents names like <code>ck_bookings_1a2b3c</code>, and
+a migration that needs to DROP a constraint cannot refer to it &mdash; so a downgrade you wrote
+months later simply does not work. Adding the convention afterwards is a migration that renames
+every constraint in the database, which nobody enjoys.</p>
+
+<h2>Let the database enforce what must be true</h2>
+
+<p>The most valuable thing in StayHub's schema is not a column. Bookings must not double-book, and
+that guarantee lives in Postgres:</p>
+
+<pre class="language-python"><code class="language-python">        ExcludeConstraint(
+            (literal_column("property_id"), "="),
+            (literal_column("daterange(check_in, check_out, '[)')"), "&amp;&amp;"),
+            where=literal_column(
+                "status IN ('PENDING', 'CONFIRMED', 'COMPLETED')"
+            ),
+            using="gist",
+            name="no_overlapping_bookings",
+        ),</code></pre>
+
+<p><code>EXCLUDE USING gist</code> is Postgres saying "no two rows may both match these operators":
+same <code>property_id</code>, and overlapping date ranges &mdash; but only among statuses that
+actually occupy the calendar, so a cancelled booking does not block its old dates.</p>
+
+<p>Why this rather than a check in Python? Because two guests can pass an availability check
+simultaneously. Both queries run before either INSERT lands, both see free dates, and both proceed.
+No amount of application code fixes that; only the database can serialise it.</p>
+
+<p><code>'[)'</code> is the half-open bound &mdash; check-out day excluded &mdash; so one guest
+leaving on the 5th does not collide with another arriving on the 5th. Get that wrong and every
+back-to-back booking in the system is rejected.</p>
+
+<p>The application still checks first, and that division of labour is the point:</p>
+
+<pre class="language-python"><code class="language-python">        if self.bookings.overlapping(prop.id, req.check_in, req.check_out):
+            raise ConflictException("Those dates are no longer available.")</code></pre>
+
+<p>The friendly check gives a readable message in the common case. The constraint is what holds
+when it loses the race:</p>
+
+<pre class="language-python"><code class="language-python">        try:
+            self.bookings.add(booking)
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            if _is_overlap_violation(exc):
+                raise ConflictException(
+                    "Those dates were just booked by someone else."
+                ) from exc
+            raise</code></pre>
+
+<p><strong>A check without a constraint is a race; a constraint without a check is a 500.</strong>
+Translating the <code>IntegrityError</code> is what turns the second into a 409 the UI can act on.
+Note the <code>rollback()</code> &mdash; after an <code>IntegrityError</code> the transaction is
+aborted, and every subsequent statement on that session fails until you roll back.</p>
+
+<h2>The repository layer</h2>
+
+<p>A generic base carries the operations every entity needs:</p>
+
+<pre class="language-python"><code class="language-python">class BaseRepository(Generic[ModelT]):
+    model: type[ModelT]
+
+    def __init__(self, db: Session) -&gt; None:
+        self.db = db
+
+    def get(self, id_: int) -&gt; ModelT | None:
+        return self.db.get(self.model, id_)
+
+    def get_by_public_id(self, public_id) -&gt; ModelT | None:
+        stmt = select(self.model).where(self.model.public_id == public_id)
+        return self.db.execute(stmt).scalar_one_or_none()</code></pre>
+
+<p>And a subclass adds the queries that entity actually needs:</p>
+
+<pre class="language-python"><code class="language-python">class BookingRepository(BaseRepository[Booking]):
+    model = Booking</code></pre>
+
+<p>The point of the layer is stated in its own docstring, and it is worth quoting because it is the
+argument, not the mechanism:</p>
+
+<pre class="language-python"><code class="language-python">"""The repository layer: the only place that knows SQLAlchemy exists.
+
+Why a layer at all, when `db.query(...)` works fine from a route? Because a route that builds
+queries cannot be read without knowing the schema, and a service that builds queries cannot be
+tested without a database. Keeping persistence here means the service layer reads as business
+rules and the routes read as HTTP.
+
+⚠️ Repositories NEVER commit. A commit is a transaction boundary, and only the caller knows where
+that boundary is — "create a booking AND its payment, or neither" is one transaction spanning two
+repositories. `flush()` is used instead where an id is needed before the commit.
+"""</code></pre>
+
+<h3>The half-open range, written down once</h3>
+
+<p>The overlap query is the availability rule, and it lives in the repository so that both the
+booking service and the calendar endpoint get the same answer:</p>
+
+<pre class="language-python"><code class="language-python">        conditions = [
+            Booking.property_id == property_id,
+            Booking.status.in_([s.value for s in BookingStatus.blocking()]),
+            Booking.check_in &lt; check_out,
+            Booking.check_out &gt; check_in,
+        ]</code></pre>
+
+<p>Both comparisons are <strong>strict</strong>, and that is what makes the ranges half-open. Using
+<code>&lt;=</code> would reject every back-to-back booking &mdash; a bug that presents as "the
+calendar is wrong" rather than as an off-by-one, and therefore takes an afternoon to find.</p>
+
+<p><code>BookingStatus.blocking()</code> is the same classmethod the database constraint's
+<code>WHERE</code> clause mirrors. The two must agree, so they read one definition.</p>
+
+<h2>Querying, 2.0 style</h2>
+
+<p>SQLAlchemy 2.0 has one query API, and it is not <code>db.query()</code>. That older interface
+still works and is what most search results will show you; new code should use
+<code>select()</code>:</p>
+
+<pre class="language-python"><code class="language-python"># legacy — still functional, do not write new code this way
+db.query(User).filter(User.email == email).first()
+
+# 2.0
+db.execute(select(User).where(User.email == email)).scalar_one_or_none()</code></pre>
+
+<p>Verbose by one method call, and worth it: the same <code>select()</code> works on the async API,
+composes cleanly, and returns a <code>Result</code> you unwrap deliberately. The unwrapping is where
+people trip, so it is worth learning the four:</p>
+
+<table>
+  <thead><tr><th>Call</th><th>Returns</th><th>When none</th><th>When many</th></tr></thead>
+  <tbody>
+    <tr><td><code>.scalar_one_or_none()</code></td><td>one object</td><td><code>None</code></td><td>raises</td></tr>
+    <tr><td><code>.scalar_one()</code></td><td>one object</td><td>raises</td><td>raises</td></tr>
+    <tr><td><code>.scalars().first()</code></td><td>one object</td><td><code>None</code></td><td>the first</td></tr>
+    <tr><td><code>.scalars().all()</code></td><td>a list</td><td><code>[]</code></td><td>all of them</td></tr>
+  </tbody>
+</table>
+
+<p><code>scalar_one_or_none()</code> is the right default for a lookup by unique key, because it
+raises when the "unique" key turns out not to be. <code>first()</code> silently returns one of
+several, which hides exactly that bug.</p>
+
+<p><code>scalars()</code> is the part people forget. Without it a <code>Result</code> yields
+<em>rows</em> &mdash; one-element tuples when you selected one entity &mdash; and the symptom is
+<code>AttributeError: 'Row' object has no attribute 'email'</code>. When you select more than one
+thing, rows are what you want:</p>
+
+<pre class="language-python"><code class="language-python">    rows = db.execute(
+        select(Booking, User.email, Property.title)
+        .join(User, Booking.guest_id == User.id)
+        .join(Property, Booking.property_id == Property.id)</code></pre>
+
+<p>That returns real tuples, unpacked as <code>for b, email, title in rows</code> &mdash; and it is
+one query rather than the twenty-one the lazy version would issue.</p>
+
+<h2>Indexes</h2>
+
+<p>Declare them on the column for a single-column index, and in <code>__table_args__</code> for a
+composite one:</p>
+
+<pre class="language-python"><code class="language-python">    property_id: Mapped[int] = mapped_column(
+        ForeignKey("properties.id"), nullable=False, index=True
+    )</code></pre>
+
+<pre class="language-python"><code class="language-python">        Index("ix_bookings_property_dates", "property_id", "check_in", "check_out"),</code></pre>
+
+<p>Two rules cover most of it. <strong>Index every foreign key</strong> &mdash; Postgres does not do
+it for you, and an unindexed FK makes both the join and the parent's delete slow.
+<strong>Index what you filter and sort by</strong>, in that column order: the composite above serves
+the availability query, which filters on property and then on a date range.</p>
+
+<p>Indexes are not free. Each one is written on every INSERT and UPDATE, so a table with nine
+indexes writes nine extra structures per row. Add them for queries you actually run, and check with
+<code>EXPLAIN ANALYZE</code> rather than by intuition.</p>
+
+<h2>The N+1 problem</h2>
+
+<p>This is the performance bug you will actually hit. SQLAlchemy loads relationships lazily by
+default: reading <code>booking.property</code> issues a query. In a loop, that is one query per
+row.</p>
+
+<pre class="language-python"><code class="language-python">bookings = db.execute(select(Booking).limit(20)).scalars().all()   # 1 query
+for b in bookings:
+    print(b.property.title)                                        # 20 more</code></pre>
+
+<p>Twenty-one queries for twenty rows, and it gets worse linearly while looking fine in
+development against ten rows of seed data. The fix is to say up front what you will need:</p>
+
+<pre class="language-python"><code class="language-python">        stmt = (
+            select(Booking)
+            .options(
+                # Chained joinedload: the booking's property AND that property's images, so a
+                # confirmation page can show the cover photo without a second query.
+                joinedload(Booking.property).joinedload(Property.images),
+                joinedload(Booking.guest),
+            )
+            .where(Booking.public_id == public_id)
+        )
+        return self.db.execute(stmt).unique().scalar_one_or_none()</code></pre>
+
+<p>Two strategies, and the choice matters:</p>
+
+<table>
+  <thead><tr><th></th><th>Does</th><th>Best for</th></tr></thead>
+  <tbody>
+    <tr><td><code>joinedload</code></td><td>a single query with a JOIN</td><td>many-to-one &mdash; a booking's property</td></tr>
+    <tr><td><code>selectinload</code></td><td>a second query with <code>IN (...)</code></td><td>one-to-many &mdash; a property's images</td></tr>
+  </tbody>
+</table>
+
+<p><code>joinedload</code> on a one-to-many multiplies the parent row by the number of children, so
+twenty bookings with five images each return a hundred rows to deduplicate in Python. That is what
+<code>.unique()</code> in the snippet above is for &mdash; and SQLAlchemy 2.0 <em>requires</em> it
+when a <code>joinedload</code> touches a collection, raising a clear error if you forget.
+<code>selectinload</code> avoids the multiplication with one extra round trip, which is usually the
+better trade for collections.</p>
+
+<h2>Transactions</h2>
+
+<p>The rule is one transaction per request, ended by the service. Everything the route does is
+inside it, and nothing commits until the work is complete:</p>
+
+<pre class="language-python"><code class="language-python">booking = self.bookings.add(booking)      # flush — the id exists, nothing is durable
+payment = self.payments.add(payment)      # flush — same transaction
+self.db.commit()                          # both, or neither</code></pre>
+
+<p>If the second <code>add</code> raises, nothing is written. That is only true because the
+repositories did not commit &mdash; which is the rule from the top of this lesson, doing its job.</p>
+
+<p>Rollback is automatic in one sense and not in another. An unhandled exception means
+<code>get_db</code> closes the session without committing, and the transaction is discarded. But if
+you <em>catch</em> an exception and continue, you must roll back explicitly before using the session
+again, as the <code>IntegrityError</code> handler above does.</p>
+
+<h2>Soft delete has a sharp edge</h2>
+
+<p>Flagging rows instead of removing them is the right call when other rows reference them forever.
+It comes with a cost that is easy to miss:</p>
+
+<pre class="language-python"><code class="language-python">    """Headline numbers, from real aggregates &mdash; never mock data.
+
+    ⚠️ Each of these filters `deleted = false` itself. The soft-delete flag is only automatic when
+    a query goes through the ORM's own filtering; a hand-written aggregate has to say so. Forgetting
+    it counts deleted rows as real ones, and the totals stay plausible while being wrong.
+    """</code></pre>
+
+<p>"Plausible while being wrong" is the whole problem. A hard delete makes a forgotten filter
+impossible; a soft delete makes it invisible. Every hand-written count, sum and join has to repeat
+the condition, and the day somebody forgets, the dashboard is simply a bit off and nobody notices
+for a month.</p>
+
+<p>Options, in increasing order of magic: repeat the filter and review for it; give the repository
+a base query that applies it; or use a SQLAlchemy event or a
+<code>with_loader_criteria</code> to apply it globally. StayHub does the first, because an explicit
+condition in a query you can read beats a filter applied somewhere you cannot see &mdash;
+particularly for staff tools, where "show me the deleted ones" is a real requirement.</p>
+
+<h2>Connection pooling</h2>
+
+<p>The pool is per <em>process</em>, and that is the number people get wrong when they deploy.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">connections = workers × (pool_size + max_overflow)
+
+  4 uvicorn workers × (5 + 10)  =  60 connections from ONE container
+  3 containers                  = 180
+  Postgres default max_connections = 100          <-- exhausted</code></pre>
+
+<p>The failure mode is <code>FATAL: sorry, too many clients already</code> under load, and it
+arrives all at once rather than gradually. Both halves are adjustable: raise the database's limit,
+lower the pool, or put PgBouncer in front so many application connections share few database ones.</p>
+
+<p>Two more settings worth knowing. <code>pool_recycle</code> closes connections older than N
+seconds, which matters behind a proxy that silently drops idle ones. And <code>pool_timeout</code>
+is how long a request waits for a free connection before raising &mdash; the default of 30 seconds
+is usually far too long, since a request that has waited 30 seconds for a connection has already
+failed as far as the user is concerned.</p>
+
+<h2>Where the query belongs</h2>
+
+<p>A recurring question once there is a repository layer: does <em>every</em> query go through it?</p>
+
+<p>StayHub's answer is no, and the exception is visible in its admin module, which builds
+aggregates inline:</p>
+
+<pre class="language-python"><code class="language-python">    gross = db.execute(
+        select(func.coalesce(func.sum(Booking.total), 0)).where(
+            Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.COMPLETED])
+        )
+    ).scalar_one()</code></pre>
+
+<p>A repository method called <code>gross_bookings_value_for_the_stats_page()</code> would be a
+worse abstraction than the query it wraps &mdash; used once, named after its caller, and hiding
+three lines of perfectly readable SQL behind a function you have to open.</p>
+
+<p>The distinction worth drawing: <strong>a repository is for queries with a domain meaning that
+more than one caller needs.</strong> "Bookings that overlap these dates" is a rule, belongs in the
+repository, and has three callers. "Sum the totals for the dashboard" is a report, has one caller,
+and reads better where it is used.</p>
+
+<p>Getting this wrong in the other direction produces repositories with forty single-use methods,
+which is the same coupling with more indirection.</p>
+
+<h2>Migrations</h2>
+
+<p>Alembic owns the schema. <code>create_all()</code> is fine for a first sketch and unusable
+afterwards &mdash; it creates missing tables and does nothing about changed ones.</p>
+
+<pre class="language-bash"><code class="language-bash">alembic revision --autogenerate -m "add cancellation_reason to bookings"
+alembic upgrade head
+alembic downgrade -1
+alembic current</code></pre>
+
+<p>Autogenerate works by comparing your models against the live database, so it needs to see every
+model:</p>
+
+<pre class="language-python"><code class="language-python">from app.models import Base  # noqa: F401 — importing app.models registers every table</code></pre>
+
+<pre class="language-python"><code class="language-python">target_metadata = Base.metadata</code></pre>
+
+<p>That <code>noqa</code> is load-bearing. The import looks unused and a linter will offer to remove
+it; if it goes, <code>Base.metadata</code> is empty, autogenerate compares an empty schema against
+your database, and cheerfully writes a migration that <strong>drops every table you have</strong>.
+Always read a generated migration before running it &mdash; that is the failure it protects you
+from.</p>
+
+<p><code>compare_type=True</code> is also set, so a column whose type changed produces a migration.
+It is off by default and its absence is silent.</p>
+
+<p><strong>Never edit an applied migration.</strong> Write a new one. An edited migration means two
+databases claiming the same version with different schemas, and nothing anywhere will tell you.</p>
+
+<p>Autogenerate does not detect everything. It misses renames &mdash; a renamed column looks like a
+drop and an add, which is data loss &mdash; and it will not create the
+<code>btree_gist</code> extension the exclusion constraint above needs. Those go in by hand:</p>
+
+<pre class="language-python"><code class="language-python">op.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")</code></pre>
+
+<p>Next: <strong>designing the REST API</strong> &mdash; turning this data layer into endpoints
+somebody else can use, including pagination that does not repeat rows.</p>

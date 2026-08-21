@@ -1,0 +1,431 @@
+<p>Authentication is who you are. Authorization is what you may do. Most tutorials cover the first
+and stop, which leaves the harder and more consequential half undone. This lesson does both, using
+StayHub's real implementation &mdash; password hashing, a JWT two services both trust, and
+authorization expressed as dependencies so a route signature states its own rules.</p>
+
+<h2>Passwords</h2>
+
+<p>Never store a password. Store a slow, salted hash of one:</p>
+
+<pre class="language-python"><code class="language-python">pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(plain: str) -&gt; str:
+    return pwd_context.hash(plain[:72])
+
+
+def verify_password(plain: str, hashed: str) -&gt; bool:
+    return pwd_context.verify(plain[:72], hashed)</code></pre>
+
+<p><strong>bcrypt is slow by design, and that is the entire point.</strong> A general-purpose hash
+like SHA-256 is built to be fast, which is exactly wrong here: fast means a leaked database can be
+brute-forced at billions of guesses per second. bcrypt takes a deliberate fraction of a second, and
+the work factor can be raised as hardware improves.</p>
+
+<p>Salting is automatic. <code>pwd_context.hash</code> generates a random salt per password and
+stores it inside the resulting string, so two users with the same password get different hashes and
+a precomputed rainbow table is useless.</p>
+
+<p><code>deprecated="auto"</code> is the upgrade path. Add a stronger scheme to the list later and
+passlib verifies old hashes with the old scheme while marking them for rehash &mdash; so you can
+migrate algorithms without asking anybody to reset a password.</p>
+
+<h3>The 72-byte truncation</h3>
+
+<pre class="language-python"><code class="language-python">    # bcrypt silently truncates at 72 BYTES. Rejecting long passwords instead would surprise users;
+    # truncating is what every bcrypt implementation does, so be explicit that it happens.</code></pre>
+
+<p>bcrypt ignores everything past 72 bytes. Not characters &mdash; <strong>bytes</strong>, so a
+passphrase of emoji or non-Latin script hits the limit far sooner than it looks. Every
+implementation does this and most do it silently; slicing explicitly means the behaviour is visible
+in the code rather than a surprise in a library.</p>
+
+<p>It matters because it is a real, if narrow, security property: two long passwords sharing their
+first 72 bytes are the same password as far as bcrypt is concerned.</p>
+
+<h2>The token</h2>
+
+<p>A JWT is three base64 segments &mdash; header, claims, signature &mdash; joined by dots. The
+claims are <strong>signed, not encrypted</strong>. Anyone holding the token can read them; nobody
+without the secret can change them.</p>
+
+<p>That single fact decides what may go in one. An id and a role, yes. An email address, probably.
+Anything you would not write on a postcard, no.</p>
+
+<pre class="language-python"><code class="language-python">    payload = {
+        "sub": user_public_id,
+        "iat": now,
+        "exp": now + timedelta(minutes=settings.access_token_expire_minutes),</code></pre>
+
+<p><code>sub</code> is the subject &mdash; who this token is about. <code>iat</code> is when it was
+issued, <code>exp</code> when it stops being valid. Note <code>sub</code> is the
+<em>public</em> UUID, not the database's integer primary key: a token is handed to a browser, and
+the same reasoning that keeps sequential ids out of URLs keeps them out of tokens.</p>
+
+<p>Decoding is deliberately uninformative about failure:</p>
+
+<pre class="language-python"><code class="language-python">def decode_access_token(token: str) -&gt; dict | None:
+    """Returns the claims, or None for anything invalid &mdash; expired, tampered with, or malformed.
+
+    The caller turns None into a 401. Distinguishing *why* a token is bad would tell an attacker
+    which half of their guess was right.
+    """
+    try:
+        return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return None</code></pre>
+
+<p><code>algorithms=[...]</code> is not optional and not a formality. Passing an explicit list is
+what prevents the <strong>algorithm confusion</strong> attack: a JWT's header names its own
+algorithm, and a library that trusts that header will happily verify a token claiming
+<code>"alg": "none"</code>, or verify an RS256 token using the public key as an HMAC secret.
+Naming the algorithms you accept closes both.</p>
+
+<h3>One login, two services</h3>
+
+<p>StayHub's token carries an extra namespace, and it is the reason one sign-in works across two
+different APIs:</p>
+
+<pre class="language-python"><code class="language-python">        HASURA_CLAIMS_NAMESPACE: {
+            "x-hasura-default-role": default_role,
+            "x-hasura-allowed-roles": allowed,
+            "x-hasura-user-id": user_public_id,
+            "x-hasura-is-host": str(is_host).lower(),
+        },</code></pre>
+
+<p>FastAPI signs the token; a GraphQL service is given the same secret and verifies the signature
+itself. No auth webhook, no shared session store, no second login. That is the general pattern for
+JWTs across services: <strong>the signature is the trust, so anything holding the key can
+authenticate independently.</strong></p>
+
+<p>Two details in there cost real time to discover. Every <code>x-hasura-*</code> claim must be a
+<strong>string</strong>, including ids and booleans &mdash; hence <code>str(is_host).lower()</code>
+&mdash; because session variables are compared as text and a JSON number fails deep inside a
+permission check that points at a table rather than at the token. And the staff role is called
+<code>staff</code>, not <code>admin</code>, because <code>admin</code> is reserved in that system:
+it bypasses every rule and cannot have rules declared for it, so naming your role that mints tokens
+for a role whose permissions can never be expressed.</p>
+
+<p>The general lesson survives the specifics: <strong>claims are a contract with whatever consumes
+them.</strong> Read that system's rules before designing your token.</p>
+
+<h2>Registering and signing in</h2>
+
+<pre class="language-python"><code class="language-python">    def register(self, payload: UserRegisterRequest) -&gt; AuthResponse:
+        email = payload.email.strip().lower()
+        if self.users.email_exists(email):
+            raise ConflictException("An account with that email already exists.")</code></pre>
+
+<p>Normalising the email is a small thing that prevents a real problem &mdash; without
+<code>.lower()</code>, <code>Sam@example.com</code> and <code>sam@example.com</code> are two
+accounts, and the second person to sign up gets a confusing failure at login instead of at
+registration.</p>
+
+<p>The line that matters most is a single hardcoded value:</p>
+
+<pre class="language-python"><code class="language-python">            # ⚠️ HARDCODED. Registration always creates a CUSTOMER. If this ever reads a role off
+            # the request body, anyone can POST themselves an admin account.
+            role=UserRole.CUSTOMER,</code></pre>
+
+<p>Privilege must never be assignable from a request body. The safest version of this rule is
+structural rather than defensive: leave the field off the request model entirely, as lesson 3
+showed with prices, and there is nothing to forget to check.</p>
+
+<p>Contrast the two error messages. Registration <em>must</em> admit the email is taken &mdash; the
+user cannot proceed otherwise. Login must not:</p>
+
+<pre class="language-python"><code class="language-python">        if user is None or not verify_password(password, user.password_hash):
+            raise UnauthorizedException("Email or password is incorrect.")</code></pre>
+
+<p>One message for both cases. Distinguishing them turns the login form into an account-enumeration
+oracle: try an email, and the error tells you whether it is registered. The asymmetry with
+registration is deliberate and worth documenting where you make it, because it looks like an
+inconsistency to the next reader.</p>
+
+<h2>Verifying on every request</h2>
+
+<pre class="language-python"><code class="language-python">bearer_scheme = HTTPBearer(auto_error=False)</code></pre>
+
+<p><code>HTTPBearer</code> parses <code>Authorization: Bearer &lt;token&gt;</code> and puts it in
+the OpenAPI schema, so <code>/docs</code> grows an Authorize button.
+<code>auto_error=False</code> means a missing header arrives as <code>None</code> rather than
+FastAPI raising its own error with a different body shape &mdash; the one-error-shape rule from the
+last lesson.</p>
+
+<p>Then the dependency that turns a token into a user:</p>
+
+<pre class="language-python"><code class="language-python">    claims = decode_access_token(credentials.credentials)
+    if claims is None or not claims.get("sub"):
+        raise UnauthorizedException("Your session has expired. Please sign in again.")
+
+    user = db.execute(
+        select(User).where(User.public_id == claims["sub"], User.deleted.is_(False))
+    ).scalar_one_or_none()
+
+    if user is None:
+        raise UnauthorizedException("Your account is no longer active.")
+    return user</code></pre>
+
+<p>The database lookup is the part people optimise away, and should not:</p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ The user is re-read from the database on every request, not trusted from the token. A
+    # token issued an hour ago says nothing about whether the account has since been deleted or
+    # demoted. The token proves WHO; the database says what they currently are.</code></pre>
+
+<p>A JWT is a snapshot of the moment it was signed. Trusting the role inside it means a demoted user
+keeps their old permissions until it expires, and a deleted account keeps working. One indexed
+lookup per request buys immediate revocation, and it is the answer to the standard objection that
+JWTs cannot be revoked &mdash; they can, if you check something.</p>
+
+<h3>HTTPBearer or OAuth2PasswordBearer?</h3>
+
+<p>FastAPI offers both and the docs lead with the second, which confuses people into thinking they
+need OAuth2.</p>
+
+<pre class="language-python"><code class="language-python">from fastapi.security import HTTPBearer, OAuth2PasswordBearer
+
+bearer = HTTPBearer(auto_error=False)                       # "there is a bearer token"
+oauth2 = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login") # "...and here is where to get one"</code></pre>
+
+<p>They parse the identical header. The difference is entirely in the OpenAPI document:
+<code>OAuth2PasswordBearer</code> declares a token endpoint, so Swagger UI shows a username and
+password form and fetches a token for you.</p>
+
+<p>That is genuinely convenient &mdash; but it expects
+<code>application/x-www-form-urlencoded</code> with fields named exactly <code>username</code> and
+<code>password</code>. StayHub's login takes JSON with an <code>email</code> field, because its
+clients are React apps, so <code>HTTPBearer</code> is the honest declaration. Choosing
+<code>OAuth2PasswordBearer</code> and then not implementing that contract gives you a docs page
+whose Authorize button does not work.</p>
+
+<p>If you want the button, use <code>OAuth2PasswordRequestForm</code> as your login body and accept
+form encoding. If you do not, use <code>HTTPBearer</code> and paste the token.</p>
+
+<h2>Refresh tokens</h2>
+
+<p>The seven-day access token above is a demo simplification. The production shape is two tokens
+with different jobs:</p>
+
+<table>
+  <thead><tr><th></th><th>Access</th><th>Refresh</th></tr></thead>
+  <tbody>
+    <tr><td>Lifetime</td><td>15&ndash;60 minutes</td><td>days to weeks</td></tr>
+    <tr><td>Sent</td><td>on every request</td><td>only to <code>/auth/refresh</code></td></tr>
+    <tr><td>Stored server-side</td><td>no</td><td><strong>yes</strong> &mdash; so it can be revoked</td></tr>
+    <tr><td>If stolen</td><td>useful for minutes</td><td>useful until revoked</td></tr>
+  </tbody>
+</table>
+
+<p>The asymmetry is the whole design. The token sent constantly is short-lived, so stealing it buys
+little. The long-lived one is sent rarely and is stored, so revoking it actually works &mdash;
+which is what "log out everywhere" means.</p>
+
+<p>Two rules make the difference between this helping and not. <strong>Store refresh tokens
+hashed</strong>, exactly like passwords: a leaked table of live refresh tokens is a leaked table of
+sessions. And <strong>rotate on use</strong> &mdash; each refresh issues a new one and invalidates
+the old, so a stolen refresh token stops working the moment the real user refreshes, and the
+collision tells you a theft happened.</p>
+
+<h2>Authorization is the other half</h2>
+
+<p>Once you have the user, "may they?" is a separate question with its own answers:</p>
+
+<pre class="language-python"><code class="language-python">def require_host(user: CurrentUser) -&gt; User:
+    """Gate for everything under /hosts. Note it checks the flag, not a role (decision D1)."""
+    if not user.is_host:
+        raise ForbiddenException("You need a host account to do that.")
+    return user
+
+
+def require_admin(user: CurrentUser) -&gt; User:
+    if user.role != UserRole.ADMIN:
+        raise ForbiddenException("Staff access only.")
+    return user</code></pre>
+
+<p>Note that these are two different <em>kinds</em> of check. <code>is_host</code> is a
+capability &mdash; a mode an ordinary account can turn on, which grants nothing else.
+<code>role</code> is a privilege level. Conflating them is how "host" ends up one rename away from
+"admin"; keeping them on separate axes means a host can never accidentally acquire staff
+access.</p>
+
+<p>Then the aliases, and forty route signatures that document themselves:</p>
+
+<pre class="language-python"><code class="language-python">HostUser = Annotated[User, Depends(require_host)]
+AdminUser = Annotated[User, Depends(require_admin)]</code></pre>
+
+<h3>Ownership is not a role</h3>
+
+<p>Role checks answer "what kind of user is this?". Most authorization questions are actually
+"is this <em>their</em> thing?", and that needs the object:</p>
+
+<pre class="language-python"><code class="language-python">        if booking.guest_id != actor.id and actor.role != "ADMIN":
+            raise NotFoundException("Booking not found.")</code></pre>
+
+<p>A dependency cannot answer that without loading the resource, which is why ownership checks live
+in the service beside the load. Note the 404 &mdash; a 403 would confirm the booking exists, and on
+a guessable id that is an enumeration oracle.</p>
+
+<p>The related rule from the same file: a guest may cancel their own booking and staff may cancel
+any, but a host may not cancel on a guest's behalf. That is a support action, not a hosting one.
+Authorization is frequently this specific, and no role system expresses it &mdash; which is why it
+belongs in a service rather than in a permissions matrix.</p>
+
+<h2>Re-issue the token when what it says changes</h2>
+
+<pre class="language-python"><code class="language-python">    def become_host(self, user: User, host_bio: str | None) -&gt; AuthResponse:
+        """Flip the host flag &mdash; and re-issue the token.
+
+        ⚠️ Re-issuing is not optional. The Hasura roles are baked into the JWT at sign-in, so a
+        user who becomes a host while holding an old token still carries
+        `allowed_roles: [customer, anonymous]`. Every host GraphQL query then fails with a
+        permission error that looks like a broken Hasura config rather than a stale token.
+        """</code></pre>
+
+<p>This is the cost of putting anything in a token: it is a copy, and copies go stale. StayHub gets
+away with a stale <code>is_host</code> for its own API &mdash; that is re-read from the database
+&mdash; but the second service trusts the claim, so the claim has to be refreshed.</p>
+
+<p>The general rule: <strong>anything a consumer trusts from the token must be re-issued when it
+changes</strong>, and the endpoint that changes it must return the new token.</p>
+
+<h2>Testing it</h2>
+
+<p>Auth code is where a subtle bug is most expensive, and it is unusually easy to test because it
+is all plain functions:</p>
+
+<pre class="language-python"><code class="language-python">    def test_it_carries_the_hasura_claims_namespace(self):</code></pre>
+
+<p>StayHub asserts on the claims themselves &mdash; that every one is a string, that the default
+role is in the allowed list, that a tampered token fails to decode. Those are properties, not
+examples, and they hold whatever the payload is.</p>
+
+<p>The other half is the route level, where <code>dependency_overrides</code> makes the negative
+cases cheap. Swap in a plain customer and the same admin route must refuse:</p>
+
+<pre class="language-python"><code class="language-python">            assert TestClient(app).get("/api/v1/admin/users").status_code == 403</code></pre>
+
+<pre class="language-python"><code class="language-python">            assert TestClient(app).get("/api/v1/admin/users").status_code == 401</code></pre>
+
+<p>Both are one line, and they are the two tests people skip. A test that a route works when you
+are allowed is worth much less than a test that it refuses when you are not &mdash; the first fails
+loudly in development, the second fails silently in production.</p>
+
+<h2>Tokens or sessions?</h2>
+
+<p>Worth answering explicitly, because JWTs are frequently chosen by default.</p>
+
+<p>A <strong>session</strong> is an opaque id in a cookie, with the state on the server. Revocation
+is instant, the cookie carries no information, and every request costs a session lookup. That is a
+perfectly good design and the right default for a server-rendered application with one backend.</p>
+
+<p>A <strong>token</strong> carries its own claims, so a service can validate it without asking
+anybody. That is what buys StayHub one login across two services with no shared session store, and
+it is the reason to choose one. The cost is that the claims are a copy, and revocation needs
+something extra &mdash; a short expiry, a re-read from the database, or a denylist.</p>
+
+<p>Choose a token when several independent services must trust the same login, or when there is no
+convenient shared store. Choose a session when there is one backend and one frontend, and enjoy the
+simpler revocation.</p>
+
+<p>For service-to-service traffic, neither: a long-lived <strong>API key</strong> per caller,
+stored hashed, scoped to what that caller may do, and rotatable without touching anybody else. A
+user token issued to a machine is a user token that never expires.</p>
+
+<h2>The endpoints a token API needs</h2>
+
+<p>Four, and the fourth is the one people forget:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+def register(payload: UserRegisterRequest, db: DbSession) -&gt; AuthResponse:
+    """Create an account and sign in immediately.
+
+    The response carries a JWT that Hasura also accepts &mdash; one login for both APIs.
+    """
+    return AuthService(db).register(payload)</code></pre>
+
+<pre class="language-python"><code class="language-python">@router.get("/me", response_model=UserResponse)
+def me(user: CurrentUser) -&gt; UserResponse:
+    """Who the current token belongs to. The frontends call this on boot to revive a session."""
+    return UserResponse.model_validate(user)</code></pre>
+
+<p><code>/me</code> is what makes a page refresh work. The browser has a token in storage and no
+idea whether it is still valid or who it belongs to; one call answers both, and a 401 is the signal
+to clear it and show the sign-in form. Without it, a frontend has to decode the JWT itself &mdash;
+which means trusting claims that may be hours stale.</p>
+
+<p>Note that registration returns a token rather than requiring a second login. That is a small
+courtesy with a real effect on completion rates, and it costs nothing because the account was just
+verified by creating it.</p>
+
+<p>The fourth endpoint is whatever changes what the token asserts &mdash; here, becoming a host
+&mdash; and it must return a new one.</p>
+
+<h2>The mistakes that actually ship</h2>
+
+<p>Five, roughly in order of how often they appear in a code review.</p>
+
+<p><strong>Role from the request body.</strong> A registration model with a <code>role</code> field
+is an admin account for anybody who reads the API documentation. The structural fix is to leave it
+off the model entirely rather than to remember to ignore it.</p>
+
+<p><strong>Authorization checked in the frontend only.</strong> Hiding a button is a courtesy. Every
+endpoint is directly reachable, and a hidden button is not a permission &mdash; which is why
+StayHub re-checks the cancellation deadline server-side even though it also tells the UI whether to
+show the button.</p>
+
+<p><strong>A token with no expiry.</strong> <code>exp</code> is optional in the specification and
+mandatory in practice. Without it, a token leaked once is valid forever, and there is no revocation
+story at all.</p>
+
+<p><strong>Secrets from a default.</strong> A JWT secret with a fallback value means a
+misconfigured deployment signs tokens anybody can forge, and nothing anywhere reports a
+problem.</p>
+
+<p><strong>The same token for users and services.</strong> A machine that never logs out needs an
+API key, scoped and rotatable, not a user token with a long expiry attached to somebody's
+account.</p>
+
+<h2>Where the checks belong</h2>
+
+<p>A useful way to place a new rule:</p>
+
+<table>
+  <thead><tr><th>Question</th><th>Belongs in</th></tr></thead>
+  <tbody>
+    <tr><td>Is the request well formed?</td><td>a pydantic model</td></tr>
+    <tr><td>Who is calling?</td><td>a dependency &mdash; <code>get_current_user</code></td></tr>
+    <tr><td>What kind of user are they?</td><td>a dependency &mdash; <code>require_host</code></td></tr>
+    <tr><td>Is this <em>their</em> resource?</td><td>a service, beside the load</td></tr>
+    <tr><td>Is this allowed right now?</td><td>a service &mdash; it needs state</td></tr>
+    <tr><td>Could two requests race?</td><td>a database constraint</td></tr>
+  </tbody>
+</table>
+
+<p>The gradient is how much context the check needs. A schema knows only the payload; a dependency
+knows the user; a service knows the world; the database knows what other transactions are doing.
+Putting a check higher than it belongs makes it bypassable, and lower than it belongs makes it
+unreadable.</p>
+
+<h2>Practical decisions</h2>
+
+<p><strong>Expiry.</strong> StayHub's is seven days, which is a demo convenience. Production wants
+a short access token &mdash; fifteen minutes to an hour &mdash; plus a refresh token that can be
+revoked. The trade is real: shorter expiry means faster revocation and more refresh traffic.</p>
+
+<p><strong>Where the browser keeps it.</strong> <code>localStorage</code> is readable by any script
+on the page, so an XSS becomes a token theft. An <code>HttpOnly</code> cookie is not readable by
+script but is sent automatically, which reintroduces CSRF and needs
+<code>SameSite</code>. Neither is free; pick knowing which attack you are choosing to defend
+against.</p>
+
+<p><strong>HS256 or RS256.</strong> HS256 uses one shared secret, so everything that verifies can
+also sign. That is fine between services you control &mdash; StayHub's two share one key. RS256
+signs with a private key and verifies with a public one, so a service can validate tokens without
+being able to mint them. Use it the moment a verifier is not fully trusted.</p>
+
+<p><strong>Rate-limit the login endpoint.</strong> bcrypt makes offline cracking expensive and does
+nothing about online guessing, and the deliberately vague error message means an attacker learns
+nothing per attempt except by volume.</p>
+
+<p>Next: <strong>file uploads</strong> &mdash; the endpoint where user input stops being JSON and
+starts being bytes on your disk.</p>

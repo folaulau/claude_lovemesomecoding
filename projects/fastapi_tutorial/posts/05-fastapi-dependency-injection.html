@@ -1,0 +1,511 @@
+<p>Dependency injection is the feature FastAPI is built on. Route parameters, database sessions,
+authentication, authorization and the seams that make any of it testable are all the same
+mechanism. It is worth learning properly rather than by copying, because used well it lets a
+function signature state its own security rules.</p>
+
+<h2>A dependency is a function</h2>
+
+<p>That is the whole idea. Declare a parameter with <code>Depends(f)</code> and FastAPI calls
+<code>f</code>, then passes the result:</p>
+
+<pre class="language-python"><code class="language-python">from fastapi import Depends
+from typing import Annotated
+
+
+def pagination(page: int = 1, page_size: int = 20) -&gt; dict:
+    return {"offset": (page - 1) * page_size, "limit": page_size}
+
+
+@app.get("/listings")
+def list_listings(paging: Annotated[dict, Depends(pagination)]):
+    return {"paging": paging}</code></pre>
+
+<p>Two things happen that are easy to miss. <code>pagination</code>'s own parameters become
+<strong>query parameters on every route that depends on it</strong> &mdash;
+<code>?page=2&amp;page_size=50</code> works on <code>/listings</code> without
+<code>list_listings</code> mentioning either. And they appear in the OpenAPI schema, so the
+documentation shows them too.</p>
+
+<p>That is the pattern in miniature: a dependency is a reusable piece of a signature, not just a
+value.</p>
+
+<h2>Dependencies that clean up</h2>
+
+<p>The more useful form uses <code>yield</code>, which puts setup and teardown in one function:</p>
+
+<pre class="language-python"><code class="language-python">def get_db() -&gt; Iterator[Session]:
+    """One session per request, always closed.
+
+    `expire_on_commit=False` above matters for FastAPI specifically: with the default, reading an
+    attribute off an object after `commit()` triggers a refresh query, and serialising the response
+    happens after the route returns — sometimes after the session is gone.
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()</code></pre>
+
+<p>Everything before <code>yield</code> runs before your route; the value is injected; everything
+after runs once the response is done. The <code>try/finally</code> is what guarantees the session
+closes even when the route raises &mdash; without it, an exception leaks a connection, and the
+symptom is a pool that exhausts itself after a few hundred errors.</p>
+
+<p>This is the shape to reach for whenever a resource must be released: database sessions, file
+handles, locks, a client that needs closing.</p>
+
+<h3>When the teardown actually runs</h3>
+
+<p>Worth knowing precisely, because one lesson later it matters. Measured on FastAPI 0.115.5:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">1. dep: open
+2. route body
+3. dep: CLOSED        <- the code after `yield`
+4. background task ran</code></pre>
+
+<p>Teardown happens <strong>before</strong> background tasks, not after. So a background task must
+not use the request's session &mdash; it is closed by then. Lesson 11 covers what that actually
+breaks, which is more subtle than it sounds.</p>
+
+<h2>Sub-dependencies</h2>
+
+<p>A dependency can depend on other dependencies, and FastAPI resolves the whole graph. This is
+StayHub's authentication, and it is the real thing:</p>
+
+<pre class="language-python"><code class="language-python">bearer_scheme = HTTPBearer(auto_error=False)
+
+DbSession = Annotated[Session, Depends(get_db)]
+Credentials = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]
+
+
+def get_current_user(db: DbSession, credentials: Credentials) -&gt; User:
+    if credentials is None:
+        raise UnauthorizedException("Sign in to continue.")
+
+    claims = decode_access_token(credentials.credentials)
+    if claims is None or not claims.get("sub"):
+        raise UnauthorizedException("Your session has expired. Please sign in again.")
+
+    user = db.execute(
+        select(User).where(User.public_id == claims["sub"], User.deleted.is_(False))
+    ).scalar_one_or_none()
+
+    if user is None:
+        raise UnauthorizedException("Your account is no longer active.")
+    return user</code></pre>
+
+<p><code>get_current_user</code> depends on <code>get_db</code> and on
+<code>bearer_scheme</code>; a route depends on <code>get_current_user</code>. Asking for the user
+gets you the session, the header parsing, the token decode and the database lookup, in the right
+order, without saying so.</p>
+
+<p>Two decisions in there are worth stealing.</p>
+
+<p><strong><code>auto_error=False</code></strong> means an absent header arrives as
+<code>None</code> instead of FastAPI raising its own 403 with a different body shape. Every error
+the frontends see should come from one place &mdash; one error parser, not two. Lesson 8 is about
+that principle.</p>
+
+<p><strong>The user is re-read from the database on every request</strong>, never trusted from the
+token. A token issued an hour ago says nothing about whether the account has since been deleted or
+demoted. The token proves <em>who</em>; the database says what they currently are. That costs one
+indexed lookup per request and removes an entire class of "we revoked their access but they can
+still…" incidents.</p>
+
+<h3>Dependencies are cached within a request</h3>
+
+<p>In the graph above, <code>get_db</code> appears twice &mdash; once for
+<code>get_current_user</code> and once for the route itself. It runs <strong>once</strong>. FastAPI
+caches each dependency's result for the duration of a request, keyed on the callable and its
+arguments.</p>
+
+<p>That is not an optimisation detail; it is what makes the pattern usable. Without it, a route
+depending on the user and the session would get two sessions in two transactions, and writes made
+through one would be invisible to the other.</p>
+
+<p>To opt out &mdash; for a dependency that must run fresh each time, like a nonce &mdash; use
+<code>Depends(f, use_cache=False)</code>. It is rarely what you want.</p>
+
+<h2>Annotated aliases, which is where this gets good</h2>
+
+<p>A dependency is a type plus a marker, so it can be given a name. That is the single highest-
+leverage thing in this lesson:</p>
+
+<pre class="language-python"><code class="language-python">CurrentUser = Annotated[User, Depends(get_current_user)]
+OptionalUser = Annotated[User | None, Depends(get_optional_user)]</code></pre>
+
+<pre class="language-python"><code class="language-python">HostUser = Annotated[User, Depends(require_host)]
+AdminUser = Annotated[User, Depends(require_admin)]</code></pre>
+
+<p>Now compare a route written the long way with the same route in StayHub:</p>
+
+<pre class="language-python"><code class="language-python">def create_property(
+    payload: PropertyCreateRequest,
+    host: User = Depends(require_host),
+    db: Session = Depends(get_db),
+): ...</code></pre>
+
+<pre class="language-python"><code class="language-python">def create_property(
+    payload: PropertyCreateRequest, host: HostUser, db: DbSession
+) -&gt; PropertyResponse:</code></pre>
+
+<p>The second reads as a sentence. <code>host: HostUser</code> says who may call this, and it says
+it in the place a reader is already looking. Multiply that by forty endpoints and the wiring
+disappears from the codebase entirely.</p>
+
+<h2>Authorization belongs here</h2>
+
+<p>This is the part most tutorials skip, and it is the better half of the feature. Authentication
+asks "who are you?"; authorization asks "may you?" &mdash; and the second is just another
+dependency:</p>
+
+<pre class="language-python"><code class="language-python">def require_host(user: CurrentUser) -&gt; User:
+    """Gate for everything under /hosts. Note it checks the flag, not a role (decision D1)."""
+    if not user.is_host:
+        raise ForbiddenException("You need a host account to do that.")
+    return user
+
+
+def require_admin(user: CurrentUser) -&gt; User:
+    if user.role != UserRole.ADMIN:
+        raise ForbiddenException("Staff access only.")
+    return user</code></pre>
+
+<p>Each takes the authenticated user, checks one thing, and returns them unchanged. Composition
+does the rest: <code>require_host</code> depends on <code>get_current_user</code>, so a route
+asking for <code>HostUser</code> gets authentication and authorization from one annotation.</p>
+
+<p>The gain over an <code>if</code> at the top of each function is real. It cannot be forgotten
+&mdash; a route with no gate visibly has none. It is testable on its own, as a plain function. And
+it lands in the OpenAPI schema, so the documentation shows which endpoints need a token without
+anybody maintaining a list.</p>
+
+<p>Notice <code>require_host</code> checks a <em>flag</em> rather than a role. In StayHub, hosting
+is a mode of an ordinary account: one person books stays and lists them, and flipping the flag
+never grants staff access. Roles and capabilities are different axes, and conflating them is how
+"host" ends up one rename away from "admin".</p>
+
+<h2>A real one, end to end</h2>
+
+<p>Pagination is the archetypal dependency: the same three concerns on every list endpoint,
+validated identically, and needed as a unit. StayHub's is worth reading in full because it shows
+the whole pattern in fifteen lines.</p>
+
+<p>First a model to hold the result, with the arithmetic attached:</p>
+
+<pre class="language-python"><code class="language-python">class PageParams(ApiModel):
+    """`?page=2&amp;pageSize=50`, validated once and reused everywhere.
+
+    A dependency rather than three repeated `Query(...)` arguments per route. The bounds are the
+    point: without `le=100` a client can ask for `pageSize=1000000` and page one becomes a full
+    table scan serialised into memory — pagination that protects nothing.
+    """
+
+    page: int = 1
+    page_size: int = 20
+
+    @property
+    def offset(self) -&gt; int:
+        return (self.page - 1) * self.page_size</code></pre>
+
+<p>Then the function that builds it from query parameters, which is where the bounds and the alias
+live:</p>
+
+<pre class="language-python"><code class="language-python">def page_params(
+    page: int = Query(default=1, ge=1, description="1-based"),
+    page_size: int = Query(default=20, ge=1, le=100, alias="pageSize"),
+) -&gt; PageParams:
+    return PageParams(page=page, page_size=page_size)
+
+
+PageQuery = Annotated[PageParams, Depends(page_params)]</code></pre>
+
+<p>And then it is one word in any endpoint that needs it:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/users", response_model=Page[AdminUserRow])
+def list_users(
+    _: AdminUser,
+    db: DbSession,
+    page: PageQuery,
+    q: str | None = Query(default=None, max_length=200, description="Matches email or name"),
+    is_host: bool | None = Query(default=None, alias="isHost"),
+) -&gt; Page[AdminUserRow]:</code></pre>
+
+<p>That signature is the endpoint's entire contract: staff only, a database session, a bounded page,
+and two optional filters. <code>page.offset</code> and <code>page.page_size</code> then go straight
+into the query. Add a third list endpoint and the bounds come with it &mdash; including the
+<code>le=100</code> that is the only thing standing between a caller and the whole table.</p>
+
+<h2>Dependencies that change behaviour rather than refusing</h2>
+
+<p>Not every gate should reject. Some endpoints do more when you are signed in and still work when
+you are not:</p>
+
+<pre class="language-python"><code class="language-python">def get_optional_user(db: DbSession, credentials: Credentials) -&gt; User | None:
+    """For routes that behave differently when signed in but do not require it.
+
+    An invalid token here is treated as "anonymous", not as an error — a stale token in
+    localStorage should not stop someone browsing listings.
+    """
+    if credentials is None:
+        return None
+    claims = decode_access_token(credentials.credentials)
+    if claims is None or not claims.get("sub"):
+        return None
+    return db.execute(
+        select(User).where(User.public_id == claims["sub"], User.deleted.is_(False))
+    ).scalar_one_or_none()</code></pre>
+
+<p>Same work as <code>get_current_user</code>, opposite failure mode: it returns <code>None</code>
+instead of raising. That distinction matters more than it looks. A browsing page that 401s because
+somebody's month-old token expired is a bug, and it is the kind that only shows up for real users.
+Having both dependencies makes the choice explicit at each route rather than accidental.</p>
+
+<h2>Async dependencies</h2>
+
+<p>A dependency can be <code>async def</code>, and FastAPI handles the mix without you thinking
+about it: <code>async</code> dependencies are awaited, plain ones run in the threadpool, and either
+kind can be used by either kind of route.</p>
+
+<pre class="language-python"><code class="language-python">async def get_async_db() -&gt; AsyncIterator[AsyncSession]:
+    """One async session per request, always closed. The async twin of `get_db`."""
+    async with AsyncSessionLocal() as session:
+        yield session</code></pre>
+
+<p>Note <code>async with</code> replacing <code>try/finally</code> &mdash; the context manager
+already guarantees the close. The one rule: <strong>do not make a dependency
+<code>async def</code> and then block inside it</strong>. An async dependency runs on the event
+loop, so a synchronous database call in there stalls every other request in the process. Lesson 12
+is entirely about that.</p>
+
+<h2>Dependencies that return nothing</h2>
+
+<p>Sometimes you need a check to run but have no use for its result. Put it on the decorator
+instead of in the signature:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/reports", dependencies=[Depends(require_admin)])
+def reports(db: DbSession):
+    ...</code></pre>
+
+<p>The dependency runs and can still raise; its return value is discarded. The same list works on
+an <code>APIRouter</code>, applying to every endpoint under it, and on <code>FastAPI()</code>
+itself, applying to everything.</p>
+
+<p>Global dependencies are worth using sparingly and never for authorization. A rule declared once
+at application level is invisible from the forty files it governs, and the day somebody adds a
+public endpoint they will not know it was there. StayHub repeats <code>_: AdminUser</code> in each
+admin signature deliberately &mdash; the repetition is cheaper than the surprise.</p>
+
+<h2>Classes as dependencies</h2>
+
+<p>Any callable works, so a class does too. Its <code>__init__</code> parameters become the
+dependency's parameters:</p>
+
+<pre class="language-python"><code class="language-python">class RateLimit:
+    def __init__(self, per_minute: int) -&gt; None:
+        self.per_minute = per_minute
+
+    def __call__(self, user: CurrentUser) -&gt; None:
+        if exceeded(user.id, self.per_minute):
+            raise ApiException("Slow down.", status_code=429)
+
+
+@router.post("/expensive", dependencies=[Depends(RateLimit(per_minute=5))])
+def expensive(...): ...</code></pre>
+
+<p>The instance is created once at import time and called per request, which is what lets the
+dependency be <em>configured</em> &mdash; different limits on different routes from one class. This
+is the right shape whenever a dependency needs parameters that are not request data.</p>
+
+<h2>Overrides, and what makes any of this testable</h2>
+
+<p>Every dependency is a seam. <code>app.dependency_overrides</code> is a plain dict that swaps one
+callable for another:</p>
+
+<pre class="language-python"><code class="language-python">@pytest.fixture
+def client(db, admin) -&gt; TestClient:
+    """A client whose requests run inside the test's transaction, authenticated as `admin`."""
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: admin
+    yield TestClient(app)
+    app.dependency_overrides.clear()</code></pre>
+
+<p>Two overrides and the test has a real HTTP client that runs inside a transaction it will roll
+back, authenticated as a user it created, with no login, no password hashing and no token. The
+application code is untouched &mdash; there is no test flag anywhere in it.</p>
+
+<p>It also makes authorization cheap to test properly. Swap in a plain customer and the same route
+must now refuse:</p>
+
+<pre class="language-python"><code class="language-python">        app.dependency_overrides[get_db] = lambda: db
+        app.dependency_overrides[get_current_user] = lambda: customer
+        try:
+            assert TestClient(app).get("/api/v1/admin/users").status_code == 403
+        finally:
+            app.dependency_overrides.clear()</code></pre>
+
+<h3>Two ways to get this wrong</h3>
+
+<p><strong>The dict is keyed on the function object, not its name.</strong> Import
+<code>get_db</code> from a different module than the application did and you are keying on a
+different object, so the override silently does nothing. The test then hits the real dependency,
+which usually fails in a way that looks like a bug in the route. There is no error and no warning
+&mdash; the key just never matches.</p>
+
+<p>The same trap catches people overriding the wrong level. StayHub's routes depend on
+<code>CurrentUser</code>, which is built from <code>get_current_user</code> &mdash; so the override
+targets <code>get_current_user</code>, the underlying function. Overriding the alias is not a
+thing; the alias is a type.</p>
+
+<p><strong>Always clear.</strong> The dict lives on the <code>app</code> object, which is
+module-level and shared by every test file in the run. A leftover override leaks into unrelated
+tests as a phantom failure &mdash; usually somewhere far away, usually blamed on test ordering.
+Clear it in a fixture teardown or a <code>finally</code>, never at the end of the test body where a
+failed assertion skips it.</p>
+
+<h2>Dependencies can read the path too</h2>
+
+<p>A dependency sees the same request your route does, path parameters included. That enables a
+pattern worth knowing: load-or-404 as a dependency, so the route never handles the missing case.</p>
+
+<pre class="language-python"><code class="language-python">def get_owned_listing(public_id: UUID, host: HostUser, db: DbSession) -&gt; Property:
+    """The listing at {public_id}, if the caller owns it. 404 otherwise."""
+    prop = PropertyRepository(db).get_by_public_id_full(public_id)
+    if prop is None or prop.deleted or prop.host_id != host.id:
+        raise NotFoundException("Listing not found.")
+    return prop
+
+
+OwnedListing = Annotated[Property, Depends(get_owned_listing)]
+
+
+@router.patch("/{public_id}", response_model=PropertyResponse)
+def update_property(listing: OwnedListing, payload: PropertyUpdateRequest, db: DbSession):
+    ...</code></pre>
+
+<p><code>public_id</code> is declared on the <em>dependency</em>, and FastAPI takes it from the
+path because the route's URL contains <code>{public_id}</code>. The route itself never mentions it.</p>
+
+<p>Three endpoints written this way share one definition of "exists, not deleted, and yours", which
+is the kind of rule that otherwise drifts between copies &mdash; one of them forgetting the
+<code>deleted</code> check, quietly, for a year.</p>
+
+<p>The catch: the dependency must run on every request to that route, so this is wrong when the
+lookup is expensive and only sometimes needed. It is also worth keeping such a dependency
+mechanical. The moment it starts deciding <em>what to do</em> with the listing rather than just
+producing it, the logic has escaped into the web layer.</p>
+
+<h2>Security() and scopes</h2>
+
+<p><code>Security()</code> is <code>Depends()</code> with one extra ability &mdash; it carries
+scopes, and FastAPI puts them in the OpenAPI document:</p>
+
+<pre class="language-python"><code class="language-python">from fastapi import Security
+
+
+@router.delete("/{public_id}")
+def delete_listing(user: Annotated[User, Security(get_current_user, scopes=["listings:write"])]):
+    ...</code></pre>
+
+<p>Scopes come into their own with OAuth2 and third-party clients, where the token itself carries a
+list of what its bearer was granted. For a first-party API where your own frontend is the only
+client, they usually add ceremony without adding safety &mdash; StayHub uses plain role
+dependencies for exactly that reason. Reach for scopes when tokens are issued to parties you do not
+control.</p>
+
+<h2>Raising from a dependency</h2>
+
+<p>A dependency raises like anything else, and the exception is handled by the same machinery.
+StayHub's raise domain exceptions rather than <code>HTTPException</code>:</p>
+
+<pre class="language-python"><code class="language-python">        raise ForbiddenException("You need a host account to do that.")</code></pre>
+
+<p>That keeps the dependency usable outside the web layer and keeps every error body identical
+&mdash; lesson 8 is about the handler that makes it so.</p>
+
+<p>One behaviour to know: <strong>a dependency that raises stops the chain</strong>. The route never
+runs, and neither do dependencies that had not been resolved yet. But anything that already yielded
+still gets its teardown, so a session opened before an authorization check failed is still closed.
+That is <code>try/finally</code> earning its place.</p>
+
+<h2>What not to put in a dependency</h2>
+
+<p>The mechanism is pleasant enough that it gets over-used. Three cases where it is the wrong
+tool.</p>
+
+<p><strong>Business logic.</strong> A dependency that computes a price or decides whether a booking
+is allowed has moved a rule out of the service layer into the web layer, where nothing else can
+reach it. Dependencies are for <em>acquiring</em> things and <em>gating</em> access.</p>
+
+<p><strong>Work that should be conditional.</strong> Dependencies always run. A dependency that
+loads an expensive object the route only sometimes needs pays for it on every request. Inject the
+session and load it when required.</p>
+
+<p><strong>Anything slow and shared.</strong> A dependency that opens an HTTP client per request is
+building a connection pool it throws away. Create it once at startup in the
+<code>lifespan</code>, hold it on <code>app.state</code>, and have the dependency hand it out.</p>
+
+<h2>Dependencies at startup, not per request</h2>
+
+<p>The most common performance mistake with dependencies is building something expensive in one.</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ a new connection pool per request, thrown away at the end of it
+async def get_http() -&gt; httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=10)</code></pre>
+
+<p>Create it once in the lifespan, hold it on <code>app.state</code>, and let the dependency hand it
+out:</p>
+
+<pre class="language-python"><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=10)
+    yield
+    await app.state.http.aclose()
+
+
+def get_http(request: Request) -&gt; httpx.AsyncClient:
+    return request.app.state.http
+
+
+Http = Annotated[httpx.AsyncClient, Depends(get_http)]</code></pre>
+
+<p>The dependency is now a lookup rather than a construction, the connection pool is reused, and
+shutdown closes it properly. The same shape applies to anything with a pool or a handshake &mdash;
+Redis, a message producer, a cloud SDK client.</p>
+
+<p>The database session is the deliberate exception: it must be per request, because a transaction
+is per request. What is shared is the <em>engine</em>, created once at import, and
+<code>SessionLocal</code> is a cheap factory over it.</p>
+
+<h2>What the graph costs</h2>
+
+<p>Dependencies are resolved per request, and the resolution itself is cheap &mdash; FastAPI
+inspects signatures once at startup and reuses the plan. What is not free is what the dependencies
+do.</p>
+
+<p>StayHub's <code>CurrentUser</code> costs one indexed database lookup on every authenticated
+request, which is a deliberate trade for immediate revocation. Stacking four dependencies that each
+query is how a route acquires four queries nobody wrote.</p>
+
+<p>The caching rule is what keeps that manageable: a dependency needed by three others runs once. If
+you find yourself avoiding a dependency because "it would query again", check &mdash; it almost
+certainly would not.</p>
+
+<h2>The short version</h2>
+
+<table>
+  <thead><tr><th>You want</th><th>Write</th></tr></thead>
+  <tbody>
+    <tr><td>A reusable value</td><td>a function, <code>Depends(f)</code></td></tr>
+    <tr><td>Setup and teardown</td><td><code>yield</code> inside <code>try/finally</code></td></tr>
+    <tr><td>A readable signature</td><td><code>Annotated[T, Depends(f)]</code> given a name</td></tr>
+    <tr><td>Authentication</td><td>a dependency returning the user</td></tr>
+    <tr><td>Authorization</td><td>a dependency taking the user and raising</td></tr>
+    <tr><td>A check with no value</td><td><code>dependencies=[Depends(f)]</code> on the decorator</td></tr>
+    <tr><td>A configured dependency</td><td>a class with <code>__init__</code> and <code>__call__</code></td></tr>
+    <tr><td>A test seam</td><td><code>app.dependency_overrides[f] = fake</code>, then clear</td></tr>
+  </tbody>
+</table>
+
+<p>Next: <strong>SQLAlchemy, sessions and migrations</strong> &mdash; what
+<code>get_db</code> is actually handing out, and the data layer it belongs to.</p>

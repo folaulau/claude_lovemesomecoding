@@ -1,0 +1,443 @@
+<p>Once an application runs somewhere you cannot attach a debugger, everything you will ever know
+about it is what it told you on the way past. This lesson covers the three things worth building
+before you need them: structured logs with a correlation id, a health check that names what is
+broken, and metrics that answer the question users are actually asking.</p>
+
+<h2>Why the default logging is not enough</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">INFO  [app.services.booking_service] Booking created
+INFO  [app.search.indexer] Indexed property
+INFO  [app.services.booking_service] Booking created</code></pre>
+
+<p>Three lines from a busy process, and there is no way to tell whether the first and third belong
+to the same user, the same request, or the same second. Under any concurrency at all, a log file is
+several conversations interleaved with no speaker labels.</p>
+
+<p>Two changes fix it: give every line a request id, and emit fields rather than sentences.</p>
+
+<h2>The correlation id</h2>
+
+<pre class="language-python"><code class="language-python">request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")</code></pre>
+
+<p>A <code>ContextVar</code>, for reasons lesson 13 covered &mdash; a global is shared by concurrent
+requests and a thread-local breaks on async. This one works for both, which is why one mechanism
+covers the whole application.</p>
+
+<p>Attaching it to every record is a filter rather than a wrapper, and that choice matters:</p>
+
+<pre class="language-python"><code class="language-python">class RequestIdFilter(logging.Filter):
+    """Attaches the current request id to every record.
+
+    A filter rather than a custom Logger or an adapter: filters apply to records from libraries
+    too, so SQLAlchemy's and uvicorn's lines get the id without either of them knowing it exists.
+    """
+
+    def filter(self, record: logging.LogRecord) -&gt; bool:
+        record.request_id = request_id_ctx.get()
+        return True  # never actually filters anything out; it only annotates</code></pre>
+
+<p>Library log lines get the id for free. A SQLAlchemy warning about a slow query lands in the same
+correlated stream as the request that caused it, without SQLAlchemy knowing an id exists.</p>
+
+<h2>JSON when something is collecting it</h2>
+
+<pre class="language-python"><code class="language-python">class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -&gt; str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "request_id": getattr(record, "request_id", "-"),
+            "message": record.getMessage(),
+        }</code></pre>
+
+<p>The half that makes it worth doing is picking up anything the caller passed as
+<code>extra</code>:</p>
+
+<pre class="language-python"><code class="language-python">        for key, value in record.__dict__.items():
+            if key not in _RESERVED:
+                payload[key] = value</code></pre>
+
+<p>So this call:</p>
+
+<pre class="language-python"><code class="language-python">    logger.info(
+        "Stored %s for listing %s", filename, prop.public_id,
+        extra={"property_id": str(prop.public_id), "size_bytes": size},
+    )</code></pre>
+
+<p>produces a line where <code>property_id</code> and <code>size_bytes</code> are queryable fields
+rather than substrings to parse back out of a sentence. That is the whole point of structured
+logging: <em>"show me every upload over 4 MB last week"</em> becomes a filter instead of a regex.</p>
+
+<p>One defensive detail that has saved more than one incident:</p>
+
+<pre class="language-python"><code class="language-python">        return json.dumps(payload, default=str)</code></pre>
+
+<p><code>default=str</code>, so a <code>Decimal</code>, a <code>UUID</code> or a
+<code>datetime</code> in <code>extra</code> cannot make logging itself raise. A log line that throws
+while reporting an error is the worst possible failure &mdash; you lose the original problem and
+gain a new one.</p>
+
+<p>The switch is configuration, not a code change:</p>
+
+<pre class="language-python"><code class="language-python">    log_level: str = "INFO"
+    # Human-readable locally, JSON wherever something is collecting it. Default off so `uvicorn
+    # --reload` stays readable; the Dockerfile sets STAYHUB_LOG_JSON=true.
+    log_json: bool = False</code></pre>
+
+<h3>Two traps in setting it up</h3>
+
+<pre class="language-python"><code class="language-python">    ⚠️ `logging.basicConfig` does NOTHING if the root logger already has a handler &mdash; and under
+    `uvicorn --reload` it sometimes does. Configuring the handler explicitly is what makes this
+    deterministic instead of "works when started one particular way".</code></pre>
+
+<p>The second is worse, because it only appears in a container:</p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ Uvicorn installs its OWN handlers on `uvicorn.access` and `uvicorn.error` when it starts,
+    # which is AFTER this function has run. Those handlers are not touched by clearing the root,
+    # so its lines bypass everything configured above:
+    #
+    #     {"ts": "...", "logger": "stayhub.access", "message": "POST /api/v1/auth/login -> 200"}
+    #     INFO:     172.19.0.1:59176 - "POST /api/v1/auth/login HTTP/1.1" 200 OK
+    #
+    # Two lines per request, one JSON and one not, in a stream something is trying to parse.
+    # Observed in `docker logs` on 2026-08-21.</code></pre>
+
+<p>Your careful JSON configuration is simply bypassed by the server that starts after it. The fix is
+to take uvicorn's handlers away and let its records propagate to yours:</p>
+
+<pre class="language-python"><code class="language-python">    for name in ("uvicorn", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.propagate = True</code></pre>
+
+<p>And the access logger is silenced outright, because the middleware already logs every request
+with a duration and an id that uvicorn's line does not have:</p>
+
+<pre class="language-python"><code class="language-python">    access = logging.getLogger("uvicorn.access")
+    access.handlers.clear()
+    access.propagate = False
+    access.disabled = True</code></pre>
+
+<h2>One line per request</h2>
+
+<pre class="language-python"><code class="language-python">            logger.log(
+                level,
+                "%s %s -&gt; %d in %.1fms",
+                request.method,
+                request.url.path,
+                response.status_code,
+                elapsed_ms,
+                extra={
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": round(elapsed_ms, 1),
+                },
+            )</code></pre>
+
+<p>Method, path, status and duration &mdash; enough to answer most operational questions without
+looking anywhere else.</p>
+
+<p>Note the id is passed <em>explicitly</em> in <code>extra</code> even though the filter would add
+it. That is deliberate:</p>
+
+<pre class="language-python"><code class="language-python">                    # Explicit, not left to RequestIdFilter. The filter lives on the root
+                    # HANDLER, so anything that swaps the handler out — pytest's caplog, a
+                    # different log config — loses it. On the one line that exists to correlate
+                    # a request, the id is passed as data.</code></pre>
+
+<h3>A bug in exactly that line</h3>
+
+<p>The access log &mdash; the one line whose entire purpose is correlation &mdash; shipped with
+<code>request_id: "-"</code> while every other line in the same request carried the real id.</p>
+
+<p>The cause was a <code>finally:</code> that reset the ContextVar before the logging call below it
+ran. It was found by reading <code>docker logs</code>, not by a test, because no test asserted on
+log <em>content</em>:</p>
+
+<pre class="language-python"><code class="language-python">        # History worth keeping: this was `finally: request_id_ctx.reset(token)` on the try block,
+        # which reads as the careful thing to do and was wrong — the reset ran BEFORE the logging
+        # below it, so the access line came out as `"request_id": "-"` while every other line in
+        # the same request carried the real id. It was found by reading `docker logs`, not by a
+        # test; nothing asserted on log CONTENT.</code></pre>
+
+<p>Two lessons, and the second is the more useful. Logging code needs tests like any other code
+&mdash; assert on what is emitted, not merely that something was. And <strong>read your own logs
+occasionally</strong>, in the environment they actually run in. Nothing else would have found
+this.</p>
+
+<h2>Health checks</h2>
+
+<pre class="language-python"><code class="language-python">    """Reports each dependency separately.
+
+    A single boolean would answer "is it up?" but not "what is broken?", which is the only thing
+    anyone actually wants from a health check at 3am.
+    """</code></pre>
+
+<pre class="language-json"><code class="language-json">{"status":"ok","database":true,"elasticsearch":true}</code></pre>
+
+<p>A health check that returns <code>{"status": "ok"}</code> and nothing else tells you the process
+is running, which you already knew because it answered. Reporting each dependency turns one call
+into a diagnosis.</p>
+
+<p>The status field also encodes a judgement about which failures matter:</p>
+
+<pre class="language-python"><code class="language-python">    es_ok = es_available()
+    return Health(
+        status="ok" if db_ok else "degraded", database=db_ok, elasticsearch=es_ok
+    )</code></pre>
+
+<p>No database means the application cannot function. No search means one feature is unavailable and
+everything else works. Only the first should make an orchestrator restart or depool the instance
+&mdash; and conflating them means a slow search cluster takes down an API that was fine.</p>
+
+<p>That distinction is usually expressed as two endpoints. <strong>Liveness</strong> answers "is
+this process wedged?" and should check almost nothing, because failing it kills the container.
+<strong>Readiness</strong> answers "should traffic go here?" and may check dependencies, because
+failing it only removes the instance from the pool.</p>
+
+<p>Keep both cheap. A health check that runs an expensive query becomes a load generator when
+polled every five seconds by every instance.</p>
+
+<h2>Logging from the layers below</h2>
+
+<p>A request id is only useful if the lines that matter carry it, and most of them are not written
+by your route.</p>
+
+<p>Because the id is attached by a filter on the root handler, every logger in the process gets it
+&mdash; including libraries. That means SQLAlchemy's own output becomes correlated for free:</p>
+
+<pre class="language-python"><code class="language-python">logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)   # every statement
+logging.getLogger("sqlalchemy.pool").setLevel(logging.DEBUG)    # checkout/return</code></pre>
+
+<p>Both are firehoses and neither belongs on in production. They are worth knowing about because
+turning one on for five minutes answers questions nothing else will &mdash; "how many queries does
+this endpoint actually issue?" is an N+1 diagnosis in one setting change.</p>
+
+<p>The permanent version of that question is a threshold rather than a stream. Log the slow ones
+and stay quiet about the rest:</p>
+
+<pre class="language-python"><code class="language-python">from sqlalchemy import event
+
+
+@event.listens_for(engine, "before_cursor_execute")
+def _start(conn, cursor, statement, params, context, executemany):
+    context._started = time.perf_counter()
+
+
+@event.listens_for(engine, "after_cursor_execute")
+def _finish(conn, cursor, statement, params, context, executemany):
+    elapsed = (time.perf_counter() - context._started) * 1000
+    if elapsed &gt; 100:
+        logger.warning(
+            "slow query %.1fms", elapsed,
+            extra={"duration_ms": round(elapsed, 1), "statement": statement[:200]},
+        )</code></pre>
+
+<p>Truncate the statement. A logged query with a thousand-element <code>IN</code> clause is a log
+line nobody can read and a bill nobody expected. And log the statement, never the parameters
+&mdash; those are the values, which is where the personal data is.</p>
+
+<h2>Sampling, and what it costs</h2>
+
+<p>At volume, logging every request stops being free. A busy service can spend real money on log
+ingestion, and the value of the ten-thousandth identical successful request line is nil.</p>
+
+<p>The standard shape keeps everything interesting and thins the rest:</p>
+
+<pre class="language-python"><code class="language-python">        if request.url.path not in QUIET_PATHS:</code></pre>
+
+<p>StayHub's version is the simplest form of this &mdash; drop the paths that are pure noise. The
+next step up is proportional:</p>
+
+<pre class="language-python"><code class="language-python">should_log = (
+    response.status_code &gt;= 400        # every failure
+    or elapsed_ms &gt; 500                # every slow request
+    or random.random() &lt; 0.05          # 5% of the healthy remainder
+)</code></pre>
+
+<p>Never sample errors, and never sample the slow tail &mdash; those are the lines you are keeping
+logs for. Sample the boring successes, which is where the volume is.</p>
+
+<p>The related discipline is retention. Logs are usually the largest store of personal data an
+organisation has and the one with the loosest access controls. Deciding how long they live is a
+decision somebody has to make deliberately, and the default of "forever" is rarely the right one.</p>
+
+<h2>Metrics</h2>
+
+<p>Logs tell you about one request; metrics tell you about all of them. Four numbers cover most
+questions:</p>
+
+<table>
+  <thead><tr><th>Metric</th><th>Answers</th></tr></thead>
+  <tbody>
+    <tr><td>Request rate</td><td>how much traffic</td></tr>
+    <tr><td>Error rate</td><td>how much of it is failing</td></tr>
+    <tr><td>Duration percentiles</td><td>how slow it feels</td></tr>
+    <tr><td>Saturation</td><td>how close to a limit &mdash; pool, threads, memory</td></tr>
+  </tbody>
+</table>
+
+<p>The usual wiring is one library and one endpoint:</p>
+
+<pre class="language-python"><code class="language-python">from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")</code></pre>
+
+<p>Two things about it are worth being deliberate over.</p>
+
+<p><strong>Percentiles, not averages.</strong> A mean response time is dominated by the fast
+majority and hides the tail entirely. p50, p95 and p99 tell you what a typical user, an unlucky one,
+and your worst case experience &mdash; and it is entirely normal for a mean of 40&nbsp;ms to sit
+alongside a p99 of two seconds.</p>
+
+<p><strong>Label by route template, never by URL.</strong> <code>/properties/{public_id}</code> is
+one label; <code>/properties/c6f21f71-…</code> is a new time series per listing. That is the
+classic cardinality explosion, and it takes a monitoring system down rather than degrading it.</p>
+
+<p>And <code>/metrics</code> should not be public. It leaks traffic volumes, error rates and often
+your route table.</p>
+
+<h2>Tracing</h2>
+
+<p>A request id correlates lines within one service. Once there are several, a
+<strong>trace</strong> is the same idea across process boundaries: one trace id per request, a span
+per unit of work, propagated in headers.</p>
+
+<p>The dividing line is practical. One service: a request id is enough, and StayHub's is exactly
+that. Several services: you want OpenTelemetry, because "the request was slow" needs to point at
+which hop.</p>
+
+<pre class="language-python"><code class="language-python">from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+FastAPIInstrumentor.instrument_app(app)</code></pre>
+
+<p>Worth noting that the id-forwarding habit already gets you part of the way. Because StayHub
+accepts an inbound <code>X-Request-ID</code> rather than always generating one, a proxy or upstream
+caller that assigned an id sees it preserved in these logs &mdash; which is a poor man's trace, and
+free.</p>
+
+<h2>Alert on symptoms, not causes</h2>
+
+<p>The instinct is to alert on everything measurable, which produces a channel nobody reads. A
+short discipline keeps it useful.</p>
+
+<p><strong>Alert on what users experience.</strong> "The error rate on <code>/bookings</code> is
+above 2% for five minutes" is a symptom &mdash; something is wrong and somebody should look.
+"CPU is at 80%" is a cause, and it may be entirely fine.</p>
+
+<p><strong>Every alert needs an action.</strong> If the response to an alert is to look at it and
+close it, delete the alert. It is training people to ignore the channel, and the one that matters
+will arrive in the same tone.</p>
+
+<p><strong>Use a window.</strong> A single 500 is not an incident. A rate sustained over minutes
+is.</p>
+
+<p>Four alerts cover most services: elevated error rate, elevated p99 latency, the health check
+failing across several instances, and a saturation signal &mdash; connection pool near its limit,
+disk near full, queue depth growing. Everything else is a dashboard, which is for the question
+"what is happening?" rather than "wake somebody up".</p>
+
+<h2>Debugging something you cannot attach to</h2>
+
+<p>When a report arrives, the path through the tools above is fairly fixed.</p>
+
+<p><strong>Start with the request id.</strong> If the client has one &mdash; from an error screen,
+a support ticket, a response header they copied &mdash; one search returns every line of that
+request across every layer, including the traceback. This is the single biggest return on the whole
+setup.</p>
+
+<p><strong>Without an id, narrow by shape.</strong> Time window, path, status. The access log has
+method, path, status and duration on one structured line precisely so this is a filter rather than
+a text search.</p>
+
+<p><strong>Then ask whether it is systemic.</strong> Metrics answer "is this one user or everyone?"
+faster than logs do, and the answer changes what you look at next.</p>
+
+<p>Two habits make all of that dramatically easier, and both are decisions made long before the
+incident. <strong>Return the request id to the client</strong>, so it can appear on an error screen
+and come back to you in the report. And <strong>log the ids of things, not their descriptions</strong>
+&mdash; <code>booking_id</code> as a field beats "the booking failed" in a sentence, because one is
+searchable and the other is not.</p>
+
+<h2>Making the health check tell the truth</h2>
+
+<p>A health check is only as good as what it actually verifies, and the common mistake is checking
+too little:</p>
+
+<pre class="language-python"><code class="language-python">    db_ok = True
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception:
+        db_ok = False</code></pre>
+
+<p><code>SELECT 1</code> through the real engine is the right amount. It exercises the pool, the
+network path and authentication &mdash; a connection that is checked out, used and returned. What it
+does not do is query a table, which would make the health check sensitive to schema and data.</p>
+
+<p>Note it opens its own connection rather than taking the request session. A health check that
+depends on <code>get_db</code> fails at the dependency rather than in the handler, so it returns a
+500 from the error handler instead of a body that says which dependency is down &mdash; losing
+exactly the information it exists to provide.</p>
+
+<p>The search check is cheaper still and deliberately separate:</p>
+
+<pre class="language-python"><code class="language-python">    es_ok = es_available()</code></pre>
+
+<p>Each dependency gets its own boolean, and the overall status encodes which ones are fatal. That
+is what lets the same endpoint serve a human at 3am and an orchestrator deciding whether to
+restart.</p>
+
+<h2>Timing things that are not requests</h2>
+
+<p>The access log covers the request. Everything else worth timing needs a line of its own, and a
+small helper keeps them consistent:</p>
+
+<pre class="language-python"><code class="language-python">@contextmanager
+def timed(operation: str, **fields):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = (time.perf_counter() - started) * 1000
+        logger.info(
+            "%s took %.1fms", operation, elapsed,
+            extra={"operation": operation, "duration_ms": round(elapsed, 1), **fields},
+        )
+
+
+with timed("reindex", property_count=count):
+    PropertyService(db).reindex_all()</code></pre>
+
+<p>The <code>finally</code> matters: a failed operation should still report how long it took before
+failing, which is frequently the more interesting number.</p>
+
+<p>What to wrap is a judgement. Anything crossing a process boundary &mdash; a third-party call, a
+search query, an upload &mdash; is worth timing, because that is where unexplained latency comes
+from. Timing every function produces noise and a measurable slowdown of its own.</p>
+
+<h2>What to log, and what not to</h2>
+
+<p>The failure mode at both extremes is the same: nothing useful when you need it.</p>
+
+<p><strong>Log</strong> one line per request; state changes with their ids ("booking X cancelled by
+user Y"); every unhandled exception with a traceback; degraded startup; and slow operations that
+crossed a threshold.</p>
+
+<p><strong>Do not log</strong> passwords, tokens, card numbers, session ids, full request bodies, or
+personal data beyond what you need. A log aggregator is usually a system with much broader access
+than your database, so anything you write there is effectively published internally.</p>
+
+<p>Two habits keep it manageable. <code>logger.exception</code> rather than
+<code>logger.error</code> inside an <code>except</code>, because it attaches the traceback
+automatically. And levels used consistently: <code>WARNING</code> for something recoverable and
+worth noticing, <code>ERROR</code> for something that failed and needs attention. If a 404 logs at
+ERROR, either your alerts fire constantly or somebody has turned them off &mdash; which is the same
+outcome as having none.</p>
+
+<p>Next: <strong>containerising it</strong> &mdash; where the JSON logging above actually gets
+turned on, and where <code>--host 0.0.0.0</code> becomes the difference between working and
+not.</p>

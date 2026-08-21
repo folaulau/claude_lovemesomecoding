@@ -1,0 +1,429 @@
+<p>Middleware is for the things every request needs regardless of what it does &mdash; a correlation
+id, a timing header, one access log line, CORS headers. It is also where an ordering rule that
+reads backwards produced a genuine bug in this codebase, one that made every server error look like
+a network failure to the browser.</p>
+
+<h2>What middleware actually is</h2>
+
+<p>An ASGI application is a callable over <code>(scope, receive, send)</code>. Middleware is an
+ASGI application that wraps another one &mdash; so your app is a stack of layers around a
+router:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ServerErrorMiddleware          catches whatever escapes everything else
+  └─ your middleware           in the order registered (outermost = added LAST)
+     └─ ExceptionMiddleware    runs your @app.exception_handler(...) handlers
+        └─ router
+           └─ dependencies
+              └─ your function</code></pre>
+
+<p>Every layer sees the request on the way in and the response on the way out, and any of them can
+short-circuit &mdash; which is exactly what CORS does to a preflight.</p>
+
+<h2>Writing one</h2>
+
+<p>The convenient base class gives you a request and a <code>call_next</code>:</p>
+
+<pre class="language-python"><code class="language-python">class RequestContextMiddleware(BaseHTTPMiddleware):
+    """Stamps an id on the request, times it, logs one line, echoes the id back.
+
+    The id is taken from an inbound `X-Request-ID` when there is one. That is what makes it useful
+    beyond this process: a reverse proxy or an upstream service that already assigned an id gets
+    the SAME id in our logs, so one identifier follows a request across the whole system. We only
+    invent one when nobody else has.
+    """</code></pre>
+
+<pre class="language-python"><code class="language-python">        request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex[:16]</code></pre>
+
+<p>Accepting an inbound id is what makes the whole thing useful. Generate one unconditionally and
+it correlates lines within this process; honour the one your proxy or upstream service already
+assigned and a single identifier follows a request across every system it touches.</p>
+
+<p>Registering it is one line, and the type is the argument &mdash; not an instance:</p>
+
+<pre class="language-python"><code class="language-python">app.add_middleware(RequestContextMiddleware)</code></pre>
+
+<h2>Carrying the id down the stack</h2>
+
+<p>The id has to be reachable from a repository four layers down without being threaded through
+every signature. That is a <code>ContextVar</code>:</p>
+
+<pre class="language-python"><code class="language-python">request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")</code></pre>
+
+<p>Not a global and not a thread-local, and the reasoning is worth keeping:</p>
+
+<pre class="language-python"><code class="language-python"># A module-level global is shared by every concurrent request, so request B overwrites A's id
+# mid-flight. A thread-local is nearly right but breaks on the async half of the app: many
+# coroutines share one thread, so they would share one "thread-local" value.
+#
+# A ContextVar is per-execution-context. asyncio copies the context into each task, and
+# `run_in_threadpool` (which is how FastAPI runs every `def` route) copies it into the worker
+# thread. So it holds for both sync and async routes, which is the only reason one mechanism
+# covers this whole app.</code></pre>
+
+<p>The direction it propagates is the part to internalise:</p>
+
+<pre class="language-python"><code class="language-python">        # ⚠️ Set BEFORE call_next, and this direction is the only one that works.
+        #
+        # BaseHTTPMiddleware runs the downstream app in a child anyio task. A child task inherits
+        # a COPY of the context at creation, so a value set here is visible all the way down —
+        # routes, services, repositories. The reverse is not true: anything the downstream app
+        # sets is written into its own copy and is invisible here after call_next returns.
+        #
+        # So: seed context on the way in, never expect to read it back on the way out.
+        token = request_id_ctx.set(request_id)</code></pre>
+
+<p>Seed on the way in; never expect to read something back on the way out. A middleware that tries
+to collect a value the route set will get the default, silently.</p>
+
+<h2>⚠️ Ordering reads backwards</h2>
+
+<p><code>add_middleware</code> <strong>inserts at the front</strong> of the list, so the
+<em>last</em> one registered is the <em>outermost</em> layer &mdash; the reverse of how the calls
+read down the page.</p>
+
+<p>StayHub registers these two inner-first, and the comment explains why that is not arbitrary:</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ ORDER IS LOAD-BEARING, and it reads backwards.
+#
+# `add_middleware` INSERTS AT THE FRONT of the list, so the LAST call here is the OUTERMOST
+# layer. These two are therefore added inner-first: RequestContextMiddleware, then CORS around it.
+#
+# CORS MUST be outside. RequestContextMiddleware turns an unhandled exception into a 500 response
+# (see the ⚠️ in core/middleware.py); CORS only adds `Access-Control-Allow-Origin` to responses
+# that pass back through it. Swap these two calls and every 500 reaches the browser without CORS
+# headers, the browser reports a CORS failure instead, and the frontend's error parser never sees
+# the body. Verified both ways on 2026-08-21.
+app.add_middleware(RequestContextMiddleware)</code></pre>
+
+<h3>The bug this describes</h3>
+
+<p>It is worth walking through, because nothing in the source looks wrong.</p>
+
+<p>Lesson 8 covered the cause: a handler registered for bare <code>Exception</code> becomes
+<code>ServerErrorMiddleware</code>'s handler, which sits <em>outside</em> every user middleware. So
+a 500 built there has skipped all of them on the way back. Measured before the fix:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">unhandled 500 ->  X-Request-ID absent   Access-Control-Allow-Origin absent
+handled   404 ->  X-Request-ID present  Access-Control-Allow-Origin present</code></pre>
+
+<p>A browser shown a 500 with no <code>Access-Control-Allow-Origin</code> reports a
+<strong>CORS failure</strong> and never exposes the body. So the React app's error handling never
+saw the message the API had written, and every server error presented as a network problem.</p>
+
+<p>The fix has two halves. The middleware catches the exception and <em>returns</em> a response
+rather than re-raising, so it never reaches the outer layer:</p>
+
+<pre class="language-python"><code class="language-python">            response = unhandled_response()
+            response.headers[REQUEST_ID_HEADER] = request_id
+            response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.1f}"
+            request_id_ctx.reset(token)
+            return response</code></pre>
+
+<p>And CORS is registered outside it, so it sees that response as an ordinary one and adds its
+headers. Get the order wrong and everything still works, right up until something throws.</p>
+
+<h2>CORS, and the rule that catches everyone</h2>
+
+<p>CORS is the browser refusing to let JavaScript on one origin read a response from another unless
+that response says it is allowed. It is enforced by the browser and nowhere else &mdash;
+<code>curl</code> ignores it entirely, which is why an endpoint can work perfectly from a terminal
+and fail from a page.</p>
+
+<pre class="language-python"><code class="language-python">app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)</code></pre>
+
+<p>The trap is the interaction between two of those arguments:</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ allow_credentials=True forbids `allow_origins=["*"]` — the browser rejects a wildcard when
+# credentials are involved, and the failure shows up as a CORS error with no useful detail. The
+# origins are therefore named explicitly in config.py.</code></pre>
+
+<p>The specification forbids the combination, and the browser enforces it. The failure message says
+nothing about which of your settings caused it, so the usual response &mdash; making the CORS
+config <em>more</em> permissive &mdash; makes it worse. Name your origins.</p>
+
+<pre class="language-python"><code class="language-python">    cors_origins: list[str] = [
+        "http://localhost:5174",
+        "http://localhost:5175",
+    ]</code></pre>
+
+<p>Those are exact-match strings. <code>http://localhost:5174</code> and
+<code>http://127.0.0.1:5174</code> are different origins, as are the same host on http and https,
+or on a different port. Most "CORS is broken" reports are one of those three.</p>
+
+<h3>Preflight</h3>
+
+<p>For anything beyond a simple form post, the browser first sends an <code>OPTIONS</code> request
+asking permission:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -o /dev/null -w '%{http_code}\n' -X OPTIONS \
+  -H 'Origin: http://localhost:5174' \
+  -H 'Access-Control-Request-Method: POST' \
+  localhost:8000/api/v1/auth/login</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">200</code></pre>
+
+<p><code>CORSMiddleware</code> answers that itself &mdash; the request never reaches your route,
+which is why a preflight to a nonexistent path can still succeed. A <code>Content-Type:
+application/json</code> header is enough to trigger one, so every JSON API pays this on
+non-GET requests. <code>max_age</code> lets the browser cache the answer and skip it.</p>
+
+<p>One more, for a header your own code sets: a browser can only read <code>Cache-Control</code>,
+<code>Content-Type</code>, <code>Expires</code>, <code>Last-Modified</code> and
+<code>Pragma</code> unless you say otherwise. To let a frontend read the request id, it has to be
+exposed:</p>
+
+<pre class="language-python"><code class="language-python"># added to the CORSMiddleware call above:
+    expose_headers=["X-Request-ID"],</code></pre>
+
+<p>Without it the header arrives on the response and JavaScript simply cannot read it &mdash; which
+looks like the server not sending it, and sends you debugging the wrong side.</p>
+
+<h2>The access log</h2>
+
+<pre class="language-python"><code class="language-python">        if request.url.path not in QUIET_PATHS:
+            # A 5xx is our fault and a 4xx usually is not, so they log at different levels — that
+            # alone makes "alert on ERROR" a usable rule.
+            level = (
+                logging.ERROR
+                if response.status_code &gt;= 500
+                else logging.WARNING
+                if response.status_code &gt;= 400
+                else logging.INFO
+            )</code></pre>
+
+<p>Splitting by class is what makes "alert on ERROR" mean something. If a 404 and a 500 log
+identically, either your alerts fire constantly or they are turned off.</p>
+
+<pre class="language-python"><code class="language-python">QUIET_PATHS = frozenset({"/health", "/docs", "/openapi.json", "/redoc"})</code></pre>
+
+<p><code>/health</code> is polled by the orchestrator every few seconds forever. Logging it buries
+every request anyone cares about under thousands of identical lines.</p>
+
+<h2>Middleware or dependency?</h2>
+
+<p>They overlap, and picking wrong is a common source of awkward code.</p>
+
+<table>
+  <thead><tr><th></th><th>Middleware</th><th>Dependency</th></tr></thead>
+  <tbody>
+    <tr><td>Applies to</td><td>every request, routes included or not</td><td>routes that ask for it</td></tr>
+    <tr><td>Sees the response</td><td>yes</td><td>no</td></tr>
+    <tr><td>Can inject a value</td><td>no</td><td>yes</td></tr>
+    <tr><td>In the OpenAPI schema</td><td>no</td><td>yes</td></tr>
+    <tr><td>Knows which route matched</td><td>not reliably</td><td>yes</td></tr>
+  </tbody>
+</table>
+
+<p>Use <strong>middleware</strong> for cross-cutting concerns that touch the response or must cover
+everything: request ids, timing, access logs, CORS, compression, security headers.</p>
+
+<p>Use a <strong>dependency</strong> for anything route-specific or anything that injects: auth,
+authorization, pagination, a database session. Authentication as middleware is a recurring mistake
+&mdash; it cannot inject the user, it cannot easily know whether this route is public, and it does
+not appear in the documentation.</p>
+
+<h2>Middleware worth having</h2>
+
+<p>Beyond request ids and CORS, a short list earns its place in most services.</p>
+
+<p><strong>Security headers</strong>, which are free and stop a category of problem:</p>
+
+<pre class="language-python"><code class="language-python">class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response</code></pre>
+
+<p><code>nosniff</code> stops a browser second-guessing your <code>Content-Type</code> &mdash;
+which is what turns an uploaded file served as <code>text/plain</code> into executed HTML.
+<code>X-Frame-Options</code> prevents clickjacking. For a JSON API those two plus
+<code>Strict-Transport-Security</code> at the proxy cover most of it; a Content-Security-Policy
+matters more for pages than for APIs.</p>
+
+<p><strong>Compression</strong>, which ships with Starlette:</p>
+
+<pre class="language-python"><code class="language-python">from fastapi.middleware.gzip import GZipMiddleware
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)</code></pre>
+
+<p>JSON compresses extremely well &mdash; a page of listings often drops by 80%. The
+<code>minimum_size</code> guard matters: compressing a 40-byte response costs CPU and makes it
+bigger.</p>
+
+<p><strong>Rate limiting</strong> is the one people expect to be middleware and usually should not
+be. A global limit is rarely what you want &mdash; login needs a strict per-IP limit while a health
+check needs none &mdash; and middleware does not reliably know which route matched. A dependency on
+the routes that need it is the better shape. And the counter has to live in Redis, not in process
+memory, because workers share nothing.</p>
+
+<h2>Ordering, in practice</h2>
+
+<p>Given that the last registration is outermost, a sensible full stack reads bottom-up:</p>
+
+<pre class="language-python"><code class="language-python">app.add_middleware(RequestContextMiddleware)     # innermost of the four
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(CORSMiddleware, ...)          # outermost</code></pre>
+
+<p>The reasoning at each level:</p>
+
+<ul>
+  <li><strong>CORS outermost</strong>, so every response &mdash; including the 500 that
+      <code>RequestContextMiddleware</code> builds &mdash; passes back through it.</li>
+  <li><strong>Compression above the request context</strong>, so the timing recorded is the work,
+      not the gzip.</li>
+  <li><strong>Security headers anywhere above the app</strong>, since they only add.</li>
+  <li><strong>Request context innermost</strong>, so its ContextVar is set before anything
+      downstream logs.</li>
+</ul>
+
+<p>One asymmetry to keep in mind: on the way <em>in</em> the outermost runs first, and on the way
+<em>out</em> it runs last. A middleware that modifies the response body must sit outside anything
+that reads the response body, or it will be reading something that has since changed.</p>
+
+<h2>The cost of BaseHTTPMiddleware</h2>
+
+<p><code>BaseHTTPMiddleware</code> is convenient and not free. It wraps the downstream app in an
+anyio task group and bridges the ASGI message stream, which adds overhead to every request and is
+the reason context does not propagate back up.</p>
+
+<p>For most applications it is irrelevant &mdash; a fraction of a millisecond against a database
+query. When it matters, or when you need to see individual ASGI messages, write pure ASGI
+middleware:</p>
+
+<pre class="language-python"><code class="language-python">class TimingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.perf_counter()
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                elapsed = (time.perf_counter() - started) * 1000
+                headers = MutableHeaders(scope=message)
+                headers.append("X-Response-Time-Ms", f"{elapsed:.1f}")
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)</code></pre>
+
+<p>More code, no task group, and the <code>scope["type"] != "http"</code> guard is mandatory
+&mdash; lifespan and websocket events come through the same callable, and forgetting it breaks
+startup in a way that is hard to trace.</p>
+
+<h2>CORS problems, in order of likelihood</h2>
+
+<p>Nearly every report resolves to one of six things, and the browser's message is unhelpful for
+all of them.</p>
+
+<ol>
+  <li><strong>The origin is not an exact match.</strong> <code>http://localhost:5174</code>,
+      <code>http://127.0.0.1:5174</code> and <code>https://localhost:5174</code> are three different
+      origins.</li>
+  <li><strong>Credentials plus a wildcard.</strong> Forbidden by the specification; name the
+      origins.</li>
+  <li><strong>The response is a 500 built outside the CORS layer.</strong> The bug this lesson is
+      about &mdash; and it presents as CORS even though CORS is configured correctly.</li>
+  <li><strong>A custom header the frontend sends is not in <code>allow_headers</code>.</strong> The
+      preflight refuses and the real request never happens.</li>
+  <li><strong>A response header the frontend reads is not in <code>expose_headers</code>.</strong>
+      The request succeeds and JavaScript cannot see the header.</li>
+  <li><strong>A proxy strips the headers</strong> or answers <code>OPTIONS</code> itself before the
+      application sees it.</li>
+</ol>
+
+<p>The diagnostic that separates them takes ten seconds: <strong>if <code>curl</code> works and the
+browser does not, it is CORS. If <code>curl</code> also fails, it is not</strong> &mdash; CORS is
+enforced by browsers and nothing else. Half the time spent on "CORS errors" is spent on requests
+that were failing for an entirely different reason.</p>
+
+<p>The preflight is worth checking directly, since it is a separate request with its own outcome:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -i -X OPTIONS localhost:8000/api/v1/bookings \
+  -H 'Origin: http://localhost:5174' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: authorization,content-type'</code></pre>
+
+<p>The response's <code>Access-Control-Allow-*</code> headers tell you exactly what the browser was
+told, which is more informative than anything the browser will show you.</p>
+
+<h2>The one that catches people in production</h2>
+
+<p>CORS configuration is environment-specific and almost always hardcoded for development:</p>
+
+<pre class="language-python"><code class="language-python">    # The two Vite dev servers. Anything else fails CORS, and the symptom in the browser is a
+    # blank page rather than an error anyone would recognise.
+    cors_origins: list[str] = [
+        "http://localhost:5174",
+        "http://localhost:5175",
+    ]</code></pre>
+
+<p>Deploying with those defaults means the production frontend &mdash; on a real domain, over HTTPS
+&mdash; is not in the list, and every request from it fails. Everything else works: health checks
+pass, <code>curl</code> works, the deployment looks successful.</p>
+
+<p>Because it is a setting, the fix is an environment variable rather than a release. It is worth
+adding to a deploy checklist precisely because nothing in the application will complain.</p>
+
+<h2>Things that look like middleware and are not</h2>
+
+<p>Three jobs people reach for middleware to do, where something else fits better.</p>
+
+<p><strong>Catching exceptions.</strong> That is what exception handlers are for &mdash; with the
+one caveat this lesson exists to explain, which is that a bare <code>Exception</code> handler ends
+up outside your middleware and a 500 therefore needs catching inside it.</p>
+
+<p><strong>Modifying the response body.</strong> Possible and awkward: the body has already been
+serialised, so you are parsing JSON to re-emit it, and streaming responses cannot be buffered
+without breaking them. If every response needs an envelope, put it in the models.</p>
+
+<p><strong>Per-route configuration.</strong> Middleware runs before routing resolves, so it does not
+reliably know which endpoint will handle the request. Anything conditional on the route belongs in a
+dependency.</p>
+
+<h2>Middleware and startup are different things</h2>
+
+<p>A small confusion worth clearing: middleware wraps <em>requests</em>, and
+<code>lifespan</code> wraps the <em>application</em>. Work that should happen once at boot &mdash;
+opening a connection pool, checking a dependency, loading a model &mdash; belongs in the lifespan,
+not in a middleware guarded by a flag.</p>
+
+<p>The two combine cleanly: create the shared thing in the lifespan, and let middleware or a
+dependency hand it out. What you should not do is lazily initialise inside a middleware, because
+several concurrent first requests will all find it uninitialised and all try.</p>
+
+<h2>Testing it</h2>
+
+<p>Middleware bugs live entirely in configuration, so nothing below <code>TestClient</code> can see
+them:</p>
+
+<pre class="language-python"><code class="language-python">    def test_a_500_still_carries_cors_headers(self, client, probe_routes):
+        """⚠️ THE regression test. Reordering the two add_middleware calls in main.py breaks this
+        and nothing else in the suite."""
+        r = client.get("/__test/boom", headers={"Origin": ORIGIN})
+        assert r.status_code == 500
+        assert r.headers.get("access-control-allow-origin") == ORIGIN</code></pre>
+
+<p>That claim was checked by reintroducing the bug: swapping the two registrations fails this test
+and nothing else. A regression test nobody has watched fail is a guess.</p>
+
+<p>Two details make such tests possible. <code>raise_server_exceptions=False</code> makes
+<code>TestClient</code> behave like a real server and return the 500 rather than re-raising into the
+test. And the probe routes are registered on the <em>real</em> app, so they travel the real
+stack &mdash; a second app assembled by hand would be testing a copy of the configuration rather
+than the configuration.</p>
+
+<p>Next: <strong>testing the whole stack</strong> &mdash; including the class of bug this lesson
+produced, which is invisible to every test below the HTTP layer.</p>

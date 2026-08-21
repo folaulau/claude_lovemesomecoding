@@ -1,0 +1,447 @@
+<p>A container is how the application stops depending on your laptop. This lesson builds StayHub's
+image &mdash; multi-stage so the compiler does not ship, non-root, with the settings that decide
+whether it works at all &mdash; and reports the size and build time it actually produced rather than
+estimating them.</p>
+
+<h2>The naive version</h2>
+
+<pre class="language-docker"><code class="language-docker">FROM python:3.12
+
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements.txt
+
+CMD ["uvicorn", "app.main:app"]</code></pre>
+
+<p>Six lines, and five separate problems:</p>
+
+<ul>
+  <li><code>python:3.12</code> is about 1&nbsp;GB. <code>python:3.12-slim</code> is roughly 150.</li>
+  <li><code>COPY . .</code> before <code>pip install</code> means every source edit reinstalls
+      every dependency.</li>
+  <li>It also copies <code>.venv</code>, <code>.git</code> and <code>.env</code> &mdash; the last of
+      which bakes your secrets into a layer.</li>
+  <li>It runs as root.</li>
+  <li>Uvicorn binds <code>127.0.0.1</code> by default, so nothing outside the container can reach
+      it.</li>
+</ul>
+
+<p>Every one of those is one line to fix.</p>
+
+<h2>Two stages</h2>
+
+<pre class="language-docker"><code class="language-docker">FROM python:3.12-slim AS builder
+
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+        build-essential libpq-dev \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN python -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+WORKDIR /build</code></pre>
+
+<p>The reason for two stages is compilers. <code>psycopg</code>, <code>bcrypt</code> and
+<code>cryptography</code> may need a toolchain to install, and a toolchain is roughly 350&nbsp;MB
+that must not be in the shipped image.</p>
+
+<p>A virtualenv rather than system site-packages, because a whole directory is trivial to
+<code>COPY</code> into the next stage while system packages are scattered.</p>
+
+<p>Then the ordering that makes rebuilds fast:</p>
+
+<pre class="language-docker"><code class="language-docker"># ⚠️ requirements.txt is copied ALONE, before the source. Docker caches per layer and invalidates
+# every layer after the first changed one. Copying the app first means each source edit re-runs
+# pip install — a minute of downloads for a one-line change. This ordering means dependencies are
+# reinstalled only when requirements.txt itself changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    &amp;&amp; pip install --no-cache-dir -r requirements.txt</code></pre>
+
+<p>This is the single highest-value line in any Python Dockerfile. Dependencies change rarely and
+source changes constantly, so the expensive step belongs above the volatile one.</p>
+
+<p>The runtime stage takes the virtualenv and nothing else:</p>
+
+<pre class="language-docker"><code class="language-docker">FROM python:3.12-slim AS runtime
+
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+        libpq5 curl \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+COPY --from=builder $VIRTUAL_ENV $VIRTUAL_ENV</code></pre>
+
+<p><code>libpq5</code> is the <em>runtime</em> half of <code>libpq-dev</code> &mdash; the shared
+library psycopg loads, without the headers and compiler. That pairing is the general pattern:
+<code>-dev</code> in the builder, the bare library in the runtime.</p>
+
+<h2>The environment variables that matter</h2>
+
+<pre class="language-docker"><code class="language-docker"># ⚠️ PYTHONUNBUFFERED is not a nicety. Python buffers stdout when it is not a TTY — which is
+# exactly the case in a container — so without this, logs appear in `docker logs` in delayed
+# chunks, and a process that crashes loses whatever was still in the buffer. The symptom is
+# "my container produces no logs", and it is entirely this.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1</code></pre>
+
+<p>"My container produces no logs" is almost always this one variable, and the fact that a crashing
+process loses its buffer means it hides exactly the output you most need.</p>
+
+<p><code>PYTHONDONTWRITEBYTECODE</code> stops <code>.pyc</code> files being written into the
+container filesystem, where they are never reused.</p>
+
+<p>And the JSON logging from the last lesson gets switched on here:</p>
+
+<pre class="language-docker"><code class="language-docker">ENV STAYHUB_LOG_JSON=true</code></pre>
+
+<h2>Not root</h2>
+
+<pre class="language-docker"><code class="language-docker"># ⚠️ A non-root user. The default is root, and root in the container is root on the host kernel
+# for anything that escapes. This costs one line.
+RUN useradd --create-home --shell /bin/bash --uid 1000 stayhub
+WORKDIR /app</code></pre>
+
+<p>Then copy with ownership, and create the writable directories before dropping privileges:</p>
+
+<pre class="language-docker"><code class="language-docker">COPY --chown=stayhub:stayhub alembic.ini pytest.ini ./
+COPY --chown=stayhub:stayhub alembic ./alembic
+COPY --chown=stayhub:stayhub app ./app
+COPY --chown=stayhub:stayhub scripts ./scripts</code></pre>
+
+<pre class="language-docker"><code class="language-docker">RUN mkdir -p uploads notifications &amp;&amp; chown -R stayhub:stayhub uploads notifications
+
+USER stayhub</code></pre>
+
+<p>The order is the part people get wrong: everything needing root happens before
+<code>USER</code>, because a non-root process cannot <code>mkdir</code> inside a root-owned
+<code>WORKDIR</code>. The failure appears at runtime as a permission error on the first upload.</p>
+
+<p>Copying specific directories rather than <code>COPY . .</code> is a second layer of defence
+&mdash; even with a <code>.dockerignore</code>, naming what goes in means a new file at the
+repository root does not silently join the image.</p>
+
+<h2>.dockerignore does two jobs</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext"># ⚠️ Without this file the build context is ~400 MB, almost all of it .venv — and it is uploaded
+# to the daemon on EVERY build, before a single instruction runs. A .dockerignore is the single
+# biggest build-speed win in a Python project.
+#
+# It is also a security control. `.env` holds the Stripe secret key; COPY-ing the directory
+# without excluding it bakes that key into an image layer, where it survives even if a later
+# layer deletes the file.</code></pre>
+
+<p>The second half is the one worth repeating. <strong>Deleting a file in a later layer does not
+remove it from the image</strong> &mdash; layers are additive, and anybody with the image can read
+the earlier one. A secret copied in at any point is in there permanently.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets. Never in an image.
+.env
+.env.*
+!.env.example
+
+# Runtime output — these are volumes, not image content
+uploads/
+notifications/</code></pre>
+
+<h2>Health and the command</h2>
+
+<pre class="language-docker"><code class="language-docker">HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1</code></pre>
+
+<p><code>--start-period</code> is the argument people omit. During it, failures do not count toward
+<code>--retries</code>, which is what stops a container being killed for not being ready while it is
+still starting.</p>
+
+<p>Then the command, which contains the single most common container mistake in the ecosystem:</p>
+
+<pre class="language-docker"><code class="language-docker">CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]</code></pre>
+
+<pre class="language-docker"><code class="language-docker"># ⚠️ --host 0.0.0.0, and this is THE container gotcha. Uvicorn's default is 127.0.0.1, which
+# inside a container means the container's own loopback. The bind succeeds, the app logs that it
+# is running, `docker ps` shows the port published — and every request from the host is refused.
+# Nothing anywhere says why.</code></pre>
+
+<p>Every signal says the application is fine. Nothing reports an error. The requests simply do not
+arrive.</p>
+
+<h3>How many workers</h3>
+
+<pre class="language-docker"><code class="language-docker"># --workers 4: these are separate PROCESSES, and they are what uses more than one CPU core, since
+# a single uvicorn process is one event loop on one core no matter how async the code is. Four is
+# a starting point for a 2-4 core container; tune it against real traffic, and remember each
+# worker carries its OWN SQLAlchemy connection pool — 4 workers × pool_size 5 is 20 connections to
+# Postgres, which must be under max_connections.</code></pre>
+
+<p>Two consequences follow from workers being separate processes, and both catch people.</p>
+
+<p><strong>Nothing in memory is shared.</strong> An in-process cache, a rate-limit counter, a
+WebSocket connection registry &mdash; each worker has its own. Anything that must be shared belongs
+in Redis or the database.</p>
+
+<p><strong>Connections multiply.</strong> Workers × (pool_size + max_overflow) × containers, all
+against one <code>max_connections</code>. This is the number that turns a successful scale-up into
+<code>FATAL: sorry, too many clients already</code>.</p>
+
+<p>And no <code>--reload</code> in an image. It watches the filesystem, costs CPU forever, and buys
+nothing when the code cannot change.</p>
+
+<h2>What it actually produced</h2>
+
+<p>Built and inspected on 2026-08-21:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">build time          45s (cold)
+image size          304MB
+runs as             stayhub (non-root)
+.env in the image   absent
+gcc in the runtime  absent
+healthcheck         healthy</code></pre>
+
+<p>Each of those was checked rather than assumed:</p>
+
+<pre class="language-bash"><code class="language-bash">docker images stayhub-api:local --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+docker run --rm stayhub-api:local whoami
+docker run --rm stayhub-api:local sh -c 'test -f /app/.env &amp;&amp; echo LEAKED || echo absent'
+docker run --rm stayhub-api:local sh -c 'which gcc || echo "gcc absent"'</code></pre>
+
+<p>Those four commands are worth running against any image you build. "The Dockerfile says
+non-root" and "the container runs as non-root" are different claims, and only one of them is
+checkable.</p>
+
+<h2>In compose</h2>
+
+<pre class="language-yaml"><code class="language-yaml">  api:
+    build:
+      context: ./stayhub-fastapi-backend
+    image: stayhub-api:local
+    container_name: stayhub-api
+    profiles: ["api"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "8000:8000"</code></pre>
+
+<p><code>condition: service_healthy</code> rather than a bare <code>depends_on</code>. The plain
+form waits for the container to <em>start</em>, not to be usable, so the API begins connecting to a
+Postgres that is still initialising.</p>
+
+<p>The service is behind a profile, which is a pattern worth borrowing:</p>
+
+<pre class="language-yaml"><code class="language-yaml">  # ⚠️ It is behind a profile because the documented workflow runs uvicorn on the HOST with
+  # --reload, which is far better for development. Both bind port 8000, so running this while the
+  # host uvicorn is up fails with "port is already allocated". That is the intended, obvious
+  # failure — the alternative was a second port that nothing else in the project knows about.</code></pre>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d                    # backing services only — the default, unchanged
+docker compose --profile api up -d      # backing services PLUS the API in a container</code></pre>
+
+<h3>The networking trap, again</h3>
+
+<pre class="language-yaml"><code class="language-yaml">      # ⚠️ `postgres:5432` and `elasticsearch:9200` — the SERVICE NAME and the container's own
+      # port. The 5433 in the host workflow is a host-side publish only and means nothing inside
+      # this network. Same trap the hasura service documents above; it catches everyone once.
+      STAYHUB_DATABASE_URL: postgresql+psycopg://stayhub:stayhub@postgres:5432/stayhub</code></pre>
+
+<p>Inside the compose network, containers reach each other by service name on the container's own
+port. The published port &mdash; the left half of <code>"5433:5432"</code> &mdash; exists only on
+the host. Using it from another container fails with a connection error that looks like the database
+being down.</p>
+
+<p>The mirror image applies to CORS:</p>
+
+<pre class="language-yaml"><code class="language-yaml">      # `localhost` here is the BROWSER's localhost — the Vite dev servers on the host machine —
+      # not the container's. CORS is judged by what the browser sends in `Origin`.
+      STAYHUB_CORS_ORIGINS: '["http://localhost:5174","http://localhost:5175"]'</code></pre>
+
+<p>Container-to-container uses service names; browser-facing configuration uses what the browser
+sees. Getting those the wrong way round is the second-most-common compose mistake.</p>
+
+<h2>Making the build faster still</h2>
+
+<p>Two techniques beyond layer ordering, both worth knowing once builds start feeling slow.</p>
+
+<p><strong>A cache mount</strong> keeps pip's download cache between builds without putting it in
+the image:</p>
+
+<pre class="language-docker"><code class="language-docker">RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt</code></pre>
+
+<p>The cache lives on the builder, not in a layer, so a changed requirements file re-resolves but
+does not re-download everything.</p>
+
+<p><strong>A lock file</strong> matters more than either. <code>requirements.txt</code> with pinned
+versions is the minimum, and it is what makes a build reproducible &mdash;
+<code>fastapi&gt;=0.100</code> means today's image and next month's image contain different code
+with no record of the change. Pin exactly, and upgrade deliberately:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic[email]==2.10.3
+SQLAlchemy[asyncio]==2.0.36</code></pre>
+
+<p>Note the extras are part of the pin. <code>SQLAlchemy</code> and
+<code>SQLAlchemy[asyncio]</code> install different things, and the difference only shows up at
+runtime when an async query fails at close time.</p>
+
+<h2>Building for the right architecture</h2>
+
+<p>An image built on an Apple Silicon laptop is <code>linux/arm64</code>. Most clusters are
+<code>linux/amd64</code>. Pushing the first to the second produces a container that dies at import
+with an error about an incompatible binary &mdash; from a compiled dependency like
+<code>pydantic-core</code>, not from anything you wrote.</p>
+
+<pre class="language-bash"><code class="language-bash">docker build --platform linux/amd64 -t stayhub-api:latest .
+docker buildx build --platform linux/amd64,linux/arm64 -t stayhub-api:latest --push .</code></pre>
+
+<p>The second builds both and pushes a manifest, so the right one is pulled automatically. Emulated
+cross-building is slow; a CI runner on the target architecture is faster if you have one.</p>
+
+<p>The check that catches it before deploy:</p>
+
+<pre class="language-bash"><code class="language-bash">docker run --rm stayhub-api:local python -c "import pydantic_core; print('ok')"</code></pre>
+
+<h2>Tags, and why `latest` is a trap</h2>
+
+<pre class="language-bash"><code class="language-bash">docker build -t registry/stayhub-api:$(git rev-parse --short HEAD) .
+docker tag registry/stayhub-api:$(git rev-parse --short HEAD) registry/stayhub-api:latest</code></pre>
+
+<p>Tag with the commit, always. <code>latest</code> is a moving pointer, so "the version running in
+production" becomes unanswerable and a rollback has nothing to roll back to. A commit-tagged image
+is a rollback target that still exists next week.</p>
+
+<p>The related habit is not rebuilding between environments. Build once, promote the same digest
+from staging to production. An image rebuilt for production is a different image, and the thing you
+tested is not the thing you shipped.</p>
+
+<h2>Making it smaller, if it matters</h2>
+
+<p>304&nbsp;MB is fine for most purposes &mdash; layers are cached, so a redeploy transfers only
+what changed. If it does matter:</p>
+
+<table>
+  <thead><tr><th>Change</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>slim</code> instead of the full image</td><td>~1GB &rarr; ~150MB base</td></tr>
+    <tr><td>Multi-stage, dropping the toolchain</td><td>&minus;350MB</td></tr>
+    <tr><td><code>--no-install-recommends</code></td><td>tens of MB</td></tr>
+    <tr><td><code>rm -rf /var/lib/apt/lists/*</code> in the same RUN</td><td>~40MB</td></tr>
+    <tr><td>Alpine instead of slim</td><td>smaller, and often slower to build</td></tr>
+  </tbody>
+</table>
+
+<p>Two of those need a caveat. Cleaning apt lists must happen <strong>in the same
+<code>RUN</code></strong> &mdash; a separate one adds a layer removing files the previous layer
+already committed, so the image does not shrink at all. And Alpine uses musl rather than glibc, so
+many Python wheels have no prebuilt binary and get compiled from source: a smaller image bought
+with much longer builds and occasional runtime surprises. <code>slim</code> is the better default
+for Python.</p>
+
+<h2>Developing against the container</h2>
+
+<p>The image is built for production, which makes it a poor development environment &mdash; no
+reload, and a rebuild per change. The usual compromise is a second stage:</p>
+
+<pre class="language-docker"><code class="language-docker">FROM runtime AS dev
+
+USER root
+RUN pip install -r requirements-dev.txt
+USER stayhub
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]</code></pre>
+
+<pre class="language-yaml"><code class="language-yaml">  api:
+    build:
+      context: ./stayhub-fastapi-backend
+      target: dev
+    volumes:
+      - ./stayhub-fastapi-backend/app:/app/app:ro</code></pre>
+
+<p><code>target: dev</code> builds the extra stage; the bind mount puts your source over the copied
+one so <code>--reload</code> sees edits. Read-only, so nothing the container writes can surprise
+you on the host.</p>
+
+<p>StayHub does not do this &mdash; its documented workflow runs uvicorn directly on the host, which
+is simpler and faster still. The container version earns its place when the application needs
+something awkward to install locally, or when "works on my machine" has already cost a day.</p>
+
+<h2>Debugging a container that will not start</h2>
+
+<p>Four commands, in order.</p>
+
+<pre class="language-bash"><code class="language-bash">docker logs stayhub-api                  # 1. what did it say on the way down
+docker run --rm -it stayhub-api:local sh # 2. poke around inside the image
+docker inspect stayhub-api               # 3. env, mounts, health, exit code
+docker exec stayhub-api env              # 4. what it actually received</code></pre>
+
+<p>The fourth catches more than it should. A variable that is set in your shell, or in a
+<code>.env</code> the compose file does not reference, is simply not there &mdash; and with a
+default in the settings model, the application starts and misbehaves rather than complaining.</p>
+
+<p>An empty log with a non-zero exit is nearly always the buffering problem: without
+<code>PYTHONUNBUFFERED=1</code> the traceback that explains the crash was still in the buffer when
+the process died.</p>
+
+<p>And if the container is running but unreachable, check the bind address before anything else.
+Inside the container:</p>
+
+<pre class="language-bash"><code class="language-bash">docker exec stayhub-api sh -c 'curl -s localhost:8000/health'</code></pre>
+
+<p>If that works and the host cannot reach it, the process is bound to the container's loopback and
+the fix is <code>--host 0.0.0.0</code>. If it fails there too, the application is genuinely not
+serving and the logs are the place to look.</p>
+
+<h2>What a good image is measured by</h2>
+
+<p>Four properties, roughly in order of how much they matter.</p>
+
+<p><strong>It contains what it needs and nothing else.</strong> No compiler, no source control, no
+secrets, no test fixtures. Each of those is attack surface, size, or both.</p>
+
+<p><strong>It is reproducible.</strong> Pinned dependencies and a commit tag mean the image running
+in production can be rebuilt identically and identified exactly. Unpinned versions make "the same
+image" a claim nobody can verify.</p>
+
+<p><strong>It fails fast and loudly.</strong> A missing secret should stop the container from
+starting, not produce a service that runs with a default. That is a settings decision rather than a
+Dockerfile one, but the container is where it shows up.</p>
+
+<p><strong>It rebuilds quickly.</strong> Layer ordering, a <code>.dockerignore</code>, and a cache
+mount. This one is about how often people are willing to rebuild, which decides how much of the rest
+is actually maintained.</p>
+
+<p>Notably absent from that list: being as small as possible. 304&nbsp;MB versus 250&nbsp;MB is
+rarely worth the Alpine build problems, and layer caching means a redeploy transfers only the layers
+that changed &mdash; usually just the source.</p>
+
+<h2>What stays outside the image</h2>
+
+<p><strong>Secrets.</strong> Environment variables at runtime, or a secrets manager. Never
+<code>ENV STAYHUB_JWT_SECRET=...</code>, which is readable by anyone with the image.</p>
+
+<p><strong>State.</strong> A container filesystem does not survive a restart and is not shared
+between replicas, so uploads need a volume &mdash; or, in production, object storage:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    volumes:
+      # Uploads must outlive the container. Without this, every restart silently loses every photo
+      # a host ever added — the container filesystem is not storage.
+      - stayhub-uploads:/app/uploads</code></pre>
+
+<p><strong>Migrations.</strong> Tempting to run <code>alembic upgrade head</code> in the entrypoint,
+and wrong once there is more than one replica: they all start at once and race. Migrations are a
+deploy step, covered next.</p>
+
+<p>Next: <strong>getting it into production</strong> &mdash; what sits in front of this image, how
+to roll it out without dropping requests, and what to check when it works locally and not in the
+cluster.</p>

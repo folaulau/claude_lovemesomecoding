@@ -1,0 +1,481 @@
+<p>Pydantic is the part of FastAPI actually doing the work. Every request body, every response
+shape, every query constraint from the last lesson is a pydantic model underneath. This lesson is
+about using it deliberately &mdash; not just as a way to declare fields, but as the place your data
+rules live.</p>
+
+<p>Everything here is pydantic <strong>v2</strong>. That matters: v1 examples are still everywhere,
+several method names changed, and the two are not compatible. If a snippet you find online uses
+<code>@validator</code>, <code>.dict()</code> or <code>orm_mode</code>, it is v1.</p>
+
+<h2>A model is a parser, not a class</h2>
+
+<p>The mental shift that makes pydantic click: a model does not describe data you already have, it
+<em>produces</em> valid data from data you do not trust.</p>
+
+<pre class="language-python"><code class="language-python">class QuoteRequest(ApiModel):
+    property_id: UUID
+    check_in: date
+    check_out: date
+    guests: int = Field(default=1, ge=1, le=50)</code></pre>
+
+<p>Hand that JSON strings and it returns a <code>UUID</code> and two <code>date</code> objects. The
+conversion is the feature. By the time your function runs, <code>check_out - check_in</code> is
+valid arithmetic, not a string comparison you have to remember to parse first.</p>
+
+<p>Fields with no default are required. A default makes them optional. And the distinction that
+catches everyone:</p>
+
+<pre class="language-python"><code class="language-python">class Example(BaseModel):
+    a: str          # required
+    b: str = "x"    # optional, defaults to "x"
+    c: str | None   # REQUIRED, and may be null
+    d: str | None = None   # optional, defaults to null</code></pre>
+
+<p><code>c</code> is required. <code>| None</code> controls whether <code>null</code> is an
+acceptable <em>value</em>; the presence of a default controls whether the field can be
+<em>omitted</em>. They look like the same idea and are not.</p>
+
+<h2>Field constraints</h2>
+
+<p><code>Field()</code> carries the rules. StayHub's listing model is a good survey:</p>
+
+<pre class="language-python"><code class="language-python">class PropertyCreateRequest(ApiModel):
+    title: str = Field(min_length=5, max_length=200)
+    description: str = Field(default="", max_length=5000)
+    property_type: PropertyType = PropertyType.HOUSE
+    room_type: RoomType = RoomType.ENTIRE_PLACE
+
+    address_line1: str = Field(default="", max_length=255)
+    city: str = Field(min_length=1, max_length=120)
+    state: str | None = Field(default=None, max_length=120)
+    country: str = Field(default="United States", max_length=120)
+    postal_code: str | None = Field(default=None, max_length=20)
+    latitude: Decimal | None = None
+    longitude: Decimal | None = None
+
+    price_per_night: Decimal = Field(gt=0, le=Decimal("100000"))
+    cleaning_fee: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("100000"))
+
+    max_guests: int = Field(default=2, ge=1, le=50)
+    bedrooms: int = Field(default=1, ge=0, le=50)
+    beds: int = Field(default=1, ge=0, le=50)
+    bathrooms: Decimal = Field(default=Decimal("1"), ge=0, le=Decimal("50"))
+
+    amenity_slugs: list[str] = []
+    images: list[PropertyImageInput] = []</code></pre>
+
+<p>Three things there are worth doing in your own models.</p>
+
+<p><strong>Every string is bounded.</strong> <code>max_length</code> on all of them, not because
+anyone types a 5,000-character city name, but because without it a request can. An unbounded string
+field is an unbounded row and, further down, an unbounded index entry.</p>
+
+<p><strong>Every number has a floor and a ceiling.</strong> <code>bedrooms: int = Field(ge=0,
+le=50)</code> makes <code>-1</code> and <code>10**9</code> impossible. Note <code>ge=0</code> for
+bedrooms (a studio has none) but <code>ge=1</code> for <code>max_guests</code> (a listing that
+sleeps nobody is not a listing). The bounds encode domain knowledge, which is why they belong here
+rather than in a service.</p>
+
+<p><strong>Money is <code>Decimal</code>, never <code>float</code>.</strong>
+<code>0.1 + 0.2 != 0.3</code> in binary floating point, and a booking total is the last place you
+want that. The same rule holds all the way down &mdash; the database column is
+<code>Numeric(10, 2)</code>. Coordinates are <code>Decimal</code> too, because a round-trip through
+a float turns <code>37.7749</code> into <code>37.774899999999995</code>.</p>
+
+<h2>What gets coerced, and what does not</h2>
+
+<p>Pydantic v2 converts between compatible types but is stricter than v1 about what "compatible"
+means. The rules are worth knowing because the surprises are all at the boundary:</p>
+
+<pre class="language-python"><code class="language-python">class Demo(BaseModel):
+    n: int
+    flag: bool
+    when: date
+
+
+Demo(n="42", flag="yes", when="2027-03-01")
+# -> n=42, flag=True, when=datetime.date(2027, 3, 1)     strings parse
+
+Demo(n=42.0, flag=1, when="2027-03-01")
+# -> n=42, flag=True                                     lossless float -> int is fine
+
+Demo(n=42.7, flag=True, when="2027-03-01")
+# -> ValidationError: Input should be a valid integer,
+#    got a number with a fractional part</code></pre>
+
+<p><code>42.0</code> becomes <code>42</code> because nothing is lost; <code>42.7</code> is an error
+rather than a silent truncation. That is the principle throughout &mdash; <strong>lossless
+conversions happen, lossy ones raise</strong>. v1 would have given you <code>42</code> and said
+nothing.</p>
+
+<p>Booleans accept the strings you would expect (<code>"yes"</code>, <code>"true"</code>,
+<code>"on"</code>, <code>"1"</code>) and reject the ones you would not. If you want none of this,
+<code>model_config = ConfigDict(strict=True)</code> turns coercion off entirely and requires exact
+types &mdash; occasionally right for an internal service, usually wrong for an HTTP API where
+everything arrives as a string anyway.</p>
+
+<h2>Nested models</h2>
+
+<p>A model can contain models, and validation recurses. StayHub's listing takes a list of images:</p>
+
+<pre class="language-python"><code class="language-python">class PropertyImageInput(ApiModel):
+    url: str = Field(max_length=500)
+    alt_text: str | None = Field(default=None, max_length=255)
+    is_cover: bool = False</code></pre>
+
+<p>Declared on the parent as <code>images: list[PropertyImageInput] = []</code>, that validates
+every element, and the error location points at the offending one:</p>
+
+<pre class="language-json"><code class="language-json">{"detail":[{"type":"string_too_long","loc":["body","images",2,"url"],
+  "msg":"String should have at most 500 characters"}]}</code></pre>
+
+<p><code>["body", "images", 2, "url"]</code> &mdash; the third image's URL. That precision is free,
+and it is why nesting models beats accepting <code>list[dict]</code> and checking by hand.</p>
+
+<p>One caution: nesting has no depth limit, and a deeply nested model is a deeply recursive
+validation on untrusted input. If a client can control the shape as well as the values, bound it
+&mdash; <code>Field(max_length=50)</code> on the list is one line and stops somebody posting fifty
+thousand images.</p>
+
+<h2>Validators, for rules a constraint cannot express</h2>
+
+<p>Two kinds, and choosing the right one matters. A <strong>field validator</strong> sees one
+field:</p>
+
+<pre class="language-python"><code class="language-python">    @field_validator("price_per_night", "cleaning_fee")
+    @classmethod
+    def two_decimal_places(cls, v: Decimal) -&gt; Decimal:
+        return v.quantize(Decimal("0.01"))</code></pre>
+
+<p>Note it <em>returns</em> a value. A validator can normalise as well as reject, and this one does
+only that: quantizing at the edge means a client sending <code>129.999</code> cannot create a
+listing whose price renders as <code>$130.00</code> but sums as something else. Doing it here rather
+than at each use means there is one place it can be forgotten, and it is not forgotten.</p>
+
+<p>A <strong>model validator</strong> sees the whole object, which is what you need when a rule
+spans fields:</p>
+
+<pre class="language-python"><code class="language-python">    @model_validator(mode="after")
+    def check_dates(self) -&gt; "QuoteRequest":
+        if self.check_out &lt;= self.check_in:
+            raise ValueError("Check-out must be after check-in.")
+        return self</code></pre>
+
+<p><code>mode="after"</code> runs once every field has been parsed, so <code>self.check_in</code>
+is a real <code>date</code> and the comparison is meaningful. <code>mode="before"</code> runs on the
+raw input instead &mdash; use it to reshape incoming data, not to validate it.</p>
+
+<p>Raise a plain <code>ValueError</code>. Pydantic catches it, and FastAPI turns it into a 422
+naming the field. Raising an <code>HTTPException</code> from a validator works but couples your data
+model to the web layer, which stops it being usable anywhere else.</p>
+
+<h2>The camelCase boundary</h2>
+
+<p>Python is snake_case. TypeScript is camelCase. Neither community is going to change, and hand-
+converting at every call site is how the two spellings end up mixed in one payload.</p>
+
+<p>StayHub solves it once, in a base class every model inherits:</p>
+
+<pre class="language-python"><code class="language-python">class ApiModel(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        from_attributes=True,
+    )</code></pre>
+
+<p>That is fifteen lines of configuration doing three separate jobs, and all three are worth
+understanding.</p>
+
+<p><strong><code>alias_generator=to_camel</code></strong> gives every field an automatic alias, so
+<code>price_per_night</code> is <code>pricePerNight</code> on the wire &mdash; in both directions,
+for every model, without a single per-field declaration.</p>
+
+<p><strong><code>populate_by_name=True</code></strong> accepts <em>both</em> spellings on input.
+Without it a request must use camelCase, which makes every <code>curl</code> example and every test
+fixture read strangely. With it, both work and the frontend is unaffected.</p>
+
+<p><strong><code>from_attributes=True</code></strong> lets a model be built from an arbitrary
+object's attributes rather than a dict &mdash; which is what makes this line work:</p>
+
+<pre class="language-python"><code class="language-python">    return PropertyResponse.model_validate(PropertyService(db).get_for_public(public_id))</code></pre>
+
+<p>That argument is a SQLAlchemy row, not a dictionary. <code>model_validate</code> reads its
+attributes and builds the DTO. In v1 this was called <code>orm_mode</code> and needed
+<code>from_orm()</code>; in v2 it is one config flag and the ordinary constructor path.</p>
+
+<h2>Separate the model you store from the model you return</h2>
+
+<p>This is the habit that matters most, and the reason is security rather than tidiness.</p>
+
+<p>StayHub has four models for one concept. <code>PropertyCreateRequest</code> is what a host may
+send. <code>PropertyUpdateRequest</code> is the same fields, all optional, because a PATCH means
+"change only what is present". <code>PropertyResponse</code> is what a guest may see. And
+<code>Property</code> &mdash; the SQLAlchemy model &mdash; is what is stored.</p>
+
+<p>Look at what the response deliberately omits:</p>
+
+<pre class="language-python"><code class="language-python">class PropertyResponse(ApiModel):
+    public_id: UUID
+    title: str
+    description: str
+    property_type: str
+    room_type: str
+    status: PropertyStatus
+
+    city: str
+    state: str | None = None
+    country: str
+    latitude: Decimal | None = None
+    longitude: Decimal | None = None</code></pre>
+
+<p>There is no <code>address_line1</code>, and its absence is a decision:</p>
+
+<pre class="language-python"><code class="language-python">    # `address_line1` is deliberately omitted. Airbnb shows the exact address only after booking;
+    # publishing it on a listing page tells the internet which houses are empty next week.</code></pre>
+
+<p>The same pattern protects the host's identity. A listing includes its host, but not the whole
+user record:</p>
+
+<pre class="language-python"><code class="language-python">class PropertyHostResponse(ApiModel):
+    """The slice of a host a guest is allowed to see. Note the absence of `email`."""
+
+    public_id: UUID
+    first_name: str
+    avatar_url: str | None = None
+    host_bio: str | None = None</code></pre>
+
+<p>If you return the ORM object directly, every column you ever add is published the day you add
+it. A response model inverts that: new columns are private until somebody deliberately exposes
+them. That is the difference between a leak being an act of commission and one of omission, and it
+is why <code>response_model</code> is a security boundary rather than a formatting convenience.</p>
+
+<h3>PATCH means every field optional</h3>
+
+<pre class="language-python"><code class="language-python">class PropertyUpdateRequest(ApiModel):
+    """Every field optional &mdash; this is a PATCH, and `None` means "leave it alone".
+
+    That is also why status is not here: publishing is a transition with rules, not a field
+    assignment. It gets its own endpoint.
+    """</code></pre>
+
+<p>The second half of that docstring is the more interesting rule. <code>status</code> is a real
+column, and it is not in the update model, because moving a listing from draft to published has
+preconditions &mdash; it must be complete, and it has to be indexed for search. Expressing that as
+an assignable field would let a client skip all of it. It gets <code>POST /publish</code> instead.
+Lesson 7 has more on actions that are not field assignments.</p>
+
+<h2>Computed fields</h2>
+
+<p>Some values are derived and should never be stored. StayHub's booking response has two:</p>
+
+<pre class="language-python"><code class="language-python">    @computed_field
+    @builtin_property
+    def cancellation_deadline(self) -&gt; date:
+        return cancellation_deadline(self.check_in)
+
+    @computed_field
+    @builtin_property
+    def is_cancellable(self) -&gt; bool:
+        return is_cancellable(self.status, self.check_in)</code></pre>
+
+<p>Both answers change at every midnight, so a stored copy is wrong within a day of being written.
+<code>@computed_field</code> adds them to the <em>output</em> without making them inputs: they
+appear in the JSON and in the OpenAPI schema, and nothing can send them. The alternative &mdash;
+passing the values in at construction &mdash; meant every call site had to remember to, and this way
+the rule travels with the DTO.</p>
+
+<p>The frontend uses <code>isCancellable</code> to decide whether to render a Cancel button. The
+server checks the same rule again when a cancellation actually arrives, because a hidden button is
+a courtesy, not a permission.</p>
+
+<h3>The trap in that snippet</h3>
+
+<p>Notice it says <code>@builtin_property</code>, not <code>@property</code>. That is not a style
+choice:</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ `BookingResponse` has a field called `property`, and a class body is one namespace: the
+# moment that annotation is assigned, the name `property` inside the class refers to the field,
+# not to the builtin decorator. A `@property` written after it fails with
+# "TypeError: 'NoneType' object is not callable" — which points at the decorator line and says
+# nothing about the field twenty lines above that caused it.
+builtin_property = property</code></pre>
+
+<p>A class body is an ordinary namespace evaluated top to bottom. <code>property:
+BookingPropertyResponse | None = None</code> binds the name <code>property</code> to a field, and
+every later reference in that body resolves to it rather than to the builtin. Capturing the builtin
+under another name at module level sidesteps it without renaming a field that the domain genuinely
+calls "property".</p>
+
+<p>The general lesson is worth more than the specific one: pydantic field names share a namespace
+with anything else in the class body. <code>id</code>, <code>type</code>, <code>list</code>,
+<code>property</code> and <code>copy</code> are all real domain words and all shadow something.</p>
+
+<h2>Two more sharp edges</h2>
+
+<p><strong><code>EmailStr</code> rejects reserved test domains.</strong> StayHub's fixtures use
+<code>@stayhub.test</code>, and the validator refuses them with "the part after the @-sign is a
+special-use or reserved name". It is right &mdash; RFC 6761 reserves <code>.test</code> precisely so
+it can never be a real domain, which is exactly why it is the correct TLD for demo accounts and
+exactly why mail can never be delivered there:</p>
+
+<pre class="language-python"><code class="language-python">email_validator.TEST_ENVIRONMENT = True</code></pre>
+
+<p>That flag says "these addresses are for testing, allow the reserved TLDs". A production service
+should <em>not</em> set it: there, an address at <code>.test</code> really is a mistake worth
+catching. Also note <code>EmailStr</code> needs the <code>pydantic[email]</code> extra, and without
+it every model using the type fails at <strong>import</strong> time &mdash; so the whole app refuses
+to start rather than failing on one request. That is the better failure, but only if you know to
+look at the install.</p>
+
+<p><strong>Mutable defaults are safe here, unlike in plain Python.</strong>
+<code>amenity_slugs: list[str] = []</code> would be a shared-mutable-default bug in an ordinary
+function. Pydantic deep-copies defaults per instance, so each model gets its own list. You do not
+need <code>Field(default_factory=list)</code> for this &mdash; though it is still the right tool
+when the default has to be computed, like a timestamp or a UUID.</p>
+
+<h2>Reusable constrained types</h2>
+
+<p>Once the same constraint appears in three models, name it. <code>Annotated</code> makes a
+constrained type a first-class thing you can import:</p>
+
+<pre class="language-python"><code class="language-python">from decimal import Decimal
+from typing import Annotated
+
+from pydantic import Field
+
+Money = Annotated[Decimal, Field(gt=0, le=Decimal("100000"), decimal_places=2)]
+ShortText = Annotated[str, Field(min_length=1, max_length=120)]
+Guests = Annotated[int, Field(ge=1, le=50)]
+
+
+class Listing(BaseModel):
+    city: ShortText
+    price_per_night: Money
+    max_guests: Guests</code></pre>
+
+<p>That reads better than the repeated <code>Field(...)</code> calls and, more usefully, gives the
+rule one definition. When somebody decides the ceiling should be 200,000, it is one edit rather
+than a search. The same aliases work as parameter annotations, so a query parameter and a body
+field can share a constraint.</p>
+
+<p>Inheritance covers the other kind of reuse &mdash; whole models that extend one another. StayHub
+uses it to say something precise:</p>
+
+<pre class="language-python"><code class="language-python">class BookingCreateRequest(QuoteRequest):</code></pre>
+
+<p>A booking request <em>is</em> a quote request, with no fields added. That is not laziness &mdash;
+it is the guarantee that you cannot be quoted one thing and charged for another, expressed as a
+type. The two endpoints run the same pricing code because they accept the same input.</p>
+
+<h2>The config options worth knowing</h2>
+
+<table>
+  <thead><tr><th>Option</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>alias_generator</code></td><td>renames every field on the wire &mdash; the camelCase boundary</td></tr>
+    <tr><td><code>populate_by_name</code></td><td>accept the Python name on input as well as the alias</td></tr>
+    <tr><td><code>from_attributes</code></td><td>build from an object's attributes, e.g. a SQLAlchemy row</td></tr>
+    <tr><td><code>extra="forbid"</code></td><td>reject unknown fields instead of ignoring them</td></tr>
+    <tr><td><code>frozen=True</code></td><td>make instances immutable and hashable</td></tr>
+    <tr><td><code>str_strip_whitespace</code></td><td>trim every string on the way in</td></tr>
+    <tr><td><code>validate_assignment</code></td><td>re-run validators when a field is set after construction</td></tr>
+    <tr><td><code>strict</code></td><td>turn off type coercion entirely</td></tr>
+  </tbody>
+</table>
+
+<p><code>extra="forbid"</code> deserves a moment, because the default is the opposite. By default an
+unknown field is silently dropped &mdash; which is what makes it safe to leave <code>total</code>
+off a booking request, as the last lesson showed. Turning it on instead means a typo like
+<code>{"guest": 2}</code> for <code>guests</code> becomes a 422 rather than a silently-defaulted
+value. Both are defensible: ignoring is friendlier to clients and to versioning, forbidding catches
+mistakes sooner. Pick per model, and prefer forbidding on internal APIs where both ends ship
+together.</p>
+
+<h2>Controlling what comes out</h2>
+
+<p>Serialisation has its own switches, and the defaults are not always what you want.</p>
+
+<pre class="language-python"><code class="language-python">booking.model_dump()
+# {'public_id': UUID('...'), 'check_in': date(2027, 3, 1), 'nightly_rate': Decimal('189.00')}
+
+booking.model_dump(mode="json")
+# {'public_id': '...', 'check_in': '2027-03-01', 'nightly_rate': '189.00'}
+
+booking.model_dump(by_alias=True)
+# {'publicId': ..., 'checkIn': ..., 'nightlyRate': ...}
+
+booking.model_dump(exclude_none=True)
+# omits every field that is currently None</code></pre>
+
+<p><code>model_dump()</code> gives Python objects; <code>mode="json"</code> gives JSON-safe ones.
+Forgetting that is the usual cause of "Object of type UUID is not JSON serializable" when writing
+to a queue or a cache by hand. FastAPI does the right thing automatically on a response, so this
+only bites off the response path.</p>
+
+<p><strong><code>by_alias=True</code> is not the default</strong>, which surprises people who set up
+an alias generator. Inside your own code the snake_case names are what you want; the camelCase form
+is for the wire, and FastAPI applies it for you when serialising a response.</p>
+
+<p>Two per-route switches are worth knowing. <code>response_model_exclude_none=True</code> drops
+nulls from the payload, which can shrink a list response substantially. And
+<code>response_model_exclude={"host"}</code> removes a field for one endpoint without needing a
+second model &mdash; useful, but reach for a real model once you are excluding more than one thing,
+because an exclusion list is invisible from the model itself.</p>
+
+<h2>Validation is not authorization</h2>
+
+<p>Worth stating plainly, because the two get conflated. Pydantic answers "is this well formed?"
+It cannot answer "is this person allowed?" or "is this true right now?"</p>
+
+<p>StayHub's booking request validates that check-out is after check-in. It cannot validate that
+the dates are free, that the guest is not the host, or that the listing is published &mdash; those
+need the database, and they live in the service layer:</p>
+
+<pre class="language-python"><code class="language-python">    def _validate_stay(self, prop: Property, check_in: date, check_out: date, guests: int) -&gt; None:
+        today = datetime.now(UTC).date()
+        if check_in &lt; today:
+            raise ApiException("Check-in cannot be in the past.")
+        if check_out &lt;= check_in:
+            raise ApiException("Check-out must be after check-in.")
+        if guests &gt; prop.max_guests:
+            raise ApiException(f"This place sleeps up to {prop.max_guests} guests.")</code></pre>
+
+<p>The check-out rule appears in both places, and that duplication is deliberate rather than sloppy:
+the model rejects it earlier and more cheaply, and the service is the rule that holds no matter who
+calls it. A schema is a filter on shape; a service is the authority on meaning.</p>
+
+<h2>Using pydantic away from the request</h2>
+
+<p>Models are not only for endpoints, and two uses pay for themselves immediately.</p>
+
+<p><strong>Validating something that is not a model.</strong> <code>TypeAdapter</code> applies the
+same machinery to any type &mdash; a bare list, a dict, a union &mdash; which is what you want when
+parsing a config file or a third-party payload:</p>
+
+<pre class="language-python"><code class="language-python">from pydantic import TypeAdapter
+
+adapter = TypeAdapter(list[PropertyImageInput])
+images = adapter.validate_python(raw_from_somewhere)   # a real list[PropertyImageInput]</code></pre>
+
+<p><strong>Typed settings.</strong> <code>pydantic-settings</code> reads environment variables
+through the same validation, so a misspelt variable is a startup error rather than a
+<code>None</code> that surfaces three layers deep at request time. StayHub's whole configuration is
+one model, and lesson 4 covers it properly.</p>
+
+<h2>The mistakes worth not making</h2>
+
+<ul>
+  <li><strong>Returning the ORM object instead of a response model.</strong> Every column you add
+      later is published the day you add it.</li>
+  <li><strong><code>float</code> for money.</strong> Use <code>Decimal</code>, all the way to the
+      database column.</li>
+  <li><strong>Unbounded strings and numbers.</strong> Every <code>str</code> wants a
+      <code>max_length</code>; every <code>int</code> wants a range.</li>
+  <li><strong><code>str | None</code> without a default</strong>, when you meant optional.</li>
+  <li><strong>Reaching for a validator when a constraint would do.</strong> <code>ge=1</code> is
+      in the OpenAPI schema; a hand-written check is not.</li>
+  <li><strong>Treating validation as authorization.</strong> A schema cannot know who is asking.</li>
+</ul>
+
+<p>Next: <strong>project structure</strong> &mdash; where the models, services and repositories in
+this lesson actually live, and the rules that keep them from collapsing into each other.</p>

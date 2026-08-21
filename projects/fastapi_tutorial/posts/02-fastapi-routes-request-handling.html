@@ -1,0 +1,512 @@
+<p>A route's job is to turn an HTTP request into typed Python arguments. FastAPI does that from the
+function signature alone &mdash; where a value comes from, what type it should be, whether it is
+required, and what makes it invalid are all declared in the parameter list. This lesson covers the
+handful of declarations that between them handle almost everything.</p>
+
+<h2>Where each parameter comes from</h2>
+
+<p>FastAPI decides what a parameter <em>is</em> by a short set of rules, applied in order:</p>
+
+<ol>
+  <li>The name matches a <code>{placeholder}</code> in the path &rarr; <strong>path parameter</strong>.</li>
+  <li>The type is a pydantic model &rarr; <strong>request body</strong>.</li>
+  <li>The type is a special one FastAPI knows &mdash; <code>Request</code>,
+      <code>BackgroundTasks</code>, <code>UploadFile</code> &rarr; that thing.</li>
+  <li>It has a <code>Depends(...)</code> &rarr; <strong>dependency</strong> (lesson 5).</li>
+  <li>Anything else &rarr; <strong>query parameter</strong>.</li>
+</ol>
+
+<p>That inference is why the simple cases need no ceremony, and why the surprising cases surprise
+people. Rule 5 in particular is a catch-all: misspell a path placeholder and your path parameter
+silently becomes a required query parameter, which shows up as a 422 complaining about something
+you never wrote.</p>
+
+<h2>Path parameters</h2>
+
+<p>A path parameter identifies <em>which</em> resource. It is never optional &mdash; it is part of
+the URL &mdash; and its annotation does real conversion:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/{public_id}", response_model=PropertyResponse)
+def get_property(public_id: UUID, db: DbSession) -&gt; PropertyResponse:
+    return PropertyResponse.model_validate(PropertyService(db).get_for_public(public_id))</code></pre>
+
+<p>That is StayHub's listing endpoint. <code>public_id: UUID</code> means the function receives a
+real <code>uuid.UUID</code>, and anything that is not a UUID never reaches it:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:8000/api/v1/properties/not-a-uuid | head -c 130</code></pre>
+
+<pre class="language-json"><code class="language-json">{"detail":[{"type":"uuid_parsing","loc":["path","public_id"],
+  "msg":"Input should be a valid UUID, invalid character: expected an optional
+  prefix of `urn:uuid:` followed by [0-9a-fA-F-], found `n` at 1"}]}</code></pre>
+
+<p>Worth noticing that the API exposes a UUID rather than the database's integer primary key.
+StayHub stores both: a <code>BIGINT</code> for fast internal joins and a <code>public_id</code>
+UUID that is the only id ever sent outside the process. A sequential integer in a URL tells the
+world how many rows you have and invites walking <code>/properties/1</code>,
+<code>/properties/2</code>.</p>
+
+<h3>The ordering trap</h3>
+
+<p>Routes are matched <strong>in declaration order</strong>, first match wins. That single fact
+causes a bug almost everyone hits once. Here is the real order in StayHub, abbreviated:</p>
+
+<pre class="language-python"><code class="language-python">router = APIRouter(prefix="/properties", tags=["properties"])
+
+
+@router.get("/amenities", response_model=list[AmenityResponse])
+def list_amenities(db: DbSession) -&gt; list[AmenityResponse]:
+...
+@router.get("/mine", response_model=list[PropertyResponse])
+def my_listings(host: HostUser, db: DbSession) -&gt; list[PropertyResponse]:
+...
+@router.get("/{public_id}", response_model=PropertyResponse)
+def get_property(public_id: UUID, db: DbSession) -&gt; PropertyResponse:</code></pre>
+
+<p><code>/amenities</code> and <code>/mine</code> are declared <strong>before</strong>
+<code>/{public_id}</code>, and that is load-bearing. Move the parameterised one up and it matches
+first for every request, so <code>GET /properties/mine</code> is read as "the property whose
+<code>public_id</code> is <code>mine</code>". The UUID conversion then fails and the endpoint
+answers 422 &mdash; for a route that exists and works.</p>
+
+<p><strong>Rule: declare literal paths before parameterised ones at the same level.</strong> The
+symptom when you get it wrong is a validation error on the wrong endpoint, which sends people
+looking in entirely the wrong file.</p>
+
+<h2>Query parameters</h2>
+
+<p>Query parameters are for filtering, sorting and paginating a collection &mdash; the modifiers on
+a request, not its identity. Anything with a default is optional:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("", response_model=SearchResponse)
+def search(
+    q: str | None = Query(default=None, max_length=200),
+    check_in: date | None = Query(default=None, alias="checkIn"),
+    check_out: date | None = Query(default=None, alias="checkOut"),
+    guests: int | None = Query(default=None, ge=1, le=50),
+    min_price: Decimal | None = Query(default=None, ge=0, alias="minPrice"),
+    max_price: Decimal | None = Query(default=None, ge=0, alias="maxPrice"),
+    property_type: str | None = Query(default=None, alias="propertyType"),
+    room_type: str | None = Query(default=None, alias="roomType"),
+    amenities: list[str] = Query(default=[]),
+    page: int = Query(default=1, ge=1, le=100),
+    page_size: int = Query(default=20, ge=1, le=100, alias="pageSize"),
+    sort: str = Query(default="relevance", pattern="^(relevance|price_asc|price_desc|rating)$"),
+) -&gt; SearchResponse:</code></pre>
+
+<p>That is StayHub's search endpoint, and nearly every query-parameter feature is in it.</p>
+
+<p><strong><code>alias</code> is the snake_case/camelCase boundary.</strong> Python wants
+<code>page_size</code>; a JavaScript client sends <code>pageSize</code>. The alias is what the wire
+uses, the parameter name is what the function uses, and neither side has to bend. Without it every
+frontend call would carry <code>page_size</code>, which reads wrong in TypeScript.</p>
+
+<p><strong>Constraints are enforcement, not documentation.</strong> <code>ge=1, le=100</code> on
+<code>page_size</code> is what stops a caller asking for a million rows. Pagination without an
+upper bound protects nothing &mdash; <code>?pageSize=1000000</code> is a full table scan
+serialised into memory:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s -o /dev/null -w '%{http_code}\n' 'localhost:8000/api/v1/search?pageSize=100000'</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">422</code></pre>
+
+<p><strong><code>pattern</code> handles small closed sets.</strong> <code>sort</code> accepts four
+values and a regex is enough; it also lands in the OpenAPI schema so the docs list them. For a
+larger or more meaningful set, use an <code>Enum</code> &mdash; FastAPI renders it as a dropdown and
+you get a Python type rather than a string.</p>
+
+<p><strong><code>amenities: list[str]</code> is a repeated parameter</strong>, not a comma-joined
+string:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s 'localhost:8000/api/v1/search?amenities=wifi&amp;amenities=parking&amp;pageSize=1' \
+  | head -c 80</code></pre>
+
+<p>Repeating the key needs no parsing and no decision about what to do with a value containing a
+comma. Splitting a string is the version that breaks the first time somebody has an amenity called
+"Washer, dryer".</p>
+
+<h3>Say what a parameter does not do</h3>
+
+<p>Two parameters in that signature are accepted and then ignored, and the endpoint says so
+outright:</p>
+
+<pre class="language-python"><code class="language-python">"""Search published listings.
+
+⚠️ `checkIn` / `checkOut` are accepted but do NOT filter results yet. Date availability lives
+in Postgres (the bookings table), not in the index, so filtering on it here would mean either
+denormalising every booking into the document or a second query per hit. The listing page
+checks availability properly. Saying so out loud beats a filter that quietly does nothing.
+"""</code></pre>
+
+<p>That docstring is rendered into the public documentation. A parameter that looks like it filters
+and does not is a bug report waiting to happen; admitting it costs three lines and saves an
+afternoon.</p>
+
+<h2>Annotated, and why it is the form to learn</h2>
+
+<p>There are two ways to attach metadata to a parameter. The older one puts it in the default
+slot:</p>
+
+<pre class="language-python"><code class="language-python">def search(q: str | None = Query(default=None, max_length=200)): ...</code></pre>
+
+<p>The newer one puts it in the type:</p>
+
+<pre class="language-python"><code class="language-python">def search(q: Annotated[str | None, Query(max_length=200)] = None): ...</code></pre>
+
+<p>Both work. The second is better for a reason that only shows up outside FastAPI: in the first
+form, the function's default value <em>is a <code>Query</code> object</em>. Call it directly from a
+test or another function and <code>q</code> is not <code>None</code>, it is a
+<code>Query</code> instance, and the failure is baffling. With <code>Annotated</code> the default is
+a real <code>None</code> and the function behaves like an ordinary Python function.</p>
+
+<p><code>Annotated</code> also composes. Because it is just a type, it can be given a name and
+reused &mdash; which is how StayHub's dependencies read as one word each:</p>
+
+<pre class="language-python"><code class="language-python">DbSession = Annotated[Session, Depends(get_db)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
+HostUser = Annotated[User, Depends(require_host)]</code></pre>
+
+<p>Those three names then appear in every signature in the application. Lesson 5 is entirely about
+what they do.</p>
+
+<h3>Constraining a path parameter</h3>
+
+<p><code>Path()</code> is <code>Query()</code>'s counterpart and takes the same arguments. It is
+worth using whenever the identifier has a range:</p>
+
+<pre class="language-python"><code class="language-python">from fastapi import Path
+from typing import Annotated
+
+
+@app.get("/pages/{page_number}")
+def get_page(page_number: Annotated[int, Path(ge=1, le=10_000)]):
+    ...</code></pre>
+
+<p>Without the bound, <code>/pages/-5</code> and <code>/pages/999999999</code> both reach your
+function and become somebody else's problem one layer down. With it they are 422s that never touch
+your code.</p>
+
+<h3>Enums beat regexes for closed sets</h3>
+
+<p>The <code>sort</code> parameter above uses a <code>pattern</code>, which is fine for four values.
+Once a set has meaning in the domain, an <code>Enum</code> is better:</p>
+
+<pre class="language-python"><code class="language-python">class BookingStatus(StrEnum):
+    PENDING = "PENDING"      # dates held, not yet paid
+    CONFIRMED = "CONFIRMED"  # paid
+    CANCELLED = "CANCELLED"
+    COMPLETED = "COMPLETED"</code></pre>
+
+<p>Used as a parameter type, that gives you three things a regex does not: the function receives a
+real <code>BookingStatus</code> rather than a string, the OpenAPI schema lists the allowed values so
+<code>/docs</code> renders a dropdown, and adding a value is one line in one place. StayHub's admin
+listing takes exactly this:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/bookings", response_model=Page[AdminBookingRow])
+def list_bookings(
+    _: AdminUser,
+    db: DbSession,
+    page: PageQuery,
+    status_filter: BookingStatus | None = Query(default=None, alias="status"),
+) -&gt; Page[AdminBookingRow]:</code></pre>
+
+<pre class="language-bash"><code class="language-bash">curl -s -o /dev/null -w '%{http_code}
+' -H "Authorization: Bearer $TOKEN"   'localhost:8000/api/v1/admin/bookings?status=NOPE'</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">422</code></pre>
+
+<p>Note <code>alias="status"</code> again, for a different reason this time: <code>status</code> is
+already the name of the FastAPI module imported at the top of that file, so the parameter is called
+<code>status_filter</code> in Python and <code>status</code> on the wire.</p>
+
+<h2>Request bodies</h2>
+
+<p>A parameter annotated with a pydantic model is the body. There is no decorator and no
+<code>Body()</code> needed:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
+def create_booking(
+    payload: BookingCreateRequest, user: CurrentUser, db: DbSession, background: BackgroundTasks
+) -&gt; BookingResponse:</code></pre>
+
+<p>Four parameters, four different sources: <code>payload</code> is the JSON body,
+<code>user</code> and <code>db</code> are dependencies, and <code>background</code> is a framework
+object. The signature is the whole wiring.</p>
+
+<p>The important design point is what <code>BookingCreateRequest</code> does <em>not</em> contain:</p>
+
+<pre class="language-python"><code class="language-python">class BookingCreateRequest(QuoteRequest):
+    """Same fields as a quote &mdash; deliberately. The client never sends a price.
+
+    ⚠️ There is no `total` here and there never should be. The server recomputes every figure;
+    a client-sent price is an invitation to book a $400 stay for $4.
+    """</code></pre>
+
+<p>If a field is not on the request model, FastAPI ignores it when it arrives. Sending
+<code>{"total": 4.00}</code> does not raise and does not set anything &mdash; the field simply does
+not exist. Leaving prices off the request model is therefore not a validation rule you might forget
+to check; it is a shape that cannot express the attack.</p>
+
+<h3>More than one body parameter</h3>
+
+<p>Declare two models and FastAPI nests them under their parameter names rather than merging
+them:</p>
+
+<pre class="language-python"><code class="language-python">@app.post("/listings/{listing_id}/review")
+def review(listing_id: int, rating: Rating, author: Author):
+    ...</code></pre>
+
+<pre class="language-json"><code class="language-json">{"rating": {"score": 5}, "author": {"name": "Sam"}}</code></pre>
+
+<p>That is occasionally what you want and usually a sign the two should be one model. The related
+surprise is the single-model case: one body parameter is <em>not</em> nested, so the JSON is the
+model's fields at the top level. If you want the nested shape with only one model, ask for it with
+<code>Body(embed=True)</code>.</p>
+
+<p>A scalar in the body needs <code>Body()</code> explicitly, because rule 5 would otherwise make
+it a query parameter:</p>
+
+<pre class="language-python"><code class="language-python">@app.post("/listings/{listing_id}/note")
+def add_note(listing_id: int, note: Annotated[str, Body()]):
+    ...</code></pre>
+
+<h3>Form data</h3>
+
+<p>HTML form posts are <code>application/x-www-form-urlencoded</code>, not JSON, and need their own
+marker:</p>
+
+<pre class="language-python"><code class="language-python">from fastapi import Form
+
+
+@app.post("/login")
+def login(username: Annotated[str, Form()], password: Annotated[str, Form()]):
+    ...</code></pre>
+
+<p>This requires <code>python-multipart</code> to be installed &mdash; and if it is not, the error
+arrives at <em>import</em> time rather than when the endpoint is called, which is the friendlier of
+the two options. The same package handles file uploads, covered in lesson 10.</p>
+
+<p><strong>You cannot mix <code>Form</code> and a JSON body in one endpoint.</strong> A request has
+one body and one encoding. StayHub takes JSON everywhere, including for login, because its clients
+are React apps rather than browser forms.</p>
+
+<h2>Headers and cookies</h2>
+
+<p>Both work like query parameters with their own marker. Headers need the alias, because HTTP
+header names contain hyphens and Python identifiers cannot:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/webhook", response_model=Message, include_in_schema=False)
+async def stripe_webhook(
+    request: Request,
+    db: DbSession,
+    stripe_signature: str = Header(default="", alias="Stripe-Signature"),
+) -&gt; Message:</code></pre>
+
+<p>That is StayHub's Stripe webhook. Three things in one signature are worth copying:
+<code>Header(alias=...)</code> for the hyphenated name; <code>request: Request</code> to reach the
+<strong>raw</strong> body, because a signature must be verified against the exact bytes Stripe sent
+rather than a re-serialised parse of them; and <code>include_in_schema=False</code> to keep the
+endpoint out of the public documentation.</p>
+
+<p>Cookies are the same shape with <code>Cookie(...)</code>. StayHub uses none &mdash; it is a
+token API consumed by React apps, so credentials travel in the <code>Authorization</code> header.</p>
+
+<h2>Status codes</h2>
+
+<p>The default is 200 for everything, which is wrong often enough to be worth fixing deliberately.
+Set it on the decorator:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("", response_model=PropertyResponse, status_code=status.HTTP_201_CREATED)
+def create_property(
+    payload: PropertyCreateRequest, host: HostUser, db: DbSession
+) -&gt; PropertyResponse:
+    """Create a listing. It starts as a DRAFT &mdash; publishing is a separate call."""
+    return PropertyResponse.model_validate(PropertyService(db).create(host, payload))</code></pre>
+
+<p>Use the <code>status</code> constants rather than the integers. <code>HTTP_201_CREATED</code>
+survives being read aloud in a review in a way that <code>201</code> does not, and a typo in a
+constant is an <code>AttributeError</code> rather than a wrong response.</p>
+
+<p>The ones worth knowing:</p>
+
+<table>
+  <thead><tr><th>Code</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>200 OK</td><td>a successful GET, PATCH, or action that returns the thing</td></tr>
+    <tr><td>201 Created</td><td>a POST that created a resource</td></tr>
+    <tr><td>204 No Content</td><td>success with nothing to say &mdash; often a DELETE</td></tr>
+    <tr><td>400 Bad Request</td><td>the request is wrong in a way you detected</td></tr>
+    <tr><td>401 Unauthorized</td><td>not signed in &mdash; "unauthenticated", despite the name</td></tr>
+    <tr><td>403 Forbidden</td><td>signed in, not allowed</td></tr>
+    <tr><td>404 Not Found</td><td>no such thing &mdash; or deliberately, someone else's thing</td></tr>
+    <tr><td>409 Conflict</td><td>well formed, but the world says no &mdash; those dates are taken</td></tr>
+    <tr><td>422 Unprocessable</td><td>failed validation &mdash; FastAPI's own default</td></tr>
+  </tbody>
+</table>
+
+<p>StayHub returns <strong>404 rather than 403</strong> for a resource somebody else owns. A 403
+confirms that the id exists, and on a guessable identifier that is a slow enumeration of the table.
+The exception is the admin API, which returns 403, because its existence is documented and not
+worth hiding.</p>
+
+<p>409 is the one people miss. "Those dates are no longer available" is not a malformed request and
+not a permissions problem &mdash; it is a valid request the current state of the world refuses.
+Lesson 8 covers how StayHub turns a database constraint violation into one.</p>
+
+<h2>Reaching for the request itself</h2>
+
+<p>Occasionally the declarative approach is not enough and you need the raw request &mdash; the
+unparsed body, the client address, an arbitrary header. Ask for it by type:</p>
+
+<pre class="language-python"><code class="language-python">    payload = await request.body()
+    try:
+        event = PaymentService(db).handle_webhook(payload, stripe_signature)
+    except ApiException:
+        raise</code></pre>
+
+<p><code>await request.body()</code> returns the exact bytes received. For the Stripe webhook that
+is not a convenience but a requirement: the signature covers the literal payload, so parsing it to
+JSON and re-serialising it produces a different byte string and every signature check fails.</p>
+
+<p>Note the route must be <code>async def</code> to await that. Reaching for
+<code>request</code> is a small escape hatch and should feel like one &mdash; if several endpoints
+need it, that is usually a dependency waiting to be written.</p>
+
+<h2>What happens to what you return</h2>
+
+<p>The other half of a route is the response, and FastAPI is doing more than
+<code>json.dumps</code> on the way out.</p>
+
+<p>Return a <code>dict</code> or a <code>list</code> and it is encoded directly. Return a pydantic
+model and it is serialised by that model. Return something neither &mdash; a SQLAlchemy row, a
+<code>Decimal</code>, a <code>datetime</code>, a <code>UUID</code> &mdash; and
+<code>jsonable_encoder</code> converts it first. That last part is why this works at all:</p>
+
+<pre class="language-python"><code class="language-python">@router.get("/mine", response_model=list[PropertyResponse])
+def my_listings(host: HostUser, db: DbSession) -&gt; list[PropertyResponse]:
+    return [PropertyResponse.model_validate(p) for p in PropertyService(db).list_mine(host)]</code></pre>
+
+<p><code>Decimal("189.00")</code> has no JSON equivalent. FastAPI renders it as the string
+<code>"189.00"</code> rather than the float <code>189.0</code>, and that is the correct choice for
+money &mdash; a float cannot hold <code>0.1 + 0.2</code> exactly and a booking total is the last
+place you want that. Clients parse it as a decimal string. It surprises people expecting a number,
+so it is worth knowing before a frontend does arithmetic on it.</p>
+
+<p>Two escape hatches. Returning a <code>Response</code> (or <code>JSONResponse</code>) directly
+skips <code>response_model</code> and the encoder entirely &mdash; useful when you need exact
+control over the bytes or the headers, and a trap if you expected filtering to still happen. And
+<code>status_code</code> can be set per-call rather than per-route by taking a
+<code>Response</code> parameter and assigning to it, which is how one endpoint answers 200 or 201
+depending on whether it created something.</p>
+
+<p>The bigger topic &mdash; what <code>response_model</code> hides, and why it is a security
+boundary rather than a formatting convenience &mdash; is lesson 7.</p>
+
+<h2>Reading a 422</h2>
+
+<p>Validation errors are the responses you will see most while building, so it pays to be fluent in
+them. Every entry has the same three fields:</p>
+
+<pre class="language-json"><code class="language-json">{"detail":[{"type":"greater_than_equal","loc":["body","guests"],
+  "msg":"Input should be greater than or equal to 1","input":0,
+  "ctx":{"ge":1}}]}</code></pre>
+
+<p><code>loc</code> is the path to the offending value and its <strong>first element names the
+source</strong> &mdash; <code>"body"</code>, <code>"query"</code>, <code>"path"</code>,
+<code>"header"</code>, <code>"cookie"</code>. That first element is the fastest debugging tool in
+the framework. If you expected a path parameter and <code>loc</code> says
+<code>["query", "listing_id"]</code>, the placeholder in your route string does not match the
+parameter name &mdash; rule 5 from the top of this lesson quietly reclassified it.</p>
+
+<p>For nested models <code>loc</code> keeps going: <code>["body", "images", 2, "url"]</code> is the
+third image's URL. That structure is machine-readable, which is the point &mdash; lesson 8 flattens
+it into <code>field &rarr; message</code> so a form can render each error next to its input.</p>
+
+<h3>Trailing slashes</h3>
+
+<p>One small behaviour that causes confusion: by default, <code>/properties</code> and
+<code>/properties/</code> are different routes, and requesting the wrong one gets a
+<strong>307 redirect</strong> to the right one. Most HTTP clients follow it silently, so it usually
+works &mdash; but a redirect on a POST can drop the body in some clients, and a redirect that
+crosses from HTTPS to HTTP behind a misconfigured proxy is worse.</p>
+
+<p>Pick one convention and declare routes that way. StayHub declares the collection endpoint as
+<code>""</code> rather than <code>"/"</code>, so with the router prefix the URL is
+<code>/api/v1/properties</code> with no trailing slash, matching every other endpoint.</p>
+
+<h2>Splitting it up with APIRouter</h2>
+
+<p>A single <code>main.py</code> stops working somewhere around fifteen endpoints.
+<code>APIRouter</code> is a router you attach endpoints to and mount later:</p>
+
+<pre class="language-python"><code class="language-python">api_router = APIRouter()
+api_router.include_router(auth.router)
+api_router.include_router(properties.router)
+api_router.include_router(bookings.router)
+api_router.include_router(payments.router)
+api_router.include_router(search.router)
+api_router.include_router(uploads.router)
+api_router.include_router(admin.router)</code></pre>
+
+<p>Each module owns its own prefix and tags, so a file is self-describing and moving it changes
+nothing else. Then the whole tree mounts once, under a version:</p>
+
+<pre class="language-python"><code class="language-python">app.include_router(api_router, prefix=settings.api_v1_prefix)</code></pre>
+
+<p>Versioning the prefix from day one is nearly free; retrofitting it once clients exist is not.
+<code>/api/v1</code> costs you one line now and buys the ability to run <code>/api/v2</code>
+alongside it later without breaking anybody.</p>
+
+<p>Prefixes compose, which is worth knowing before it confuses you: the router declares
+<code>prefix="/properties"</code>, the mount adds <code>/api/v1</code>, and the endpoint declares
+<code>"/{public_id}"</code> &mdash; so the URL is
+<code>/api/v1/properties/{public_id}</code>. A prefix must start with <code>/</code> and must not
+end with one, and FastAPI raises at import time if you get that wrong rather than serving a broken
+path.</p>
+
+<h3>Declaring something once for a whole router</h3>
+
+<p><code>APIRouter</code> takes most of what a decorator takes, applied to every endpoint under it.
+StayHub's admin router is the clearest case &mdash; every endpoint requires staff, and rather than
+repeating that it could be declared once:</p>
+
+<pre class="language-python"><code class="language-python">router = APIRouter(prefix="/admin", tags=["admin"])</code></pre>
+
+<pre class="language-python"><code class="language-python"># the same router, with the requirement hoisted
+router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin)],
+    responses={403: {"model": ErrorBody, "description": "Staff access only"}},
+)</code></pre>
+
+<p><code>dependencies=[...]</code> runs for every endpoint but injects nothing &mdash; it is for
+checks whose <em>return value</em> you do not need. <code>responses={...}</code> documents a status
+code the endpoint can produce that FastAPI cannot infer.</p>
+
+<p>StayHub uses the first form and repeats <code>_: AdminUser</code> in each signature instead. That
+is a deliberate trade: the requirement is then visible in the function you are reading rather than
+forty lines away at the top of the file, which matters more for a security rule than the repetition
+costs. Hoisting is the better call when the router is large or the dependency is uncontroversial
+&mdash; a rate limiter, a request logger.</p>
+
+<h2>The short version</h2>
+
+<table>
+  <thead><tr><th>You want</th><th>Declare</th></tr></thead>
+  <tbody>
+    <tr><td>Which resource</td><td><code>{id}</code> in the path, <code>id: UUID</code> in the signature</td></tr>
+    <tr><td>A filter or a page</td><td>a plain parameter with a default</td></tr>
+    <tr><td>Bounds on either</td><td><code>Annotated[int, Query(ge=1, le=100)]</code></td></tr>
+    <tr><td>A different name on the wire</td><td><code>alias="pageSize"</code></td></tr>
+    <tr><td>A closed set of values</td><td>an <code>Enum</code> as the type</td></tr>
+    <tr><td>Repeated values</td><td><code>list[str]</code></td></tr>
+    <tr><td>Data being created</td><td>a pydantic model parameter</td></tr>
+    <tr><td>A hyphenated header</td><td><code>Header(alias="Stripe-Signature")</code></td></tr>
+    <tr><td>The raw bytes</td><td><code>request: Request</code> and <code>await request.body()</code></td></tr>
+    <tr><td>A created resource</td><td><code>status_code=status.HTTP_201_CREATED</code></td></tr>
+  </tbody>
+</table>
+
+<p>Next: <strong>pydantic models and validation</strong> &mdash; the layer doing the actual work
+underneath every signature in this lesson, including validators, computed fields, and keeping the
+model you store separate from the model you return.</p>

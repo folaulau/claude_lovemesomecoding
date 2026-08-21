@@ -1,0 +1,417 @@
+<p>The questions a FastAPI role actually asks, answered against the seventeen lessons before this
+one. Short answers with the reasoning attached &mdash; because in an interview the reasoning is what
+is being assessed, and the answer is just the way in.</p>
+
+<h2>Fundamentals</h2>
+
+<p><strong>What does FastAPI actually do for you?</strong></p>
+
+<p>It reads your type hints and uses them for three jobs at once: validating and converting the
+request, serialising the response, and generating an OpenAPI document with interactive
+documentation. One annotation, three uses. Everything else &mdash; routing, dependency injection,
+middleware &mdash; is built on Starlette underneath.</p>
+
+<p><strong>Why is it fast?</strong></p>
+
+<p>Two reasons, neither of which is the one people give. Starlette is a thin ASGI layer, and
+pydantic v2's validation core is compiled Rust. It is <em>not</em> fast because it is async
+&mdash; async removes waiting, not work.</p>
+
+<p>The follow-up worth volunteering: framework overhead is almost never why an API is slow. One
+unindexed query or one N+1 in a list endpoint costs more than the framework will spend all day.</p>
+
+<p><strong>What is ASGI, and why does it matter?</strong></p>
+
+<p>WSGI is a function that takes a request and returns a response &mdash; one request occupies one
+worker for its whole life, and the protocol has no vocabulary for anything arriving later. ASGI is
+a coroutine over <code>(scope, receive, send)</code>, so responses are streams of events. That is
+what makes WebSockets, server-sent events and streaming ordinary rather than special.</p>
+
+<h2>async def or def</h2>
+
+<p><strong>What is the difference?</strong></p>
+
+<p>A <code>def</code> route is dispatched to a threadpool, so blocking in it is safe. An
+<code>async def</code> route runs on the event loop, so blocking in it stalls every other request
+in the process.</p>
+
+<p><strong>So which should I use?</strong></p>
+
+<p>If the handler does not <code>await</code> anything, write <code>def</code>. An
+<code>async def</code> that never awaits is strictly worse than the same function written
+<code>def</code> &mdash; same duration, and it blocks everything else while doing it.</p>
+
+<p data-antipattern><strong>What is the classic mistake?</strong></p>
+
+<pre class="language-python"><code class="language-python">@app.get("/listings")
+async def list_listings(db: Session = Depends(get_db)):
+    return db.execute(select(Property).limit(20)).scalars().all()   # blocks the loop</code></pre>
+
+<p>Synchronous SQLAlchemy inside <code>async def</code>. It works perfectly in development &mdash;
+one request at a time, a 2&nbsp;ms query &mdash; and degrades under concurrency in a way that looks
+like a database problem.</p>
+
+<p><strong>Is async always faster?</strong></p>
+
+<p>No, and this is worth having a number for. Eight independent aggregate queries against a local
+Postgres, measured:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">8 serial      median   7.9ms
+8 concurrent  median  19.8ms      <- 2.5x SLOWER</code></pre>
+
+<p>Async charges a fixed overhead and pays back in proportion to waiting. Break-even is roughly
+1&ndash;2&nbsp;ms of wait per call &mdash; below it you pay for nothing, above it the returns are
+large. A local database is below the line; an S3 upload or a third-party API is far above it.</p>
+
+<p><strong>How big is the threadpool?</strong></p>
+
+<p>Forty threads by default. Forty concurrent <code>def</code> requests occupy all of them and the
+forty-first waits for a thread rather than for the database. It becomes the bottleneck when
+handlers are slow for non-database reasons.</p>
+
+<h2>Dependency injection</h2>
+
+<p><strong>What does <code>Depends</code> do?</strong></p>
+
+<p>Calls a function before your route and passes the result. The dependency's own parameters become
+part of the route's signature &mdash; so a pagination dependency adds <code>?page=</code> and
+<code>?pageSize=</code> to every route that uses it, including in the documentation.</p>
+
+<p><strong>What does <code>yield</code> add?</strong></p>
+
+<p>Teardown. Everything before <code>yield</code> is setup, the value is injected, everything after
+runs when the response is done. It is how a database session is guaranteed to close even when the
+route raises &mdash; hence <code>try/finally</code>.</p>
+
+<p><strong>Are dependencies re-run if two things need them?</strong></p>
+
+<p>No &mdash; cached per request, keyed on the callable and its arguments. That is not an
+optimisation, it is what makes the pattern usable: without it a route depending on both the user
+and the session would get two sessions in two transactions.</p>
+
+<p><strong>How do you test code that uses them?</strong></p>
+
+<pre class="language-python"><code class="language-python">    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: admin</code></pre>
+
+<p>The trap: the dict is keyed on the <em>function object</em>. Import it from a different module
+than the app did and the override silently does nothing &mdash; no error, the key just never
+matches. And always clear it, because the dict lives on the module-level app and leaks between test
+files.</p>
+
+<h2>Requests and responses</h2>
+
+<p><strong>How does FastAPI decide where a parameter comes from?</strong></p>
+
+<p>In order: a name matching a <code>{placeholder}</code> is a path parameter; a pydantic model is
+the body; a known type like <code>Request</code> or <code>BackgroundTasks</code> is that thing;
+anything with <code>Depends</code> is a dependency; everything else is a query parameter.</p>
+
+<p>The last one is a catch-all, which is why misspelling a path placeholder silently turns your path
+parameter into a required query parameter &mdash; a 422 about something you never wrote.</p>
+
+<p data-antipattern><strong>What is wrong with this?</strong></p>
+
+<pre class="language-python"><code class="language-python">@router.get("/{public_id}")
+def get_property(public_id: UUID): ...
+
+
+@router.get("/mine")
+def my_listings(host: HostUser): ...</code></pre>
+
+<p>Routes match in declaration order, first match wins, so <code>/mine</code> is read as a property
+whose <code>public_id</code> is <code>"mine"</code> &mdash; and the UUID conversion fails with a 422
+on an endpoint that exists and works. Literal paths must be declared before parameterised ones.</p>
+
+<p><strong>Why <code>Annotated</code> rather than a default value?</strong></p>
+
+<pre class="language-python"><code class="language-python">def search(q: str | None = Query(default=None, max_length=200)): ...     # older
+def search(q: Annotated[str | None, Query(max_length=200)] = None): ... # better</code></pre>
+
+<p>In the first, the function's actual default <em>is</em> a <code>Query</code> object, so calling it
+directly from a test gives you a <code>Query</code> instead of <code>None</code>. With
+<code>Annotated</code> the default is a real <code>None</code> and the function behaves like an
+ordinary Python function &mdash; and the type can be given a name and reused.</p>
+
+<p><strong>What is <code>response_model</code> for?</strong></p>
+
+<p>Filtering. It is the difference between a new column being private by default and public the
+moment somebody adds it. If you return the ORM object directly, you publish the password hash the
+day the column appears.</p>
+
+<h2>Data</h2>
+
+<p><strong>Why separate pydantic schemas from ORM models?</strong></p>
+
+<p>Because <code>response_model</code> is a security boundary. A field not on the model does not
+appear in the response, so a new column is private until somebody exposes it &mdash; rather than
+public the moment it is added. Return the ORM object directly and you publish the password hash the
+day you add it.</p>
+
+<p><strong>Where does a transaction begin and end?</strong></p>
+
+<p>The service opens it implicitly and commits it. Repositories <code>flush()</code> and never
+<code>commit()</code>, because only the caller knows the boundary &mdash; "create a booking AND its
+payment, or neither" spans two repositories.</p>
+
+<p><strong>What is the N+1 problem?</strong></p>
+
+<p>Relationships load lazily, so reading <code>booking.property</code> in a loop over twenty
+bookings is twenty-one queries. Fix it with <code>joinedload</code> for many-to-one and
+<code>selectinload</code> for one-to-many &mdash; the second avoids multiplying parent rows by
+children.</p>
+
+<p><strong>How do you stop two users booking the same dates?</strong></p>
+
+<p>Not in application code. Two requests can both pass an availability check before either INSERT
+lands. The guarantee is a database constraint:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">EXCLUDE USING gist (property_id WITH =, daterange(check_in, check_out, '[)') WITH &amp;&amp;)
+  WHERE (status IN ('PENDING', 'CONFIRMED', 'COMPLETED'))</code></pre>
+
+<p>The application still checks first, for a readable message. <strong>A check without a constraint
+is a race; a constraint without a check is a 500.</strong> Catching the
+<code>IntegrityError</code> and translating it into a 409 is what joins the two.</p>
+
+<p><strong>Why <code>expire_on_commit=False</code>?</strong></p>
+
+<p>Specifically a FastAPI concern. With the default, objects are marked stale after
+<code>commit()</code>, so reading an attribute triggers a refresh &mdash; and response serialisation
+happens after the route returns, sometimes after the session has closed. The symptom is
+<code>DetachedInstanceError</code> on an innocent-looking attribute access.</p>
+
+<h2>Errors, middleware and background work</h2>
+
+<p><strong>Why not raise <code>HTTPException</code> from a service?</strong></p>
+
+<p>Because that service then only works inside a web request. A domain exception is portable and
+lets the web layer decide what a failure means over HTTP. Routes may raise
+<code>HTTPException</code>; services should not.</p>
+
+<p><strong>What is the trap with <code>@app.exception_handler(Exception)</code>?</strong></p>
+
+<p>It does not run where the other handlers do. Specific handlers live in
+<code>ExceptionMiddleware</code>, the innermost layer; a handler for bare <code>Exception</code>
+becomes <code>ServerErrorMiddleware</code>'s, the outermost. So its response has skipped every user
+middleware &mdash; including CORS. The browser then reports a CORS failure and never exposes the
+body, so a frontend never sees the error message. Catch it inside your own middleware instead.</p>
+
+<p><strong>Which order does middleware run in?</strong></p>
+
+<p><code>add_middleware</code> inserts at the front, so the <em>last</em> one registered is the
+<em>outermost</em> &mdash; the reverse of how the calls read. CORS belongs outside anything that
+converts exceptions into responses.</p>
+
+<p><strong>Middleware or a dependency?</strong></p>
+
+<p>Middleware for cross-cutting concerns that touch the response or must cover everything: request
+ids, timing, access logs, CORS. Dependencies for anything route-specific or that injects a value:
+auth, pagination, sessions. Authentication as middleware is a common mistake &mdash; it cannot
+inject the user and does not appear in the OpenAPI schema.</p>
+
+<p><strong>What does <code>BackgroundTasks</code> promise?</strong></p>
+
+<p>That the work runs after the response is sent. Nothing else. No retry, no persistence, no
+back-pressure, no visibility. Use it for work that can silently never happen; use a real queue for
+anything else.</p>
+
+<p><strong>What is the trap with it?</strong></p>
+
+<p>A <code>yield</code> dependency's teardown runs <em>before</em> background tasks, so the
+request's session is closed by then. Passing an ORM object half-works: a loaded column still reads,
+the first unvisited relationship raises <code>DetachedInstanceError</code>. So the version that
+passes the object passes a test that checks the total and breaks when somebody adds a related field
+&mdash; after the 200 has gone out, where nobody is looking. Pass ids; open a session in the
+task.</p>
+
+<h2>Security</h2>
+
+<p><strong>Why bcrypt rather than SHA-256?</strong></p>
+
+<p>Because it is slow. A fast hash means a leaked database is brute-forced at billions of guesses a
+second. bcrypt also salts automatically, so identical passwords produce different hashes.</p>
+
+<p><strong>Anything surprising about it?</strong></p>
+
+<p>It truncates at 72 <em>bytes</em>, silently. Two long passwords sharing their first 72 bytes are
+the same password to bcrypt, and a passphrase in a non-Latin script hits the limit far sooner than
+it looks.</p>
+
+<p><strong>What can safely go in a JWT?</strong></p>
+
+<p>The claims are signed, not encrypted &mdash; anyone holding the token can read them. An id and a
+role, yes; anything you would not write on a postcard, no.</p>
+
+<p><strong>How do you revoke one?</strong></p>
+
+<p>A token is a snapshot, so you either keep it short-lived with a revocable refresh token, or check
+something on each request. StayHub re-reads the user from the database every request &mdash; one
+indexed lookup that turns a demotion or deletion into immediate effect. Trusting the role in the
+token means a demoted user keeps their old permissions until it expires.</p>
+
+<p><strong>Why does <code>jwt.decode</code> need <code>algorithms=[...]</code>?</strong></p>
+
+<p>Because a JWT's header names its own algorithm, and a library that trusts it will verify a token
+claiming <code>"alg": "none"</code>, or verify an RS256 token using the public key as an HMAC
+secret. Naming what you accept closes both.</p>
+
+<p><strong>Why return 404 for someone else's resource?</strong></p>
+
+<p>A 403 confirms the id exists, which on a guessable identifier is a slow enumeration of the table.
+The exception is a documented surface like an admin API, where existence is not a secret and a 403
+is less confusing.</p>
+
+<p><strong>What is wrong with trusting <code>UploadFile.content_type</code>?</strong></p>
+
+<p>It is whatever the client typed in the multipart part. <code>curl -F
+'file=@shell.php;type=image/png'</code> sets it to anything. Sniff the leading bytes and require
+them to match the declared type &mdash; and never build a path from
+<code>file.filename</code>, because <code>"../../app/main.py"</code> is a valid string.</p>
+
+<h2>Production</h2>
+
+<p><strong>How many workers?</strong></p>
+
+<p>Start at <code>2 × cores</code>, then check the arithmetic: containers × workers × (pool_size +
+max_overflow) must stay under the database's <code>max_connections</code>. That product is what
+turns a successful scale-up into <code>FATAL: sorry, too many clients already</code>.</p>
+
+<p><strong>The most common container mistake?</strong></p>
+
+<p>Missing <code>--host 0.0.0.0</code>. Uvicorn binds the container's own loopback, the bind
+succeeds, the app logs that it is running, <code>docker ps</code> shows the port published, and
+every request is refused with nothing anywhere saying why.</p>
+
+<p><strong>Why <code>PYTHONUNBUFFERED=1</code>?</strong></p>
+
+<p>Python buffers stdout when it is not a TTY, which is exactly the case in a container. Without it
+logs arrive in delayed chunks and a crashing process loses whatever was still buffered &mdash; so
+you get an empty log for the one event you needed.</p>
+
+<p><strong>When do migrations run?</strong></p>
+
+<p>As a deploy step, before the new version serves traffic &mdash; not in the entrypoint, where
+several replicas race. And they must be backwards-compatible, because during a rollout old and new
+code both run against one database. Add a column nullable, then require it in a second deploy.</p>
+
+<p><strong>How do you deploy without dropping requests?</strong></p>
+
+<p>Three things. A readiness probe that means ready, so traffic does not arrive before the pool is
+warm. Exec-form <code>CMD</code>, so <code>SIGTERM</code> reaches uvicorn and in-flight requests
+finish. And a brief pause before shutdown, so the load balancer has finished deregistering.</p>
+
+<h2>Things people get wrong on a whiteboard</h2>
+
+<p><strong>Write a paginated list endpoint.</strong></p>
+
+<p>The three things being checked are usually the three people miss:</p>
+
+<pre class="language-python"><code class="language-python">    total = db.execute(select(func.count(User.id)).where(*conditions)).scalar_one()
+...
+    rows = db.execute(
+        select(User)
+        .where(*conditions)
+        .order_by(User.id.desc())
+        .limit(page.page_size)
+        .offset(page.offset)
+    ).scalars().all()
+...
+    return Page.of([AdminUserRow.model_validate(u) for u in rows], total, page)</code></pre>
+
+<p>Filtering the rows but counting the whole table gives a silently wrong pager. No
+<code>ORDER BY</code> means page two can repeat rows from page one, because Postgres promises
+nothing without it. And an unbounded <code>pageSize</code> is pagination that protects nothing.</p>
+
+<p data-antipattern><strong>What is wrong with this validator?</strong></p>
+
+<pre class="language-python"><code class="language-python">@field_validator("guests")
+@classmethod
+def check_capacity(cls, v: int, info) -&gt; int:
+    listing = db.get(Property, info.data["property_id"])   # ⚠️
+    if v &gt; listing.max_guests:
+        raise ValueError("Too many guests.")
+    return v</code></pre>
+
+<p>It puts a database query inside a schema. A model answers "is this well formed?"; it cannot know
+what is true right now, and it should not have a session. Capacity is a service-layer rule
+&mdash; and the schema layer reaching for a database is how a circular import arrives a week
+later.</p>
+
+<p data-antipattern><strong>Spot the bug.</strong></p>
+
+<pre class="language-python"><code class="language-python">@app.post("/bookings")
+def create(payload: BookingCreateRequest, db: DbSession, background: BackgroundTasks):
+    background.add_task(send_confirmation, payload)
+    booking = BookingService(db).create(user, payload)
+    return booking</code></pre>
+
+<p>Two. The task is queued <em>before</em> the work &mdash; Starlette runs whatever is on the list,
+so a failed booking still emails "your dates are held". And the endpoint returns the ORM object with
+no <code>response_model</code>, publishing every column on it.</p>
+
+<h2>The open-ended ones</h2>
+
+<p><strong>How would you structure a FastAPI project?</strong></p>
+
+<p>Routes own HTTP, services own the rules, repositories own persistence and never commit, schemas
+are what is sent and models are what is stored. Then the honest half: not on day one. Six layers
+for six endpoints is worse than one file. The signals to move are the same logic appearing twice,
+or a rule you cannot test without a client.</p>
+
+<p><strong>What would you do differently at scale?</strong></p>
+
+<p>Object storage instead of local disk. A real queue instead of <code>BackgroundTasks</code> for
+anything that must happen. PgBouncer once the connection arithmetic stops working. Keyset
+pagination instead of OFFSET on large tables. Redis for anything currently in process memory, since
+workers share nothing.</p>
+
+<p><strong>How do you debug a slow endpoint?</strong></p>
+
+<p>Duration percentiles per route first &mdash; p95 and p99, never the mean, which is dominated by
+the fast majority. Then look for N+1 and missing indexes, because it is nearly always the database.
+Only then reach for caching or more processes. Four containers running the same N+1 query serve four
+times the traffic at exactly the same speed per request.</p>
+
+<p><strong>What do you check when it works locally and not in production?</strong></p>
+
+<p>Bind address, hostnames that only exist on your machine, a missing environment variable, CORS
+origins, whether migrations ran, connection pool exhaustion, proxy timeouts, and wheels built for
+the wrong architecture. In that order, and starting with the logs.</p>
+
+<h2>Questions worth asking back</h2>
+
+<p>An interview is two-directional, and these tend to be more informative than they sound.</p>
+
+<p><strong>"How do you test the API layer?"</strong> The answer separates teams that test services
+in isolation from teams that also test the assembled application. The second catches a class of bug
+&mdash; middleware ordering, response filtering, exception handler registration &mdash; that the
+first structurally cannot.</p>
+
+<p><strong>"What happens when a deploy goes wrong?"</strong> Whether rollback is one command, and
+whether anybody has run it. A pipeline that only goes forward is a pipeline nobody trusts.</p>
+
+<p><strong>"Where do background jobs run?"</strong> If the answer is <code>BackgroundTasks</code>
+for things that must happen, you have found either a gap or a conversation.</p>
+
+<p><strong>"How would I find out why one request was slow?"</strong> The presence of a correlation
+id, structured logs and per-route percentiles is a good proxy for how debuggable the whole system
+is.</p>
+
+<p><strong>"What is the oldest thing here nobody wants to touch?"</strong> Every codebase has one.
+How it is described tells you more about the team than any answer about architecture.</p>
+
+<h2>What to say when you do not know</h2>
+
+<p>The strongest answers in this list are the ones with a measurement or a scar attached &mdash;
+the async numbers, the CORS bug, the background-task trap. That is not a coincidence: interviewers
+are trying to distinguish people who have read about a framework from people who have shipped one.</p>
+
+<p>So when you do not know, say so and then say how you would find out. "I would check whether the
+teardown runs before or after the task &mdash; that is measurable in about five minutes" is a better
+answer than a confident guess, and it is true regardless of which way the answer goes.</p>
+
+<p>That is the end of the track. The eighteen lessons build one application: a REST API with typed
+validation, a real data layer, one error shape, authentication, uploads, background work, tests that
+catch configuration bugs, structured logs, and a container that runs it. Every example came from an
+application that runs and has a hundred passing tests &mdash; which is the only reason any of it can
+be trusted.</p>

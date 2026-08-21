@@ -1,0 +1,479 @@
+<p>Whether a route is <code>def</code> or <code>async def</code> is the most consequential one-word
+decision in FastAPI, and the framework's name pushes people toward the wrong one. This lesson
+explains what actually happens in each case, and then measures it &mdash; including a case in this
+codebase where the concurrent version is two and a half times slower.</p>
+
+<h2>What FastAPI does with each</h2>
+
+<p>The framework accepts both and treats them completely differently.</p>
+
+<pre class="language-python"><code class="language-python">@app.get("/sync")
+def sync_route():
+    return {"ok": True}       # dispatched to a WORKER THREAD
+
+
+@app.get("/async")
+async def async_route():
+    return {"ok": True}       # runs directly ON THE EVENT LOOP</code></pre>
+
+<p>A <code>def</code> route is handed to a threadpool, so it can block for as long as it likes
+without affecting anything else. FastAPI does this deliberately, and it is why plain synchronous
+code is safe here in a way it is not in most async frameworks.</p>
+
+<p>An <code>async def</code> route runs on the event loop, in the same thread as every other
+concurrent request. It gives control back only when it <code>await</code>s. Between awaits, nothing
+else in the process runs.</p>
+
+<p>That asymmetry produces the single most important rule:</p>
+
+<blockquote>
+<p><strong>If you are not going to <code>await</code> something, write <code>def</code>.</strong>
+An <code>async def</code> that never awaits is strictly worse than the same function written
+<code>def</code> &mdash; it takes the same time and blocks everything else while doing it.</p>
+</blockquote>
+
+<h2>The mistake, and why it is invisible</h2>
+
+<pre class="language-python"><code class="language-python">@app.get("/listings")
+async def list_listings(db: Session = Depends(get_db)):
+    # ⚠️ Synchronous database call inside an async route.
+    return db.execute(select(Property).limit(20)).scalars().all()</code></pre>
+
+<p>SQLAlchemy's synchronous <code>execute</code> blocks. Inside <code>async def</code> it blocks the
+event loop, so while that query runs, <em>no other request in the process makes progress</em>
+&mdash; not the ones already mid-flight, not new ones arriving.</p>
+
+<p>The reason it survives review is that it works perfectly in development. One developer, one
+request at a time, a 2&nbsp;ms local query: indistinguishable from correct. Under concurrency it
+degrades in a way that looks like a database problem rather than a code problem, because every
+request slows down together.</p>
+
+<p>The same trap covers anything synchronous: <code>requests.get()</code>,
+<code>time.sleep()</code>, <code>open().read()</code> on a large file, <code>bcrypt</code>, an image
+resize. All fine in <code>def</code>; all poison in <code>async def</code>.</p>
+
+<p>Three ways out, in order of preference: write <code>def</code> and let the threadpool handle it;
+use a genuinely async library and <code>await</code> it; or push the blocking call to a thread
+explicitly:</p>
+
+<pre class="language-python"><code class="language-python">from starlette.concurrency import run_in_threadpool
+
+
+@app.get("/listings")
+async def list_listings(db: Session = Depends(get_db)):
+    rows = await run_in_threadpool(lambda: db.execute(select(Property).limit(20)).scalars().all())
+    return rows</code></pre>
+
+<p>The third exists mostly for when you are already in an async route for another reason. If the
+whole function is one blocking call, the first option is better and simpler.</p>
+
+<h2>Concurrency is not parallelism</h2>
+
+<p>Worth separating, because the GIL confuses the two.</p>
+
+<p><strong>Concurrency</strong> is making progress on many things by interleaving them. One thread,
+one core, switching whenever something waits. That is what an event loop does, and it is what
+async gives you.</p>
+
+<p><strong>Parallelism</strong> is doing many things at literally the same instant, which needs
+more than one core. In CPython that needs more than one <em>process</em>, because the GIL means one
+thread executes Python bytecode at a time.</p>
+
+<p>So neither <code>async</code> nor the threadpool makes CPU-bound work faster. Resizing images or
+computing a report will not speed up by being awaited &mdash; and in an async route it will freeze
+every other request while it runs. The answers there are a process pool, a worker service, or a
+library that releases the GIL in C.</p>
+
+<pre class="language-python"><code class="language-python">from concurrent.futures import ProcessPoolExecutor
+
+pool = ProcessPoolExecutor(max_workers=4)
+
+
+@app.post("/reports")
+async def build_report(spec: ReportSpec):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(pool, expensive_pure_function, spec.model_dump())</code></pre>
+
+<p>Note it is handed a plain dict rather than a model &mdash; arguments cross a process boundary by
+pickling, and that is the same discipline background tasks needed for a different reason.</p>
+
+<p>Also note what uvicorn's <code>--workers</code> actually gives you: separate processes, and
+therefore real parallelism across cores. Async buys concurrency <em>within</em> a worker; workers
+buy parallelism <em>across</em> them. Both, and they solve different problems.</p>
+
+<h2>The threadpool has a size</h2>
+
+<p>"Just use <code>def</code>" has a limit, and it is worth knowing before you meet it. The
+threadpool defaults to <strong>40 threads</strong>. Forty concurrent <code>def</code> requests
+occupy all of them, and the forty-first waits &mdash; not for the database, for a thread.</p>
+
+<p>That ceiling is usually fine, because it tends to sit above the database's own connection limit.
+It becomes the bottleneck when handlers are slow for reasons other than the database &mdash; a
+third-party HTTP call with a two-second latency, for instance. Twenty requests per second against a
+two-second call is exactly forty threads.</p>
+
+<p>Raise it if you must, at startup:</p>
+
+<pre class="language-python"><code class="language-python">import anyio
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 100
+    yield</code></pre>
+
+<p>The better answer at that point is usually to make the slow call properly async, since waiting on
+a network is exactly what async is good at.</p>
+
+<h2>Now measure it</h2>
+
+<p>StayHub's <code>/admin/stats</code> runs eight independent aggregate queries. Nothing depends on
+anything else, so it is the textbook case for concurrency.</p>
+
+<p>The synchronous version issues them one after another. The async version runs them together:</p>
+
+<pre class="language-python"><code class="language-python">    (
+        total_users, total_hosts, total_properties, published_properties,
+        total_bookings, confirmed_bookings, cancelled_bookings, gross,
+    ) = await asyncio.gather(</code></pre>
+
+<p>Textbook says eight serial round trips become one. Here is what actually happened, 30 runs each
+after warm-up:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">/admin/stats        (8 serial)      median   7.9ms
+/admin/stats-async  (8 concurrent)  median  19.8ms      <- 2.5x WORSE</code></pre>
+
+<p>The concurrent version is <strong>two and a half times slower</strong>, and both return
+identical numbers. That is not a bug in the implementation. It is what async costs when there is
+nothing to wait for.</p>
+
+<h3>Where the crossover is</h3>
+
+<p>Vary only the per-query wait &mdash; same eight queries, same machine, <code>pg_sleep</code>
+standing in for latency &mdash; and the picture resolves:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">per-query wait   sync serial   async gather
+          0ms         4.0ms        15.5ms     async 289% slower
+          5ms        59.1ms        22.2ms     async  63% faster
+         50ms       444.9ms        76.2ms     async  83% faster
+        200ms      1654.7ms       232.9ms     async  86% faster</code></pre>
+
+<p>The rule falls out of the table: <strong>async removes waiting, not work.</strong> It charges a
+fixed overhead &mdash; a session and a pooled connection per task, the greenlet bridge SQLAlchemy's
+async layer uses, event-loop scheduling &mdash; and pays you back in proportion to how long you
+would otherwise have waited.</p>
+
+<p>Break-even is roughly <strong>1&ndash;2&nbsp;ms of wait per call</strong>. Below it you are
+paying overhead for nothing. Above it the returns are large and approach the theoretical eight-fold
+ceiling.</p>
+
+<p>Which side of the line things sit on:</p>
+
+<table>
+  <thead><tr><th>Call</th><th>Typical wait</th><th>Async worth it?</th></tr></thead>
+  <tbody>
+    <tr><td>Postgres on the same host</td><td>0.2&ndash;2 ms</td><td>no</td></tr>
+    <tr><td>Postgres across a network</td><td>2&ndash;20 ms</td><td>yes</td></tr>
+    <tr><td>Redis</td><td>&lt; 1 ms</td><td>no</td></tr>
+    <tr><td>An S3 upload</td><td>50&ndash;500 ms</td><td>emphatically</td></tr>
+    <tr><td>A third-party HTTP API</td><td>100&ndash;1000 ms</td><td>emphatically</td></tr>
+    <tr><td>An LLM call</td><td>seconds</td><td>emphatically</td></tr>
+  </tbody>
+</table>
+
+<p>StayHub's <code>/admin/stats</code> stays synchronous, because it is the faster endpoint. The
+async twin exists to be measured against, which is the only reason to keep two versions of
+anything.</p>
+
+<h2>The async database path</h2>
+
+<p>If you do want one, it is less work than expected:</p>
+
+<pre class="language-python"><code class="language-python">async_engine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    echo=False,
+    pool_size=5,
+    max_overflow=5,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=async_engine, expire_on_commit=False, autoflush=False
+)</code></pre>
+
+<p>Same URL and same driver &mdash; <code>postgresql+psycopg://</code> is psycopg 3, which speaks
+both protocols. With psycopg 2 you would need a second driver, <code>asyncpg</code>, with its own
+type handling, which is how a <code>Decimal</code> starts arriving as a float on one code path and
+not the other.</p>
+
+<p>Three things to watch.</p>
+
+<p><strong>The install needs an extra.</strong> SQLAlchemy's async layer is a greenlet bridge over
+the sync core, so it needs <code>greenlet</code> &mdash; which a bare install does not pull in:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">SQLAlchemy[asyncio]==2.0.36</code></pre>
+
+<p>Without it everything imports fine and the first async query dies at <em>close</em> time with
+<code>ValueError: the greenlet library is required to use this function</code>, pointing at
+SQLAlchemy's internals rather than at anything you wrote.</p>
+
+<p><strong>The pools add up.</strong> An async engine alongside a sync one is a second pool, and
+Postgres counts total connections. Workers × (sync pool + async pool) has to stay under
+<code>max_connections</code>.</p>
+
+<p><strong>One session cannot multiplex.</strong> <code>asyncio.gather</code> over a single
+<code>AsyncSession</code> does not work &mdash; a session is one connection. Each task takes its
+own:</p>
+
+<pre class="language-python"><code class="language-python">    async def scalar(stmt) -&gt; int:
+        # Its own session per task. See the ⚠️ above.
+        async with AsyncSessionLocal() as s:
+            return (await s.execute(stmt)).scalar_one() or 0</code></pre>
+
+<p>Which is also where a chunk of that fixed overhead comes from.</p>
+
+<h2>Where async is unambiguously right</h2>
+
+<p>Two cases in this application, neither about speed.</p>
+
+<p><strong>File uploads</strong>, because the API is async:</p>
+
+<pre class="language-python"><code class="language-python">            while chunk := await file.read(CHUNK):</code></pre>
+
+<p>You cannot <code>await</code> in a <code>def</code>, so the route has to be
+<code>async def</code>. Reading <code>file.file</code> synchronously instead would block the loop
+for the duration of the upload &mdash; on a slow connection, seconds.</p>
+
+<p><strong>Many independent slow calls</strong>, which is the case the table above endorses. Three
+third-party APIs at 300&nbsp;ms each is 900&nbsp;ms serial and 300&nbsp;ms concurrent, and that is a
+difference a user feels:</p>
+
+<pre class="language-python"><code class="language-python">async with httpx.AsyncClient(timeout=5) as client:
+    weather, events, transit = await asyncio.gather(
+        client.get(f"{WEATHER}/forecast", params={"city": city}),
+        client.get(f"{EVENTS}/upcoming", params={"city": city}),
+        client.get(f"{TRANSIT}/lines", params={"city": city}),
+    )</code></pre>
+
+<p>Note <code>httpx.AsyncClient</code> rather than <code>requests</code>. <code>requests</code> is
+synchronous; there is no way to await it, and calling it in an async route is the blocking mistake
+from the top of this lesson.</p>
+
+<p><code>gather</code> also has a sharp edge worth knowing: by default one failure cancels the
+others and propagates immediately. Pass <code>return_exceptions=True</code> when partial results are
+better than none &mdash; which for three independent widgets on a page they usually are.</p>
+
+<h2>The tools worth knowing</h2>
+
+<p>Four asyncio primitives cover almost everything a web application needs.</p>
+
+<p><strong><code>gather</code></strong> runs awaitables concurrently and returns their results in
+order. By default one failure cancels the rest and propagates; pass
+<code>return_exceptions=True</code> when partial results beat none:</p>
+
+<pre class="language-python"><code class="language-python">results = await asyncio.gather(*calls, return_exceptions=True)
+ok = [r for r in results if not isinstance(r, Exception)]</code></pre>
+
+<p><strong>A timeout</strong>, because a request with no deadline is a worker held forever by
+somebody else's outage:</p>
+
+<pre class="language-python"><code class="language-python">async with asyncio.timeout(2.0):
+    data = await client.get(url)</code></pre>
+
+<p><strong>A semaphore</strong>, to bound concurrency. Firing five hundred concurrent requests at a
+third-party API gets you rate-limited or blocked; ten at a time is usually as fast and does not:</p>
+
+<pre class="language-python"><code class="language-python">sem = asyncio.Semaphore(10)
+
+
+async def fetch(url: str):
+    async with sem:
+        return await client.get(url)</code></pre>
+
+<p><strong>A task group</strong>, when several things must run together and any failure should
+cancel the others:</p>
+
+<pre class="language-python"><code class="language-python">async with asyncio.TaskGroup() as tg:
+    weather = tg.create_task(get_weather(city))
+    events = tg.create_task(get_events(city))</code></pre>
+
+<p>One rule that is easy to break: <strong>do not create a bare task and forget it.</strong>
+<code>asyncio.create_task(...)</code> without holding a reference can be garbage-collected
+mid-flight, and its exception disappears with it. Keep the reference, or use a task group.</p>
+
+<h2>Streaming, which only async can do</h2>
+
+<p>Async is not only about speed. Some response shapes are unavailable without it, because they
+depend on sending in pieces:</p>
+
+<pre class="language-python"><code class="language-python">from fastapi.responses import StreamingResponse
+
+
+@app.get("/exports/bookings.csv")
+async def export_bookings(db: AsyncDbSession):
+    async def rows():
+        yield "id,check_in,check_out,total\n"
+        async for booking in stream_bookings(db):
+            yield f"{booking.public_id},{booking.check_in},{booking.check_out},{booking.total}\n"
+
+    return StreamingResponse(rows(), media_type="text/csv")</code></pre>
+
+<p>The alternative builds the whole export in memory before sending a byte, which for a large table
+is both a memory spike and a long silence the client may time out on. Streaming starts immediately
+and uses constant memory.</p>
+
+<p>The same mechanism underlies server-sent events and WebSockets &mdash; both are long-lived
+connections, which is exactly what ASGI added over WSGI and exactly what a synchronous worker
+cannot hold.</p>
+
+<h2>The library you reach for changes</h2>
+
+<p>An async route needs async libraries. Reaching for the familiar synchronous one is the blocking
+mistake wearing a different hat:</p>
+
+<table>
+  <thead><tr><th>Instead of</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td><code>requests</code></td><td><code>httpx.AsyncClient</code> or <code>aiohttp</code></td></tr>
+    <tr><td><code>time.sleep</code></td><td><code>await asyncio.sleep</code></td></tr>
+    <tr><td><code>psycopg</code> (sync)</td><td>SQLAlchemy async, or <code>asyncpg</code></td></tr>
+    <tr><td><code>redis</code></td><td><code>redis.asyncio</code></td></tr>
+    <tr><td><code>open().read()</code></td><td><code>aiofiles</code>, or accept the block for small files</td></tr>
+    <tr><td>anything with no async version</td><td><code>run_in_threadpool</code></td></tr>
+  </tbody>
+</table>
+
+<p>Create HTTP clients once at startup rather than per request. An
+<code>httpx.AsyncClient</code> holds a connection pool, and building one per request throws away
+the pooling that makes it worth using:</p>
+
+<pre class="language-python"><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=10)
+    yield
+    await app.state.http.aclose()</code></pre>
+
+<h2>Mixing is fine</h2>
+
+<p>An application does not have to pick. StayHub is overwhelmingly synchronous with two async
+routes, and nothing special is required to combine them:</p>
+
+<ul>
+  <li>An <code>async</code> dependency can serve a <code>def</code> route.</li>
+  <li>A <code>def</code> dependency can serve an <code>async def</code> route &mdash; it runs in
+      the threadpool.</li>
+  <li>Middleware is always async, and can wrap either.</li>
+  <li>Background tasks follow the same rule as routes: <code>def</code> for blocking work.</li>
+</ul>
+
+<p>The one thing you cannot do is call an async function from a sync one without a loop. If you find
+yourself reaching for <code>asyncio.run()</code> inside a route, something has been declared the
+wrong way round.</p>
+
+<h2>Testing async code</h2>
+
+<p><code>TestClient</code> handles async routes with no ceremony &mdash; it runs the loop for you,
+so a test looks identical whichever way the route is written. Testing an async function
+<em>directly</em> needs a plugin:</p>
+
+<pre class="language-python"><code class="language-python">import pytest
+
+
+@pytest.mark.asyncio
+async def test_stats_async_matches_sync(db):
+    a = stats(admin, db)
+    b = await stats_async(admin, async_db)
+    assert a == b</code></pre>
+
+<p>That assertion &mdash; that both versions return identical numbers &mdash; is the one worth
+writing whenever you keep two implementations. StayHub's benchmark script asserts it too, because a
+faster endpoint returning different answers is not a win:</p>
+
+<pre class="language-python"><code class="language-python">    if a == b:
+        print("  both endpoints return identical numbers ✓")
+        return 0</code></pre>
+
+<p>Two async testing traps. Fixtures and tests must share an event loop, which is what
+<code>asyncio_default_fixture_loop_scope</code> in <code>pytest.ini</code> pins down &mdash; without
+it you get failures about a future attached to a different loop. And an async test that forgets to
+<code>await</code> passes silently, because an un-awaited coroutine is truthy: <code>assert
+some_async_call()</code> asserts that a coroutine object exists.</p>
+
+<h2>How to tell you got it wrong</h2>
+
+<p>Blocking the event loop has a distinctive signature, which is worth recognising because it does
+not look like a code problem.</p>
+
+<p><strong>Latency rises for everything at once.</strong> Not one endpoint &mdash; all of them,
+including the health check, including endpoints that touch nothing. That symmetry is the tell: a
+slow database makes database endpoints slow, while a blocked loop makes <em>everything</em> slow.</p>
+
+<p><strong>Throughput plateaus far below what one core should do.</strong> A blocked loop serialises
+every request in the worker, so the process handles one at a time regardless of concurrency.</p>
+
+<p><strong>It is fine in development.</strong> One request at a time never reveals it.</p>
+
+<p>The direct way to confirm it is asyncio's own debug mode, which logs any callback that occupies
+the loop too long:</p>
+
+<pre class="language-bash"><code class="language-bash">PYTHONASYNCIODEBUG=1 uvicorn app.main:app</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Executing &lt;Task ...list_listings...&gt; took 0.412 seconds</code></pre>
+
+<p>That line names the coroutine. It is the fastest route from "the API is slow" to the specific
+function holding the loop, and it is one environment variable.</p>
+
+<h2>Two more things that surprise people</h2>
+
+<p><strong>A dependency can be a different flavour from its route.</strong> An <code>async</code>
+dependency serving a <code>def</code> route is fine, and so is the reverse &mdash; a
+<code>def</code> dependency used by an <code>async def</code> route runs in the threadpool. So
+adopting async does not mean converting everything at once, which is what makes an incremental
+migration possible.</p>
+
+<p><strong>The GIL is not the reason async exists.</strong> Async is about not waiting; the GIL is
+about not executing bytecode in parallel. They are unrelated problems with unrelated solutions
+&mdash; async for I/O, processes for CPU &mdash; and conflating them leads to the belief that
+async will speed up a report generator. It will not.</p>
+
+<h2>Migrating a sync codebase, if you must</h2>
+
+<p>The wrong way is to add <code>async</code> to every route and fix the fallout. The order that
+works:</p>
+
+<ol>
+  <li><strong>Find the endpoints that actually wait.</strong> Per-route latency percentiles, and
+      then what they are waiting <em>on</em>. Most applications have one or two.</li>
+  <li><strong>Convert one, with its libraries.</strong> An async route calling a sync client is
+      worse than the sync route it replaced.</li>
+  <li><strong>Measure it.</strong> If the wait is under a millisecond or two, revert &mdash; the
+      table above says you have just made it slower.</li>
+  <li><strong>Leave the rest alone.</strong> <code>def</code> routes in a threadpool are correct,
+      not a compromise.</li>
+</ol>
+
+<p>StayHub is the end state of exactly that process: two async routes, one because
+<code>UploadFile</code> requires it and one kept only for measurement, and everything else plain
+<code>def</code>. A mostly-synchronous FastAPI application is not a failure to adopt the framework
+properly. It is usually the right answer.</p>
+
+<h2>How to decide</h2>
+
+<ol>
+  <li><strong>Does the handler await anything?</strong> No &rarr; <code>def</code>. Done.</li>
+  <li><strong>Does it await exactly one thing?</strong> Then async buys you concurrency with
+      <em>other requests</em>, not within this one &mdash; worth it if the wait is long, since a
+      thread is not tied up. Below a millisecond or two, not worth it.</li>
+  <li><strong>Does it await several independent things?</strong> This is the case async is for.
+      Use <code>asyncio.gather</code>.</li>
+  <li><strong>Is anything in it blocking?</strong> Then it must be <code>def</code>, or the
+      blocking part must go through <code>run_in_threadpool</code>.</li>
+</ol>
+
+<p>And whichever you choose: <strong>measure before believing.</strong> The table above was
+produced by a thirty-line script against a real database, and it contradicted the expected answer.
+That is normal, and it is why the script lives in the repository next to the endpoints it
+compares.</p>
+
+<p>Next: <strong>middleware, ordering and CORS</strong> &mdash; the layer wrapped around every route
+in this lesson, and an ordering rule that reads backwards.</p>

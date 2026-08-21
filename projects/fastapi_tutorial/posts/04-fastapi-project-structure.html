@@ -1,0 +1,467 @@
+<p>The official documentation shows a single <code>main.py</code>, and it is right to &mdash; the
+framework is easier to learn without a directory tree in the way. But every real project outgrows
+that file, and FastAPI has no opinion about what comes next. This is the question people get wrong
+most often, and the cost is paid slowly rather than loudly.</p>
+
+<h2>What going wrong looks like</h2>
+
+<p>The single file does not fail dramatically. It degrades, in a recognisable order.</p>
+
+<p>First, endpoints start doing business logic, because that is where the data is. Then two
+endpoints need the same rule and one of them gets a slightly different copy. Then a route builds a
+database query inline, so reading it requires knowing the schema. Then a bug is fixed in one of the
+three places the rule now lives. By the time anyone proposes restructuring, every endpoint is
+load-bearing and none of it is testable without HTTP.</p>
+
+<p>None of those steps is unreasonable on its own. That is what makes it happen.</p>
+
+<h2>The same endpoint, both ways</h2>
+
+<p>Concretely, here is creating a booking as it tends to get written first &mdash; everything in
+the route, because everything is to hand:</p>
+
+<pre class="language-python"><code class="language-python">@app.post("/bookings", status_code=201)
+def create_booking(payload: BookingCreateRequest, user: CurrentUser, db: DbSession):
+    prop = db.execute(
+        select(Property).where(Property.public_id == payload.property_id)
+    ).scalar_one_or_none()
+    if prop is None or prop.deleted:
+        raise HTTPException(404, "Listing not found.")
+    if prop.status != "PUBLISHED":
+        raise HTTPException(400, "This listing is not accepting bookings.")
+    if prop.host_id == user.id:
+        raise HTTPException(400, "You cannot book your own listing.")
+    if payload.guests &gt; prop.max_guests:
+        raise HTTPException(400, f"This place sleeps up to {prop.max_guests} guests.")
+
+    clash = db.execute(
+        select(Booking).where(
+            Booking.property_id == prop.id,
+            Booking.status.in_(["PENDING", "CONFIRMED", "COMPLETED"]),
+            Booking.check_in &lt; payload.check_out,
+            Booking.check_out &gt; payload.check_in,
+        )
+    ).first()
+    if clash:
+        raise HTTPException(409, "Those dates are no longer available.")
+
+    nights = (payload.check_out - payload.check_in).days
+    subtotal = prop.price_per_night * nights
+    service_fee = (subtotal * Decimal("0.12")).quantize(Decimal("0.01"))
+    total = subtotal + prop.cleaning_fee + service_fee
+
+    booking = Booking(
+        property_id=prop.id, guest_id=user.id, nights=nights,
+        subtotal=subtotal, service_fee=service_fee, total=total, status="PENDING",
+    )
+    db.add(booking)
+    db.commit()
+    db.refresh(booking)
+    return booking</code></pre>
+
+<p>Nothing there is stupid. It is readable, it works, and writing it took ten minutes. The problems
+are all things that have not happened yet:</p>
+
+<ul>
+  <li>The <strong>12% service fee</strong> is now a number in a route. The quote endpoint needs the
+      same number, and will get its own copy.</li>
+  <li>The <strong>status strings</strong> <code>"PENDING"</code>, <code>"CONFIRMED"</code>,
+      <code>"COMPLETED"</code> are duplicated from wherever else they appear. Adding a fourth
+      blocking status means finding every list like this one.</li>
+  <li>Testing "you cannot book your own listing" requires an HTTP client, a route, a token and a
+      database.</li>
+  <li>The overlap query is the availability rule. The calendar endpoint needs it too.</li>
+  <li><code>db.commit()</code> in a route means this can never be part of a larger transaction.</li>
+</ul>
+
+<p>The layered version says the same thing:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
+def create_booking(
+    payload: BookingCreateRequest, user: CurrentUser, db: DbSession, background: BackgroundTasks
+) -&gt; BookingResponse:
+    """Hold the dates. The booking is PENDING until payment succeeds.
+
+    ⚠️ The body carries no price. Every figure is computed server-side from the listing.
+    """
+    booking = BookingService(db).create(user, payload)</code></pre>
+
+<p>The rules did not disappear &mdash; they moved somewhere they can be reused and tested. The fee
+became <code>settings.service_fee_rate</code>. The status strings became an enum with a
+<code>blocking()</code> classmethod that both the availability query and the database constraint
+read, so the two cannot disagree. And the overlap check became a repository method the calendar
+endpoint also calls.</p>
+
+<h2>The layout</h2>
+
+<p>StayHub's, which is a fairly standard shape for a FastAPI service of this size:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">app/
+├── main.py         the FastAPI object: middleware, error handlers, routers, health
+├── core/           config · security · deps · exceptions · logging · middleware
+├── db/             declarative base and mixins · session · async_session
+├── models/         SQLAlchemy entities and enums      — what is STORED
+├── schemas/        pydantic DTOs                      — what is SENT
+├── repositories/   the only place that knows SQLAlchemy exists
+├── services/       business rules — pricing, booking, cancellation, payments
+├── search/         client · index mapping · indexer · queries
+└── api/v1/routes/  auth · properties · bookings · payments · search · admin · uploads</code></pre>
+
+<p>The two directories people merge, and should not, are <code>models/</code> and
+<code>schemas/</code>. One is the database's idea of a booking; the other is the API's. They are
+similar today and diverge the moment you add a column you do not publish, or publish a value you do
+not store. Lesson 3 covered why that separation is a security boundary.</p>
+
+<h2>The rule for each layer</h2>
+
+<p>A structure is only worth having if you can say what does <em>not</em> belong in each box. Four
+rules, in priority order.</p>
+
+<h3>1. Routes own HTTP, and nothing else</h3>
+
+<p>A route's job is to translate: take an HTTP request, call something, turn the result into a
+response. If a route computes a price, it is in the wrong layer.</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/quote", response_model=PriceBreakdown)
+def quote(payload: QuoteRequest, db: DbSession) -&gt; PriceBreakdown:
+    """What would this stay cost? Creates nothing.
+
+    Runs the same pricing code the booking runs, so a quote is always honoured.
+    """
+    _, breakdown = BookingService(db).quote(payload)
+    return breakdown</code></pre>
+
+<p>Three lines, and only one of them does anything. That is the target. The test for whether a
+route is too fat is simple: could this logic be needed by something that is not an HTTP request
+&mdash; a CLI command, a scheduled job, a message consumer? If yes, it does not belong here.</p>
+
+<h3>2. Services own the rules</h3>
+
+<p>Everything that is true about your domain regardless of transport lives in a service. Prices,
+eligibility, state transitions, the order operations must happen in.</p>
+
+<pre class="language-python"><code class="language-python">    def create(self, guest: User, req: BookingCreateRequest) -&gt; Booking:
+        prop = self._bookable_property(req.property_id)
+        self._validate_stay(prop, req.check_in, req.check_out, req.guests)
+
+        if prop.host_id == guest.id:
+            raise ApiException("You cannot book your own listing.")</code></pre>
+
+<p>"You cannot book your own listing" is a fact about the business. It is not a validation rule
+&mdash; the request is perfectly well formed &mdash; and it is not an HTTP concern. It belongs
+exactly here, where it is reachable by every path that creates a booking and testable without a
+server.</p>
+
+<p>Services are also where a transaction spans more than one thing, which brings us to the rule
+that matters most.</p>
+
+<h3>3. Repositories never commit</h3>
+
+<pre class="language-python"><code class="language-python">    def add(self, entity: ModelT) -&gt; ModelT:
+        self.db.add(entity)
+        self.db.flush()
+        return entity</code></pre>
+
+<p><code>flush()</code>, not <code>commit()</code>. The distinction is the whole design:
+<code>flush</code> sends the INSERT so the database assigns an id, while leaving the transaction
+open. <code>commit</code> ends the transaction.</p>
+
+<p>The reason is that <strong>only the caller knows where a transaction ends</strong>. "Create a
+booking AND its payment, or neither" is one transaction spanning two repositories. If each
+repository committed, the first would be durable before the second was attempted, and a failure
+would leave a booking with no payment and no way to know it happened. A repository cannot see far
+enough to make that call.</p>
+
+<p>The corollary is that services commit, and routes do not touch transactions at all.</p>
+
+<h3>4. One rule, one home &mdash; even if it is awkward</h3>
+
+<p>StayHub's cancellation policy is three lines of logic in a file of its own:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">app/services/cancellation_policy.py</code></pre>
+
+<p>That looks like over-engineering until you see why. Both the schema layer and the service layer
+need it &mdash; the response DTO computes <code>isCancellable</code> for the UI, and the booking
+service enforces the same rule when a cancellation arrives. If it lived in
+<code>booking_service.py</code>, the schema would have to import the service, and the service
+already imports the schema. A circular import.</p>
+
+<p>The general form: <strong>when two layers need the same rule, it moves down, not sideways.</strong>
+A module with no dependencies of its own can be imported by anything. Reaching for a local import
+inside a function to break the cycle works, but it is a signal you have put something in the wrong
+place, not a solution.</p>
+
+<h2>Configuration</h2>
+
+<p>Reading <code>os.environ</code> scattered through the code is the thing this replaces. A typo in
+a variable name becomes a <code>None</code> that surfaces three layers deep at request time; typed
+settings turn it into a startup error.</p>
+
+<pre class="language-python"><code class="language-python">class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="STAYHUB_",
+        extra="ignore",
+    )
+
+    app_name: str = "StayHub API"
+    api_v1_prefix: str = "/api/v1"
+
+    database_url: str = "postgresql+psycopg://stayhub:stayhub@localhost:5433/stayhub"</code></pre>
+
+<p><code>env_prefix</code> earns its place on a machine running more than one thing:
+<code>STAYHUB_DATABASE_URL</code> cannot collide with another service's
+<code>DATABASE_URL</code>. And the settings object is cached, so the file is parsed once per
+process rather than once per request:</p>
+
+<pre class="language-python"><code class="language-python">@lru_cache
+def get_settings() -&gt; Settings:
+    """Cached so the .env file is parsed once per process, not once per request."""
+    return Settings()
+
+
+settings = get_settings()</code></pre>
+
+<h3>The gotcha that costs an afternoon</h3>
+
+<p><strong>pydantic-settings parses <code>.env</code> into the object and never touches
+<code>os.environ</code>.</strong> So this returns an empty string for anything that lives only in
+the file:</p>
+
+<pre class="language-python"><code class="language-python">os.getenv("STAYHUB_STRIPE_PUBLISHABLE_KEY")   # "" — the .env is not in os.environ</code></pre>
+
+<p>StayHub hit exactly this. The failure is quiet: a payment intent is created fine and the browser
+simply receives an empty publishable key, with no error logged anywhere. The rule is absolute
+&mdash; once you have a settings object, <code>os.getenv</code> is a bug.</p>
+
+<p>Defaults deserve a moment too. Every field above has one, which makes the app runnable with no
+configuration at all &mdash; good for a demo. For a real deployment, secrets should have <em>no</em>
+default, so a missing one fails at boot rather than starting with
+<code>"dev-only-change-me"</code>. StayHub's JWT secret has a default and says so in a comment; a
+production service would drop it and let pydantic refuse to construct.</p>
+
+<h2>What main.py is for</h2>
+
+<p>Assembly, in a deliberate order, and nothing else:</p>
+
+<pre class="language-python"><code class="language-python">"""The FastAPI application.
+
+Responsibilities, in order: CORS, error handling, routes, health. Business logic lives in
+`app/services`, persistence in `app/repositories`. Nothing in this file should know what a booking
+costs.
+"""</code></pre>
+
+<p>That last sentence is the test. If <code>main.py</code> knows a domain fact, it has grown
+something it should not have.</p>
+
+<p>The one piece of real logic that does belong there is the health check, and only because it is
+about the process rather than the domain:</p>
+
+<pre class="language-python"><code class="language-python">@app.get("/health", response_model=Health, tags=["health"])
+def health() -&gt; Health:
+    """Reports each dependency separately.
+
+    A single boolean would answer "is it up?" but not "what is broken?", which is the only thing
+    anyone actually wants from a health check at 3am.
+    """</code></pre>
+
+<h2>Which way the imports point</h2>
+
+<p>The single most useful property of a layered structure is that dependencies only ever point one
+way:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">routes  ──&gt;  services  ──&gt;  repositories  ──&gt;  models
+   │             │                                 ▲
+   └──&gt; schemas ─┘─────────────────────────────────┘
+                      core/  (imported by everyone, imports nobody)</code></pre>
+
+<p>Nothing below imports something above. A repository never imports a route; a model never imports
+a service. When that holds, you can reason about a layer in isolation and, more practically, a
+circular import becomes impossible rather than merely unlikely.</p>
+
+<p>When it does not hold, Python tells you &mdash; but late, and unhelpfully. <code>ImportError:
+cannot import name X from partially initialized module</code> names the two files at the ends of
+the cycle, not the design decision in the middle that caused it. Two ways out are legitimate: move
+the shared thing down into a leaf module (the cancellation policy), or use
+<code>TYPE_CHECKING</code> when the import exists only for annotations:</p>
+
+<pre class="language-python"><code class="language-python">if TYPE_CHECKING:
+    from app.models.property import Property
+    from app.models.user import User</code></pre>
+
+<p>That is how StayHub's models reference each other in type hints without importing at runtime.
+The quoted forward reference &mdash; <code>Mapped["Property"]</code> &mdash; is resolved by
+SQLAlchemy later, and the annotation is still there for the editor.</p>
+
+<h2>The service shape</h2>
+
+<p>Services in StayHub are classes constructed with a session:</p>
+
+<pre class="language-python"><code class="language-python">class BookingService:
+    def __init__(self, db: Session) -&gt; None:
+        self.db = db
+        self.bookings = BookingRepository(db)
+        self.properties = PropertyRepository(db)</code></pre>
+
+<p>The constructor takes the one thing that varies per request and builds its repositories from it.
+Every method then reads as domain language: <code>BookingService(db).create(user, payload)</code>.</p>
+
+<p>Plain functions work just as well when there is no shared state to carry. StayHub uses both
+&mdash; <code>pricing_service</code> and <code>cancellation_policy</code> are modules of functions,
+because pricing needs no session and the cancellation rule needs nothing at all:</p>
+
+<pre class="language-python"><code class="language-python">from app.services import pricing_service
+from app.services.cancellation_policy import cancellation_deadline, is_cancellable</code></pre>
+
+<p>The choice is not stylistic. A function with no dependencies can be imported by anything, which
+is precisely the property that let the cancellation rule be shared between two layers that cannot
+import each other. Reach for a class when there is per-request state; reach for a function when
+there is not.</p>
+
+<h2>Where the enum lives, and why it matters</h2>
+
+<p>A small example of "one rule, one home" that pays for itself repeatedly:</p>
+
+<pre class="language-python"><code class="language-python">class BookingStatus(StrEnum):
+    PENDING = "PENDING"      # dates held, not yet paid
+    CONFIRMED = "CONFIRMED"  # paid
+    CANCELLED = "CANCELLED"
+    COMPLETED = "COMPLETED"
+
+    @classmethod
+    def blocking(cls) -&gt; tuple["BookingStatus", ...]:
+        """The statuses that occupy a property's calendar.
+
+        Used by both the availability service and the database's exclusion constraint — they must
+        agree, so they read the same definition.
+        """
+        return (cls.PENDING, cls.CONFIRMED, cls.COMPLETED)</code></pre>
+
+<p>"Which statuses block a calendar" is a domain fact with two consumers, one of them a database
+constraint. Putting it on the enum means there is exactly one answer. In the fat-route version above
+it was an inline list, which is fine right up until the day somebody adds a status and updates two
+of the three places it appears.</p>
+
+<h2>Testability is the real payoff</h2>
+
+<p>The argument for layers is usually made aesthetically, which is unconvincing. The concrete
+version: this is a test of a real business rule, with no HTTP anywhere.</p>
+
+<pre class="language-python"><code class="language-python">def book(db, listing, guest, start_offset: int, nights: int, status=BookingStatus.CONFIRMED):
+    check_in = TODAY + timedelta(days=start_offset)
+    check_out = check_in + timedelta(days=nights)</code></pre>
+
+<p>Because the pricing and booking rules live in services that take a session and plain arguments,
+they can be exercised directly. StayHub's suite runs a hundred tests in under three seconds, and
+most of them never construct a request. The ones that do &mdash; and there is a class of bug only
+they can find &mdash; are lesson 14.</p>
+
+<h2>Everything else that lives beside the app</h2>
+
+<p>Three directories sit outside <code>app/</code> and are easy to place badly.</p>
+
+<p><strong><code>alembic/</code> owns the schema.</strong> Migrations are not application code and
+do not import services. The one file worth configuring carefully is <code>alembic/env.py</code>,
+which needs to see every model for autogenerate to work &mdash; import the declarative
+<code>Base</code> and the models package, and set <code>target_metadata</code> from it. The
+non-negotiable rule: <strong>never edit a migration that has been applied anywhere</strong>. Write
+a new one. An edited migration means two databases with the same version and different schemas, and
+nothing will tell you.</p>
+
+<p><strong><code>tests/</code> mirrors the layers, not the files.</strong> StayHub's suite splits
+by what is being tested rather than by module:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">tests/
+├── conftest.py                shared fixtures — the rollback session
+├── test_pricing.py            a pure function, no database
+├── test_cancellation_policy.py a pure function, no database
+├── test_booking_service.py    service rules, real database
+├── test_security.py           JWT and hashing
+├── test_api_admin.py          through HTTP — pagination, authorization
+├── test_api_uploads.py        through HTTP — every upload guard
+└── test_api_middleware.py     through HTTP — things only the stack can show</code></pre>
+
+<p>The split is informative in itself: the first two need nothing, the middle three need a session,
+and the last three need the whole application. That gradient is a direct consequence of the layers,
+and it is why most of the suite is fast.</p>
+
+<p><strong><code>scripts/</code> is for things run by hand.</strong> Seeding, benchmarks,
+one-off migrations of data rather than schema. They import the app, so they live outside it.</p>
+
+<h2>Small conventions that save time</h2>
+
+<p><strong>Absolute imports, always.</strong> <code>from app.services.booking_service import
+BookingService</code>, never <code>from ..services import</code>. Relative imports break when a
+file moves and read differently depending on where you are, and the saving is a few characters.</p>
+
+<p><strong>Keep <code>__init__.py</code> empty.</strong> The temptation is to re-export everything
+for shorter imports. The cost is that importing anything imports everything, which is how a
+circular import appears between two modules that do not reference each other. StayHub's package
+files are empty and its import graph stays a tree.</p>
+
+<p><strong>Name the layer in the filename.</strong> <code>booking_service.py</code>,
+<code>booking_repository.py</code> &mdash; not <code>booking.py</code> in four directories. Editors
+open files by name, and four tabs called <code>booking.py</code> is a small tax paid all day.</p>
+
+<p><strong>Group a subsystem by feature, not by layer.</strong> <code>search/</code> holds its
+client, its index mapping, its indexer and its queries together, because they change together and
+are used as a unit. Layers are the default; a cohesive subsystem is the exception worth making.</p>
+
+<h2>Where the search subsystem lives, and why it is different</h2>
+
+<p><code>search/</code> breaks the layer rule deliberately, and the exception is instructive.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">app/search/
+├── client.py     the Elasticsearch connection, and whether it is reachable
+├── index.py      the index mapping
+├── indexer.py    the Postgres -> Elasticsearch sink
+└── queries.py    building a query, and turning hits into DTOs</code></pre>
+
+<p>Those four files are a client, a schema, a writer and a reader &mdash; one of each layer, grouped
+by <em>feature</em> rather than by kind. That is the right call because they change together: adding
+a filterable field touches the mapping, the indexer and the query in one commit, and splitting them
+across four top-level directories would make one change a tour of the codebase.</p>
+
+<p>The rule that emerges: <strong>layers by default, feature packages for subsystems that are used
+as a unit.</strong> A subsystem qualifies when it has its own vocabulary, its own failure modes, and
+a boundary you could plausibly replace &mdash; swapping Elasticsearch for something else should
+touch one directory.</p>
+
+<p>What keeps it honest is that the boundary is real. Nothing outside <code>search/</code> imports
+the Elasticsearch client, and the sink is called from the service layer rather than from routes:</p>
+
+<pre class="language-python"><code class="language-python">    from app.search import indexer
+
+    indexer.index_property(prop)  # removes it from the index — SUSPENDED is not visible</code></pre>
+
+<p>Note the local import. That one is a legitimate use rather than a smell: it keeps a route module
+from importing the search stack at module load, which matters because the search client tries to
+connect on import.</p>
+
+<h2>When not to do any of this</h2>
+
+<p>A structure has a cost, paid in indirection every time you read the code. Six layers for six
+endpoints is worse than one file, not better.</p>
+
+<p>A reasonable progression:</p>
+
+<table>
+  <thead><tr><th>Size</th><th>Structure</th></tr></thead>
+  <tbody>
+    <tr><td>a handful of endpoints</td><td>one <code>main.py</code>. Genuinely fine.</td></tr>
+    <tr><td>~10&ndash;20</td><td>split routes into <code>routers/</code>, add <code>schemas.py</code>, <code>models.py</code>, <code>config.py</code></td></tr>
+    <tr><td>20+, or a real domain</td><td>the full layout above</td></tr>
+    <tr><td>several teams</td><td>separate services, and this becomes each one's internal shape</td></tr>
+  </tbody>
+</table>
+
+<p>Two signals that you have reached the next step, both more reliable than a file-length rule.
+<strong>The same logic appears in two endpoints</strong> &mdash; extract a service. <strong>You
+cannot test a rule without spinning up a client</strong> &mdash; the rule is in the wrong layer.</p>
+
+<p>What you should not do is build the full tree on day one for an application that might have
+eight endpoints forever. Structure is a response to pressure, and inventing the pressure is how a
+small project acquires a large project's overhead with none of its problems.</p>
+
+<p>Next: <strong>dependency injection</strong> &mdash; the mechanism that connects these layers,
+and the reason a route signature can declare its own security rules.</p>
