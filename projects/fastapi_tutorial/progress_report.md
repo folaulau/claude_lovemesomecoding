@@ -1,7 +1,7 @@
 # FastAPI tutorial track — progress report
 
-**Status:** WRITTEN AND SEEDED TO **local** — all 18 post bodies exist, pass every check, and are
-in the local content tree with the category record fixed. NOT published to prod.
+**Status:** ✅ **PUBLISHED AND LIVE** — 18 posts on https://lovemesomecoding.com/fastapi, all 18
+URLs verified serving at the edge. Build `394b0bd`, deployed 2026-08-21.
 **Started:** 2026-08-21
 **Where it lands:** https://lovemesomecoding.com/fastapi
 
@@ -339,7 +339,7 @@ Feeds post **17**.
 | Post bodies | ✅ **18 of 18**, 54,300 words, 357 code blocks |
 | Category record fixed | ✅ `"FastAPI"` + a real description |
 | Seeded to `local` | ✅ archive holds 18, dates in reading order, 9 frozen URLs preserved |
-| Published to `prod` | ⬜ **not done** — awaiting review |
+| Published to `prod` | ✅ seeded, site rebuilt, CloudFront invalidated, 18/18 URLs verified live |
 
 ---
 
@@ -591,11 +591,58 @@ tree          652 -> 661 published posts
 
 ---
 
+## Published — 2026-08-21
+
+`seed.py --env prod --write --force-dates` ran once, then `npm run deploy`.
+
+### Before writing, a rollback snapshot was taken
+
+The nine original post objects plus every index the publish touches
+(`index/posts.json`, `index/categories.json`, `index/by-category/fastapi.json`,
+`search/index.json`) — 13 files, saved outside the repo. Restoring is a straight `aws s3 cp` back,
+followed by a rebuild.
+
+### The deploy
+
+```
+next build          854 static pages generated
+verify-build        posts served       661/661
+                    categories served  42/42
+                    pages redirected   94
+                    index cross-check  42/42 category counts agree
+                    all indexed URLs accounted for
+deploy.sh           1731 files -> s3://lovemesomecoding.com  (build 394b0bd)
+                    CloudFront function republished (94 redirects, 6.2 KB / 10 KB)
+                    invalidation IAY26TZXKW1LF1VR91YZ4USBT8 — complete
+                    edge serves 394b0bd  (match)
+```
+
+`verify-build.mjs` passing is the guard that matters here: it fails the build if any indexed post
+URL stops resolving, and all nine 2023 URLs were rewritten in place rather than replaced.
+
+### Verified live
+
+```
+9 rewritten URLs   200 × 9
+9 new URLs         200 × 9
+/fastapi archive   18 post links, title "FastAPI Tutorials", description rendering
+content            new opening present; "E-Commerce" / "Blazing Fast Performance" gone
+highlighting       16 python blocks on lesson 1, Prism tokens present
+measurements       7.9ms / 19.8ms / "async 289% slower" all rendered
+sitemap            18 fastapi URLs
+unaffected tracks  / /hasura /python /java /oracle all 200
+```
+
+---
+
 ## Outstanding
 
-1. **Review the 18 posts**, then `seed.py --env prod --write --force-dates` (once).
-2. **Decide on length** &mdash; accept 13&ndash;15 min, or merge pairs to reach the band.
-3. **Commit the StayHub additions** &mdash; 10 modified, 11 new files in
-   `lovemesomecoding_demo_project`, all uncommitted.
-4. **`--force-dates` is needed exactly once per tree.** Already used on `local`; prod still needs
-   it, or nine 2023 posts interleave with nine 2026 ones.
+1. **Decide on length** &mdash; the posts are live at 13&ndash;15 min against an agreed
+   15&ndash;20. Accept, or merge two adjacent pairs (13+15, 11+12) and republish.
+2. **Commit the StayHub additions** &mdash; 23 uncommitted files in
+   `lovemesomecoding_demo_project` (middleware, logging, uploads, notifications, async session,
+   Dockerfile, 42 new tests). The published posts quote this code, so it should not stay
+   uncommitted.
+3. **Commit this project** &mdash; `manifest.py`, both checkers, `seed.py`, `posts/`, this report.
+4. **`--force-dates` has now been used on both trees.** Do not pass it again unless the manifest
+   dates change; a re-run without it is safe and idempotent.
