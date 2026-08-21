@@ -80,13 +80,26 @@ def main() -> int:
     parser.add_argument("--force-dates", action="store_true",
                         help="stamp the manifest date onto posts that already exist. "
                              "Needed once, to reorder the rewritten 2019 post.")
+    parser.add_argument("--only", default=None,
+                        help="comma-separated slugs to seed, instead of the whole track. "
+                             "For previewing a post while the rest are still unwritten — the "
+                             "track is not publishable until every file exists.")
     parser.add_argument("--author", default="folauk")
     args = parser.parse_args()
+
+    posts = manifest.POSTS
+    if args.only:
+        wanted = [slug.strip() for slug in args.only.split(",") if slug.strip()]
+        known = {entry["slug"] for entry in manifest.POSTS}
+        unknown = [slug for slug in wanted if slug not in known]
+        if unknown:
+            raise SystemExit(f"not in the manifest: {', '.join(unknown)}")
+        posts = [entry for entry in manifest.POSTS if entry["slug"] in wanted]
 
     config, post_service, category_service = load_backend(args.env)
     prefix = config.db_prefix()
     print(f"target  s3://{config.DB_BUCKET}/{prefix}/")
-    print(f"posts   {len(manifest.POSTS)}")
+    print(f"posts   {len(posts)}" + (f" of {len(manifest.POSTS)} (--only)" if args.only else ""))
     print(f"mode    {'WRITE' if args.write else 'dry run'}\n")
 
     index_before = len(post_service.list_posts())
@@ -95,7 +108,7 @@ def main() -> int:
     # Fail early rather than half-seeding: every file must exist and no slug may
     # already belong to a different category.
     bodies = {}
-    for entry in manifest.POSTS:
+    for entry in posts:
         bodies[entry["slug"]] = read_post_html(entry)
         existing = post_service.get_post(entry["slug"])
         if existing and existing.get("category") != manifest.CATEGORY["slug"]:
@@ -105,7 +118,7 @@ def main() -> int:
             )
 
     if not args.write:
-        for entry in manifest.POSTS:
+        for entry in posts:
             existing = post_service.get_post(entry["slug"])
             state = "update" if existing else "create"
             note = ""
@@ -121,7 +134,7 @@ def main() -> int:
     category = category_service.upsert_category(manifest.CATEGORY)
     print(f"category {category['slug']} -> {category['url']}")
 
-    for entry in manifest.POSTS:
+    for entry in posts:
         if args.force_dates:
             # upsert_post keeps `existing["date"]`, so the only way to move a
             # published post's date is to change it on the stored object first.

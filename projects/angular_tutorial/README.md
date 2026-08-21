@@ -27,7 +27,8 @@ The 28-post topic table, the manifest and the tooling are done, and the demo app
 snippet comes from `lovemesomecoding_demo_project/pizza/pizza-angular-frontend` (Angular 21.2,
 TypeScript 5.9, Bootstrap 5 + Sass, NgRx 21, standalone and zoneless).
 
-**No post body is written yet — that is the remaining job.**
+**1 of 28 post bodies written** (`angular-component`, lesson 4 — the one indexed URL, chosen first
+so the house style is settled before 27 posts inherit it). The other 27 are the remaining job.
 
 Four examples the track needed were added to the app and are covered by new unit tests: an
 `Autofocus` directive, a debounced menu search, a `CanDeactivate` guard on checkout, and a Vitest
@@ -58,6 +59,19 @@ AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/angular_tut
 2019-07-31, so without this flag it keeps that timestamp and sorts to the back of the track.
 **Needed exactly once, on the first prod publish** — every run without it leaves the archive alone,
 which is what you want the rest of the time.
+
+### `--only`
+
+`seed.py` normally refuses to run while any post file is missing, which is right for publishing and
+useless for drafting. `--only` seeds a subset so a post can be previewed at `:3000` while the rest
+of the track is still unwritten:
+
+```bash
+AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/angular_tutorial/seed.py \
+  --env local --only angular-component --write
+```
+
+It does not make the track publishable — a full `--env prod` run still needs all 28 files.
 
 ### Re-dating the track
 

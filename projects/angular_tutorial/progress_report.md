@@ -1,6 +1,6 @@
 # Angular tutorial track — progress report
 
-**Status:** READY TO AUTHOR — demo app built, gaps closed, tooling verified. Post bodies not started.
+**Status:** AUTHORING — 1 of 28 post bodies written and previewed. Demo app built, gaps closed.
 **Started:** 2026-08-20
 **Where it lands:** https://lovemesomecoding.com/angular
 
@@ -25,7 +25,7 @@ Every code sample comes from `lovemesomecoding_demo_project/pizza/pizza-angular-
 | `seed.py` / `check_content.py` | ✅ both run clean |
 | Content pipeline | ✅ `scss` support added (see below) |
 | Demo app | ✅ built, and the four missing examples added |
-| Post bodies | ⛔ **none written** — this is the whole remaining job |
+| Post bodies | 🟡 **1 of 28** — `angular-component` written, seeded to the local tree and rendered at `:3000` |
 
 ## The demo app
 
@@ -178,6 +178,39 @@ by design.
 not reproduce on two later runs and passed in isolation. It was started while the dev server was
 still rebuilding after an edit. **If those two fail again, suspect leftover fixtures from an
 interrupted run before suspecting the code** — the suite is serial against one database.
+
+## Lesson 4 — `angular-component` (written 2026-08-20)
+
+Written first, out of order, deliberately: it is the only indexed URL in the collection and the only
+one currently empty, and settling the house style on it means 27 posts inherit a decided style
+rather than setting one.
+
+1081 words, 12 headings, 9 code blocks, all highlighted. Verified:
+
+- `check_content.py` — round-trips byte-for-byte.
+- **Snippets diffed against the app**, which `check_content.py` does NOT do: `main.ts`, `app.ts` and
+  `index.html` match verbatim, and `spinner.ts` matches exactly once its teaching comment is
+  stripped. Worth repeating for every post — the check proves the HTML is stable, not that a quote
+  is still true.
+- Rendered at `:3000`: 223 Prism token spans, all 12 headings anchored, Angular markup showing as
+  literal `<app-greeting />` rather than being eaten.
+
+Style settled here, for the rest of the track to follow:
+
+- Escape code blocks **programmatically**, never by hand. One missed `&lt;` is invisible until it
+  renders, and there are hundreds per post.
+- `language-typescript` for `.ts`, `language-markup` for templates and HTML, `language-bash` for CLI.
+- Open with a two-or-three-line invented example to make the idea concrete, then immediately show
+  the real thing from the demo app. Lesson 5 of the React track does the same.
+- Quote the app **verbatim**, minus its `ANGULAR CONCEPT:` teaching comments — those are the
+  tutorial's job, and repeating them in the post says everything twice.
+- Keep the React comparison to a sentence where it genuinely helps, not a running commentary.
+
+### `seed.py --only`
+
+Added while writing this. `seed.py` refuses to run while any file is missing — correct for
+publishing, useless for drafting — so `--only <slugs>` seeds a subset for preview. It does not make
+the track publishable.
 
 ## Next steps
 
