@@ -1,0 +1,158 @@
+<p>Hasura points at a database you already have and gives you a working GraphQL API over it
+immediately &mdash; filtering, sorting, pagination, relationships, aggregates and row-level
+permissions &mdash; without you writing a single resolver. That is the whole pitch, and it is worth
+being precise about what it does and does not mean before spending twenty lessons on it.</p>
+
+<h2>What you actually get</h2>
+
+<p>Give Hasura a Postgres connection string and tell it which tables to expose. That is the entire
+setup. This query is running against the demo application this track uses, on a real engine:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  properties(orderBy: {ratingAverage: DESC}, limit: 2) {
+    title
+    city
+    ratingAverage
+    host { firstName isHost }
+    images(limit: 1) { url }
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{
+  "data": {
+    "properties": [
+      {
+        "title": "Oceanfront Villa, Private Steps to Sand",
+        "city": "Maui",
+        "ratingAverage": 4.98,
+        "host": { "firstName": "Marcus", "isHost": true },
+        "images": [ { "url": "https://images.unsplash.com/photo-1613490493576-..." } ]
+      },
+      {
+        "title": "Lakefront A-Frame",
+        "city": "Lake Tahoe",
+        "ratingAverage": 4.96,
+        "host": { "firstName": "Priya", "isHost": true },
+        "images": [ { "url": "https://images.unsplash.com/photo-1449844908441-..." } ]
+      }
+    ]
+  }
+}</code></pre>
+
+<p>Nobody wrote code to produce that. <code>host</code> and <code>images</code> are separate tables;
+Hasura joined them because foreign keys exist, and it did it in one SQL query rather than one per
+row. Aggregates come free too:</p>
+
+<pre class="language-graphql"><code class="language-graphql">query {
+  propertiesAggregate {
+    aggregate { count avg { pricePerNight } }
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{"data":{"propertiesAggregate":{"aggregate":{"count":12,"avg":{"pricePerNight":261.6666666666667}}}}}</code></pre>
+
+<h2>The thing most tutorials skip</h2>
+
+<p>That request was sent with <strong>no authentication header at all</strong>, and it still returned
+data. That is not Hasura being insecure &mdash; it is a configured role for anonymous visitors, and
+it is allowed to read published listings and nothing else.</p>
+
+<p>Watch what happens when the same unauthenticated request asks for bookings:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "errors": [
+    {
+      "message": "field 'bookings' not found in type: 'query_root'",
+      "extensions": { "path": "$.selectionSet.bookings", "code": "validation-failed" }
+    }
+  ]
+}</code></pre>
+
+<p>Read that error carefully, because it is the single most important idea in Hasura. The query did
+not return an empty list, and it did not return &ldquo;permission denied&rdquo;. The field
+<strong>does not exist</strong>. Permissions in Hasura do not filter results out of a fixed schema
+&mdash; they <em>shape the schema itself</em>, per role. A visitor cannot ask about a table they have
+no permission on, because as far as their API is concerned there is no such table. Introspection
+shows them a smaller API than an administrator sees.</p>
+
+<p>Send the same query with the admin secret and both tables are there:</p>
+
+<pre class="language-json"><code class="language-json">{"data":{"bookingsAggregate":{"aggregate":{"count":3}},
+         "propertiesAggregate":{"aggregate":{"count":12}}}}</code></pre>
+
+<h2>What Hasura is not</h2>
+
+<p>It is not an application server. It does not log anyone in &mdash; it verifies a token something
+else issued. It does not run your business rules, send your email, or charge anyone&rsquo;s card. The
+moment a request needs to do more than read or write rows under a permission rule, it belongs
+somewhere else and Hasura&rsquo;s job is to route to it.</p>
+
+<p>Teams get into trouble by trying to push real logic into the database to keep everything inside
+Hasura. The demo app in this track deliberately does the opposite: every read is a GraphQL query, and
+every write that means something goes through its own backend. Lesson 6 covers where that line
+belongs.</p>
+
+<h2>There are two products: Hasura v2 and Hasura v3 (DDN)</h2>
+
+<p>This is the part that wastes people&rsquo;s afternoons. <strong>Hasura v2 and Hasura v3 (DDN) are
+different products, not two releases of one.</strong> Terminology does not carry over, the CLI is a
+different binary, and a v2 answer pasted into a v3 project does not work.</p>
+
+<table>
+<thead>
+<tr>
+<th>Item</th><th>Hasura v2</th><th>Hasura v3 (DDN)</th><th>What actually changes</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Where you configure it</td><td>The web Console — click to track a table, click to add a permission</td><td><code>.hml</code> files in your editor, driven by the <code>ddn</code> CLI and a VS Code extension</td><td>Code-first. The DDN console is for testing, traces and analytics, not authoring.</td></tr>
+<tr><td>Exposing a table</td><td><strong>Track</strong> the table</td><td>Add a <strong>Model</strong> (<code>ddn model add</code>)</td><td>The word changes and so does the mechanism: a Model is a metadata object you keep in git, not a row in the engine&#x27;s state.</td></tr>
+<tr><td>Custom logic in the schema</td><td><strong>Actions</strong> — declare types, point at an HTTP endpoint</td><td><strong>Commands</strong> on a <strong>lambda connector</strong></td><td>You write a TypeScript/Python/Go function in the project instead of hosting a webhook and describing it.</td></tr>
+<tr><td>On a schedule</td><td><strong>Cron / scheduled triggers</strong></td><td>❌ <strong>Not supported</strong></td><td>⚠️ No replacement. This one is simply gone.</td></tr>
+<tr><td>Admin access</td><td><code>HASURA_GRAPHQL_ADMIN_SECRET</code> grants the unrestricted built-in <code>admin</code> role</td><td>❌ <strong>There is no admin secret</strong></td><td>⚠️ The biggest surprise in this table. Every v2 habit built on the admin secret — seeding, scripts, the console — needs rethinking. API access uses a Cloud PAT (<code>cloud_pat</code> header).</td></tr>
+</tbody>
+</table>
+
+<p>Those five rows are the orientation; the full item-by-item comparison &mdash; thirty-three rows of
+it &mdash; is in the getting started lesson at the end of the track. Two rows above deserve flagging
+now, because they surprise people: <strong>DDN has no admin secret at all</strong>, and
+<strong>cron triggers do not exist in v3</strong>.</p>
+
+<h3>v2 or v3 &mdash; which should you learn?</h3>
+
+<p>Both, in that order, and this track is built that way. v2 is what the overwhelming majority of
+running Hasura installations are, it is what you will be asked about, and its concepts &mdash;
+permissions shaping the schema, roles, session variables, relationships &mdash; carry into v3 even
+when the syntax does not. Every lesson here teaches v2 against a running engine, then says what the
+same idea looks like in v3.</p>
+
+<h2>The versions this track is written against</h2>
+
+<p>Every v2 example in these twenty lessons was executed against this stack before it was quoted:</p>
+
+<pre class="language-bash"><code class="language-bash">$ curl -s http://localhost:8081/v1/version
+{"server_type":"ce","version":"v2.42.0"}</code></pre>
+
+<p>Hasura GraphQL Engine <strong>v2.42.0</strong>, Community Edition, over Postgres 16, with the
+Hasura CLI at v2.40.0. <code>server_type: ce</code> matters and this track will say so again:
+response caching, allow-lists and rate limiting are Enterprise and Cloud features. Where a lesson
+covers one, it labels it rather than pretending to demonstrate it.</p>
+
+<p>The v3 half is different and the track is honest about it: it is written from the official Hasura
+DDN documentation as read on <strong>2026-08-21</strong>, and was not run locally. v3 sections show
+configuration, never claimed output.</p>
+
+<h2>The application every example comes from</h2>
+
+<p>All of it comes from <strong>StayHub</strong>, a short-let booking app &mdash; listings, hosts,
+guests, bookings, reviews. It runs Hasura next to a FastAPI backend sharing one JWT, with four roles:
+<code>anonymous</code>, <code>customer</code>, <code>host</code> and <code>staff</code>. It is a real
+application with a real permission model, which is why its examples have awkward edges that invented
+ones never do.</p>
+
+<h2>Where to go next</h2>
+
+<p>Lesson 2 gets an engine running next to Postgres and gets you into the console. From there the
+track runs foundations, then the data API, then auth, then everything beyond the database, then what
+it takes to put it in production &mdash; finishing with two lessons on v3 and a set of interview
+questions.</p>

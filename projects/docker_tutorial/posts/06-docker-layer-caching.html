@@ -1,0 +1,128 @@
+<p>One rule explains most of the difference between a Dockerfile that rebuilds in eight seconds and
+one that takes a minute and a half:</p>
+
+<p><strong>Copy the dependency manifest and install dependencies before you copy your source.</strong></p>
+
+<p>Here is what it is worth, measured on the API image in this track. Same Dockerfile, same machine,
+three different changes:</p>
+
+<pre class="language-bash"><code class="language-bash">nothing changed          0s
+a file added to src/     8s
+one line added to pom.xml       92s</code></pre>
+
+<p>Eleven times slower, for a change to a file the compiler barely reads. Understanding why is the
+whole lesson.</p>
+
+<h2>How the cache decides</h2>
+
+<p>Docker walks the Dockerfile top to bottom. For each instruction it computes a key and looks for a
+layer already built with that key. On a hit it reuses the layer and moves on; <strong>on the first
+miss it rebuilds that instruction and every single one after it</strong>, hit or not.</p>
+
+<p>That last part is the whole game. The cache is a prefix, not a set. One early miss invalidates
+everything downstream.</p>
+
+<p>The key depends on the instruction:</p>
+
+<p>For <code>COPY</code> and <code>ADD</code>, it is a <strong>checksum of the file contents</strong>
+being copied, plus the layer below. Not the timestamp — <code>touch pom.xml</code> changes nothing,
+which surprises people who expect <code>make</code> semantics.</p>
+
+<p>For <code>RUN</code>, it is the <strong>literal command string</strong>, plus the layer below.
+Docker does not run the command to see whether the result changed. <code>RUN apt-get update</code>
+is one string forever, so it can be reused for months and hand you a stale package index — which is
+why it belongs chained to the <code>install</code> it feeds.</p>
+
+<h2>The ordering, applied</h2>
+
+<p>The API's build stage, with the ordering that produced those numbers:</p>
+
+<pre class="language-docker"><code class="language-docker">COPY .mvn/ .mvn/
+COPY mvnw pom.xml ./
+RUN ./mvnw -B dependency:go-offline || true
+COPY src/ src/
+RUN ./mvnw -B clean package -DskipTests</code></pre>
+
+<p>Read it as two halves. Everything above <code>COPY src/</code> depends only on
+<code>pom.xml</code>, which changes when you add a dependency — a few times a year. Everything below
+depends on your source, which changes constantly.</p>
+
+<p>So an ordinary code change misses at <code>COPY src/</code>, and the expensive dependency
+resolution above it is a cache hit. That is the 8 seconds.</p>
+
+<p>Write it the obvious way instead:</p>
+
+<pre class="language-docker"><code class="language-docker"># Don't. Every one-character edit re-downloads the dependency tree.
+COPY . .
+RUN ./mvnw -B clean package -DskipTests</code></pre>
+
+<p>and every change misses at <code>COPY . .</code>, because the checksum of "everything" includes
+your source. That is the 92 seconds, on every single build.</p>
+
+<p>The same shape in Node, for exactly the same reason:</p>
+
+<pre class="language-docker"><code class="language-docker">COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build</code></pre>
+
+<p><code>npm ci</code> rather than <code>npm install</code>, incidentally: it installs exactly the
+lockfile, fails loudly if <code>package.json</code> and the lockfile disagree, and never rewrites
+the lockfile. That is the difference between a build that is reproducible and one that is merely
+repeatable.</p>
+
+<h2>Watch the cache work</h2>
+
+<pre class="language-bash"><code class="language-bash">$ docker build -t pizza-api:dev .
+ => [build 3/8] COPY .mvn/ .mvn/                                     CACHED
+ => [build 4/8] COPY mvnw pom.xml ./                                 CACHED
+ => [build 5/8] RUN ./mvnw -B dependency:go-offline || true          CACHED
+ => [build 6/8] COPY src/ src/                                       0.1s
+ => [build 7/8] RUN ./mvnw -B clean package -DskipTests              6.8s</code></pre>
+
+<p><code>CACHED</code> down to the first real change, then work. If you see the first
+<code>CACHED</code> disappear on a build where you only touched source, your <code>COPY</code> order
+is wrong.</p>
+
+<h2>Cache mounts, for the part ordering cannot fix</h2>
+
+<p>Ordering keeps the dependency layer cached while <code>pom.xml</code> holds still. It does
+nothing for the case where <code>pom.xml</code> <em>does</em> change — you add one dependency and
+Maven re-downloads all four hundred, because the layer that held them was invalidated.</p>
+
+<p>BuildKit's cache mounts fix that. A mount is a directory that persists across builds and is
+<strong>not</strong> part of any layer:</p>
+
+<pre class="language-docker"><code class="language-docker">RUN --mount=type=cache,target=/root/.m2 \
+    ./mvnw -B clean package -DskipTests</code></pre>
+
+<pre class="language-docker"><code class="language-docker">RUN --mount=type=cache,target=/root/.npm \
+    npm ci</code></pre>
+
+<p>Now a changed <code>pom.xml</code> re-runs Maven, but Maven finds its downloads already in
+<code>~/.m2</code> and only fetches what is genuinely new.</p>
+
+<p>Two caveats, both real. The cache is <strong>local to the builder</strong>, so a fresh CI runner
+starts empty — lesson 20 covers <code>cache-from</code>/<code>cache-to</code>, which is the CI
+answer. And because the mount is not a layer, nothing in it ends up in your image; that is the point,
+but it means the build must still produce its output outside the mount.</p>
+
+<h2>Two habits that quietly destroy the cache</h2>
+
+<p><strong>A version or a timestamp early in the file.</strong></p>
+
+<pre class="language-docker"><code class="language-docker">ARG BUILD_DATE
+ENV BUILD_DATE=$BUILD_DATE     # ← at the top: nothing below this ever caches again
+COPY package.json ./
+RUN npm ci</code></pre>
+
+<p>The value changes every build, so every layer after it rebuilds. Move it to the last line, where
+nothing depends on it.</p>
+
+<p><strong>An unbounded <code>COPY</code> before an expensive step.</strong> <code>COPY . .</code>
+early is the same mistake in a different costume — and lesson 5's <code>.dockerignore</code> is
+part of the fix, because a README that nothing reads can still bust the cache if it is inside a
+<code>COPY . .</code>.</p>
+
+<p>Next: <a href="/docker/docker-multi-stage-builds">building in one image and shipping from
+another</a>.</p>

@@ -1,0 +1,122 @@
+<p>Run a build and watch the first line:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker build .
+[+] Building
+ => transferring context: 189.74MB                                    2.0s</code></pre>
+
+<p>That happens <strong>before Docker reads a single instruction</strong>. The dot at the end of
+<code>docker build .</code> is not decoration — it is an argument, and it names the directory that
+gets packed up and handed to the builder.</p>
+
+<p>That directory is the <strong>build context</strong>, and understanding it explains a build that
+appears to hang doing nothing, a <code>COPY</code> that cannot find an obvious file, and one of the
+easier ways to leak a credential.</p>
+
+<h2>Why it works this way</h2>
+
+<p>The builder is not your shell. On this machine it is inside a Linux VM; on a CI runner or a
+remote builder it is another host entirely. It has no access to your filesystem, so anything
+<code>COPY</code> might want has to be sent to it first.</p>
+
+<p>Two rules follow, and they cover most build confusion:</p>
+
+<p><strong>Every <code>COPY</code> path is relative to the context, not to the Dockerfile.</strong>
+Even when the Dockerfile lives somewhere else entirely.</p>
+
+<p><strong><code>COPY ../shared/lib .</code> cannot work.</strong> Not "is discouraged" — cannot.
+The parent directory was never sent. The error is
+<code>forbidden path outside the build context</code>, and the fix is to build from a context high
+enough to include everything you need:</p>
+
+<pre class="language-bash"><code class="language-bash">docker build -f pizza-springboot-backend/Dockerfile pizza-springboot-backend
+#              └── which Dockerfile ──┘             └──── the CONTEXT ────┘</code></pre>
+
+<p><code>-f</code> and the context argument are independent. That is how a monorepo builds one
+service with a Dockerfile stored next to it and a context that reaches shared code.</p>
+
+<h2>What it costs to get wrong</h2>
+
+<p>The React frontend, measured both ways on this machine:</p>
+
+<pre class="language-bash"><code class="language-bash">$ du -sh node_modules
+232M    node_modules
+
+# with .dockerignore
+ => transferring context: 5.69kB
+
+# with .dockerignore temporarily removed
+ => transferring context: 189.74MB                                    2.0s</code></pre>
+
+<p><strong>189.74 MB versus 5.69 kB</strong>, for a build whose Dockerfile copies
+<code>package.json</code>, <code>package-lock.json</code> and <code>src/</code>. Everything else was
+sent for nothing.</p>
+
+<p>Two seconds is survivable locally. On a CI runner pushing a context to a remote builder over a
+network it is not, and it happens on every single build.</p>
+
+<h2>It is a correctness problem too</h2>
+
+<p>This is the part that matters more than the speed.</p>
+
+<p><code>node_modules</code> holds binaries compiled for <strong>this</strong> machine — macOS,
+arm64. The build runs <code>npm ci</code> inside Alpine Linux. If a stray <code>COPY . .</code>
+drags the host's <code>node_modules</code> in, the build either fails with an error blaming esbuild,
+or succeeds and produces an image that dies at start-up. Neither error mentions the copy.</p>
+
+<p>Same shape for Java: <code>target/</code> holds classes compiled by the JDK on your laptop.
+Letting them into the context risks the build reusing them instead of compiling fresh — which is
+precisely how "it works on my machine" becomes an image nobody can reproduce.</p>
+
+<h2>.dockerignore</h2>
+
+<p>Same syntax as <code>.gitignore</code>, sits at the root of the context, filters what gets
+packed. Here is the React frontend's, in full:</p>
+
+<pre class="language-bash"><code class="language-bash">node_modules/
+dist/
+
+test-results/
+playwright-report/
+screenshots/
+e2e/
+
+.env
+.env.local
+
+.git/
+.gitignore
+.idea/
+.vscode/
+
+README.md
+Dockerfile
+.dockerignore</code></pre>
+
+<p>Four groups, each for a different reason.</p>
+
+<p><strong>Big and wrong</strong> — <code>node_modules/</code>, <code>dist/</code>. The image builds
+its own; a stale local copy could be used instead of the fresh one.</p>
+
+<p><strong>Big and irrelevant</strong> — Playwright output, screenshots. 2.3 MB of PNGs that no
+instruction copies.</p>
+
+<p><strong>Dangerous</strong> — <code>.env.local</code> holds a real Stripe key, and
+<code>.git/</code> holds every version of every file ever committed, including any secret that was
+committed and later removed. ⚠️ Remember lesson 3: a file copied into a layer is in that layer
+permanently. A later <code>RUN rm</code> hides it and ships it.</p>
+
+<p><strong>Cache-busting</strong> — <code>README.md</code>, the Dockerfile itself. Nothing copies
+them, but if a <code>COPY . .</code> is ever added, editing the README would invalidate every layer
+after it. Excluding them makes the cache depend only on things that matter.</p>
+
+<h2>Check what you are actually sending</h2>
+
+<p>You do not have to guess:</p>
+
+<pre class="language-bash"><code class="language-bash">docker build --progress=plain --no-cache . 2>&1 | grep "transferring context"</code></pre>
+
+<p>If that number is much larger than your source tree, something is being sent that should not be.
+It is a ten-second check and it is the first thing to run on a build that feels slow.</p>
+
+<p>Next: <a href="/docker/docker-layer-caching">why the second build is instant, and how to keep
+it that way</a>.</p>

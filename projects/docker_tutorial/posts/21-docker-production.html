@@ -1,0 +1,160 @@
+<p>Lesson 17 ended with a list of everything the compose file in this track is not good enough for.
+This is that list, worked through — which of it Docker can fix, and where you have genuinely run out
+of Docker.</p>
+
+<h2>Restart policies</h2>
+
+<pre class="language-yaml"><code class="language-yaml">    restart: unless-stopped</code></pre>
+
+<p>Four values:</p>
+
+<pre class="language-bash"><code class="language-bash">no               the default. It stays dead.
+on-failure[:5]   restart on a non-zero exit, optionally capped
+always           restart whatever happens, including after a daemon restart
+unless-stopped   like always, except a container YOU stopped stays stopped</code></pre>
+
+<p><code>unless-stopped</code> is the usual right answer. The difference from <code>always</code>
+only shows up on reboot: with <code>always</code>, a container you deliberately stopped last week
+comes back.</p>
+
+<p>⚠️ A restart policy is not a health policy. It reacts to the process <em>exiting</em>. An
+application that is deadlocked, or returning 500 to everything, is still running — Docker sees a
+healthy process and does nothing. A healthcheck marks it <code>unhealthy</code> and still does not
+restart it; plain Docker has no mechanism for that. Swarm and Kubernetes do.</p>
+
+<h2>Resource limits, and the JVM</h2>
+
+<p>Without limits, one container can consume the machine and take everything else with it.</p>
+
+<pre class="language-yaml"><code class="language-yaml">    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1g
+        reservations:
+          memory: 512m</code></pre>
+
+<p>Memory is a hard ceiling: exceed it and the kernel OOM-kills the process. Exit code 137, lesson
+13.</p>
+
+<p>CPU is a throttle rather than a wall — <code>cpus: "1.5"</code> means one and a half cores'
+worth of time. The container is slowed, not killed, which makes it much harder to notice.</p>
+
+<p>⚠️ <strong>Set the memory limit before you tune the JVM, not after.</strong> A JVM with no
+<code>-Xmx</code> sizes its heap from what it believes the machine has. Modern JVMs are
+container-aware and read the cgroup limit — but only if there is one. With no limit set, the JVM in
+a 1 GB container sees the <em>host's</em> 32 GB, sizes a heap accordingly, and is OOM-killed long
+before it ever runs a garbage collection. The container looks like it crashed at random.</p>
+
+<pre class="language-bash"><code class="language-bash">-XX:MaxRAMPercentage=75.0</code></pre>
+
+<p>Better than a fixed <code>-Xmx</code>, because it tracks the limit. Leave the remaining 25% for
+metaspace, thread stacks and native allocations, which are not in the heap and are the thing that
+usually pushes a "correctly sized" JVM over the edge.</p>
+
+<h2>Logs</h2>
+
+<p>Log to stdout. Not to a file — a file inside a container is on the writable layer, which dies with
+it, and is invisible to every collection tool.</p>
+
+<p>Then decide what happens to stdout, because the default is a problem:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"</code></pre>
+
+<p><strong>The default <code>json-file</code> driver has no rotation at all.</strong> A chatty
+service on a long-running host fills the disk, and the failure this produces is spectacular and
+confusing — everything on the machine starts failing at once, and nothing points at logs. Those four
+lines cap it at 30 MB.</p>
+
+<p>Beyond one host you want the logs off the machine entirely — <code>awslogs</code>, <code>gelf</code>,
+<code>fluentd</code>, or a sidecar collector.</p>
+
+<h2>Shutting down without dropping requests</h2>
+
+<p>The sequence: Docker sends <code>SIGTERM</code>, waits (10 seconds by default), then
+<code>SIGKILL</code>.</p>
+
+<p>Getting a clean shutdown needs three things, and all three have to be right.</p>
+
+<p><strong>The signal must reach your process.</strong> Exec-form <code>ENTRYPOINT</code>, so your
+process is PID 1 — lesson 4. Shell form means <code>/bin/sh</code> gets the signal and does not
+pass it on.</p>
+
+<p><strong>Your application must handle it.</strong> Stop accepting new connections, finish
+in-flight requests, close the pool. Spring Boot:</p>
+
+<pre class="language-properties"><code class="language-properties">server.shutdown=graceful
+spring.lifecycle.timeout-per-shutdown-phase=20s</code></pre>
+
+<p><strong>The grace period must be long enough.</strong></p>
+
+<pre class="language-yaml"><code class="language-yaml">    stop_grace_period: 30s</code></pre>
+
+<p>⚠️ These two numbers must agree. A 20-second application shutdown behind a 10-second Docker
+default is SIGKILL every time — and it looks exactly like a graceful shutdown that was configured
+and did nothing.</p>
+
+<p>⚠️ And a second trap: PID 1 does not get default signal handlers. A process that ignores
+<code>SIGTERM</code> as PID 1 would be fine anywhere else. If your entrypoint is a shell script
+spawning children, you also inherit zombie reaping — <code>docker run --init</code> or
+<code>init: true</code> inserts a minimal init process to deal with both.</p>
+
+<h2>Hardening</h2>
+
+<pre class="language-yaml"><code class="language-yaml">    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true</code></pre>
+
+<p>Plus <code>USER</code> from lesson 9, which matters more than all of these.</p>
+
+<p><code>read_only</code> is the one with real teeth and the one most likely to break something —
+most applications write <em>somewhere</em>, so expect to add <code>tmpfs</code> mounts until it
+starts. Worth the hour.</p>
+
+<p><code>no-new-privileges</code> stops a setuid binary inside the container from escalating.
+Cheap, and there is rarely a reason not to.</p>
+
+<h2>Where Docker stops</h2>
+
+<p>Be honest about this, because it is the most useful thing in the lesson.</p>
+
+<p>Docker runs containers on <strong>one machine</strong>. Which means:</p>
+
+<p><strong>That machine is a single point of failure.</strong> It dies, everything on it is down.
+Nothing moves the work elsewhere.</p>
+
+<p><strong>There is no zero-downtime deploy.</strong> <code>docker compose up -d</code> stops the old
+container and starts the new one. In between, requests fail. Rolling updates and health-gated
+rollouts are an orchestrator feature.</p>
+
+<p><strong>There is no scaling.</strong> <code>--scale</code> starts more containers on the same
+machine, which does nothing for a machine that is already saturated.</p>
+
+<p><strong>Unhealthy is not restarted.</strong> As above.</p>
+
+<p><strong>Secrets are environment variables</strong> unless you build something better.</p>
+
+<p>None of that means you need Kubernetes. A single well-configured Docker host is a perfectly good
+answer for an internal tool, a side project, a staging environment, or anything whose users tolerate
+a few seconds of downtime during a deploy — and it is <em>far</em> simpler to operate than a
+cluster. Reach for more when you actually have the requirement, not in advance:</p>
+
+<pre class="language-bash"><code class="language-bash">one host + compose   simple, cheap, has downtime during deploys
+Swarm                multi-host, rolling updates, tiny learning curve, fading
+ECS / Cloud Run      managed. No control plane to operate. Cloud-specific.
+Kubernetes           everything, at the cost of being a full-time job</code></pre>
+
+<p>The order of things to fix, if you are running containers on one host today: a memory limit and a
+matching <code>MaxRAMPercentage</code>, log rotation, <code>restart: unless-stopped</code>,
+<code>USER</code>, and a graceful shutdown whose two timeouts agree. That is most of the value, and
+none of it requires an orchestrator.</p>
+
+<p>Next: <a href="/docker/docker-interview-questions">the questions people actually ask</a>.</p>

@@ -1,0 +1,161 @@
+<p>The questions Docker interviews actually ask, answered the way you would say them out loud — short
+enough to be an answer rather than a lecture, with the follow-up they are usually fishing for.</p>
+
+<h2>What is a container, and how is it different from a VM?</h2>
+
+<p>A container is a process running on the host's kernel with an isolated view of the filesystem,
+network and process table. A VM boots its own kernel and a full operating system on top of a
+hypervisor.</p>
+
+<p>So a container starts in milliseconds and costs what your app costs; a VM starts in tens of
+seconds and costs a gigabyte before your app does anything. The trade is isolation — a VM has a
+hypervisor boundary, a container has kernel features, and a kernel bug is a shared problem.</p>
+
+<p><em>The follow-up:</em> when would you still want a VM? Running untrusted code from strangers, or
+where a compliance regime demands hardware-level separation.</p>
+
+<h2>Image versus container?</h2>
+
+<p>An image is a stack of read-only layers on disk, inert. A container is one running instance of an
+image with a thin writable layer on top.</p>
+
+<p>The consequence worth stating: anything written inside a container goes to that writable layer and
+disappears when the container is removed. Ten containers from one image share the image's bytes and
+each get their own scratch space.</p>
+
+<h2>CMD versus ENTRYPOINT?</h2>
+
+<p><code>ENTRYPOINT</code> is the executable; <code>CMD</code> is its default arguments. Anything
+after the image name on <code>docker run</code> replaces <code>CMD</code> and is appended to
+<code>ENTRYPOINT</code>.</p>
+
+<p>So <code>ENTRYPOINT</code> when the image <em>is</em> one program, <code>CMD</code> alone when the
+image is an environment somebody might want a shell in.</p>
+
+<p><em>The follow-up, and the real question:</em> always use exec form, the JSON array. Shell form
+runs your process as a child of <code>/bin/sh</code>, which does not forward signals — so
+<code>docker stop</code> never reaches your application, it gets SIGKILLed ten seconds later, and
+every graceful-shutdown hook you wrote is skipped. Exec form makes your process PID 1, which
+receives the signal.</p>
+
+<h2>COPY versus ADD?</h2>
+
+<p><code>COPY</code> copies files. <code>ADD</code> also fetches URLs and auto-extracts tarballs.</p>
+
+<p>Use <code>COPY</code>. The auto-extraction is a surprise — <code>ADD app.tar.gz /app</code>
+unpacks it, so if you wanted the file you now have its contents. Use
+<code>ADD --checksum=</code> only when you specifically want a verified remote fetch.</p>
+
+<h2>How does layer caching work?</h2>
+
+<p>Each instruction produces a layer with a cache key. For <code>COPY</code> it is a checksum of the
+file contents; for <code>RUN</code> it is the literal command string. Docker walks top to bottom
+reusing layers — and <strong>on the first miss it rebuilds that instruction and everything after
+it</strong>.</p>
+
+<p>Which gives you the one rule: copy the dependency manifest and install dependencies before
+copying your source. On the API in this track that is 8 seconds for a code change versus 92 for a
+<code>pom.xml</code> change.</p>
+
+<p><em>The follow-up:</em> <code>RUN apt-get update</code> on its own line is cached by its command
+string, so it can hand you a months-stale package index. Chain it to the <code>install</code>.</p>
+
+<h2>Why is my image 1.2 GB?</h2>
+
+<p>Almost always: the base image is a full JDK or a full Node image, and the build tooling shipped
+along with the application.</p>
+
+<p>The fix in order of effect — a multi-stage build, so the compiler and
+<code>node_modules</code> never reach the result; then a runtime base rather than a toolchain, JRE
+not JDK; then not committing package-manager caches.</p>
+
+<p>Real numbers from this track: the API's build stage is 957 MB and the image that ships is 460 MB.
+Of that 460, the application itself is 336 kB.</p>
+
+<p><em>The follow-up they want:</em> a later <code>RUN rm</code> does <strong>not</strong> shrink an
+image. The file is still in the layer that added it; the delete just adds a marker hiding it.</p>
+
+<h2>How do you keep a secret out of an image?</h2>
+
+<p>Don't put it in. An <code>ARG</code> is printed by <code>docker history</code>, an
+<code>ENV</code> is in the image forever, and a <code>COPY</code>ed file is recoverable from the
+layer even after a <code>RUN rm</code> — <code>docker save</code> and <code>tar</code>, two standard
+commands, no exploit.</p>
+
+<p>Needed at build time: <code>RUN --mount=type=secret</code>, which is in no layer. Needed at run
+time — the common case: an environment variable at minimum, Docker <code>secrets:</code> to get it
+out of <code>docker inspect</code>, a real secret store if you want rotation. And
+<code>.dockerignore</code> so <code>.env</code> and <code>.git/</code> never reach the builder at
+all.</p>
+
+<h2>Two containers, how do they talk?</h2>
+
+<p>By service name on a shared user-defined network. Compose creates one per project and runs DNS on
+it, so <code>http://api:8085</code> resolves.</p>
+
+<p>The port in that URL is the port <em>inside</em> the target container. Publishing with
+<code>-p</code> is only for traffic from outside Docker.</p>
+
+<p><em>The follow-up:</em> why does <code>127.0.0.1:3309</code> not work from inside a container?
+Because <code>localhost</code> in there means that container, and 3309 is a host-side number that
+means nothing on the container network.</p>
+
+<h2>depends_on guarantees what?</h2>
+
+<p>That the dependency's container was <em>started</em>. Not that the service inside it is ready —
+so the app races the database and dies on a connection refused.</p>
+
+<p>The fix is a healthcheck on the dependency plus
+<code>depends_on: {mysql: {condition: service_healthy}}</code>.</p>
+
+<p><em>The follow-up:</em> does that mean the app no longer needs retry logic? No.
+<code>depends_on</code> only applies to start-up; it says nothing about the database restarting at
+three in the morning.</p>
+
+<h2>Named volume or bind mount?</h2>
+
+<p>Named volume when only the container needs the data — databases, uploads. Bind mount when you
+need it too — source you are editing, a config file to tweak.</p>
+
+<p><em>The follow-up worth knowing:</em> a named volume mounted over a <em>non-empty</em> directory
+copies the image's contents and ownership on first use. A bind mount does not — it presents the host
+directory as-is, which is why the same two lines of YAML give you a working uploads directory one
+way and <code>Permission denied</code> the other.</p>
+
+<h2>What does :latest actually mean?</h2>
+
+<p>Nothing. It is the default tag, and a tag is a mutable pointer that anyone can move.</p>
+
+<p>Deploy it and two servers pulling a minute apart can run different code, nobody can answer "what
+is in production", and there is nothing to roll back to. Deploy an immutable tag —
+<code>sha-a3f9c21</code> — and keep <code>:latest</code> for humans typing <code>docker run</code>.
+A digest is the only thing that pins bytes.</p>
+
+<h2>exec format error?</h2>
+
+<p>Architecture mismatch. You built <code>arm64</code> on an Apple Silicon Mac and the server is
+<code>amd64</code>.</p>
+
+<p><code>docker buildx build --platform linux/amd64,linux/arm64 --push</code> produces a manifest
+list so the registry hands each host the right image. Note <code>--push</code> and not
+<code>--load</code>: your local store cannot hold two images under one tag.</p>
+
+<p>And you cannot catch this by running it locally — Docker Desktop emulates, so it works on your
+machine and fails on the server.</p>
+
+<h2>Is Docker enough for production?</h2>
+
+<p>The one where a confident yes or no is the wrong answer.</p>
+
+<p>For a single host: yes, for plenty of real workloads, once you have set a memory limit, log
+rotation, a restart policy, a non-root user and a graceful shutdown whose timeouts agree.</p>
+
+<p>What you do not get is anything spanning machines — no failover, no zero-downtime deploy
+(<code>compose up</code> stops the old container before starting the new one), no rescheduling off a
+dead host, no restart of a container that is unhealthy but still running.</p>
+
+<p>So: a staging environment, an internal tool, a side project — one host is genuinely fine and far
+simpler to operate. When downtime during a deploy stops being acceptable, that is the requirement
+that buys an orchestrator, and not before.</p>
+
+<p>Back to <a href="/docker/docker-what-is-docker">the start of the track</a>.</p>

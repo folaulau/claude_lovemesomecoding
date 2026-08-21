@@ -1,0 +1,124 @@
+<p>An image on your laptop is not a deployment. A registry is the thing in between — a server that
+stores images and hands them out by name.</p>
+
+<h2>What a reference is made of</h2>
+
+<p>Every image name is the same four parts, most of them usually left out:</p>
+
+<pre class="language-bash"><code class="language-bash">ghcr.io/folaukaveinga/pizza/pizza-api:1.4.2
+└─ registry ─┘└──── namespace + repository ────┘└ tag ┘
+
+nginx
+→ docker.io/library/nginx:latest</code></pre>
+
+<p>That expansion is why <code>docker pull nginx</code> works and why a plain
+<code>docker push pizza-api</code> does not: with no registry in the name it tries Docker Hub, under
+a namespace you do not own.</p>
+
+<p>So pushing is always two steps — retag with a full reference, then push:</p>
+
+<pre class="language-bash"><code class="language-bash">docker tag pizza-api:dev ghcr.io/folaukaveinga/pizza/pizza-api:1.4.2
+docker push ghcr.io/folaukaveinga/pizza/pizza-api:1.4.2</code></pre>
+
+<p><code>docker tag</code> copies nothing. It adds a second name for the same image ID.</p>
+
+<h2>Logging in</h2>
+
+<pre class="language-bash"><code class="language-bash">echo "$GITHUB_TOKEN" | docker login ghcr.io -u folaukaveinga --password-stdin</code></pre>
+
+<p><strong><code>--password-stdin</code>, not <code>-p</code>.</strong> A password on the command
+line is in your shell history and in the process list, where anyone on the machine can read it with
+<code>ps</code>. Docker prints a warning about this and it is worth heeding.</p>
+
+<p>⚠️ <code>docker login</code> writes the credential to <code>~/.docker/config.json</code>, and on
+Linux with no credential helper configured that is <strong>base64, not encryption</strong>. Install
+<code>docker-credential-pass</code> or the equivalent on any shared machine.</p>
+
+<h2>Which registry</h2>
+
+<p><strong>Docker Hub</strong> is the default and where public base images live. Free public
+repositories, one free private one, and <strong>rate limits on anonymous pulls</strong> — which is
+the detail that catches people, because a CI pipeline pulling from a shared NAT address hits them
+and the error blames your build.</p>
+
+<p><strong>GHCR</strong> (<code>ghcr.io</code>) inherits your repository's permissions and
+authenticates with the <code>GITHUB_TOKEN</code> that GitHub Actions mints for each run — so there
+is no long-lived credential to store. That is what the workflow in lesson 20 uses.</p>
+
+<p><strong>ECR</strong>, <strong>Artifact Registry</strong>, <strong>ACR</strong> — the cloud
+providers' own. Use the one your compute is in: the pull is on the internal network, and IAM does
+the authentication so there is no password anywhere.</p>
+
+<p>ECR has one wrinkle worth knowing in advance: <strong>a repository must exist before you can push
+to it.</strong> Every other registry creates one on first push; ECR returns
+<code>name unknown</code>.</p>
+
+<h2>Tagging that survives a rollback</h2>
+
+<p>Here is the part that actually matters, and it is a design decision rather than a command.</p>
+
+<p><strong><code>:latest</code> is a mutable pointer, not a version.</strong> Nothing about the name
+tells you what is in it, and it moves.</p>
+
+<p>Deploy <code>:latest</code> and you get three problems. Two servers pulling a minute apart can
+run different code. Nobody can answer "what is running in production?" — <code>:latest</code> is not
+an answer. And there is nothing to roll back <em>to</em>, because the previous image no longer has a
+name.</p>
+
+<p>What works is several tags on the same image, each answering a different question:</p>
+
+<pre class="language-bash"><code class="language-bash">ghcr.io/…/pizza-api:sha-a3f9c21     ← immutable. THIS is what you deploy.
+ghcr.io/…/pizza-api:1.4.2           ← the release humans talk about
+ghcr.io/…/pizza-api:1.4             ← "latest patch of 1.4", for a base image
+ghcr.io/…/pizza-api:main            ← whatever is on main right now
+ghcr.io/…/pizza-api:latest          ← for a human typing `docker run`</code></pre>
+
+<p>Derive them from the git ref rather than typing them, so they cannot be wrong:</p>
+
+<pre class="language-yaml"><code class="language-yaml">          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}</code></pre>
+
+<p>The rule underneath all of it: <strong>deploy an immutable tag, and keep the moving ones for
+humans.</strong> A rollback is then re-deploying a <code>sha-</code> tag that is still sitting in
+the registry.</p>
+
+<h2>Digests, when it has to be exact</h2>
+
+<p>Even an immutable-by-convention tag is only convention. A digest is content:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker image inspect --format '{{index .RepoDigests 0}}' alpine:3.21
+alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</code></pre>
+
+<p>Pull that and you get exactly those bytes or an error. Registries can enforce it for you —
+<strong>ECR has tag immutability as a repository setting</strong>, which is one checkbox and removes
+a whole class of "someone repushed the tag" incident.</p>
+
+<h2>Pushing sends less than you think</h2>
+
+<pre class="language-bash"><code class="language-bash">$ docker push ghcr.io/…/pizza-api:1.4.2
+5f70bf18a086: Layer already exists
+a1b2c3d4e5f6: Pushed
+9f8e7d6c5b4a: Layer already exists</code></pre>
+
+<p>Layers are content-addressed (lesson 3), so the registry only accepts what it does not already
+have. This is the payoff for lesson 7's layer ordering: the 120 MB dependency layer is pushed once
+and then says <code>Layer already exists</code> forever, while a code change pushes a 336 kB
+application layer.</p>
+
+<p>Get the ordering wrong and every deploy pushes and pulls the whole thing.</p>
+
+<h2>Housekeeping</h2>
+
+<p>A <code>sha-</code> tag per commit adds up fast, and storage is billed. Set a retention policy
+early — ECR lifecycle rules, GHCR package retention — rather than discovering the bill.</p>
+
+<p>⚠️ Two things to be careful of when you do. Retention that counts <em>images</em> can delete one
+that a running deployment would need to restart from; keep untagged images longer than you think.
+And a base image other builds reference must not be pruned out from under them.</p>
+
+<p>Next: <a href="/docker/docker-multi-platform-builds">why the image that works on your laptop may
+not start on the server</a>.</p>

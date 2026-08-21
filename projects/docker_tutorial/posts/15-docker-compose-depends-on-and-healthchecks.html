@@ -1,0 +1,141 @@
+<p>You add <code>depends_on: [mysql]</code>, run <code>docker compose up</code>, and the API dies
+with a connection refused. Compose did exactly what you asked. What you asked for was not what you
+wanted.</p>
+
+<h2>started is not ready</h2>
+
+<p><strong><code>depends_on</code> waits for the container, not for the service inside it.</strong>
+A container is "started" the instant its main process launches — and MySQL takes several more
+seconds after that to initialise its data directory, run its own start-up, and begin accepting
+connections on the socket.</p>
+
+<p>So the sequence is: MySQL's container starts, Compose considers the dependency satisfied, the API
+starts, the API connects, MySQL is not listening yet, the API exits.</p>
+
+<p>The symptom is a stack that works when you run <code>up</code> twice — because the second time
+MySQL was already warm — and fails on a clean machine or in CI. Which is the worst kind of bug to
+have, since it only appears where you cannot easily look.</p>
+
+<h2>A healthcheck</h2>
+
+<p>The fix is to define what "ready" means, and then wait for that:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s</code></pre>
+
+<p>Docker runs <code>test</code> inside the container on a schedule. Exit 0 is healthy, anything
+else is not.</p>
+
+<p>The four timings, each doing something specific:</p>
+
+<p><strong><code>interval</code></strong> — how often to probe once it is up and running.</p>
+
+<p><strong><code>timeout</code></strong> — how long one probe may take before it counts as a
+failure. Worth setting deliberately: a probe that hangs rather than failing is what makes a stack
+sit there for minutes.</p>
+
+<p><strong><code>retries</code></strong> — consecutive failures before the container is marked
+<code>unhealthy</code>.</p>
+
+<p><strong><code>start_period</code></strong> — the grace window at the beginning during which
+failures do not count toward <code>retries</code>. This is the one people leave out and then
+wonder why a slow-starting service is marked unhealthy and killed before it ever had a chance. A
+JVM application with Liquibase migrations to run needs a generous one.</p>
+
+<h2>condition: service_healthy</h2>
+
+<p>The healthcheck alone changes nothing about ordering. It has to be depended on:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    depends_on:
+      mysql:
+        condition: service_healthy</code></pre>
+
+<p>Note the shape. The list form — <code>depends_on: [mysql]</code> — cannot express a condition;
+you need the map form to say anything more than "start it first".</p>
+
+<p>Three conditions exist:</p>
+
+<pre class="language-bash"><code class="language-bash">service_started            the default. Container exists. Says nothing about readiness.
+service_healthy            the healthcheck is passing.
+service_completed_successfully   the container ran and exited 0 — for a
+                                 migration or seed job that must finish first.</code></pre>
+
+<p>And now the output says what you want it to:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose up -d
+ Container pizza-mysql-1  Starting
+ Container pizza-mysql-1  Started
+ Container pizza-mysql-1  Waiting
+ Container pizza-mysql-1  Healthy
+ Container pizza-api-1    Starting
+ Container pizza-api-1    Started</code></pre>
+
+<p><code>Waiting</code>, then <code>Healthy</code>, then the API. That is the race gone.</p>
+
+<h2>Not everything should wait</h2>
+
+<p>Worth resisting the urge to make every dependency <code>service_healthy</code>. The web tier in
+this stack deliberately does not:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    depends_on:
+      - api</code></pre>
+
+<p>nginx serves static files perfectly well before the API is up, and it resolves <code>api</code>
+lazily, per request. Waiting would delay the login page for no benefit — and would mean a slow API
+start-up makes the whole site unavailable rather than just the data on it.</p>
+
+<p>Ask what actually breaks if the dependency is not ready. If the answer is "the first request
+fails and then it works", <code>service_started</code> is right.</p>
+
+<h2>Check with something the image has</h2>
+
+<p>The rule from lesson 13, because it is the mistake that costs the most time here: a healthcheck
+that cannot run its own command reports <code>unhealthy</code> forever, which looks identical to a
+service that failed to start.</p>
+
+<p>The demo app's Artemis broker has no <code>curl</code> in its image, so a curl-based probe
+"fails" every time while the broker serves happily. It uses the tool that is present:</p>
+
+<pre class="language-yaml"><code class="language-yaml">      test: ["CMD", "/var/lib/artemis-instance/bin/artemis", "check", "node", "--up",
+             "--user", "admin", "--password", "admin"]</code></pre>
+
+<p>Which also probes the messaging port rather than the web console — the port clients actually
+use.</p>
+
+<p>Handy forms for common images:</p>
+
+<pre class="language-yaml"><code class="language-yaml">test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+test: ["CMD-SHELL", "pg_isready -U stayhub -d stayhub"]
+test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+test: ["CMD-SHELL", "wget -qO- http://localhost:8085/actuator/health || exit 1"]</code></pre>
+
+<p><code>CMD</code> runs the command directly; <code>CMD-SHELL</code> wraps it in
+<code>/bin/sh -c</code>, which you need for pipes, <code>||</code> and variables.</p>
+
+<p>⚠️ <code>curl -f</code> is doing real work in those: without it, curl exits 0 on an HTTP 500,
+and your healthcheck cheerfully reports a broken service as healthy.</p>
+
+<h2>up --wait</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d --wait</code></pre>
+
+<p>Blocks until every service with a healthcheck is healthy, then returns — and returns non-zero if
+one never gets there. This is what you want in CI, where the next step is a test suite that assumes
+the stack is up.</p>
+
+<h2>Retry anyway</h2>
+
+<p>Healthchecks fix start-up ordering. They do not fix a database that restarts at three in the
+morning while your API is running, and <code>depends_on</code> has nothing to say about that — it
+applies to <code>up</code>, not to the rest of the service's life.</p>
+
+<p>So the application still needs a connection pool that reconnects, and start-up retries with
+backoff. What healthchecks buy you is that the common case stops being a coin flip; they are not a
+substitute for an application that survives its dependencies going away.</p>
+
+<p>Next: <a href="/docker/docker-compose-profiles-and-overrides">not starting everything every
+time</a>.</p>

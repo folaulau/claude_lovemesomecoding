@@ -1,0 +1,173 @@
+<p>The point of an image is that the artifact you tested is the artifact you deploy. Which means one
+image has to run in several places, and the differences between those places have to come from
+outside it.</p>
+
+<p>Docker gives you two mechanisms, and the difference between them decides what you can change
+later.</p>
+
+<h2>ARG is build time. ENV is run time.</h2>
+
+<pre class="language-docker"><code class="language-docker">ARG VITE_API_BASE_URL=""
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL</code></pre>
+
+<p><code>ARG</code> exists only while the image is being built. It is passed with
+<code>--build-arg</code>, is not present in the finished image, and cannot be changed afterwards.</p>
+
+<p><code>ENV</code> is baked into the image and set in every container started from it — and can be
+overridden at run time with <code>-e</code>.</p>
+
+<p>So the question to ask of any setting is: <strong>can this change without rebuilding?</strong>
+If yes, it is <code>ENV</code>. If no, it is <code>ARG</code>, and you have one image per value.</p>
+
+<h2>Server-side: pass it at run time</h2>
+
+<p>The API takes everything from the environment:</p>
+
+<pre class="language-yaml"><code class="language-yaml">environment:
+  SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/pizza?useSSL=false&amp;allowPublicKeyRetrieval=true&amp;connectionTimeZone=LOCAL&amp;preserveInstants=false
+  SPRING_DATASOURCE_USERNAME: root
+  SPRING_DATASOURCE_PASSWORD: ""</code></pre>
+
+<p>Note what is <em>not</em> here: a new <code>application-container.properties</code>. Spring Boot's
+relaxed binding maps <code>SPRING_DATASOURCE_URL</code> onto the <code>spring.datasource.url</code>
+property — upper-case, dots and dashes to underscores — and environment variables outrank every
+properties file. So the committed file keeps working for a developer running the app natively, and
+the container overrides it without a second copy of the config to keep in sync.</p>
+
+<p>Most frameworks have an equivalent: <code>DATABASE_URL</code> in Rails and Django,
+<code>process.env</code> in Node. This is the twelve-factor idea, and Docker is why it became
+standard rather than optional.</p>
+
+<h2>Client-side: it is baked in, and you cannot change it later</h2>
+
+<p>Here is where people get caught. A single-page application runs in the browser, not in the
+container — so there is no environment for it to read. <strong>Its configuration was compiled into
+the JavaScript at build time</strong>, and no amount of <code>docker run -e</code> will touch
+it.</p>
+
+<p>Both frontends in this track need to know where the API is, and the two frameworks solve it
+differently. The contrast is worth seeing.</p>
+
+<h3>React: a build arg</h3>
+
+<pre class="language-docker"><code class="language-docker">ARG VITE_API_BASE_URL=""
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL</code></pre>
+
+<p>Vite substitutes <code>import.meta.env.VITE_*</code> into the bundle during the build, so it
+reads that variable and the value is compiled in.</p>
+
+<pre class="language-yaml"><code class="language-yaml">build:
+  context: ./pizza-react-frontend
+  args:
+    VITE_API_BASE_URL: ""</code></pre>
+
+<p>Empty, deliberately — which makes the app request <code>/api/...</code> on its own origin, where
+nginx proxies it to the API container. One line.</p>
+
+<h3>Angular: a file and a build configuration</h3>
+
+<p>Angular has no <code>import.meta.env</code> and no runtime environment mechanism at all. The
+CLI's mechanism is <code>fileReplacements</code>: swap one source file for another at build time.
+So the same idea takes a new file —</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const environment = {
+  production: true,
+  apiBaseUrl: '',
+  stripePublishableKey:
+    'pk_test_51U5Wc3BeMrxmFducR7hlZ3YwT770EF2DFj8VPmEmqZ7r2sVasfWDRjWMQBvEqdWOSuIGg6RSd8oIcjQ9RblgJxRq00ThBQPY9F',
+};</code></pre>
+
+<p>— plus a build configuration that swaps it in:</p>
+
+<pre class="language-json"><code class="language-json">"container": {
+  "budgets": [
+    {
+      "type": "initial",
+      "maximumWarning": "800kB",
+      "maximumError": "1MB"
+    },
+    {
+      "type": "anyComponentStyle",
+      "maximumWarning": "4kB",
+      "maximumError": "8kB"
+    }
+  ],
+  "outputHashing": "all",
+  "fileReplacements": [
+    {
+      "replace": "src/environments/environment.ts",
+      "with": "src/environments/environment.container.ts"
+    }
+  ]
+},</code></pre>
+
+<p>— plus a flag on the build:</p>
+
+<pre class="language-docker"><code class="language-docker">RUN npm run build -- --configuration container</code></pre>
+
+<p>Same outcome, three times the ceremony, and no build arg at all. Worth knowing before you plan a
+per-environment image strategy around one framework or the other.</p>
+
+<p>You can verify the substitution happened rather than hoping:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose exec web-angular \
+    sh -c 'grep -c "http://localhost:8085" /usr/share/nginx/html/*.js'
+# no matches — the absolute URL is not in the bundle</code></pre>
+
+<h3>The third option: runtime config</h3>
+
+<p>If one image really must serve every environment, do not bake anything. Have the app fetch a
+small file on startup:</p>
+
+<pre class="language-bash"><code class="language-bash">GET /config.json  ->  { "apiBaseUrl": "https://api.example.com" }</code></pre>
+
+<p>and bind-mount or generate that file per deployment. Costs a request before the app can start;
+buys you one artifact for every environment.</p>
+
+<h2>--env-file, and .env</h2>
+
+<pre class="language-bash"><code class="language-bash">docker run --env-file ./local.env pizza-api:dev</code></pre>
+
+<p>⚠️ Compose has a <strong>different</strong> mechanism with a confusingly similar name. A
+<code>.env</code> file next to <code>compose.yaml</code> is read by Compose itself, to interpolate
+<code>${VAR}</code> in the compose file — it does not automatically become the container's
+environment:</p>
+
+<pre class="language-yaml"><code class="language-yaml">STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}</code></pre>
+
+<p><code>${VAR:-default}</code> is evaluated on the host, before the container exists. So those two
+lines read the keys from your shell or from <code>.env</code> if they are set, and pass empty
+strings if not — which is how a real key stays out of a committed file entirely.</p>
+
+<p>For the container to receive a whole file, that is <code>env_file:</code> on the service.</p>
+
+<h2>Secrets</h2>
+
+<p>An environment variable is not a secret store, and it is worth being specific about why:</p>
+
+<p><code>docker inspect</code> prints it. Anything that dumps the environment on a crash logs it.
+It is inherited by every child process. And in a compose file it is in git.</p>
+
+<p>The compose file in this track has one committed:</p>
+
+<pre class="language-yaml"><code class="language-yaml">PIZZA_JWT_SECRET: local-compose-only-not-a-real-secret-at-least-32-bytes</code></pre>
+
+<p>Acceptable only because it signs tokens for a demo on your own machine, and it is there so the
+stack starts with one command. Anywhere reachable, in increasing order of effort:</p>
+
+<p><strong>A gitignored <code>.env</code></strong> next to the compose file. Keeps it out of git;
+still visible to <code>docker inspect</code>.</p>
+
+<p><strong>Docker's <code>secrets:</code></strong>, which mounts the value as a file at
+<code>/run/secrets/&lt;name&gt;</code> rather than putting it in the environment. Not in
+<code>inspect</code>, not inherited by child processes.</p>
+
+<p><strong>A real secret store</strong> — AWS Secrets Manager, Vault — fetched at startup. The only
+option that gives you rotation and an audit trail.</p>
+
+<p>And for a secret genuinely needed during the <em>build</em>, lesson 9's
+<code>--mount=type=secret</code>. Never an <code>ARG</code>: <code>docker history</code> prints
+those.</p>
+
+<p>Next: <a href="/docker/docker-logs-and-debugging">when it does not work</a>.</p>

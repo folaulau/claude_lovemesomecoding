@@ -1,0 +1,155 @@
+<p>Four symptoms cover most of what goes wrong with a container: it exited, it says
+<code>unhealthy</code>, it cannot reach something, or it is behaving like a version of your code
+that is not the one you just built. Each has a reliable way in.</p>
+
+<h2>Logs</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose logs api             # everything so far
+docker compose logs -f api          # follow
+docker compose logs --tail 50 api   # just the end
+docker compose logs -t api          # with timestamps
+docker compose logs                 # every service, interleaved and colour-coded</code></pre>
+
+<p>What <code>logs</code> shows is <strong>stdout and stderr of PID 1</strong>. Nothing else.</p>
+
+<p>That is worth stating plainly, because it explains the common case of an application that runs
+fine and logs nothing: it was configured to write to a file. In a container the convention is to log
+to stdout and let the platform deal with collection — <code>logging.file.name</code> unset in Spring
+Boot, the default in most frameworks. If your app insists on a file, the usual workaround is to
+symlink it to <code>/dev/stdout</code>.</p>
+
+<p>Note also that <code>docker compose down</code> removes the containers, and their logs with them.
+Read them before you tear the stack down.</p>
+
+<h2>"It exited"</h2>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose ps -a
+NAME            STATUS
+pizza-api-1     Exited (1) 4 seconds ago</code></pre>
+
+<p>The number in brackets is the process's exit code, and it is the first real clue:</p>
+
+<pre class="language-bash"><code class="language-bash">0     finished successfully — usually "the command had nothing to do"
+1     the application threw
+125   docker itself failed (a bad flag)
+126   the command was found but is not executable
+127   command not found  — a typo, or a binary that is not in this image
+137   SIGKILL   — usually the OOM killer, or `docker stop` timing out
+139   SIGSEGV
+143   SIGTERM   — a normal `docker stop`</code></pre>
+
+<p><strong>137 is the one worth recognising on sight.</strong> It usually means the container hit
+its memory limit and the kernel killed it. Nothing in the application's own logs will mention this,
+because the process was not asked — it was shot. Confirm it:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker inspect pizza-api-1 --format '{{.State.OOMKilled}} {{.State.ExitCode}}'
+true 137</code></pre>
+
+<p><strong>Exit 0 with no error at all</strong> is the other classic, and it is not a fault — see
+lesson 2. A container lives exactly as long as its main process. If that process starts a daemon and
+returns, the container exits immediately, however healthy the daemon was.</p>
+
+<h2>Getting inside</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose exec api sh</code></pre>
+
+<p><code>exec</code> starts a second process in a <em>running</em> container. Two things that trip
+people:</p>
+
+<p><strong><code>sh</code>, not <code>bash</code>.</strong> Alpine images have no bash, and the error
+— <code>executable file not found</code> — reads like the container is broken rather than
+minimal.</p>
+
+<p><strong>Many of your tools are not in there.</strong> A slim image has no <code>curl</code>, no
+<code>ps</code>, no <code>dig</code>. <code>wget</code> is usually present in Alpine;
+<code>getent hosts</code> covers DNS.</p>
+
+<p>And <code>exec</code> is no use at all on a container that has already exited. For that:</p>
+
+<pre class="language-bash"><code class="language-bash">docker run --rm -it --entrypoint sh pizza-api:dev</code></pre>
+
+<p>Same image, same filesystem, but a shell instead of your program — so you can check whether the
+file you expected is actually where you expected it.</p>
+
+<h2>What configuration did it actually get?</h2>
+
+<p>Usually more informative than reading the compose file again, because it shows what was
+resolved:</p>
+
+<pre class="language-bash"><code class="language-bash">docker inspect pizza-api-1 --format '{{json .Config.Env}}' | tr ',' '\n'
+docker inspect pizza-api-1 --format '{{json .Mounts}}'
+docker inspect pizza-api-1 --format '{{json .NetworkSettings.Networks}}'
+docker compose config                      # the merged, interpolated compose file</code></pre>
+
+<p><code>docker compose config</code> is the one to reach for when <code>${VAR}</code> interpolation
+or a <code>-f</code> override is involved. It prints exactly what Compose is going to act on, with
+every variable substituted.</p>
+
+<h2>Resources</h2>
+
+<pre class="language-bash"><code class="language-bash">$ docker stats --no-stream
+CONTAINER       CPU %   MEM USAGE / LIMIT     MEM %
+pizza-api-1     0.31%   412MiB / 1.914GiB     21.02%
+pizza-mysql-1   0.52%   448MiB / 1.914GiB     22.86%</code></pre>
+
+<p>If <code>MEM USAGE</code> is pinned against <code>LIMIT</code> and the container keeps restarting,
+you have found your 137.</p>
+
+<h2>The healthcheck that lies</h2>
+
+<p>A container marked <code>unhealthy</code> that is serving perfectly well is a specific and
+memorable failure, and the demo app's development compose file has a comment about it because it
+cost real time.</p>
+
+<p>The rule: <strong>health-check with a command the container actually has.</strong> A
+<code>curl</code>-based check on an image with no <code>curl</code> fails every time, forever — and
+what you see is a service that never becomes healthy, which looks exactly like a service that never
+started. Meanwhile <code>up --wait</code> blocks and then blames the wrong thing.</p>
+
+<pre class="language-yaml"><code class="language-yaml">healthcheck:
+  test: ["CMD", "/var/lib/artemis-instance/bin/artemis", "check", "node", "--up",
+         "--user", "admin", "--password", "admin"]
+  interval: 10s
+  timeout: 10s
+  retries: 20
+  start_period: 30s</code></pre>
+
+<p>Artemis ships its own probe, and unlike an HTTP poke at the web console it checks the messaging
+port — the thing clients actually connect to. Check what you depend on, with a tool that is
+present.</p>
+
+<p>When one is failing, the output is recorded:</p>
+
+<pre class="language-bash"><code class="language-bash">docker inspect pizza-mysql-1 --format '{{json .State.Health}}'</code></pre>
+
+<p>That gives you the last few probe runs with their exit codes and output — which turns "unhealthy"
+into an actual error message.</p>
+
+<h2>"My change did not take effect"</h2>
+
+<p>Almost always one of three things.</p>
+
+<p><strong>Compose did not rebuild.</strong> <code>docker compose up -d</code> reuses an existing
+image; it does not notice that a source file changed. Use <code>up -d --build</code>.</p>
+
+<p><strong>You changed a build arg.</strong> Anything compiled into a bundle needs a rebuild, not a
+restart — lesson 12.</p>
+
+<p><strong>The layer cache reused something you did not expect.</strong> Rare, but
+<code>--no-cache</code> settles the question in one command.</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d --build
+docker compose build --no-cache api && docker compose up -d api</code></pre>
+
+<h2>A working order</h2>
+
+<p>When a service will not come up, work outward rather than guessing:</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose ps -a                       # 1. is it running? what exit code?
+docker compose logs --tail 50 api          # 2. what did it say on the way out?
+docker inspect pizza-api-1 --format '{{json .State.Health}}'   # 3. healthcheck output
+docker compose exec api sh                 # 4. look around inside
+docker compose exec api sh -c 'getent hosts mysql'   # 5. can it see its dependency?
+docker compose config                      # 6. is the config what you think?</code></pre>
+
+<p>Next: <a href="/docker/docker-compose">running more than one of these at a time</a>.</p>

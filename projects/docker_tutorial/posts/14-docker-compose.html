@@ -1,0 +1,145 @@
+<p>One container is <code>docker run</code>. Two containers that have to find each other is a shell
+script nobody wants to read:</p>
+
+<pre class="language-bash"><code class="language-bash">docker network create pizza-net
+docker volume create mysql-data
+docker run -d --name mysql --network pizza-net \
+  -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=pizza \
+  -v mysql-data:/var/lib/mysql -p 3309:3306 mysql:8.4
+docker run -d --name api --network pizza-net \
+  -e SPRING_DATASOURCE_URL='jdbc:mysql://mysql:3306/pizza' \
+  -p 8086:8085 pizza-api:dev</code></pre>
+
+<p>That is not wrong, it is just unmaintainable. Compose is the same thing as a file you can read,
+diff and commit.</p>
+
+<h2>The file</h2>
+
+<pre class="language-yaml"><code class="language-yaml">name: pizza
+
+services:
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    ports:
+      - "3309:3306"
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: pizza
+...
+    volumes:
+      - mysql-data:/var/lib/mysql
+...
+volumes:
+  mysql-data:</code></pre>
+
+<p>Every key maps to a <code>docker run</code> flag you already know: <code>image</code>,
+<code>ports</code> is <code>-p</code>, <code>environment</code> is <code>-e</code>,
+<code>volumes</code> is <code>-v</code>, <code>restart</code> is <code>--restart</code>.</p>
+
+<p>What you get for free is the part worth having: <strong>a private network with all the services
+on it, and DNS that resolves service names</strong> (lesson 10). Nothing declares that; it is
+what a project is.</p>
+
+<h2>The name at the top</h2>
+
+<pre class="language-yaml"><code class="language-yaml">name: pizza</code></pre>
+
+<p>The project name prefixes the network (<code>pizza_default</code>), the volumes
+(<code>pizza_mysql-data</code>) and the container names (<code>pizza-mysql-1</code>). It is how two
+stacks coexist without colliding, and how Compose knows which containers a later
+<code>down</code> refers to.</p>
+
+<p>Set it explicitly. Left off, Compose uses the <em>directory name</em> — so cloning the repo into
+a differently-named folder gives you a second project with a second, empty set of volumes, and the
+database you were using appears to have vanished.</p>
+
+<h2>Building, not just pulling</h2>
+
+<pre class="language-yaml"><code class="language-yaml">  api:
+    build:
+      context: ./pizza-springboot-backend
+      target: runtime
+    image: pizza-api:dev
+    restart: unless-stopped</code></pre>
+
+<p><code>build</code> instead of (or alongside) <code>image</code>. <code>context</code> is lesson
+5's build context — the directory sent to the builder, and what every <code>COPY</code> path is
+relative to. <code>target</code> picks a stage from a multi-stage Dockerfile (lesson 7). There is no
+<code>dockerfile:</code> key here because <code>./Dockerfile</code> relative to the context is the
+default.</p>
+
+<p>With both <code>build</code> and <code>image</code>, Compose builds it and tags the result — so
+the same file works for local development and produces a named image you could push.</p>
+
+<p>⚠️ <strong><code>docker compose up</code> does not rebuild.</strong> If an image already exists,
+it is reused, however stale. This is the single most common Compose confusion:</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d --build      # rebuild changed images, then start
+docker compose build --no-cache api   # nuclear option for one service</code></pre>
+
+<h2>Do not set container_name</h2>
+
+<p>It is tempting and it is a trap. A container name is global to the Docker daemon, so this:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    container_name: pizza-mysql</code></pre>
+
+<p>collides with any other project that had the same idea:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose up -d
+Error response from daemon: Conflict. The container name "/pizza-mysql" is
+already in use by container "ce7502b3be84...". You have to remove (or rename)
+that container to be able to reuse that name.</code></pre>
+
+<p>Which is exactly what happened when the full-stack file in this track met the demo app's existing
+development compose file. Leave it off and Compose names them from the project —
+<code>pizza-mysql-1</code>, <code>pizza-api-1</code> — with no possibility of collision. It also
+keeps <code>--scale</code> working, which a fixed name makes impossible.</p>
+
+<p>Address services by <strong>service</strong> name (<code>docker compose logs api</code>) and the
+container names never need to come up.</p>
+
+<h2>The commands</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d              # start everything, detached
+docker compose up -d --build      # ... rebuilding first
+docker compose ps                 # what is running, and is it healthy
+docker compose logs -f api        # follow one service
+docker compose exec api sh        # shell into a running service
+docker compose restart api        # restart, same container
+docker compose down               # stop and remove containers + network
+docker compose down -v            # ... and delete the volumes</code></pre>
+
+<p>Three distinctions worth having straight:</p>
+
+<p><strong><code>restart</code> vs <code>up -d</code>.</strong> <code>restart</code> restarts the
+same container with the same configuration. <code>up -d</code> notices that the configuration
+changed and recreates what needs recreating — which is what you want after editing the file.</p>
+
+<p><strong><code>stop</code> vs <code>down</code>.</strong> <code>stop</code> leaves the containers
+in place, so <code>start</code> brings back the same ones. <code>down</code> removes them, and their
+logs with them.</p>
+
+<p><strong><code>run</code> vs <code>exec</code>.</strong> <code>exec</code> goes into a running
+container. <code>run</code> starts a new, throwaway one from the same service definition — the way
+to run a one-off migration or a shell when the service itself will not stay up.</p>
+
+<h2>compose.yaml, docker-compose.yml, and the hyphen</h2>
+
+<p>All of these still work, and the differences are historical:</p>
+
+<p><strong><code>docker-compose</code> (with a hyphen)</strong> is Compose V1, a separate Python
+program. End-of-life since 2023. <strong><code>docker compose</code> (a space)</strong> is V2, a
+plugin written in Go, and what everything here uses.</p>
+
+<p><strong>The filename</strong>: <code>compose.yaml</code> is the name the specification prefers;
+<code>docker-compose.yml</code> is the older one and is still found first for compatibility. Both
+work. The demo app has one of each, which turned out to be a useful way of keeping two very
+different stacks from being confused for one another.</p>
+
+<p>And the <code>version: "3.8"</code> line at the top of every compose file you have ever seen is
+<strong>obsolete</strong>. V2 ignores it and warns about it. Delete it.</p>
+
+<p>Next: <a href="/docker/docker-compose-depends-on-and-healthchecks">why the API starts before the
+database is ready</a>.</p>

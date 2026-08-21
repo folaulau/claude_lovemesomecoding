@@ -1,0 +1,125 @@
+<p>Two ideas cause nearly every Docker networking problem, and neither is complicated once
+stated:</p>
+
+<p><strong>A published port has a host side and a container side, and they are independent.</strong></p>
+
+<p><strong>Inside a container, <code>localhost</code> means that container.</strong></p>
+
+<h2>-p, read correctly</h2>
+
+<pre class="language-yaml"><code class="language-yaml">ports:
+  - "3309:3306"</code></pre>
+
+<p><strong>Host on the left, container on the right.</strong> Always. So MySQL listens on 3306
+inside its container, as MySQL always does, and your machine reaches it on 3309.</p>
+
+<p>Why shifted? Because the host side is a scarce, shared resource — one port, one claimant, for the
+whole machine. On the machine this track was written on, 3306 is a natively installed MySQL and
+3308 belongs to the demo app's development compose file, so the full-stack file takes 3309:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose up -d
+Error response from daemon: failed to bind host port for 0.0.0.0:3308:
+address already in use</code></pre>
+
+<p>The container side is <em>not</em> scarce. Each container has its own network namespace and its
+own set of 65,535 ports, so ten containers can all listen on 3306 with no conflict at all. Which
+means there is never a reason to shift it — and shifting it breaks the service names other
+containers connect by.</p>
+
+<p>Some variations worth knowing:</p>
+
+<pre class="language-bash"><code class="language-bash">-p 8080:80              # host 8080 -> container 80
+-p 127.0.0.1:8080:80    # ... reachable only from this machine, not the LAN
+-p 80                   # random free host port -> container 80
+-P                      # publish every EXPOSEd port to random host ports</code></pre>
+
+<p>⚠️ <strong><code>-p 8080:80</code> binds <code>0.0.0.0</code></strong> — every interface. On a
+laptop on a café network, that database you published is reachable from the café. The
+<code>127.0.0.1:</code> prefix is the fix, and is worth defaulting to for anything with data in
+it.</p>
+
+<h2>Containers talk to each other without any of this</h2>
+
+<p>Here is the part that clicks late for most people. <strong>Publishing is only for traffic coming
+from outside Docker.</strong> Containers on the same network reach each other directly, on the
+container port, whether or not anything is published.</p>
+
+<p>Compose puts every service in a project on one network and runs a DNS server on it that resolves
+<strong>service names</strong>:</p>
+
+<pre class="language-yaml"><code class="language-yaml">SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/pizza?useSSL=false&amp;allowPublicKeyRetrieval=true&amp;connectionTimeZone=LOCAL&amp;preserveInstants=false</code></pre>
+
+<p><code>mysql</code> is the service name from <code>compose.yaml</code>. <code>3306</code> is the
+port inside that container. Neither value has anything to do with the <code>3309:3306</code> line —
+this traffic never touches the host.</p>
+
+<pre class="language-nginx"><code class="language-nginx">location /api/ {
+    proxy_pass         http://api:8085;
+    proxy_http_version 1.1;</code></pre>
+
+<p>Same thing from nginx: service name <code>api</code>, container port 8085. The host publishes
+<code>8086:8085</code>, and the proxy does not care.</p>
+
+<p>Prove it from inside:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose exec web sh -c 'getent hosts api mysql'
+172.18.0.3    api
+172.18.0.2    mysql</code></pre>
+
+<h2>The mistake this all exists to prevent</h2>
+
+<p>You have MySQL working from your terminal on <code>127.0.0.1:3309</code>. You put the same string
+in the API's configuration. The API cannot connect.</p>
+
+<pre class="language-yaml"><code class="language-yaml"># Wrong — inside the api container, 127.0.0.1 IS the api container,
+# which runs no database. And 3309 is a host-side number that means
+# nothing on the container network.
+SPRING_DATASOURCE_URL: jdbc:mysql://127.0.0.1:3309/pizza
+
+# Right — service name, container port.
+SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/pizza</code></pre>
+
+<p>Every container has its own loopback interface. <code>localhost</code> is not a synonym for
+"this machine" in there; it is a synonym for "this container".</p>
+
+<p>The same trap in the other direction: a container that needs something running natively on your
+laptop — a database you did not containerise, a debugger — cannot use <code>localhost</code>
+either. Docker Desktop provides a name for it:</p>
+
+<pre class="language-bash"><code class="language-bash">host.docker.internal</code></pre>
+
+<p>On Linux it is not automatic; add
+<code>extra_hosts: ["host.docker.internal:host-gateway"]</code> to the service.</p>
+
+<h2>Network types, briefly</h2>
+
+<p><strong><code>bridge</code></strong> is the default and what Compose creates per project.
+Containers get private IPs, talk to each other by name, and reach the outside world through NAT.</p>
+
+<p>⚠️ One wrinkle worth knowing: <strong>the default bridge network you get from a bare
+<code>docker run</code> has no DNS between containers.</strong> Name resolution is a feature of
+<em>user-defined</em> networks, which is what Compose makes and what
+<code>docker network create</code> gives you. It is a common source of "it works in Compose and not
+with <code>docker run</code>".</p>
+
+<p><strong><code>host</code></strong> removes the isolation entirely — the container shares your
+network stack, so <code>-p</code> is meaningless and its ports are simply your ports. Fast, and
+Linux-only in any meaningful sense.</p>
+
+<p><strong><code>none</code></strong> gives no networking at all. Genuinely useful for a batch job
+that only touches a mounted volume.</p>
+
+<h2>Debugging it</h2>
+
+<pre class="language-bash"><code class="language-bash">docker network ls
+docker network inspect pizza_default          # which containers, which IPs
+docker compose port api 8085                  # what is 8085 published as?
+docker compose exec web sh -c 'getent hosts api'   # does the name resolve?
+docker compose exec web sh -c 'wget -qO- http://api:8085/api/products | head -c 100'</code></pre>
+
+<p>Work outwards. If <code>getent hosts api</code> fails, it is a network or service-name problem.
+If it resolves but the request hangs, the target is not listening on that port — often because the
+app bound <code>127.0.0.1</code> instead of <code>0.0.0.0</code>, and is therefore unreachable from
+anywhere but its own container.</p>
+
+<p>Next: <a href="/docker/docker-volumes-and-persistence">where the data goes</a>.</p>

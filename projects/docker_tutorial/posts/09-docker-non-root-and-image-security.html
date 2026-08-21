@@ -1,0 +1,151 @@
+<p>Two things in this lesson are worth more than every scanner report you will ever read: the user
+your container runs as, and the fact that a deleted file is still in your image.</p>
+
+<h2>Your container is running as root</h2>
+
+<p>Unless you said otherwise. Check any image you use:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker run --rm --entrypoint id nginx:1.27-alpine
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),...</code></pre>
+
+<p>Root <em>inside</em> the container is uid 0 on the kernel it shares with your host. Namespaces
+make that mostly harmless most of the time — but "mostly" is doing real work in that sentence. A
+container escape, a mounted host path, a socket handed in for convenience, and uid 0 in the
+container is uid 0 outside it.</p>
+
+<p>The two images in this track:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker run --rm --entrypoint id pizza-api:dev
+uid=999(pizza) gid=999(pizza) groups=999(pizza)
+
+$ docker compose exec web id
+uid=101(nginx) gid=101(nginx) groups=101(nginx)</code></pre>
+
+<h2>Doing it</h2>
+
+<pre class="language-docker"><code class="language-docker">RUN groupadd --system pizza && useradd --system --gid pizza --no-create-home pizza
+WORKDIR /app
+COPY --from=build --chown=pizza:pizza /build/extracted/application/ ./
+RUN mkdir -p /app/uploads/products && chown -R pizza:pizza /app/uploads
+USER pizza</code></pre>
+
+<p><code>--system</code> gives an account with no password, no home directory and no login shell —
+an identity to run as, not a person.</p>
+
+<p><code>--chown</code> on the <code>COPY</code> rather than a <code>RUN chown</code> afterwards is
+worth the habit. A separate <code>chown</code> rewrites every file's metadata, which for a
+copy-on-write filesystem means a <strong>second full copy of those files in a new layer</strong>.
+On the 120 MB dependency layer that is 120 MB of pure waste.</p>
+
+<p><code>USER</code> goes as late as possible — everything after it runs unprivileged, including
+remaining build steps, so package installs and directory creation come first.</p>
+
+<p>Verify it does what you think:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker run --rm --entrypoint sh pizza-api:dev -c 'touch /etc/probe'
+touch: cannot touch '/etc/probe': Permission denied
+
+$ docker run --rm --entrypoint sh pizza-api:dev -c 'touch /app/uploads/probe && echo ok'
+ok</code></pre>
+
+<h2>Then port 80 stops working</h2>
+
+<p>The predictable next problem. Ports below 1024 are privileged, and a non-root process cannot
+bind one:</p>
+
+<pre class="language-bash"><code class="language-bash">bind() to 0.0.0.0:80 failed (13: Permission denied)</code></pre>
+
+<p>The wrong fix is to go back to root. The right one is to listen on a high port and publish it
+wherever you like — the <em>host</em> side of a publish is bound by the Docker daemon, which is
+root, so <code>-p 80:8080</code> works fine.</p>
+
+<p>That is exactly what <code>nginxinc/nginx-unprivileged</code> does. The official nginx image
+starts as root to bind 80 and drops privileges for its workers; the unprivileged one never runs as
+root at all, and listens on 8080:</p>
+
+<pre class="language-nginx"><code class="language-nginx">server {
+    listen       8080;
+    server_name  localhost;</code></pre>
+
+<pre class="language-yaml"><code class="language-yaml">ports:
+  - "8080:8080"</code></pre>
+
+<h2>A deleted secret is not deleted</h2>
+
+<p>This one is worth demonstrating rather than asserting, because the image really does look clean.</p>
+
+<pre class="language-docker"><code class="language-docker">FROM alpine:3.21
+COPY secrets.env /tmp/secrets.env
+RUN cat /tmp/secrets.env > /dev/null
+RUN rm /tmp/secrets.env</code></pre>
+
+<pre class="language-bash"><code class="language-bash">$ docker run --rm leakdemo:v1 cat /tmp/secrets.env
+cat: can't open '/tmp/secrets.env': No such file or directory</code></pre>
+
+<p>Gone. Now unpack the image instead of running it:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker save leakdemo:v1 -o img.tar && tar -xf img.tar -C export
+$ tar -xOf export/blobs/sha256/0d27be0959... tmp/secrets.env
+API_KEY=sk_live_pretend_this_is_real</code></pre>
+
+<p>The <code>COPY</code> layer holds the file. The <code>rm</code> layer holds a whiteout marker
+that hides it. Both ship, and anyone who can pull the image can do what you just did — no exploit,
+no privileged access, two standard commands.</p>
+
+<p>The same applies to <code>ARG</code> and <code>ENV</code>: build arguments are recorded in the
+image metadata and <code>docker history</code> prints them.</p>
+
+<p>The fix is a BuildKit secret mount, which makes the value available during one
+<code>RUN</code> and puts it in no layer:</p>
+
+<pre class="language-docker"><code class="language-docker">RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm ci</code></pre>
+
+<pre class="language-bash"><code class="language-bash">docker build --secret id=npmrc,src=$HOME/.npmrc .</code></pre>
+
+<p>And the fix for the far more common case — a secret that was never needed at build time at all —
+is to pass it at <em>run</em> time. Lesson 12.</p>
+
+<h2>Keep it out of the context in the first place</h2>
+
+<p>Best of all, the file the builder never receives cannot end up in a layer by accident.
+<code>.dockerignore</code> is a security control as much as a speed one:</p>
+
+<pre class="language-bash"><code class="language-bash">src/main/resources/application-local.properties
+src/main/resources/application-*.local.properties
+.env
+.env.local
+.git/</code></pre>
+
+<p><code>.git/</code> deserves its own mention: it holds every version of every file ever
+committed, including a secret that was committed once and removed in the next commit.</p>
+
+<h2>Pin the base image by digest</h2>
+
+<p>A tag is a mutable pointer (lesson 3). For anything you care about reproducing:</p>
+
+<pre class="language-docker"><code class="language-docker">FROM alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</code></pre>
+
+<p>The honest trade: you now get no security updates until someone changes that line. Pinning
+without a bot like Dependabot or Renovate to bump it is how a base image ends up two years stale.
+Pin plus automation, or a tag plus a rebuild schedule — but pick one deliberately.</p>
+
+<h2>Scanning</h2>
+
+<pre class="language-bash"><code class="language-bash">docker scout quickview pizza-api:dev
+docker scout cves pizza-api:dev</code></pre>
+
+<p>⚠️ <code>docker scout</code> requires a Docker Hub login, so there is no output to show you here —
+this track was written without signing in. <a href="https://trivy.dev">Trivy</a> is the usual
+alternative and needs no account:</p>
+
+<pre class="language-bash"><code class="language-bash">docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image pizza-api:dev</code></pre>
+
+<p>What to expect: a long list, mostly in the base image, mostly in packages your application never
+calls. Which is why the ordering in this lesson is what it is. A scanner tells you which CVEs are
+present. It cannot tell you that your container is running as root, or that a credential is sitting
+in layer three.</p>
+
+<p>Next: <a href="/docker/docker-ports-and-networking">how containers reach each other, and why
+<code>localhost</code> lies</a>.</p>

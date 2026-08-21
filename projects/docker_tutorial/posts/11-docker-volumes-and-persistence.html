@@ -1,0 +1,147 @@
+<p>Lesson 3: a container gets a thin writable layer on top of the image, and that layer belongs to
+the container. Remove the container and everything written to it is gone.</p>
+
+<p>Which is exactly what you want for a stateless API and exactly what you do not want for a
+database. So a database in a container needs somewhere else to write.</p>
+
+<h2>Named volumes</h2>
+
+<pre class="language-yaml"><code class="language-yaml">services:
+  mysql:
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+volumes:
+  mysql-data:</code></pre>
+
+<p>Two parts, both required. The <code>volumes:</code> at the bottom declares it; the line inside
+the service mounts it. Left of the colon is the volume name, right is the path inside the
+container.</p>
+
+<p>Docker creates and owns the storage:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker volume ls --filter name=pizza_
+pizza_api-uploads
+pizza_mysql-data
+
+$ docker volume inspect pizza_mysql-data --format '{{.Mountpoint}}'
+/var/lib/docker/volumes/pizza_mysql-data/_data</code></pre>
+
+<p>The <code>pizza_</code> prefix is the Compose project name. That is what keeps this stack's
+database separate from another project's, and it is why <code>name: pizza</code> at the top of the
+compose file matters — without it the project name comes from the directory, and cloning the repo
+into a differently-named folder silently gives you a second, empty database.</p>
+
+<p>⚠️ On a Mac that mountpoint is inside Docker Desktop's Linux VM, not on your filesystem. Do not
+go looking for it in Finder.</p>
+
+<h2>Proving it works</h2>
+
+<p>Worth doing once so you trust it:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose exec mysql mysql -uroot -e \
+    "CREATE TABLE pizza.volume_probe (note VARCHAR(64)); \
+     INSERT INTO pizza.volume_probe VALUES ('survived');"
+
+$ docker compose down
+ Container pizza-mysql-1  Removed
+ Network pizza_default    Removed
+
+$ docker compose up -d
+$ docker compose exec mysql mysql -uroot -e "SELECT note FROM pizza.volume_probe;"
+note
+survived</code></pre>
+
+<p>The container was destroyed and recreated. The data did not notice.</p>
+
+<h2>down versus down -v</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose down        # containers and network go. Volumes stay.
+docker compose down -v     # ... and the volumes are deleted.</code></pre>
+
+<p><strong><code>-v</code> is not undoable and there is no confirmation prompt.</strong> It is the
+right command when a migration has left the schema in a state you would rather start over from, and
+the wrong one every other time. Get in the habit of typing <code>down</code> and adding
+<code>-v</code> deliberately, rather than the reverse.</p>
+
+<h2>Bind mounts</h2>
+
+<p>The other kind. Instead of storage Docker manages, you mount a path from your own machine:</p>
+
+<pre class="language-yaml"><code class="language-yaml">volumes:
+  - ./hasura/metadata:/hasura-metadata</code></pre>
+
+<p>The giveaway is the leading <code>./</code> or <code>/</code> — a path rather than a name.</p>
+
+<p>Bind mounts are for when <strong>you</strong> need to see the files: source you are editing while
+the container runs it, a config file you want to tweak without a rebuild, output the container
+produces that you want to keep.</p>
+
+<p>Three things to know about them.</p>
+
+<p><strong>The host wins.</strong> Whatever is at that host path replaces what the image had at that
+container path. Bind-mount an empty directory over <code>/app</code> and the application is gone.</p>
+
+<p><strong>Permissions are the host's.</strong> A container running as uid 999 writing to a
+bind-mounted directory owned by your user gets <code>Permission denied</code> — a specifically
+Linux problem, since Docker Desktop papers over it on macOS and Windows.</p>
+
+<p><strong>They are slower on macOS and Windows.</strong> Every read and write crosses the VM
+boundary. Tolerable for source files; genuinely painful for a database's write pattern, which is one
+of the reasons the compose file in this track uses a named volume for MySQL.</p>
+
+<h2>Which to use</h2>
+
+<pre class="language-bash"><code class="language-bash">database storage           named volume
+uploaded files             named volume
+source code, live reload   bind mount
+a config file to tweak     bind mount
+build output to keep       bind mount</code></pre>
+
+<p>The rule underneath: <strong>if only the container needs it, use a named volume; if you need it
+too, bind mount it.</strong></p>
+
+<h2>Uploads, and a real trap</h2>
+
+<pre class="language-yaml"><code class="language-yaml">volumes:
+  - api-uploads:/app/uploads</code></pre>
+
+<p>The API writes product images to <code>./uploads/products</code> inside the container. Without
+this line every redeploy loses them, and a redeploy is not a rare event.</p>
+
+<p>The trap: the image creates that directory owned by the app's user —</p>
+
+<pre class="language-docker"><code class="language-docker">RUN mkdir -p /app/uploads/products && chown -R pizza:pizza /app/uploads</code></pre>
+
+<p>— and a <strong>named volume mounted over a non-empty directory copies the image's contents,
+ownership included, on first use.</strong> That is why this works without any further
+<code>chown</code>. A <em>bind</em> mount does no such copy; it presents the host directory as-is,
+and the container's user very likely cannot write to it. Same two lines of YAML, completely
+different outcome.</p>
+
+<h2>Backups</h2>
+
+<p>Compose does not back anything up. A volume is a directory in the VM, and the standard trick is
+a throwaway container that can see both it and your machine:</p>
+
+<pre class="language-bash"><code class="language-bash">docker run --rm \
+  -v pizza_mysql-data:/from \
+  -v "$PWD":/to \
+  alpine:3.21 tar czf /to/mysql-backup.tar.gz -C /from .</code></pre>
+
+<p>For a database, prefer its own dump tool — <code>mysqldump</code>, <code>pg_dump</code> — over a
+file-level copy of a running data directory, which can catch it mid-write.</p>
+
+<h2>Cleaning up</h2>
+
+<pre class="language-bash"><code class="language-bash">docker volume ls
+docker volume ls --filter dangling=true   # attached to nothing
+docker volume prune                       # delete those
+docker system df -v                       # what is actually using the space</code></pre>
+
+<p><code>docker volume prune</code> deletes volumes no container currently references — which
+includes the database of a stack you took <code>down</code> last week and meant to bring back.
+<code>ls</code> first.</p>
+
+<p>Next: <a href="/docker/docker-environment-and-configuration">configuring the same image
+differently in different places</a>.</p>

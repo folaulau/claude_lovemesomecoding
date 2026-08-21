@@ -1,0 +1,150 @@
+<p>The demo API can use Elasticsearch for product search, a message broker for order events, and an
+SMTP sink for receipt emails. None of them is required to run the application.</p>
+
+<p>If they are all in the compose file, <code>docker compose up</code> starts four containers and
+several gigabytes of JVM heap to serve a pizza menu. If they are not in it, there is nowhere to
+record how to run them. Profiles are the answer to that.</p>
+
+<h2>Profiles</h2>
+
+<pre class="language-yaml"><code class="language-yaml">  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
+    container_name: pizza-elasticsearch
+    profiles: ["search", "all"]</code></pre>
+
+<p><strong>A service with a <code>profiles</code> key does not start unless one of its profiles is
+requested.</strong> A service without one always starts.</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d                          # MySQL only
+docker compose --profile search up -d         # + Elasticsearch
+docker compose --profile messaging up -d      # + the Artemis broker
+docker compose --profile mail up -d           # + Mailpit
+docker compose --profile all up -d            # everything</code></pre>
+
+<p>Listing two profiles — <code>["search", "all"]</code> — means the service is included by either,
+which is how <code>all</code> works without repeating anything.</p>
+
+<p>The naming is worth stealing: <strong>each compose profile is named after the Spring profile that
+needs it.</strong> So the two commands line up, and nobody has to remember a mapping:</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose --profile search up -d
+./mvnw spring-boot:run -Dspring-boot.run.profiles=local,search</code></pre>
+
+<p>The same mechanism in the full-stack file keeps the second frontend out of the default build:</p>
+
+<pre class="language-yaml"><code class="language-yaml">  web-angular:
+    profiles: ["angular"]</code></pre>
+
+<p>Two frontends against one API is useful to have <em>available</em> and wasteful to build every
+time.</p>
+
+<h3>Two things that will catch you</h3>
+
+<p><strong><code>down</code> needs the profile too.</strong> <code>docker compose down</code> only
+tears down services in the active profiles, so a container started with
+<code>--profile search</code> is left running by a bare <code>down</code>. Use
+<code>docker compose --profile all down</code>, or <code>--profile</code> matching what you
+started.</p>
+
+<p><strong>A dependency does not activate a profile.</strong> If an always-on service declares
+<code>depends_on</code> on a profiled one, the dependency is skipped rather than pulled in — and
+you get a start-up failure that does not mention profiles at all.</p>
+
+<h2>The override file</h2>
+
+<p>Compose reads <code>compose.yaml</code> and then, if present,
+<code>compose.override.yaml</code>, merging the second over the first. Automatically, with no
+flags.</p>
+
+<p>The usual arrangement is a base file with what is true everywhere, and an override — gitignored,
+or committed as the development default — with what is true here:</p>
+
+<pre class="language-yaml"><code class="language-yaml"># compose.yaml — committed, true everywhere
+services:
+  api:
+    build:
+      context: ./pizza-springboot-backend
+    ports:
+      - "8086:8085"</code></pre>
+
+<pre class="language-yaml"><code class="language-yaml"># compose.override.yaml — local only
+services:
+  api:
+    environment:
+      LOGGING_LEVEL_COM_PIZZA: DEBUG
+    volumes:
+      - ./pizza-springboot-backend/src:/src:ro</code></pre>
+
+<p>Nobody edits the shared file to change a log level, and nobody accidentally commits their
+personal debugging setup.</p>
+
+<h3>How the merge actually works</h3>
+
+<p>This is the part that surprises people, and it is worth knowing before you rely on it.</p>
+
+<p><strong>Scalars are replaced.</strong> <code>image</code>, <code>restart</code>, a single value —
+the override wins.</p>
+
+<p><strong>Maps are merged, key by key.</strong> <code>environment</code>, <code>labels</code>. The
+override adds and replaces individual keys; it does not discard the rest.</p>
+
+<p><strong>Sequences are <em>concatenated</em>, not replaced.</strong> <code>ports</code>,
+<code>volumes</code>, <code>command</code> arguments. So an override that "changes" a port actually
+adds a second one:</p>
+
+<pre class="language-yaml"><code class="language-yaml"># base
+ports: ["8086:8085"]
+# override
+ports: ["9000:8085"]
+# result: BOTH published — 8086 and 9000</code></pre>
+
+<p>There is no way to remove a list entry from an override. If you need a genuinely different list,
+the base file must not declare one — which is a real argument for keeping ports out of the base and
+in the per-environment files.</p>
+
+<p><code>docker compose config</code> prints the merged result. Use it rather than reasoning about
+the rules.</p>
+
+<h2>Stacking files with -f</h2>
+
+<p>For more than two environments, name them and be explicit:</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose -f compose.yaml -f compose.prod.yaml up -d</code></pre>
+
+<p>Later files win. ⚠️ <strong>Passing any <code>-f</code> disables the automatic
+<code>compose.override.yaml</code></strong> — which is a feature (your production command does not
+silently pick up someone's local debugging file) and a trap the first time a
+<code>-f compose.yaml</code> makes your usual overrides stop applying.</p>
+
+<p>One caveat on relative paths: they resolve against the <strong>first</strong> file's directory,
+not each file's own. Splitting compose files across directories produces build contexts that point
+somewhere unexpected.</p>
+
+<h2>Variables and .env</h2>
+
+<pre class="language-yaml"><code class="language-yaml">      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}</code></pre>
+
+<p>Interpolation happens <strong>on the host, before any container exists</strong> — Compose is
+doing string substitution on the YAML. A <code>.env</code> file next to the compose file is read
+automatically for these values.</p>
+
+<pre class="language-bash"><code class="language-bash">${VAR}            empty if unset
+${VAR:-default}   default if unset OR empty
+${VAR-default}    default only if UNSET (an empty value stays empty)
+${VAR:?message}   fail with `message` if unset — for a required value</code></pre>
+
+<p><code>${VAR:?message}</code> is underused. It turns "the stack came up but nothing works" into a
+clear error before anything starts.</p>
+
+<p>⚠️ Do not confuse this <code>.env</code> with the container's environment. This one configures
+<em>Compose</em>; to give a container a file of variables, that is <code>env_file:</code> on the
+service. Lesson 12.</p>
+
+<h2>Which mechanism for what</h2>
+
+<pre class="language-bash"><code class="language-bash">profiles         optional SERVICES — search, messaging, a second frontend
+override files   different SETTINGS for the same services — dev vs prod
+variables        different VALUES — hostnames, keys, tags</code></pre>
+
+<p>Next: <a href="/docker/docker-compose-full-stack">the whole application, one command</a>.</p>

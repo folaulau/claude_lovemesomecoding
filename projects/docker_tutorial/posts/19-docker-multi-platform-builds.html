@@ -1,0 +1,121 @@
+<p>You build on an Apple Silicon Mac. You push. The server says:</p>
+
+<pre class="language-bash"><code class="language-bash">exec /app/entrypoint: exec format error</code></pre>
+
+<p>Nothing is corrupt. You built an <code>arm64</code> image and the server is <code>amd64</code>,
+and a CPU cannot execute instructions from another architecture.</p>
+
+<h2>Images have an architecture</h2>
+
+<p>An image is built for a specific OS and CPU, and the default is whatever built it:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker info --format '{{.Architecture}}'
+aarch64
+
+$ docker image inspect pizza-web:dev --format '{{.Os}}/{{.Architecture}}'
+linux/arm64</code></pre>
+
+<p>That is the whole problem. Every image built on this machine is <code>arm64</code> unless
+something says otherwise, and most cloud instances are <code>amd64</code>.</p>
+
+<p>It went unnoticed for years because everyone's laptop was x86. Apple Silicon and Graviton made it
+a daily concern.</p>
+
+<h2>Why you did not notice locally</h2>
+
+<pre class="language-bash"><code class="language-bash">$ docker run --rm --platform linux/amd64 alpine:3.21 uname -m
+x86_64</code></pre>
+
+<p>That runs, on an arm64 machine, because Docker Desktop emulates. Which is convenient and means
+<strong>you cannot catch this by running the image on your laptop</strong> — it works there and
+fails on the server.</p>
+
+<h2>Building for the other one</h2>
+
+<pre class="language-bash"><code class="language-bash">docker buildx build --platform linux/amd64 -t pizza-web:amd64 --load .</code></pre>
+
+<p><code>buildx</code> rather than <code>build</code>, because plain <code>docker build</code>
+cannot target another platform. It is bundled with Docker Desktop and recent Engine versions:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker buildx version
+github.com/docker/buildx v0.19.2</code></pre>
+
+<p>And for both at once:</p>
+
+<pre class="language-bash"><code class="language-bash">docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/…/pizza-web:1.4.2 --push .</code></pre>
+
+<p>⚠️ <strong><code>--push</code>, not <code>--load</code>.</strong> A multi-platform build produces a
+<em>manifest list</em> — an index pointing at one image per architecture — and your local image
+store can only hold one image per tag. So <code>--load</code> fails on a two-platform build, and
+that error is a common first stumble.</p>
+
+<p>The payoff of a manifest list is that the reference just works: everyone pulls
+<code>pizza-web:1.4.2</code> and the registry hands each client the right one.</p>
+
+<h2>What emulation costs</h2>
+
+<p>Honest numbers rather than received wisdom, measured on the machine this track was written on
+(Docker Desktop, Apple Silicon). Identical CPU-bound work — 600 MB hashed — native and
+emulated:</p>
+
+<pre class="language-bash"><code class="language-bash">linux/arm64    2690 ms
+linux/amd64    3251 ms</code></pre>
+
+<p>About 1.2×. That is <em>far</em> below the 5–10× that older writing about QEMU reports, because
+Docker Desktop on Apple Silicon can use Rosetta rather than QEMU for x86 emulation. On a Linux CI
+runner using <code>binfmt_misc</code> and QEMU, expect much worse.</p>
+
+<p>⚠️ And a warning about how you measure it. Timing two <code>docker build --no-cache</code> runs
+does not measure emulation — it mostly measures npm and Maven downloading over the network. Doing
+exactly that on the API image here produced 87 s native and 20 s emulated, which is nonsense.
+Isolate the CPU work or do not quote a number.</p>
+
+<h2>The trick that removes the cost</h2>
+
+<p>Emulating the whole build is the brute-force approach. If your toolchain can cross-compile, you
+can run the build stage <strong>natively</strong> and only produce output for the target:</p>
+
+<pre class="language-docker"><code class="language-docker">FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+ARG TARGETOS TARGETARCH
+WORKDIR /src
+COPY . .
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/app .
+
+FROM alpine:3.21
+COPY --from=build /out/app /app
+ENTRYPOINT ["/app"]</code></pre>
+
+<p>Two variables BuildKit provides automatically. <code>BUILDPLATFORM</code> is the machine doing
+the building; <code>TARGETPLATFORM</code> (and its <code>TARGETOS</code>/<code>TARGETARCH</code>
+parts) is what is being built for. So the compiler runs at full native speed and is simply told to
+emit a different architecture.</p>
+
+<p>How far this gets you depends entirely on the language. Go and Rust cross-compile
+straightforwardly. <strong>The JVM does not need any of this</strong> — bytecode is architecture
+independent, so only the base image differs, and a JVM multi-platform build is nearly free.
+Interpreted languages are fine until a dependency has a native extension, and then you are back to
+emulation for that step.</p>
+
+<h2>Checking what you have</h2>
+
+<pre class="language-bash"><code class="language-bash">docker buildx imagetools inspect ghcr.io/…/pizza-web:1.4.2</code></pre>
+
+<p>Lists every platform in the manifest, without pulling anything. Worth putting in a deploy
+checklist the first few times.</p>
+
+<h2>Which platforms to build</h2>
+
+<p>Not both by default. A multi-platform build costs roughly the sum of its parts in CI time, every
+time, and half of it may be for nothing.</p>
+
+<p><strong>Just <code>linux/amd64</code></strong> if that is what you deploy to and nobody runs the
+image locally. Simplest and cheapest.</p>
+
+<p><strong>Both</strong> if developers on Apple Silicon run the same images your servers do — the
+usual reason, and worth the CI minutes for the friction it removes.</p>
+
+<p><strong>Just <code>linux/arm64</code></strong> if you have moved to Graviton or Ampere, which is
+increasingly the cheaper choice.</p>
+
+<p>Next: <a href="/docker/docker-ci-github-actions">having a machine do all of this</a>.</p>

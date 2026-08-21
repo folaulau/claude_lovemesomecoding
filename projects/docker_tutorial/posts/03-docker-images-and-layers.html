@@ -1,0 +1,128 @@
+<p>Almost everything that is surprising about Docker — why the second build is instant, why your
+image is 460 MB, why deleting a file does not shrink it, why ten containers cost one image's disk —
+follows from one structural fact. An image is a <strong>stack of read-only layers</strong>.</p>
+
+<h2>The stack</h2>
+
+<p>Each layer is a set of filesystem changes: files added, modified or deleted relative to the layer
+below. They are stacked and presented to the container as one filesystem by a union filesystem
+(<code>overlay2</code>, on this machine and most others).</p>
+
+<p>Here is the API image from this track, real output, read bottom-up:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker history pizza-api:dev
+SIZE      CREATED BY
+0B        ENTRYPOINT ["java" "-jar" "app.jar"]
+0B        EXPOSE map[8085/tcp:{}]
+0B        USER pizza
+0B        RUN mkdir -p /app/uploads/products && chown -R pizza:pizza /app/uploads
+336kB     COPY /build/extracted/application/ ./
+0B        COPY /build/extracted/snapshot-dependencies/ ./
+0B        COPY /build/extracted/spring-boot-loader/ ./
+120MB     COPY /build/extracted/dependencies/ ./
+0B        WORKDIR /app
+4.72kB    RUN groupadd --system pizza && useradd --system --gid pizza ... pizza
+0B        ENTRYPOINT ["/__cacert_entrypoint.sh"]
+5.31kB    COPY --chmod=755 entrypoint.sh /__cacert_entrypoint.sh
+165MB     RUN set -eux; ARCH="$(dpkg --print-architecture)"; ...   ← the JRE
+54.9MB    RUN apt-get update; apt-get install -y --no-install-recommends ...
+0B        ENV LANG=en_US.UTF-8 ...</code></pre>
+
+<p>Read that and the image stops being a mystery. 165 MB of it is a Java runtime. 55 MB is the
+base OS packages. 120 MB is the application's dependencies. <strong>The application itself is
+336 kB</strong> — 0.07% of a 460 MB image.</p>
+
+<p>Two things fall out immediately. Optimising your own code's size is pointless; the base image is
+the decision that matters (lesson 8). And the 120 MB dependency layer is separate from the 336 kB
+application layer <em>on purpose</em> — lesson 6 is about why.</p>
+
+<h2>Some instructions cost nothing</h2>
+
+<p>Notice how many layers are <code>0B</code>. <code>ENV</code>, <code>EXPOSE</code>,
+<code>USER</code>, <code>WORKDIR</code>, <code>ENTRYPOINT</code> and <code>CMD</code> change
+metadata, not files. They are free.</p>
+
+<p><code>RUN</code>, <code>COPY</code> and <code>ADD</code> change the filesystem, so they cost
+whatever they wrote.</p>
+
+<h2>Deleting a file does not make the image smaller</h2>
+
+<p>This is the consequence people trip over, and it is worth understanding rather than
+memorising.</p>
+
+<pre class="language-docker"><code class="language-docker">COPY secrets.env /tmp/secrets.env
+RUN ./configure-with secrets.env
+RUN rm /tmp/secrets.env</code></pre>
+
+<p>The final image does not show <code>/tmp/secrets.env</code>. It is still there. The
+<code>COPY</code> layer holds the file; the <code>rm</code> layer holds a marker saying "this file
+is deleted", and the union filesystem hides it. Both layers ship.</p>
+
+<p>So the image is no smaller, and — the part that matters — <strong>anyone who pulls the image can
+recover the file</strong> by reading that layer. This is the single most common way a credential
+gets published. Lesson 9 covers what to do instead.</p>
+
+<p>The same logic explains the classic <code>apt-get</code> incantation:</p>
+
+<pre class="language-docker"><code class="language-docker"># Bad — two layers, the cache ships in the first one
+RUN apt-get update
+RUN apt-get install -y curl
+RUN rm -rf /var/lib/apt/lists/*
+
+# Good — one layer, the cache never exists at the end of it
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*</code></pre>
+
+<p>The <code>&amp;&amp;</code> chain is not stylistic. It makes the download and its cleanup the
+same layer, so the cache is never committed at all.</p>
+
+<h2>Layers are shared</h2>
+
+<p>Layers are content-addressed — identified by a hash of what is in them — so identical layers are
+stored once and reused everywhere.</p>
+
+<p>Both frontend images in this track are built <code>FROM nginxinc/nginx-unprivileged:1.27-alpine</code>:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker image ls
+REPOSITORY          TAG   SIZE
+pizza-web           dev   50.8MB
+pizza-web-angular   dev   50.5MB</code></pre>
+
+<p>That is not 101 MB on disk. The 49 MB nginx base is one copy, shared; the two images differ by
+about 1 MB of built JavaScript each. <code>docker system df</code> shows the real total.</p>
+
+<p>The same sharing is what makes a pull fast: a registry only sends layers you do not already
+have.</p>
+
+<h2>The container's writable layer</h2>
+
+<p>When you start a container, Docker adds one thin writable layer on top of the image's read-only
+stack. Every write the container makes lands there — copy-on-write, so modifying a large file from
+a lower layer first copies it up.</p>
+
+<p>That layer belongs to the container, not the image. Remove the container and it is gone. This
+is why a database in a container needs a volume, which is lesson 11.</p>
+
+<h2>Tags, and why a tag is not an identity</h2>
+
+<pre class="language-bash"><code class="language-bash">nginxinc/nginx-unprivileged:1.27-alpine
+└──────── repository ─────────┘ └─ tag ─┘</code></pre>
+
+<p><strong>A tag is a mutable pointer.</strong> Nothing stops the owner of a repository moving
+<code>1.27-alpine</code> to different bytes tomorrow, and for <code>:latest</code> that is
+guaranteed to happen. Pull the same tag on two machines a week apart and you can get two different
+images.</p>
+
+<p>What does not move is the digest:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker image inspect --format '{{index .RepoDigests 0}}' alpine:3.21
+alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+
+$ docker pull alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d</code></pre>
+
+<p>The digest is a hash of the image's content, so it identifies exactly one image, permanently.
+Tags are for humans. Digests are for anything that has to be reproducible — which is why lesson 18
+argues against deploying <code>:latest</code>, and lesson 9 pins base images by digest.</p>
+
+<p>Next: <a href="/docker/docker-dockerfile">writing the file that produces one</a>.</p>

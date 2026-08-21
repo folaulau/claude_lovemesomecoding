@@ -1,0 +1,121 @@
+<p>Lesson 3 showed where a 460 MB image's bytes actually are: 165 MB of Java runtime, 55 MB of base
+OS packages, 120 MB of dependencies, and 336 kB of application code.</p>
+
+<p>So the <code>FROM</code> line is the size decision. Nothing you do to your own code moves the
+needle next to it.</p>
+
+<h2>What the suffixes mean</h2>
+
+<p>Measured on this machine, arm64, with <code>docker image inspect</code>:</p>
+
+<pre class="language-bash"><code class="language-bash">eclipse-temurin:21-jdk                     500 MB
+eclipse-temurin:21-jre                     340 MB
+eclipse-temurin:21-jre-alpine              207 MB
+node:22-alpine                             160 MB
+nginxinc/nginx-unprivileged:1.27-alpine     49 MB
+alpine:3.21                                  8 MB</code></pre>
+
+<p>Roughly, and in increasing order of how much they remove:</p>
+
+<p><strong>The default tag</strong> is a full Debian or Ubuntu userland — a package manager, a
+shell, coreutils, docs, locales. Comfortable, and mostly things your app never calls.</p>
+
+<p><strong><code>-slim</code></strong> is the same distribution with the documentation, locales and
+optional packages stripped. Same libc, same shell, same package manager. Usually the best
+effort-to-reward ratio, because nothing about it can surprise you.</p>
+
+<p><strong><code>-alpine</code></strong> is a different distribution built on <strong>musl</strong>
+libc rather than glibc. That is where the savings come from and also where the surprises come from
+— see below.</p>
+
+<p><strong>Distroless</strong> (Google's <code>gcr.io/distroless/*</code>) has no shell, no package
+manager, no coreutils. Your binary, its runtime, and CA certificates. The smallest and the hardest
+to debug: <code>docker exec -it c sh</code> does not work, because there is no <code>sh</code>.</p>
+
+<p><strong><code>scratch</code></strong> is genuinely empty. Only useful for a statically linked
+binary — Go, Rust — which is why you see it in Go projects and nowhere else.</p>
+
+<h2>The Alpine caveat, stated properly</h2>
+
+<p>musl is not a drop-in replacement for glibc. Three real consequences:</p>
+
+<p><strong>Anything with a compiled native extension needs a musl build.</strong> Python wheels and
+Node native modules are commonly published for glibc only, so <code>pip install</code> falls back
+to compiling from source — which turns a 30-second Alpine build into a ten-minute one and
+frequently needs build tools you then have to install. A "smaller" image that takes ten minutes to
+build is not obviously a win.</p>
+
+<p><strong>DNS resolution differs.</strong> musl historically had a smaller resolver with different
+search-domain and TCP-fallback behaviour. Mostly fine; occasionally the cause of an intermittent
+lookup failure that appears only in the Alpine image.</p>
+
+<p><strong>Some runtimes have known musl performance issues.</strong> musl's allocator has cost
+measurable throughput in allocation-heavy workloads. Measure rather than assume.</p>
+
+<p>None of that means don't use Alpine. It means the size number is not the whole trade, and it is
+worth checking rather than adopting on reputation.</p>
+
+<h2>An experiment worth running</h2>
+
+<p>The API in this track ships on <code>eclipse-temurin:21-jre</code>. Alpine's JRE is 133 MB
+smaller, so: does it work?</p>
+
+<pre class="language-docker"><code class="language-docker">FROM eclipse-temurin:21-jre-alpine AS runtime
+RUN addgroup -S pizza && adduser -S -G pizza pizza</code></pre>
+
+<p>Note that even this two-line change is not literal. Alpine ships BusyBox, so
+<code>groupadd</code>/<code>useradd</code> do not exist and you want
+<code>addgroup</code>/<code>adduser</code>, with different flags. That is the Alpine tax in
+miniature.</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker image ls
+REPOSITORY   TAG                  SIZE
+pizza-api    dev                  460MB
+pizza-api    alpine-experiment    327MB
+
+$ docker run --rm pizza-api:alpine-experiment
+  :: Spring Boot ::                (v4.1.0)
+Starting PizzaSpringbootBackendApplication ... using Java 21.0.11 with PID 1</code></pre>
+
+<p><strong>327 MB, and it boots.</strong> A real 133 MB saving for a JVM app with no native
+dependencies, which is the case Alpine handles well.</p>
+
+<p>The point is less the number than the method: it took one build and one <code>docker run</code>
+to find out, and that beats any amount of arguing about it.</p>
+
+<h2>What actually shrinks an image</h2>
+
+<p>In descending order of effect, for a typical application:</p>
+
+<p><strong>1. A multi-stage build.</strong> 957 MB → 460 MB here. Nothing else comes close, and
+lesson 7 covers it.</p>
+
+<p><strong>2. A smaller base.</strong> 460 MB → 327 MB. One line, subject to the caveats above.</p>
+
+<p><strong>3. A runtime instead of a toolchain.</strong> JRE not JDK, <code>python:3.13-slim</code>
+not <code>python:3.13</code>. Often the same edit as (2).</p>
+
+<p><strong>4. Not committing caches.</strong> Chain <code>apt-get install</code> with
+<code>rm -rf /var/lib/apt/lists/*</code> in one <code>RUN</code>; use
+<code>--no-install-recommends</code>; use a cache mount for package managers so their downloads are
+never in a layer at all.</p>
+
+<p>And what does <em>not</em> help: a later <code>RUN rm</code> of something an earlier layer added.
+Lesson 3 — the file is still in the earlier layer, the image is no smaller, and the file is
+recoverable.</p>
+
+<h2>Why it matters, and where it does not</h2>
+
+<p>Be clear about the actual cost, because image size is easy to over-optimise.</p>
+
+<p>A smaller image does <strong>not</strong> make your application faster. It does not use less
+memory. It matters at <strong>pull</strong> time — the first deploy to a new host, an autoscaler
+adding an instance, a CI job on a cold runner — and it matters for what is in the image at all,
+which is a security question (lesson 9) more than a size one.</p>
+
+<p>Layer sharing blunts even that. Ten services on one <code>21-jre</code> base pull those 340 MB
+once. Which is a good argument for a <em>consistent</em> base across your services, and often a
+better use of an afternoon than shaving 40 MB off one of them.</p>
+
+<p>Next: <a href="/docker/docker-non-root-and-image-security">the user that container is running
+as</a>.</p>

@@ -1,0 +1,148 @@
+<p>Building images by hand works until it doesn't: someone builds from an uncommitted branch,
+someone forgets to push, someone's laptop produces an arm64 image nobody notices until deploy. CI
+removes the human from the loop.</p>
+
+<p>What follows is the workflow from the demo application, in pieces.</p>
+
+<h2>Tests first, in their own job</h2>
+
+<pre class="language-yaml"><code class="language-yaml">jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Run the test suite
+        working-directory: pizza-springboot-backend
+        run: ./mvnw -B test</code></pre>
+
+<p>The image's Dockerfile builds with <code>-DskipTests</code> (lesson 4), and this is the other half
+of that decision. Tests in a separate job report a failure against the commit with the report
+attached, and no image is built at all. Tests inside the Dockerfile make every image build pay for
+them and turn a flaky test into a failed deploy with no useful output.</p>
+
+<p><code>cache: maven</code> caches <code>~/.m2</code> keyed on the pom files. A runner is a fresh
+machine every time, so without it every run re-downloads the whole dependency tree — the CI
+equivalent of getting the <code>COPY</code> order wrong in a Dockerfile.</p>
+
+<h2>Permissions, and not storing a password</h2>
+
+<pre class="language-yaml"><code class="language-yaml">    permissions:
+      contents: read
+      packages: write</code></pre>
+
+<p>This is the part worth copying even if you use nothing else here. GitHub mints a
+<code>GITHUB_TOKEN</code> for each run, scoped to this repository, expiring when the job ends. With
+<code>packages: write</code> it can push to GHCR.</p>
+
+<p>So there is <strong>no long-lived registry credential in the repository secrets</strong> —
+nothing to leak, nothing to rotate, nothing that keeps working after someone leaves. For AWS or GCP
+the equivalent is OIDC federation: the runner presents its identity token and the cloud hands back
+short-lived credentials, with no access key stored anywhere.</p>
+
+<h2>One job per image</h2>
+
+<pre class="language-yaml"><code class="language-yaml">    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pizza-api
+            context: ./pizza-springboot-backend
+          - name: pizza-web
+            context: ./pizza-react-frontend
+          - name: pizza-web-angular
+            context: ./pizza-angular-frontend</code></pre>
+
+<p>Three parallel jobs from one definition. <code>fail-fast: false</code> matters — the default
+cancels the siblings the moment one fails, so a broken frontend build hides whether the API would
+have built.</p>
+
+<h2>The build steps</h2>
+
+<pre class="language-yaml"><code class="language-yaml">      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}</code></pre>
+
+<p>QEMU for cross-architecture emulation, buildx because plain <code>docker build</code> cannot do
+multi-platform or inline cache (lesson 19).</p>
+
+<p>The <code>if:</code> on the login is a small thing that prevents a real annoyance: a pull request
+from a fork gets a read-only token, so this step would fail. Skipping it lets the build still run —
+it just does not push, which is exactly what you want from an untrusted PR.</p>
+
+<h2>Tags from the git ref</h2>
+
+<pre class="language-yaml"><code class="language-yaml">      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}</code></pre>
+
+<p>Lesson 18's tagging scheme, derived rather than typed. A push to <code>main</code> produces
+<code>:main</code>, <code>:sha-a3f9c21</code> and <code>:latest</code>; a <code>v1.4.2</code> tag
+also produces <code>:1.4.2</code> and <code>:1.4</code>.</p>
+
+<p>Deploy the <code>sha-</code> tag. <code>:latest</code> is produced here for humans typing
+<code>docker run</code>, not for a deployment to reference.</p>
+
+<h2>The cache line that decides your CI time</h2>
+
+<pre class="language-yaml"><code class="language-yaml">      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max</code></pre>
+
+<p>Every runner is a fresh machine with an <strong>empty layer cache</strong>. So all the careful
+<code>COPY</code> ordering from lesson 6 buys nothing in CI by default — every run reinstalls every
+dependency, in the one place it hurts most.</p>
+
+<p><code>type=gha</code> stores the layer cache in GitHub's own Actions cache and restores it next
+run.</p>
+
+<p><strong><code>mode=max</code> is the important half.</strong> The default (<code>min</code>)
+caches only layers present in the final image — and in a multi-stage build the expensive layer
+(<code>npm ci</code>, <code>mvn package</code>) is in the <em>build</em> stage, which never appears
+in the result. Without <code>mode=max</code> you cache the cheap layers and rebuild the expensive
+ones.</p>
+
+<p>Two caveats: GitHub's Actions cache has a 10 GB per-repository limit and evicts least-recently-used
+entries, so several large images can push each other out. And cache is scoped per branch, with
+fallback to the default branch — so the first build on a new branch is slow, and that is normal.</p>
+
+<h2>What this workflow does not do</h2>
+
+<p>It builds and pushes. It does not deploy — that is a separate concern, usually a separate workflow
+triggered by this one, and it should reference the <code>sha-</code> tag this run produced.</p>
+
+<p>⚠️ And one honest note about the file itself: <strong>it has never run.</strong> The demo project
+has no GitHub remote yet, so this is written to be correct rather than proven. Every underlying
+command was verified locally with the equivalent <code>docker buildx</code> invocation; the
+workflow wiring has not been. Its own header says so, which is the right place for that
+information to live.</p>
+
+<p>Next: <a href="/docker/docker-production">what changes when it is not your laptop</a>.</p>

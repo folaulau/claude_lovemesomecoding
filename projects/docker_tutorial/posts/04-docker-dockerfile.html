@@ -1,0 +1,170 @@
+<p>A Dockerfile is a script for building an image. Each instruction produces a layer; the layers
+stack into a filesystem; the metadata instructions record how to start a process in it.</p>
+
+<p>There are about fifteen instructions and you will use eight.</p>
+
+<h2>FROM</h2>
+
+<pre class="language-docker"><code class="language-docker">FROM eclipse-temurin:21-jdk AS build</code></pre>
+
+<p>Every image starts from another image. <code>eclipse-temurin</code> is the Adoptium build of
+OpenJDK — the same one <code>sdk install java</code> gives you by default — and <code>21-jdk</code>
+is the tag.</p>
+
+<p><code>AS build</code> names this stage. A Dockerfile can have several, and that is lesson 7.</p>
+
+<p><strong>Pin something.</strong> <code>FROM eclipse-temurin</code> with no tag means
+<code>:latest</code>, and your build silently moves to Java 25 the day it is released.</p>
+
+<h2>WORKDIR</h2>
+
+<pre class="language-docker"><code class="language-docker">WORKDIR /build</code></pre>
+
+<p>Sets the directory for every following <code>RUN</code>, <code>COPY</code>, <code>ENTRYPOINT</code>
+and <code>CMD</code>, and creates it if it does not exist.</p>
+
+<p>Use it rather than <code>RUN cd /build</code>. Each <code>RUN</code> is a fresh shell, so a
+<code>cd</code> in one has no effect on the next — a genuinely confusing failure where files land
+in <code>/</code> and nothing errors.</p>
+
+<h2>COPY</h2>
+
+<pre class="language-docker"><code class="language-docker">COPY .mvn/ .mvn/
+COPY mvnw pom.xml ./</code></pre>
+
+<p>Copies from the build context (lesson 5) into the image. Paths on the left are relative to the
+context; paths on the right are relative to <code>WORKDIR</code>.</p>
+
+<p><strong>The trailing slash is load-bearing.</strong> <code>COPY src/ src/</code> copies the
+<em>contents</em> of <code>src</code> into <code>src</code>. <code>COPY src /app</code> where
+<code>/app</code> does not exist copies the directory <em>as</em> <code>/app</code>. Getting it
+wrong produces <code>/app/src/src</code> or a file where a directory should be.</p>
+
+<p>There is also <code>ADD</code>, which does everything <code>COPY</code> does plus fetching URLs
+and auto-extracting tarballs. <strong>Use <code>COPY</code>.</strong> The auto-extraction is a
+surprise nobody wants — <code>ADD app.tar.gz /app</code> unpacks it, and if you wanted the file you
+now have its contents instead.</p>
+
+<h2>RUN</h2>
+
+<pre class="language-docker"><code class="language-docker">RUN ./mvnw -B dependency:go-offline || true
+COPY src/ src/
+RUN ./mvnw -B clean package -DskipTests</code></pre>
+
+<p>Runs a command at <strong>build</strong> time and commits the result as a layer. (Contrast
+<code>CMD</code>, which runs at <strong>run</strong> time and commits nothing.)</p>
+
+<p>Two things in those three lines are deliberate and worth stealing.</p>
+
+<p><code>|| true</code> on the warm-up: <code>dependency:go-offline</code> resolves what the build
+will need and stops, but some plugins only reveal their dependencies once they actually run, so it
+can exit non-zero on a warning. Failing the whole build over a warm-up step is not what anyone
+wants; the real build below downloads whatever was missed.</p>
+
+<p><code>-DskipTests</code>: tests belong in CI, where a failure is reported against a commit with
+the report attached. Running them here makes every image build pay for them and turns a flaky test
+into a failed deploy. The workflow in lesson 20 runs tests in a separate job, first.</p>
+
+<p><strong><code>RUN</code> is where images get fat.</strong> Every one is a layer, and a layer
+keeps whatever the command left behind — see lesson 3 on why <code>&amp;&amp; rm -rf</code> belongs
+in the same <code>RUN</code> as the thing it cleans up.</p>
+
+<h2>ENV and ARG</h2>
+
+<pre class="language-docker"><code class="language-docker">ARG VITE_API_BASE_URL=""
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL</code></pre>
+
+<p><code>ARG</code> is a build-time variable, passed with <code>--build-arg</code>, and it does not
+exist in the finished image. <code>ENV</code> is an environment variable that <em>does</em> — set
+in every layer after it and in every container started from it.</p>
+
+<p>The two lines above, from the React frontend's Dockerfile, accept a build argument and promote
+it to an environment variable so the build tool can read it.</p>
+
+<p>⚠️ <strong>Neither is a place for a secret.</strong> An <code>ARG</code> is recorded in the image
+metadata and <code>docker history</code> prints it; an <code>ENV</code> is in the image forever.
+Lesson 12 covers where secrets actually go.</p>
+
+<h2>USER</h2>
+
+<pre class="language-docker"><code class="language-docker">RUN groupadd --system pizza && useradd --system --gid pizza --no-create-home pizza
+USER pizza</code></pre>
+
+<p>Everything after this line — remaining build steps and the container's own process — runs as
+that user. Without it, everything runs as root. Lesson 9 is about why that matters more than it
+sounds.</p>
+
+<h2>EXPOSE</h2>
+
+<pre class="language-docker"><code class="language-docker">EXPOSE 8085</code></pre>
+
+<p><strong>This publishes nothing.</strong> It is documentation: a record of which port the image
+expects to serve on, readable by <code>docker inspect</code>, and the list <code>docker run -P</code>
+uses when it assigns random host ports.</p>
+
+<p>Reaching the port from your machine still requires <code>-p</code>. Omitting <code>EXPOSE</code>
+breaks nothing; including it tells the next person which port to publish.</p>
+
+<h2>CMD and ENTRYPOINT</h2>
+
+<p>The distinction everyone gets wrong once.</p>
+
+<p><strong><code>ENTRYPOINT</code> is the executable. <code>CMD</code> is its default
+arguments.</strong> Anything you type after the image name on <code>docker run</code> replaces
+<code>CMD</code> and is appended to <code>ENTRYPOINT</code>.</p>
+
+<pre class="language-docker"><code class="language-docker">ENTRYPOINT ["java", "-jar", "app.jar"]
+CMD ["--spring.profiles.active=prod"]</code></pre>
+
+<pre class="language-bash"><code class="language-bash">docker run pizza-api            # java -jar app.jar --spring.profiles.active=prod
+docker run pizza-api --debug    # java -jar app.jar --debug</code></pre>
+
+<p>So: <code>ENTRYPOINT</code> when the image <em>is</em> one program and arguments configure it.
+<code>CMD</code> alone when the image is an environment someone might want a shell in — with only
+<code>CMD</code>, <code>docker run myimage sh</code> gets you a shell; with
+<code>ENTRYPOINT</code>, it tries to pass <code>sh</code> to your program.</p>
+
+<h3>Exec form, always</h3>
+
+<p>This is the part that actually bites.</p>
+
+<pre class="language-docker"><code class="language-docker"># exec form — a JSON array. Correct.
+ENTRYPOINT ["java", "-jar", "app.jar"]
+
+# shell form — a bare string. Runs as: /bin/sh -c "java -jar app.jar"
+ENTRYPOINT java -jar app.jar</code></pre>
+
+<p>In shell form your process is a <strong>child of <code>/bin/sh</code></strong>, and that shell
+does not forward signals. So <code>docker stop</code> sends SIGTERM to the shell, the JVM never
+hears about it, Docker waits ten seconds and SIGKILLs everything — cutting off in-flight requests
+and skipping every shutdown hook.</p>
+
+<p>Exec form makes your process PID 1, which receives the signal. You can check:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker compose logs api | grep "PID"
+Starting PizzaSpringbootBackendApplication v0.0.1-SNAPSHOT using Java 21.0.11 with PID 1</code></pre>
+
+<p><strong>PID 1.</strong> That is what a graceful shutdown depends on, and lesson 21 returns to
+it.</p>
+
+<h3>Exec form has no shell, and that is the catch</h3>
+
+<p>No shell means no variable expansion and no globbing:</p>
+
+<pre class="language-docker"><code class="language-docker">ENTRYPOINT ["java", "-jar", "/app/*.jar"]     # fails: Unable to access jarfile /app/*.jar
+ENTRYPOINT ["java", "-jar", "$APP_HOME/app.jar"]   # fails: $APP_HOME is a literal</code></pre>
+
+<p>Which is exactly why the real Dockerfile renames the jar during the build rather than globbing
+for it at start-up — Spring Boot's jar comes out as
+<code>pizza-springboot-backend-0.0.1-SNAPSHOT.jar</code>, and hard-coding that version is an edit
+that gets forgotten on the next release:</p>
+
+<pre class="language-docker"><code class="language-docker">RUN mv extracted/application/*.jar extracted/application/app.jar</code></pre>
+
+<p>If you genuinely need shell behaviour, ask for it explicitly —
+<code>ENTRYPOINT ["sh", "-c", "exec java -jar $APP_HOME/app.jar"]</code>. The <code>exec</code>
+matters: it replaces the shell with the JVM, so you get expansion <em>and</em> your process back
+at PID 1.</p>
+
+<p>Next: <a href="/docker/docker-build-context-and-dockerignore">what <code>docker build .</code>
+actually sends</a>.</p>
