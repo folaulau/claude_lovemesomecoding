@@ -1,0 +1,462 @@
+<p>The database is the part of a system you cannot simply run more of. Application servers are
+interchangeable; a database holds state, and state is what makes scaling hard. It is why almost
+every system design conversation eventually arrives here.</p>
+
+<p>There is an order to do things in, and most designs skip several steps. The order below is the
+answer to &ldquo;how would you scale this?&rdquo; &mdash; and knowing where to <em>stop</em> is more
+valuable than knowing the last step.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  index properly            free, and usually enough
+   2  fix the query patterns    N+1 is the usual culprit
+   3  connection pooling        cheap, and a common silent ceiling
+   4  bigger machine            boring, effective, no code changes
+   5  read replicas             reads scale; writes do not
+   6  partition                 one table split within one database
+   7  shard                     data split across databases — expensive
+   8  a different datastore     when the shape was wrong all along</code></pre>
+
+<h2>1. Indexes</h2>
+
+<p>An index is a sorted structure that turns &ldquo;scan every row&rdquo; into &ldquo;walk down a
+tree&rdquo;. On a million rows that is the difference between a million comparisons and about
+twenty.</p>
+
+<p>The part worth understanding is <strong>column order in a composite index</strong>, because it
+is where most index problems actually live. StayHub&rsquo;s outbox has one index, and its shape is
+derived directly from the query it has to serve:</p>
+
+<pre class="language-sql"><code class="language-sql">-- the query:  WHERE status = 'PENDING' AND available_at &lt;= now()
+--             ORDER BY available_at
+CREATE INDEX ix_outbox_pending ON outbox (status, available_at);</code></pre>
+
+<p>Equality column first, then the range-and-sort column. Postgres seeks straight to the PENDING
+rows and then walks them <em>already in <code>available_at</code> order</em>, so there is no sort
+step and the cost does not grow as millions of DONE rows pile up behind them.</p>
+
+<p>Reverse the two and the index can no longer satisfy the ORDER BY without sorting. Index only
+<code>status</code> and every poll re-sorts every pending row. The rule generalises:
+<strong>equality columns first, then the range or sort column.</strong></p>
+
+<h3>Indexes are not free</h3>
+
+<p>Each one is a second copy of its columns that must be updated on every insert, update and
+delete. Six indexes on a table means a write does seven writes.</p>
+
+<p>The most common waste is a <em>redundant</em> index, and it arrives by accident. StayHub&rsquo;s
+first outbox migration created two:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX ix_outbox_pending ON outbox (status, available_at);
+CREATE INDEX ix_outbox_status  ON outbox (status);              -- redundant</code></pre>
+
+<p>A B-tree on <code>(a, b)</code> already answers every query a lone index on <code>(a)</code>
+would, because it is sorted by <code>a</code> first. The second index costs write throughput and
+disk for nothing. It appeared because the model declared <code>index=True</code> on the column
+<em>and</em> a composite index, and the schema autogenerator faithfully created both &mdash; which
+is exactly how redundant indexes get into real systems.</p>
+
+<p>Two more worth knowing. A <strong>partial index</strong> covers only some rows, which is ideal
+for a queue where the pending set is minuscule:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX ix_outbox_pending ON outbox (status, available_at)
+    WHERE status = 'PENDING';</code></pre>
+
+<p>And a <strong>covering index</strong> includes every column a query needs, so the answer comes
+from the index without touching the table at all.</p>
+
+<h2>2. Query patterns</h2>
+
+<p>The most common database performance problem is not a missing index. It is issuing hundreds of
+correct, fast, indexed queries where one would do.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   N+1:   SELECT * FROM properties LIMIT 20;          1 query
+          for each: SELECT * FROM images WHERE ...   20 queries
+                    SELECT * FROM amenities ...      20 queries
+                    SELECT * FROM users WHERE id=... 20 queries
+                                                     ── 61 queries
+   fixed: eager-load the relationships                ── 4 queries</code></pre>
+
+<p>Each of those 61 is a network round trip &mdash; and from the <a
+href="/system-design/system-design-back-of-envelope-estimation">latency table</a>, a datacenter
+round trip costs more than reading a megabyte from memory. The number of calls matters more than
+the size of each.</p>
+
+<p>N+1 is insidious because it is invisible in development. StayHub&rsquo;s seed database holds 12
+listings; 61 fast queries against 12 rows is imperceptible. The same code against a page of 100
+results in production is 301 queries.</p>
+
+<p>The fix is eager loading &mdash; telling the ORM to fetch the relationships up front. The
+detection is easier than the fix: count queries per request in development and fail a test when the
+count is unexpected.</p>
+
+<h3>Reading the query plan</h3>
+
+<p>Everything above is guesswork until you ask the database what it is actually doing.
+<code>EXPLAIN ANALYZE</code> is the tool, and you need to recognise about four things in its
+output:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   Seq Scan on bookings  (cost=0.00..18334.00 rows=1000000)
+   ^^^^^^^^ reading every row — fine on 100 rows, fatal on 10 million
+
+   Index Scan using ix_bookings_property  (rows=12)
+   ^^^^^^^^^^ found them via the index, then fetched the rows
+
+   Index Only Scan  (rows=12)
+   ^^^^^^^^^^^^^^^ answered entirely from the index — never touched the table
+
+   Sort  (actual rows=1000000)
+   ^^^^ sorting a million rows in memory or on disk;
+        usually means the index order does not match the ORDER BY</code></pre>
+
+<p>Two habits make this useful rather than decorative. Run <code>EXPLAIN ANALYZE</code>, not plain
+<code>EXPLAIN</code> &mdash; the first executes the query and reports what really happened, while
+the second only reports the plan and its estimates. And compare the <em>estimated</em> row counts
+with the <em>actual</em> ones: when they differ by orders of magnitude the planner is working from
+stale statistics, and the fix is <code>ANALYZE</code>, not a new index.</p>
+
+<p>A sequential scan is not automatically wrong, either. For a small table, or a query returning
+most of the rows, reading everything sequentially genuinely beats bouncing through an index. The
+planner knows this; the finding is a sequential scan on a large table returning few rows.</p>
+
+<h2>3. Connection pooling</h2>
+
+<p>A database connection is expensive to create and, in Postgres, is backed by an actual operating
+system process using several megabytes. Postgres&rsquo;s default limit is 100.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   20 app servers x a pool of 20 connections each  = 400 connections
+   Postgres max_connections                        = 100
+
+   -> 300 connections refused. The application reports
+      "too many clients already" and looks like a database outage.</code></pre>
+
+<p>This is a genuine ceiling that people hit while believing they have a scaling problem. The
+answers, in order: size each application pool deliberately rather than by default; put a connection
+pooler such as PgBouncer in front, which multiplexes thousands of client connections onto a few
+dozen real ones; and only then raise <code>max_connections</code>, which costs memory per
+connection.</p>
+
+<p>Counter-intuitively, more connections is often <em>slower</em>. Beyond roughly the number of
+cores, they contend rather than parallelise.</p>
+
+<h2>4. A bigger machine</h2>
+
+<p>Deeply unfashionable and frequently correct. Vertical scaling requires no code changes, no
+distributed anything, and modern hardware goes remarkably far &mdash; a database server with 128
+cores and a terabyte of RAM handles more than most companies ever will.</p>
+
+<p>Its limits are real: there is a ceiling, resizing means a brief restart, and it is still one
+machine to lose. But the comparison to make is not &ldquo;bigger machine versus sharding&rdquo; in
+the abstract. It is &ldquo;a week of work and a larger bill&rdquo; versus &ldquo;a quarter of
+engineering, a permanent increase in complexity, and losing cross-shard transactions
+forever.&rdquo;</p>
+
+<p>Take the bigger machine. Do it twice. Then talk about sharding.</p>
+
+<h2>5. Read replicas</h2>
+
+<p>The first real distribution step, and the one with the best ratio of benefit to cost &mdash;
+because most systems read far more than they write.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                 writes
+   [ app ] ─────────────> [ PRIMARY ]
+      │                        │  streaming replication (async)
+      │                        ├──> [ replica 1 ] ─┐
+      └──── reads ─────────────┴──> [ replica 2 ] ─┴─> reads</code></pre>
+
+<p>The primary takes every write and streams changes to replicas that serve reads. Adding replicas
+scales reads nearly linearly. It does nothing at all for writes, which is the thing to say out
+loud, because it is the limitation that eventually forces sharding.</p>
+
+<h3>Replication lag is a correctness problem</h3>
+
+<p>Replication is asynchronous, so a replica is always slightly behind &mdash; milliseconds
+normally, seconds under load, minutes if something is wrong.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   t=0     user updates their profile      -> PRIMARY
+   t=0.01  page reloads, reads a replica    -> replica is 200ms behind
+                                            -> the OLD name comes back
+
+   The user sees their change vanish. They try again.</code></pre>
+
+<p>This is not a performance issue; it is a bug users report and engineers cannot reproduce,
+because it depends on which replica answered and how loaded it was. It has a name &mdash;
+<strong>read-your-writes</strong> &mdash; and it gets covered properly in the <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a>.</p>
+
+<p>The practical answers: route a user&rsquo;s reads to the primary for a few seconds after they
+write; or send reads that must be current to the primary by design. StayHub does the latter
+implicitly &mdash; every booking decision reads the primary, because availability must never be
+answered from a stale copy.</p>
+
+<h3>What replicas also buy you</h3>
+
+<p>Worth mentioning because it is often the stronger justification: a replica is a warm standby.
+If the primary dies, one can be promoted, which turns &ldquo;restore from backup over several
+hours&rdquo; into &ldquo;fail over in under a minute&rdquo;.</p>
+
+<p>They are also where you point analytics, so an accidental full-table scan by a reporting query
+cannot slow down the site.</p>
+
+<h2>6. Partitioning</h2>
+
+<p>One table split into several physical pieces <em>within the same database</em>. Transactions,
+joins and foreign keys all still work, which makes it dramatically cheaper than sharding.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE bookings (
+    id          BIGSERIAL,
+    property_id BIGINT NOT NULL,
+    check_in    DATE   NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE bookings_2026_q1 PARTITION OF bookings
+    FOR VALUES FROM ('2026-01-01') TO ('2026-04-01');
+CREATE TABLE bookings_2026_q2 PARTITION OF bookings
+    FOR VALUES FROM ('2026-04-01') TO ('2026-07-01');</code></pre>
+
+<p>Two payoffs. Queries filtered by the partition key touch only the relevant partitions
+(&ldquo;partition pruning&rdquo;), so a query for last month reads one partition instead of five
+years of history. And deleting old data becomes <code>DROP TABLE bookings_2019_q1</code> &mdash;
+instant, rather than a <code>DELETE</code> that rewrites millions of rows and leaves the table
+bloated.</p>
+
+<p>That second point is the underrated one. Time-series data that must be retained for a fixed
+window is the clearest possible case for partitioning, and the reason is data <em>removal</em>, not
+query speed.</p>
+
+<h2>7. Sharding</h2>
+
+<p>Splitting data across separate databases, each holding a subset. This is the step that has no
+ceiling and a very high cost.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   shard_for(user_id) = hash(user_id) % 4
+
+   users 1, 5, 9  ──> [ DB 0 ]
+   users 2, 6, 10 ──> [ DB 1 ]
+   users 3, 7, 11 ──> [ DB 2 ]
+   users 4, 8, 12 ──> [ DB 3 ]
+
+   4x the write capacity. And no query can span two of them.</code></pre>
+
+<h3>What you give up</h3>
+
+<p>These are not inconveniences; they are the reason to postpone this step as long as possible.</p>
+
+<ul>
+  <li><strong>Cross-shard joins are gone.</strong> Data that lives on different shards has to be
+      assembled in application code.</li>
+  <li><strong>Cross-shard transactions are gone.</strong> &ldquo;Move money from A to B&rdquo;
+      stops being atomic and becomes a saga with compensating actions.</li>
+  <li><strong>Globally unique ids need solving.</strong> Auto-increment collides across shards
+      &mdash; see the <a href="/system-design/system-design-unique-id-generator">unique id
+      post</a>.</li>
+  <li><strong>Every query needs the shard key</strong>, or it fans out to all shards and you have
+      built a slow, expensive version of a single database.</li>
+  <li><strong>Operations multiply.</strong> Backups, migrations, upgrades and monitoring now happen
+      N times.</li>
+</ul>
+
+<h3>Choosing the key</h3>
+
+<p>The decision you will live with, because changing it later means moving all the data.</p>
+
+<table>
+  <thead><tr><th>Key</th><th>Good</th><th>Bad</th></tr></thead>
+  <tbody>
+    <tr><td><code>hash(user_id)</code></td><td>Even distribution; a user&rsquo;s data stays together</td>
+        <td>Anything not scoped to one user fans out</td></tr>
+    <tr><td><code>tenant_id</code></td><td>Natural isolation for B2B</td>
+        <td>One huge customer becomes a hot shard on their own</td></tr>
+    <tr><td>Geography</td><td>Locality, and data residency rules</td>
+        <td>Population is not evenly distributed</td></tr>
+    <tr><td>Date</td><td>Trivial to reason about</td>
+        <td>All writes land on the newest shard &mdash; the worst hot spot there is</td></tr>
+  </tbody>
+</table>
+
+<p>The test is simple: <strong>can your most common query be answered from one shard?</strong> If a
+booking system shards by <code>property_id</code>, then &ldquo;this property&rsquo;s calendar&rdquo;
+is one shard and &ldquo;my bookings&rdquo; is all of them. Shard by <code>user_id</code> and it is
+the reverse. You have to pick which query gets to be fast.</p>
+
+<h3>Hot shards, and resharding</h3>
+
+<p>Even distribution of <em>keys</em> is not even distribution of <em>load</em>. A social network
+sharded by user id puts a celebrity with fifty million followers on one shard, and that shard is
+now the whole problem.</p>
+
+<p>And when four shards become eight, <code>hash(key) % 4</code> becomes <code>hash(key) % 8</code>
+&mdash; which relocates roughly <strong>every row</strong>. <strong>Consistent hashing</strong>
+exists to fix exactly this: keys and shards are placed on a ring, and adding a shard moves only the
+keys in one arc, which is roughly 1/N of the data rather than all of it.</p>
+
+<p>The other common answer is to over-provision logical shards from the start &mdash; create 1,024
+of them and map many onto each physical machine. Growing then means moving logical shards between
+machines, with no rehashing at all.</p>
+
+<h3>Moving to a shard without downtime</h3>
+
+<p>Worth having an answer for, because &ldquo;we shard&rdquo; invites &ldquo;how do you get
+there?&rdquo; &mdash; and the honest answer is that it is a migration, not a deployment.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  add the shard key to the schema, backfill it       (no behaviour change)
+   2  route reads AND writes through a routing layer     (still one database)
+   3  stand up the new shards, replicate into them
+   4  dual-write: every write goes to old AND new
+   5  verify: compare the two continuously
+   6  shift reads to the new shards, a percentage at a time
+   7  stop writing to the old one
+   8  decommission
+
+   Every step is reversible until step 7. That is the point of the order.</code></pre>
+
+<p>The two steps people skip are 2 and 5. Introducing the routing layer while there is still only
+one database means the risky change (routing) and the risky change (splitting the data) do not
+happen simultaneously. And continuous verification is the only way to discover that some write path
+nobody remembered is still writing to the old place.</p>
+
+<h2>8. A different datastore</h2>
+
+<p>Sometimes the answer is that the data was never relational-shaped. Adding a specialised store
+alongside Postgres &mdash; not instead of it &mdash; is often better than scaling Postgres into a
+job it is bad at.</p>
+
+<p>StayHub does exactly this for search: Postgres remains the source of truth, and Elasticsearch
+holds a derived copy for the one query pattern SQL handles badly.</p>
+
+<pre class="language-python"><code class="language-python">    def _sync(self, prop: Property) -> None:
+        indexed = indexer.index_property(prop)</code></pre>
+
+<p>The property that makes it safe is that the index is <strong>derived and disposable</strong>. It
+can be rebuilt from Postgres at any time, so a divergence is a repair job rather than data loss.
+The cost is the dual-write problem, which is what the <a
+href="/system-design/system-design-consistency-and-availability">next post</a> is about.</p>
+
+<h2>Two things that are not scaling but look like it</h2>
+
+<p>Both come up constantly and neither is on the ladder, because they are about the data rather
+than the machines.</p>
+
+<h3>Denormalisation</h3>
+
+<p>Storing the same value in more than one place to avoid a join. A listing row carrying
+<code>rating_average</code> and <code>rating_count</code> rather than computing them from the
+reviews table on every read:</p>
+
+<pre class="language-python"><code class="language-python">    rating_average: Mapped[Decimal] = mapped_column(Numeric(3, 2), default=Decimal("0"), nullable=False)
+    rating_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)</code></pre>
+
+<p>The read becomes free and the write becomes a problem: every new review has to update the
+listing too, and the two can now disagree. That is the trade, in one sentence &mdash;
+<strong>denormalisation moves work from read time to write time and buys it with the risk of
+inconsistency.</strong></p>
+
+<p>It is the right call when reads massively outnumber writes and the derived value is
+reconstructible, which is the case here: if the average ever drifts, it can be recomputed from the
+reviews. Denormalised data you <em>cannot</em> rebuild is a much worse bargain.</p>
+
+<h3>Soft deletes</h3>
+
+<p>Flagging rows rather than removing them. StayHub does this because a booking references a
+property and a user forever, and deleting either would leave the booking pointing at nothing.</p>
+
+<p>The scaling consequence is the one people miss: <strong>deleted rows still cost you</strong>.
+They occupy pages, they sit in indexes, and every single query must remember to exclude them. Miss
+one <code>WHERE deleted = false</code> and you have leaked deleted data into a response &mdash;
+which is a correctness bug, not a performance one.</p>
+
+<p>At volume the answer is to move genuinely dead rows to an archive table on a schedule, so the
+hot table stays small, and to use partial indexes that cover only the live rows.</p>
+
+<h3>The counters problem</h3>
+
+<p>A specific denormalisation worth naming, because it is where write contention usually shows up
+first. A view counter, a like count, an inventory level &mdash; a single row that many requests
+update at once.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1,000 requests/sec all doing:
+       UPDATE posts SET views = views + 1 WHERE id = 42;
+
+   Every one takes a row lock on the SAME row. They serialise.
+   Throughput is now "how fast can one row be updated", not 1,000/sec.</code></pre>
+
+<p>Row-level locking is doing exactly its job here, and the job is the bottleneck. There is no index
+to add.</p>
+
+<p>Three standard escapes. <strong>Batch in memory</strong> and flush periodically, accepting that
+the count is slightly behind and that a crash loses a few. <strong>Shard the counter</strong> into
+N rows and sum them on read, so writes spread across N locks. Or <strong>move it out of the
+relational database entirely</strong> &mdash; Redis increments are atomic and cost nothing, and a
+view count is precisely the kind of value that can be approximate and volatile.</p>
+
+<p>The general principle is the useful part: <strong>contention is about how many writers touch one
+row, not how many rows exist.</strong> A table with a billion rows and no contention scales fine; a
+table with one row and a thousand writers does not.</p>
+
+<h2>Where most systems actually land</h2>
+
+<p>Being honest about this is worth more in an interview than reciting the full ladder.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   indexes + query fixes            solves ~70% of "the database is slow"
+   + connection pooling             ~80%
+   + a bigger machine               ~90%
+   + read replicas                  ~97%
+   + partitioning                   ~99%
+   + sharding                       the remaining 1%</code></pre>
+
+<p>The arithmetic from the <a
+href="/system-design/system-design-back-of-envelope-estimation">estimation post</a> is what places
+you on that list. A booking system at 0.3 writes per second is in row one, and a candidate who
+shards it has been given the answer and not read it.</p>
+
+<h2>Migrations at scale</h2>
+
+<p>One last thing that catches teams the moment a table gets large: a schema change that is
+instantaneous on a development database can lock a production table for minutes.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Locks the whole table while it rewrites every row.
+ALTER TABLE bookings ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+
+-- Three cheap steps instead. Each is safe on its own.
+ALTER TABLE bookings ADD COLUMN notes TEXT;              -- metadata only
+UPDATE bookings SET notes = '' WHERE notes IS NULL;      -- in batches
+ALTER TABLE bookings ALTER COLUMN notes SET NOT NULL;    -- brief validation</code></pre>
+
+<p>The general rule is that <strong>a migration must be safe to run while the old code is still
+deployed</strong>, because during a rolling deploy both versions are running at once. That forces
+the expand-and-contract shape: add the new column, write to both, backfill, switch reads, then drop
+the old one &mdash; several deploys rather than one.</p>
+
+<p>The related discipline: <strong>never edit a migration that has already been applied.</strong>
+Your database has run it; a colleague&rsquo;s has not; the two now disagree about what the schema
+is and nothing detects it. Write a new migration.</p>
+
+<p>Adding an index has the same trap and the same escape &mdash; <code>CREATE INDEX
+CONCURRENTLY</code> builds without blocking writes, at the cost of taking longer and needing to be
+retried if it fails.</p>
+
+<h2>The summary</h2>
+
+<ul>
+  <li><strong>Index for the query you actually run</strong> &mdash; equality columns first, then
+      the range or sort column &mdash; and delete the redundant ones.</li>
+  <li><strong>Fix N+1 before scaling anything.</strong> It is invisible on small data and
+      catastrophic on large.</li>
+  <li><strong>Check the connection pool.</strong> It is a ceiling that looks like an outage.</li>
+  <li><strong>Vertical scaling is underrated.</strong> Twice, before considering anything
+      distributed.</li>
+  <li><strong>Replicas scale reads only</strong>, and introduce lag that is a correctness problem
+      rather than a performance one.</li>
+  <li><strong>Partition before sharding.</strong> Same table, one database, transactions
+      intact.</li>
+  <li><strong>Shard last.</strong> Name what you lose &mdash; joins, transactions, simple ids
+      &mdash; and pick the key by which query has to be fast.</li>
+</ul>
+
+<p>The one-line version: <strong>almost nothing needs sharding, and everything needs indexes.</strong>
+The ladder exists so you can say where a given system sits on it and why &mdash; and the most
+impressive answer to &ldquo;how would you scale this?&rdquo; is frequently &ldquo;I would not yet,
+and here is the arithmetic.&rdquo;</p>
+
+<p>Next: <a href="/system-design/system-design-consistency-and-availability">consistency,
+availability and CAP</a> &mdash; the theory behind replica lag, and what it costs to have more than
+one copy of anything.</p>

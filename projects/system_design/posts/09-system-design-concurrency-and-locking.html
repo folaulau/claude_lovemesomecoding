@@ -1,0 +1,472 @@
+<p>Two guests, one room, the same millisecond. It is the question every booking, ticketing and
+inventory system gets asked, and the answer everyone gives first is wrong &mdash; not slightly
+wrong, but wrong in a way that works perfectly in testing and fails under exactly the load it was
+built for.</p>
+
+<p>This post is about that class of bug: where it comes from, the four mechanisms that fix it, and
+why the one people reach for first should be the last one you consider.</p>
+
+<h2>The bug</h2>
+
+<p>Here is the natural way to write it, and it is what almost every codebase contains before
+somebody notices:</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">if bookings.overlapping(property_id, check_in, check_out):
+    raise ConflictException("Those dates are no longer available.")
+
+booking = Booking(property_id=property_id, check_in=check_in, check_out=check_out)
+db.add(booking)
+db.commit()</code></pre>
+
+<p>Check, then write. Read it again and it still looks correct, because sequentially it <em>is</em>
+correct. Draw the timeline for two requests and the bug is obvious:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   time ──>
+
+   guest A:  overlapping()? ─> NO ──────────> INSERT ✓
+   guest B:      overlapping()? ─> NO ──────────> INSERT ✓
+                              ▲
+             both checks ran before either insert landed,
+             so both saw an empty calendar</code></pre>
+
+<p>Nothing is wrong with either request. The gap between the check and the write is the bug, and it
+is measured in microseconds &mdash; which is why it never happens in development and happens
+constantly on a launch day.</p>
+
+<p>This shape has a name: <strong>check-then-act</strong>, or a time-of-check-to-time-of-use race.
+Once you can see it, you find it everywhere &mdash; &ldquo;is this username taken?&rdquo;,
+&ldquo;is there stock left?&rdquo;, &ldquo;has this coupon been used?&rdquo;.</p>
+
+<p>Three things that do <em>not</em> fix it, and all three get proposed:</p>
+
+<ul>
+  <li><strong>A lock in application code.</strong> A mutex protects threads in one process. The
+      second request is on another machine.</li>
+  <li><strong>Wrapping it in a transaction.</strong> At Postgres&rsquo;s default isolation level
+      (read committed), the two transactions genuinely do not see each other&rsquo;s uncommitted
+      inserts. The <a href="/system-design/system-design-consistency-and-availability">consistency
+      post</a> covers why &mdash; this is a phantom read, and read committed does not promise to
+      prevent it.</li>
+  <li><strong>Checking again just before the insert.</strong> Narrows the window. Does not close
+      it. A narrower race is a race that is harder to reproduce.</li>
+</ul>
+
+<h3>How often does it actually happen?</h3>
+
+<p>Worth doing the arithmetic, because the answer surprises people in both directions.</p>
+
+<p>From the <a href="/system-design/system-design-back-of-envelope-estimation">estimation post</a>,
+a regional booking site runs about 0.3 bookings per second at peak. If the window between the check
+and the insert is 5 milliseconds, the chance that two specific bookings collide seems vanishingly
+small &mdash; and for two <em>random</em> bookings it is.</p>
+
+<p>But collisions do not arrive randomly. They cluster:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   a concert announcement, a sale, a popular listing on a holiday weekend
+
+   normal:  0.3 bookings/sec spread over 2M listings   -> never collides
+   spike:   4,000 requests/sec for ONE listing         -> collides constantly
+
+   The rate that matters is not bookings/sec.
+   It is requests for THE SAME ROW per second.</code></pre>
+
+<p>That is why estimation does not excuse you here. Throughput can be trivial while contention is
+severe, because contention is about concentration, not volume. And the moment it matters is always
+the moment you least want a bug &mdash; launch day, a sale, the last seat.</p>
+
+<p>The inverse is also worth saying: this is not a reason to add locking everywhere. Rows nobody
+contends for need no protection. The question is always <em>which specific row do many writers want
+at once</em>, and in a booking system there are exactly two &mdash; the calendar for a hot listing,
+and any counter of remaining inventory.</p>
+
+<h2>The mechanisms, worst to best</h2>
+
+<h3>Pessimistic locking</h3>
+
+<p>Take a lock, do the work, release it. <code>SELECT ... FOR UPDATE</code> locks rows so nobody
+else can touch them until you commit.</p>
+
+<pre class="language-sql"><code class="language-sql">BEGIN;
+SELECT * FROM properties WHERE id = 7 FOR UPDATE;   -- others now wait here
+-- check availability, insert the booking
+COMMIT;                                             -- lock released</code></pre>
+
+<p>It works, and it is the right tool when contention is genuinely high and conflicts are
+expensive. Its costs are real: every other request for that property waits, so throughput on a
+popular listing becomes serial; a long transaction holds the lock for its whole duration; and locks
+taken in inconsistent orders deadlock.</p>
+
+<p>Note that the lock is on the <em>property</em>, not on the booking &mdash; you cannot lock a row
+that does not exist yet. Locking a parent row to protect inserts of children is a common and
+slightly awkward pattern, and it serialises far more than you wanted.</p>
+
+<h3>Optimistic locking</h3>
+
+<p>Assume conflicts are rare. Do not lock; detect.</p>
+
+<pre class="language-sql"><code class="language-sql">-- read: note the version
+SELECT id, price, version FROM properties WHERE id = 7;    -- version = 4
+
+-- write: only if nobody else changed it
+UPDATE properties SET price = 250, version = 5
+ WHERE id = 7 AND version = 4;
+-- 0 rows updated? Somebody else won. Re-read and retry.</code></pre>
+
+<p>No waiting at all in the common case, which makes it excellent for low-contention updates. The
+cost is that the caller must handle the retry, and under high contention it degrades badly &mdash;
+everyone keeps retrying and failing, which is worse than queuing politely.</p>
+
+<p>The rule of thumb: <strong>optimistic when conflicts are rare, pessimistic when they are
+common.</strong> Editing your own profile is optimistic; the last seat on a flight is
+pessimistic.</p>
+
+<h3>Database constraints</h3>
+
+<p>The best answer, when it applies, and the one people think of last: make the bad state
+<em>impossible to represent</em>. Then no amount of concurrency can produce it, because the
+database refuses.</p>
+
+<p>StayHub&rsquo;s calendar rule is a Postgres exclusion constraint:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings ADD CONSTRAINT bookings_no_overlapping_bookings
+EXCLUDE USING gist (
+    property_id WITH =,
+    daterange(check_in, check_out, '[)') WITH &amp;&amp;
+) WHERE (status IN ('PENDING', 'CONFIRMED', 'COMPLETED'));</code></pre>
+
+<p>In English: for any two rows in a blocking status with the same <code>property_id</code>, their
+date ranges may not overlap. It is a unique constraint generalised from equality to any operator
+&mdash; here <code>&amp;&amp;</code>, &ldquo;ranges overlap&rdquo;.</p>
+
+<p>Two details in it are worth stealing. The range is <code>'[)'</code> &mdash; inclusive of
+check-in, exclusive of check-out &mdash; so a booking ending on the 5th and one starting on the 5th
+do not overlap, which is exactly how hotel nights work. And the <code>WHERE</code> clause means
+cancelled bookings stop blocking dates automatically, with no cleanup job.</p>
+
+<p>Now the race resolves in the only place that can see both writes at once:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   guest A:  check? NO ──> INSERT ──> ✓ committed
+   guest B:      check? NO ──> INSERT ──> ✗ rejected by the constraint
+
+   B's application believed the dates were free one millisecond earlier.
+   It does not matter. The database is the only thing that gets a vote.</code></pre>
+
+<h3>Idempotency keys</h3>
+
+<p>The fourth mechanism, for a different flavour of the same problem: not two users racing, but
+<em>one</em> user whose request happened twice. A double-clicked button, a client retry after a
+timeout, a proxy replaying a request.</p>
+
+<p>The client sends a key it generates; the server records it and refuses to do the work twice.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE idempotency_keys (
+    key          VARCHAR(64) PRIMARY KEY,   -- the uniqueness IS the enforcement
+    response     JSONB       NOT NULL,      -- replay the original answer
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);</code></pre>
+
+<p>The important detail: store the <strong>response</strong>, not just the key. A retry should
+receive the same answer as the original request, not a 409. From the client&rsquo;s point of view
+the operation simply succeeded, which is what makes retrying safe &mdash; and safe retries are the
+only escape from the two generals problem in the <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a>.</p>
+
+<p>This is what payment providers do, and it is why their APIs ask for an idempotency key on every
+charge.</p>
+
+<h3>What if your database cannot do that?</h3>
+
+<p>Exclusion constraints are a Postgres speciality. The idea generalises, though &mdash; the goal
+is always to turn the invariant into something the database enforces on a single write.</p>
+
+<p>The portable trick is to <strong>make the thing you are protecting into a unique key</strong>.
+For bookings, that means storing one row per night rather than one row per stay:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE booked_nights (
+    property_id BIGINT NOT NULL,
+    night       DATE   NOT NULL,
+    booking_id  BIGINT NOT NULL REFERENCES bookings(id),
+    PRIMARY KEY (property_id, night)      -- the uniqueness IS the guard
+);</code></pre>
+
+<p>Inserting three nights for a three-night stay, in the same transaction as the booking, now
+cannot overlap an existing stay &mdash; the primary key forbids it, on any database. The costs are
+more rows and a multi-row insert, and it makes &ldquo;which nights are taken&rdquo; a trivially
+indexed query rather than a range comparison.</p>
+
+<p>Airlines do the same thing with seats, and inventory systems with reserved units. When you
+cannot express the rule as a constraint, the move is to <em>reshape the data until you can</em>
+&mdash; and that is usually a better instinct than reaching for a lock.</p>
+
+<h2>Keeping the friendly error</h2>
+
+<p>A constraint violation is a database error. Shown to a user it is a 500 and a stack trace, which
+is not acceptable for something that happens legitimately.</p>
+
+<p>So StayHub keeps <em>both</em> checks, and each has a distinct job:</p>
+
+<pre class="language-python"><code class="language-python">        if self.bookings.overlapping(prop.id, req.check_in, req.check_out):
+            raise ConflictException("Those dates are no longer available.")</code></pre>
+
+<p>This is the friendly check. It catches the overwhelmingly common case &mdash; dates that were
+already taken when the request arrived &mdash; and produces a good message. It loses the race, and
+it is not trying to win it. The repository comment says so directly: <em>&ldquo;This is the
+friendly check.&rdquo;</em></p>
+
+<p>Then the constraint wins the race, and the application translates its verdict:</p>
+
+<pre class="language-python"><code class="language-python">        except IntegrityError as exc:
+            self.db.rollback()
+            if _is_overlap_violation(exc):
+                raise ConflictException(
+                    "Those dates were just booked by someone else."
+                ) from exc
+            raise</code></pre>
+
+<p>Note that the two messages differ. &ldquo;No longer available&rdquo; versus &ldquo;just booked
+by someone else&rdquo; &mdash; because they describe genuinely different situations, and the second
+one is worth knowing about when reading logs.</p>
+
+<p>And note that it does not catch <code>IntegrityError</code> broadly:</p>
+
+<pre class="language-python"><code class="language-python">def _is_overlap_violation(exc: IntegrityError) -> bool:
+    """Was this IntegrityError our exclusion constraint, or something else entirely?</code></pre>
+
+<p>Treating every integrity error as &ldquo;dates taken&rdquo; would report a broken foreign key as
+a booking clash &mdash; turning a real bug into a plausible business message that nobody
+investigates. Checking the constraint name by hand is unglamorous and it is the difference between
+an error handler and a bug concealer.</p>
+
+<h2>Counters, and the same bug in miniature</h2>
+
+<p>The smallest instance of check-then-act, and the one most people write without noticing:</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">count = redis.get("views:42")      # read
+redis.set("views:42", count + 1)   # modify, write</code></pre>
+
+<p>Two processes read 100, both write 101, and one view is gone. It is the identical shape,
+compressed into two lines, and under any real concurrency it loses a substantial fraction of every
+count.</p>
+
+<p>The fix is that the operation must be one operation:</p>
+
+<pre class="language-bash"><code class="language-bash">INCR views:42          # atomic — read, add, write, indivisibly</code></pre>
+
+<p>Same in SQL: <code>UPDATE posts SET views = views + 1 WHERE id = 42</code> is atomic because the
+database evaluates <code>views + 1</code> under a row lock it takes for you. Reading the value into
+your application and writing it back is not.</p>
+
+<p>The general rule, and it is the through-line of this entire post: <strong>if a decision depends
+on a value, read and write it in a single operation, in the system that owns it.</strong> Every
+mechanism here is a way of achieving that &mdash; a constraint does it in the database, an atomic
+increment does it in Redis, a Lua script does it for logic too complex for one command.</p>
+
+<h2>Where the last one is needed</h2>
+
+<p>Rate limiting is the canonical case where no single command is enough, because the logic is
+&ldquo;refill the bucket for elapsed time, then spend a token if there is one&rdquo; &mdash; three
+steps that must be indivisible.</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">tokens = redis.get(key)            # process A reads 1.0    process B reads 1.0
+if tokens >= 1: tokens -= 1        # A: allow               B: allow
+redis.set(key, tokens)             # A writes 0.0           B writes 0.0</code></pre>
+
+<p>Two requests, one token, both allowed. And this is not a rare interleaving &mdash; it is the
+<em>normal</em> outcome when a client sends requests concurrently, which is exactly what an abusive
+client does. Under four API workers the effective limit becomes four times what it says, and the
+limiter passes every sequential test ever written for it.</p>
+
+<p>The answer is to send the logic to where the data is, as one atomic unit. Redis runs a Lua
+script without interleaving any other command:</p>
+
+<pre class="language-lua"><code class="language-lua">local tokens = tonumber(bucket[1])
+...
+tokens = math.min(capacity, tokens + elapsed * refill)
+
+local allowed = 0
+if tokens &gt;= cost then
+  tokens = tokens - cost
+  allowed = 1
+end</code></pre>
+
+<p>Read, decide and write become one operation, which is what the algorithm assumed all along. The
+<a href="/system-design/system-design-rate-limiting">next post</a> is about that in full, including
+the test that proves it: 50 concurrent threads against a 20-token bucket, and exactly 20 get
+through.</p>
+
+<h2>Distributed locks</h2>
+
+<p>When the resource is not a database row &mdash; a file, an external API, a scheduled job that
+must run on exactly one server &mdash; there is no constraint to lean on, and you need a lock that
+several machines share.</p>
+
+<p>The naive version has a fatal flaw:</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">if redis.get("lock:job") is None:      # check
+    redis.set("lock:job", "mine")      # ...act
+    do_the_work()</code></pre>
+
+<p>Check-then-act again, one level up. Two processes both see no lock and both take it. The atomic
+version is a single command:</p>
+
+<pre class="language-bash"><code class="language-bash">SET lock:job &lt;owner-token&gt; NX PX 30000
+#                          │  └─ expire after 30s, so a crashed holder
+#                          │     does not lock the resource forever
+#                          └──── only if it does not already exist</code></pre>
+
+<p>The <code>NX</code> makes it atomic and <code>PX</code> is the safety net. A lock with no expiry
+held by a process that dies is a resource nobody can ever have again.</p>
+
+<p>But the expiry creates the problem that makes distributed locks genuinely hard:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   t=0    A takes the lock, TTL 30s
+   t=25   A pauses — GC, a slow disk, the VM is descheduled
+   t=30   the lock EXPIRES. A does not know.
+   t=31   B takes the lock and starts working
+   t=35   A wakes up, believing it still holds the lock
+
+          A and B are now both in the critical section.</code></pre>
+
+<p>Nothing detects this. Partial mitigations exist &mdash; release with a compare-and-delete so A
+cannot release B&rsquo;s lock, extend the TTL with a heartbeat, use fencing tokens so the protected
+resource rejects the stale holder &mdash; but a distributed lock is fundamentally a lease with a
+timeout, and timeouts can be wrong.</p>
+
+<p>Hence the ordering in this post. <strong>A database constraint cannot fail this way</strong>,
+because there is no lease and no timeout: the check and the write are the same operation, inside
+the system that owns the data. Reach for a distributed lock when there is genuinely no such
+system.</p>
+
+<h2>Deadlocks</h2>
+
+<p>Once locks are involved, two transactions can each hold what the other wants.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   transaction A            transaction B
+
+   lock row 1               lock row 2
+   ...                      ...
+   wants row 2  ──waits──>  holds it
+   holds it     <──waits──  wants row 1
+
+   Neither can proceed. Postgres detects the cycle after ~1s
+   and kills one of them with a deadlock error.</code></pre>
+
+<p>The database resolving it is the good outcome &mdash; the alternative is waiting forever. But
+one transaction failed, and the fix is not to catch the error. It is to make the cycle
+impossible.</p>
+
+<p><strong>Lock in a consistent order.</strong> If every transaction that touches several rows takes
+them in ascending id order, no cycle can form: A holds 1 and wants 2, so B cannot be holding 2 and
+wanting 1, because B would have taken 1 first. This is the whole solution, and it is almost always
+enough.</p>
+
+<p>Two supporting habits. Keep transactions <strong>short</strong> &mdash; a transaction that opens,
+calls an external API for two seconds, then writes is holding locks for two seconds. And never call
+an external service inside a transaction at all; do the call first, or afterwards through the
+outbox.</p>
+
+<p>Since a deadlock is transient by nature, a retry usually succeeds &mdash; so retrying the whole
+transaction once or twice, with a small delay, is a reasonable belt-and-braces on top of the
+ordering rule.</p>
+
+<h2>How to test for a race</h2>
+
+<p>The problem with concurrency bugs is that a normal test cannot see them. Calling the function
+twice in sequence exercises the code and proves nothing, because sequentially the buggy version is
+correct.</p>
+
+<p>The test has to be genuinely concurrent, and it has to assert on a total:</p>
+
+<pre class="language-python"><code class="language-python">        with cf.ThreadPoolExecutor(max_workers=50) as pool:
+            allowed = list(pool.map(lambda _: rate_limit.check(rule, "swarm").allowed, range(50)))
+
+        assert sum(allowed) == 20, (
+            f"{sum(allowed)} of 50 allowed against a capacity of 20 — the check is not atomic"
+        )</code></pre>
+
+<p>Two design decisions in that test are worth copying. It uses <strong>far more threads than
+capacity</strong>, so a lost update shows up as a number rather than as a rare flake. And it
+asserts an <strong>exact total</strong>, not &ldquo;at most&rdquo; &mdash; a racy implementation
+does not fail cleanly, it allows 23 or 27 or 21 depending on timing, and only an exact assertion
+catches the small overruns.</p>
+
+<p>The equivalent for a database race needs real, separate connections. Two sessions sharing one
+connection cannot block each other, so a test using a shared transactional fixture will pass
+against code with no locking whatsoever &mdash; which is the worst kind of green, and a trap this
+project walked into while writing the outbox tests.</p>
+
+<h2>Choosing</h2>
+
+<table>
+  <thead><tr><th>Situation</th><th>Use</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Uniqueness (email, short code)</td><td>Unique constraint</td><td>Free, atomic, impossible to bypass</td></tr>
+    <tr><td>Non-overlapping ranges (bookings, seats)</td><td>Exclusion constraint</td><td>Same, generalised past equality</td></tr>
+    <tr><td>Rare concurrent edits</td><td>Optimistic (version column)</td><td>No waiting in the common case</td></tr>
+    <tr><td>Frequent contention on one row</td><td>Pessimistic (<code>FOR UPDATE</code>)</td><td>Retrying under contention is worse than queuing</td></tr>
+    <tr><td>Pulling work from a queue</td><td><code>FOR UPDATE SKIP LOCKED</code></td><td>Workers take disjoint sets and never block</td></tr>
+    <tr><td>A request that must not repeat</td><td>Idempotency key</td><td>Makes client retries safe</td></tr>
+    <tr><td>Counters under load</td><td>Atomic increment</td><td>Never read-modify-write</td></tr>
+    <tr><td>No database involved</td><td>Distributed lock</td><td>Last resort &mdash; and know what it cannot promise</td></tr>
+  </tbody>
+</table>
+
+<h2>Holds, and the case a constraint cannot cover</h2>
+
+<p>One shape that recurs in ticketing, retail checkout and flights: the resource must be reserved
+<em>while the user pays</em>, and released if they abandon.</p>
+
+<p>StayHub handles it by making the hold a real row in a blocking status:</p>
+
+<pre class="language-python"><code class="language-python">            status=BookingStatus.PENDING,</code></pre>
+
+<p>Because <code>PENDING</code> is one of the statuses the exclusion constraint covers, the dates
+are protected during checkout by exactly the same mechanism that prevents double booking. No
+separate hold table, no lock, no timer &mdash; the constraint does both jobs.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   PENDING    dates held, not yet paid       ─┐
+   CONFIRMED  paid                            ├─ block the calendar
+   COMPLETED  stay finished                  ─┘
+   CANCELLED  ──────────────────────────────── does NOT block
+
+   Cancelling frees the dates automatically. No cleanup job:
+   the constraint's WHERE clause stops seeing the row.</code></pre>
+
+<p>That last line is the elegant part. Expressing &ldquo;which states block&rdquo; once, in the
+constraint, means release is a status change rather than a deletion &mdash; and the availability
+query and the constraint cannot disagree, because they are reading the same definition.</p>
+
+<p>What it does not solve is <strong>expiry</strong>. A guest who opens checkout and closes the tab
+holds those dates forever. The answer is a scheduled job that cancels stale pending bookings after
+some minutes &mdash; and it has its own concurrency question, because that job must run on exactly
+one server. Which is precisely the case with no database row to constrain, and therefore one of the
+few legitimate uses of a distributed lock.</p>
+
+<p>The higher-stakes version of this is a flight seat, where holds are shorter, contention is far
+worse, and the business deliberately oversells. The <a
+href="/system-design/system-design-delta-airlines">airline post</a> takes it further.</p>
+
+<h2>The summary</h2>
+
+<ul>
+  <li><strong>Check-then-act is always a race.</strong> The gap is microseconds, which is why it
+      passes review and fails in production.</li>
+  <li><strong>A transaction alone does not fix it</strong> at the default isolation level.</li>
+  <li><strong>Prefer a constraint.</strong> Making the bad state unrepresentable beats coordinating
+      to avoid it.</li>
+  <li><strong>Keep the friendly check anyway</strong>, for the message &mdash; and be explicit that
+      it is not the guard.</li>
+  <li><strong>Translate the specific violation</strong>, never every integrity error.</li>
+  <li><strong>Optimistic for rare conflicts, pessimistic for common ones.</strong></li>
+  <li><strong>Distributed locks are leases that can be wrong.</strong> Last resort.</li>
+</ul>
+
+<p>One last framing, because it is what makes this topic click. Every mechanism above is an answer
+to the same question: <em>which single component gets to decide, and can it decide in one
+step?</em> A constraint says the database decides, in one write. An atomic increment says Redis
+decides, in one command. A Lua script says Redis decides, in one script. A distributed lock is the
+weakest of the four precisely because the decider &mdash; a lease with a timeout &mdash; can be
+wrong about whether it still holds.</p>
+
+<p>Next: <a href="/system-design/system-design-rate-limiting">rate limiting</a> &mdash; the same
+atomicity problem, in a system where the answer is a Lua script rather than a constraint.</p>

@@ -1,0 +1,506 @@
+<p>The questions you should be able to answer out loud, with answers short enough to actually say.
+Each one links to the post that works it through properly, and most are followed by the follow-up
+an interviewer asks next &mdash; because the follow-up is usually where the real assessment
+happens.</p>
+
+<p>This is the last post in the <a href="/system-design">System Design</a> track and it assumes the
+other seventeen. If an answer here feels compressed, that is deliberate: it is meant to be the
+version you say in thirty seconds, not the version you understand.</p>
+
+<h2>The approach</h2>
+
+<h3>How do you approach a system design question?</h3>
+
+<p>Four steps, and keeping the first three short is what leaves room for the fourth.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  SCOPE      5-10 min   functional + non-functional requirements
+   2  ESTIMATE   5 min      QPS, storage, bandwidth
+   3  HIGH LEVEL 15-20 min  boxes, arrows, API, schema
+   4  DEEP DIVE  15-20 min  one hard part, usually the one THEY pick</code></pre>
+
+<p><em>Follow-up: &ldquo;What are you optimising for?&rdquo;</em> Say which non-functional
+requirement dominates and why the design bends around it. See <a
+href="/system-design/system-design-introduction">where to start</a>.</p>
+
+<h3>What is the interviewer actually scoring?</h3>
+
+<p>Not whether your design matches a model answer &mdash; there isn&rsquo;t one. They are checking
+whether you ask before building, can estimate, know what each standard component is for, can name
+the trade you just made, know where it breaks, and can go deep when pushed.</p>
+
+<h3>What is the most common mistake?</h3>
+
+<p>Drawing before asking. The second most common is designing for Google &mdash; sharding and
+multi-region replication for a system with ten thousand users. Over-engineering reads as
+inexperience, not ambition.</p>
+
+<h3>How do you estimate?</h3>
+
+<p>Users &times; actions/day &divide; 100,000 = per second. Then &times; read:write ratio, &times;
+bytes per record, &times;3 for peak. Round 86,400 seconds to 100,000 and say you are rounding.</p>
+
+<p><em>Follow-up: &ldquo;What does that number tell you?&rdquo;</em> That is the actual question.
+&ldquo;30,000 reads/sec, so the read path is the entire design&rdquo; is the answer; the arithmetic
+was just how you got there. See <a
+href="/system-design/system-design-back-of-envelope-estimation">estimation</a>.</p>
+
+<h2>Fundamentals</h2>
+
+<h3>Vertical or horizontal scaling?</h3>
+
+<p>Vertical is a bigger machine: no code changes, hard ceiling, still one machine to lose.
+Horizontal is more machines: no ceiling, gives redundancy, and requires the work to be divisible
+&mdash; statelessness for app servers, sharding for databases.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   VERTICAL  [ 8 cpu ] -> [ 64 cpu ]     no code changes, hard ceiling
+   HORIZONTAL  [ x ]   -> [x][x][x][x]   no ceiling, needs divisible work</code></pre>
+
+<p>In practice: horizontal for the app tier, vertical first for the database. Reversing that
+&mdash; sharding a database that would fit on one larger box &mdash; is the most expensive
+premature decision in this field.</p>
+
+<h3>What does &ldquo;stateless&rdquo; actually require?</h3>
+
+<p>That any server can handle any request. So: no server-side sessions (use signed tokens), no
+uploads on local disk (object storage), no scheduled jobs in the app process (ten servers means
+the nightly job runs ten times), no in-memory rate-limit counters (the limit multiplies by the
+number of servers).</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   login   ──> [ app 1 ]   sessions = {abc123: user 7}
+   next    ──> [ app 2 ]   sessions = {}          -> "please log in"
+
+   fix: put the session IN the request (a signed token),
+        so no server has to remember anything.</code></pre>
+
+<p><em>Follow-up: &ldquo;What does a signed token cost you?&rdquo;</em> Revocation. Nothing is
+looked up, so a banned user&rsquo;s token works until it expires. Mitigate with short lifetimes, or
+re-read the user row anyway. See <a href="/system-design/system-design-load-balancing">load
+balancing</a>.</p>
+
+<h3>Layer 4 or layer 7 load balancing?</h3>
+
+<p>Layer 4 forwards packets: fast, and it cannot route by path or health-check meaningfully. Layer
+7 reads the HTTP request: path routing, TLS termination, safe retries, and a health check that asks
+&ldquo;does this instance work?&rdquo; rather than &ldquo;is the port open?&rdquo;</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   L4   is the port open?          a deadlocked process passes this
+   L7   does GET /health return    it does not pass this
+        200 with its dependencies
+        reported separately?</code></pre>
+
+<p>For an HTTP API, layer 7, and the health check row is why.</p>
+
+<h3>What makes a good health check?</h3>
+
+<p>It reports dependencies separately and lets only the ones you genuinely cannot serve without
+decide whether traffic arrives. If a cache outage marks every instance unhealthy, the load balancer
+pulls the whole fleet and a slow site becomes no site.</p>
+
+<p>Also: liveness restarts, readiness diverts. Never let a readiness failure trigger restarts, or a
+database outage restarts your entire fleet in a loop.</p>
+
+<h3>SQL or NoSQL?</h3>
+
+<p>Start relational unless you can name the specific reason not to. Money, bookings, orders and
+inventory all involve invariants across rows, and a transaction is the cheapest way to enforce one.
+Reach for non-relational when the access pattern is genuinely one key at a time at enormous volume
+&mdash; sessions, event logs, feed caches, telemetry.</p>
+
+<h2>Caching</h2>
+
+<h3>Which caching pattern, and why?</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">   READ                          WRITE
+     look in cache                 write to database
+       hit  -> return              DELETE the cache entry
+       miss -> read database          (delete, not update — two
+               store in cache          serialisation paths drift)
+               return</code></pre>
+
+<p>Cache-aside: the reader fills on a miss, the writer <em>deletes</em>. Deleting rather than
+updating means the two serialisation paths cannot drift; the worst case is an extra database
+read.</p>
+
+<h3>What should you cache?</h3>
+
+<p>Reads that are hot, expensive, and rarely written &mdash; all three. Never cache anything where
+stale means wrong: balances, remaining inventory, permission checks, booking availability.</p>
+
+<h3>How do you invalidate?</h3>
+
+<p>Both explicit deletion and a TTL. Explicit alone means one forgotten write path caches a wrong
+value forever; TTL alone means everything is stale for its whole lifetime. Together, each covers
+the other&rsquo;s failure.</p>
+
+<p><em>Follow-up: &ldquo;How do you make sure no write path forgets?&rdquo;</em> Hang invalidation
+off a method every write path already calls, ideally one whose omission also breaks something
+loud.</p>
+
+<h3>What is a cache stampede?</h3>
+
+<p>A popular key expires and every concurrent request misses at once, so the database gets the full
+unfiltered load of your hottest item. Fixes: jittered TTLs, a lock so one request recomputes, or
+background refresh before expiry.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   popular key expires at t=0
+
+   t=0.000  request 1   -> miss -> query the database
+   t=0.001  request 2   -> miss -> query the database
+   ...                                the first query has not
+   t=0.050  request 500 -> miss ->    returned, so nothing is cached</code></pre>
+
+<p>The related operational rule: never flush a cache on a running system. A cold cache at a 95% hit
+rate is a twenty-fold load increase.</p>
+
+<h3>What happens when the cache goes down?</h3>
+
+<p>Nothing, if it was built correctly &mdash; every call returns &ldquo;miss&rdquo; rather than
+raising, with a short timeout so a <em>hung</em> cache cannot park every worker on a socket read.
+The claim only counts if the test suite runs with it stopped. See <a
+href="/system-design/system-design-caching">caching</a>.</p>
+
+<h2>Databases</h2>
+
+<h3>How would you scale a database?</h3>
+
+<p>In order, and stop as soon as it is enough:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   indexes + query fixes    solves ~70% of "the database is slow"
+   + connection pooling     ~80%
+   + a bigger machine       ~90%
+   + read replicas          ~97%
+   + partitioning           ~99%
+   + sharding               the remaining 1%</code></pre>
+
+<h3>How do you design an index?</h3>
+
+<p>For the query you actually run: equality columns first, then the range or sort column. Then check
+the plan &mdash; and delete redundant indexes, since a B-tree on <code>(a, b)</code> already answers
+everything an index on <code>(a)</code> would.</p>
+
+<h3>What is the most common database performance bug?</h3>
+
+<p>N+1 queries, and it is invisible in development because there are twelve rows. Each extra query
+is a network round trip, which costs more than reading a megabyte from memory.</p>
+
+<h3>What do you lose by sharding?</h3>
+
+<p>Cross-shard joins, cross-shard transactions, simple auto-increment ids, and any query that
+doesn&rsquo;t carry the shard key. Operations multiply by N.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   shard by property_id   "this property's calendar" -> 1 shard
+                          "my bookings"              -> ALL shards
+   shard by guest_id      the reverse
+
+   You are choosing which query gets to be fast.</code></pre>
+
+<p><em>Follow-up: &ldquo;How do you pick the key?&rdquo;</em> Ask which query must be fast, because
+you are choosing which one gets to be. And beware hot shards &mdash; even key distribution is not
+even load distribution.</p>
+
+<h3>What is replication lag and why does it matter?</h3>
+
+<p>Replicas are asynchronous, so they are behind. A user updates their profile, the next read hits
+a lagging replica, and their change appears to vanish &mdash; a bug they report and you cannot
+reproduce. Route a user&rsquo;s reads to the primary briefly after they write. See <a
+href="/system-design/system-design-database-scaling">scaling the database</a>.</p>
+
+<h2>Distributed systems</h2>
+
+<h3>Explain CAP.</h3>
+
+<p>During a network partition you must choose availability or consistency. Partition tolerance is
+not optional &mdash; networks fail &mdash; so the real question is what you do when nodes cannot
+talk: refuse the write and stay correct, or accept it and diverge.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   [ node A ] ── ✗ ── [ node B ]     a write arrives at A,
+                                      B cannot be told
+
+   CP: refuse it.  Correct, and this node is DOWN.
+   AP: accept it.  Up, and the two now DISAGREE.</code></pre>
+
+<p><em>Follow-up: &ldquo;And when there is no partition?&rdquo;</em> PACELC: else, choose latency
+or consistency. That is the trade you live with daily, since partitions are rare and every
+consistency guarantee is bought with waiting.</p>
+
+<h3>Which consistency model would you choose?</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">   is this room available?   STRONG     stale = a double booking
+   charging a card           STRONG     money
+   search results            eventual   a second late is invisible
+   your own profile edit     read-your-writes
+   review count              eventual   nobody counts 127 vs 128</code></pre>
+
+<p>It is a property of the operation, not the system. Availability checks and payments need strong;
+search results and review counts are fine eventually consistent; a user&rsquo;s own edits need
+read-your-writes.</p>
+
+<h3>What is the dual-write problem?</h3>
+
+<p>Two datastores cannot be updated atomically &mdash; no transaction spans a database and a search
+index, or a database and an email provider. Commit, then update the second, and a crash between
+leaves them divergent.</p>
+
+<p><em>Follow-up: &ldquo;So how do you fix it?&rdquo;</em> Say which store is the truth and make
+every other copy rebuildable. Then close the gap with a transactional outbox, or change data
+capture. See <a href="/system-design/system-design-consistency-and-availability">consistency and
+CAP</a>.</p>
+
+<h3>Why can&rsquo;t you have exactly-once delivery?</h3>
+
+<p>The two generals problem: when a call times out you cannot tell whether it failed or succeeded
+with a lost response. What exists is at-least-once delivery plus idempotent handling, which produces
+exactly-once <em>effects</em> &mdash; and that is what you actually want.</p>
+
+<h3>What is a transactional outbox?</h3>
+
+<p>Write the intent to send as a row in the same transaction as the business change, so both commit
+or neither does. A separate worker reads the table and does the work, retrying until it succeeds.
+The rule: the enqueue must never commit &mdash; the caller&rsquo;s commit is what makes it
+atomic.</p>
+
+<h3>How does a worker claim work without duplicating it?</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">   FOR UPDATE              A: rows 1-20    B: BLOCKS      -> 1x throughput
+   FOR UPDATE SKIP LOCKED  A: rows 1-20    B: rows 21-40  -> 2x, no coordination</code></pre>
+
+<p><code>SELECT ... FOR UPDATE SKIP LOCKED</code>. <code>FOR UPDATE</code> stops two workers taking
+the same rows; <code>SKIP LOCKED</code> stops the second worker <em>waiting</em> for the first,
+which is what makes additional workers add throughput rather than queue behind each other.</p>
+
+<h3>Design a retry policy.</h3>
+
+<p>Exponential backoff, capped, with jitter, and a limit on attempts after which the message is
+dead-lettered. Growth stops retries becoming the load; the cap stops a recoverable message waiting a
+week; jitter stops every client retrying in unison; the attempt limit is the difference between a
+queue and a spin loop.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BEGIN
+     INSERT INTO bookings ...     the business change
+     INSERT INTO outbox   ...     "and an email needs sending"
+   COMMIT                         both, or neither
+
+   backoff: 2, 4, 8, 16, 32, 64, 128, 256 seconds, then DEAD</code></pre>
+
+<p><em>Follow-up: &ldquo;What do you do with dead letters?&rdquo;</em> Alert on the count. A DLQ
+nobody monitors is a folder where data goes to be forgotten. See <a
+href="/system-design/system-design-message-queues">message queues</a>.</p>
+
+<h2>Concurrency</h2>
+
+<h3>Two users book the last room simultaneously. What happens?</h3>
+
+<p>With check-then-write, both succeed &mdash; the gap between the check and the insert is the bug,
+and a transaction does not close it at the default isolation level, because that is a phantom read.
+The fix is a database constraint that makes the overlap unrepresentable.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   guest A:  is it free? ─> YES ──────────> INSERT ✓
+   guest B:      is it free? ─> YES ──────────> INSERT ✓
+                            ▲
+        both checks ran before either insert landed</code></pre>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings ADD CONSTRAINT bookings_no_overlapping_bookings
+EXCLUDE USING gist (
+    property_id WITH =,
+    daterange(check_in, check_out, '[)') WITH &amp;&amp;
+) WHERE (status IN ('PENDING', 'CONFIRMED', 'COMPLETED'));</code></pre>
+
+<p><em>Follow-up: &ldquo;So why keep the application check?&rdquo;</em> For the error message. It
+handles the common case where the dates were already taken; the constraint handles the race. Say
+explicitly which one is the guard.</p>
+
+<h3>Optimistic or pessimistic locking?</h3>
+
+<p>Optimistic when conflicts are rare: no waiting, and the caller retries on the rare miss.
+Pessimistic when contention is high, because under real contention everybody retrying and failing
+is worse than queuing politely.</p>
+
+<p>Better than either, when it applies: a constraint. There is no lease to expire and no lock to
+hold.</p>
+
+<h3>What is wrong with a distributed lock?</h3>
+
+<p>It is a lease with a timeout, and timeouts can be wrong. A holder that pauses &mdash; garbage
+collection, a descheduled VM &mdash; can have its lock expire while it still believes it holds it,
+and then two processes are in the critical section with nothing detecting it. Use one only when
+there is no datastore that owns the resource.</p>
+
+<h3>How do you make an operation safe to retry?</h3>
+
+<p>An idempotency key, stored with a unique constraint and the original response, so a retry
+receives the same answer rather than a conflict. Or make the operation naturally idempotent &mdash;
+writing a document whose id is the entity&rsquo;s id is the same whether it runs once or five
+times.</p>
+
+<p>Never read-modify-write a counter; use an atomic increment. See <a
+href="/system-design/system-design-concurrency-and-locking">concurrency and locking</a>.</p>
+
+<h2>Rate limiting and ids</h2>
+
+<h3>Which rate limiting algorithm?</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">   fixed window     100 at 11:59:59 + 100 at 12:00:00 = 200 in one second
+   sliding log      exact, and stores one timestamp per request
+   sliding counter  two counters, interpolated — approximate
+   token bucket     two numbers, burst set independently of rate  ✓</code></pre>
+
+<p>Token bucket: two numbers of state regardless of traffic, and burst is a parameter you set
+independently of the rate. Never fixed window for anything security-related &mdash; a client
+straddling the boundary gets double the limit in one second.</p>
+
+<h3>Why must the counter be atomic?</h3>
+
+<p>Read-modify-write loses updates under concurrency, so the effective limit multiplies by the
+number of workers &mdash; and it passes every sequential test, because sequentially it is correct.
+Use a single atomic command, or a script the datastore executes indivisibly.</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">tokens = redis.get(key)            # process A reads 1.0    process B reads 1.0
+if tokens >= 1: tokens -= 1        # A: allow               B: allow
+redis.set(key, tokens)             # A writes 0.0           B writes 0.0</code></pre>
+
+<p><em>Follow-up: &ldquo;How would you test that?&rdquo;</em> Concurrently, with an exact
+assertion. Fifty threads against a twenty-token bucket must allow exactly twenty; a racy
+implementation allows twenty-three.</p>
+
+<h3>Who do you rate limit?</h3>
+
+<p>The account when there is one, the IP otherwise. Never trust <code>X-Forwarded-For</code> unless
+a proxy you control set it &mdash; it is client-supplied, so honouring it blindly lets anyone mint a
+fresh bucket per request. And never key login on the submitted email, or an attacker can lock a
+victim out of their own account.</p>
+
+<h3>Fail open or fail closed?</h3>
+
+<p>For availability protection, open &mdash; a cache outage must not become a login outage. For
+quota enforcement someone is billed against, closed. Decide deliberately and check that no code path
+escapes the decision. See <a href="/system-design/system-design-rate-limiting">rate limiting</a>.</p>
+
+<h3>How do you generate ids across many machines?</h3>
+
+<p>The trade is sortability against coordination. Auto-increment is small and sorted and breaks when
+sharded. UUIDv4 needs no coordination and hurts B-tree inserts because it is random; UUIDv7 fixes
+that with a timestamp prefix. Snowflake gives 64-bit time-sortable ids with no coordination &mdash;
+and must refuse to generate when the clock moves backwards.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   INSIDE                        OUTSIDE
+   bookings.property_id -> 7     /properties/89c69134-4b96-49ee-...
+   8 bytes, joins fast           16 bytes, unguessable, opaque
+   never leaves the process      never used as a foreign key</code></pre>
+
+<p><em>Follow-up: &ldquo;Which id do you expose?&rdquo;</em> Often two per row: a small sequential
+one internally, an opaque one externally. Sequential ids in URLs leak your volume and invite
+enumeration. See <a href="/system-design/system-design-unique-id-generator">unique ids</a>.</p>
+
+<h2>The case-study openers</h2>
+
+<h3>Design a URL shortener.</h3>
+
+<p>Estimate first: 100M/day is 1,000 writes and 10,000 reads per second, 91 TB over five years.
+Random seven-character base62 codes with a unique constraint as the guard &mdash; the occupancy
+arithmetic (~5% of the keyspace) is what says seven and says retries terminate. 302 not 301, because
+analytics and revocability beat the saved traffic. Cache absorbs the reads; partition by month so
+expiry is a dropped table. See <a href="/system-design/system-design-url-shortener">the full
+walkthrough</a>.</p>
+
+<h3>Design a chat system.</h3>
+
+<p>The bottleneck is connections, not messages: 10 million concurrent WebSockets at ~10k per server
+is a thousand machines holding sockets open. That forces a registry of user &rarr; connection server
+plus pub/sub between servers, which nothing else in this track needs. Persist before acknowledging,
+order by server-assigned ids rather than client clocks, and shard by conversation. See <a
+href="/system-design/system-design-chat-system">chat</a>.</p>
+
+<h3>Design a notification system.</h3>
+
+<p>One queue per channel, so a slow SMS provider cannot block email. Preferences and a suppression
+list keyed by address rather than user. At-least-once with idempotency keys. And rate control as a
+<em>safety</em> feature &mdash; per-user, per-type and global caps that halt and page rather than
+queue, because the worst bug here sends ten thousand emails with no rollback. See <a
+href="/system-design/system-design-notification-system">notifications</a>.</p>
+
+<h3>Design Airbnb.</h3>
+
+<p>0.3 bookings per second at peak, so throughput is not the problem &mdash; correctness is. A
+Postgres exclusion constraint makes overlapping bookings impossible; PENDING is in its status list
+so checkout holds dates for free. Search from a derived index sunk after commit; listing pages
+cached (15.2ms to 2.0ms measured). Pricing server-side always. And if you shard, shard by property,
+because the constraint can only compare rows on the same machine. See <a
+href="/system-design/system-design-airbnb">Airbnb</a>.</p>
+
+<h3>Design Amazon.</h3>
+
+<p>Products versus SKUs; attributes as JSON because attribute queries go to the search index, not
+the database. Facet counts are aggregations in the index, not <code>GROUP BY</code>. Cart lives
+server-side, holds SKU ids not prices, reserves nothing, and merges on sign-in. Inventory is a
+conditional update, then relaxed &mdash; approximate on read, authoritative at checkout &mdash;
+and real retailers oversell on purpose. Checkout is a saga; authorise before capture. See <a
+href="/system-design/system-design-amazon">Amazon</a>.</p>
+
+<h3>Design an airline booking system.</h3>
+
+<p>Inventory is not a seat count but fare-class buckets, which conveniently distributes contention.
+Overbooking is a requirement, so the goal is selling exactly the <em>authorised</em> number, not
+avoiding oversell. Search is a graph problem solved by precomputing route structures offline.
+Booking is a saga across inventory, payment and ticketing, and ticket issuance must be
+exactly-once in effect. See <a href="/system-design/system-design-delta-airlines">airline
+booking</a>.</p>
+
+<h2>Questions to ask them</h2>
+
+<p>An interview ends with &ldquo;any questions?&rdquo; and the design-relevant ones are worth
+having ready, because they show you think about systems as things that run rather than things that
+are drawn.</p>
+
+<ul>
+  <li><strong>&ldquo;What is your on-call load like?&rdquo;</strong> &mdash; the single most
+      informative question about a system&rsquo;s real quality.</li>
+  <li><strong>&ldquo;What is the largest table, and has it been sharded?&rdquo;</strong> &mdash;
+      tells you the actual scale, which is usually smaller than the job description implies.</li>
+  <li><strong>&ldquo;What broke most recently, and what changed afterwards?&rdquo;</strong> &mdash;
+      whether incidents produce learning or blame.</li>
+  <li><strong>&ldquo;How long from merge to production?&rdquo;</strong> &mdash; deploy frequency
+      predicts almost everything else about how the team works.</li>
+</ul>
+
+<h2>How to say it out loud</h2>
+
+<p>Three habits that matter as much as the content, because a correct answer delivered badly scores
+worse than a decent answer delivered well.</p>
+
+<p><strong>Narrate, including the options you reject.</strong> Two minutes of silent thinking looks
+identical to being stuck. &ldquo;I could put this in the database or in Redis &mdash; Redis, because
+it is ephemeral and high-write&rdquo; shows the reasoning that a bare conclusion hides.</p>
+
+<p><strong>Say the cost yourself, before you are asked.</strong> Every choice above has one. If
+everything you propose sounds free, you have either not understood the choices or you are hiding
+them, and both read the same way from the other side of the table.</p>
+
+<p><strong>Treat a challenge as a hint.</strong> &ldquo;What if that node fails?&rdquo; is not an
+attack; it means you have missed something. Think about it rather than explaining why it will not
+happen &mdash; and if you genuinely disagree, say why in terms of the requirements you agreed in
+step 1.</p>
+
+<p>And know when to say a design is finished. &ldquo;At 200 requests a second this is one server and
+a database; here is the arithmetic, and here is the first thing I would change if the traffic were
+a hundred times larger&rdquo; is a stronger answer than a sharded multi-region system nobody asked
+for.</p>
+
+<h2>The five sentences worth memorising</h2>
+
+<p>If everything above compresses into anything, it is these:</p>
+
+<ul>
+  <li><strong>Estimate before designing.</strong> The numbers tell you which system you are
+      building, and being an order of magnitude out is fine while a thousand times out is not.</li>
+  <li><strong>In transactional systems the difficulty is almost never throughput.</strong> All
+      three case studies peak at under 200 writes per second and all three are hard.</li>
+  <li><strong>Prefer making the bad state unrepresentable to coordinating to avoid it.</strong> A
+      constraint beats a lock.</li>
+  <li><strong>Say which copy is the truth, and make every other copy rebuildable.</strong></li>
+  <li><strong>Every component needs a stated answer for what happens when it is gone</strong>
+      &mdash; and if that answer is &ldquo;degrades gracefully&rdquo;, test it with the component
+      turned off.</li>
+</ul>
+
+<p>That is the whole track. Start at <a href="/system-design/system-design-introduction">where to
+start</a> if you arrived here first.</p>

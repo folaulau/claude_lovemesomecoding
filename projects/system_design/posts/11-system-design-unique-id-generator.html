@@ -1,0 +1,465 @@
+<p>Every row needs an id. On one database that is a solved problem &mdash; the database hands you
+one. Across many machines it becomes a genuine design question, and it is a favourite interview
+warm-up precisely because the whole thing turns on a single trade-off you can state in one
+sentence.</p>
+
+<p>That sentence is: <strong>sortability versus coordination.</strong> Everything below is a
+different point on that line.</p>
+
+<h2>What you are actually being asked for</h2>
+
+<p>&ldquo;Unique&rdquo; is the easy requirement. The interesting ones are the others, and which of
+them you need decides the answer:</p>
+
+<table>
+  <thead><tr><th>Requirement</th><th>Why it might matter</th></tr></thead>
+  <tbody>
+    <tr><td>Unique</td><td>Non-negotiable</td></tr>
+    <tr><td>Sortable by time</td><td>&ldquo;newest first&rdquo; without a secondary index; efficient B-tree inserts</td></tr>
+    <tr><td>Small</td><td>Every foreign key and index carries a copy</td></tr>
+    <tr><td>Unguessable</td><td>An id in a URL is an id anyone can iterate</td></tr>
+    <tr><td>No coordination</td><td>Generating one must not need a network call</td></tr>
+    <tr><td>Opaque</td><td>It should not tell the world how many rows you have</td></tr>
+  </tbody>
+</table>
+
+<p>Notice that several conflict. Sortable-by-time means the id leaks when the row was created.
+Unguessable means not sortable, unless you work at it. Small fights unguessable directly &mdash;
+there is no such thing as a short unpredictable id.</p>
+
+<p>So the first move in an interview is to ask which of these actually matter, exactly as in the
+<a href="/system-design/system-design-introduction">framework post</a>.</p>
+
+<h2>Auto-increment</h2>
+
+<p>Start here, because it is what you get for free and because knowing precisely when it stops
+working is most of the answer.</p>
+
+<p>The database keeps a counter. It is small, sorted, and free.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE bookings (
+    id BIGSERIAL PRIMARY KEY   -- 8 bytes, monotonic, allocated by Postgres
+);</code></pre>
+
+<p>It fails in exactly two situations, and both are worth naming.</p>
+
+<p><strong>Sharding.</strong> Each shard has its own counter, so every shard produces id 1, 2, 3.
+The classic patch is to give each shard a different starting point and step &mdash; shard 0 does 1,
+5, 9; shard 1 does 2, 6, 10 &mdash; which works and then makes adding a fifth shard a migration.</p>
+
+<p><strong>Exposure.</strong> A sequential id in a URL tells the world two things you did not intend
+to publish:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   /bookings/1042        someone signs up, gets 1042
+   /bookings/1109        a week later, 1109
+                         -> you have 67 bookings a week
+
+   and /bookings/1041, /bookings/1040, ... are all valid ids to try.</code></pre>
+
+<p>That second line is the security problem. Guessable identifiers turn any authorisation weakness
+into a bulk extraction, because there is no discovery step. It is why the <a
+href="/system-design/system-design-airbnb">Airbnb post</a> insists on 404 rather than 403 for
+foreign-owned resources: a 403 confirms the id exists, and confirming existence on an enumerable id
+is a slow read of your entire table.</p>
+
+<h2>UUIDs</h2>
+
+<p>128 random bits. No coordination at all &mdash; any machine generates one alone, and collisions
+are not a practical concern.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   v4  550e8400-e29b-41d4-a716-446655440000
+       122 random bits. Unguessable. Completely unordered.
+
+   v7  0190b3f5-4a2c-7000-8f1e-3c9a5b7d2e01
+       └─ 48-bit millisecond timestamp ─┘ + random
+       Time-ordered AND unguessable-enough.</code></pre>
+
+<p>The difference between them matters more than it looks, and it is about how databases store
+indexes.</p>
+
+<p>A B-tree index is kept sorted. Inserting <strong>sequential</strong> keys always appends to the
+rightmost page, which stays in memory and packs full. Inserting <strong>random</strong> keys writes
+to a random page every time &mdash; so the index cannot stay cached, pages split half-empty, and
+the index grows larger and slower than it needs to be.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   sequential inserts        random inserts (UUIDv4)
+
+   [..][..][..][XX]          [X.][.X][..][X.][.X][..]
+                 ^                ^     ^        ^
+        one hot page,        writes land anywhere;
+        always cached        the whole index must stay cached
+                             or every insert is a disk read</code></pre>
+
+<p>On a large table that is a real, measurable difference in write throughput. <strong>UUIDv7 was
+standardised specifically to fix it</strong>: a millisecond timestamp in the high bits makes the
+values roughly increasing, so inserts are near-sequential again while the low bits keep them
+unguessable. If you are choosing a UUID version today, choose v7.</p>
+
+<p>The other cost is size. 16 bytes against 8, in every index and every foreign key &mdash; and
+36 bytes if stored as text, which is a mistake worth avoiding explicitly.</p>
+
+<h3>How unlikely is a collision, really?</h3>
+
+<p>Worth being able to answer, because &ldquo;UUIDs are unique&rdquo; is a claim and not a
+guarantee &mdash; they are random, so collision is merely improbable.</p>
+
+<p>UUIDv4 has 122 random bits. The birthday paradox says collisions become likely at roughly the
+square root of the space, which is 2<sup>61</sup>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   2^61  ≈  2.3 quintillion ids before a 50% chance of ONE collision
+
+   At a billion ids per second, that is ~73 years.
+   At any realistic rate, it will not happen.</code></pre>
+
+<p>So the honest statement is &ldquo;collision is not a practical concern&rdquo; rather than
+&ldquo;collision is impossible&rdquo;, and the difference matters in one place: the random number
+source. UUIDv4 is only that unlikely if the bits are genuinely unpredictable. Seeded from a poor
+source &mdash; a fresh container with no entropy, a language default that is not cryptographically
+secure &mdash; two machines can generate the same sequence, and then collisions arrive immediately
+rather than never.</p>
+
+<p>The practical consequence is small but real: use the platform&rsquo;s UUID function rather than
+building one from a general-purpose random generator, and keep the unique constraint on the column
+regardless. It costs nothing and it turns an astronomically unlikely event into a caught error
+rather than silent data corruption.</p>
+
+<h2>Both, which is usually the answer</h2>
+
+<p>The requirements conflict, so stop trying to satisfy them with one value. StayHub gives every
+row two ids, each doing the job it is good at:</p>
+
+<pre class="language-python"><code class="language-python">class PublicIdMixin:
+    """A UUID the API exposes, alongside the BIGINT primary key the database joins on.
+
+    Two ids per row is deliberate. Integers make fast, small foreign keys; a sequential integer in
+    a URL also tells the world how many rows you have and invites `/properties/1`, `/properties/2`.
+    The UUID is the only id that ever leaves the process.
+    """
+
+    public_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), default=uuid.uuid4, unique=True, nullable=False, index=True
+    )</code></pre>
+
+<p>The internal <code>BIGINT</code> is what foreign keys reference and what joins run on: 8 bytes,
+sequential, cache-friendly. The <code>public_id</code> UUID is the only id that ever appears in a
+URL, a JSON response or a log line.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   INSIDE                            OUTSIDE
+   bookings.property_id -> 7         /properties/89c69134-4b96-49ee-8329-...
+   8 bytes, joins fast               16 bytes, unguessable, opaque
+   never leaves the process          never used as a foreign key</code></pre>
+
+<p>The costs are honest: every table carries a second unique index, and every lookup by public id
+is one index hop rather than a direct primary-key hit. In exchange, enumeration is impossible, your
+row counts are private, and internal ids can be renumbered during a migration without breaking a
+single external reference.</p>
+
+<p>This pattern is worth having in your pocket, because &ldquo;which id do you expose?&rdquo; is a
+question that comes up in most schema discussions and most people have not separated the two
+concerns.</p>
+
+<h3>Sortable and unguessable at once</h3>
+
+<p>The conflict at the top of this post has a partial resolution worth knowing, because interviewers
+like it: you can have time-ordering <em>internally</em> and opacity <em>externally</em> by
+encrypting the id on the way out.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   stored:   1042              sequential, small, sortable
+   exposed:  "k7Bq2xNfR4"      format-preserving encryption of 1042
+
+   decrypt on the way in -> 1042
+   nobody can walk the sequence without the key</code></pre>
+
+<p>The database keeps every benefit of a sequential key, and the outside world sees something it
+cannot iterate. The costs are a key to manage &mdash; rotating it invalidates every URL ever issued
+&mdash; and a layer of encoding in every request path.</p>
+
+<p>It is genuinely used, and it is more machinery than most systems need. The two-id approach above
+buys the same external property with an index lookup instead of a key-management problem, which is
+usually the better trade.</p>
+
+<h2>Ticket server</h2>
+
+<p>One central service hands out ids. Everyone asks it.</p>
+
+<p>Simple, and it gives you strictly increasing 64-bit ids with no coordination logic anywhere
+else. The problems are the obvious ones: it is a single point of failure, and it adds a network
+round trip to every insert.</p>
+
+<p>The mitigation is <strong>batching</strong>, and it is what makes the approach viable: each
+server requests a block of a thousand ids and hands them out locally, so the round trip happens
+once per thousand rows rather than once per row. The cost is gaps in the sequence when a server
+restarts holding unused ids &mdash; which matters only if you were treating the id as a count, and
+you should not be.</p>
+
+<h3>Batching, concretely</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">   server A: "give me 1000 ids"  ──> ticket server ──> 1000-1999
+   server B: "give me 1000 ids"  ──> ticket server ──> 2000-2999
+
+   Both now hand out ids locally, no network call per row.
+   A restarts having used 400 -> 600 ids are lost. Nobody cares.</code></pre>
+
+<p>The block size is the dial. Larger blocks mean fewer round trips and bigger gaps on restart;
+smaller blocks the reverse. A thousand is a sensible default for most write rates, and the
+&ldquo;nobody cares&rdquo; is the important part &mdash; the moment somebody <em>does</em> care
+about the gaps, they are using the id as a count, and that is the bug.</p>
+
+<p>Availability is still the weak point. If the ticket server is down, every application server
+keeps working until its block is exhausted, so the outage is survivable for a while rather than
+immediate &mdash; which is a much better failure mode than one round trip per insert and worth
+saying out loud.</p>
+
+<h2>Snowflake</h2>
+
+<p>The answer when you need time-sortable, coordination-free, 64-bit ids at high volume. Twitter
+published the design and the name stuck.</p>
+
+<p>Pack meaning into the bits instead of asking anyone:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">    0 | 41 bits timestamp     | 10 bits machine | 12 bits sequence
+    ^   ^                       ^                 ^
+    │   ms since a custom       which machine     counter within
+    │   epoch (~69 years)       (1024 of them)    the same ms (4096)
+    │
+    unused, so the number is positive as a signed 64-bit int
+
+   Result: 4,096 ids per millisecond per machine
+           = ~4.1 million per second per machine
+           and 64 bits total, sortable by time</code></pre>
+
+<p>Three design choices in that layout are worth understanding, because they are what an
+interviewer will probe.</p>
+
+<p><strong>The custom epoch.</strong> Counting milliseconds from your service&rsquo;s launch rather
+than from 1970 buys back the decades you would otherwise waste, extending the usable range to
+roughly 69 years.</p>
+
+<p><strong>The machine id must be assigned, not chosen.</strong> Two machines with the same id
+generating in the same millisecond produce identical ids. In practice this comes from a
+coordination service or from the orchestrator &mdash; and &ldquo;how do machines get their
+ids?&rdquo; is the standard follow-up question.</p>
+
+<p><strong>The sequence handles the same millisecond.</strong> 4,096 per machine per millisecond,
+and if you exhaust it you wait for the next millisecond. That is a hard local ceiling, and it is
+generous.</p>
+
+<h3>The failure everyone forgets</h3>
+
+<p>Snowflake assumes time moves forward. It does not always:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   t = 1000   generate ids with timestamp 1000
+              NTP corrects the clock backwards
+   t = 995    generate ids with timestamp 995
+
+   Those ids were already issued. Collision.</code></pre>
+
+<p>A clock adjustment &mdash; NTP correcting drift, a leap second, a VM resuming from a snapshot
+&mdash; can move time backwards. The standard defence is to record the last timestamp used and
+<strong>refuse to generate</strong> while the clock is behind it, rather than producing ids you
+know may be duplicates. Refusing is uncomfortable and it is correct; the alternative is silent
+corruption that surfaces as a unique-constraint violation somewhere unrelated, weeks later.</p>
+
+<p>This is the detail that separates a memorised description from an understood one, so it is worth
+volunteering rather than waiting to be asked.</p>
+
+<h3>Running out, and other bounds</h3>
+
+<p>Worth being able to answer &ldquo;when does this break?&rdquo; for each scheme, because the
+answers differ by many orders of magnitude:</p>
+
+<table>
+  <thead><tr><th>Scheme</th><th>Bound</th><th>Reached when</th></tr></thead>
+  <tbody>
+    <tr><td><code>BIGSERIAL</code></td><td>9.2 &times; 10<sup>18</sup></td>
+        <td>Never, realistically &mdash; a million a second for 290,000 years</td></tr>
+    <tr><td><code>SERIAL</code> (32-bit)</td><td>2.1 billion</td>
+        <td>Genuinely reachable, and a real outage when it happens</td></tr>
+    <tr><td>UUIDv4</td><td>2<sup>122</sup></td><td>Collision is not a practical concern</td></tr>
+    <tr><td>Snowflake</td><td>~69 years of timestamps</td><td>From your chosen epoch</td></tr>
+    <tr><td>Snowflake, per machine</td><td>4,096 per millisecond</td>
+        <td>At ~4.1M/sec on one machine &mdash; it waits for the next millisecond</td></tr>
+    <tr><td>base62, 7 chars</td><td>3.5 trillion</td><td>See the arithmetic below</td></tr>
+  </tbody>
+</table>
+
+<p>The second row is the one that actually bites people. A 32-bit auto-increment on a
+high-throughput table &mdash; events, log lines, clicks &mdash; runs out, and the failure is
+inserts stopping entirely. Using <code>BIGSERIAL</code> from the start costs four extra bytes per
+row and removes the problem permanently, which is why StayHub uses it everywhere.</p>
+
+<h2>Short codes, which is a different problem</h2>
+
+<p>URL shorteners want the opposite of everything above: as few characters as possible, because a
+human reads them out.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   base62 = [0-9a-zA-Z]
+
+   62^6 =        56 billion
+   62^7 =      3.5 trillion
+   62^8 =    218 trillion</code></pre>
+
+<p>Two approaches, and they fail differently.</p>
+
+<p><strong>Encode a counter.</strong> Take an auto-increment id and write it in base62. Uniqueness
+comes free from the counter, codes are as short as possible, and no collision check is needed. The
+cost is that codes are sequential and therefore enumerable &mdash; anyone can walk your entire
+database of links &mdash; and they leak your volume.</p>
+
+<p><strong>Generate randomly and check.</strong> Pick seven random characters, insert, and let a
+unique constraint reject a collision; retry on rejection. Unguessable, and the retry loop only
+terminates quickly while the keyspace is sparse.</p>
+
+<p>Which is where the arithmetic from the <a
+href="/system-design/system-design-back-of-envelope-estimation">estimation post</a> settles it. At
+100 million links a day for five years:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   182 billion rows / 3.5 trillion possible codes  =  ~5% occupancy
+
+   -> a random 7-character code collides ~5% of the time
+   -> retries terminate almost immediately
+   -> 6 characters would be 56 billion possibilities
+      against 182 billion rows: impossible.</code></pre>
+
+<p>So: seven characters, generated randomly, with the unique constraint as the guard. That is the
+<a href="/system-design/system-design-concurrency-and-locking">concurrency post&rsquo;s</a>
+principle again &mdash; do not check whether the code is taken and then insert it, just insert it
+and let the constraint decide.</p>
+
+<h3>Gaps are normal, and that is fine</h3>
+
+<p>A detail that surprises people the first time they notice it: sequences produce gaps. A
+transaction that rolls back has already consumed its id and does not give it back.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   INSERT ... -> id 1042    committed
+   INSERT ... -> id 1043    ROLLED BACK — 1043 is gone forever
+   INSERT ... -> id 1044    committed</code></pre>
+
+<p>This is deliberate. Handing the id back would require the sequence to be transactional, which
+would mean every insert waiting on a lock held by every other insert &mdash; turning your id
+generator into the bottleneck the <a href="/system-design/system-design-concurrency-and-locking">
+concurrency post</a> describes. Sequences are non-transactional on purpose, and gaps are the price.</p>
+
+<p>It only matters if you were using the id as a count, or expecting <code>MAX(id)</code> to equal
+the number of rows. Neither is safe, and code that relies on either is code that will be wrong the
+first time a transaction rolls back.</p>
+
+<h2>Storing them properly</h2>
+
+<p>A practical detail that costs real performance and is easy to get wrong: <strong>store a UUID as
+16 bytes, not as 36 characters.</strong></p>
+
+<pre class="language-sql"><code class="language-sql">-- 16 bytes, compared as an integer pair
+public_id UUID NOT NULL UNIQUE
+
+-- 36 bytes, compared character by character, and it accepts '' and 'banana'
+public_id VARCHAR(36) NOT NULL UNIQUE</code></pre>
+
+<p>The text version is more than twice the size in the table and in every index, comparisons are
+slower, and the column no longer rejects nonsense. Databases without a native UUID type usually
+have a 16-byte binary alternative, which is the right target there.</p>
+
+<p>The same discipline applies at the API boundary: accept and emit the canonical hyphenated
+string, and parse it into a real UUID type immediately. StayHub does this by typing the route
+parameter, so a malformed id is a 422 before any code runs rather than a database error later.</p>
+
+<h3>Ids in URLs are not access control</h3>
+
+<p>The most important caveat in this post, because unguessable ids invite exactly the wrong
+conclusion.</p>
+
+<p>A UUID makes an id hard to guess. It does not make it secret. Ids leak through browser history,
+referrer headers, server logs, screenshots, support tickets and shared links. Anyone who has ever
+legitimately seen a resource keeps its id forever.</p>
+
+<p>So the id is a <em>name</em>, and every request still needs an authorisation check. What the
+UUID buys is that a missing check is not immediately exploitable at scale &mdash; an attacker
+cannot enumerate. That is defence in depth, and treating it as the defence itself is the mistake
+the term &ldquo;security through obscurity&rdquo; was coined for.</p>
+
+<h2>Changing your mind later</h2>
+
+<p>The question that decides how much this matters: how expensive is it to switch schemes after
+launch?</p>
+
+<p>Expensive, and asymmetrically so. Every foreign key holds a copy of the id, so changing the
+primary key means rewriting every table that references it &mdash; plus every cached value, every
+external system that stored one, and every URL anyone has bookmarked.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   ADD a new id alongside          cheap — one column, one backfill
+   CHANGE what URLs expose         expensive — old links break forever
+   CHANGE the internal primary key very expensive — every FK, every index</code></pre>
+
+<p>Which suggests the practical strategy: <strong>decide the external id carefully and the internal
+one casually.</strong> The internal key can be migrated with effort and nobody outside notices. The
+external one is a public contract from the first request that returns it.</p>
+
+<p>It also explains why the two-id pattern is worth adopting before you need it. A row with both
+ids from day one can have its internal key renumbered, its tables re-sharded, even its database
+replaced, without a single external reference changing &mdash; because nothing outside ever knew
+the internal id existed. Adding a public id to a table whose sequential ids are already in a million
+URLs is the migration you were trying to avoid.</p>
+
+<h2>Choosing</h2>
+
+<table>
+  <thead><tr><th>Situation</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>Single database, internal ids</td><td><code>BIGSERIAL</code>. Do not overthink it.</td></tr>
+    <tr><td>Ids that appear in URLs</td><td>UUID (v7), alongside an internal integer</td></tr>
+    <tr><td>Client-generated, offline-capable</td><td>UUIDv4 &mdash; no coordination at all</td></tr>
+    <tr><td>Sharded, high volume, needs time order</td><td>Snowflake</td></tr>
+    <tr><td>Moderate volume, wants simple + sortable</td><td>Ticket server with batching</td></tr>
+    <tr><td>Short human-readable codes</td><td>base62, sized by the occupancy arithmetic</td></tr>
+  </tbody>
+</table>
+
+<h2>Composite and natural keys</h2>
+
+<p>One more option that gets forgotten: sometimes the right id is not generated at all.</p>
+
+<p>A <strong>natural key</strong> is a value the domain already guarantees is unique &mdash; an
+ISBN, a country code, an email address. A <strong>composite key</strong> is several columns
+together, which is the right shape for a join table:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE property_amenities (
+    property_id BIGINT NOT NULL REFERENCES properties(id),
+    amenity_id  BIGINT NOT NULL REFERENCES amenities(id),
+    PRIMARY KEY (property_id, amenity_id)   -- no surrogate id needed
+);</code></pre>
+
+<p>Adding an <code>id BIGSERIAL</code> to that table would buy nothing and cost an index. The
+composite primary key already enforces the rule that matters &mdash; a property cannot list the
+same amenity twice &mdash; which is the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post&rsquo;s</a> principle
+appearing yet again: encode the invariant in the key.</p>
+
+<p>The warning about natural keys is that they change. Email addresses get updated, product codes
+get reissued, and a country splits in two. Anything that can change is a poor primary key, because
+changing it means updating every foreign key that references it. The conventional advice &mdash;
+surrogate key as the primary key, natural key as a unique constraint beside it &mdash; exists
+because that keeps both properties without the cascade.</p>
+
+<h2>The summary</h2>
+
+<ul>
+  <li><strong>The trade is sortability against coordination.</strong> Everything else follows.</li>
+  <li><strong>Random ids hurt B-tree inserts.</strong> UUIDv7 exists to fix exactly that; prefer it
+      to v4 for stored keys.</li>
+  <li><strong>Two ids per row is often right</strong> &mdash; a small sequential one inside, an
+      opaque one outside.</li>
+  <li><strong>Sequential ids in URLs leak volume and invite enumeration.</strong></li>
+  <li><strong>Snowflake trusts the clock</strong>, so it must refuse to generate when the clock
+      moves backwards.</li>
+  <li><strong>Size short codes with arithmetic</strong>, not by preference.</li>
+  <li><strong>Let a unique constraint catch collisions.</strong> Never check-then-insert.</li>
+</ul>
+
+<p>And the reason this question is a good interview warm-up: it is small enough to answer
+completely in ten minutes, and it still requires you to ask what the requirements are, do a piece of
+arithmetic, name a trade-off, and describe a failure mode. That is the whole framework in
+miniature.</p>
+
+<p>That is the last of the mechanisms. Next, the case studies begin: <a
+href="/system-design/system-design-url-shortener">designing a URL shortener</a>, which uses this
+post&rsquo;s arithmetic directly.</p>

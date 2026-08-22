@@ -1,0 +1,473 @@
+<p>The most dangerous line in most codebases is the one immediately after a commit.</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">self.db.commit()                       # the booking is now real
+send_confirmation_email(booking)       # ...and this line never runs</code></pre>
+
+<p>Between those two statements the process can be deployed over, killed by the OOM reaper, or lose
+its network. The booking exists, the email does not, and nothing anywhere records that it was ever
+owed. Nobody finds out until a guest complains.</p>
+
+<p>Reversing the order does not help &mdash; it makes it worse. Send first and a transaction that
+subsequently rolls back has emailed somebody about a booking that does not exist.</p>
+
+<p>This post is about the machinery that closes that gap, and about what asynchronous work costs
+once you accept it.</p>
+
+<h2>Why not just do it in the request?</h2>
+
+<p>Three reasons, and the third is the one people underrate.</p>
+
+<p><strong>Latency.</strong> An email provider takes 400ms. The user does not need to wait for it
+to see &ldquo;your booking is confirmed&rdquo;.</p>
+
+<p><strong>Failure isolation.</strong> If the provider is down for ten minutes and sending is on
+the request path, your booking endpoint is down for ten minutes. With a queue, the work waits and
+the site keeps taking bookings. <strong>A queue converts somebody else&rsquo;s outage into your
+backlog.</strong></p>
+
+<p><strong>Back-pressure.</strong> A burst of traffic becomes a longer queue rather than a burst of
+concurrent provider calls. The system degrades by getting slower, which is survivable, instead of
+by falling over, which is not.</p>
+
+<h2>What in-process background tasks are not</h2>
+
+<p>Every web framework ships something that runs work after the response. It is not a queue, and
+the difference costs people real incidents. StayHub&rsquo;s notification module states it
+plainly:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">It is NOT a job queue, and the difference is not academic:
+
+  * no retry           — a provider blip loses the email
+  * no persistence     — a deploy or a crash mid-task loses it too
+  * no back-pressure   — a burst of requests is a burst of concurrent tasks
+  * no visibility      — nothing anywhere records that it was meant to happen</code></pre>
+
+<p>Those tasks run in the same process, in the same event loop, after the response is sent. That
+buys latency and nothing else. So the rule is: <strong>in-process for work that is genuinely nice
+to have, a real queue for work that must happen.</strong></p>
+
+<h2>The transactional outbox</h2>
+
+<p>The fix for the opening problem, and it is simpler than it sounds. If two systems cannot be
+updated atomically, make the <em>intent</em> to update the second one part of the first one&rsquo;s
+transaction.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BEGIN
+     INSERT INTO bookings ...        the business change
+     INSERT INTO outbox   ...        "and an email needs sending"
+   COMMIT                            both, or neither
+
+           │
+           v  a separate worker polls the table
+     [ worker ] ──> send the email ──> mark the row DONE</code></pre>
+
+<p>There is now no gap. If the commit succeeded, the row saying &ldquo;send this&rdquo; is durable.
+If it rolled back, the intent vanished with the booking.</p>
+
+<p>In StayHub, the position of one line is the entire pattern:</p>
+
+<pre class="language-python"><code class="language-python">        try:
+            self.bookings.add(booking)
+
+            outbox_service.enqueue(
+                self.db,
+                notification_service.TOPIC_BOOKING_CREATED,
+                {
+                    "bookingId": str(booking.public_id),
+                    "guestEmail": guest.email,
+                    "propertyTitle": prop.title,
+                    "checkIn": req.check_in,
+                    "checkOut": req.check_out,
+                    "total": breakdown.total,
+                    "idempotencyKey": f"booking-created:{booking.public_id}",
+                },
+            )
+
+            self.db.commit()</code></pre>
+
+<p>The enqueue is <em>before</em> the commit. Move it after and the gap is back.</p>
+
+<p>It also inherits something for free: if the database rejects the booking &mdash; StayHub has an
+exclusion constraint that prevents double bookings &mdash; the rollback takes the outbox row with
+it. Nobody is emailed about a booking that lost the race. That is not extra code; it is a
+consequence of being in the same transaction.</p>
+
+<p>Which makes one rule non-negotiable: <strong><code>enqueue</code> must never commit.</strong></p>
+
+<pre class="language-python"><code class="language-python">    message = OutboxMessage(
+        topic=topic,
+        payload=json.loads(json.dumps(payload, default=str)),
+        status=OutboxStatus.PENDING,
+    )
+    db.add(message)
+    db.flush()
+    return message</code></pre>
+
+<p><code>flush</code> assigns the id without ending the transaction; the caller&rsquo;s
+<code>commit</code> remains the single boundary. A commit hidden inside <code>enqueue</code> would
+reopen the gap invisibly &mdash; the code would look correct and work perfectly until the first
+crash.</p>
+
+<h3>What goes in the message</h3>
+
+<p>Two decisions worth making deliberately.</p>
+
+<p><strong>Name events, not commands.</strong> <code>booking.created</code>, not
+<code>send_confirmation_email</code>. A command has exactly one handler by definition, so the
+producer must know every consumer and gets edited whenever one is added. An event has none of that:
+today <code>booking.created</code> sends an email, next month it also notifies the host, and the
+booking service is untouched both times.</p>
+
+<p><strong>Carry a snapshot, not just a key.</strong> A foreign key alone is smaller and it is the
+thing that goes wrong: by the time the worker runs, the row may have changed &mdash; so the email
+describes the current state rather than the state that triggered it &mdash; or it may be gone, in
+which case the message can only be discarded.</p>
+
+<p>The payload above does both: the id, so the handler can re-read anything that must be fresh, and
+a snapshot of what the email actually says.</p>
+
+<h3>The table</h3>
+
+<p>The schema is short, and every column is there for a reason worth naming:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE outbox (
+    id           BIGSERIAL PRIMARY KEY,
+    public_id    UUID        NOT NULL UNIQUE,   -- the idempotency key sent downstream
+    topic        VARCHAR(64) NOT NULL,          -- 'booking.created' — an EVENT, past tense
+    payload      JSONB       NOT NULL,          -- a snapshot, not just a foreign key
+    status       VARCHAR(16) NOT NULL,          -- PENDING | DONE | DEAD
+    attempts     INTEGER     NOT NULL DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- created_at, then the backoff deadline
+    processed_at TIMESTAMPTZ,
+    last_error   TEXT,                          -- so a DEAD row is diagnosable without the logs
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ix_outbox_pending ON outbox (status, available_at);</code></pre>
+
+<p><code>available_at</code> does two jobs in one column: it is the creation time for a new message
+and the backoff deadline after a failure. That keeps the worker&rsquo;s query to a single
+<code>available_at &lt;= now()</code> rather than a null check plus a comparison.</p>
+
+<p>The index earns its own mention. Equality column first, then the range-and-sort column, so
+Postgres seeks straight to the pending rows and walks them <em>already in order</em> &mdash; no
+sort step, and the cost does not grow as millions of DONE rows accumulate behind them. A production
+version makes it partial (<code>WHERE status = 'PENDING'</code>), because the done rows come to
+outnumber the live ones by orders of magnitude.</p>
+
+<p>Which raises the housekeeping question people forget: <strong>DONE rows accumulate forever</strong>
+unless something removes them. Delete or archive them on a schedule &mdash; and if the table is
+partitioned by date, dropping a partition is instant where a <code>DELETE</code> of millions of rows
+is not.</p>
+
+<h2>Claiming work without doing it twice</h2>
+
+<p>Once there is a table of pending work, several workers will read it, and the obvious query is
+wrong.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT * FROM outbox
+ WHERE status = 'PENDING' AND available_at &lt;= now()
+ ORDER BY available_at
+ LIMIT 20
+   FOR UPDATE SKIP LOCKED;</code></pre>
+
+<p>Both halves of that last line are load-bearing, and the second is the one people omit.</p>
+
+<p><strong><code>FOR UPDATE</code></strong> locks the selected rows for the transaction&rsquo;s
+duration. Without it, two workers polling at the same moment read the same rows and both send the
+same email. At-least-once is a guarantee to design around; twice on <em>every</em> message because
+two workers are running is simply a bug.</p>
+
+<p><strong><code>SKIP LOCKED</code></strong> tells Postgres to step over rows another transaction
+already holds and take the next free ones. Leaving it off is worse than it looks: plain
+<code>FOR UPDATE</code> makes worker B <em>wait</em> for worker A&rsquo;s rows, so a second worker
+adds no throughput at all &mdash; it just queues behind the first, and one slow handler blocks
+everybody.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   FOR UPDATE            worker A: takes rows 1-20
+                         worker B: BLOCKS until A commits    -> 1x throughput
+
+   FOR UPDATE SKIP LOCKED
+                         worker A: takes rows 1-20
+                         worker B: takes rows 21-40          -> 2x, no coordination</code></pre>
+
+<p>The difference is only visible under concurrency, which is why the test for it has to be
+concurrent and has to assert on <em>timing</em>:</p>
+
+<pre class="language-python"><code class="language-python">                started = time.perf_counter()
+                claimed_b = outbox_service.claim(worker_b, limit=10)
+                elapsed = time.perf_counter() - started
+
+                assert claimed_b == []
+                assert elapsed &lt; 1.0, f"worker B blocked for {elapsed:.2f}s — it is waiting, not skipping"</code></pre>
+
+<p>Empty and <em>fast</em>. Without <code>SKIP LOCKED</code> the result is also eventually empty
+&mdash; it just takes as long as worker A does, and only the clock tells the two apart.</p>
+
+<h2>Retries and backoff</h2>
+
+<p>The point of a queue is that failure is temporary. A failed message goes back with a delay.</p>
+
+<pre class="language-python"><code class="language-python">def backoff_for(attempts: int) -> timedelta:
+    return timedelta(seconds=min(BACKOFF_BASE_SECONDS * (2 ** max(0, attempts - 1)), BACKOFF_MAX_SECONDS))</code></pre>
+
+<p>StayHub&rsquo;s schedule is <strong>2, 4, 8, 16, 32, 64, 128, 256 seconds</strong> &mdash; eight
+attempts spanning about four and a quarter minutes, then the message is dead.</p>
+
+<p>Three properties of that sequence, each of which is a decision:</p>
+
+<p><strong>It grows.</strong> Retrying a struggling provider every second is how a limited outage
+becomes a total one, because the retries <em>are</em> the load. Exponential backoff means a
+recovering service sees exponentially less traffic from you.</p>
+
+<p><strong>It is capped.</strong> Uncapped doubling reaches days by attempt twenty, so a message
+that would have succeeded on the next retry waits a week. The cap matters as much as the
+growth.</p>
+
+<p><strong>It gives up.</strong> A cap on attempts is the difference between a queue and a spin
+loop. A message with a malformed payload fails identically forever; without a limit the worker
+retries it on every poll and it sits at the front of the queue delaying everything behind it.</p>
+
+<p>One thing production adds that StayHub deliberately leaves out: <strong>jitter</strong>, a
+random fraction of the delay. Without it, every message that failed during the same outage retries
+at exactly the same instant and the recovering service is hit by a thundering herd of your own
+making. It is omitted here only so the tests can assert exact numbers.</p>
+
+<h3>Dead letters</h3>
+
+<p>After the last attempt, the message stops being retried and starts being evidence:</p>
+
+<pre class="language-python"><code class="language-python">    if message.attempts &gt;= MAX_ATTEMPTS:
+        message.status = OutboxStatus.DEAD
+        message.processed_at = datetime.now(UTC)</code></pre>
+
+<p>A dead-letter queue is not a failure of the design, it is the design working &mdash; the
+alternative is losing the message silently or retrying it forever. What matters is that
+<strong>somebody looks</strong>. A DLQ nobody monitors is a folder where data goes to be forgotten,
+so the count of dead messages belongs on a dashboard with an alert on it.</p>
+
+<p>Keeping the last error on the row is worth the column, because by the time anyone investigates,
+the logs have very possibly rotated.</p>
+
+<h2>At-least-once, and the duplicate you will get</h2>
+
+<p>This is the cost of the whole pattern and it cannot be engineered away. The worker can hand a
+message to the provider and die before marking it done; the next worker sends it again.</p>
+
+<p>&ldquo;Exactly-once delivery&rdquo; does not exist across a network &mdash; it is the two
+generals problem from the <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a>. What exists
+is at-least-once delivery plus idempotent handling, which produces exactly-once <em>effects</em>,
+and that is the thing you actually want.</p>
+
+<p>Building this, the duplicate showed up immediately and visibly. Both delivery paths were briefly
+live at once &mdash; the old in-process task and the new outbox worker &mdash; and one booking
+produced two files:</p>
+
+<pre class="language-bash"><code class="language-bash">$ ls notifications/
+20260822T190807315928-guest_at_stayhub.test.json
+20260822T190807858799-guest_at_stayhub.test.json    # same email, twice</code></pre>
+
+<p>That was a bug with an obvious fix (the routes stopped calling the in-process task). But it is
+also exactly what a redelivery looks like, and it is worth seeing, because the same shape arrives
+legitimately whenever a worker dies at the wrong moment.</p>
+
+<p>How handlers survive it:</p>
+
+<ul>
+  <li><strong>Make the operation naturally idempotent.</strong> The index handler writes a document
+      whose id is the property&rsquo;s id, so running it five times produces the same index as
+      running it once. This is the best answer when it is available.</li>
+  <li><strong>Pass an idempotency key downstream.</strong> The payload above carries
+      <code>"idempotencyKey": f"booking-created:{booking.public_id}"</code>. Real providers accept
+      one and deduplicate on it.</li>
+  <li><strong>Record what you did.</strong> A table of processed message ids, written in the same
+      transaction as the effect.</li>
+</ul>
+
+<h2>Unknown topics stay pending</h2>
+
+<p>A small decision with a large consequence. What should the worker do with a message whose topic
+it has no handler for?</p>
+
+<pre class="language-python"><code class="language-python">        if handler is None:
+            counts["unhandled"] += 1
+            logger.warning(
+                "No handler for outbox topic %r (known: %s) — leaving it pending",
+                message.topic,
+                ", ".join(registered_topics()) or "none",
+            )
+            db.commit()  # releases the row lock so the next poll can see it again
+            continue</code></pre>
+
+<p>Not a failure to retry &mdash; no amount of waiting grows a handler &mdash; but deliberately
+<strong>not</strong> dead-lettered either. This is normally a deployment problem: a producer shipped
+ahead of its consumer. Marking those messages dead turns a five-minute deploy skew into permanent
+data loss.</p>
+
+<p>There is a trap adjacent to this that cost real time here. Handlers register themselves at
+import time, so a module nobody imports has no topics &mdash; and the symptom is not a crash, it is
+&ldquo;No handler for topic <code>booking.created</code>&rdquo; on a perfectly valid message,
+forever. The worker therefore imports its handler modules explicitly, and ships a
+<code>--list-topics</code> flag so the registry can be inspected when this happens.</p>
+
+<h2>The worker is a separate process</h2>
+
+<pre class="language-bash"><code class="language-bash">python -m scripts.drain_outbox              # run until interrupted
+python -m scripts.drain_outbox --once       # one batch, then exit
+python -m scripts.drain_outbox --list-topics</code></pre>
+
+<p>Separate, and that separation is the point. Inside the API it would compete with request
+handling and die with every deploy mid-message. As its own process it can be restarted, scaled out
+or stopped without touching the API &mdash; and stopping it is <em>safe</em>, which is the property
+that distinguishes a queue from a background task. Messages simply accumulate as pending until it
+comes back.</p>
+
+<p>Two details from the worker loop that generalise. It <strong>commits per message, not per
+batch</strong>, so one poisoned message cannot roll back the successful work beside it and cause
+all of it to be re-sent. And it opens <strong>a session per batch, not per lifetime</strong> &mdash;
+a long-lived session holds a connection open for days and accumulates every object it ever loaded.</p>
+
+<p>Shutdown deserves a moment too. On SIGTERM the worker sets a flag and finishes the batch in
+flight rather than exiting immediately. Killed mid-handler, a message is left pending and
+redelivered &mdash; correct, but a duplicate nobody needed. Draining first makes the common case
+clean.</p>
+
+<h2>Ordering, and why you mostly should not need it</h2>
+
+<p>A question that comes up immediately: do messages arrive in the order they were sent?</p>
+
+<p>StayHub&rsquo;s claim clause is <code>ORDER BY available_at</code>, which processes
+oldest-ready-first &mdash; roughly FIFO. It is emphatically <em>not</em> an ordering guarantee, and
+relying on it as one is a bug waiting to happen:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   worker A claims message 1  (a slow handler, 3 seconds)
+   worker B claims message 2  (fast, 20ms)
+
+   message 2 completes first. Always, under any concurrency.</code></pre>
+
+<p>Ordering and parallelism are in direct conflict. Guaranteeing global order means one consumer,
+one at a time &mdash; which caps your throughput at whatever one worker can do.</p>
+
+<p>Systems that need both compromise with <strong>partial ordering</strong>: messages sharing a key
+go to the same partition and are processed in order, while different keys proceed in parallel. All
+events for booking 1234 are ordered relative to each other; booking 5678 is independent. That is
+almost always what &ldquo;ordering&rdquo; actually meant.</p>
+
+<p>The simplest answer, though, is to design so ordering does not matter. If two messages must be
+applied in sequence, that is usually a sign they should be <strong>one message</strong>. And if
+handlers are idempotent and carry the state they need, arrival order stops being interesting
+&mdash; which is another dividend of the design decisions above.</p>
+
+<h2>Watching it</h2>
+
+<p>An asynchronous system fails silently by construction. The request succeeded; the work did not
+happen; nobody is holding an error. So the queue needs to be observable or it will fail
+undetected.</p>
+
+<pre class="language-python"><code class="language-python">def pending_count(db: Session) -> int:
+    """For the health check and the admin page. A number that only goes up means the worker is
+    dead, and that is worth an alert — a queue nobody is draining fails completely silently."""</code></pre>
+
+<p>Four numbers cover it:</p>
+
+<table>
+  <thead><tr><th>Metric</th><th>Alert when</th><th>It means</th></tr></thead>
+  <tbody>
+    <tr><td>Queue depth</td><td>Rising steadily</td><td>Consumers are slower than producers, or dead</td></tr>
+    <tr><td>Oldest pending age</td><td>Above your latency budget</td><td>Better than depth &mdash; catches a stuck message a busy queue hides</td></tr>
+    <tr><td>Dead-letter count</td><td>Any increase</td><td>Something is failing permanently</td></tr>
+    <tr><td>Processing rate</td><td>Drops to zero</td><td>The worker is not running at all</td></tr>
+  </tbody>
+</table>
+
+<p>The second row is the one worth adding if you only add one. Depth alone is ambiguous &mdash; a
+thousand messages is fine if they are draining in seconds &mdash; whereas &ldquo;the oldest message
+has been waiting eleven minutes&rdquo; is unambiguous, and it catches a single poisoned message
+sitting at the head of an otherwise healthy queue.</p>
+
+<h2>Queue or log?</h2>
+
+<p>The other question in this space, and the distinction is about what happens after a message is
+read.</p>
+
+<table>
+  <thead><tr><th></th><th>Queue (SQS, RabbitMQ)</th><th>Log (Kafka, Kinesis)</th></tr></thead>
+  <tbody>
+    <tr><td>After consumption</td><td>The message is gone</td><td>It stays; consumers track an offset</td></tr>
+    <tr><td>Consumers</td><td>Compete &mdash; each message goes to one</td><td>Independent &mdash; each reads everything</td></tr>
+    <tr><td>Replay</td><td>No</td><td>Yes &mdash; rewind the offset</td></tr>
+    <tr><td>Ordering</td><td>Best effort</td><td>Strict, within a partition</td></tr>
+    <tr><td>Good for</td><td>Task distribution &mdash; send this email</td><td>Event streams several systems consume</td></tr>
+  </tbody>
+</table>
+
+<p>Replay is the deciding feature. If you need to add a consumer next year that processes the last
+six months of events, you need a log. If you need work done once, a queue is simpler and
+cheaper.</p>
+
+<p>And a database table is a perfectly respectable queue at moderate volume. It gives you
+transactions with your business data &mdash; which is the entire outbox pattern &mdash; and it is
+one less system to operate. Move to a dedicated broker when the volume or the fan-out demands it,
+not before.</p>
+
+<h2>Where the outbox does not reach</h2>
+
+<p>Honesty about a pattern&rsquo;s limits is worth more than the pattern. StayHub has two async
+paths and only one of them is fully transactional &mdash; the code says so:</p>
+
+<pre class="language-python"><code class="language-python">            outbox_service.enqueue(
+                self.db,
+                indexer.TOPIC_PROPERTY_CHANGED,
+                {"propertyId": str(prop.public_id), "reason": "index-write-failed"},
+            )
+            self.db.commit()</code></pre>
+
+<p>That <code>commit</code> is the tell. This enqueue happens in the search-index path, which runs
+<em>after</em> the business transaction has already committed &mdash; deliberately, because
+indexing inside the transaction would let a slow search cluster fail a host&rsquo;s save. So the
+message is genuinely a second write, and a crash between the commit and this line loses it.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BOOKING PATH                       INDEX PATH
+     BEGIN                              COMMIT (business change)
+       INSERT booking                   ...crash here loses the index update
+       INSERT outbox        <- atomic   try to index
+     COMMIT                             failed? enqueue + commit
+                                        ^ a SECOND transaction, not the same one</code></pre>
+
+<p>Two different guarantees in one application, and both are right for their path. The booking
+email must never be lost, so it is transactional. The index update can be lost, because the index
+is derived data with a rebuild button &mdash; and buying atomicity there would cost the write path
+its independence from Elasticsearch.</p>
+
+<p>The general lesson: <strong>the outbox is for work that must not be lost, and it costs you an
+extra table, an extra process and a few seconds of latency.</strong> Applying it everywhere is as
+much a mistake as applying it nowhere. Ask what losing the message actually costs, and pay
+accordingly.</p>
+
+<h2>The summary</h2>
+
+<ul>
+  <li><strong>The line after the commit is where messages are lost.</strong> The outbox makes the
+      intent part of the transaction.</li>
+  <li><strong><code>enqueue</code> never commits</strong> &mdash; the caller&rsquo;s commit is what
+      makes it atomic.</li>
+  <li><strong>Name events, carry snapshots</strong>, and include an idempotency key.</li>
+  <li><strong><code>FOR UPDATE SKIP LOCKED</code></strong> &mdash; both halves. Without the second,
+      more workers add nothing.</li>
+  <li><strong>Exponential backoff, capped, with jitter, and a limit on attempts.</strong></li>
+  <li><strong>At-least-once is the guarantee.</strong> Every handler must be idempotent, and you
+      will see the duplicate eventually.</li>
+  <li><strong>Alert on queue depth and dead letters.</strong> A queue nobody drains fails
+      silently.</li>
+</ul>
+
+<p>The mental model worth keeping: a queue does not make work reliable, it makes the
+<em>record</em> of the work reliable. Everything after that &mdash; retries, backoff, dead letters,
+idempotency &mdash; exists because delivery itself never becomes certain. You are not building a
+system where nothing fails; you are building one where a failure is recorded, retried, and
+eventually visible to a human.</p>
+
+<p>Next: <a href="/system-design/system-design-concurrency-and-locking">concurrency and
+locking</a> &mdash; what happens when two requests want the same row at the same instant, which the
+outbox&rsquo;s row locking has already hinted at.</p>

@@ -1,0 +1,474 @@
+<p>&ldquo;We&rsquo;ll need a few servers and probably a cache.&rdquo; That sentence is why
+estimation is on the scorecard. It sounds like an answer and contains no information &mdash; it
+would be equally true of a system with a hundred users or a hundred million, and those are not the
+same system.</p>
+
+<p>Estimation is the five minutes that turn a vague problem into a specific one. It is also the
+step candidates most often skip, and interviewers notice, because it is the cheapest possible
+signal that someone has operated a real system rather than read about one.</p>
+
+<h2>What it is for</h2>
+
+<p>Not accuracy. Nobody is checking your multiplication. It is for making the next twenty minutes
+decidable.</p>
+
+<p>Consider two answers to &ldquo;should we cache this?&rdquo;</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">  "Caching would probably help here."
+
+  "40,000 reads/sec against 300 writes/sec — 130:1. The read path IS the
+   problem, and at that ratio a 5-minute TTL is ~99% hit rate. Cache it."</code></pre>
+
+<p>The second one has already made three decisions and justified them. It also produced a number
+that can be wrong, which is the point: a claim you can check beats a claim you cannot.</p>
+
+<p>Estimation also catches the class of error that matters. Being out by a factor of three changes
+nothing &mdash; you would build the same system. Being out by a factor of a thousand means you are
+designing something else entirely, and the arithmetic is how you notice.</p>
+
+<h2>The numbers worth memorising</h2>
+
+<p>You need very few. These are the ones that come up constantly.</p>
+
+<h3>Powers of two, as data sizes</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">   2^10  =  1 thousand    1 KB
+   2^20  =  1 million     1 MB
+   2^30  =  1 billion     1 GB
+   2^40  =  1 trillion    1 TB
+   2^50  =                1 PB</code></pre>
+
+<p>And a few typical sizes, because you will be asked how big a record is:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   a char / ASCII byte        1 B
+   an integer, a timestamp    4-8 B
+   a UUID                     16 B binary, 36 B as text
+   a short URL row            ~500 B      (id, long url, owner, dates)
+   a tweet row                ~300 B      (280 chars + metadata)
+   a compressed photo         ~200 KB
+   a minute of 1080p video    ~50 MB</code></pre>
+
+<h3>Latency, ordered</h3>
+
+<p>The exact figures drift with hardware; the <em>ratios</em> do not, and the ratios are what the
+argument rests on.</p>
+
+<table>
+  <thead><tr><th>Operation</th><th>Roughly</th><th>Relative</th></tr></thead>
+  <tbody>
+    <tr><td>L1 cache reference</td><td>1 ns</td><td>1</td></tr>
+    <tr><td>Main memory reference</td><td>100 ns</td><td>100</td></tr>
+    <tr><td>Read 1 MB from memory</td><td>~10 &micro;s</td><td>10,000</td></tr>
+    <tr><td>SSD random read</td><td>~100 &micro;s</td><td>100,000</td></tr>
+    <tr><td>Read 1 MB from SSD</td><td>~200 &micro;s</td><td>200,000</td></tr>
+    <tr><td>Round trip within a datacenter</td><td>~500 &micro;s</td><td>500,000</td></tr>
+    <tr><td>Disk seek (spinning)</td><td>~10 ms</td><td>10,000,000</td></tr>
+    <tr><td>Round trip California &rarr; Netherlands</td><td>~150 ms</td><td>150,000,000</td></tr>
+  </tbody>
+</table>
+
+<p>Three conclusions fall straight out of that table, and they justify most of the caching and CDN
+decisions in this track:</p>
+
+<ul>
+  <li><strong>Memory is roughly a thousand times faster than SSD.</strong> That gap is the entire
+      argument for a cache.</li>
+  <li><strong>A datacenter round trip costs more than reading a megabyte from memory.</strong> So
+      the number of calls usually matters more than the size of each one &mdash; which is why N+1
+      queries are so damaging and why batching helps so much.</li>
+  <li><strong>Crossing an ocean costs 150ms and physics is not negotiable.</strong> No amount of
+      server tuning fixes it. Only moving the data closer does, which is what a CDN is.</li>
+</ul>
+
+<h3>Time, so per-day converts to per-second</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1 day   = 86,400 seconds   ≈ 100,000    <- use 100k, always
+   1 month = ~2.6 million seconds
+   1 year  = ~31.5 million seconds</code></pre>
+
+<p>Rounding 86,400 to 100,000 is the single most useful shortcut in estimation. Dividing by 100,000
+is moving a decimal point, and the 16% error it introduces is far below the noise in every other
+number you are using.</p>
+
+<h3>QPS, and the trap in the word</h3>
+
+<p>&ldquo;Queries per second&rdquo; gets used for three different things and the difference
+matters.</p>
+
+<p><strong>Requests per second</strong> is what arrives at your load balancer. <strong>Queries per
+second</strong> is what arrives at your database &mdash; and one request is rarely one query. A
+listing page that loads the property, its images, its amenities and its host is four queries, so
+100 requests a second is 400 queries a second unless something joins or caches them.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   300 page views/sec
+      x 4 queries each (property, images, amenities, host)
+      = 1,200 queries/sec        <- what the database actually sees
+
+   with a cache at 90% hit rate
+      = 120 queries/sec          <- what it sees after
+</code></pre>
+
+<p>That multiplier is where N+1 query bugs turn into outages: a page that issues one query per
+result in a list of fifty is not 4x, it is 50x, and it looks completely fine in development against
+twelve rows. Working out the fan-out explicitly is worth the ten seconds.</p>
+
+<p><strong>Transactions per second</strong> is the third, and it is the one that has a hard
+ceiling, because a write transaction has to be durably committed to disk. A single Postgres
+instance manages thousands of small write transactions a second, not hundreds of thousands.</p>
+
+<h2>The five-step recipe</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1.  users        daily active users
+   2.  x actions    per user, per day        -> writes/day
+   3.  / 100k       seconds in a day         -> writes/sec
+   4.  x ratio      read:write               -> reads/sec
+   5.  x size       bytes per record         -> storage/day, /year
+                    x QPS                    -> bandwidth</code></pre>
+
+<p>Then one more, which people forget: <strong>peak</strong>. Traffic is not flat. A rule of thumb
+is peak is two to three times average, so multiply and design for that. A system sized for its
+average falls over every evening.</p>
+
+<h2>Worked: a URL shortener</h2>
+
+<p>State the assumptions out loud. Anyone can disagree with an assumption; nobody can disagree with
+a number you refuse to give.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME
+   100M new URLs per day
+   10:1 reads to writes
+   ~500 bytes per row
+   links kept 5 years
+
+WRITES
+   100M / 100k          = 1,000 writes/sec
+   peak x3              = 3,000 writes/sec
+
+READS
+   1,000 x 10           = 10,000 reads/sec
+   peak x3              = 30,000 reads/sec
+
+STORAGE
+   100M x 500 B         = 50 GB/day
+   x 365 x 5            = ~91 TB over 5 years
+
+BANDWIDTH
+   write 50 GB/day / 100k s   = ~0.5 MB/s in
+   read  10k/s x 500 B        = ~5 MB/s out</code></pre>
+
+<p>Now read what those numbers actually said.</p>
+
+<p><strong>3,000 writes a second is fine.</strong> One well-indexed Postgres instance does that
+without complaint. No sharding, no queue in front of it, nothing exotic. Say so &mdash; declining to
+over-engineer is a positive signal.</p>
+
+<p><strong>30,000 reads a second is not fine</strong> for the same instance &mdash; but redirects
+are the most cacheable thing imaginable. They are immutable lookups by key. A cache absorbs
+essentially all of it and the database sees the misses only.</p>
+
+<p><strong>91 TB is the interesting number.</strong> It is too much for one machine, so something
+must give: expire old links, tier cold data to object storage, or shard. That is a design
+conversation the arithmetic just handed you, and you would not have found it by drawing boxes.</p>
+
+<p><strong>5 MB/s is nothing.</strong> Bandwidth is not a constraint here. Saying that explicitly
+shows you checked rather than assumed.</p>
+
+<h3>Where those numbers came from</h3>
+
+<p>Two of the four assumptions above are worth defending, because &ldquo;100 million a day&rdquo;
+sounds like it was invented and largely was.</p>
+
+<p>The <strong>row size</strong> is not a guess, though &mdash; you can add it up. A shortener row
+holds a short code, the original URL, an owner, a creation timestamp and an expiry:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE urls (
+    short_code  VARCHAR(7)   PRIMARY KEY,   --   7 B
+    long_url    VARCHAR(2048) NOT NULL,     -- ~100 B typical, 2 KB worst case
+    user_id     BIGINT,                     --   8 B
+    created_at  TIMESTAMPTZ NOT NULL,       --   8 B
+    expires_at  TIMESTAMPTZ                 --   8 B
+);                                          -- ~130 B + row overhead + index</code></pre>
+
+<p>That is closer to 130 bytes than 500. Rounding up to 500 covers Postgres&rsquo;s per-row
+overhead, the primary key index, and the occasional enormous URL &mdash; and rounding
+<em>up</em> on storage is the right direction to be wrong in. Say that out loud too: &ldquo;call it
+500 bytes with indexes and overhead&rdquo; is a much stronger line than an unexplained 500.</p>
+
+<p>The <strong>volume</strong>, by contrast, is genuinely arbitrary, and the correct move is to
+label it as such. &ldquo;I&rsquo;ll assume 100 million a day &mdash; tell me if you had a different
+scale in mind&rdquo; takes three seconds and either gets you the real number or an agreement to
+proceed. Both outcomes are better than a silent guess.</p>
+
+<h2>Sizing the cache</h2>
+
+<p>&ldquo;Add a cache&rdquo; is not a design until you say how big. The usual starting point is the
+80/20 rule &mdash; 20% of the keys serve 80% of the traffic &mdash; and for URL shorteners the
+skew is far more extreme than that.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   daily reads          10k/s x 86,400   ≈ 864M reads/day
+   distinct URLs hit    assume 20% of the day's 100M    = 20M
+   x 500 bytes                                          = 10 GB
+
+   10 GB fits in memory on one machine, comfortably.</code></pre>
+
+<p>Ten gigabytes is an ordinary Redis instance. If the arithmetic had produced ten terabytes, the
+answer would be different &mdash; a distributed cache, or caching only the hot tail &mdash; and
+again, the number is what tells you which conversation to have.</p>
+
+<h2>Worked: a booking system</h2>
+
+<p>The second example is deliberately smaller, because most systems are, and because the interesting
+result is the opposite one.</p>
+
+<p>StayHub&rsquo;s development database holds 12 listings and 4 users, which is a seed fixture
+rather than a business. So scale it to something plausible: a regional booking site with 2 million
+listings and 500,000 daily active users.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME
+   500k daily active users
+   each views ~20 listings, searches ~5 times
+   1 in 50 visits ends in a booking
+   listing row + images metadata ~2 KB
+
+READS
+   500k x 20 / 100k     = 100 listing views/sec
+   500k x 5  / 100k     =  25 searches/sec
+   peak x3              = 300 views/sec, 75 searches/sec
+
+WRITES
+   500k / 50 = 10k bookings/day / 100k  = 0.1 bookings/sec
+   peak x3                              = 0.3 bookings/sec
+
+STORAGE
+   2M listings x 2 KB   = 4 GB          (all of it fits in memory)
+   10k bookings/day x 1 KB x 365        = ~3.6 GB/year</code></pre>
+
+<p>Now the conclusions, and they are almost the reverse of the shortener&rsquo;s.</p>
+
+<p><strong>Bookings are 0.3 per second at peak.</strong> That is not a scale problem in any sense.
+Nothing about the write path needs sharding, queuing or partitioning &mdash; and yet the booking
+path is where all the engineering goes, because <em>correctness</em> is the problem, not
+throughput. Two people booking the same room at the same instant is a disaster at 0.3 writes a
+second exactly as much as at 3,000.</p>
+
+<p>This is the most useful thing estimation does, and it gets underrated: <strong>it tells you when
+the hard part is not scale.</strong> A candidate who computes 0.3 writes a second and then spends
+fifteen minutes sharding the bookings table has been given the answer and not read it.</p>
+
+<p><strong>Search at 75/sec against 2 million listings</strong> is the read problem, and it is not
+one SQL can do well &mdash; text matching plus a dozen optional filters. That is what justifies a
+search index, and the arithmetic is what justifies it rather than habit.</p>
+
+<p><strong>4 GB of listings fits in memory.</strong> The entire catalog can be cached. That is a
+genuinely different design from one where it cannot, and you only know which you are in by
+multiplying.</p>
+
+<h2>How many servers?</h2>
+
+<p>The question that follows every QPS figure, and the one people guess at. It is a division, and
+the only hard part is the number you divide by.</p>
+
+<p>A single application server handles somewhere between a few hundred and a few thousand requests
+per second, and where in that range depends almost entirely on what a request does:</p>
+
+<table>
+  <thead><tr><th>Request does</th><th>Roughly per server</th></tr></thead>
+  <tbody>
+    <tr><td>Serves from memory, no I/O</td><td>5,000&ndash;20,000/sec</td></tr>
+    <tr><td>One cached read</td><td>2,000&ndash;5,000/sec</td></tr>
+    <tr><td>One or two indexed database queries</td><td>500&ndash;2,000/sec</td></tr>
+    <tr><td>Several queries, or a call to another service</td><td>100&ndash;500/sec</td></tr>
+    <tr><td>Anything CPU-bound &mdash; image work, PDF, crypto</td><td>10&ndash;100/sec</td></tr>
+  </tbody>
+</table>
+
+<p>So for the shortener&rsquo;s peak of 30,000 reads a second, where a read is one cache hit:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   30,000 / 3,000 per server   = 10 servers
+   + headroom to lose some     = 13-15
+   spread across 3 zones       = 5 per zone</code></pre>
+
+<p>The headroom is the part worth saying out loud. Running exactly ten means losing one puts the
+other nine over capacity, and they then fall over in sequence &mdash; which is how a single instance
+failure becomes a total outage. Size for N+2, or for losing a whole availability zone, and say
+which you chose.</p>
+
+<h2>Storage is bigger than you calculated</h2>
+
+<p>Raw row size times row count is the beginning of the answer, not the end. Real storage carries
+several multipliers, and forgetting them is how a &ldquo;91 TB&rdquo; estimate becomes a 300 TB
+invoice.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   raw data                     91 TB
+   x indexes           +30%     118 TB     an index is a copy of its columns
+   x replication       x3       354 TB     three copies is the normal default
+   + backups           +1 copy  ~450 TB    and they are retained for weeks
+   + free headroom     +30%     ~580 TB    a full disk is an outage</code></pre>
+
+<p>The replication factor is the one that dominates, and it is not optional &mdash; a single copy
+of your data is not durable. Three is the usual answer, and it means the honest number is roughly
+<strong>five times</strong> the raw figure, not the raw figure.</p>
+
+<p>Nobody expects you to produce all five lines. Saying &ldquo;call it 91 TB raw, so realistically
+three to five times that with replication and indexes&rdquo; is exactly the right amount of
+detail.</p>
+
+<h2>Worked: a chat system</h2>
+
+<p>One more, because it produces a different bottleneck again &mdash; and one that is not a
+database at all.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME
+   50M daily active users
+   each sends 40 messages/day
+   messages are ~100 bytes of text
+   users are connected ~5 hours/day
+
+MESSAGES
+   50M x 40             = 2B messages/day
+   2B / 100k            = 20,000 messages/sec
+   peak x3              = 60,000 messages/sec
+
+STORAGE
+   2B x 100 B           = 200 GB/day
+   x 365                = 73 TB/year   (x3 replication -> ~220 TB)
+
+CONNECTIONS  <- the number that actually matters
+   50M x (5/24)         = ~10M concurrent connections
+   at ~10k per server   = 1,000 connection servers</code></pre>
+
+<p>The message rate is high but not remarkable &mdash; 60,000 writes a second is a sharding problem
+with a well-understood answer. The number that shapes this design is <strong>ten million
+concurrent connections</strong>.</p>
+
+<p>Chat cannot be request/response, because the server has to push. So every online user holds an
+open WebSocket, each one consuming a file descriptor and a few kilobytes of kernel memory, and a
+tuned server handles perhaps ten thousand of them. A thousand machines exist purely to hold
+connections open, doing almost nothing.</p>
+
+<p>That is why chat designs have a component no other system has: a registry mapping user &rarr;
+which connection server currently holds them, so a message from a user on server 400 can reach a
+user on server 812. The estimate is what makes that component obviously necessary rather than a
+detail someone remembered.</p>
+
+<h2>When a number tells you the design is wrong</h2>
+
+<p>Certain results should stop you.</p>
+
+<table>
+  <thead><tr><th>If you compute&hellip;</th><th>It probably means&hellip;</th></tr></thead>
+  <tbody>
+    <tr><td>&gt; 10k writes/sec to one table</td><td>One primary will not do it &mdash; partition, shard, or batch</td></tr>
+    <tr><td>&gt; 100k reads/sec</td><td>The design is a caching design; everything else is secondary</td></tr>
+    <tr><td>Petabytes within a year</td><td>Object storage and tiering, not a database</td></tr>
+    <tr><td>&gt; 10 Gbps egress</td><td>A CDN is mandatory, not an optimisation</td></tr>
+    <tr><td>A cache larger than a big machine&rsquo;s RAM</td><td>Distributed cache, or cache less</td></tr>
+    <tr><td>Under 100 requests/sec</td><td>One server and a database. Say so and move on.</td></tr>
+  </tbody>
+</table>
+
+<p>That last row is the one people are least comfortable saying and it is often the correct answer.</p>
+
+<h2>Ratios worth carrying in your head</h2>
+
+<p>Most estimates begin with a guess at a ratio, and being roughly right about these saves the
+whole exercise from being arbitrary.</p>
+
+<table>
+  <thead><tr><th>System</th><th>Read:write</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Social feed</td><td>100:1</td><td>Everyone reads constantly, few post</td></tr>
+    <tr><td>URL shortener</td><td>10:1 to 100:1</td><td>One create, many redirects</td></tr>
+    <tr><td>E-commerce</td><td>50:1</td><td>Long browsing, rare purchase</td></tr>
+    <tr><td>Booking site</td><td>200:1</td><td>Heavy comparison, one booking</td></tr>
+    <tr><td>Chat</td><td>~1:1</td><td>Every message written is read once or twice</td></tr>
+    <tr><td>Analytics ingestion</td><td>1:100 (write-heavy)</td><td>Everything is written, little is queried</td></tr>
+  </tbody>
+</table>
+
+<p>The two extremes at the bottom are the useful ones. Chat and analytics are the systems where
+&ldquo;add a cache and read replicas&rdquo; is not the answer, because the load is not reads &mdash;
+and recognising that early saves you from designing the wrong system politely.</p>
+
+<p>Two more conversion rates that come up whenever a funnel is involved: roughly 10% of registered
+users are active on a given day, and roughly 1&ndash;3% of visits to a commerce or booking site end
+in a transaction. Both are order-of-magnitude figures, and both are worth stating as assumptions so
+they can be corrected.</p>
+
+<h2>What to do when you have no idea</h2>
+
+<p>Sometimes you genuinely cannot guess the top-line number &mdash; how many people use a service
+you have never seen. Work from something you can anchor to instead.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   world population              ~8 billion
+   internet users                ~5 billion
+   a very large social network   ~2 billion MAU,  ~500M DAU
+   a large national service      ~50M users
+   a successful startup          ~1M users
+   a B2B product                 ~10k accounts</code></pre>
+
+<p>Then place the thing you are designing between two of those and say why. &ldquo;This is a
+national booking service, so somewhere below a large social network and well above a startup
+&mdash; call it 20 million monthly, 2 million daily&rdquo; is a defensible number, arrived at in
+ten seconds, and everyone in the room now agrees what is being designed.</p>
+
+<p>The alternative &mdash; refusing to pick because you are not sure &mdash; leaves the rest of the
+hour with nothing to stand on.</p>
+
+<h2>How to do it out loud</h2>
+
+<p>The arithmetic is the easy half. Presenting it is where it goes wrong.</p>
+
+<ul>
+  <li><strong>Say the assumption before the number.</strong> &ldquo;Let&rsquo;s assume 100 million
+      a day&rdquo; invites a correction, which is useful. A number with no assumption attached
+      cannot be corrected, only doubted.</li>
+  <li><strong>Round hard, and say you are.</strong> 86,400 becomes 100,000. 1.7 becomes 2. Nobody
+      wants to watch long division.</li>
+  <li><strong>Keep the units visible.</strong> Writing <code>100M/day &divide; 100k s/day = 1k/s</code>
+      makes an error obvious. Most estimation mistakes are unit slips, not arithmetic.</li>
+  <li><strong>Interpret every result.</strong> The number is not the deliverable; the sentence
+      after it is. &ldquo;91 TB, so this cannot live on one machine for five years&rdquo; is what
+      you are being paid for.</li>
+  <li><strong>Do not compute what you will not use.</strong> If bandwidth is obviously irrelevant,
+      say it is obviously irrelevant and skip it.</li>
+</ul>
+
+<h2>A worked sanity check</h2>
+
+<p>One last technique, and it is the one that catches genuine blunders: estimate the same quantity
+a second way and see whether the two agree.</p>
+
+<p>The shortener estimate said 91 TB over five years. Check it from the other end &mdash; how many
+rows is that, and is that a plausible number of URLs?</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   100M/day x 365 x 5   = 182 billion rows
+
+   A 7-character base62 code has 62^7 ≈ 3.5 trillion possibilities.
+   182 billion / 3.5 trillion = ~5% of the keyspace used.</code></pre>
+
+<p>Those two agree, and they also just answered a question you had not asked: <strong>seven
+characters is enough</strong>. At 5% occupancy, random code generation still collides rarely, so a
+generate-and-retry scheme terminates quickly. Six characters would be 56 billion possibilities
+against 182 billion rows &mdash; impossible &mdash; and the arithmetic says so in one line.</p>
+
+<p>That is the estimation step earning its keep twice: it sized the storage, and then it settled a
+design decision that would otherwise have been a preference.</p>
+
+<h2>The thing to actually remember</h2>
+
+<p>Three shortcuts carry most of the load, and they are worth having automatic:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   per day -> per second     divide by 100,000
+   peak                      multiply average by 3
+   memory vs disk            ~1000x — this is why caches exist</code></pre>
+
+<p>Everything else is one multiplication at a time, out loud, with the units written down.</p>
+
+<p>And one habit: after every number, say the sentence it implies. &ldquo;30,000 reads a second,
+<em>so the read path is the design</em>.&rdquo; &ldquo;0.3 writes a second, <em>so throughput is
+not the problem here &mdash; correctness is</em>.&rdquo; The arithmetic is a means; the sentence is
+the output.</p>
+
+<p>Next: <a href="/system-design/system-design-load-balancing">load balancing and the stateless
+tier</a>, which is what you build once the arithmetic says one server is not enough.</p>

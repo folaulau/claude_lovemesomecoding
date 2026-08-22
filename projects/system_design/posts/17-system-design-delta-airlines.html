@@ -1,0 +1,469 @@
+<p>Airline booking is the hardest inventory problem in this track, and it is worth doing last
+because it breaks the answers that worked in the previous two.</p>
+
+<p>A hotel night can be resold tomorrow. A seat on a flight that has departed is worth exactly zero,
+forever &mdash; which is why airlines deliberately sell more seats than they have, price the same
+seat at wildly different amounts, and run pricing engines that change those amounts several times a
+day. The engineering follows from that economics, not the other way round.</p>
+
+<p><strong>As with the Amazon post</strong>, this is design work rather than a running application:
+nobody operates a global distribution system on a laptop. Where a mechanism has already been shown
+working earlier in the track, it is linked rather than re-invented.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                           OUT OF SCOPE (say so)
+  search flights                     loyalty programmes
+  fares and seat availability        crew and aircraft scheduling
+  hold a seat during payment         cargo
+  book, pay, ticket                  check-in and boarding
+  seat selection                     the actual pricing science
+  cancel / change
+
+WORTH ASKING
+  one airline or an aggregator?    -> decides whether you OWN the inventory
+  connecting flights?              -> makes search a graph problem, not a lookup
+  overbooking allowed?             -> yes, and it is a business requirement
+  how long is a seat held?         -> minutes, and it is contractual
+
+NON-FUNCTIONAL
+  search: fast, may be stale        prices are quoted, then re-validated
+  booking: correct, never stale     selling seat 14A twice is a real incident
+  read:write ~ 1000:1               enormous browsing, few bookings
+  a ticket must NEVER be lost       it is a financial instrument</code></pre>
+
+<p>The read-to-write ratio is the largest in this track. People search flights obsessively and book
+rarely, which means the search path and the booking path are effectively two different systems with
+different requirements.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  a large carrier: ~5,000 flights/day · ~150 seats each
+        ~1M searches/day per 10k bookings
+
+SEATS     5,000 x 150            = 750k seats/day
+          x 330 days of schedule = ~250M seat-inventory records live at once
+
+SEARCHES  1M / 100k              = 10 searches/sec   peak x5 = 50/sec
+          BUT each search fans out:
+            "LHR -> LAX, flexible +/- 3 days, 1 stop allowed"
+            = hundreds of candidate itineraries priced per search
+
+BOOKINGS  10k/day / 100k         = 0.1/sec          peak x10 = 1/sec</code></pre>
+
+<p>One booking per second at peak. Once again &mdash; as with Airbnb and Amazon &mdash; the write
+volume is trivial and the write path is where all the difficulty is.</p>
+
+<p>The interesting number is the fan-out on the second block. A single user search is not one
+lookup; it is a search over combinations of flights, dates and fare classes, each of which must be
+priced. The work per search is hundreds of times the work per request, which is why flight search is
+famously expensive and why every airline caches aggressively.</p>
+
+<h2>Step 3 &mdash; Search is a graph problem</h2>
+
+<p>&ldquo;London to Los Angeles&rdquo; is not a row lookup. Direct flights are one answer; one-stop
+itineraries are a join of two flights whose times connect; two-stop is another level.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   LHR ──────────── direct ──────────────> LAX
+
+   LHR ──> JFK ──> LAX        valid if:  arrival + minimum connect time
+   LHR ──> AMS ──> LAX                     <= departure of the next leg
+   LHR ──> DUB ──> ORD ──> LAX           and total duration is reasonable
+                                          and the airports are the same terminal-ish
+
+   Airports x flights x dates x fare classes = a combinatorial explosion.</code></pre>
+
+<p>The mechanism that makes it tractable is the same one as everywhere else in this track:
+<strong>precompute the expensive part offline and look it up online.</strong></p>
+
+<p>Route <em>structures</em> &mdash; which sequences of flights physically connect, given minimum
+connection times &mdash; change only when the schedule changes, which is weekly. So they are
+computed in batch and stored. A search then becomes: look up candidate itineraries for this
+origin-destination pair, then price and filter them, rather than exploring a graph at request
+time.</p>
+
+<p>Pricing the survivors is still expensive, which is why results are cached per
+origin-destination-date and quoted as <em>indicative</em>. The price is re-validated before payment
+&mdash; and the fact that a quoted fare can vanish is a genuine product behaviour rather than a bug,
+which is unusual and worth saying out loud.</p>
+
+<h2>Step 4 &mdash; Inventory is not a seat count</h2>
+
+<p>This is the part that surprises people. An airline does not sell &ldquo;150 seats&rdquo;. It
+sells buckets, and the buckets are the pricing system.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   Flight DL123, 2026-11-04, 150 physical seats
+
+   fare class    seats     price     rules
+   ──────────────────────────────────────────────────────────────
+   J  business      12    $4,200     changeable, refundable
+   Y  full econ     10      $980     changeable
+   M  economy       25      $520     change fee
+   K  economy       40      $380     non-refundable
+   T  economy       48      $240     non-refundable, no bags
+   ──────────────────────────────────────────────────────────────
+                   135 sold as fare classes, 15 held back
+
+   Same physical cabin. Five different products.</code></pre>
+
+<p>Revenue management moves seats between buckets continuously as departure approaches &mdash;
+closing the cheap classes as the flight fills, reopening them if it does not. So &ldquo;is there a
+seat?&rdquo; is not a question about capacity, it is a question about whether a <em>bucket</em> has
+availability at a price.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE flight_inventory (
+    flight_id    BIGINT      NOT NULL,
+    departure    DATE        NOT NULL,
+    fare_class   CHAR(1)     NOT NULL,   -- J, Y, M, K, T ...
+    authorised   INTEGER     NOT NULL,   -- how many MAY be sold in this bucket
+    sold         INTEGER     NOT NULL,
+    held         INTEGER     NOT NULL,   -- in a checkout right now
+    PRIMARY KEY (flight_id, departure, fare_class)
+);
+-- available = authorised - sold - held</code></pre>
+
+<p>Note that <code>authorised</code> can exceed the physical seat count, across buckets and in
+total. That is not a bug; it is overbooking, and it is the next section.</p>
+
+<p>The primary key is worth a moment: the contended row is now one <em>fare class on one
+flight-date</em> rather than the flight as a whole, which distributes contention across five rows
+instead of one. That is the sharded-counter trick from the <a
+href="/system-design/system-design-amazon">Amazon post</a>, arriving naturally out of the domain
+model rather than being bolted on.</p>
+
+<h2>Step 5 &mdash; Overbooking is a requirement</h2>
+
+<p>Roughly 5&ndash;15% of passengers do not show up. A flight that departs with empty seats sold at
+zero is pure loss, and the seat cannot be sold later &mdash; the inventory is perishable in the
+strictest sense.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   150 physical seats
+   historical no-show rate for this route/day/season: 8%
+   -> authorise ~162 seats
+
+   most departures:  ~149 people board. Full flight, nothing wasted.
+   occasionally:     152 people board. 2 must be denied.
+                     -> voluntary compensation first, then involuntary
+                     -> the cost of that is BUDGETED, not an incident</code></pre>
+
+<p>Engineering-wise this changes one thing profoundly: <strong>the system is designed to sell more
+than it has, so &ldquo;prevent overselling&rdquo; is not the goal.</strong> The goal is to sell
+exactly the authorised number, where the authorised number is a forecast.</p>
+
+<p>That reframes the correctness requirement. Selling 163 when 162 were authorised is a bug &mdash;
+the count must be exact against the authorisation. Selling 162 against 150 physical seats is the
+system working as designed. Being able to state that distinction clearly is most of what this
+question is testing.</p>
+
+<h2>Step 6 &mdash; The seat hold</h2>
+
+<p>The concurrency problem, and it is the Airbnb hold at much worse contention: on a popular
+flight, dozens of people are in checkout for the same fare class simultaneously.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Take the hold atomically. The guard is IN the statement.
+UPDATE flight_inventory
+   SET held = held + 1
+ WHERE flight_id = 123 AND departure = '2026-11-04' AND fare_class = 'K'
+   AND authorised - sold - held &gt;= 1;
+-- 0 rows updated? That bucket is full. Offer the next fare class up.</code></pre>
+
+<p>Then the hold has to expire, because people abandon checkout constantly.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE seat_holds (
+    hold_id     UUID        PRIMARY KEY,
+    flight_id   BIGINT      NOT NULL,
+    departure   DATE        NOT NULL,
+    fare_class  CHAR(1)     NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,     -- typically 10-20 minutes
+    session_id  UUID        NOT NULL
+);
+CREATE INDEX ix_holds_expiry ON seat_holds (expires_at);</code></pre>
+
+<p>Two things about expiry are worth getting right.</p>
+
+<p><strong>Do not rely on a sweeper alone.</strong> A background job releasing expired holds is
+necessary, and it runs on an interval &mdash; so between a hold expiring and the sweep, the seat is
+invisible. Availability queries should therefore treat <code>expires_at &lt; now()</code> as already
+released, and let the sweeper do the bookkeeping afterwards. Correct immediately, tidy eventually.</p>
+
+<p><strong>The sweeper must run exactly once.</strong> Two instances releasing the same hold
+double-decrement the counter, and the fix is to make release conditional on the hold row still
+existing &mdash; delete-and-decrement in one transaction, so the delete is the guard. Same
+turn-a-delta-into-a-fact move as the <a href="/system-design/system-design-amazon">Amazon
+post</a>.</p>
+
+<h3>Specific seats are a second problem</h3>
+
+<p>Choosing 14A is separate from buying a fare-class seat, and it has its own uniqueness rule:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE seat_assignments (
+    flight_id   BIGINT  NOT NULL,
+    departure   DATE    NOT NULL,
+    seat        CHAR(4) NOT NULL,        -- '14A'
+    booking_id  BIGINT  NOT NULL,
+    PRIMARY KEY (flight_id, departure, seat)   -- the uniqueness IS the guard
+);</code></pre>
+
+<p>The composite primary key makes double-assignment impossible, which is the <a
+href="/system-design/system-design-concurrency-and-locking">constraint-not-coordination</a>
+principle again &mdash; and here it is the portable version, since a unique key needs no
+database-specific feature.</p>
+
+<p>Note that overbooking makes seat assignment genuinely fallible: if 162 tickets exist for 150
+seats, twelve of them cannot have an assignment. Airlines handle this by assigning at check-in
+rather than at booking for some fare classes, which is a product decision the schema has to
+allow.</p>
+
+<h3>How much contention, really</h3>
+
+<p>Worth a moment of arithmetic, because &ldquo;one booking per second&rdquo; sounds harmless and
+the contention profile is not.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   average:  1 booking/sec spread over ~5,000 flight-dates
+             -> collisions essentially never
+
+   a sale on one popular route:
+             500 people in checkout for ONE flight-date
+             competing for ~40 seats in fare class K
+             -> every single request contends on ONE row</code></pre>
+
+<p>This is the point the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post</a> makes about
+contention being concentration rather than volume, in its most extreme form in this track. The
+system-wide write rate is negligible; the per-row write rate during a sale is brutal.</p>
+
+<p>Which is why the fare-class key matters so much. Splitting inventory into five buckets divides
+contention five ways for free, and if that is not enough, the same trick extends &mdash; partition
+a bucket into sub-counters and sum them for display, at the cost of a bucket appearing empty while
+another has seats.</p>
+
+<h2>Step 7 &mdash; Booking, PNR and ticketing</h2>
+
+<p>Three distinct things that people conflate, and the distinction is the domain model.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   PNR       the reservation record — who, what flights, contact details
+             a 6-character code: "X7K2QP"
+             exists as soon as you book, before any money moves
+
+   TICKET    the financial document — proof of payment, per passenger
+             a 13-digit number
+             issued AFTER payment settles
+
+   COUPON    one flight leg on a ticket
+             consumed at boarding; the unit that gets refunded or reissued</code></pre>
+
+<p>A booking without a ticket is a reservation that will be cancelled if not paid. A ticket is a
+financial instrument with its own lifecycle: it can be exchanged, refunded, reissued or voided, and
+each of those is an accounting event.</p>
+
+<p>The engineering consequence: <strong>ticket issuance must be exactly-once in its effects</strong>,
+because a duplicate ticket is a duplicate charge. That is the idempotency-key pattern from the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post</a>, applied to the
+step that touches money.</p>
+
+<p>And the whole flow is a <a
+href="/system-design/system-design-consistency-and-availability">saga</a>, because it spans
+inventory, payment and a ticketing system:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1 hold seats            compensate: release the hold
+   2 create PNR            compensate: cancel the PNR
+   3 authorise payment     compensate: void the authorisation
+   4 issue ticket          compensate: void the ticket (a real operation)
+   5 capture payment       compensate: refund
+
+   Fail at step 4 -> void nothing yet, release the hold, cancel the PNR.
+   Fail at step 5 -> the ticket exists and is unpaid: void it, alert a human.</code></pre>
+
+<h2>Step 8 &mdash; Changes and cancellations</h2>
+
+<p>Airbnb&rsquo;s cancellation rule was one cutoff date. Here it is a matrix, and the matrix is
+attached to the fare rather than to the booking.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   fare class   change            cancel                 no-show
+   ─────────────────────────────────────────────────────────────────
+   J business   free              full refund            refundable
+   Y full econ  free              full refund            refundable
+   M economy    $75 + fare diff   refund minus $200      forfeit
+   K economy    $150 + fare diff  credit only, expires   forfeit
+   T basic      NOT PERMITTED     no refund              forfeit</code></pre>
+
+<p>Two engineering points fall out of that table.</p>
+
+<p><strong>&ldquo;Fare difference&rdquo; means a change is a re-pricing, not an edit.</strong>
+Moving to another flight requires checking availability in the new fare class, computing the
+difference against today&rsquo;s prices, collecting or refunding it, and reissuing the ticket
+&mdash; which is another saga touching inventory, payment and ticketing. Modelling a change as an
+update to a row is the mistake; it is a cancellation and a rebooking, recorded as such.</p>
+
+<p><strong>The rules must live in one place</strong>, exactly as in the <a
+href="/system-design/system-design-airbnb">Airbnb post</a>, because at least three surfaces need
+them: the UI deciding whether to show a Change button, the API enforcing the rule, and the
+accounting system computing the refund. Three implementations means three answers.</p>
+
+<p>And there is a genuine domain subtlety worth mentioning: releasing a cancelled seat back to
+inventory is not simply a decrement. Revenue management may want it back in a different fare class
+than it was sold from &mdash; a seat sold cheap six months ago and cancelled the week before
+departure should return to an expensive bucket, not a cheap one.</p>
+
+<h2>Step 9 &mdash; Talking to systems older than the web</h2>
+
+<p>An aggregator does not own the inventory. It asks a global distribution system, and those
+predate almost everything in this track.</p>
+
+<ul>
+  <li><strong>They are slow and rate-limited.</strong> Availability lookups take hundreds of
+      milliseconds and you are billed per query, which means aggressive caching is not an
+      optimisation but a commercial necessity.</li>
+  <li><strong>Their data is authoritative and yours is a copy.</strong> Every cached price is
+      provisional and must be re-validated before payment.</li>
+  <li><strong>They fail in ways your code must survive.</strong> Timeouts, partial responses, and
+      occasionally a booking that succeeded upstream while the response was lost &mdash; which is
+      exactly the two generals problem, so every call needs an idempotency key and a
+      reconciliation path.</li>
+</ul>
+
+<p>The architectural answer is the standard one: an adapter per provider behind one interface,
+circuit breakers, and per-provider rate limiting so a slow partner cannot consume your workers.
+&ldquo;A slow dependency with no timeout occupies every worker&rdquo; is the failure from the <a
+href="/system-design/system-design-load-balancing">load balancing post</a>, and it is at its most
+likely here.</p>
+
+<h2>Step 10 &mdash; When a storm cancels four hundred flights</h2>
+
+<p>Irregular operations are the airline-specific problem, and they are what makes the whole system
+harder than a booking site.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   one storm -> 400 cancellations -> ~60,000 passengers to rebook
+                                     each on a network already near capacity
+
+   AND simultaneously:
+     - every one of them opens the app at once      (traffic spike)
+     - each rebooking consumes scarce inventory     (contention spike)
+     - downstream connections cascade               (one delay -> many)</code></pre>
+
+<p>The design implications are worth naming because they are unusual:</p>
+
+<p><strong>Rebooking must be automated and prioritised</strong>, because sixty thousand manual
+rebookings is not a thing that can happen. Priority is a business rule &mdash; status, fare class,
+onward connections &mdash; and it belongs in one place, like the cancellation policy in the <a
+href="/system-design/system-design-airbnb">Airbnb post</a>.</p>
+
+<p><strong>The spike is in contention, not just traffic.</strong> Sixty thousand people competing
+for a few thousand seats is the worst possible concurrency profile, and it is exactly when the
+inventory counters must not be wrong. Queueing rebookings per flight &mdash; one writer per
+contended row &mdash; is more robust here than optimistic retries, which would mostly fail.</p>
+
+<p><strong>Degrade deliberately.</strong> Seat selection, upgrades and ancillary sales can all be
+disabled to protect the rebooking path. Same principle as the Amazon post: rank features by whether
+they matter, and shed in reverse order.</p>
+
+<h2>Failure modes</h2>
+
+<table>
+  <thead><tr><th>What fails</th><th>Effect</th><th>Degradation</th></tr></thead>
+  <tbody>
+    <tr><td>Search cache</td><td>Every search hits pricing and the GDS</td>
+        <td>The most expensive failure here, because those calls are billed and rate-limited.
+            Shed load and serve stale results rather than passing the traffic through.</td></tr>
+    <tr><td>A GDS partner</td><td>That airline&rsquo;s flights disappear from results</td>
+        <td>Circuit-break it and show the rest. Partial results beat an error page.</td></tr>
+    <tr><td>Inventory service</td><td>No holds, no bookings</td>
+        <td>No safe degradation &mdash; unlike retail, you cannot optimistically accept and
+            reconcile, because a seat cannot be manufactured. Refuse cleanly.</td></tr>
+    <tr><td>Payment</td><td>PNRs created, unticketed</td>
+        <td>They expire naturally by the ticketing deadline, releasing the seats. The domain
+            already has this concept, which is convenient.</td></tr>
+    <tr><td>Ticketing</td><td>Payment captured, no ticket</td>
+        <td>The one that must never be silent. Alert immediately; a human resolves it. Money
+            without a corresponding document is an accounting incident.</td></tr>
+  </tbody>
+</table>
+
+<p>The third row is the sharpest contrast with the <a
+href="/system-design/system-design-amazon">Amazon post</a>. Retail can accept an order it may not
+be able to fulfil, because stock can be replenished and the customer can wait. An airline cannot:
+the seat either exists on that aircraft or it does not, and there is no equivalent of a backorder.
+So the same architectural question &mdash; what do we do when inventory is unavailable? &mdash; gets
+opposite answers in two systems that look superficially alike.</p>
+
+<h2>The whole thing</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   SEARCH (50/s, huge fan-out)          BOOK (1/s, high contention)
+
+   GET /search                          POST /bookings
+       │                                    │
+       v                                    │ saga:
+   [ cache: O-D-date ]                      ├─> hold seats (conditional UPDATE)
+       │ miss                               ├─> create PNR
+       v                                    ├─> authorise payment
+   [ itinerary builder ]                    ├─> issue ticket (idempotent)
+       │  precomputed route graph           └─> capture payment
+       v                                        │
+   [ pricing / fare rules ]                     v
+       │                                  [ inventory ]  keyed by
+       └──> [ GDS adapters ]               (flight, date, fare_class)
+            circuit-broken,                     │
+            rate-limited                        └──> [ ticketing / accounting ]
+
+   background: revenue management moves seats between buckets
+               sweeper releases expired holds
+               irregular-ops rebooking queue, one writer per flight</code></pre>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;How do you prevent selling the same seat twice?&rdquo;</strong> &mdash; a
+      conditional update against the fare-class bucket for inventory, and a composite primary key
+      for specific seat assignments. Then say that overbooking means the goal is not zero
+      oversell.</li>
+  <li><strong>&ldquo;Why not just count seats?&rdquo;</strong> &mdash; because fare classes are the
+      product. Availability is per bucket, and the buckets move.</li>
+  <li><strong>&ldquo;How do you hold a seat during payment?&rdquo;</strong> &mdash; a held counter
+      plus an expiring hold row; treat expired holds as released at read time and let the sweeper
+      tidy up.</li>
+  <li><strong>&ldquo;Search is too slow.&rdquo;</strong> &mdash; precompute route structures
+      offline, cache by origin-destination-date, and accept that quoted prices are indicative and
+      re-validated.</li>
+  <li><strong>&ldquo;The payment succeeds but ticketing fails.&rdquo;</strong> &mdash; a saga with
+      compensations; void the ticket, and never leave money captured against nothing.</li>
+  <li><strong>&ldquo;How do you scale it?&rdquo;</strong> &mdash; shard inventory by flight and
+      date, which co-locates every row a booking must compare. Search scales independently and is
+      almost entirely cache.</li>
+  <li><strong>&ldquo;A storm cancels 400 flights.&rdquo;</strong> &mdash; automated prioritised
+      rebooking through a per-flight queue, plus deliberate degradation of everything that is not
+      rebooking.</li>
+</ul>
+
+<h2>What the three case studies have in common</h2>
+
+<p>Worth ending the case studies by putting them side by side, because the same question gets three
+different correct answers.</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Airbnb</th><th>Amazon</th><th>Airline</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>The unit</td><td>A date range</td><td>A count</td><td>A count, per fare bucket</td></tr>
+    <tr><td>Guard</td><td>Exclusion constraint</td><td>Conditional update</td><td>Conditional update</td></tr>
+    <tr><td>Perishable?</td><td>No &mdash; resell tomorrow</td><td>No &mdash; restock</td><td><strong>Yes, absolutely</strong></td></tr>
+    <tr><td>Oversell?</td><td>Never</td><td>Deliberately, sometimes</td><td>Deliberately, always</td></tr>
+    <tr><td>If inventory is down</td><td>Refuse</td><td>Accept and reconcile</td><td>Refuse</td></tr>
+    <tr><td>Peak multiplier</td><td>x3</td><td>x10 (Black Friday)</td><td>x10+ (disruption)</td></tr>
+    <tr><td>Write rate at peak</td><td>0.3/sec</td><td>200/sec</td><td>1/sec</td></tr>
+  </tbody>
+</table>
+
+<p>Every one of those write rates is trivial, and every one of these systems is hard. That is the
+single most transferable observation in the three posts: <strong>in transactional systems, the
+difficulty is almost never throughput.</strong> It is correctness under concurrency, and what
+happens when a dependency you do not control is unavailable.</p>
+
+<p>The perishability row is what makes this one different. It is why airlines oversell, why they
+price the same seat five ways, and why a storm is an engineering problem rather than only an
+operational one &mdash; an unsold seat on a departed flight is the one loss the system can never
+recover.</p>
+
+<p>Next, and last: <a href="/system-design/system-design-interview-questions">the interview
+questions</a> &mdash; everything in this track, condensed into answers short enough to say out
+loud.</p>

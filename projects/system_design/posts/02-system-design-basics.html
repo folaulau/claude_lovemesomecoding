@@ -1,0 +1,456 @@
+<p>Every system design diagram is drawn from the same small parts list. There are about a dozen
+boxes, they mean the same thing every time, and once you know what each one is for &mdash; and,
+more usefully, what problem forces it to appear &mdash; most diagrams stop being intimidating.</p>
+
+<p>This post builds the whole picture from one server. Each box arrives because something specific
+broke, because a part added for no reason is a part you cannot defend when asked.</p>
+
+<h2>Stage 0 &mdash; one box</h2>
+
+<p>Everything starts here, and this is a real architecture, not a strawman. A single virtual
+machine running your application and its database serves a surprising amount of traffic.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   browser ──HTTP──> [ server + database ]
+                          one machine</code></pre>
+
+<p>What actually happens when someone types your domain: the browser asks <strong>DNS</strong> for
+an IP address, opens a TCP connection to it, negotiates TLS, and sends an HTTP request. DNS is the
+only piece of internet infrastructure in every design, and it is worth remembering that its answers
+are cached for as long as the TTL says &mdash; which is why a DNS change &ldquo;does not take
+effect&rdquo; for minutes or hours after you make it.</p>
+
+<p>This stage fails in three ways, and they arrive in a predictable order: the machine dies and
+everything is gone; the application and the database start competing for the same CPU and memory;
+and there is nowhere to put a second server even if you wanted one.</p>
+
+<h2>Stage 1 &mdash; split the database out</h2>
+
+<p>The first thing to separate is the application from its data, because the two scale differently
+and one of them is much harder to replace.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   browser ──> [ app server ] ──> [ database ]</code></pre>
+
+<p>An application server is mostly CPU: it parses requests, runs logic, serialises JSON. A database
+is mostly memory and disk, and it cares enormously about being interrupted. Sharing a box means a
+traffic spike starves the database of the memory its cache was using, and the whole system falls
+over in a way that looks like a database problem but is not.</p>
+
+<p>The split also buys the thing everything else depends on: you can now run more than one
+application server.</p>
+
+<h3>Choosing the database</h3>
+
+<p>The first genuine fork in the road. It is asked in every interview and the answer is more boring
+than the debate suggests.</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Relational (Postgres, MySQL)</th><th>Non-relational (Mongo, Cassandra, DynamoDB)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Shape</td><td>Tables, a fixed schema, foreign keys</td><td>Documents or wide rows, schema per record</td></tr>
+    <tr><td>Joins</td><td>Yes, and they are fast</td><td>No &mdash; you denormalise instead</td></tr>
+    <tr><td>Transactions</td><td>ACID across many rows and tables</td><td>Usually per-document only</td></tr>
+    <tr><td>Scaling out</td><td>Hard; sharding is manual work</td><td>Designed for it</td></tr>
+    <tr><td>Best when</td><td>The data has relationships and correctness matters</td><td>Huge volume, simple access patterns, low latency</td></tr>
+  </tbody>
+</table>
+
+<p>The useful heuristic: <strong>start relational unless you can name the specific reason not
+to.</strong> Money, bookings, orders and inventory all involve invariants across several rows, and
+a transaction is the cheapest way to enforce one. StayHub&rsquo;s entire booking correctness rests
+on a Postgres constraint; there is no application-level equivalent that works.</p>
+
+<p>Reach for non-relational when the access pattern is genuinely one key at a time at enormous
+volume &mdash; a session store, event logs, a feed cache, telemetry.</p>
+
+<h2>Stage 2 &mdash; more than one app server</h2>
+
+<p>One server is a single point of failure and a hard ceiling. The fix is several, with something
+in front deciding where each request goes.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                          ┌──> [ app 1 ]
+   browser ──> [ LB ] ────┼──> [ app 2 ] ────> [ database ]
+                          └──> [ app 3 ]
+                    health checks: is each one still answering?</code></pre>
+
+<p>A <strong>load balancer</strong> spreads requests across the pool and stops sending traffic to
+instances that fail their health check. That second job is the more important one: without it,
+losing a server means a third of requests fail instead of none.</p>
+
+<p>This only works if the application is <strong>stateless</strong> &mdash; if any server can
+handle any request. The moment a server keeps something in memory that a request needs (a session,
+an upload in progress, a cached user object), requests are no longer interchangeable and you are
+back to one server wearing a costume.</p>
+
+<p>StayHub is stateless because authentication is a signed token rather than a server-side session.
+Any instance can verify it with the shared secret and nothing is stored between requests:</p>
+
+<pre class="language-python"><code class="language-python">def create_access_token(user: User) -> str:
+    now = datetime.now(UTC)
+    expires = now + timedelta(minutes=settings.access_token_expire_minutes)
+
+    claims = {
+        "sub": str(user.public_id),
+        "email": user.email,
+        "role": user.role.value,
+        "iat": int(now.timestamp()),
+        "exp": int(expires.timestamp()),</code></pre>
+
+<p>The cost is real and worth stating: a token cannot be revoked before it expires, because nothing
+is looked up. StayHub accepts that by re-reading the user row on every request &mdash; the token
+proves <em>who</em>, the database says what they currently are. Load balancing gets a <a
+href="/system-design/system-design-load-balancing">post of its own</a>.</p>
+
+<h3>Two ways to get bigger</h3>
+
+<p>Worth naming explicitly, because the choice recurs at every stage.</p>
+
+<p><strong>Vertical scaling</strong> is a bigger machine &mdash; more cores, more memory. It is
+enormously underrated: it requires no code changes, no distributed anything, and modern hardware
+goes a very long way. A database server with 128 cores and a terabyte of RAM handles more than most
+companies will ever need.</p>
+
+<p><strong>Horizontal scaling</strong> is more machines. It has no ceiling and it is how you get
+redundancy, but it demands that the work be divisible &mdash; which for application servers means
+statelessness, and for databases means the much harder problem of sharding.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">  VERTICAL                          HORIZONTAL
+    [ 8 cpu ] -> [ 64 cpu ]           [ x ] -> [ x ][ x ][ x ][ x ]
+
+    no code changes                   needs the work to be divisible
+    hard ceiling                      no ceiling
+    still ONE machine to lose         survives losing one
+    seconds of downtime to resize     add capacity with none</code></pre>
+
+<p>The sensible order is vertical first for the database, horizontal first for the application
+tier. That is exactly what the stages below do, and reversing it &mdash; sharding a database that
+would fit comfortably on one larger box &mdash; is the single most expensive premature decision in
+this field.</p>
+
+<h2>Stage 3 &mdash; a cache</h2>
+
+<p>Now the app tier scales and the database is the bottleneck, which it always becomes, because it
+is the one part you cannot simply run more of.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   [ app ] ──1──> [ cache ]  hit? return it        ~0.3ms
+      │              ▲
+      └──2──> [ database ]  miss: read, then       ~8.8ms
+                            populate the cache</code></pre>
+
+<p>A cache is an in-memory key-value store &mdash; Redis or Memcached &mdash; holding the results
+of expensive reads. The pattern above is <strong>cache-aside</strong>: the reader checks the cache,
+falls back to the database on a miss, and stores what it found.</p>
+
+<p>On StayHub&rsquo;s listing page, that read goes from <strong>8.8ms to 0.3ms</strong> at the
+service layer and <strong>15.2ms to 2.0ms</strong> measured over HTTP. Those are real numbers from
+this application, not a rule of thumb; the <a
+href="/system-design/system-design-caching">caching post</a> shows how they were taken.</p>
+
+<p>The rule that matters more than the speedup: <strong>a cache must be optional.</strong> If the
+site goes down when Redis does, you have not added an optimisation, you have added a second
+database and made availability worse. StayHub&rsquo;s cache treats an outage as a permanent
+miss:</p>
+
+<pre class="language-python"><code class="language-python">def get_json(key: str) -> Any | None:
+    """Read a cached value. Returns None on a miss, on a failure, and on unreadable JSON."""
+    client = _client()
+    if client is None:
+        return None
+    try:
+        raw = client.get(key)
+    except Exception as exc:  # noqa: BLE001
+        _warn_once(exc)
+        return None</code></pre>
+
+<p>Every path returns &ldquo;not cached&rdquo; rather than raising, so a dead Redis makes the site
+slower and nothing else.</p>
+
+<h2>Stage 4 &mdash; read replicas</h2>
+
+<p>Caches help repeated reads. They do nothing for reads that are all different, and they do
+nothing for writes.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                 writes
+   [ app ] ─────────────> [ PRIMARY ]
+      │                        │  replication (asynchronous)
+      │                        ├──> [ replica 1 ]
+      └──── reads ─────────────┴──> [ replica 2 ]</code></pre>
+
+<p>The primary takes every write and streams its changes to replicas that serve reads. Since most
+systems read far more than they write &mdash; ten to one is ordinary, a hundred to one is common
+&mdash; this buys a lot.</p>
+
+<p>It also introduces <strong>replication lag</strong>, and that lag is a correctness problem
+rather than a performance one. A user updates their profile, the write goes to the primary, the
+next page load reads a replica that is 200 milliseconds behind, and their change has vanished. They
+will try again, and now you have a support ticket about a bug that does not reproduce.</p>
+
+<p>The usual fix is to route a user&rsquo;s reads to the primary for a short window after they
+write. It is not free, and knowing that this problem exists at all is most of what an interviewer
+is checking. <a href="/system-design/system-design-database-scaling">Scaling the database</a> goes
+through the full ladder.</p>
+
+<h2>Stage 5 &mdash; CDN and object storage</h2>
+
+<p>Images, video, CSS and JavaScript should never touch an application server. They are large, they
+never change, and serving them occupies a worker that could be answering a real request.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   browser ──> [ CDN edge ]  hit  ──> done, ~10ms, never reached you
+                    │ miss
+                    v
+              [ object store ]  S3 / GCS — cheap, durable, not a database</code></pre>
+
+<p>A <strong>CDN</strong> is a global network of caches sitting near users. An
+<strong>object store</strong> is where the files actually live: cheap per gigabyte, effectively
+unlimited, and deliberately not a filesystem &mdash; you cannot append to an object or seek within
+it, you replace it.</p>
+
+<p>The rule is that <strong>a database row holds the URL, never the bytes</strong>. Storing images
+as blobs bloats every backup, wrecks the caching the database does of its own pages, and makes
+replication crawl. This site is itself an example: it is a static build in an object store behind a
+CDN, and nothing is computed when you load this page.</p>
+
+<h2>Stage 6 &mdash; a queue</h2>
+
+<p>Some work does not belong in the request. Sending an email, generating a thumbnail, rebuilding a
+search index &mdash; the user does not need to wait, and if the provider is slow they should not
+have to.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   request ──> [ app ] ──> respond immediately  ✓
+                  │
+                  └──> [ queue ] ──> [ worker ] ──> email provider
+                        durable        separate process,
+                        survives       restarted / scaled
+                        a restart      independently</code></pre>
+
+<p>Two benefits, and the second is the one that matters. The obvious one is latency: the response
+does not wait for a 400ms provider call. The subtle one is <strong>failure isolation</strong> &mdash;
+if the email provider is down for ten minutes, the queue holds the work and the site keeps taking
+orders. Without a queue, that outage is your outage.</p>
+
+<p>A queue also changes what &ldquo;done&rdquo; means, and this is where most systems get it wrong.
+Writing to the database and then sending to a queue is two operations that can half-happen. The
+<strong>transactional outbox</strong> fixes it by making the message part of the same database
+transaction as the change that caused it &mdash; StayHub does exactly this, and the <a
+href="/system-design/system-design-message-queues">queues post</a> is about why.</p>
+
+<h3>What a queue is not</h3>
+
+<p>Almost every web framework ships something called background tasks, and it is not a queue. The
+distinction costs people real incidents, so it is worth being precise. StayHub&rsquo;s notification
+module states it plainly, because it used to rely on exactly this:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">It is NOT a job queue, and the difference is not academic:
+
+  * no retry           — a provider blip loses the email
+  * no persistence     — a deploy or a crash mid-task loses it too
+  * no back-pressure   — a burst of requests is a burst of concurrent tasks
+  * no visibility      — nothing anywhere records that it was meant to happen</code></pre>
+
+<p>In-process background tasks run after the response, in the same process, in the same event loop.
+That buys one thing &mdash; the user does not wait &mdash; and buys none of the others. So the rule
+is: in-process for work that is genuinely nice to have, a real queue for work that
+<em>must</em> happen.</p>
+
+<h2>Stage 7 &mdash; a search index</h2>
+
+<p>&ldquo;Find me somewhere in San Francisco under $200 that sleeps four and has wifi&rdquo; is not
+a query a relational database is good at. Full-text matching, relevance ranking and a dozen
+optional filters are what a search engine does, and doing it in SQL means a query that cannot use
+an index.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   writes ──> [ Postgres ]  source of truth
+                   │
+                   │  sunk from application code on every write
+                   v
+              [ Elasticsearch ]  derived, disposable, rebuildable
+                   ▲
+   search ─────────┘</code></pre>
+
+<p>The critical property is the one written on the diagram: <strong>the index is derived
+data</strong>. Postgres is the truth and the index is a copy that can be thrown away and rebuilt.
+That is what makes it safe for the two to disagree briefly, and they always will &mdash; two
+datastores cannot be updated atomically.</p>
+
+<p>StayHub sinks the index from application code, and the ordering is load-bearing:</p>
+
+<pre class="language-python"><code class="language-python">def _sync(self, prop: Property) -> None:
+    indexed = indexer.index_property(prop)
+    cache.invalidate(cache.property_key(prop.public_id))</code></pre>
+
+<p>Called <em>after</em> the commit, never before. Indexing first means a transaction that then
+rolls back leaves a listing in the search results that does not exist in the database, and the
+guest who clicks it gets a 404 from a page that just offered it to them.</p>
+
+<h2>Stage 8 &mdash; knowing which part is broken</h2>
+
+<p>The last box is the one candidates forget, and it is the one that makes the others operable.
+With eight components, &ldquo;the site is slow&rdquo; is not a diagnosis.</p>
+
+<ul>
+  <li><strong>Logs</strong> &mdash; what happened, per request. Structured (JSON) rather than
+      prose, and carrying a request id that follows one request through every service.</li>
+  <li><strong>Metrics</strong> &mdash; numbers over time. Request rate, error rate, latency
+      percentiles, queue depth, cache hit rate. These are what you alert on.</li>
+  <li><strong>Traces</strong> &mdash; where one request spent its time across services.</li>
+  <li><strong>Health checks</strong> &mdash; what the load balancer polls to decide whether an
+      instance should receive traffic.</li>
+</ul>
+
+<p>A health check that returns a bare &ldquo;ok&rdquo; answers the wrong question. StayHub&rsquo;s
+reports each dependency separately, and deliberately does not let an optional one mark the instance
+unfit:</p>
+
+<pre class="language-python"><code class="language-python">    es_ok = es_available()
+    cache_ok = cache.available()
+
+    return Health(
+        status="ok" if db_ok else "degraded",
+        database=db_ok,
+        elasticsearch=es_ok,
+        cache=cache_ok,
+    )</code></pre>
+
+<p>Only the database decides <code>status</code>. If Redis being down marked the instance
+unhealthy, a cache outage would pull every server out of the load balancer and turn a slow site
+into no site at all.</p>
+
+<h2>Every box is also a failure mode</h2>
+
+<p>Adding a component adds a way to fail. That is not an argument against adding them, but it is
+the thing to say out loud when you do &mdash; and it is what an interviewer means when they point
+at a box and ask &ldquo;what if that dies?&rdquo;</p>
+
+<table>
+  <thead>
+    <tr><th>Part</th><th>If it fails</th><th>What makes that survivable</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Load balancer</td><td>Everything is unreachable</td>
+        <td>It is the one true SPOF &mdash; run a pair, or use a managed one across zones</td></tr>
+    <tr><td>App server</td><td>Nothing, if the pool is bigger than one</td>
+        <td>Health checks that actually detect sickness, not just liveness</td></tr>
+    <tr><td>Cache</td><td>Slower, not broken</td>
+        <td>Only if every call treats an outage as a miss</td></tr>
+    <tr><td>Read replica</td><td>Reads shift to the primary</td>
+        <td>The primary must have headroom to absorb them</td></tr>
+    <tr><td>Primary database</td><td>Writes stop &mdash; the real outage</td>
+        <td>Automated failover to a standby; practised, not theoretical</td></tr>
+    <tr><td>Queue</td><td>Async work pauses and accumulates</td>
+        <td>Durable storage, and an alert on queue depth</td></tr>
+    <tr><td>Search index</td><td>Search degrades</td>
+        <td>It is derived data &mdash; rebuild it from the source of truth</td></tr>
+    <tr><td>Worker</td><td>Nothing immediately</td>
+        <td>Messages wait; that is the entire point of the queue</td></tr>
+  </tbody>
+</table>
+
+<p>Two rows are worth dwelling on. The <strong>primary database is the outage</strong> &mdash;
+everything else on that list degrades, and this one stops the system doing its job. It is why so
+much of this track is about the database.</p>
+
+<p>And the <strong>cache row has a condition attached</strong>. &ldquo;Slower, not broken&rdquo; is
+only true if it was built that way. StayHub&rsquo;s test suite asserts it in both directions: 165
+tests pass with Redis running, and with Redis stopped 142 pass and 23 skip, with nothing failing.
+An availability claim you have not tested is an availability claim you do not have.</p>
+
+<h2>The whole picture</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">                              [ DNS ]
+                                 │
+   browser ──> [ CDN ] ──────────┴──> [ load balancer ]
+                  │                          │
+            [ object store ]        ┌────────┼────────┐
+             images, static         v        v        v
+                                 [app 1]  [app 2]  [app 3]     stateless
+                                    │        │        │
+                    ┌───────────────┼────────┴────────┘
+                    v               v               │
+               [ cache ]      [ PRIMARY DB ]        └──> [ search index ]
+                                    │
+                                    ├──> [ replica ] ──> reads
+                                    │
+                                    └──> [ queue ] ──> [ worker ] ──> email, etc.
+
+                    everything above emits ──> [ logs · metrics · traces ]</code></pre>
+
+<h2>What the numbers look like at each stage</h2>
+
+<p>Rough figures, but the orders of magnitude are what matter &mdash; they are how you decide which
+stage you are actually designing for.</p>
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>Roughly handles</th><th>What forces the next step</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0 &mdash; one box</td><td>a few hundred requests/sec</td>
+        <td>the app and the database fight for memory</td></tr>
+    <tr><td>1 &mdash; split database</td><td>~1k requests/sec</td>
+        <td>one server is a SPOF and a ceiling</td></tr>
+    <tr><td>2 &mdash; LB + app pool</td><td>~10k requests/sec</td>
+        <td>the database is now the bottleneck</td></tr>
+    <tr><td>3 &mdash; cache</td><td>~50k reads/sec, if they repeat</td>
+        <td>reads that do not repeat, and writes</td></tr>
+    <tr><td>4 &mdash; replicas</td><td>~100k reads/sec</td>
+        <td>write volume, or one dataset outgrowing one machine</td></tr>
+    <tr><td>5&ndash;7 &mdash; CDN, queue, index</td><td>removes whole classes of load</td>
+        <td>writes genuinely exceeding one primary</td></tr>
+    <tr><td>8 &mdash; sharding</td><td>no ceiling, high cost</td>
+        <td>&mdash;</td></tr>
+  </tbody>
+</table>
+
+<p>The gap between stage 2 and stage 8 is enormous, and almost every system lives inside it. If
+your estimate lands at 500 requests a second, the design is stage 2 with a cache, and saying so
+confidently &mdash; with the arithmetic to back it &mdash; is a better answer than a sharded,
+multi-region system that solves a problem you do not have.</p>
+
+<h2>Monolith or services?</h2>
+
+<p>The question that always follows, and the honest answer disappoints people who expect
+&ldquo;microservices&rdquo;.</p>
+
+<p>Nothing above requires splitting the application into separate deployable services. Every box on
+that diagram can be one codebase that scales horizontally, and for the overwhelming majority of
+systems that is the right answer. A monolith gives you a transaction across your whole domain, one
+deployment, one place to look, and a function call where services need a network round trip that
+can fail.</p>
+
+<p>Split when a specific pressure forces it: one component needs to scale on a completely different
+axis, teams are blocking each other on releases, or a piece genuinely needs a different runtime.
+Those are real reasons. &ldquo;Microservices are modern&rdquo; is not, and the cost is a distributed
+system, which means every function call becomes a thing that can time out, retry and arrive twice.</p>
+
+<p>StayHub is a useful middle case: it is one application, but it does talk to four separate
+datastores &mdash; Postgres, Elasticsearch, Redis and a GraphQL layer. That is enough to have every
+distributed-systems problem this track covers, without a single microservice.</p>
+
+<h2>What to take from this</h2>
+
+<p>The parts list is short and it does not change. What changes is which parts a given problem
+needs, and the skill is being able to say what forced each one:</p>
+
+<table>
+  <thead><tr><th>Symptom</th><th>The part that answers it</th></tr></thead>
+  <tbody>
+    <tr><td>One server is a single point of failure</td><td>Load balancer + several stateless app servers</td></tr>
+    <tr><td>The same expensive read, constantly</td><td>Cache</td></tr>
+    <tr><td>Far more reads than writes</td><td>Read replicas</td></tr>
+    <tr><td>Large static files</td><td>Object store + CDN</td></tr>
+    <tr><td>Slow work on the request path</td><td>Queue + worker</td></tr>
+    <tr><td>Text search and faceted filters</td><td>Search index</td></tr>
+    <tr><td>Writes exceed one machine</td><td>Sharding &mdash; and only then</td></tr>
+    <tr><td>&ldquo;Something is slow&rdquo;</td><td>Metrics, logs, traces</td></tr>
+  </tbody>
+</table>
+
+<p>One habit is worth carrying out of this post. When you add a box, say the sentence that forced
+it &mdash; &ldquo;the numbers say 40,000 reads a second and one database cannot serve that, so a
+cache goes here&rdquo; &mdash; and then say what it costs, which for a cache is stale data and one
+more thing to operate. Two sentences per box. A diagram annotated that way is a design; the same
+diagram without them is a picture someone memorised.</p>
+
+<p>Next: <a href="/system-design/system-design-back-of-envelope-estimation">back-of-the-envelope
+estimation</a>, which is how you work out which row of that table you are actually in.</p>

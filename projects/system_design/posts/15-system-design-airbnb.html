@@ -1,0 +1,478 @@
+<p>This is the case study where nothing is hypothetical. Every code sample below is taken from
+StayHub, a working Airbnb-style booking application &mdash; FastAPI and Postgres for writes,
+Elasticsearch for search, Redis for caching and rate limiting, a transactional outbox for
+asynchronous work &mdash; and every number quoted was measured on it.</p>
+
+<p>The point of doing it this way is that a booking system&rsquo;s hard parts are not the ones a
+diagram shows. They are in the transaction boundaries, and those only become concrete when there is
+code.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                          OUT OF SCOPE (say so)
+  search listings                   messaging between guest and host
+  view a listing                    reviews and ratings pipeline
+  check availability                dynamic/surge pricing
+  book and pay                      identity verification, insurance
+  cancel (rules apply)              a mobile app
+  hosts create listings
+
+WORTH ASKING
+  can two guests book the same
+    dates?                        -> NO. This is the whole system.
+  cancellation policy?            -> a business rule, and it must live in ONE place
+  when is money taken?            -> at booking, or at check-in? changes the flow
+  instant book, or host approval? -> changes booking from 1 step to 2
+
+NON-FUNCTIONAL
+  search must be fast              it is the browsing experience
+  bookings must be correct         a double booking is a real-world incident
+  read-heavy, ~200:1
+  availability > consistency
+    for BROWSING                   a stale listing is fine
+  consistency > availability
+    for BOOKING                    refusing beats double-booking</code></pre>
+
+<p>That last pair is the sentence to say out loud. The same product wants opposite answers on the
+CAP question depending on which operation is running, which is exactly the point the <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a> makes: the
+model is a property of the operation, not the system.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  500k daily active users · 2M listings
+        each user views ~20 listings, searches ~5 times
+        1 in 50 visits ends in a booking
+
+READS   500k x 20 / 100k   = 100 listing views/sec    peak x3 = 300/sec
+        500k x 5  / 100k   =  25 searches/sec         peak x3 =  75/sec
+WRITES  500k / 50 = 10k bookings/day / 100k
+                           = 0.1 bookings/sec         peak x3 = 0.3/sec
+STORAGE 2M listings x 2 KB = 4 GB       <- the entire catalog fits in memory
+        10k bookings/day x 1 KB x 365   = ~3.6 GB/year</code></pre>
+
+<p>Read those results before moving on, because they say something surprising.</p>
+
+<p><strong>0.3 bookings per second at peak.</strong> That is not a throughput problem in any sense.
+Nothing about the write path needs sharding, queuing or partitioning &mdash; and yet the booking
+path is where all the engineering goes, because the problem is <em>correctness</em>. Two people
+booking the same room at the same instant is a disaster at 0.3 writes a second exactly as much as
+at 3,000.</p>
+
+<p><strong>4 GB of listings fits in memory.</strong> The entire catalog can be cached, which makes
+the read design much simpler than it would otherwise be.</p>
+
+<p><strong>75 searches/sec across 2 million listings</strong> is the read problem, and it is not
+one SQL does well. That is what justifies a search index &mdash; arithmetic, not habit.</p>
+
+<h2>Step 3 &mdash; The shape</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">                 ┌── writes ──> FastAPI ──> Postgres
+   React apps ───┤                              │
+                 ├── reads  ──> Hasura ─────────┘
+                 └── search ──> FastAPI ──> Elasticsearch
+                                              ▲
+                        sunk in application code from every write path</code></pre>
+
+<p>The split is the lesson. <strong>Every create, update and delete goes through one service</strong>,
+which is what makes server-side pricing, the availability check and the cancellation rule impossible
+to bypass. Reads come from a GraphQL layer with row-level permissions, with one deliberate exception:
+search, because the entire point of maintaining an index is to answer that question without touching
+Postgres.</p>
+
+<p>One JWT, signed by the write service and verified by the read layer with a shared secret. One
+login, two APIs, no session store &mdash; which is what makes the tier stateless.</p>
+
+<p>The property this split buys is worth naming, because it is the reason to accept its complexity:
+<strong>no role has insert, update or delete permission in the read layer.</strong> Not
+&ldquo;the frontend does not use them&rdquo; &mdash; they do not exist. That is what makes
+server-side pricing and the availability rules genuinely unbypassable rather than merely
+conventional, and it is a much stronger guarantee than a code review can give.</p>
+
+<h2>Step 4 &mdash; The schema</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE properties (
+    id              BIGSERIAL PRIMARY KEY,   -- internal: small, fast joins
+    public_id       UUID NOT NULL UNIQUE,    -- the ONLY id that leaves the process
+    host_id         BIGINT NOT NULL REFERENCES users(id),
+    status          VARCHAR(16) NOT NULL,    -- DRAFT | PUBLISHED | SUSPENDED
+    price_per_night NUMERIC(10,2) NOT NULL,
+    cleaning_fee    NUMERIC(10,2) NOT NULL,
+    max_guests      INTEGER NOT NULL,
+    rating_average  NUMERIC(3,2) NOT NULL DEFAULT 0,   -- denormalised
+    deleted         BOOLEAN NOT NULL DEFAULT false     -- soft delete
+);
+
+CREATE TABLE bookings (
+    id              BIGSERIAL PRIMARY KEY,
+    public_id       UUID NOT NULL UNIQUE,
+    property_id     BIGINT NOT NULL REFERENCES properties(id),
+    guest_id        BIGINT NOT NULL REFERENCES users(id),
+    check_in        DATE NOT NULL,
+    check_out       DATE NOT NULL,
+    status          VARCHAR(16) NOT NULL,    -- PENDING|CONFIRMED|CANCELLED|COMPLETED
+    nightly_rate    NUMERIC(10,2) NOT NULL,  -- captured at booking time
+    total           NUMERIC(10,2) NOT NULL
+);</code></pre>
+
+<p>Four decisions in there recur across the whole track.</p>
+
+<p><strong>Two ids per row.</strong> A <code>BIGSERIAL</code> for foreign keys and joins, and a
+UUID that is the only id ever appearing in a URL. A sequential id in a URL tells the world how many
+bookings you have and invites <code>/bookings/1</code>, <code>/bookings/2</code> &mdash; the <a
+href="/system-design/system-design-unique-id-generator">unique id post</a> covers why.</p>
+
+<p><strong>Money is <code>NUMERIC</code>, never a float.</strong> Binary floating point cannot
+represent 0.10 exactly, and the errors accumulate. This is not a style preference.</p>
+
+<p><strong>Prices are captured on the booking.</strong> <code>nightly_rate</code> and
+<code>total</code> are stored, not recomputed from the listing &mdash; because a host raising their
+price next week must not change what a guest already agreed to pay.</p>
+
+<p><strong>Deletes are soft.</strong> A booking references a property and a user forever, so those
+rows are flagged rather than removed.</p>
+
+<h2>Step 5 &mdash; The booking race</h2>
+
+<p>The core of the system. The natural implementation is check-then-write, and it is wrong:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   guest A:  is 5-7 Jan free? ─> YES ──────────> INSERT ✓
+   guest B:      is 5-7 Jan free? ─> YES ──────────> INSERT ✓
+
+   Both checks ran before either insert landed.</code></pre>
+
+<p>A transaction does not fix it &mdash; at Postgres&rsquo;s default isolation level this is a
+phantom read, which read committed does not promise to prevent. The fix is to make the overlap
+impossible in the only place that can see both writes:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings ADD CONSTRAINT bookings_no_overlapping_bookings
+EXCLUDE USING gist (
+    property_id WITH =,
+    daterange(check_in, check_out, '[)') WITH &amp;&amp;
+) WHERE (status IN ('PENDING', 'CONFIRMED', 'COMPLETED'));</code></pre>
+
+<p>Two details worth stealing. The range is <code>'[)'</code>, so a booking ending on the 5th and
+one starting on the 5th do not overlap &mdash; which is exactly how hotel nights work, and using
+<code>&lt;=</code> instead would reject every legitimate back-to-back booking. And the
+<code>WHERE</code> clause means cancelling frees the dates automatically, with no cleanup job.</p>
+
+<p>The application keeps a friendly check as well, and is explicit that it is not the guard:</p>
+
+<pre class="language-python"><code class="language-python">        if self.bookings.overlapping(prop.id, req.check_in, req.check_out):
+            raise ConflictException("Those dates are no longer available.")</code></pre>
+
+<p>That catches the common case &mdash; dates already taken when the request arrived &mdash; and
+produces a good message. It loses the race, deliberately. The constraint wins it, and the
+application translates the verdict:</p>
+
+<pre class="language-python"><code class="language-python">        except IntegrityError as exc:
+            self.db.rollback()
+            if _is_overlap_violation(exc):
+                raise ConflictException(
+                    "Those dates were just booked by someone else."
+                ) from exc
+            raise</code></pre>
+
+<p>Note it checks <em>which</em> constraint fired. Treating every integrity error as &ldquo;dates
+taken&rdquo; would report a broken foreign key as a booking clash &mdash; turning a real bug into a
+plausible business message nobody investigates.</p>
+
+<h3>The hold, for free</h3>
+
+<p><code>PENDING</code> is in the constraint&rsquo;s status list, so a booking awaiting payment
+blocks the calendar by the same mechanism that prevents double booking. No separate hold table, no
+lock, no timer.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   PENDING    dates held, not yet paid    ─┐
+   CONFIRMED  paid                         ├─ block the calendar
+   COMPLETED  stay finished                ─┘
+   CANCELLED  ─────────────────────────────── does not block
+
+   Release is a status change, not a deletion.</code></pre>
+
+<p>What it does not solve is expiry: a guest who abandons checkout holds those dates indefinitely.
+That needs a scheduled job cancelling stale pending bookings &mdash; and that job must run on
+exactly one server, which is one of the few legitimate uses for a distributed lock.</p>
+
+<h3>What the booking transaction actually contains</h3>
+
+<p>Worth listing, because the boundary is the design:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BEGIN
+     validate: is the property bookable, does it sleep this many, is the
+               guest not the host?
+     friendly overlap check                    (loses the race, on purpose)
+     compute the price server-side
+     INSERT booking (PENDING)                  <- the constraint arbitrates here
+     INSERT outbox  ('booking.created')        <- the email, atomically
+   COMMIT
+      │
+      └── AFTER the commit: index, invalidate cache</code></pre>
+
+<p>Three things are inside and two are outside, and each placement is a decision.</p>
+
+<p><strong>The outbox row is inside</strong>, so the booking and the instruction to email commit
+together. It also means a booking rejected by the constraint takes its notification with it &mdash;
+nobody is emailed about a reservation that lost the race, and that is free rather than coded.</p>
+
+<p><strong>Indexing and cache invalidation are outside</strong>, because they touch systems that
+cannot participate in a Postgres transaction and must not be able to fail a booking.</p>
+
+<p><strong>Nothing external is called inside.</strong> No payment provider, no email, no HTTP at
+all &mdash; because a transaction holding locks while waiting on somebody else&rsquo;s network is
+how a slow third party becomes your deadlock.</p>
+
+<h2>Step 6 &mdash; Pricing is a security boundary</h2>
+
+<p>The request body carries no amount. Ever.</p>
+
+<pre class="language-python"><code class="language-python">        breakdown = pricing_service.quote(prop, req.check_in, req.check_out)</code></pre>
+
+<p>The server recomputes every figure from the listing. If the client sent a price, a modified
+request would book a $2,000 stay for $1 &mdash; and the fact that your own frontend would never do
+that is irrelevant, because the attacker is not using your frontend.</p>
+
+<p>The same logic makes registration always create a customer, whatever the body says, and makes
+foreign-owned resources return 404 rather than 403 &mdash; a 403 confirms the id exists, which on a
+guessable identifier is a slow read of your table.</p>
+
+<h2>Step 7 &mdash; Search</h2>
+
+<p>75 searches a second over 2 million listings with text matching and a dozen optional filters.
+Postgres can do it; it cannot do it well, and every filter combination would want its own index.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   writes ──> [ Postgres ]   source of truth
+                   │
+                   │  sunk from application code, AFTER the commit
+                   v
+              [ Elasticsearch ]   derived, disposable, rebuildable</code></pre>
+
+<p>The sink is two lines, and their position is load-bearing:</p>
+
+<pre class="language-python"><code class="language-python">    def _sync(self, prop: Property) -> None:
+        indexed = indexer.index_property(prop)
+        cache.invalidate(cache.property_key(prop.public_id))</code></pre>
+
+<p>Called <em>after</em> the commit. Indexing first means a rolled-back transaction leaves a
+listing in the search results that does not exist, and the guest who clicks it gets a 404 from a
+page that just offered it. Indexing <em>inside</em> the transaction is worse still &mdash; a slow
+search cluster would then fail a host&rsquo;s save.</p>
+
+<p>That leaves a gap: crash between the commit and the index write and the two diverge. It is
+survivable because the index is derived data with a rebuild path, and because a failed index write
+queues a retry through the outbox. The <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a> works through
+exactly this.</p>
+
+<p>One deliberate limitation worth stating: <strong>date availability is not in the index.</strong>
+Availability lives in the bookings table, so filtering on it at search time would mean either
+denormalising every booking into the document or a second query per hit. The listing page checks
+properly. Saying so beats a filter that quietly does nothing.</p>
+
+<h2>Step 8 &mdash; The read path</h2>
+
+<p>The listing page is the hottest read, and it earns a cache on all three counts: hot, expensive
+(it joins images, amenities and the host), and rarely written.</p>
+
+<pre class="language-python"><code class="language-python">        key = cache.property_key(public_id)
+
+        cached = cache.get_json(key)
+        if cached is not None:
+            return PropertyResponse.model_validate(cached)
+
+        view = PropertyResponse.model_validate(self.get_for_public(public_id))
+        cache.set_json(key, view.model_dump(mode="json"), settings.cache_ttl_property_seconds)
+        return view</code></pre>
+
+<p>Measured on the machine that wrote this: <strong>15.2ms cold, 2.0ms warm</strong> over HTTP;
+<strong>8.8ms to 0.3ms</strong> at the service layer.</p>
+
+<p>Invalidation hangs off <code>_sync</code>, which every write path already calls &mdash; so a new
+write path that forgets it does not merely serve a stale cache, it also fails to appear in search,
+which somebody notices within minutes. Coupling the silent failure to the loud one is deliberate.</p>
+
+<p>And the cache is optional: every call returns &ldquo;miss&rdquo; on failure rather than raising.
+The suite proves it &mdash; <strong>165 tests pass with Redis running; with it stopped, 142 pass and
+23 skip, and nothing fails.</strong></p>
+
+<h3>What the index holds</h3>
+
+<p>The document is a denormalised snapshot &mdash; everything a search result card needs, and
+nothing else:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   {
+     publicId, title, city, state, country,
+     propertyType, roomType,
+     pricePerNight, cleaningFee,
+     maxGuests, bedrooms, beds, bathrooms,
+     ratingAverage, ratingCount,
+     coverImageUrl, amenities[]
+   }
+
+   Denormalised ON PURPOSE: rendering a result page must not
+   require a single query against Postgres.</code></pre>
+
+<p>That is the read-model idea in its clearest form. The index is not a copy of the properties
+table; it is a copy of <em>the answer to one question</em>, shaped so the question is cheap. Host
+name, address and internal ids are absent because a result card does not show them.</p>
+
+<p>The document id is the property&rsquo;s public id, which is what makes indexing idempotent
+&mdash; running it five times produces the same index as running it once, so at-least-once retries
+from the outbox are safe by construction.</p>
+
+<p>One more decision worth naming: unpublished listings are <strong>deleted</strong> from the index
+rather than flagged. Filtering on a status field at query time would work, and one forgotten filter
+leaks a draft into public results. Absent cannot leak.</p>
+
+<h2>Step 9 &mdash; Payment</h2>
+
+<p>The step that spans a boundary you do not control, so it cannot be a transaction.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  create booking PENDING     dates are held by the constraint
+   2  create a payment intent    with the provider
+   3  client confirms payment    in the browser, with the provider directly
+   4  provider webhook           -> mark CONFIRMED
+
+   The WEBHOOK is the source of truth, not the browser.</code></pre>
+
+<p>Step 4 is the one people get wrong. A browser telling your server &ldquo;payment
+succeeded&rdquo; is a claim from an untrusted client. The webhook comes from the provider and
+carries a signature &mdash; and since the provider has no token of yours, <strong>that signature
+IS the authentication</strong>.</p>
+
+<p>Card details never reach your servers. You store the provider&rsquo;s identifier plus brand and
+last four digits for display, and nothing else. If a <code>card_number</code> column exists
+anywhere, something has gone badly wrong.</p>
+
+<h2>Step 10 &mdash; Cancellation</h2>
+
+<p>A business rule, and the interesting part is where it lives.</p>
+
+<pre class="language-python"><code class="language-python">        if actor.role != "ADMIN" and not is_cancellable(booking.status, booking.check_in):
+            deadline = cancellation_deadline(booking.check_in)
+            raise ApiException(
+                f"This booking can no longer be cancelled — the deadline was {deadline:%d %b %Y}, "
+                f"{settings.cancellation_cutoff_days} days before check-in."
+            )</code></pre>
+
+<p>The rule is in its own module, dependency-free, because two layers need it: the service enforces
+it, and the response schema reports <code>isCancellable</code> so the UI can hide the button.
+Duplicating it would mean a UI that disagrees with the server.</p>
+
+<p>Enforcing it server-side regardless of what the UI shows is the point. A hidden button is a
+courtesy; anyone can post to the endpoint.</p>
+
+<h2>Step 11 &mdash; Availability, the read side</h2>
+
+<p>Booking correctness is one half. The other is showing a calendar before anyone commits, and it
+is a different query with different requirements.</p>
+
+<pre class="language-python"><code class="language-python">    def blocked_ranges(self, property_id: int, *, from_date: date) -> list[Booking]:</code></pre>
+
+<p>The picker greys out taken dates, and it reads from the primary rather than a replica &mdash;
+because a calendar that is 200 milliseconds stale offers dates that were just taken, and the guest
+then gets a 409 on a date the UI said was free. That is a worse experience than a slightly slower
+calendar.</p>
+
+<p>It is also deliberately <strong>not cached</strong>, which is the exception to everything in the
+<a href="/system-design/system-design-caching">caching post</a>. Availability is the one value where
+stale means wrong: serving a five-minute-old &ldquo;those dates are free&rdquo; is not a performance
+win, it is a failed booking at best.</p>
+
+<p>The general rule this illustrates: <strong>cache what is expensive to compute and cheap to be
+wrong about.</strong> A listing description is both. An availability calendar is neither &mdash; it
+is a cheap indexed range query, and being wrong about it costs a conversion.</p>
+
+<p>The overlap test itself is worth reading carefully, because the boundary is where these queries
+go wrong:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   existing.check_in &lt; new.check_out  AND  existing.check_out &gt; new.check_in
+
+   strictly less-than on both sides, so:
+      existing  |----5th----6th----7th|
+      new                             |----7th----8th|
+                                      ^ no overlap. Correct.
+
+   Using &lt;= would reject every back-to-back booking there is.</code></pre>
+
+<h2>Step 12 &mdash; Scaling it up</h2>
+
+<p>The estimate said this system does not need much. If the numbers were ten or a hundred times
+larger:</p>
+
+<table>
+  <thead><tr><th>Multiply by</th><th>What changes</th></tr></thead>
+  <tbody>
+    <tr><td>10x</td><td>Read replicas for listing reads. Cache the whole catalog &mdash; it is still only 40 GB.
+        Booking writes are 3/sec: still nothing.</td></tr>
+    <tr><td>100x</td><td>Elasticsearch cluster properly sharded. Regional read replicas and CDN for
+        images. Bookings at 30/sec &mdash; one primary still handles it, and the constraint still
+        holds.</td></tr>
+    <tr><td>1000x</td><td>Now shard bookings, by <code>property_id</code>, so a property&rsquo;s
+        calendar and its constraint stay on one shard. This is the key choice: shard by guest
+        instead and the exclusion constraint stops working, because the rows it must compare land
+        on different machines.</td></tr>
+  </tbody>
+</table>
+
+<p>That last row is the most interesting scaling consequence in this post. The correctness mechanism
+constrains the shard key &mdash; a constraint can only enforce an invariant across rows that live in
+the same database. Sharding by the wrong key does not slow the system down, it silently removes the
+guarantee.</p>
+
+<h2>Failure modes</h2>
+
+<table>
+  <thead><tr><th>What fails</th><th>Effect</th><th>Why it is survivable</th></tr></thead>
+  <tbody>
+    <tr><td>Redis</td><td>Listing pages ~7x slower</td>
+        <td>Every call degrades to a miss. Tested both ways: 165 pass with it, 142 pass and 23 skip
+            without.</td></tr>
+    <tr><td>Elasticsearch</td><td>Search returns 503; everything else works</td>
+        <td>Startup does not block on it, and browsing by link is unaffected. The index is
+            rebuildable from Postgres.</td></tr>
+    <tr><td>The outbox worker</td><td>Confirmation emails stop; bookings continue</td>
+        <td>Messages accumulate as PENDING. Stopping the worker is <em>safe</em> &mdash; that is
+            what distinguishes a queue from a background task.</td></tr>
+    <tr><td>Payment provider</td><td>Bookings are created and held PENDING; payment cannot complete</td>
+        <td>The dates are still held by the constraint, and the checkout page says payment is
+            unavailable rather than failing obscurely.</td></tr>
+    <tr><td>Postgres primary</td><td>The real outage &mdash; no bookings, no availability</td>
+        <td>Promote a replica. This is the one component with no graceful degradation, which is why
+            it gets the standby.</td></tr>
+  </tbody>
+</table>
+
+<p>The pattern is the one worth articulating: <strong>everything except Postgres degrades to
+slower or partially unavailable, and Postgres is the only true outage.</strong> That is not an
+accident &mdash; it is the result of deciding, for each dependency, what happens when it is gone,
+and then writing the code that way.</p>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;How do you prevent double booking?&rdquo;</strong> &mdash; a database
+      exclusion constraint, not application logic. Explain why check-then-write fails and why a
+      transaction alone does not save it.</li>
+  <li><strong>&ldquo;How do you hold dates during checkout?&rdquo;</strong> &mdash; a PENDING
+      booking, blocked by the same constraint. Plus a job to expire abandoned ones.</li>
+  <li><strong>&ldquo;How is search kept in sync?&rdquo;</strong> &mdash; sunk from application code
+      after the commit; derived data with a rebuild path; a failed write queues a retry.</li>
+  <li><strong>&ldquo;What if Redis dies?&rdquo;</strong> &mdash; slower, not broken, and there is a
+      test suite that runs both ways.</li>
+  <li><strong>&ldquo;Where does pricing happen?&rdquo;</strong> &mdash; server-side, always. The
+      request body never carries an amount.</li>
+  <li><strong>&ldquo;How do you know payment succeeded?&rdquo;</strong> &mdash; the signed webhook,
+      never the browser.</li>
+  <li><strong>&ldquo;How would you shard?&rdquo;</strong> &mdash; by property id, because the
+      correctness constraint requires the competing rows to be co-located.</li>
+</ul>
+
+<p>If there is one thing to take from this case study, it is the shape of the answer rather than
+any individual mechanism: the estimate said throughput was trivial, so every design decision was
+about <em>correctness under concurrency</em> and <em>what happens when a dependency is gone</em>.
+Those two questions produce a better system than &ldquo;how do we handle the load&rdquo;, and they
+are the two most system designs skip.</p>
+
+<p>Next: <a href="/system-design/system-design-amazon">designing Amazon</a>, where the same
+inventory problem appears at a scale that breaks every answer in this post.</p>

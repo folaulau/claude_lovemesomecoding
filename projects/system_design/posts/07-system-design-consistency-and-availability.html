@@ -1,0 +1,473 @@
+<p>The moment your system holds more than one copy of anything &mdash; a read replica, a cache, a
+search index &mdash; you have a consistency problem. Not a potential one. The copies are updated at
+different times, so there is always a window in which they disagree, and the design question is
+what happens to a request that arrives during it.</p>
+
+<p>This post covers what CAP actually says (which is narrower than its reputation), the consistency
+models worth naming, and the dual-write problem &mdash; shown against a live system, including
+exactly where it goes wrong.</p>
+
+<h2>CAP, without the folklore</h2>
+
+<p>The theorem states that a distributed system cannot simultaneously guarantee all three of:</p>
+
+<ul>
+  <li><strong>Consistency</strong> &mdash; every read returns the most recent write.</li>
+  <li><strong>Availability</strong> &mdash; every request gets a non-error response.</li>
+  <li><strong>Partition tolerance</strong> &mdash; the system keeps working when the network drops
+      messages between nodes.</li>
+</ul>
+
+<p>The popular version is &ldquo;pick two&rdquo;, and that framing is what makes it useless in
+practice. You do not get to pick partition tolerance. Networks fail: cables are cut, switches
+reboot, a deploy misconfigures a security group. If your nodes talk over a network, partitions
+happen, so P is a fact rather than a choice.</p>
+
+<p>Which means CAP is really about what you do <em>during</em> a partition:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                    the network splits
+
+    [ node A ] ── ✗ ── [ node B ]
+        ▲                   ▲
+   a write arrives here, and B cannot be told about it
+
+   CP: refuse the write.  Data stays correct, this node is DOWN.
+   AP: accept the write.  Node stays UP, the two now DISAGREE.
+
+   There is no third option. That is the whole theorem.</code></pre>
+
+<p>A <strong>CP</strong> system refuses to serve rather than serve something wrong. A traditional
+relational database with synchronous replication behaves this way: lose the quorum and writes stop.
+That is correct for money.</p>
+
+<p>An <strong>AP</strong> system keeps answering and reconciles later. A shopping cart, a social
+feed, a DNS record. A slightly stale timeline is fine; an error page is not.</p>
+
+<h3>PACELC, which is more useful</h3>
+
+<p>CAP only describes the failure case, and partitions are rare. PACELC extends it to the other
+99.9% of the time:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   if (P)artition:  choose (A)vailability or (C)onsistency
+   (E)lse:          choose (L)atency      or (C)onsistency</code></pre>
+
+<p>That second line is the one you live with daily. Even when nothing is broken, making a read
+consistent means waiting &mdash; for a quorum, for a replica to catch up, for a lock. Every
+milliseconds-versus-correctness decision in a healthy system is the EL/C trade, and it comes up far
+more often than partitions do.</p>
+
+<p>Postgres with async replicas is PA/EL: it stays available and it is fast, and it is not strongly
+consistent across replicas. Spanner is PC/EC: consistent always, and it pays for it in latency.</p>
+
+<h3>The two-generals reason none of this goes away</h3>
+
+<p>It is worth knowing why this is a fundamental limit rather than an engineering gap somebody will
+close.</p>
+
+<p>Two generals must attack at the same time, and can only communicate by messengers who may be
+captured. General A sends &ldquo;attack at dawn&rdquo;. Did it arrive? A needs an acknowledgement.
+B sends one &mdash; but did <em>that</em> arrive? B now needs an acknowledgement of the
+acknowledgement, and so on forever. No finite exchange of messages gives both sides certainty.</p>
+
+<p>That is every network call you will ever make. When a request times out, you do not know whether
+it failed or succeeded and the response was lost:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   POST /charge  ──X──>   did the charge happen?
+                          you cannot tell from a timeout.
+
+   retry  -> maybe charging twice
+   don't  -> maybe never charging at all</code></pre>
+
+<p>This is why <strong>idempotency is not an optimisation but a requirement</strong>: it is the
+only way out of the dilemma. If retrying is guaranteed harmless, the impossible question stops
+needing an answer &mdash; you simply retry. Every reliable distributed system is built on that
+move, and it is why the topic recurs in the <a
+href="/system-design/system-design-message-queues">queues</a> and <a
+href="/system-design/system-design-concurrency-and-locking">concurrency</a> posts.</p>
+
+<h2>The consistency models you should be able to name</h2>
+
+<table>
+  <thead><tr><th>Model</th><th>Guarantee</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Strong / linearizable</td><td>A read always sees the latest write</td>
+        <td>Single-node databases; Spanner; a quorum system</td></tr>
+    <tr><td>Sequential</td><td>Everyone sees operations in the same order, maybe delayed</td>
+        <td>Replicated state machines</td></tr>
+    <tr><td>Causal</td><td>Related operations are seen in order; unrelated ones may differ</td>
+        <td>Comment threads, chat</td></tr>
+    <tr><td>Read-your-writes</td><td>You see your own changes; others may not yet</td>
+        <td>Profile edits, posting</td></tr>
+    <tr><td>Monotonic reads</td><td>You never see time go backwards</td>
+        <td>Feeds, timelines</td></tr>
+    <tr><td>Eventual</td><td>If writes stop, everyone converges. Eventually.</td>
+        <td>DNS, caches, search indexes, S3 listings</td></tr>
+  </tbody>
+</table>
+
+<p>The two in the middle are the ones that matter in practice, because they are what users
+actually notice.</p>
+
+<p><strong>Read-your-writes.</strong> A user edits their profile, the write goes to the primary,
+the next page load hits a replica 200ms behind, and their change has vanished. They will try again,
+and you will get a bug report you cannot reproduce.</p>
+
+<p><strong>Monotonic reads.</strong> Two consecutive reads land on different replicas at different
+lags, so a comment appears and then disappears. This one is worse than plain staleness, because
+users interpret it as data loss.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   read 1 -> replica A (100ms behind)  -> comment IS there
+   read 2 -> replica B (900ms behind)  -> comment is GONE
+   read 3 -> replica A                 -> it is back
+
+   Nothing was lost. It looks exactly like something was.</code></pre>
+
+<p>The usual fix for both is stickiness: route a given user&rsquo;s reads to the same replica, or
+to the primary for a few seconds after they write. Note that this is not free &mdash; it is the
+sticky-session problem from the <a href="/system-design/system-design-load-balancing">load
+balancing post</a>, reappearing at the data layer.</p>
+
+<h3>Where the models come from</h3>
+
+<p>One point that clears up a lot of confusion: these models are not different technologies, they
+are different amounts of waiting.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   write arrives
+      │
+      ├─ acknowledge NOW, replicate later      -> eventual (fast, may be stale)
+      ├─ acknowledge when a quorum has it      -> strong-ish (slower)
+      └─ acknowledge when ALL have it          -> strong (slowest, fragile —
+                                                  one slow replica stalls writes)</code></pre>
+
+<p>Every consistency guarantee is bought with latency at write time, read time, or both. That is
+the PACELC &ldquo;else&rdquo; branch made concrete, and it is why &ldquo;just make it strongly
+consistent&rdquo; is not a free move: it means every write waits for the slowest participant, and
+the slowest participant is sometimes a machine having a bad minute.</p>
+
+<h2>Quorums</h2>
+
+<p>How distributed datastores make the consistency level a per-request choice rather than a
+property of the system.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   N = 3 replicas
+   W = replicas that must acknowledge a write
+   R = replicas read from
+
+   W + R > N   =>  the read set and the write set overlap,
+                   so a read always sees the newest write
+
+   W=1 R=1  (2 > 3 false)  fast, may be stale
+   W=3 R=1  (4 > 3 true)   strong reads, writes fail if any node is down
+   W=2 R=2  (4 > 3 true)   balanced — survives one node down, either way</code></pre>
+
+<p><code>W=2, R=2</code> on three replicas is the common default, and the reason is the middle
+column: it tolerates losing exactly one node without losing either strong reads or the ability to
+write. That is the shape of most quorum configurations you will meet.</p>
+
+<h2>Transactions, and what isolation actually promises</h2>
+
+<p>Before distributing anything, it is worth being precise about what a single database gives you,
+because the guarantees are weaker than most people assume &mdash; and every distributed consistency
+problem is a version of one of these.</p>
+
+<p>ACID is four promises: <strong>atomicity</strong> (all of it or none), <strong>consistency</strong>
+(constraints hold), <strong>isolation</strong> (concurrent transactions do not interfere), and
+<strong>durability</strong> (a committed write survives a crash).</p>
+
+<p>Isolation is the one with a dial on it, and the settings are named after the anomalies they
+prevent:</p>
+
+<table>
+  <thead>
+    <tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Read uncommitted</td><td>possible</td><td>possible</td><td>possible</td></tr>
+    <tr><td>Read committed <em>(Postgres default)</em></td><td>no</td><td>possible</td><td>possible</td></tr>
+    <tr><td>Repeatable read</td><td>no</td><td>no</td><td>possible*</td></tr>
+    <tr><td>Serializable</td><td>no</td><td>no</td><td>no</td></tr>
+  </tbody>
+</table>
+
+<p>The default matters more than the table. Postgres runs <strong>read committed</strong>, which
+means that within one transaction, reading the same row twice can return different values &mdash;
+because another transaction committed in between.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BEGIN
+     SELECT count(*) FROM bookings WHERE property_id = 7;   -> 0
+                                        (another transaction commits a booking)
+     INSERT INTO bookings ...                               -> now there are 2
+   COMMIT</code></pre>
+
+<p>That is a <strong>phantom</strong>, and it is the database-level version of the double-booking
+race. A transaction did not protect against it, because read committed does not promise to. This is
+why the <a href="/system-design/system-design-concurrency-and-locking">concurrency post</a> reaches
+for a constraint rather than a transaction: wrapping the check and the insert in <code>BEGIN</code>
+and <code>COMMIT</code> changes nothing at the default isolation level.</p>
+
+<p><code>SERIALIZABLE</code> does prevent it, by making concurrent transactions behave as if they
+ran one after another &mdash; and it pays for that by aborting some of them, so every caller needs
+retry logic. That is a real option and it is the reason people reach for constraints instead: a
+constraint costs nothing and fails at exactly one place.</p>
+
+<h2>The dual-write problem</h2>
+
+<p>Here is where theory becomes a bug in your code. Two datastores cannot be updated atomically.
+There is no transaction that spans Postgres and Elasticsearch, or Postgres and an email provider,
+or a database and a cache.</p>
+
+<p>StayHub has exactly this shape. Postgres is the source of truth; Elasticsearch holds a derived
+copy so that search does not have to touch Postgres:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   writes ──> [ Postgres ]  source of truth
+                   │
+                   │  sunk from application code, after the commit
+                   v
+              [ Elasticsearch ]  derived, disposable, rebuildable</code></pre>
+
+<p>The code is two lines, and every interesting question is about their order:</p>
+
+<pre class="language-python"><code class="language-python">    def _sync(self, prop: Property) -> None:
+        indexed = indexer.index_property(prop)
+        cache.invalidate(cache.property_key(prop.public_id))</code></pre>
+
+<h3>Why it is after the commit</h3>
+
+<p>Indexing <em>before</em> the commit looks more careful and is worse. If the transaction then
+rolls back, a listing exists in the search results that does not exist in the database, and the
+guest who clicks it gets a 404 from a page that just offered it to them.</p>
+
+<p>Indexing inside the transaction is worse still. It makes a search cluster having a bad day into
+a reason that a host&rsquo;s save fails &mdash; coupling the availability of the write path to a
+system that was supposed to be an optimisation.</p>
+
+<p>So: commit first, then index. Which leaves a gap, and the gap is real.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   COMMIT succeeds   <- the listing is now published, durably
+   ...                  process is killed here
+   index_property()  <- never runs
+
+   Postgres says PUBLISHED. Search has never heard of it.</code></pre>
+
+<p>The module says so out loud rather than pretending:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">**What it does not do:** it is not transactional. The commit succeeds and *then* the index is
+updated, so a crash in between leaves the two out of step. That is deliberate — the alternative
+(indexing inside the transaction) is worse: a slow or dead Elasticsearch would then fail writes
+that have nothing wrong with them.</code></pre>
+
+<h3>Three ways to narrow the gap</h3>
+
+<p><strong>Retry on failure.</strong> If the index write returns an error, queue it and try again.
+This handles the common case &mdash; Elasticsearch restarting &mdash; and StayHub does it:</p>
+
+<pre class="language-python"><code class="language-python">        if not indexed:
+            outbox_service.enqueue(
+                self.db,
+                indexer.TOPIC_PROPERTY_CHANGED,
+                {"propertyId": str(prop.public_id), "reason": "index-write-failed"},
+            )</code></pre>
+
+<p>It does <em>not</em> handle the process dying between the commit and the enqueue. The code says
+that too, because a comment claiming a guarantee the code does not provide is worse than no
+comment.</p>
+
+<p><strong>The transactional outbox.</strong> The complete fix: write the intent to index as a row
+in the same transaction as the change, and let a worker do the actual indexing. Now there is no gap
+&mdash; if the commit succeeded, the instruction is durable. It costs latency, since the index is
+updated when the worker next polls rather than immediately. The <a
+href="/system-design/system-design-message-queues">queues post</a> is about this pattern.</p>
+
+<p><strong>Change data capture.</strong> Read the database&rsquo;s replication log and project it
+outward. Nothing in application code can forget, because it is not in application code at all. It
+is the most robust answer and it is a substantial piece of infrastructure.</p>
+
+<h3>The property that makes it survivable</h3>
+
+<p>Whatever you choose, some divergence will happen. What makes it recoverable rather than fatal is
+that the index is <strong>derived data</strong>: Postgres is authoritative and the index is a copy
+that can be thrown away.</p>
+
+<p>So there is a repair path, and it is one call:</p>
+
+<pre class="language-python"><code class="language-python">    def reindex_all(self) -> int:
+        """Rebuild the whole search index from Postgres. The repair button."""
+        return indexer.rebuild_index(self.properties.all_for_reindex())</code></pre>
+
+<p>This is the single most important idea in the post. <strong>Decide which copy is the truth, and
+make every other copy rebuildable from it.</strong> Then eventual consistency is a temporary
+annoyance rather than corruption, and &ldquo;how do you recover?&rdquo; has an answer that fits in
+a sentence.</p>
+
+<p>A system where two stores are both authoritative and they disagree has no repair path, because
+there is no way to know which one is right. That is the situation to design yourself out of.</p>
+
+<h3>Handlers must be idempotent</h3>
+
+<p>Retrying implies delivering more than once. The index write survives that by construction:</p>
+
+<pre class="language-python"><code class="language-python">        client.index(
+            index=settings.elasticsearch_index,
+            id=str(prop.public_id),
+            document=to_document(prop),
+        )</code></pre>
+
+<p>The document id <em>is</em> the property&rsquo;s public id, so indexing the same property five
+times produces exactly the same index as indexing it once. That is what makes at-least-once
+delivery safe here rather than merely tolerable.</p>
+
+<p>There is a second, subtler decision in the retry handler: it <strong>re-reads the property from
+Postgres</strong> rather than replaying a snapshot captured when the event happened. For derived
+data that is correct &mdash; if the listing was edited three more times while Elasticsearch was
+down, writing the first snapshot would store a stale document and then mark the job done, leaving
+search confidently wrong. Re-reading collapses all four changes into one correct write.</p>
+
+<p>The opposite is true for an email about a booking: that describes a moment, so it should carry
+the moment. The question to ask is <strong>does the consumer need the event as it happened, or the
+world as it is now?</strong></p>
+
+<h2>Detecting divergence before a user does</h2>
+
+<p>&ldquo;It will converge eventually&rdquo; is a claim, and a claim nobody checks is a claim that
+quietly stops being true. If two copies can disagree, something should be looking.</p>
+
+<p>The cheapest useful check is a count comparison on a schedule &mdash; how many published
+listings does Postgres have, and how many documents are in the index?</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   every 5 minutes:
+       postgres: SELECT count(*) WHERE status='PUBLISHED' AND NOT deleted
+       index:    GET /_count
+
+   equal            -> fine
+   differ slightly  -> normal; writes are in flight
+   differ and STAY  -> alert. something is not converging.</code></pre>
+
+<p>The distinction on the last two lines is the whole design of the check. A momentary difference
+is the system working as intended; a difference that persists across several samples is the failure
+mode. Alerting on the first produces noise nobody reads, which is worse than no alert.</p>
+
+<p>Where correctness genuinely matters, the stronger version compares content rather than counts
+&mdash; hash a set of fields per record on both sides and compare the hashes, usually over a sample
+rather than everything. That is what a reconciliation job is, and financial systems run them
+nightly for exactly this reason.</p>
+
+<p>A related habit that costs nothing: <strong>expose the lag as a metric</strong>. Replication
+delay in seconds, queue depth, the age of the oldest unprocessed message. Staleness you can graph
+is staleness you can reason about; staleness you cannot measure is one you will discover from a
+support ticket.</p>
+
+<h2>Conflicts, when both sides can write</h2>
+
+<p>Everything above has one writer and several derived copies, which is the easy case &mdash; there
+is always an obvious winner. When two replicas both accept writes, that stops being true, and you
+need a rule for reconciling them.</p>
+
+<table>
+  <thead><tr><th>Strategy</th><th>How</th><th>Problem</th></tr></thead>
+  <tbody>
+    <tr><td>Last write wins</td><td>Keep the one with the later timestamp</td>
+        <td>Silently discards the other. Clocks between machines disagree.</td></tr>
+    <tr><td>Version vectors</td><td>Track causality; detect true conflicts</td>
+        <td>Detects them, does not resolve them &mdash; someone still must</td></tr>
+    <tr><td>Application merge</td><td>Domain logic decides</td>
+        <td>Correct, and you have to write it per data type</td></tr>
+    <tr><td>CRDTs</td><td>Types that mathematically cannot conflict</td>
+        <td>Only some data fits &mdash; counters, sets, collaborative text</td></tr>
+  </tbody>
+</table>
+
+<p>Last-write-wins deserves particular suspicion, because it is the default in several systems and
+it depends on clocks. Two servers whose clocks differ by 50ms will disagree about which write came
+second, and the loser is discarded with no record. The classic illustration is a shopping cart
+where two devices add different items and one item simply disappears &mdash; which is why
+Dynamo-style systems modelled carts as a <em>set union</em> instead.</p>
+
+<p>The practical advice is to design so this never arises: <strong>one writer per piece of
+data</strong>. Multi-master writing is a genuinely hard problem and it is almost never worth
+adopting to solve a scaling issue that a single primary with replicas would have handled.</p>
+
+<h2>Choosing a model, per feature</h2>
+
+<p>Consistency is not a property of a system, it is a property of an operation. The same
+application wants different answers for different things:</p>
+
+<table>
+  <thead><tr><th>Operation</th><th>Needs</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Is this room available?</td><td>Strong</td><td>Stale means a double booking</td></tr>
+    <tr><td>Charging a card</td><td>Strong + idempotent</td><td>Money</td></tr>
+    <tr><td>Search results</td><td>Eventual</td><td>A listing appearing a second late is invisible</td></tr>
+    <tr><td>A host&rsquo;s own listing page</td><td>Read-your-writes</td><td>Their edit must appear immediately</td></tr>
+    <tr><td>Review count</td><td>Eventual</td><td>Nobody notices &ldquo;127&rdquo; versus &ldquo;128&rdquo;</td></tr>
+    <tr><td>Notification delivery</td><td>At-least-once</td><td>A duplicate email beats a missing one</td></tr>
+  </tbody>
+</table>
+
+<p>Being able to produce a table like that for the system on the whiteboard is a genuinely strong
+signal, because it shows you know consistency has a price and are choosing where to pay it.</p>
+
+<h2>Distributed transactions, and why you probably will not use one</h2>
+
+<p>The obvious question after all of this: if two datastores cannot be updated atomically, why not
+use a protocol that makes them?</p>
+
+<p><strong>Two-phase commit</strong> does exist. A coordinator asks every participant to prepare,
+and if all agree, tells them all to commit:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   PHASE 1   coordinator -> "can you commit?" -> A: yes
+                                              -> B: yes
+   PHASE 2   coordinator -> "commit"          -> A: done
+                                              -> B: done
+
+   The failure that ruins it:
+   PHASE 1   both say yes  (both are now HOLDING LOCKS)
+             coordinator dies before phase 2
+             -> A and B wait. Forever. Holding locks.</code></pre>
+
+<p>That is the blocking problem, and it is why 2PC is rare outside a single database cluster. It
+converts the coordinator into a component whose failure freezes every participant, which is
+precisely the availability property you were trying to improve.</p>
+
+<p>The pattern that replaced it is the <strong>saga</strong>: a sequence of local transactions,
+each with a compensating action if a later step fails.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   book the room     ok      compensate: cancel the booking
+   charge the card   ok      compensate: refund
+   send confirmation FAILED
+                             -> run the compensations backwards</code></pre>
+
+<p>Sagas are eventually consistent by construction and they leak: for a moment the room is booked
+and the card is not charged, and someone can see that state. There is no way around it &mdash; you
+are trading atomicity for availability, which is the same trade as everywhere else in this post.
+The <a href="/system-design/system-design-amazon">Amazon post</a> works one through in detail,
+because checkout is the canonical example.</p>
+
+<p>The practical advice is the boring one: <strong>arrange your boundaries so that the things which
+must be atomic live in one database.</strong> StayHub creates a booking and its payment record and
+its outbox message in one transaction, precisely so no saga is needed for the part that matters.
+Sagas are for what genuinely crosses a boundary &mdash; a third-party payment provider &mdash; not
+for boundaries you drew yourself.</p>
+
+<h2>What to say when asked</h2>
+
+<ul>
+  <li><strong>CAP is about behaviour during a partition.</strong> P is not optional; the choice is
+      refuse or diverge.</li>
+  <li><strong>PACELC is the version you use daily</strong> &mdash; even healthy, consistency costs
+      latency.</li>
+  <li><strong>Name the model per operation</strong>, not per system.</li>
+  <li><strong>Read-your-writes and monotonic reads</strong> are the two users actually notice.</li>
+  <li><strong>Two datastores cannot be updated atomically.</strong> Say which one is the truth.</li>
+  <li><strong>Make every derived copy rebuildable</strong>, and know where the rebuild button
+      is.</li>
+  <li><strong>Anything retried must be idempotent</strong>, and idempotency is usually achieved by
+      choosing the right key rather than by adding a check.</li>
+</ul>
+
+<p>And the framing to carry into the case studies: consistency questions are almost never
+&ldquo;is this system consistent?&rdquo; They are &ldquo;which copy is the truth, how far behind
+can the others get, who notices, and how do I rebuild them?&rdquo; A design that answers those four
+has answered the topic.</p>
+
+<p>Next: <a href="/system-design/system-design-message-queues">message queues and asynchronous
+work</a>, which is the complete answer to the dual-write gap this post left open.</p>

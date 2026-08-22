@@ -1,0 +1,465 @@
+<p>Notifications look like a feature and are a system. One service, three or four channels, dozens
+of message types, and a set of delivery guarantees that are harder than they appear &mdash; plus a
+legal obligation, which is unusual for a piece of infrastructure.</p>
+
+<p>The failure that defines it: a bug in a notification system does not produce an error page, it
+produces ten thousand emails to real people, and there is no rollback.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                         OUT OF SCOPE (say so)
+  email, SMS, push, in-app         marketing campaign management
+  user preferences and opt-out     A/B testing of copy
+  templating and localisation      an analytics UI
+  retries and deduplication        rich interactive notifications
+
+WORTH ASKING
+  transactional or marketing?     -> completely different compliance rules
+  how fast must it be?            -> "2FA code" and "weekly digest" differ by hours
+  who triggers it?                -> one service, or every service in the company?
+
+NON-FUNCTIONAL
+  at-least-once, never zero        a missing password reset is a support ticket
+  no duplicate storms              worse than late — it is what users complain about
+  one bad channel must not
+    block the others               SMS down should not stop email
+  a bug must not send 10,000       rate control is a SAFETY feature here</code></pre>
+
+<p>The first question is the one that shapes everything. <strong>Transactional</strong>
+notifications &mdash; a receipt, a password reset, a booking confirmation &mdash; are things the
+user asked for by acting. <strong>Marketing</strong> notifications are things you decided to send.
+The distinction is not editorial: in most jurisdictions marketing requires consent and a working
+unsubscribe, and transactional does not. Mixing them in one pipeline means applying the strictest
+rules to everything, or breaking the law.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  10M users · ~3 notifications/user/day across all channels
+
+VOLUME    30M/day / 100k    = 300/sec        peak x5 = 1,500/sec
+          (x5 not x3 — batch sends are spiky by nature)
+
+MIX       email  60%   ~180/sec    cheap, slow, high volume
+          push   30%    ~90/sec    cheap, fast
+          SMS    10%    ~30/sec    EXPENSIVE — ~$0.01 each
+                                   = ~$26,000/day if unchecked
+
+STORAGE   30M events x ~500 B = 15 GB/day of delivery records
+          (retain 30-90 days, then aggregate)</code></pre>
+
+<p>The SMS line is why this system needs spend limits as a first-class feature rather than a
+nice-to-have. A retry loop with no cap on an expensive channel is a bug that bills you.</p>
+
+<p>1,500 per second is otherwise not a throughput problem. Like the booking system in the <a
+href="/system-design/system-design-back-of-envelope-estimation">estimation post</a>, the difficulty
+here is correctness, not scale.</p>
+
+<h2>Step 3 &mdash; The shape</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   any service ──> POST /notifications  {userId, type, data}
+                        │
+                        v
+                  [ ingestion ]  validate, deduplicate, enqueue
+                        │
+                        v
+                  [ preference check ]  is this user opted in, on this
+                        │               channel, at this hour?
+                        v
+                  [ template render ]  copy + locale, NOT in code
+                        │
+                        v
+                  [ QUEUE, one per channel ]
+                    email │ sms │ push │ in-app
+                        │
+                        v
+                  [ per-channel workers ] ──> provider APIs
+                        │
+                        v
+                  [ delivery log ]  what was sent, when, and what happened</code></pre>
+
+<p>The single most important structural decision is on the queue line: <strong>one queue per
+channel</strong>. Channels have wildly different latencies, failure modes and costs, and a shared
+queue means a slow SMS provider blocks email delivery for everybody. Separate queues let each
+channel fail, retry and scale on its own.</p>
+
+<h2>Step 4 &mdash; Getting the event in reliably</h2>
+
+<p>Before any of that, the triggering service has to record its intent without losing it. This is
+the <a href="/system-design/system-design-message-queues">transactional outbox</a> again, and
+notifications are its canonical use.</p>
+
+<pre class="language-python"><code class="language-python">            outbox_service.enqueue(
+                self.db,
+                notification_service.TOPIC_BOOKING_CREATED,
+                {
+                    "bookingId": str(booking.public_id),
+                    "guestEmail": guest.email,
+                    "propertyTitle": prop.title,
+                    "checkIn": req.check_in,
+                    "checkOut": req.check_out,
+                    "total": breakdown.total,
+                    "idempotencyKey": f"booking-created:{booking.public_id}",
+                },
+            )
+
+            self.db.commit()</code></pre>
+
+<p>The enqueue is inside the transaction that creates the booking, so the booking and the
+instruction to notify commit together or not at all. A crash between them is impossible, and a
+booking rejected by the database takes its notification with it &mdash; nobody is emailed about a
+reservation that lost the race.</p>
+
+<p>Two things in that payload are deliberate. A <strong>snapshot</strong>, not just an id: by the
+time the worker runs, the booking may have changed, and the email should describe what happened
+rather than what is now true. And an <strong>idempotency key</strong>, because delivery is
+at-least-once and the provider needs a way to recognise a redelivery.</p>
+
+<h3>Where the outbox stops and this system starts</h3>
+
+<p>Worth drawing the boundary, because the two are easy to conflate.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BOOKING SERVICE                    NOTIFICATION SERVICE
+   owns: the booking                  owns: who gets told, how, and whether
+         the outbox row                     preferences, templates, providers
+
+   "booking.created happened"   ──>   "that means 5 notifications,
+    a fact, stated once                 subject to these rules"</code></pre>
+
+<p>The producing service&rsquo;s only obligation is to record the fact durably. Everything about
+delivery &mdash; channels, retries, quiet hours, suppression &mdash; belongs on the other side of
+that line.</p>
+
+<p>Getting this boundary wrong is the most common structural mistake in notification systems, and
+it shows up as domain services that import an email client. Once the booking service knows what an
+SMTP failure is, it has acquired a dependency on a third party for a job that has nothing to do
+with bookings &mdash; and it will eventually fail a booking because of it.</p>
+
+<h2>Step 5 &mdash; Preferences, which are not optional</h2>
+
+<p>The check that runs before every send, and the one with legal weight behind it.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE notification_preferences (
+    user_id     BIGINT      NOT NULL,
+    type        VARCHAR(64) NOT NULL,   -- 'booking.confirmed', 'marketing.weekly'
+    channel     VARCHAR(16) NOT NULL,   -- 'email' | 'sms' | 'push' | 'in_app'
+    enabled     BOOLEAN     NOT NULL,
+    PRIMARY KEY (user_id, type, channel)
+);
+
+CREATE TABLE notification_suppressions (
+    address     VARCHAR(320) PRIMARY KEY,  -- email or phone, NOT user_id
+    reason      VARCHAR(32)  NOT NULL,     -- 'unsubscribed'|'bounced'|'complained'
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);</code></pre>
+
+<p>The second table is the one people forget, and it is keyed by <strong>address</strong> rather
+than by user for a specific reason: a hard bounce or a spam complaint attaches to the address, and
+must survive the user deleting and recreating their account, or the same address appearing on a
+second account. Continuing to send to a complained address is how a sending domain gets
+blacklisted, at which point none of your email arrives anywhere.</p>
+
+<p>The rule to state clearly: <strong>suppression beats preference beats default.</strong> A
+suppressed address is never sent to, whatever any other table says &mdash; and, importantly, a
+suppression list applies to marketing but never to genuinely transactional messages like a password
+reset, which is the other half of why the two must be distinguishable.</p>
+
+<p>Two more that belong here: <strong>quiet hours</strong> in the user&rsquo;s timezone, because a
+3am push is a deleted app; and <strong>digesting</strong>, so twenty events in ten minutes become
+one message.</p>
+
+<p>Quiet hours have a subtlety worth catching. Deferring a notification until morning means it must
+be <em>held</em>, and held notifications for a whole timezone all become due at the same instant
+&mdash; so 9am local time produces a spike shaped exactly like the thundering herd from the <a
+href="/system-design/system-design-caching">caching post</a>. Spreading the release over a window,
+with jitter, is the same fix as everywhere else.</p>
+
+<p>And the check must be against the recipient&rsquo;s timezone, not the server&rsquo;s. That
+sounds obvious and is the single most common bug in this area, because the server&rsquo;s clock is
+the one that is conveniently available.</p>
+
+<h2>Step 6 &mdash; Fan-out: one event, several notifications</h2>
+
+<p>A single business event usually produces more than one notification, to more than one person, on
+more than one channel &mdash; and the expansion has to happen somewhere.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   one event: booking.created
+
+   ├── guest   email  "your stay is confirmed"
+   ├── guest   push   "confirmed — 4 Jan to 7 Jan"
+   ├── host    email  "you have a new reservation"
+   ├── host    push   "new booking for Sunlit Loft"
+   └── ops     in-app (only if the booking value is over a threshold)
+
+   1 event -> 5 notifications -> 5 independent delivery attempts</code></pre>
+
+<p>The rule that keeps this manageable: <strong>the producing service emits one event; the
+notification service decides who hears about it.</strong> If the booking service had to know that
+hosts get push notifications and that operations wants alerts above a value threshold, then every
+change to notification policy would be a change to the booking service.</p>
+
+<p>That is the events-not-commands distinction from the <a
+href="/system-design/system-design-message-queues">queues post</a>, and this is where it pays off:
+adding a sixth recipient is a routing rule, not a deployment of the domain service.</p>
+
+<p>Each of the five is then independently queued, retried and logged. One failing does not affect
+the others &mdash; the host&rsquo;s email is not lost because the guest&rsquo;s push token was
+stale.</p>
+
+<h2>Step 7 &mdash; Providers</h2>
+
+<p>Every channel goes through a third party, and every third party has bad days. The abstraction to
+build is thin and its purpose is failover.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   interface Sender:
+       send(recipient, rendered, idempotency_key) -> ProviderResult
+
+   email:  Postmark  ─fails─>  SES         (secondary)
+   sms:    Twilio    ─fails─>  MessageBird
+   push:   APNs (iOS) + FCM (Android)      — not interchangeable</code></pre>
+
+<p>The value of the interface is that switching providers is a configuration change rather than a
+project. That matters because it will happen: providers have outages, get acquired, and change
+pricing.</p>
+
+<p>Three things the wrapper must normalise, because providers disagree about all of them:</p>
+
+<ul>
+  <li><strong>Which failures are retryable.</strong> A 500 or a timeout is worth retrying; an
+      invalid address is not, and retrying it eight times wastes eight attempts on something that
+      will never succeed. This distinction is the difference between a retry policy and a
+      loop.</li>
+  <li><strong>Rate limits.</strong> Providers impose their own, and exceeding them gets you
+      throttled or suspended. The worker has to respect them, which means the <a
+      href="/system-design/system-design-rate-limiting">token bucket</a> appears here too &mdash;
+      this time protecting somebody else&rsquo;s service from you.</li>
+  <li><strong>Asynchronous outcomes.</strong> Accepting a message is not delivering it. Bounces and
+      complaints arrive minutes later by webhook, which means the delivery log has states that are
+      written long after the send.</li>
+</ul>
+
+<h2>Step 8 &mdash; At-least-once, and its consequence</h2>
+
+<p>The guarantee is the same one from the <a
+href="/system-design/system-design-message-queues">queues post</a>: a worker can hand a message to
+a provider and die before recording that it did.</p>
+
+<p>Building StayHub&rsquo;s outbox, that duplicate appeared immediately &mdash; two delivery paths
+were briefly live at once, and one booking produced two files:</p>
+
+<pre class="language-bash"><code class="language-bash">$ ls notifications/
+20260822T190807315928-guest_at_stayhub.test.json
+20260822T190807858799-guest_at_stayhub.test.json    # same email, twice</code></pre>
+
+<p>That had an obvious fix. But it is exactly what a redelivery looks like, and the same shape
+arrives legitimately whenever a worker dies at the wrong moment. It is worth having seen.</p>
+
+<p>The defences, in order of preference:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  pass an idempotency key to the provider   they deduplicate for you
+   2  record (idempotency_key) as UNIQUE        a second attempt is rejected
+      in the same transaction as the send        by the database
+   3  suppress by content hash within a window  catches near-duplicates from
+                                                 different code paths</code></pre>
+
+<p>The second is the one you control. A unique constraint on the key means a duplicate send is
+impossible rather than unlikely &mdash; the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post&rsquo;s</a> principle
+applied to delivery.</p>
+
+<h2>Step 9 &mdash; Rate control as a safety feature</h2>
+
+<p>In most systems rate limiting protects a server. Here it protects users from you, and it is the
+control that prevents the worst possible incident.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   PER USER      max 5 notifications/hour, 20/day
+                 -> a loop cannot spam one person
+
+   PER TYPE      max N/minute globally
+                 -> a bad deploy cannot mail everybody
+
+   GLOBAL        a hard ceiling and a SPEND cap
+                 -> stop sending, page a human, do not "retry harder"
+
+   CIRCUIT       provider failing? stop calling it for a while</code></pre>
+
+<p>The global ceiling deserves emphasis. The classic notification incident is a scheduled job that
+re-sends because its cursor was not persisted, and the outcome is measured in the hundreds of
+thousands. A cap that halts sending and alerts, rather than one that queues everything for later
+delivery, is what turns that into an embarrassing hour instead of a company-wide apology.</p>
+
+<p>Note that halting is the right behaviour and it is <strong>failing closed</strong> &mdash; the
+opposite of the rate limiter in the <a href="/system-design/system-design-rate-limiting">rate
+limiting post</a>, which fails open. The difference is what the failure costs: refusing to send is
+recoverable, and sending wrongly is not.</p>
+
+<h2>Step 10 &mdash; Retries that respect the channel</h2>
+
+<p>The backoff schedule from the <a href="/system-design/system-design-message-queues">queues
+post</a> &mdash; 2, 4, 8, 16, 32, 64, 128, 256 seconds &mdash; is a sensible default, and
+notifications need it tuned per channel because the value of a late message differs enormously.</p>
+
+<table>
+  <thead><tr><th>Channel</th><th>Retry window</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>2FA / password reset</td><td>Seconds, then give up</td>
+        <td>A code arriving four minutes late is useless and confusing &mdash; the user has already
+            requested another</td></tr>
+    <tr><td>Push</td><td>A few minutes</td><td>Cheap; the device may be briefly unreachable</td></tr>
+    <tr><td>Email</td><td>Hours</td><td>Nobody expects instant, and provider outages are measured in minutes</td></tr>
+    <tr><td>SMS</td><td>Minutes, with a hard attempt cap</td><td>Each retry costs real money</td></tr>
+    <tr><td>Marketing</td><td>Do not retry</td><td>A late campaign is worse than none, and it is not urgent by definition</td></tr>
+  </tbody>
+</table>
+
+<p>The first row is the interesting one, because it inverts the usual instinct. Most retry policies
+try harder for the most important message; here the most important message has the
+<em>shortest</em> retry window, because its value decays to zero in about a minute. Giving up
+quickly and letting the user request another is better than delivering a stale code.</p>
+
+<p>A related rule: <strong>attach a deadline to the message, not just an attempt count.</strong>
+&ldquo;Do not send this after 14:35&rdquo; is more meaningful than &ldquo;try eight times&rdquo;,
+because it expresses the thing you actually care about.</p>
+
+<h2>Step 11 &mdash; Templates</h2>
+
+<p>Copy does not belong in code. Changing &ldquo;Your stay is confirmed&rdquo; should not require a
+deploy, and it certainly should not require one per language.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   template: booking.confirmed
+   locale:   en-GB
+   channel:  email
+
+   subject: "Your stay at {{propertyTitle}} is confirmed"
+   body:    "Hi {{firstName}}, we are holding {{propertyTitle}} from
+             {{checkIn}} to {{checkOut}}."
+
+   The same template id renders differently per channel:
+   SMS gets 160 characters; push gets a title and a line.</code></pre>
+
+<p>Two rules. <strong>Escape by channel</strong> &mdash; the same variable needs HTML escaping in
+an email and none in an SMS, and getting that backwards is either broken text or an injection
+vulnerability. And <strong>version templates</strong>, so a delivery log written three months ago
+can still be rendered as it was actually sent.</p>
+
+<p>A template also needs a fallback locale, because the alternative to a missing translation is a
+blank email.</p>
+
+<h2>Step 12 &mdash; Testing something that emails real people</h2>
+
+<p>A category of risk this system has and most do not: a mistake in a test run reaches actual
+inboxes, and there is no undo.</p>
+
+<p>The defences are unglamorous and all of them are worth having before the first send:</p>
+
+<ul>
+  <li><strong>A hard environment gate.</strong> Non-production sends to a local capture directory,
+      a mail-catcher, or a provider&rsquo;s sandbox &mdash; never to a real provider. StayHub
+      writes files to <code>notifications/</code> for exactly this reason, and the file-per-send
+      behaviour also makes duplicates countable.</li>
+  <li><strong>An allowlist in staging.</strong> If staging must use a real provider &mdash; to test
+      rendering across mail clients &mdash; restrict recipients to a handful of internal addresses,
+      enforced in the sender rather than in configuration.</li>
+  <li><strong>A dry-run mode.</strong> Render, log the resolved recipient and body, do not send.
+      This is what you run before a large campaign, and reading its output is what catches the
+      template variable that resolves to <code>None</code>.</li>
+  <li><strong>Reserved test addresses.</strong> RFC 6761 reserves <code>.test</code> precisely so
+      it can never be a real domain, which makes it the correct TLD for fixtures &mdash; and
+      strict email validators reject it for that same reason, so the validator needs a test-mode
+      flag rather than a looser rule.</li>
+</ul>
+
+<p>The general principle: <strong>the blast radius of a bug here is external and permanent, so the
+guard rails belong in the code path rather than in configuration or process.</strong> A
+configuration mistake should not be able to send, and &ldquo;remember to check the environment
+variable&rdquo; is not a control.</p>
+
+<h2>Step 13 &mdash; Knowing what happened</h2>
+
+<p>An asynchronous system fails silently. The request succeeded, the notification did not arrive,
+and nobody is holding an error.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE notification_log (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key VARCHAR(128) NOT NULL UNIQUE,   -- the duplicate guard
+    user_id         BIGINT       NOT NULL,
+    type            VARCHAR(64)  NOT NULL,
+    channel         VARCHAR(16)  NOT NULL,
+    status          VARCHAR(16)  NOT NULL,  -- QUEUED|SENT|DELIVERED|BOUNCED|FAILED
+    provider_id     VARCHAR(128),           -- to correlate with their support
+    attempts        INTEGER      NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);</code></pre>
+
+<p>This table answers the question every support ticket asks &mdash; &ldquo;did they get it?&rdquo;
+&mdash; and it is worth having before you need it, because reconstructing it from provider
+dashboards after the fact is miserable.</p>
+
+<p>What to alert on: queue depth and the age of the oldest pending message; bounce rate, which
+rising sharply means a list problem or a domain reputation problem; dead-letter count; and spend on
+the expensive channel.</p>
+
+<h2>In-app notifications are a different problem</h2>
+
+<p>Three of the four channels push outward to a provider. The fourth &mdash; the bell icon in your
+own product &mdash; is a read model you own, and it behaves nothing like the others.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE in_app_notifications (
+    user_id     BIGINT      NOT NULL,
+    id          BIGINT      NOT NULL,   -- time-sortable, so no ORDER BY sort
+    type        VARCHAR(64) NOT NULL,
+    payload     JSONB       NOT NULL,   -- rendered client-side, so it can be localised late
+    read_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, id)
+);</code></pre>
+
+<p>The composite key is the same trick as the chat message table: one user&rsquo;s notifications
+are stored together and already in order, so &ldquo;the latest 20&rdquo; is a range scan and
+pagination is by cursor.</p>
+
+<p>Two differences from the outbound channels are worth stating. There is <strong>no delivery
+guarantee to worry about</strong> &mdash; the row exists or it does not, and the client reads it
+when it looks; there is no provider to fail. And the <strong>unread count</strong> is the
+expensive part, because it is requested on every page load by every user.</p>
+
+<p>Counting unread rows on each request is the counter problem in disguise. The usual answers are
+to keep a denormalised count updated on write, or to store a last-read marker and count the range
+&mdash; the latter being preferable for the reason the <a
+href="/system-design/system-design-chat-system">chat post</a> gives: a derived value that can be
+recomputed beats a stored one that can drift.</p>
+
+<p>Delivery here is also a natural fit for the connection tier from that post: if the user has a
+live WebSocket, push the notification to it immediately; otherwise it simply waits in the table.</p>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;How do you avoid sending twice?&rdquo;</strong> &mdash; you cannot avoid
+      at-least-once delivery, so you make duplicates harmless: an idempotency key, unique in your
+      database and passed to the provider.</li>
+  <li><strong>&ldquo;A provider is down for an hour.&rdquo;</strong> &mdash; the channel&rsquo;s
+      queue absorbs it, backoff stops you hammering them, the circuit breaker stops you trying at
+      all, and other channels are unaffected because the queues are separate.</li>
+  <li><strong>&ldquo;How do you stop a bug mailing everyone?&rdquo;</strong> &mdash; per-user,
+      per-type and global caps, plus a spend limit, and the behaviour on breach is to halt and page
+      rather than to queue.</li>
+  <li><strong>&ldquo;How does the triggering service avoid losing events?&rdquo;</strong> &mdash;
+      transactional outbox: the notification intent commits with the business change.</li>
+  <li><strong>&ldquo;How do you handle unsubscribes?&rdquo;</strong> &mdash; a suppression list
+      keyed by address, not by user, checked before every marketing send and never applied to
+      transactional messages.</li>
+  <li><strong>&ldquo;Priority?&rdquo;</strong> &mdash; separate queues by urgency, not a priority
+      field. A 2FA code must never wait behind a weekly digest, and the cleanest way to guarantee
+      that is for them not to share a queue.</li>
+</ul>
+
+<p>The framing that makes this system click: it is a <em>queue with policy on both ends</em>.
+Reliable ingestion at the front (the outbox), reliable delivery at the back (retries, idempotency,
+dead letters), and in the middle a set of rules &mdash; preferences, suppressions, quiet hours,
+rate caps &mdash; that decide whether the message should exist at all. Most of the hard parts are
+in the middle, and none of them are about scale.</p>
+
+<p>Next: <a href="/system-design/system-design-airbnb">designing Airbnb</a> &mdash; the first of
+three whole-system case studies, and the one where every claim is backed by an application that
+actually runs.</p>

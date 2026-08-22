@@ -1,0 +1,454 @@
+<p>Chat is the case study where the bottleneck is not what people expect. The message rate is
+ordinary; the storage is ordinary. What makes it a different kind of system is that the server has
+to <em>push</em>, which means millions of connections stay open doing nothing, and a message from
+one user has to reach another user connected to a completely different machine.</p>
+
+<p>That single fact produces a component no other system in this track needs.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                        OUT OF SCOPE (say so)
+  1:1 messaging                   voice and video
+  small group chat (&lt;=100)        threads and reactions
+  online / offline presence       message search
+  delivery + read receipts        end-to-end encryption
+  message history                 very large channels (100k members)
+
+WORTH ASKING
+  group size limit?              -> decides fan-out strategy entirely
+  media, or text only?           -> media is a separate upload path
+  history retention?             -> forever changes the storage plan
+  multi-device?                  -> changes delivery from "a user" to "a device"
+
+NON-FUNCTIONAL
+  low latency                     sub-second delivery is the product
+  ordered within a conversation   out-of-order chat is unreadable
+  no message ever lost            worse than late
+  availability > consistency      a late message beats an error</code></pre>
+
+<p>The group size question is the important one. Chat for groups of 100 and chat for channels of
+100,000 are different systems, and picking a bound early keeps the design coherent.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  50M daily active users · 40 messages/day · ~100 B of text
+        users connected ~5 hours/day
+
+MESSAGES  50M x 40           = 2B/day
+          2B / 100k          = 20,000/sec      peak x3 = 60,000/sec
+STORAGE   2B x 100 B         = 200 GB/day  ->  73 TB/year (x3 replication ≈ 220 TB)
+
+CONNECTIONS  <- the number that shapes everything
+          50M x (5/24)       = ~10M concurrent
+          at ~10k per server = 1,000 connection servers</code></pre>
+
+<p>60,000 writes a second is a sharding problem with a well-understood answer. 73 TB a year is
+large but unremarkable.</p>
+
+<p><strong>Ten million concurrent connections</strong> is the design. Each one holds a file
+descriptor and kernel buffers, so a well-tuned server manages perhaps ten thousand &mdash; meaning
+a thousand machines exist mostly to hold sockets open, doing nothing, most of the time.</p>
+
+<p>Worth pausing on the asymmetry, because it is what makes this system unlike the others in this
+track. A URL shortener at 30,000 requests a second holds no connection for more than a few
+milliseconds. Here, 20,000 messages a second travel over ten million connections that are open for
+five hours &mdash; so the ratio of idle sockets to active work is roughly five hundred to one.</p>
+
+<p>That is why the fleet is sized by <em>connections</em>, not by requests, and why almost every
+design decision below is really about connection management.</p>
+
+<h2>Step 3 &mdash; How the server pushes</h2>
+
+<p>HTTP is request/response: the client asks, the server answers. Chat needs the reverse, and there
+are four ways to fake or fix it.</p>
+
+<table>
+  <thead><tr><th></th><th>How</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td>Polling</td><td>Ask every N seconds</td>
+        <td>Latency is N/2 on average; almost every request returns nothing</td></tr>
+    <tr><td>Long polling</td><td>Ask, and the server holds the request open until there is news</td>
+        <td>Near-real-time, works everywhere; a connection per waiting client anyway, plus reconnect churn</td></tr>
+    <tr><td>Server-sent events</td><td>One long-lived HTTP stream, server &rarr; client</td>
+        <td>Simple, auto-reconnecting &mdash; but one-directional</td></tr>
+    <tr><td><strong>WebSocket</strong></td><td>One TCP connection, both directions, after an HTTP upgrade</td>
+        <td>Full duplex, low overhead per message &mdash; and you own the connection lifecycle</td></tr>
+  </tbody>
+</table>
+
+<p>WebSockets for chat, because messages flow both ways and per-message overhead matters at this
+volume. Worth knowing the others exist, though: SSE is a better answer for a notification feed or a
+live dashboard, where only the server ever speaks, and long polling remains the fallback for
+networks that block WebSocket upgrades.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   POLLING                     WEBSOCKET
+
+   c ──"anything?"──> s        c ══════ open ══════ s
+   c <──"no"───────── s              (idle, no traffic)
+   c ──"anything?"──> s        c <───── message ─── s   pushed instantly
+   c <──"no"───────── s
+   c ──"anything?"──> s        one handshake, then
+   c <──"YES"─────────s        messages cost ~2 bytes of framing</code></pre>
+
+<h2>Step 4 &mdash; The component nothing else needs</h2>
+
+<p>Here is the problem the open connections create.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   Alice is connected to server 400.
+   Bob   is connected to server 812.
+
+   Alice sends "hi" for Bob.
+   Server 400 has Alice's socket. It does not have Bob's.
+
+   How does server 400 reach a socket held by server 812?</code></pre>
+
+<p>Two pieces solve it: a <strong>registry</strong> of who is connected where, and a way for
+servers to <strong>talk to each other</strong>.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                     ┌──────────────────────────────┐
+                     │  REGISTRY  (Redis)           │
+                     │  user:alice -> conn-srv-400  │
+                     │  user:bob   -> conn-srv-812  │
+                     └──────────────────────────────┘
+                            ▲                  ▲
+   Alice ══ws══ [ conn 400 ] │                  │ [ conn 812 ] ══ws══ Bob
+                     │       │                  │       ▲
+                     │  1. look up bob          │       │
+                     │  2. publish to 812 ──────┴───────┘
+                     v
+                [ message queue / pub-sub between servers ]</code></pre>
+
+<p>Sending a message becomes: persist it, look up where the recipient is, and forward it to that
+server &mdash; which writes it to the socket it holds.</p>
+
+<p>Three details that matter.</p>
+
+<p><strong>The registry must expire entries.</strong> A server that crashes does not get to
+deregister its users, so those entries would point at a dead machine forever. Every entry carries a
+TTL refreshed by a heartbeat, which is the same lease-with-a-timeout shape as a distributed lock
+&mdash; and it has the same weakness: briefly, the registry can be wrong.</p>
+
+<p><strong>Multi-device makes it one-to-many.</strong> <code>user:alice</code> maps to a
+<em>set</em> of connections, not one, and every message fans out to all of them.</p>
+
+<p><strong>The registry is a hot dependency.</strong> Every message costs a lookup. It is a cache
+in shape, but it cannot degrade to a miss the way the <a
+href="/system-design/system-design-caching">caching post</a>&rsquo;s cache can &mdash; a miss here
+means the message is not delivered. So it needs replication and a fallback: on a miss, treat the
+user as offline and deliver through the offline path below, which is correct if slower.</p>
+
+<h3>Holding ten thousand sockets</h3>
+
+<p>The connection tier is unusual enough to be worth a moment, because it is sized by things most
+web servers never think about.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   per idle WebSocket:  1 file descriptor
+                        ~4-16 KB kernel send/receive buffers
+                        + whatever your runtime holds per connection
+
+   10,000 connections ≈ 100-200 MB of buffers alone, doing NOTHING</code></pre>
+
+<p>Three consequences. The default file-descriptor limit on most systems is 1,024, so it has to be
+raised deliberately &mdash; and hitting it presents as connections being refused for no visible
+reason. The runtime must be able to hold many idle connections cheaply, which means an event loop
+rather than a thread per connection: ten thousand threads is ten thousand stacks and a scheduler in
+distress.</p>
+
+<p>And <strong>heartbeats are mandatory</strong>. A TCP connection whose peer vanished &mdash;
+laptop lid closed, phone lost signal &mdash; can stay open on the server indefinitely, because
+nothing tells it otherwise. Without a periodic ping, dead connections accumulate until the server
+runs out of descriptors holding sockets to nobody. The ping interval also doubles as the registry
+TTL refresh, which is why the two are usually the same mechanism.</p>
+
+<p>The load balancer needs care too. A WebSocket cannot be re-balanced mid-life, so a deploy of the
+connection tier disconnects everyone on the instance being replaced. That is survivable &mdash;
+clients reconnect &mdash; provided reconnection is staggered. Ten thousand clients reconnecting
+simultaneously to the remaining servers is a thundering herd, and the fix is the same as
+everywhere: jittered backoff on the client.</p>
+
+<h2>Step 5 &mdash; Storage</h2>
+
+<p>The access pattern is narrow and that is what makes the schema easy: almost every read is
+&ldquo;the most recent N messages in this conversation&rdquo;, then &ldquo;the N before
+those&rdquo;.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE messages (
+    conversation_id BIGINT      NOT NULL,
+    message_id      BIGINT      NOT NULL,   -- Snowflake: time-sortable, no coordination
+    sender_id       BIGINT      NOT NULL,
+    body            TEXT        NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (conversation_id, message_id)
+);</code></pre>
+
+<p>The composite primary key is the whole design. Messages for one conversation are stored
+physically together and already in order, so &ldquo;the last 50&rdquo; is a single range scan with
+no sort. Pagination is by <code>message_id</code> cursor, never by offset &mdash; offset pagination
+over a growing conversation shows duplicates and skips messages.</p>
+
+<p><strong>The shard key is <code>conversation_id</code>.</strong> Every read and write carries it,
+so nothing ever fans out across shards, and a whole conversation lives on one machine. That is the
+test from the <a href="/system-design/system-design-database-scaling">database scaling post</a>,
+passed cleanly.</p>
+
+<p>At this volume a wide-column store &mdash; Cassandra, HBase &mdash; is the conventional choice
+over a relational database: enormous write throughput, a partition key plus clustering key that is
+exactly this access pattern, and no joins needed because there is nothing to join.</p>
+
+<h3>Conversations, and the one query that is awkward</h3>
+
+<p>The message table above is clean. The conversation list &mdash; the screen users actually open
+first &mdash; is the query that does not fit it.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE conversation_members (
+    user_id            BIGINT NOT NULL,
+    conversation_id    BIGINT NOT NULL,
+    last_read_message  BIGINT,              -- the high-water mark for unread counts
+    last_message_at    TIMESTAMPTZ,         -- DENORMALISED, so the list can sort
+    PRIMARY KEY (user_id, conversation_id)
+);</code></pre>
+
+<p><code>last_message_at</code> is denormalised on purpose. Without it, showing &ldquo;your
+conversations, most recent first&rdquo; means asking every one of a user&rsquo;s conversations for
+its newest message &mdash; and those live on different shards, so it is a fan-out query on the most
+frequently loaded screen in the app.</p>
+
+<p>With it, the list is one range scan on rows keyed by <code>user_id</code>. The cost is a write:
+every message updates a row per participant. For groups of 100 that is 100 small updates per
+message, which is the <a href="/system-design/system-design-database-scaling">read-time versus
+write-time</a> trade made explicitly, in the direction that favours the screen everybody looks
+at.</p>
+
+<p>Unread counts work the same way: store the last-read message id and compute the count as a
+range, rather than maintaining a counter that can drift. A derived value that can be recomputed
+beats a stored one that can be wrong.</p>
+
+<h2>Step 6 &mdash; Ordering</h2>
+
+<p>&ldquo;Messages must be in order&rdquo; sounds obvious and is subtle, because there is no single
+clock.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   Alice's phone:  14:32:05.100  (clock is 200ms fast)
+   Bob's laptop:   14:32:05.050  (clock is correct)
+
+   Bob replied AFTER Alice, but his timestamp is EARLIER.
+   Sort by client time and the conversation reads backwards.</code></pre>
+
+<p>So client timestamps are display metadata, never the sort key. Order comes from a value assigned
+server-side, and the natural choice is a Snowflake id from the <a
+href="/system-design/system-design-unique-id-generator">unique id post</a>: 64 bits, time-sortable,
+generated without coordination.</p>
+
+<p>The guarantee to aim for is <strong>ordering within a conversation</strong>, not globally.
+Global ordering across a whole system means one sequencer and therefore one bottleneck; per
+conversation it is free, because all of a conversation&rsquo;s messages go through one shard
+anyway.</p>
+
+<p>The remaining wrinkle is that two messages sent in the same millisecond on different servers can
+be ordered arbitrarily. In practice a per-conversation sequence number &mdash; incremented on the
+shard that owns the conversation &mdash; removes even that, at the cost of a counter per
+conversation.</p>
+
+<h2>Step 7 &mdash; Delivery, receipts, and offline</h2>
+
+<p>A message has more states than &ldquo;sent&rdquo;, and each transition is a separate event.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   SENT       accepted and persisted by the server   ✓
+   DELIVERED  written to the recipient's socket       ✓✓
+   READ       the recipient opened it                 ✓✓ (blue)</code></pre>
+
+<p>Receipts are just messages in the other direction, and they are worth counting: read receipts in
+a 100-person group are 100 events per message. Batching them &mdash; &ldquo;read up to message
+X&rdquo; rather than one per message &mdash; is the standard economy, and it is why real clients
+track a high-water mark instead of per-message flags.</p>
+
+<p>Offline delivery is the important half. If the registry says the recipient has no connection,
+the message is already persisted &mdash; so delivery becomes: queue a push notification, and let
+the client fetch what it missed on reconnect.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   client reconnects
+      └─> "give me everything after message_id 88213"
+          └─> one range scan on the conversation shard
+
+   The client tracks its own high-water mark. The server keeps
+   no per-user inbox — it is derivable from what the client last saw.</code></pre>
+
+<p>That last line is the design decision. Maintaining a per-user undelivered queue is a second
+source of truth that can disagree with the message store; a cursor the client supplies cannot
+diverge, because there is only one copy of the data.</p>
+
+<h2>Step 8 &mdash; Group fan-out</h2>
+
+<p>For a group of 100, sending is 100 registry lookups and up to 100 forwards. That is fine, and it
+is fine because the group size was bounded in step 1.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   group of 100, one message
+
+   naive:   100 lookups, 100 individual forwards
+
+   better:  group the recipients BY SERVER first
+            -> "server 400: deliver to alice, carol, dave"
+            -> 100 recipients might be only 30 forwards</code></pre>
+
+<p>Beyond a few hundred, this stops working and the model has to invert. Very large channels use
+<strong>fan-out on read</strong>: the message is written once, and clients pull it when they look,
+rather than the server pushing to a hundred thousand sockets. Broadcast-style channels use a
+pub/sub topic per channel with connection servers subscribing on behalf of their users, which turns
+N deliveries into one publish.</p>
+
+<p>This is the same fan-out-on-write versus fan-out-on-read decision that social feeds face, and
+naming it is what the interviewer is listening for.</p>
+
+<h3>What happens to a message, step by step</h3>
+
+<p>Worth tracing once end to end, because the ordering of these steps is where reliability lives:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  Alice's client sends over its WebSocket, with a CLIENT-GENERATED id
+   2  server 400 validates: is Alice in this conversation?
+   3  PERSIST to the message store          <- durable BEFORE anything else
+   4  ack to Alice ("sent" ✓)               <- she can stop worrying
+   5  look up Bob in the registry
+   6  publish to server 812
+   7  server 812 writes to Bob's socket     <- "delivered" ✓✓
+   8  Bob offline? -> push notification instead</code></pre>
+
+<p>Step 3 before step 4 is the rule. Acknowledging before persisting means telling Alice her
+message was sent and then losing it, which is the one failure this system must not have. Everything
+after step 4 can fail and be retried, because the message is already durable.</p>
+
+<p>The client-generated id in step 1 is the idempotency key from the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post</a>. A flaky mobile
+network means clients retry constantly, and without it every retry is a duplicate message in the
+conversation. With it, the server recognises the resend and re-acknowledges the original.</p>
+
+<p>It also gives the client optimistic rendering for free: show the message immediately in a
+pending state, and reconcile when the ack arrives carrying the server-assigned id.</p>
+
+<h2>Step 9 &mdash; Presence</h2>
+
+<p>Presence looks trivial and is the most expensive feature in the system, because it changes
+constantly and is interesting to many people at once.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   online  = the registry has a live connection for this user
+   offline = the TTL expired without a heartbeat
+
+   The cost: every status change notifies everyone watching.
+   A user with 500 contacts who commutes through a tunnel
+   generates 1,000 notifications for two connection events.</code></pre>
+
+<p>The standard economies: only publish presence to people currently <em>looking</em> at that user;
+batch changes over a short window rather than emitting each one; and add hysteresis, so a
+five-second network blip does not produce an offline-then-online pair.</p>
+
+<p>Typing indicators are the same shape and are usually handled by not persisting them at all
+&mdash; fire-and-forget, best effort, expiring after a few seconds. A lost typing indicator costs
+nothing, and that is what licenses the cheapest possible implementation.</p>
+
+<p>The general principle is worth extracting, because it applies well beyond chat: <strong>match
+the durability of a signal to what losing it actually costs.</strong> A message gets persistence,
+replication and retries. A read receipt gets best-effort delivery and a high-water mark. A typing
+indicator gets nothing at all. Spending the same reliability budget on all three is how a system
+ends up slow everywhere in order to protect something nobody would miss.</p>
+
+<h2>Step 10 &mdash; Media</h2>
+
+<p>Text is 100 bytes; a photo is 200 KB. Sending media through the WebSocket would be a mistake,
+and the reason generalises.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  client asks for an upload URL      POST /api/uploads  -> presigned URL
+   2  client uploads DIRECTLY to object storage   (never through your servers)
+   3  client sends a message containing the object key, not the bytes
+   4  recipients fetch it through the CDN</code></pre>
+
+<p>The message stays 100 bytes, which keeps the connection tier doing the one thing it is sized
+for. The bytes never traverse an application server, so a hundred people sharing videos does not
+consume the capacity that is holding ten million sockets open. And the CDN serves the download,
+which is what CDNs are for.</p>
+
+<p>The presigned URL is the mechanism worth naming: a time-limited, scope-limited credential that
+lets a client write one object to your bucket without ever having your storage credentials. It also
+means the upload can resume, which matters on a phone.</p>
+
+<p>The obligations that come with it: validate the file by its <em>bytes</em> rather than its
+declared content type, cap the size during the upload rather than after, and generate the stored
+name yourself rather than trusting the client&rsquo;s filename. Those are the same three rules any
+upload path needs, and they matter more here because the uploader is anonymous to the storage
+layer.</p>
+
+<h2>The whole thing</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   clients ══ws══> [ LB ]
+                     │  sticky by connection — a WebSocket
+                     │  cannot be re-balanced mid-life
+              ┌──────┴──────┬──────────────┐
+              v             v              v
+        [ conn srv 1 ] [ conn srv 2 ] ... [ conn srv 1000 ]
+              │             │              │      ~10k sockets each
+              ├─────────────┴──────────────┤
+              v                            v
+       [ REGISTRY (Redis) ]        [ pub/sub between servers ]
+        user -> server(s)                  │
+                                           v
+                                    [ message store ]
+                                     sharded by conversation_id
+                                           │
+                                           └──> [ push notifications ]
+                                                 for offline recipients</code></pre>
+
+<h2>Failure modes</h2>
+
+<table>
+  <thead><tr><th>What fails</th><th>Effect</th><th>Recovery</th></tr></thead>
+  <tbody>
+    <tr><td>A connection server</td><td>~10k users disconnected</td>
+        <td>Clients reconnect elsewhere; registry entries expire by TTL; missed messages pulled by
+            cursor. Nothing lost &mdash; delivery was never the same thing as storage.</td></tr>
+    <tr><td>The registry</td><td>Online users look offline</td>
+        <td>Messages fall back to the offline path: persisted plus a push notification. Degraded,
+            not broken &mdash; provided that fallback exists.</td></tr>
+    <tr><td>Pub/sub between servers</td><td>Cross-server delivery stops</td>
+        <td>The worst one. Messages persist, so nothing is lost, but real-time delivery becomes
+            fetch-on-reconnect and the product stops feeling like chat.</td></tr>
+    <tr><td>One message-store shard</td><td>Those conversations are read-only or unavailable</td>
+        <td>Replica promotion. Blast radius is bounded to one shard&rsquo;s conversations.</td></tr>
+    <tr><td>Push provider</td><td>Offline users are not woken</td>
+        <td>They see messages on next open. Queue and retry.</td></tr>
+  </tbody>
+</table>
+
+<p>The pattern across that table is the one to state out loud: <strong>because every message is
+persisted before it is delivered, every delivery failure degrades to a delay rather than a
+loss.</strong> That is the property the whole architecture is arranged to have, and it is what lets
+each component fail independently.</p>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;WebSocket or long polling?&rdquo;</strong> &mdash; WebSocket, because
+      bidirectional and the per-message overhead matters at 60k/sec. Long polling as the fallback
+      where upgrades are blocked.</li>
+  <li><strong>&ldquo;How does server A reach a user on server B?&rdquo;</strong> &mdash; the
+      registry plus pub/sub. This is the question the whole design exists to answer.</li>
+  <li><strong>&ldquo;A connection server dies. What happens?&rdquo;</strong> &mdash; its clients
+      reconnect elsewhere and re-register; its registry entries expire by TTL. Messages sent during
+      the gap are persisted, and the reconnecting client pulls them by cursor. Nothing is lost
+      because delivery was never the same thing as storage.</li>
+  <li><strong>&ldquo;How do you keep messages in order?&rdquo;</strong> &mdash; server-assigned
+      Snowflake ids, ordered per conversation, never client clocks.</li>
+  <li><strong>&ldquo;How do you shard?&rdquo;</strong> &mdash; by conversation id; every operation
+      carries it.</li>
+  <li><strong>&ldquo;What about a 100,000-member channel?&rdquo;</strong> &mdash; different system:
+      fan-out on read, or pub/sub per channel. Say that the design above deliberately bounded group
+      size in step 1.</li>
+  <li><strong>&ldquo;End-to-end encryption?&rdquo;</strong> &mdash; changes the server&rsquo;s job
+      to routing opaque bytes, and removes server-side search, moderation and multi-device history
+      unless keys are shared between devices. Worth knowing what it costs, not just that it exists.</li>
+</ul>
+
+<p>The takeaway that transfers: chat is the case study where the <em>connection</em> is the
+resource being managed, not the request. Once you see that, the registry, the heartbeats, the
+sticky load balancing and the reconnect-by-cursor protocol all stop being separate tricks and
+become consequences of one fact.</p>
+
+<p>Next: <a href="/system-design/system-design-notification-system">designing a notification
+system</a> &mdash; the offline half of this post, made into a system of its own.</p>

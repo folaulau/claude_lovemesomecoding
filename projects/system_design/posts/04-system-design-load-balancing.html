@@ -1,0 +1,447 @@
+<p>One server is a ceiling and a single point of failure. The fix &mdash; run several and put
+something in front to spread the traffic &mdash; sounds like the easiest decision in system design,
+and mostly it is. The interesting part is not the load balancer. It is what running several servers
+demands of your application, which is where designs actually fail.</p>
+
+<p>This post covers both: how a load balancer picks a server, and what &ldquo;stateless&rdquo;
+really requires. Plus the layer above, where the fastest request is the one that never reaches you
+at all.</p>
+
+<h2>What it does, and the job people forget</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">                          ┌──> [ app 1 ]  ✓ healthy
+   clients ──> [ LB ] ────┼──> [ app 2 ]  ✓ healthy
+                          └──> [ app 3 ]  ✗ failing health checks
+                                             — taken out of rotation</code></pre>
+
+<p>The obvious job is distribution. The job that matters more is the annotation on the third line:
+<strong>a load balancer is also the thing that notices a server is sick and stops sending it
+traffic.</strong></p>
+
+<p>Without health checks, losing one instance out of three does not cost you a third of your
+capacity &mdash; it costs you a third of your <em>requests</em>, as errors, until a human
+intervenes. With them, the same failure is invisible to users. That is the availability argument,
+and it is a stronger reason to run a load balancer than throughput is.</p>
+
+<p>It also gives you two things you did not ask for and will use constantly: a place to terminate
+TLS, so certificates live in one place rather than on every server; and the ability to deploy
+without downtime, by draining one instance at a time.</p>
+
+<h2>Layer 4 or layer 7</h2>
+
+<p>The first real choice, and it is about how much the balancer understands.</p>
+
+<p>A <strong>layer 4</strong> balancer works at the TCP level. It sees IP addresses and ports,
+picks a backend, and forwards packets. It never looks inside the connection, which means it is very
+fast and cannot do very much.</p>
+
+<p>A <strong>layer 7</strong> balancer terminates the HTTP request, reads it, and then decides. It
+knows the path, the headers, the cookies and the method.</p>
+
+<table>
+  <thead><tr><th></th><th>Layer 4</th><th>Layer 7</th></tr></thead>
+  <tbody>
+    <tr><td>Sees</td><td>IP, port, TCP</td><td>URL, headers, cookies, method</td></tr>
+    <tr><td>Routing by path</td><td>No</td><td>Yes &mdash; <code>/api/*</code> here, <code>/static/*</code> there</td></tr>
+    <tr><td>TLS termination</td><td>No (passes through)</td><td>Yes</td></tr>
+    <tr><td>Retry a failed request</td><td>No &mdash; it does not know what a request is</td><td>Yes, safely, for idempotent methods</td></tr>
+    <tr><td>Throughput</td><td>Higher</td><td>Lower &mdash; it parses everything</td></tr>
+    <tr><td>Health checks</td><td>Is the port open?</td><td>Does <code>GET /health</code> return 200?</td></tr>
+  </tbody>
+</table>
+
+<p>For an HTTP API, layer 7 is nearly always the answer, and the health check row is why. &ldquo;Is
+the port open?&rdquo; is a much weaker question than &ldquo;does this instance actually work?&rdquo;
+A process that has deadlocked, lost its database connection, or run out of heap still accepts TCP
+connections perfectly happily.</p>
+
+<h3>Where it sits, physically</h3>
+
+<p>One more distinction that comes up: a load balancer can be hardware, software, or somebody
+else&rsquo;s problem.</p>
+
+<table>
+  <thead><tr><th></th><th>Examples</th><th>When it fits</th></tr></thead>
+  <tbody>
+    <tr><td>Managed</td><td>AWS ALB/NLB, GCP LB, Cloudflare</td>
+        <td>Almost always. Already redundant across zones, scales itself, someone else is on call for it.</td></tr>
+    <tr><td>Software</td><td>nginx, HAProxy, Envoy, Traefik</td>
+        <td>Self-hosted, or when you need routing rules a managed one cannot express</td></tr>
+    <tr><td>Hardware</td><td>F5, Citrix</td>
+        <td>Existing datacenters, regulated environments. Rare in new designs.</td></tr>
+  </tbody>
+</table>
+
+<p>&ldquo;A managed load balancer&rdquo; is a perfectly good interview answer, provided you can say
+what it is doing for you &mdash; which is the redundancy from the section below, plus TLS
+termination, plus health checking. Naming the product is not the answer; knowing which of its jobs
+you depend on is.</p>
+
+<h2>Algorithms</h2>
+
+<p>How the balancer picks. There are five worth knowing and the differences only show up under
+load.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ROUND ROBIN          1, 2, 3, 1, 2, 3 ...
+                     simple; assumes every request costs the same
+
+WEIGHTED             server 1 gets 2x the share of server 2
+                     for a mixed fleet
+
+LEAST CONNECTIONS    send to whoever has fewest in flight
+                     self-correcting when request costs vary
+
+LEAST RESPONSE TIME  fewest connections, tie-broken by latency
+                     routes around a sick-but-alive instance
+
+IP HASH / CONSISTENT hash(client) -> always the same server
+                     needed only when something is NOT stateless</code></pre>
+
+<p><strong>Round robin</strong> is the sensible default and its assumption is the thing to
+remember: it assumes requests cost roughly the same. If one endpoint takes 5ms and another takes
+two seconds, round robin will happily give one server three of the slow ones in a row.</p>
+
+<p><strong>Least connections</strong> fixes that without needing to know anything about the
+endpoints, which is why it is the right default for a mixed API.</p>
+
+<p><strong>IP hash</strong> deserves suspicion. It exists to send the same client to the same
+server every time, and the only reason you need that is that your servers are keeping something in
+memory &mdash; which is the problem, not the solution. It is also unfair, because thousands of
+users behind one corporate NAT all hash to the same instance.</p>
+
+<h2>Health checks that actually check health</h2>
+
+<p>The gap between &ldquo;the process is running&rdquo; and &ldquo;this instance can serve
+requests&rdquo; is where availability is lost.</p>
+
+<p>A check that returns a constant is worse than useless, because it will keep reporting healthy
+while the database connection pool is exhausted. A check should touch the dependencies it needs
+&mdash; and, critically, distinguish the ones it needs from the ones it merely likes.</p>
+
+<p>StayHub&rsquo;s reports each dependency separately and lets only one of them decide:</p>
+
+<pre class="language-python"><code class="language-python">    es_ok = es_available()
+    cache_ok = cache.available()
+
+    return Health(
+        status="ok" if db_ok else "degraded",
+        database=db_ok,
+        elasticsearch=es_ok,
+        cache=cache_ok,
+    )</code></pre>
+
+<p>The <code>status</code> field answers &ldquo;should traffic come here?&rdquo; and only the
+database gets a vote. The booleans answer &ldquo;what is broken?&rdquo; for a human.</p>
+
+<p>That split matters more than it looks. If Redis being down marked instances unhealthy, a cache
+outage would pull the entire fleet out of rotation at once &mdash; converting a slow site into no
+site, because of a component that was supposed to be optional. <strong>A dependency in your health
+check is a dependency that can take you down.</strong></p>
+
+<h3>Liveness and readiness are different questions</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">  LIVENESS   "is this process wedged?"        failing -> RESTART it
+  READINESS  "can it serve traffic now?"      failing -> stop sending, don't restart</code></pre>
+
+<p>Conflating them causes a specific and nasty failure. If a readiness failure triggers restarts,
+then a database outage &mdash; which makes every instance unready &mdash; restarts your entire
+fleet in a loop, and the fleet is now also cold and hammering the database with reconnections while
+it recovers.</p>
+
+<p>Readiness should also fail during startup, before caches are warm and connections are
+established, so an instance does not receive traffic it cannot yet serve.</p>
+
+<h2>Stateless, and what it actually costs</h2>
+
+<p>Everything above assumes any server can handle any request. That assumption is the real work.</p>
+
+<p>The classic violation is server-side sessions. A user logs in, the server stores the session in
+memory, and now only that server knows who they are:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   login   ──> [ app 1 ]   sessions = {abc123: user 7}
+   next    ──> [ app 2 ]   sessions = {}          -> "please log in"</code></pre>
+
+<p>There are three ways out, and only two are good.</p>
+
+<p><strong>Sticky sessions</strong> pin each user to one server. It is the tempting fix and it is a
+trap: you cannot deploy without logging people out, one server dying logs out everyone on it, load
+becomes uneven and stays uneven, and autoscaling cannot help because new servers get no traffic.</p>
+
+<p><strong>A shared session store</strong> &mdash; sessions in Redis rather than in memory &mdash;
+works properly. Any server can serve any request. The cost is a network round trip per request and
+a new critical dependency, which brings back the availability question above.</p>
+
+<p><strong>A signed token</strong> puts the session in the request. The server verifies a signature
+and needs no lookup at all. This is what StayHub does:</p>
+
+<pre class="language-python"><code class="language-python">def create_access_token(user: User) -> str:
+    now = datetime.now(UTC)
+    expires = now + timedelta(minutes=settings.access_token_expire_minutes)
+
+    claims = {
+        "sub": str(user.public_id),
+        "email": user.email,
+        "role": user.role.value,
+        "iat": int(now.timestamp()),
+        "exp": int(expires.timestamp()),</code></pre>
+
+<p>Any instance with the shared secret can verify that token. Nothing is stored, so nothing has to
+be shared, and a server can be destroyed mid-session with no consequence.</p>
+
+<p>The cost is real and specific: <strong>you cannot revoke a token before it expires</strong>,
+because nothing is consulted. Ban a user and their token keeps working until it lapses. The usual
+mitigations are short lifetimes plus refresh tokens, or a revocation list &mdash; which reintroduces
+the lookup you were avoiding, though only for the rare case.</p>
+
+<p>StayHub takes a middle path: it re-reads the user row on every request anyway.</p>
+
+<pre class="language-python"><code class="language-python">    user = db.execute(
+        select(User).where(User.public_id == claims["sub"], User.deleted.is_(False))
+    ).scalar_one_or_none()
+
+    if user is None:
+        raise UnauthorizedException("Your account is no longer active.")
+    return user</code></pre>
+
+<p>The token proves <em>who</em>; the database says what they currently are. A deleted or demoted
+account stops working immediately, and the lookup is a primary-key hit that the database serves
+from memory.</p>
+
+<h3>The other state people forget</h3>
+
+<p>Sessions are the obvious one. These are the ones that ship to production and then break:</p>
+
+<ul>
+  <li><strong>Uploaded files written to local disk.</strong> The next request lands on another
+      server and the file is not there. Object storage, not a filesystem.</li>
+  <li><strong>In-process caches.</strong> Not fatal, but each server has its own, so invalidation
+      on one leaves the others stale &mdash; and users see values flip as they are balanced
+      around.</li>
+  <li><strong>Scheduled jobs in the app process.</strong> Ten servers means the nightly billing run
+      executes ten times. This one is expensive.</li>
+  <li><strong>Rate limit counters in memory.</strong> A limit of 100 becomes an effective limit of
+      100 &times; the number of servers. The <a
+      href="/system-design/system-design-rate-limiting">rate limiting post</a> is about exactly
+      this.</li>
+  <li><strong>WebSocket connections.</strong> Genuinely stateful and cannot be made otherwise
+      &mdash; the connection lives on one machine. The answer is a registry of which server holds
+      which user, which is why <a href="/system-design/system-design-chat-system">chat systems</a>
+      have a component nothing else does.</li>
+</ul>
+
+<h2>Deploying without dropping requests</h2>
+
+<p>Once traffic is balanced across a pool, you can replace instances one at a time. Doing it
+without errors takes one more step than people expect.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1. mark instance NOT READY          LB stops sending NEW requests
+   2. wait for in-flight to finish     ~30s "connection draining"
+   3. SIGTERM the process              it finishes and exits cleanly
+   4. start the replacement
+   5. wait for it to pass readiness    NOT liveness — it may need warming
+   6. put it back in rotation
+   7. next instance</code></pre>
+
+<p>Step 2 is the one that gets skipped, and skipping it produces a small, constant trickle of 502s
+during every deploy that nobody can reproduce afterwards. A request already being served when the
+process dies is a failed request; draining is simply waiting for those to finish.</p>
+
+<p>Step 5 matters for a different reason. A freshly started instance has an empty connection pool
+and a cold cache, so its first requests are slow. Sending it a full share immediately means a
+latency spike on every deploy.</p>
+
+<p>The same mechanism gives you <strong>canary deploys</strong>: weight the new version to 5% of
+traffic, watch its error rate against the others, then shift the rest or roll back. That is a
+capability you get free from having a load balancer, and it is worth mentioning as a benefit
+alongside throughput.</p>
+
+<h2>Autoscaling, and the trap in it</h2>
+
+<p>Since the tier is stateless, machines can be added and removed automatically &mdash; usually on
+CPU, request rate, or a queue depth.</p>
+
+<p>The trap is that <strong>scaling up is not instant</strong>. Provisioning a machine, starting
+the runtime, warming connections and passing readiness takes two to five minutes, and traffic
+spikes take seconds. An autoscaler alone does not protect you from a sudden spike; it protects you
+from a sustained one.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   traffic  ▁▁▁▁▁▁▇▇▇▇▇▇▇▇▇▇▇▇▇▇
+   capacity ▁▁▁▁▁▁▁▁▁▁▁▃▃▃▃▇▇▇▇▇
+                       ^^^^^
+                       2-5 minutes of being overloaded
+                       while the new instances boot</code></pre>
+
+<p>So the answers are: keep headroom rather than running at 80% CPU; scale on a leading indicator
+(queue depth, latency) rather than a lagging one (CPU); pre-scale for events you know about; and
+set a sensible floor so you are never at one instance.</p>
+
+<p>The other trap is <strong>flapping</strong> &mdash; scaling down as soon as load drops, then
+back up thirty seconds later. Cooldown periods and asymmetric thresholds (scale up eagerly, down
+reluctantly) are the usual fix.</p>
+
+<h2>The load balancer is now the single point of failure</h2>
+
+<p>Worth saying, because it is the obvious follow-up question. You removed the SPOF from the app
+tier and created one in front of it.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">        DNS returns several IPs (round robin)
+              │
+      ┌───────┴───────┐
+      v               v
+   [ LB A ]        [ LB B ]        active/active, different zones
+      └───────┬───────┘
+              v
+        [ app 1..N ]</code></pre>
+
+<p>Two answers in practice. Run a pair, sharing a floating IP that moves on failure. Or use a
+managed load balancer, which is already several machines across several availability zones
+pretending to be one thing &mdash; and this is the honest reason most teams use a cloud
+balancer.</p>
+
+<p>DNS-level round robin sits above both. It is crude &mdash; clients cache DNS answers and will
+keep using a dead address until the TTL expires &mdash; so it distributes but does not fail over
+quickly. It is worth knowing precisely because of that weakness: a short TTL is the difference
+between a two-minute recovery and an hour of some users hitting a dead address, and TTLs are
+routinely left at their defaults.</p>
+
+<p>There is a nice symmetry to notice here. Every layer of this stack solves the availability
+problem the same way &mdash; by having more than one of the thing and a way to detect which ones
+are broken. DNS has several A records, the balancer pair has a floating IP, the app tier has health
+checks, and further down the database has a standby. The mechanism differs; the shape does not.</p>
+
+<h3>Getting users to the nearest region</h3>
+
+<p>Everything so far is one datacenter. Serving users on several continents adds a routing layer
+above the load balancer, and there are two mechanisms.</p>
+
+<p><strong>GeoDNS</strong> answers the same hostname with different IPs depending on where the
+query came from &mdash; European users get the Frankfurt balancer, American users get Virginia. It
+is simple and it inherits DNS&rsquo;s weakness: answers are cached, so failing a region over is as
+slow as the TTL.</p>
+
+<p><strong>Anycast</strong> announces the same IP address from many locations and lets internet
+routing deliver each packet to the nearest one. Failover is nearly immediate, because it happens at
+the network layer rather than by clients re-resolving. It is what CDNs use.</p>
+
+<p>Both raise a question they cannot answer: your database is in one region. Serving a European
+read from Frankfurt is only useful if the data is there too, which means read replicas per region
+&mdash; and now every one of them lags. Multi-region is not a load balancing decision, it is a data
+decision, and it is genuinely hard. Reaching for it before you need it is one of the more expensive
+mistakes available.</p>
+
+<h2>Not sending the request at all</h2>
+
+<p>The cheapest request is the one that never arrives. Before scaling the fleet, remove work
+from it.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   browser ──> [ CDN edge, near the user ]
+                     │ hit  -> ~10ms, your servers never knew
+                     │ miss
+                     v
+               [ LB ] ──> [ app ] ──> [ origin / object store ]</code></pre>
+
+<p>A CDN is a global network of caches near users. It answers for anything static &mdash; images,
+CSS, JavaScript, fonts, video &mdash; and for a media-heavy site that is the overwhelming majority
+of requests by count and almost all of them by bytes.</p>
+
+<p>The physics argument from the <a
+href="/system-design/system-design-back-of-envelope-estimation">estimation post</a> applies here and
+cannot be engineered around: a round trip from California to Europe is about 150ms no matter how
+fast your servers are. Only moving the bytes closer helps.</p>
+
+<p>Cache lifetime is controlled by headers, and the pattern that makes it safe is
+<strong>fingerprinting</strong>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   /static/app.a3f9c2.js     Cache-Control: max-age=31536000, immutable
+                             ^^^^^^ content hash — a new build is a NEW URL,
+                                    so a year-long cache is never stale
+
+   /index.html               Cache-Control: no-cache
+                             must revalidate — it names the fingerprinted files</code></pre>
+
+<p>Fingerprinted assets cache forever safely, because changing the content changes the URL. The
+small HTML file that points at them is the only thing that must be revalidated. This site is built
+exactly this way.</p>
+
+<h2>Protecting the servers behind it</h2>
+
+<p>A load balancer distributes load. It does not, by itself, protect anything &mdash; and the point
+where all traffic converges is the natural place to add protection, because it is the only place
+that sees everything.</p>
+
+<p>Three mechanisms belong here, and they are worth naming because interviewers ask what happens
+when traffic is not merely high but hostile or pathological.</p>
+
+<p><strong>Rate limiting at the edge.</strong> A request refused at the balancer costs no worker,
+no database connection and no log line. A request refused inside your application has already cost
+all three. Fine-grained per-user limits still belong in the application &mdash; that is where you
+know who is calling &mdash; but a coarse per-IP limit belongs out here.</p>
+
+<p><strong>Timeouts, everywhere.</strong> The default in most clients is no timeout at all, which
+means &ldquo;wait forever&rdquo;. One slow dependency then occupies every worker in the fleet, and
+a partial failure becomes a total one:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   no timeout:   200 workers x waiting forever on a hung service
+                 = 0 workers left for the 95% of requests that
+                   do not touch that service at all
+
+   with timeout: those requests fail in 2s and free the worker</code></pre>
+
+<p>Every timeout in a chain should also be shorter than the one above it. If the balancer gives up
+after 30 seconds and your database query has no limit, the client is long gone while the query
+grinds on holding a connection.</p>
+
+<p><strong>Circuit breakers.</strong> After N consecutive failures against a dependency, stop
+calling it for a while and fail immediately instead. This is counter-intuitive &mdash; you are
+choosing to fail requests that might have worked &mdash; and it is right, because retrying a
+struggling service is how you keep it struggling. The retries <em>are</em> the load.</p>
+
+<p>The same logic explains why retries need <strong>jitter</strong>. If every client retries after
+exactly one second, the recovering service is hit by a synchronised wave, fails again, and the wave
+repeats. A random component spreads them out. The <a
+href="/system-design/system-design-message-queues">queues post</a> makes the same argument about
+backoff.</p>
+
+<h2>Putting it together</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   client
+     │
+     ├── static ──> [ CDN ] ──────────────> [ object store ]
+     │                                          (never touches an app server)
+     └── API ────> [ DNS ] ──> [ LB pair ]
+                                   │  layer 7, TLS terminated here
+                                   │  least connections
+                                   │  GET /health every 5s
+                        ┌──────────┼──────────┐
+                        v          v          v
+                     [ app 1 ] [ app 2 ] [ app 3 ]   stateless:
+                        │          │          │        - JWT, no sessions
+                        └──────────┴──────────┘        - uploads -> object store
+                                   │                   - jobs -> a worker
+                                   v                   - counters -> Redis
+                            [ database ]</code></pre>
+
+<h2>What to say when asked</h2>
+
+<ul>
+  <li><strong>Layer 7 for an HTTP API</strong>, because path routing and real health checks are
+      worth more than layer 4&rsquo;s throughput at any scale you are likely to design for.</li>
+  <li><strong>Least connections</strong> when endpoint costs vary, round robin when they do
+      not.</li>
+  <li><strong>Health checks report dependencies separately</strong>, and only the ones you truly
+      cannot serve without get a vote on whether traffic arrives.</li>
+  <li><strong>Liveness restarts, readiness diverts.</strong> Never let the second trigger the
+      first.</li>
+  <li><strong>Stateless via signed tokens</strong>, with the cost named out loud: revocation. Not
+      sticky sessions.</li>
+  <li><strong>Run the balancer in pairs</strong>, or use a managed one, and say why.</li>
+  <li><strong>CDN first.</strong> Removing requests beats distributing them.</li>
+</ul>
+
+<p>The through-line: the load balancer itself is the simple part. Everything hard about this
+topic is a consequence of running more than one of something &mdash; state has nowhere to live,
+failures have to be detected rather than noticed, and deploys become a rolling operation instead of
+a restart. Get those right and the balancer is a config file.</p>
+
+<p>Next: <a href="/system-design/system-design-caching">caching</a> &mdash; the other way to stop
+work reaching the parts of your system that cannot scale horizontally.</p>

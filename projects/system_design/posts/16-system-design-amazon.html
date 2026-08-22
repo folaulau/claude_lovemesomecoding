@@ -1,0 +1,464 @@
+<p>&ldquo;Design Amazon&rdquo; is really four systems: a catalog, a search engine, an inventory
+ledger and an order pipeline. Each is a reasonable interview question on its own, so the first
+thing to do is say that out loud and pick a spine to follow.</p>
+
+<p>The spine here is a single item&rsquo;s journey from search to delivery, because it touches all
+four.</p>
+
+<p><strong>A note on what follows.</strong> The <a href="/system-design/system-design-airbnb">Airbnb
+post</a> quotes a running application. This one cannot: nobody operates a catalog of hundreds of
+millions of products on a laptop. The schemas and flows below are design work, presented as such
+&mdash; where a mechanism has already been shown working earlier in this track, it is linked rather
+than re-invented.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                          OUT OF SCOPE (say so)
+  browse and search products        the seller marketplace and its payouts
+  product detail pages              reviews and Q&amp;A
+  cart                              returns and refunds
+  checkout and payment              subscriptions, digital goods
+  inventory and order state         the logistics network itself
+  order tracking
+
+WORTH ASKING
+  can we oversell?                 -> the single most important question here
+  one warehouse or many?           -> changes inventory from a number to a matrix
+  guest checkout?                  -> changes the cart's identity model
+  how fresh must stock be?         -> "2 left!" vs "in stock" is a design decision
+
+NON-FUNCTIONAL
+  browsing: fast, may be stale      a 2-minute-old price on a listing is fine
+  checkout: correct, never stale    charging the wrong price is not
+  read:write ~ 50:1
+  availability > consistency
+    for browsing
+  consistency > availability
+    for money and stock</code></pre>
+
+<p>The oversell question is the one to press on, and the honest answer is that
+<strong>real retailers do oversell</strong> &mdash; deliberately. Refusing every uncertain sale
+costs more than occasionally apologising and refunding. That is a business decision that changes
+the engineering completely, and discovering it in step 1 saves you from designing a perfectly
+consistent system nobody wanted.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  100M daily active users · 300M products
+        each user views ~30 products, searches ~8 times
+        ~2% of visits end in an order · ~3 items per order
+
+READS   100M x 30 / 100k   = 30,000 product views/sec   peak x3 =  90,000/sec
+        100M x 8  / 100k   =  8,000 searches/sec        peak x3 =  24,000/sec
+WRITES  100M x 0.02 = 2M orders/day / 100k
+                           =     20 orders/sec          peak x10 =    200/sec
+        (x10, not x3 — retail peaks are Black Friday, not evenings)
+
+STORAGE 300M products x ~10 KB   = 3 TB of catalog
+        2M orders/day x 5 KB x 365 = ~3.6 TB/year of orders</code></pre>
+
+<p>Three readings, and the third is the one that shapes the design.</p>
+
+<p><strong>90,000 product views/sec</strong> is a caching and CDN problem, and it is entirely
+solvable that way because product pages change rarely.</p>
+
+<p><strong>200 orders/sec</strong> is small. Twenty database writes a second is nothing; two hundred
+is still nothing. Once again the write path is hard for reasons other than volume.</p>
+
+<p><strong>3 TB of catalog does not fit in memory</strong>, which is the difference from Airbnb. The
+whole catalog cannot be cached, so caching becomes a hot-set problem with an eviction policy that
+matters &mdash; and the long tail of products will always be a database read.</p>
+
+<h2>Step 3 &mdash; The catalog</h2>
+
+<p>The first genuinely hard modelling problem: a book, a television and a bag of coffee share almost
+no attributes, and there are tens of thousands of categories.</p>
+
+<pre class="language-sql"><code class="language-sql">-- The stable spine: the same for every product, whatever it is.
+CREATE TABLE products (
+    id            BIGINT PRIMARY KEY,
+    title         TEXT NOT NULL,
+    brand_id      BIGINT,
+    category_id   BIGINT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL
+);
+
+-- The variable part: category-specific, schemaless on purpose.
+CREATE TABLE product_attributes (
+    product_id    BIGINT NOT NULL REFERENCES products(id),
+    attributes    JSONB NOT NULL,   -- {"screenSize":"55in","panel":"OLED"}
+    PRIMARY KEY (product_id)
+);
+
+-- What is actually bought: a specific size/colour, with its own stock and price.
+CREATE TABLE skus (
+    id            BIGINT PRIMARY KEY,
+    product_id    BIGINT NOT NULL REFERENCES products(id),
+    variant       JSONB NOT NULL,   -- {"size":"M","colour":"navy"}
+    price         NUMERIC(12,2) NOT NULL
+);</code></pre>
+
+<p>The product-versus-SKU split is the decision that matters. A customer browses a
+<strong>product</strong> (&ldquo;this jacket&rdquo;) and buys a <strong>SKU</strong> (&ldquo;this
+jacket, medium, navy&rdquo;). Stock, price and physical dimensions belong to the SKU; title,
+description and images belong to the product. Conflating them is the mistake that makes every later
+feature awkward.</p>
+
+<p>Attributes as JSON rather than a column per attribute is the pragmatic answer to tens of
+thousands of category-specific fields. The cost is that JSON cannot be indexed as effectively as a
+column &mdash; which does not matter here, because <em>attribute queries do not go to the database
+at all</em>. They go to the search index, which is built for exactly that.</p>
+
+<h2>Step 4 &mdash; Search and faceting</h2>
+
+<p>24,000 searches a second across 300 million products, with faceted filters that must show counts
+before you click them.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   "running shoes"          12,847 results
+
+   Brand                    Size                Price
+   [ ] Nike        (3,201)  [ ] 8     (1,120)   [ ] under $50   (2,010)
+   [ ] Adidas      (2,876)  [ ] 9     (1,340)   [ ] $50-100     (5,932)
+   [ ] New Balance (1,455)  [ ] 10    (1,502)   [ ] $100-200    (3,881)
+
+   Every one of those counts is an aggregation over the FILTERED set,
+   recomputed on every query. SQL cannot do this at this scale.</code></pre>
+
+<p>That is what a search engine is for: an inverted index for the text, plus aggregations that
+compute facet counts in the same pass as the query. Postgres could produce those counts with a
+dozen <code>GROUP BY</code> queries per search, and at 24,000 searches a second it would not
+survive.</p>
+
+<p>The index is a <strong>denormalised read model</strong> &mdash; product, SKU, brand, category,
+price and stock flag flattened into one document, so rendering a result page needs no joins and no
+database. Same principle as the Airbnb index, at a much larger scale.</p>
+
+<p>Ranking is where the real work is, and it is worth naming that relevance here is
+<em>commercial</em> rather than purely textual: text match, plus sales velocity, rating, price
+competitiveness, delivery speed and stock. A perfectly relevant result that cannot be delivered for
+three weeks is a bad result.</p>
+
+<h3>Keeping the index in step with 300 million products</h3>
+
+<p>The catalog is the source of truth and the index is derived, exactly as in the Airbnb post
+&mdash; but at this size the sink cannot be a synchronous call after each write.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   seller updates a price
+        │
+        v
+   [ catalog DB ]  commit
+        │
+        └──> outbox row ──> [ stream ] ──> [ indexer ] ──> search index
+                              partitioned      batches documents,
+                              by product_id    ~seconds behind</code></pre>
+
+<p>Three consequences of doing it through a stream rather than inline. Updates are
+<strong>batched</strong>, because indexing 300 million documents one HTTP call at a time is
+impossible &mdash; and batching is why the index is seconds behind rather than milliseconds.
+Partitioning by product id gives <strong>per-product ordering</strong>, so two rapid price changes
+cannot be applied out of order. And a slow indexer becomes a growing lag metric rather than a slow
+seller-facing API.</p>
+
+<p>The staleness is acceptable for the same reason it was acceptable at Airbnb: search results are
+a browsing surface, and the authoritative price is read again at checkout. What is <em>not</em>
+acceptable is silent divergence, which is why the lag is a monitored number and a full rebuild is a
+supported operation rather than an emergency.</p>
+
+<h2>Step 5 &mdash; The cart</h2>
+
+<p>A cart looks trivial and has three properties that make it interesting.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   ANONYMOUS          cart tied to a session/device id
+        │
+        │  user signs in
+        v
+   IDENTIFIED         MERGE the two carts — do not discard either
+                      (discarding the anonymous one is the classic bug)</code></pre>
+
+<p><strong>It must survive a logout, a new device and a month of neglect</strong>, so it lives
+server-side rather than in browser storage. <strong>It must merge on sign-in</strong>, and the
+merge rule needs deciding: union the items, and for a duplicate SKU take the larger quantity rather
+than summing, or a customer who adds the same thing on two devices ends up with four.</p>
+
+<p><strong>It does not hold prices.</strong> The cart stores SKU ids and quantities; price is
+resolved at display and again at checkout. Storing the price means an item added in a sale is still
+at the sale price six weeks later &mdash; and the reverse, a price rise applying retroactively to a
+cart, is worse.</p>
+
+<p>The natural store is a key-value database keyed by user or session, with a TTL. Carts are
+high-write, low-value, per-user data with no relationships &mdash; which is the clearest case in
+this track for <em>not</em> using the relational database.</p>
+
+<p>Adding to a cart must not reserve stock. Millions of carts holding inventory would make
+everything appear out of stock permanently.</p>
+
+<h2>Step 6 &mdash; Inventory</h2>
+
+<p>The heart of the system, and the place where the Airbnb answer stops working.</p>
+
+<p>There, a Postgres exclusion constraint made double booking impossible. Here the equivalent is a
+count, and the naive version is the check-then-act race from the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post</a>:</p>
+
+<pre class="language-sql" data-antipattern="true"><code class="language-sql">-- WRONG: two orders read 1, both decide there is stock, both proceed.
+SELECT quantity FROM inventory WHERE sku_id = 42;   -- 1
+UPDATE inventory SET quantity = quantity - 1 WHERE sku_id = 42;</code></pre>
+
+<p>The single-node fix is one statement with the guard in it:</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE inventory
+   SET available = available - 1
+ WHERE sku_id = 42 AND available &gt;= 1;
+-- 0 rows updated? There was no stock. The database decided, atomically.</code></pre>
+
+<p>That is correct and it does not scale, for the reason the <a
+href="/system-design/system-design-database-scaling">database scaling post</a> gives: every buyer
+of a popular SKU contends on one row. On a launch day that row is the whole system, and row locks
+serialise it.</p>
+
+<h3>Reserved versus available</h3>
+
+<p>Stock is not one number. It is at least three, and separating them removes a class of bug:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE inventory (
+    sku_id       BIGINT NOT NULL,
+    warehouse_id BIGINT NOT NULL,
+    on_hand      INTEGER NOT NULL,   -- physically present
+    reserved     INTEGER NOT NULL,   -- promised to open orders
+    PRIMARY KEY (sku_id, warehouse_id)
+);
+-- sellable = on_hand - reserved</code></pre>
+
+<p>Checkout increments <code>reserved</code>; shipping decrements both. A cancelled or expired order
+releases the reservation. That gives a natural hold with a timeout &mdash; the same shape as the
+PENDING booking in the Airbnb post, expressed as a counter instead of a row.</p>
+
+<p>Multiple warehouses turn stock into a matrix, and &ldquo;is it available?&rdquo; becomes
+&ldquo;is it available somewhere that can deliver to this address in time?&rdquo; That is a
+routing question, not a stock question, and it is where retail inventory genuinely diverges from
+booking.</p>
+
+<h3>What actually gets built at scale</h3>
+
+<p>The strict version cannot take a launch-day spike, so large retailers relax it deliberately:</p>
+
+<ul>
+  <li><strong>Approximate counts on read.</strong> The product page says &ldquo;in stock&rdquo; from
+      a cached, slightly stale value. Only checkout consults the authoritative number, so 90,000
+      views a second never touch the contended row.</li>
+  <li><strong>Sharded counters.</strong> Split one SKU&rsquo;s stock into N rows across N shards,
+      decrement whichever shard the request lands on, and sum for display. Contention drops by a
+      factor of N; the cost is that a shard can be empty while others are not.</li>
+  <li><strong>Queue the decrements.</strong> Serialise per SKU through a queue partitioned by SKU,
+      so the hot row has exactly one writer. Adds latency, removes contention entirely.</li>
+  <li><strong>Accept overselling.</strong> Take the order, reconcile later, apologise and refund.
+      For most catalog items the expected cost of that is lower than the revenue lost by refusing
+      &mdash; and it is why the step 1 question mattered.</li>
+</ul>
+
+<p>Being able to say &ldquo;correctness here is a business decision with a price, and here is how I
+would implement either answer&rdquo; is a much stronger response than picking one.</p>
+
+<h3>Making the decrement idempotent</h3>
+
+<p>One detail that is easy to miss and expensive to get wrong: the conditional update is atomic but
+it is <em>not</em> idempotent. Retry it and stock decrements twice.</p>
+
+<pre class="language-sql" data-antipattern="true"><code class="language-sql">-- Atomic, and NOT safe to retry. A network timeout leaves the caller
+-- unable to tell whether it ran, and running it again is wrong.
+UPDATE inventory SET available = available - 1 WHERE sku_id = 42 AND available &gt;= 1;</code></pre>
+
+<p>Since the caller cannot distinguish &ldquo;the update failed&rdquo; from &ldquo;the update
+succeeded and the response was lost&rdquo; &mdash; the two generals problem from the <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a> &mdash; the
+reservation has to be recorded as a fact rather than applied as a delta:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE inventory_reservations (
+    order_id  BIGINT  NOT NULL,
+    sku_id    BIGINT  NOT NULL,
+    quantity  INTEGER NOT NULL,
+    PRIMARY KEY (order_id, sku_id)   -- the same order reserving twice is REJECTED
+);</code></pre>
+
+<p>Insert the reservation and adjust the counter in one transaction. A retry now violates the
+primary key, which the caller reads as &ldquo;already done&rdquo; rather than as a failure &mdash;
+and the count stays correct.</p>
+
+<p>That is the same move as the idempotency key in the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post</a>: <strong>turn a
+delta into a uniquely-keyed fact, and retries become free.</strong> It also gives you the audit
+trail needed to release reservations when an order expires, which a bare counter cannot.</p>
+
+<h2>Step 7 &mdash; Checkout is a saga</h2>
+
+<p>Placing an order spans systems that cannot share a transaction: your database, a payment
+provider, and a fulfilment network.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1 create order PENDING            compensate: cancel it
+   2 reserve inventory               compensate: release the reservation
+   3 authorise payment               compensate: void the authorisation
+   4 capture payment                 compensate: refund
+   5 hand to fulfilment              compensate: recall (if not shipped)
+
+   any step fails -> run the compensations for completed steps, backwards</code></pre>
+
+<p>This is the saga from the <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a>, and the two
+things that make it work in practice are worth stating.</p>
+
+<p><strong>Every step is idempotent</strong>, with an idempotency key carried through, because
+every step will be retried. Charging twice is the failure that reaches the news.</p>
+
+<p><strong>The order state machine is durable</strong> and each transition is recorded, so a crash
+mid-saga is recoverable &mdash; a process reads the last known state and continues, rather than
+guessing.</p>
+
+<p>Authorise-then-capture is the detail that makes this tolerable: authorisation reserves the funds
+without moving them, so the reversible step comes before the irreversible one. Capture happens at
+shipment. That ordering is deliberate &mdash; put the expensive-to-undo action last.</p>
+
+<h2>Step 8 &mdash; Orders</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   PENDING ──> PAID ──> PICKING ──> SHIPPED ──> DELIVERED
+      │          │
+      │          └──> REFUNDED
+      └──> CANCELLED</code></pre>
+
+<p>Two properties. Transitions are <strong>append-only events</strong>, not overwrites of a status
+column &mdash; you need the history for support, for disputes and for the tracking page, and
+&ldquo;when did it ship?&rdquo; has no answer if you only store the current state.</p>
+
+<p>And orders are <strong>immutable once placed</strong>. A change is a cancellation plus a new
+order, or an amendment record. Editing an order in place makes the money and the goods disagree
+with the record, which is the one thing a retail system must never do.</p>
+
+<p>Sharding orders is by <code>customer_id</code>, because &ldquo;my orders&rdquo; is the dominant
+query and it must not fan out. The consequence, exactly as in the Airbnb post: &ldquo;all orders
+containing SKU 42&rdquo; now fans out across every shard, which is why that question is answered by
+an analytics system rather than by the operational database.</p>
+
+<h2>Step 9 &mdash; The product page at 90,000/sec</h2>
+
+<p>The read path is the other half of the system, and it is where the volume actually is. The
+useful framing is that a product page is <strong>several fragments with completely different
+freshness requirements</strong>, and treating them as one page is what makes it expensive.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   title, description, images   change monthly    -> CDN, cache for hours
+   price                        changes daily     -> cache for minutes
+   stock ("in stock")           changes constantly-> cache for SECONDS, approximate
+   reviews summary              changes hourly    -> cache for minutes
+   "customers also bought"      changes daily     -> precomputed, cache for hours
+   your recently viewed         per user          -> not cached at all</code></pre>
+
+<p>Caching the assembled page at the slowest fragment&rsquo;s rate wastes the opportunity; caching
+it at the fastest fragment&rsquo;s rate means caching almost nothing. So the page is composed from
+independently cached pieces, each with its own TTL.</p>
+
+<p>The stock line is the one that matters commercially. Showing &ldquo;in stock&rdquo; from a
+seconds-old cache is fine; showing &ldquo;only 2 left&rdquo; from the same cache is a promise you
+may not keep. The usual resolution is to display precise counts only below a threshold, and to
+treat the number as advisory everywhere except checkout &mdash; which is exactly the split from step
+6, surfacing in the UI.</p>
+
+<p>At this volume the catalog is also a good candidate for a <strong>read replica per
+region</strong> plus edge caching, because product data is the ideal cacheable payload: large,
+read-mostly, and harmless when slightly stale.</p>
+
+<h2>Step 10 &mdash; Recommendations</h2>
+
+<p>&ldquo;Customers who bought this also bought&hellip;&rdquo; is not computed at request time.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   OFFLINE (hours)              ONLINE (milliseconds)
+
+   order history ──> model ──> [ precomputed: sku -> [related skus] ]
+                                        │
+                     product page ──────┘  one key-value lookup</code></pre>
+
+<p>The expensive computation runs on a schedule over historical data; the request path does a single
+lookup of a precomputed answer. This is the general shape for anything expensive and
+approximate &mdash; and it is why recommendations being a day stale is fine while a price being a
+day stale is not.</p>
+
+<h2>Failure modes</h2>
+
+<table>
+  <thead><tr><th>What fails</th><th>Effect</th><th>Degradation</th></tr></thead>
+  <tbody>
+    <tr><td>Search index</td><td>No search or facets</td>
+        <td>Browsing by category still works from the catalog database. Rebuild from the source of
+            truth.</td></tr>
+    <tr><td>Product cache</td><td>90k/s hits the catalog database</td>
+        <td>The dangerous one &mdash; a 10x load increase on a database sized for the miss rate.
+            Needs a second cache tier and load shedding at the edge.</td></tr>
+    <tr><td>Cart store</td><td>Carts unavailable; browsing fine</td>
+        <td>Replicate it. A lost cart is a lost sale, so this is worth more redundancy than its
+            simplicity suggests.</td></tr>
+    <tr><td>Payment provider</td><td>Orders cannot complete</td>
+        <td>A second provider, and a saga that can retry. Never take the order and pretend.</td></tr>
+    <tr><td>Inventory service</td><td>Checkout blocked</td>
+        <td>Or: accept orders optimistically and reconcile &mdash; the deliberate oversell,
+            chosen in advance rather than in a panic.</td></tr>
+    <tr><td>Recommendations</td><td>Page renders without them</td>
+        <td>The clearest example of a feature that must degrade silently. Never let it block the
+            buy button.</td></tr>
+  </tbody>
+</table>
+
+<p>The last row is the general principle for a commerce system, and it is worth saying explicitly:
+<strong>rank features by whether they take money, and degrade in reverse order.</strong> Search,
+recommendations and reviews can all disappear before checkout does. A site that shows a product and
+lets you buy it is still a shop; one with beautiful recommendations and a broken buy button is
+not.</p>
+
+<h2>The whole thing</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BROWSE (90k/s)                        BUY (200/s)
+
+   [ CDN ]  images, static                POST /orders
+      │                                       │
+      v                                       v
+   [ product service ] ── cache ──┐      [ order service ]
+      │                           │           │ saga:
+      v                           │           ├─> reserve inventory
+   [ catalog DB ]                 │           ├─> authorise payment
+      │                           │           ├─> capture at ship
+      └──> [ search index ] <─────┘           └─> hand to fulfilment
+             24k searches/s                       │
+             facets + ranking                     v
+                                            [ order DB ]  sharded by customer
+                                                  │
+                                                  └──> events ──> [ analytics ]
+                                                                  [ recommendations ]</code></pre>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;How do you stop overselling?&rdquo;</strong> &mdash; a conditional update is
+      the correct single-node answer; then explain why it does not survive a launch spike, give the
+      four relaxations, and say that real retailers choose to oversell.</li>
+  <li><strong>&ldquo;Product versus SKU?&rdquo;</strong> &mdash; browse a product, buy a SKU. Stock
+      and price belong to the SKU.</li>
+  <li><strong>&ldquo;How do facet counts work?&rdquo;</strong> &mdash; aggregations in the search
+      engine over the filtered set, not <code>GROUP BY</code> in SQL.</li>
+  <li><strong>&ldquo;Where does the cart live?&rdquo;</strong> &mdash; server-side key-value store,
+      merged on sign-in, holding SKU ids rather than prices, reserving nothing.</li>
+  <li><strong>&ldquo;Payment fails after inventory is reserved.&rdquo;</strong> &mdash; a saga with
+      compensating actions; authorise before capture so the irreversible step is last.</li>
+  <li><strong>&ldquo;How do you shard orders?&rdquo;</strong> &mdash; by customer, and name what
+      that costs: SKU-wide queries move to analytics.</li>
+  <li><strong>&ldquo;Black Friday?&rdquo;</strong> &mdash; pre-scale rather than autoscale, since
+      instances take minutes and spikes take seconds; serve the catalog from cache and CDN; shed
+      load at the edge; and degrade non-essential features (recommendations, reviews) before the
+      buy button.</li>
+</ul>
+
+<p>The thread running through this case study, and the one that distinguishes it from Airbnb:
+<strong>the same operation wants different guarantees at different points in the funnel.</strong>
+Stock is approximate while browsing, authoritative at checkout, and reconciled after shipping.
+Price is cached on a listing and recomputed at payment. Getting that gradient right is most of the
+design, and treating the system as uniformly consistent or uniformly eventual gets it wrong in both
+directions.</p>
+
+<p>Next: <a href="/system-design/system-design-delta-airlines">designing an airline booking
+system</a>, where the inventory problem gets harder still &mdash; the units are seats, they cannot
+be restocked, and the whole industry oversells on purpose.</p>

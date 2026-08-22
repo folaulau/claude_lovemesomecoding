@@ -1,0 +1,471 @@
+<p>The URL shortener is the standard warm-up question, and it earns its place: it is small enough
+to design completely in forty minutes, and every stage of it has a real decision in it. It is also
+the question where candidates most often skip straight to a database schema and miss the two things
+that actually shape the system.</p>
+
+<p>This is the full walkthrough, using the framework from the <a
+href="/system-design/system-design-introduction">first post</a>.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<p>Say what is in and what is out, and ask the three questions whose answers change the design.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                      OUT OF SCOPE (say these out loud)
+  shorten a long URL            user accounts and dashboards
+  redirect a short code         an analytics UI
+  optional custom alias         link previews, spam scanning
+  optional expiry               editing a link's destination
+
+WORTH ASKING
+  how long do links live?       -> forever vs expiring changes the storage plan
+  are codes guessable?          -> decides counter vs random generation
+  do we need click counts?      -> decides 301 vs 302, which is not obvious
+
+NON-FUNCTIONAL
+  redirects must be fast        p99 under ~50ms; this is the product
+  read-heavy, roughly 10:1
+  a code must NEVER be reused   -> pointing someone at the wrong site
+  availability > consistency    a stale link beats an error page</code></pre>
+
+<p>The last functional line is the real requirement. Everything else is negotiable; sending someone
+to the wrong destination is not, and it is what makes deletion and expiry interesting later.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  100M new URLs/day · 10:1 reads · ~500 B/row · kept 5 years
+
+WRITES   100M / 100k          = 1,000/sec        peak x3 =  3,000/sec
+READS    1,000 x 10           = 10,000/sec       peak x3 = 30,000/sec
+STORAGE  100M x 500 B         = 50 GB/day  ->  ~91 TB over 5 years
+BANDWIDTH  ~0.5 MB/s in, ~5 MB/s out</code></pre>
+
+<p>Four numbers, and each one has already decided something:</p>
+
+<p><strong>3,000 writes/sec</strong> is comfortable for one well-indexed database. No sharding, no
+queue in front of it. Say so &mdash; declining to over-engineer is a positive signal.</p>
+
+<p><strong>30,000 reads/sec</strong> is not comfortable for that same database, but redirects are
+the most cacheable thing imaginable: immutable lookups by key. A cache absorbs essentially all of
+it.</p>
+
+<p><strong>91 TB</strong> is the number that creates work. It does not fit on one machine for five
+years, so something has to give &mdash; expiry, tiering, or sharding.</p>
+
+<p><strong>5 MB/s</strong> is nothing. Bandwidth is not a constraint. Saying that explicitly shows
+you checked rather than assumed.</p>
+
+<h2>Step 3 &mdash; The API</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">POST /api/urls          {url, customAlias?, expiresAt?}
+                        -> 201 {shortUrl, code, expiresAt}
+                        -> 409 if the alias is taken
+                        -> 400 if the URL is malformed or blocked
+
+GET  /{code}            -> 302 Location: &lt;long url&gt;
+                        -> 404 unknown or expired
+
+GET  /api/urls/{code}   -> {url, createdAt, clicks}   (metadata, no redirect)</code></pre>
+
+<p>Note that the redirect endpoint is at the root, not under <code>/api</code>. The whole product is
+that the URL is short, and <code>/api/urls/abc1234</code> is not short. That sounds trivial and it
+constrains routing: the root path is now a wildcard, so every other route the service serves has to
+be reserved and excluded.</p>
+
+<h2>Step 4 &mdash; Generating the code</h2>
+
+<p>This is the actual question, and it is where the interview goes.</p>
+
+<h3>Base62 of a counter</h3>
+
+<p>Take an auto-increment id and write it in base62. Uniqueness is free from the counter, codes are
+as short as possible, and no collision check is needed at all.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   id 125     -> "21"
+   id 1000000 -> "4c92"
+
+   And that is the problem:
+   "4c92" -> id 1000000, so "4c91" and "4c93" are also valid links.
+   Anyone can walk the entire database, and read your volume off the ids.</code></pre>
+
+<h3>Hash and truncate</h3>
+
+<p>Hash the URL, take the first seven characters. Deterministic, so the same URL always shortens to
+the same code &mdash; which is either a feature (deduplication) or a bug (two users cannot get
+different links for the same destination, so per-user analytics become impossible).</p>
+
+<p>Truncating a hash also means collisions between <em>different</em> URLs, which is the worst
+possible failure: two destinations, one code.</p>
+
+<h3>Random, with the constraint as the guard</h3>
+
+<p>Generate seven random base62 characters and insert. Let the unique constraint reject a collision
+and retry.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   62^7 = 3.5 trillion possible codes
+   182 billion rows after 5 years  ->  ~5% occupancy
+
+   -> a random code collides ~5% of the time
+   -> the retry loop terminates almost immediately
+   -> 6 characters = 56 billion, against 182 billion rows: impossible</code></pre>
+
+<p>That arithmetic is what settles it. Seven characters, random, with the database enforcing
+uniqueness &mdash; and crucially <em>not</em> a check-then-insert:</p>
+
+<pre class="language-sql"><code class="language-sql">-- WRONG: two requests can both see "free" before either inserts.
+-- SELECT 1 FROM urls WHERE short_code = 'k7Bq2xN';  -- then INSERT
+
+-- RIGHT: let the constraint decide, and retry on violation.
+INSERT INTO urls (short_code, long_url) VALUES ('k7Bq2xN', 'https://...');
+-- unique_violation? generate another code and try again.</code></pre>
+
+<p>Same principle as the <a href="/system-design/system-design-concurrency-and-locking">concurrency
+post</a>: do not coordinate to avoid the bad state, make it unrepresentable.</p>
+
+<p>A hybrid worth mentioning: <strong>pre-generate a pool</strong> of unused codes in a background
+job and pop from it at write time. Creation becomes a single insert with no retry loop at all, at
+the cost of a table to maintain.</p>
+
+<h3>Where the code is generated</h3>
+
+<p>One more decision hides inside &ldquo;generate a random code&rdquo;: which component does it?</p>
+
+<p><strong>In the application</strong> is the default and it is right here. The application picks
+seven characters, attempts the insert, and retries on violation. No coordination, no extra service,
+and the database is the only arbiter of uniqueness.</p>
+
+<p><strong>In the database</strong> &mdash; a default expression on the column &mdash; is tempting
+and awkward, because the retry logic then lives in SQL and the application has to read back what
+was actually stored.</p>
+
+<p><strong>A dedicated id service</strong> is the answer at extreme write volume, and this system
+does not have extreme write volume. Three thousand inserts a second does not justify a network hop
+and a new thing to keep running &mdash; which is exactly the judgement the <a
+href="/system-design/system-design-unique-id-generator">unique id post</a> is about.</p>
+
+<p>The retry loop needs one guard worth mentioning: a bound. If it has failed five times, something
+is wrong &mdash; the keyspace is far fuller than the estimate assumed, or the random source is
+broken &mdash; and looping forever turns a capacity problem into a hung request. Fail loudly after
+a handful of attempts and alert on it; the count reaching that bound is itself the signal that it
+is time to add a character.</p>
+
+<h2>Step 5 &mdash; The schema</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE urls (
+    short_code  VARCHAR(7)    PRIMARY KEY,     -- the code IS the key
+    long_url    VARCHAR(2048) NOT NULL,
+    user_id     BIGINT,
+    created_at  TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ                    -- NULL = never
+);
+
+CREATE INDEX idx_urls_expires ON urls (expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_urls_user    ON urls (user_id)    WHERE user_id IS NOT NULL;</code></pre>
+
+<p>Three decisions in nine lines.</p>
+
+<p><strong>The code is the primary key</strong>, not a surrogate id. Every read is a lookup by code,
+so making it the key means the read is a primary-key hit rather than an index hop followed by a
+fetch. There is no separate id because nothing needs one.</p>
+
+<p><strong>Both indexes are partial.</strong> Most links never expire and many have no owner, so
+indexing only the rows where the column is non-null keeps both indexes a fraction of the size.</p>
+
+<p><strong>No click counter in this table.</strong> Incrementing a column on the hottest row in the
+system, on every single redirect, is the counter-contention problem from the <a
+href="/system-design/system-design-database-scaling">database scaling post</a> &mdash; a thousand
+requests a second all taking a row lock on the same row. Clicks are counted elsewhere; see
+below.</p>
+
+<h3>Why not just store the hash of the URL?</h3>
+
+<p>A follow-up worth pre-empting, because deduplication sounds obviously good.</p>
+
+<p>If the same long URL always produces the same code, you store one row instead of a thousand for
+a popular link. That is a genuine saving. It also removes three things:</p>
+
+<ul>
+  <li><strong>Per-user analytics.</strong> Two marketing campaigns pointing at the same landing
+      page get the same code, so their click counts are indistinguishable. This alone kills the
+      idea for a commercial shortener.</li>
+  <li><strong>Independent expiry.</strong> One user&rsquo;s link expiring would expire
+      everybody&rsquo;s.</li>
+  <li><strong>Independent revocation.</strong> Taking down one abusive link takes down every
+      legitimate link to the same destination.</li>
+</ul>
+
+<p>The compromise that actually gets built: generate a fresh code per request, and keep a separate
+index on the long URL if you want to <em>offer</em> the user their previous code rather than
+forcing it on them. Deduplication becomes a convenience rather than a constraint.</p>
+
+<h2>Step 6 &mdash; The read path</h2>
+
+<p>This is the product, and it is 97% of the traffic.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   GET /k7Bq2xN
+        │
+        v
+   [ CDN / edge ]  ── most redirects can be served here entirely
+        │ miss
+        v
+   [ app server ]
+        │
+        ├─ Redis: GET url:k7Bq2xN   ── hit (~95%) ──> 302, done
+        │
+        └─ miss ──> Postgres, one primary-key lookup
+                    populate the cache
+                    302</code></pre>
+
+<p>The cache hit rate is what the whole design rests on, and it is high for a specific reason: link
+popularity is extremely skewed. A handful of links get millions of clicks and the long tail gets
+one each.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   10,000 reads/sec arriving
+
+   hit rate    reaching Postgres
+      90%          1,000/s
+      95%            500/s
+      99%            100/s     <- comfortably one database</code></pre>
+
+<p>Sizing it, from the <a href="/system-design/system-design-back-of-envelope-estimation">estimation
+post</a>: 20% of a day&rsquo;s 100 million links at 500 bytes is about 10 GB, which fits in memory
+on one ordinary Redis instance.</p>
+
+<p>One property makes this cache unusually easy: <strong>entries are immutable</strong>. A code
+always points at the same URL, so there is no invalidation problem &mdash; the hardest part of
+caching simply does not arise. The only exception is deletion, and that is a single explicit
+eviction.</p>
+
+<h3>What the redirect response actually contains</h3>
+
+<p>Worth being concrete, because the whole product is one HTTP response and there are two headers
+in it that matter beyond the obvious one:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">HTTP/1.1 302 Found
+Location: https://example.com/a/very/long/path?utm_source=...
+Cache-Control: private, max-age=0
+Referrer-Policy: no-referrer
+
+(no body — a redirect does not need one)</code></pre>
+
+<p><code>Cache-Control</code> is what makes the 302 mean what you intended. Without it, an
+intermediate proxy may cache the response anyway and you have accidentally shipped a 301 with extra
+steps. Being explicit is the difference between a policy and a hope.</p>
+
+<p><code>Referrer-Policy</code> is the privacy consideration people miss. By default the destination
+site receives your shortener&rsquo;s URL in the <code>Referer</code> header, which tells them which
+short code was used and therefore which campaign, mailing list or private message the visitor came
+from. Suppressing it is one header.</p>
+
+<p>The response has no body deliberately. At 10,000 redirects a second, a courtesy HTML page saying
+&ldquo;redirecting you&hellip;&rdquo; is bandwidth spent on something no user sees for more than a
+few milliseconds.</p>
+
+<h2>Step 7 &mdash; 301 or 302?</h2>
+
+<p>The question that sounds like trivia and is genuinely a product decision.</p>
+
+<table>
+  <thead><tr><th></th><th>301 Permanent</th><th>302 Found</th></tr></thead>
+  <tbody>
+    <tr><td>Browser caches it</td><td>Yes, aggressively &mdash; often forever</td><td>No</td></tr>
+    <tr><td>Later requests</td><td>Never reach you again</td><td>Reach you every time</td></tr>
+    <tr><td>Your load</td><td>Dramatically lower</td><td>Full</td></tr>
+    <tr><td>Click analytics</td><td>Impossible &mdash; you never see the click</td><td>Complete</td></tr>
+    <tr><td>Changing the destination</td><td>Impossible for cached clients</td><td>Fine</td></tr>
+  </tbody>
+</table>
+
+<p>So: <strong>301 if you want cheap, 302 if you want data.</strong> Every commercial shortener
+uses 302, because click analytics is the business &mdash; and it means accepting the traffic that
+301 would have eliminated.</p>
+
+<p>The trap is that 301 is <em>irreversible in practice</em>. A browser that cached your permanent
+redirect will not ask again, so a link whose destination turns out to be malicious cannot be
+retracted from clients that already have it. That alone argues for 302 in anything user-generated.</p>
+
+<h2>Step 8 &mdash; Counting clicks without dying</h2>
+
+<p>Given 302s, every redirect is an opportunity to record a click, and doing it synchronously would
+double the cost of the cheapest operation in the system.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   redirect ──> 302 to the user IMMEDIATELY      (never blocked)
+        │
+        └──> fire-and-forget event ──> [ queue ] ──> [ aggregator ]
+                                                         │
+                                       roll up per code per minute
+                                                         v
+                                                   [ analytics store ]</code></pre>
+
+<p>Three properties matter. The write to the queue must not block the redirect. Events are
+aggregated rather than stored individually &mdash; 864 million clicks a day as rows is a data
+warehouse problem; the same clicks as per-minute counts is a small table. And click counts are
+explicitly <strong>eventually consistent</strong>: nobody notices whether a dashboard says 4,201 or
+4,198.</p>
+
+<p>For counters that must be closer to live, an atomic <code>INCR</code> in Redis flushed
+periodically is the standard shape &mdash; and it is a counter, so it must be an atomic increment
+rather than a read-modify-write.</p>
+
+<h2>Step 9 &mdash; Expiry and the 91 TB</h2>
+
+<p>The storage estimate said something has to give. Expiry is the cheapest answer, and the naive
+implementation is a mistake:</p>
+
+<pre class="language-sql"><code class="language-sql">-- WRONG: scans and rewrites millions of rows, bloats the table,
+-- and holds locks while it runs.
+DELETE FROM urls WHERE expires_at &lt; now();</code></pre>
+
+<p>Two better options. <strong>Lazy expiry</strong> checks <code>expires_at</code> on read and
+returns 404 for an expired link without deleting anything &mdash; correct behaviour immediately,
+zero write cost, and the row lingers. Combine it with a slow background job deleting in small
+batches.</p>
+
+<p>Or <strong>partition by creation month</strong>, so removing old data is
+<code>DROP TABLE urls_2021_03</code> &mdash; instant, no bloat, no locks. This is the
+time-series-retention case that partitioning exists for.</p>
+
+<p>If links must live forever, the remaining options are tiering cold rows to object storage or
+sharding by code, which is easy here: the code is the natural shard key and every read has it.</p>
+
+<h2>Step 10 &mdash; Custom aliases</h2>
+
+<p>A small feature that touches most of the design, which is why it is worth asking about in step
+1.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   POST /api/urls  {url: "...", customAlias: "summer-sale"}
+
+   -> 201 if free
+   -> 409 if taken   (and "taken" must include RESERVED words)</code></pre>
+
+<p>Three consequences. Aliases and generated codes share one namespace, so they must be checked
+together &mdash; which the primary key already does, provided the alias column is the same column
+rather than a second one. Aliases are variable length, so <code>VARCHAR(7)</code> becomes something
+longer, and the generated codes are still seven.</p>
+
+<p>And a reserved list becomes mandatory. Every route the service itself serves &mdash;
+<code>/api</code>, <code>/login</code>, <code>/health</code>, <code>/static</code> &mdash; must be
+unclaimable, or the first person to register <code>api</code> as an alias breaks the application.
+This is a direct consequence of putting the redirect at the root, and it is the kind of detail that
+distinguishes a design from a sketch.</p>
+
+<p>Worth adding a profanity and impersonation filter too, since a custom alias is user-supplied
+text that appears in your domain name.</p>
+
+<h2>Step 11 &mdash; Abuse</h2>
+
+<p>A URL shortener is an anonymity tool, so it will be used to disguise links to malware and
+phishing. This is not an aside; it is why shorteners have moderation teams.</p>
+
+<ul>
+  <li><strong>Validate on creation</strong> &mdash; well-formed, http/https only, and not pointing
+      at your own service (a loop) or at internal addresses. That last one is server-side request
+      forgery if you ever fetch the URL for previews.</li>
+  <li><strong>Rate limit creation</strong>, hard, by IP and by account. Bulk creation is the signal
+      that distinguishes a spam campaign from a user.</li>
+  <li><strong>Check against a blocklist</strong> asynchronously after creation, and disable
+      retroactively when a link turns bad.</li>
+  <li><strong>Support takedown</strong>, which means a link&rsquo;s destination must be revocable
+      &mdash; and that is the strongest argument in the whole design for 302 over 301.</li>
+</ul>
+
+<h2>Failure modes</h2>
+
+<p>The follow-up question in every case study is what breaks. Being able to walk it component by
+component is worth more than any single clever answer.</p>
+
+<table>
+  <thead><tr><th>What fails</th><th>Effect</th><th>Why it is survivable</th></tr></thead>
+  <tbody>
+    <tr><td>Redis</td><td>Every read hits Postgres &mdash; 10k/s instead of 500/s</td>
+        <td>Survivable only if Postgres has the headroom. This is the one to think about: a cold
+            cache at this hit rate is a 20x load increase.</td></tr>
+    <tr><td>One app server</td><td>Nothing</td><td>Stateless tier behind a load balancer</td></tr>
+    <tr><td>Postgres primary</td><td>Creation stops; redirects continue from cache</td>
+        <td>The read path degrades gracefully because it is cache-first</td></tr>
+    <tr><td>The click queue</td><td>Analytics stop; redirects unaffected</td>
+        <td>Fire-and-forget by design &mdash; the redirect never waits on it</td></tr>
+    <tr><td>The CDN</td><td>More traffic reaches you</td><td>Capacity problem, not correctness</td></tr>
+  </tbody>
+</table>
+
+<p>The first row is the interesting one, and it is worth volunteering. At a 95% hit rate, losing
+the cache multiplies database load by twenty &mdash; and a Postgres sized for 500 queries a second
+does not absorb 10,000. So the honest answer includes a mitigation: a small local in-process cache
+as a second tier, or Redis replicas so the whole cache never disappears at once, or rate limiting
+at the edge to shed load rather than fall over.</p>
+
+<p>This is also why <strong>never flush this cache on a running system</strong> is an operational
+rule rather than advice. A deliberate flush produces exactly the same 20x spike as an outage.</p>
+
+<h2>The whole thing</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   CREATE (1k/s)                      REDIRECT (10k/s)
+
+   POST /api/urls                     GET /{code}
+       │                                  │
+       │ validate, rate limit             v
+       v                             [ CDN edge ]  ── some hits served here
+   [ app ]                                │ miss
+       │ generate random code             v
+       │ INSERT (unique constraint)   [ app ] ── Redis hit ~95% ──> 302
+       │ retry on violation               │
+       v                                  └── miss ──> Postgres PK lookup
+   [ Postgres ]  <──────────────────────────────────── populate cache
+     partitioned by month                  │
+     code = primary key                    └──> click event ──> [ queue ]
+                                                                  │
+                                                            [ aggregator ]</code></pre>
+
+<h2>Scaling it, if the numbers were bigger</h2>
+
+<p>The estimate said one database is enough for writes. Worth saying what changes if it were not,
+because &ldquo;and how would this scale?&rdquo; always follows.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   shard by short_code:  shard = hash(code) % N
+
+   READ   GET /k7Bq2xN  -> hash the code -> exactly one shard
+   WRITE  generate code -> hash it       -> exactly one shard
+
+   No query ever fans out. No cross-shard join exists,
+   because there are no joins.</code></pre>
+
+<p>This is the easiest sharding case in the whole track, and the reason is worth naming: every
+single operation carries the shard key, and the data has no relationships. Compare that with the <a
+href="/system-design/system-design-database-scaling">general case</a>, where choosing a key means
+deciding which query gets to be fast and which one fans out.</p>
+
+<p>The generation strategy changes slightly &mdash; with random codes, the shard is decided
+<em>by</em> the code you generated, so a shard cannot be targeted. That is fine here and it is the
+kind of interaction between two decisions that is worth spotting out loud.</p>
+
+<p>Geographic distribution is the other axis, and for this system it is unusually easy: the data is
+immutable, so replicating the entire table to every region introduces no consistency problem at
+all. Reads are served locally everywhere; only creation needs to reach a primary. Very few systems
+get to say that, and the reason this one does is the same reason its cache is simple.</p>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;Why not a counter?&rdquo;</strong> &mdash; enumerable, and it leaks volume.
+      Random plus a unique constraint, sized by the occupancy arithmetic.</li>
+  <li><strong>&ldquo;How do you avoid collisions?&rdquo;</strong> &mdash; you do not avoid them,
+      you let the database reject them. At 5% occupancy the retry loop is not a concern.</li>
+  <li><strong>&ldquo;301 or 302?&rdquo;</strong> &mdash; 302, because analytics and revocability
+      are worth more than the traffic 301 saves.</li>
+  <li><strong>&ldquo;What if Redis dies?&rdquo;</strong> &mdash; every read falls through to
+      Postgres. Slower, not broken &mdash; provided the client treats an outage as a miss.</li>
+  <li><strong>&ldquo;How do you delete a link everywhere?&rdquo;</strong> &mdash; delete the row,
+      evict the cache key, and accept that CDN and browser caches lag by their TTL. Which is
+      exactly why the TTL is short and the redirect is not permanent.</li>
+  <li><strong>&ldquo;How would you shard?&rdquo;</strong> &mdash; by short code. Every read carries
+      it, so no query ever fans out. This is the easiest sharding case in this whole track, and
+      saying why is the point.</li>
+</ul>
+
+<p>The pattern to carry into the harder case studies: the arithmetic in step 2 decided nearly
+everything, and the two genuinely hard questions &mdash; how codes are generated, and 301 versus
+302 &mdash; were both settled by requirements rather than by preference. A case study answered well
+looks like a sequence of forced moves, not a sequence of choices.</p>
+
+<p>Next: <a href="/system-design/system-design-chat-system">designing a chat system</a>, where the
+constraint is not throughput but ten million connections that must stay open.</p>

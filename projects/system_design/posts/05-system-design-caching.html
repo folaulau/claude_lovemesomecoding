@@ -1,0 +1,460 @@
+<p>Caching is the highest-leverage optimisation available: memory is roughly a thousand times
+faster than disk, and most systems read the same handful of things over and over. It is also the
+source of a disproportionate share of production incidents, because a cache is a second copy of
+your data and second copies go wrong.</p>
+
+<p>This post is about both halves &mdash; the pattern, measured on a real endpoint, and then
+everything that makes it hard.</p>
+
+<h2>A cache, measured</h2>
+
+<p>StayHub caches one thing: the public listing page. Here is what that is worth, taken on the
+machine that wrote this post &mdash; four consecutive requests with the Redis key deleted first:</p>
+
+<pre class="language-bash"><code class="language-bash">$ curl -o /dev/null -w "%{time_total}s\n" localhost:8000/api/v1/properties/$PROP
+  request 1: 0.015185s     # miss — reads Postgres, populates the cache
+  request 2: 0.002153s     # hit
+  request 3: 0.002059s     # hit
+  request 4: 0.001975s     # hit</code></pre>
+
+<p><strong>15.2ms cold, 2.0ms warm.</strong> Measured at the service layer, without HTTP framing,
+the same read goes from <strong>8.8ms to 0.3ms</strong> &mdash; roughly 28x, because the fixed
+overhead of the web layer dominates once the data itself is nearly free.</p>
+
+<p>Both numbers are worth having, because they say different things. The 28x is what the cache did.
+The 7x is what the user got, and the gap between them is a reminder that a cache can only remove
+the part you were spending on the thing you cached.</p>
+
+<h2>Why that read and not others</h2>
+
+<p>Not everything deserves a cache, and choosing badly costs you complexity for nothing. Three
+things make a read worth caching, and the listing page has all three:</p>
+
+<ul>
+  <li><strong>Hot</strong> &mdash; it is the most-requested read in the app. A guest comparing
+      places opens a dozen listings.</li>
+  <li><strong>Expensive</strong> &mdash; it joins images, amenities and the host record. It is not
+      a single-row primary key lookup.</li>
+  <li><strong>Rarely written</strong> &mdash; a host edits a listing a handful of times a year. The
+      ratio of reads to writes is enormous.</li>
+</ul>
+
+<p>Invert any one and it stops being worthwhile. A cheap read saves nothing. A cold read is never
+in the cache when you want it. A frequently-written value spends its life being invalidated, and
+you have added a component to serve misses.</p>
+
+<p>There is also a category that must <em>never</em> be cached regardless of how hot it is:
+anything where a stale answer is a correctness bug. Account balances, remaining inventory,
+permission checks, and &mdash; in a booking system &mdash; availability. Serving a five-minute-old
+&ldquo;those dates are free&rdquo; is not a performance win, it is a double booking.</p>
+
+<h3>Sizing it</h3>
+
+<p>Before choosing a pattern, work out whether the working set fits in memory &mdash; because if it
+does, the design gets much simpler.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   2M listings x ~2 KB each   = 4 GB
+
+   4 GB fits in RAM on one ordinary machine, with room to spare.
+   -> cache everything; hit rate approaches 100%; no eviction tuning</code></pre>
+
+<p>If instead that had come out at 4 TB, the answers change entirely: cache only the hot tail, or
+shard the cache across machines, and now eviction policy and hit rate become things you tune rather
+than things that take care of themselves.</p>
+
+<p>The 80/20 rule is the usual starting assumption &mdash; 20% of keys serve 80% of requests
+&mdash; and for most consumer systems the skew is far sharper. Either way, it is one multiplication
+and it decides the shape of everything below.</p>
+
+<h2>The patterns</h2>
+
+<h3>Cache-aside</h3>
+
+<p>The default, and the one to reach for unless you have a reason not to. The application
+orchestrates; the cache is dumb storage.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   READ                                WRITE
+     look in cache                       write to database
+       hit  -> return                    delete the cache entry
+       miss -> read database
+               store in cache
+               return</code></pre>
+
+<p>Note the write path: it <strong>deletes</strong> rather than updates. That is deliberate. An
+update means serialising the object in two places, and the two drift the first time someone adds a
+field to one of them. A delete cannot drift &mdash; the worst case is an extra database read.</p>
+
+<p>StayHub&rsquo;s read is the pattern almost verbatim:</p>
+
+<pre class="language-python"><code class="language-python">        key = cache.property_key(public_id)
+
+        cached = cache.get_json(key)
+        if cached is not None:
+            return PropertyResponse.model_validate(cached)
+
+        view = PropertyResponse.model_validate(self.get_for_public(public_id))
+        cache.set_json(key, view.model_dump(mode="json"), settings.cache_ttl_property_seconds)
+        return view</code></pre>
+
+<p>Two details in there are worth stealing.</p>
+
+<p>It caches the <strong>response object, not the database row</strong>. An ORM entity is bound to
+a database session and carries lazy relationships; reviving one in a later request is a class of
+bug waiting to happen. Caching the already-serialised response also guarantees a hit and a miss
+produce identical JSON &mdash; a cache that returns a subtly different shape on the second request
+is worse than no cache, because it only appears in production.</p>
+
+<p>And there is <strong>no error handling</strong>, because there is nothing to catch. Every
+function in the cache module returns &ldquo;miss&rdquo; instead of raising, which is the subject of
+the last section.</p>
+
+<h3>Write-through and write-behind</h3>
+
+<p>The alternatives, both of which put the cache in the write path.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   WRITE-THROUGH    app -> cache -> database        (synchronously)
+                    cache is always current; every write costs both
+
+   WRITE-BEHIND     app -> cache -> [ later ] -> database
+                    fastest writes; a crash loses data that
+                    the application was told had been saved
+
+   READ-THROUGH     app -> cache, and the CACHE fetches on a miss
+                    same shape as cache-aside, less application code,
+                    needs a cache that can read your database</code></pre>
+
+<p>Write-behind is the one to be careful with. It is genuinely faster and it means acknowledging a
+write before it is durable, so a crash loses data you promised to keep. That is acceptable for view
+counts and unacceptable for orders, and the distinction is the answer if you are asked.</p>
+
+<h2>Eviction and TTL</h2>
+
+<p>Memory is finite, so entries have to leave. Two mechanisms, and you want both.</p>
+
+<p><strong>TTL</strong> is a per-entry expiry. StayHub uses five minutes on listings.
+<strong>Eviction</strong> is what happens when memory fills up regardless of TTLs:</p>
+
+<table>
+  <thead><tr><th>Policy</th><th>Evicts</th><th>Good for</th></tr></thead>
+  <tbody>
+    <tr><td>LRU</td><td>Least recently used</td><td>The default. Fits most access patterns.</td></tr>
+    <tr><td>LFU</td><td>Least frequently used</td><td>A stable hot set that occasional scans should not flush</td></tr>
+    <tr><td>FIFO</td><td>Oldest inserted</td><td>Rarely right &mdash; ignores whether anything is using it</td></tr>
+    <tr><td>Random</td><td>Anything</td><td>Surprisingly decent, and very cheap</td></tr>
+  </tbody>
+</table>
+
+<p>The configuration matters more than the choice. Redis&rsquo;s default when it hits its memory
+limit is to <em>refuse writes</em>, which turns a full cache into failing requests &mdash; exactly
+the coupling you were trying to avoid. StayHub sets it explicitly:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    command:
+      - redis-server
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru</code></pre>
+
+<p><code>allkeys-lru</code> is right here because every key in this instance is disposable: cached
+listings and rate-limit counters both regenerate on demand. An instance holding something that
+cannot be regenerated needs a different answer &mdash; and probably should not be sharing this
+one.</p>
+
+<h2>Invalidation</h2>
+
+<p>The hard part, and the reason for the joke about the two hard problems in computer science.</p>
+
+<p>There are two strategies and the right answer is <strong>both</strong>, because each covers the
+other&rsquo;s failure:</p>
+
+<ul>
+  <li><strong>TTL</strong> alone means every value is stale for up to its lifetime. Edit a price
+      and it is wrong for five minutes.</li>
+  <li><strong>Explicit invalidation</strong> alone means one write path that forgets to delete
+      caches a wrong price <em>forever</em>.</li>
+</ul>
+
+<p>Together: explicit deletion makes edits appear immediately, and the TTL bounds the damage from
+the write path someone will eventually add and forget.</p>
+
+<p>The practical problem with explicit invalidation is that it is a line you must remember in every
+write path, and one day someone adds a ninth. StayHub sidesteps that by hanging it off a method
+that <em>every</em> write path already calls:</p>
+
+<pre class="language-python"><code class="language-python">        indexed = indexer.index_property(prop)
+        cache.invalidate(cache.property_key(prop.public_id))</code></pre>
+
+<p>The trick is the pairing. That method also updates the search index, so a new write path that
+forgets to call it does not merely serve a stale cache &mdash; it fails to appear in search, which
+somebody notices within minutes. <strong>Coupling the silent failure to the loud one</strong> is
+worth doing deliberately wherever you can.</p>
+
+<h3>Key design</h3>
+
+<p>Two rules that prevent a whole category of incident.</p>
+
+<pre class="language-python"><code class="language-python">def property_key(public_id: UUID | str) -> str:
+    return f"stayhub:{CACHE_VERSION}:property:{public_id}"</code></pre>
+
+<p>First, <strong>build keys in a named function, never with an f-string at the call site.</strong>
+The reader and the writer must agree on the exact string, and the way they stop agreeing is a typo
+in one of two places &mdash; which does not raise an error, it silently caches forever and
+invalidates nothing.</p>
+
+<p>Second, <strong>put a version in the key.</strong> When the shape of the cached value changes,
+bump it; old entries then simply never match and expire on their own. The alternative is flushing
+the cache on deploy, which works right up until the deploy you roll back &mdash; the new code is
+gone and its differently-shaped entries are not.</p>
+
+<h3>Serialisation costs something too</h3>
+
+<p>One practical detail that gets missed: what you store has to be encoded, and the encoding is not
+free. StayHub stores JSON, which is the right default &mdash; it is readable in
+<code>redis-cli</code> when you are debugging, it is portable across languages, and it cannot
+execute anything.</p>
+
+<p>The tempting alternative is language-native serialisation (Python&rsquo;s <code>pickle</code>,
+Java serialisation). Avoid it for two reasons. It is a <strong>security hole</strong>: deserialising
+untrusted bytes can execute code, and a shared cache is a place where untrusted bytes can end up.
+And it is a <strong>coupling problem</strong>: the encoded form embeds your class definitions, so
+renaming a field breaks every entry written by the previous deploy.</p>
+
+<p>The related habit is defending against values you cannot read:</p>
+
+<pre class="language-python"><code class="language-python">    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:</code></pre>
+
+<p>Something eventually writes a value your code cannot parse &mdash; a shape change that skipped
+the version prefix, or another service sharing the keyspace. Treating that as a miss lets the next
+write overwrite it. Raising means a 500 on a corrupted cache entry, which is a spectacular way for
+an optimisation to take down a page.</p>
+
+<h2>Stampede</h2>
+
+<p>The failure mode that turns a cache into an outage, and it happens at the worst moment.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   popular key expires at t=0
+
+   t=0.000  request 1  -> miss -> query database
+   t=0.001  request 2  -> miss -> query database      the first query
+   t=0.002  request 3  -> miss -> query database      has not finished,
+   ...                                                so nothing is cached yet
+   t=0.050  request 500 -> miss -> query database
+
+   500 identical expensive queries at once, on the hottest key you have</code></pre>
+
+<p>Everything was fine a millisecond earlier. The cache was doing its job so well that the database
+was sized for the miss rate, and now it is getting the full unfiltered load of your most popular
+item.</p>
+
+<p>Three fixes, in increasing order of effort:</p>
+
+<ul>
+  <li><strong>Jittered TTL</strong> &mdash; expire at 300 seconds plus a random 0&ndash;30, so a
+      batch of entries populated together does not expire together. Nearly free, and it solves the
+      common case where a deploy or a cache flush warmed everything simultaneously.</li>
+  <li><strong>Locking</strong> &mdash; the first miss takes a lock and recomputes; the others wait
+      briefly or serve the stale value. Correct, and it costs you a distributed lock, with all the
+      caveats in the <a href="/system-design/system-design-concurrency-and-locking">concurrency
+      post</a>.</li>
+  <li><strong>Early recomputation</strong> &mdash; refresh in the background before expiry, so the
+      entry is never actually absent.</li>
+</ul>
+
+<p>A related one worth naming: <strong>cache penetration</strong>, where requests for keys that do
+not exist miss every time and hit the database on every request. Caching the negative result is the
+usual answer, and it has its own trap &mdash; see below.</p>
+
+<h2>Do not cache a miss (usually)</h2>
+
+<p>Caching &ldquo;this does not exist&rdquo; is a real technique for absorbing floods of lookups
+for things that are absent. It is also frequently wrong, and StayHub deliberately does not do
+it.</p>
+
+<p>The listing read raises a 404 for a draft, and that exception propagates past the cache write
+without ever reaching it. If it were cached, a host who publishes a listing would be told for the
+next five minutes that it does not exist &mdash; on the page they just published.</p>
+
+<p>The test asserts the behaviour, because it is the kind of thing an optimisation would quietly
+add later:</p>
+
+<pre class="language-python"><code class="language-python">    def test_a_missing_listing_is_not_cached(self, db):
+        """Negative caching is deliberately absent — see the docstring on `get_public_view`."""
+        from app.core.exceptions import NotFoundException
+
+        ghost = uuid4()
+        with pytest.raises(NotFoundException):
+            PropertyService(db).get_public_view(ghost)
+
+        assert cache.get_json(cache.property_key(ghost)) is None</code></pre>
+
+<p>The rule: negative caching is for absent keys that are <em>enumerable and hammered</em> &mdash;
+sequential ids being scraped, say. When the ids are UUIDs there is no flood to absorb, and all you
+have bought is a window where creating something makes it invisible.</p>
+
+<h2>Consistency, briefly</h2>
+
+<p>A cache is a second copy of your data, so every problem in the <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a> applies to it
+&mdash; it is the smallest and most common instance of the dual-write problem.</p>
+
+<p>Concretely, this race exists in every delete-on-write cache and cannot be fully closed:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   reader                      writer
+
+   miss, query DB -> "$180"
+                               UPDATE price = $200
+                               DELETE cache key
+   SET cache "$180"   <-- writes the OLD value, AFTER the invalidation
+
+   the cache now holds a stale price until its TTL expires</code></pre>
+
+<p>The window is tiny &mdash; the reader has to be descheduled at exactly the wrong moment &mdash;
+but at scale, tiny windows happen constantly. This is the single strongest argument for a TTL even
+when you invalidate explicitly: the TTL is what bounds a race you cannot otherwise eliminate.</p>
+
+<p>The stronger fixes exist and cost more. Versioned keys sidestep it entirely, since a write mints
+a new key and the stale one is never read again. Or you can accept it, which is what StayHub does,
+because the value at risk is a listing description for at most five minutes &mdash; and the price
+that actually matters is recomputed server-side at booking time, never read from a cache.</p>
+
+<p>That last point generalises. The safest way to live with a cache is to arrange for the cached
+copy never to be the thing a decision depends on.</p>
+
+<h2>The rule that matters most</h2>
+
+<p>A cache is an optimisation. The moment it can take the system down, it has stopped being one and
+become a second database that you are treating casually.</p>
+
+<p>Every call into Redis in StayHub is wrapped, and every failure returns &ldquo;not cached&rdquo;
+rather than raising:</p>
+
+<pre class="language-python"><code class="language-python">def get_json(key: str) -> Any | None:
+    """Read a cached value. Returns None on a miss, on a failure, and on unreadable JSON."""
+    client = _client()
+    if client is None:
+        return None
+    try:
+        raw = client.get(key)
+    except Exception as exc:  # noqa: BLE001
+        _warn_once(exc)
+        return None</code></pre>
+
+<p>Two details that turn this from an intention into a guarantee.</p>
+
+<p><strong>Timeouts.</strong> The default socket timeout in most clients is none &mdash; wait
+forever. A Redis that is <em>down</em> fails fast and costs nothing; a Redis that is
+<em>hung</em> (swapping, saving a large snapshot, a network path silently dropping packets) accepts
+the connection and never answers. With no timeout, every request that touches the cache parks a
+worker on a socket read and the application stops serving pages it could have served from Postgres.
+Half a second is far longer than a local Redis needs and far shorter than a user will wait.</p>
+
+<p><strong>Logging once, not per request.</strong> A dead cache is dead for every request, so
+logging each failure turns a degraded cache into a log flood that buries whatever actually broke
+&mdash; and log volume is not free when something is collecting it.</p>
+
+<p>The claim is only worth making if it is tested. StayHub&rsquo;s suite runs both ways:
+<strong>165 tests pass with Redis running; with it stopped, 142 pass and 23 skip, and nothing
+fails.</strong> An availability property you have not exercised is an availability property you do
+not have.</p>
+
+<h2>Hit rate is the number to watch</h2>
+
+<p>A cache with a 50% hit rate is barely a cache. The relationship between hit rate and the load
+reaching your database is not linear, and seeing the arithmetic makes it obvious why small
+improvements at the top end are worth chasing.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   10,000 reads/sec arriving
+
+   hit rate    reaching the database     vs 100% uncached
+      0%           10,000/s                 —
+     50%            5,000/s                 2x better
+     90%            1,000/s                10x
+     95%              500/s                20x
+     99%              100/s               100x
+   99.9%               10/s              1000x</code></pre>
+
+<p>Going from 90% to 99% is only nine percentage points and it removes 90% of the remaining
+database load. That is why the stampede problem above matters so much: a hot key expiring does not
+nudge the hit rate, it briefly takes it to zero for the busiest thing you have.</p>
+
+<p>It also explains a counter-intuitive operational rule: <strong>never flush the whole cache on a
+running system.</strong> A cold cache means 100% miss rate against a database sized for 5%, and the
+usual outcome is that the database falls over and cannot recover, because every retry is another
+miss. Warm a new cache alongside the old one, or expire gradually.</p>
+
+<p>Worth alerting on, in order: hit rate dropping, eviction rate rising (the cache is too small),
+and memory usage approaching the limit.</p>
+
+<h2>What to cache, concretely</h2>
+
+<p>&ldquo;Cache the expensive read&rdquo; is easy to say. In practice there are four different
+things people mean, and they behave differently.</p>
+
+<table>
+  <thead><tr><th>Granularity</th><th>Example</th><th>Trade</th></tr></thead>
+  <tbody>
+    <tr><td>Whole page / response</td><td>The rendered listing JSON</td>
+        <td>Biggest win, coarsest invalidation &mdash; any change drops all of it</td></tr>
+    <tr><td>Object</td><td>One property record</td>
+        <td>StayHub&rsquo;s choice. Reusable across endpoints, invalidates precisely.</td></tr>
+    <tr><td>Query result</td><td>&ldquo;top 20 in San Francisco&rdquo;</td>
+        <td>Helps lists, but invalidation is genuinely hard &mdash; which queries does a new
+            listing affect?</td></tr>
+    <tr><td>Computed value</td><td>An aggregate, a permission set</td>
+        <td>Cheap to store, and often the single biggest saving</td></tr>
+  </tbody>
+</table>
+
+<p>The query-result row is the one to be wary of. Caching &ldquo;the results of this search&rdquo;
+sounds obviously right and creates an invalidation problem with no clean answer: a newly published
+listing should appear in an unknown number of cached queries, and you cannot enumerate them. The
+usual resolutions are a short TTL and accepting the staleness, or not caching queries at all and
+caching the objects they return &mdash; which is why StayHub caches objects.</p>
+
+<h2>Where else caches live</h2>
+
+<p>&ldquo;Add a cache&rdquo; usually means Redis, but there are several layers and they are worth
+distinguishing when asked.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   browser cache      Cache-Control on the response — free, closest to the user
+   CDN edge           static assets, near the user
+   application memory per-process; fastest, but N servers = N copies,
+                      and invalidation reaches only one of them
+   distributed cache  Redis / Memcached — shared, invalidatable, one round trip
+   database cache     Postgres' own buffer pool — already caching for you</code></pre>
+
+<p>The application-memory row is the one that catches people. It is the fastest option and it is
+not shared, so on a load-balanced fleet each server holds its own copy and an invalidation on one
+leaves the rest stale. Users then see values flip as they are balanced between servers. It is fine
+for genuinely immutable data &mdash; configuration read at startup, compiled templates &mdash; and
+a trap for anything else.</p>
+
+<h2>The summary</h2>
+
+<ul>
+  <li><strong>Cache-aside</strong> by default; the writer deletes rather than updates.</li>
+  <li><strong>Cache hot, expensive, rarely-written reads.</strong> Never cache anything where stale
+      means wrong.</li>
+  <li><strong>TTL and explicit invalidation together</strong> &mdash; each covers the other&rsquo;s
+      failure.</li>
+  <li><strong>Keys from a named function, with a version in them.</strong></li>
+  <li><strong>Jitter the TTL</strong> so a hot key expiring does not send the full load at your
+      database.</li>
+  <li><strong>Set an eviction policy explicitly</strong>, or a full cache becomes failed
+      requests.</li>
+  <li><strong>Every cache call degrades to a miss, with a short timeout</strong> &mdash; and test
+      it with the cache turned off.</li>
+</ul>
+
+<p>And the framing worth carrying: a cache is not a component you add, it is a
+<em>copy you have chosen to maintain</em>. Every difficulty above &mdash; invalidation, stampede,
+the read-write race, the stale value on one server out of ten &mdash; is a consequence of there
+being two copies. That is why the discipline is worth more than the speedup: the speedup is
+automatic, and the copy is the part that will page you.</p>
+
+<p>Next: <a href="/system-design/system-design-database-scaling">scaling the database</a>, for the
+reads a cache cannot help with and the writes it never could. Between them, a cache and a read
+replica handle almost every read-scaling problem you will meet before sharding &mdash; and the
+order to try them in is the order they appear in this track.</p>

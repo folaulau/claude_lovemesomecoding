@@ -1,0 +1,507 @@
+<p>An unlimited login endpoint is a password-guessing service with a pleasant JSON API. An
+unlimited search endpoint is a way for one buggy client to consume your entire database. Rate
+limiting is how a public API stops being a shared resource that anyone can monopolise.</p>
+
+<p>It is also a small, self-contained distributed-systems problem: a counter that several machines
+update at once, where getting the atomicity wrong produces a limiter that passes every test and
+does nothing.</p>
+
+<h2>The four algorithms</h2>
+
+<p>They differ in what happens at the edges, and the edges are where limiters are attacked.</p>
+
+<h3>Fixed window</h3>
+
+<p>Count requests per calendar minute. Reset the counter when the minute changes.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   key = "user:42:2026-08-22T14:31"
+   INCR key ; EXPIRE key 60 ; allow if count <= limit</code></pre>
+
+<p>Two commands and one counter. It also has a bug that makes it unsuitable for anything security
+related:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   limit = 100/minute
+
+   14:31:59   ████████████████ 100 requests   (window A)
+   14:32:00   ████████████████ 100 requests   (window B — counter reset)
+              └────── 200 requests in ~1 second ──────┘</code></pre>
+
+<p>Twice the stated limit, delivered in a burst, by simply straddling a boundary that is trivial to
+predict. Fine for rough quota accounting; not fine for a login endpoint.</p>
+
+<h3>Sliding log</h3>
+
+
+<p>Store a timestamp per request; count the ones inside the window. Exactly correct, no boundary
+effect, and unaffordable: a limit of 1,000 per hour means storing 1,000 timestamps
+<em>per client</em>. Memory scales with traffic, which is the property you least want in the
+component that exists to handle excess traffic.</p>
+
+<h3>Sliding window counter</h3>
+
+<p>The pragmatic compromise: keep two fixed-window counters and interpolate.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   30% into the current minute:
+
+   estimate = current_count + previous_count x 0.7
+
+   Two counters, no boundary doubling, slightly approximate.</code></pre>
+
+<p>Good, cheap, and what several large CDNs use. It is an estimate, so it can be marginally
+generous or strict at the edges.</p>
+
+<h3>Token bucket</h3>
+
+<p>A bucket holds up to <em>capacity</em> tokens and refills continuously. Each request spends one;
+an empty bucket means refusal.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   capacity 20, refill 20/minute (1 every 3s)
+
+   ┌────────────────────┐  full — 20 requests may arrive at once
+   │ ● ● ● ● ● ● ● ● ●  │
+   └────────────────────┘
+            │ spend 1 per request
+            │ refill 1 every 3s, never above capacity
+            v
+   empty -> refuse, and say when to come back</code></pre>
+
+<p>Two numbers of state &mdash; tokens remaining, and when they were last counted &mdash; regardless
+of traffic. And the burst allowance is a <em>feature</em> you set independently of the rate, which
+none of the others give you: a page firing six requests on load should not be throttled by a
+&ldquo;one per second&rdquo; rule, and a bucket of 20 refilling at 1/second permits that page load
+while still holding the long-run average to one per second.</p>
+
+<table>
+  <thead><tr><th></th><th>Burst</th><th>Memory</th><th>The flaw</th></tr></thead>
+  <tbody>
+    <tr><td>Fixed window</td><td>Full limit each window</td><td>1 counter</td><td>Double rate at the boundary</td></tr>
+    <tr><td>Sliding log</td><td>None</td><td>1 entry per request</td><td>Unaffordable</td></tr>
+    <tr><td>Sliding window counter</td><td>Smoothed</td><td>2 counters</td><td>Approximate</td></tr>
+    <tr><td><strong>Token bucket</strong></td><td><strong>Bounded, deliberate</strong></td><td><strong>2 numbers</strong></td><td><strong>None that matters</strong></td></tr>
+  </tbody>
+</table>
+
+<h3>Which to pick</h3>
+
+<p>In practice the choice collapses quickly. Use a <strong>token bucket</strong> unless you have a
+reason not to &mdash; it is the only one where you set burst and rate independently, and its state
+does not grow with traffic.</p>
+
+<p>Reach for the <strong>sliding window counter</strong> when you need a hard &ldquo;never more than
+N in any window&rdquo; guarantee with no burst at all, which is occasionally a contractual
+requirement rather than an engineering preference. Reach for the <strong>sliding log</strong> only
+when N is tiny and exactness matters &mdash; five password resets a day, say, where storing five
+timestamps is nothing.</p>
+
+<p>And avoid <strong>fixed window</strong> for anything an adversary touches, while accepting it is
+perfectly reasonable for rough internal quota accounting where a boundary burst costs nothing.</p>
+
+<h2>The bug that makes a limiter decorative</h2>
+
+<p>Here is the implementation almost everyone writes:</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">tokens = redis.get(key)            # process A reads 1.0    process B reads 1.0
+if tokens >= 1: tokens -= 1        # A decides: allow       B decides: allow
+redis.set(key, tokens)             # A writes 0.0           B writes 0.0</code></pre>
+
+<p>Two requests, one token, both allowed. That is a lost update, and it is not an unlucky
+interleaving &mdash; it is the <em>normal</em> outcome when a client sends requests concurrently,
+which is precisely what an abusive client does.</p>
+
+<p>Under four API workers the effective limit becomes roughly four times what it says. And the
+limiter passes every sequential test ever written for it, because sequentially it is correct. This
+is the check-then-act race from the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post</a>, in three
+lines.</p>
+
+<h2>Making it atomic</h2>
+
+<p>The logic is three steps &mdash; refill for elapsed time, decide, write back &mdash; which is
+too much for a single Redis command. So the logic goes to where the data is. Redis executes a Lua
+script as one indivisible unit; no other command from any connection interleaves with it.</p>
+
+<pre class="language-lua"><code class="language-lua">local now_pair   = redis.call('TIME')
+local now        = tonumber(now_pair[1]) + tonumber(now_pair[2]) / 1000000
+
+local bucket     = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens     = tonumber(bucket[1])
+local ts         = tonumber(bucket[2])
+
+if tokens == nil then
+  tokens = capacity
+  ts = now
+end
+
+local elapsed = math.max(0, now - ts)
+tokens = math.min(capacity, tokens + elapsed * refill)
+
+local allowed = 0
+if tokens &gt;= cost then
+  tokens = tokens - cost
+  allowed = 1
+end
+
+redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', key, ttl)</code></pre>
+
+<p>Four details in there are decisions rather than incidentals.</p>
+
+<p><strong>Nothing runs on a timer.</strong> The bucket is recomputed from how long it has been
+since anyone last looked: <code>tokens + elapsed * refill</code>. No background job refills
+anything, which is what keeps the state to two numbers.</p>
+
+<p><strong><code>math.min(capacity, ...)</code>.</strong> Without the cap, a client idle for an
+hour returns with an hour of accumulated tokens and can spend them all at once &mdash; a limiter
+permitting exactly the burst it was deployed to prevent.</p>
+
+<p><strong><code>redis.call('TIME')</code>, not a timestamp from the caller.</strong> The API runs
+on several machines whose clocks disagree by tens of milliseconds. One clock &mdash; the
+server&rsquo;s &mdash; is the only way every worker refills the same bucket consistently.</p>
+
+<p><strong>The <code>EXPIRE</code> is refreshed every call.</strong> A bucket that expires while a
+client is still being limited hands them a fresh full one; the TTL exists only to reclaim keys for
+clients that have gone away.</p>
+
+<p>One more, invisible in the script: the key is passed as a <em>key</em> rather than built inside
+the script body. Redis Cluster routes a script by its declared keys, so a script that constructs
+key names internally works on a single node and silently misroutes the day the cache is sharded.</p>
+
+<h3>The state it keeps</h3>
+
+<p>The rule is expressed as capacity plus a window rather than as a refill rate, and that is a
+readability decision worth copying:</p>
+
+<pre class="language-python"><code class="language-python">@dataclass(frozen=True)
+class Rule:
+    name: str
+    capacity: int
+    per_seconds: int
+
+    @property
+    def refill_per_second(self) -> float:
+        return self.capacity / self.per_seconds</code></pre>
+
+<p>&ldquo;Twenty at once, twenty a minute sustained&rdquo; is something a human can reason about
+and argue with. &ldquo;0.333 tokens per second&rdquo; is the same statement in a form nobody can
+sanity-check, and it is derived rather than configured.</p>
+
+<p>The stored state per client is genuinely just the two numbers the bucket needs:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   key: stayhub:v1:ratelimit:login:ip:203.0.113.5
+   ├── tokens  7.34            fractional, because refill is continuous
+   └── ts      1787425138.21   when they were last counted
+
+   TTL: 2x the window, refreshed on every call.
+
+   Two fields per client, whether they made one request or a million.</code></pre>
+
+<p>The TTL being twice the window is deliberate: a bucket must outlive the period it is limiting
+even for a client that goes quiet halfway through, or the client returns to a full bucket.</p>
+
+<p>The keys are also namespaced and versioned by the same helper the cache uses, which matters
+because both live in the same Redis. Sharing a keyspace with no prefix is how one component starts
+reading another&rsquo;s data, and the symptom is not an error &mdash; it is a counter that behaves
+strangely.</p>
+
+<h2>Proving it</h2>
+
+<p>Sequential tests cannot tell the two implementations apart. The test has to be concurrent and
+has to assert an exact total:</p>
+
+<pre class="language-python"><code class="language-python">        with cf.ThreadPoolExecutor(max_workers=50) as pool:
+            allowed = list(pool.map(lambda _: rate_limit.check(rule, "swarm").allowed, range(50)))
+
+        assert sum(allowed) == 20, (
+            f"{sum(allowed)} of 50 allowed against a capacity of 20 — the check is not atomic"
+        )</code></pre>
+
+<p><strong>50 threads, a bucket of 20, and exactly 20 get through.</strong> That runs green against
+the Lua version. Against the read-modify-write version it produces 23, or 27, or 21, depending on
+timing &mdash; which is why the assertion is an exact equality rather than &ldquo;at most&rdquo;. A
+racy limiter does not fail dramatically; it overruns slightly and irregularly.</p>
+
+<p>The window is deliberately an hour long so that refill cannot mask a lost update by handing out
+extra tokens mid-test.</p>
+
+<h2>Who is being limited?</h2>
+
+<p>A limiter is only as good as its notion of &ldquo;who&rdquo;. Get it wrong and you either limit
+everyone together &mdash; one noisy client throttles the site &mdash; or limit nobody, because
+every request looks unique.</p>
+
+<pre class="language-python"><code class="language-python">def identify(request, user=None) -> str:
+    if user is not None:
+        return f"user:{user.public_id}"
+    return f"ip:{client_ip(request)}"</code></pre>
+
+<p>The account wins when there is one. An IP is a poor identity in both directions: an office or a
+university NATs thousands of people behind one address, and a single abusive client can rent
+thousands of addresses.</p>
+
+<h3>The header that turns the limiter off</h3>
+
+<p>This is the security bug worth knowing, because the naive implementation is what most tutorials
+show:</p>
+
+<pre class="language-python" data-antipattern="true"><code class="language-python">ip = request.headers.get("X-Forwarded-For", request.client.host)</code></pre>
+
+<p><code>X-Forwarded-For</code> is set by the client. Anyone can send a random value on every
+request and receive a fresh bucket each time; the limiter then diligently tracks millions of clients
+that made one request each. It is a header a <em>proxy</em> sets, and it means nothing unless you
+know a proxy you trust set it.</p>
+
+<pre class="language-python"><code class="language-python">    if TRUSTED_PROXY_COUNT &gt; 0:
+        forwarded = request.headers.get(FORWARDED_FOR, "")
+        hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+        if len(hops) &gt;= TRUSTED_PROXY_COUNT:
+            return hops[-TRUSTED_PROXY_COUNT]</code></pre>
+
+<p>Two rules. Honour the header only when a trusted proxy is genuinely in front &mdash; the default
+is to ignore it entirely. And count hops <strong>from the right</strong>: the rightmost entries were
+appended by infrastructure you control, and everything to the left is whatever the client chose to
+claim.</p>
+
+<h2>Telling a client how much is left</h2>
+
+<p>A well-designed limiter is one clients can cooperate with, and cooperation needs information
+before the refusal rather than after it.</p>
+
+<pre class="language-python"><code class="language-python">@dataclass(frozen=True)
+class Decision:
+    allowed: bool
+    remaining: int
+    retry_after: int
+    reset_at: int</code></pre>
+
+<p>Returning the decision on success as well as failure is what makes that possible &mdash; a
+route can put <code>X-RateLimit-Remaining</code> on a 200, so a client watching it drop can slow
+down before it hits zero. A limiter that only speaks when refusing has forced every client into
+trial and error.</p>
+
+<p>The corresponding client-side discipline is worth naming because it is the other half of the
+contract: on a 429, wait for <code>Retry-After</code>, and add jitter. If every refused client
+retries at exactly the moment the header specifies, they arrive together and are refused
+together.</p>
+
+<h2>Distributed by construction</h2>
+
+<p>One reason the counter lives in Redis rather than in the application: an in-memory limiter on N
+servers is N independent limiters.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   limit: 10 per 5 minutes, counted IN PROCESS
+
+   [ app 1 ]  10 allowed
+   [ app 2 ]  10 allowed        the load balancer spreads an attacker
+   [ app 3 ]  10 allowed        across all of them
+   [ app 4 ]  10 allowed
+              ── effective limit: 40, and it grows every time you scale up</code></pre>
+
+<p>This is the in-memory state problem from the <a
+href="/system-design/system-design-load-balancing">load balancing post</a>, with a security
+consequence attached: the limiter gets weaker precisely when traffic is high enough that you added
+servers.</p>
+
+<p>Shared state is the answer, and it costs one network round trip per limited request &mdash;
+sub-millisecond to a local Redis, and only on the endpoints that carry a limit. That is a very
+cheap round trip for a correct answer.</p>
+
+<p>At extreme volume the round trip does start to matter, and the usual escape is a hybrid: allow
+each server a local allowance drawn from a shared pool, and reconcile periodically. It is
+approximate by design, and the approximation is acceptable when the limit is a quota rather than a
+security boundary.</p>
+
+<h2>Where the limiter goes</h2>
+
+<p>StayHub applies limits as route dependencies rather than as middleware, and both the choice and
+its cost are worth stating.</p>
+
+<p>Middleware sees every request, which sounds ideal and makes per-endpoint limits awkward &mdash;
+you end up with a path-prefix table inside the middleware, which is a router, badly. Middleware also
+runs before authentication, so it can only ever limit by IP.</p>
+
+<p>A dependency runs after authentication, so it can limit the account; it sits on exactly the
+routes that need it; and it appears in the API documentation. The cost is that a new expensive
+endpoint is unprotected until somebody adds it.</p>
+
+<pre class="language-python"><code class="language-python">LOGIN_RULE = rate_limit.Rule(
+    name="login",
+    capacity=settings.rate_limit_login_capacity,
+    per_seconds=settings.rate_limit_login_seconds,
+)</code></pre>
+
+<p>Two endpoints are limited and the asymmetry is the design. Login gets <strong>10 requests per 5
+minutes</strong> &mdash; strict, because the endpoint guards a password. Someone who mistypes twice
+never notices; a script working through a wordlist gets ten tries per five minutes per address,
+which turns a feasible attack into an infeasible one.</p>
+
+<p>Search gets <strong>60 requests per minute</strong> &mdash; generous, because it protects a
+server rather than a secret. Nobody browsing can reach it; a runaway loop reaches it in under a
+second.</p>
+
+<p>In production a coarse limit also belongs at the <strong>edge</strong>, in the load balancer or
+CDN, because a request refused there costs no worker, no database connection and no log line. The
+fine-grained layer behind it is not a replacement for that.</p>
+
+<h3>Do not key login on the email address</h3>
+
+<p>A tempting refinement that creates a weapon. Limiting by submitted email lets an attacker lock
+any user out of their own account by deliberately failing logins on their address &mdash; a limiter
+that becomes a denial-of-service tool against the person it protects.</p>
+
+<p>Serious deployments key on both: a per-account limit that slows attempts and a per-IP limit that
+stops them, so neither alone can be abused this way.</p>
+
+<h2>The response</h2>
+
+<p>A 429 with no further information is a request to retry immediately, and a limiter that provokes
+a retry storm has made the load problem worse than the one it was deployed to fix.</p>
+
+<pre class="language-python"><code class="language-python">            headers={
+                "Retry-After": str(retry_after),
+                "X-RateLimit-Limit": str(limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(reset_at),
+            },</code></pre>
+
+<p><code>Retry-After</code> is the contract. The <code>X-RateLimit-*</code> headers let a
+well-behaved client slow down <em>before</em> being refused, which is the whole point of publishing
+them.</p>
+
+<p>Over HTTP that produces exactly what you want:</p>
+
+<pre class="language-bash"><code class="language-bash">request 11 -> 429
+  body   : {'message': 'Too many sign-in attempts. Please wait a moment and try again.',
+            'fieldErrors': {}}
+  retry-after           : 30
+  x-ratelimit-limit     : 10
+  x-ratelimit-remaining : 0</code></pre>
+
+<p>Two things that are easy to get wrong. The body keeps <strong>the same error shape as every
+other error</strong> in the API, so the frontend needs one parser rather than a special case. And
+the response still carries <strong>CORS headers</strong> &mdash; a 429 without them is reported by
+the browser as a network failure, so the user sees &ldquo;something went wrong&rdquo; instead of
+&ldquo;you are being rate limited&rdquo;.</p>
+
+<h2>Fail open, and say so</h2>
+
+<p>If Redis is unreachable, StayHub&rsquo;s limiter allows the request. That is a real trade with a
+real downside, so it should be a decision rather than an accident.</p>
+
+<p>Fail <strong>closed</strong> and a Redis outage takes down login for everybody &mdash; a cache
+outage becomes a total outage, which is exactly the coupling the <a
+href="/system-design/system-design-caching">caching post</a> works to avoid, reintroduced by the
+back door. Fail <strong>open</strong> and for the duration of the outage login is unprotected
+against brute force, while the passwords behind it are still hashed and the application&rsquo;s own
+lockout rules still apply.</p>
+
+<p>The right answer depends on what the limiter protects. For quota enforcement somebody is billed
+against, fail closed &mdash; giving away free usage is worse than refusing service. For availability
+protection, which this is, fail open.</p>
+
+<p>And a guarantee is only as wide as its narrowest <code>try</code>. This limiter originally
+wrapped the Lua call but not the script registration:</p>
+
+<pre class="language-python"><code class="language-python">        try:
+            client = cache._client()
+            if client is None:
+                return None
+            _script = client.register_script(_TOKEN_BUCKET)
+        except Exception as exc:  # noqa: BLE001
+            _fail_open(exc)
+            return None</code></pre>
+
+<p>Registration looks like a local operation &mdash; it hashes a string &mdash; but it runs on a
+client object that a malformed connection URL makes unbuildable. So a misconfigured
+<code>redis_url</code> failed <strong>closed</strong>: every login returning 500, which is precisely
+the outcome the fail-open decision existed to prevent. A test caught it, and only because the test
+patched the client to raise rather than to be absent.</p>
+
+<h2>Choosing the numbers</h2>
+
+<p>&ldquo;Rate limit the API&rdquo; is not a design until there are numbers on it, and picking them
+by feel produces limits that either annoy real users or stop nobody.</p>
+
+<p>The method that works is to measure first and set the limit above observed legitimate use:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   1  log request rates per client for a week, WITHOUT enforcing
+   2  find the p99 of legitimate users        say 12/min
+   3  set the limit well above it             say 60/min
+   4  enable in "report only" — log what WOULD have been refused
+   5  read that log. Anything surprising is a real user you nearly broke.
+   6  enforce</code></pre>
+
+<p>Steps 4 and 5 are the ones that get skipped and the ones that prevent an incident. The clients
+you are about to refuse are frequently your own: a mobile app that retries aggressively, an
+internal dashboard polling every second, a partner integration nobody documented.</p>
+
+<p>Which leads to the practical necessity of <strong>tiers</strong>. One global limit is always
+wrong for somebody:</p>
+
+<table>
+  <thead><tr><th>Caller</th><th>Typical treatment</th></tr></thead>
+  <tbody>
+    <tr><td>Anonymous</td><td>Strictest &mdash; by IP, and the identity is weak</td></tr>
+    <tr><td>Signed in</td><td>Generous &mdash; a real account, and revocable</td></tr>
+    <tr><td>Paying / partner</td><td>Higher, contractually specified</td></tr>
+    <tr><td>Internal services</td><td>Exempt, or limited only to catch runaway loops</td></tr>
+  </tbody>
+</table>
+
+<p>And the off switch matters more than it looks. StayHub keeps one:</p>
+
+<pre class="language-python"><code class="language-python">    rate_limit_enabled: bool = True</code></pre>
+
+<p>Rate limiting you cannot disable without a deploy is rate limiting you cannot disable during the
+incident it is causing. That is a small piece of configuration bought cheaply, and the day you need
+it you will need it urgently.</p>
+
+<h2>What rate limiting is not</h2>
+
+<p>Worth being clear about the boundary, because it gets asked as a follow-up.</p>
+
+<p>A rate limiter counts requests per client and refuses the excess. That defends against
+<strong>one</strong> abusive client, a buggy integration, and credential stuffing from a small set
+of addresses. It is the right tool for those.</p>
+
+<p>It is not a defence against a distributed denial of service, where the traffic comes from a
+hundred thousand hosts each making a handful of requests. None of them exceeds any per-client
+limit, and your servers are still saturated &mdash; frequently at a layer beneath HTTP, where the
+limiter never sees the packets. That is a problem for network-level scrubbing, upstream capacity,
+and a CDN absorbing the load, which is one more argument for the coarse layer living at the
+edge.</p>
+
+<p>Nor is it a defence against an expensive <em>legitimate</em> request. Sixty allowed searches a
+minute is still sixty searches, and if one of them can trigger an unbounded query the limit is
+irrelevant. Pagination caps, query timeouts and result limits are what protect against that &mdash;
+different mechanisms, aimed at cost per request rather than requests per client.</p>
+
+<h2>The summary</h2>
+
+<ul>
+  <li><strong>Token bucket by default.</strong> Two numbers of state, and burst is a parameter
+      rather than an accident.</li>
+  <li><strong>Never fixed window for anything security-related</strong> &mdash; the boundary gives
+      away double the limit.</li>
+  <li><strong>The counter must be atomic.</strong> Read-modify-write multiplies your limit by the
+      number of workers and passes every sequential test.</li>
+  <li><strong>Test it concurrently, with an exact assertion.</strong></li>
+  <li><strong>Key on the account when you have one</strong>, and never trust
+      <code>X-Forwarded-For</code> without a trusted proxy in front.</li>
+  <li><strong>Different limits for different endpoints.</strong> Strict where a secret is guarded,
+      generous where a server is.</li>
+  <li><strong>Return <code>Retry-After</code></strong>, keep your normal error shape, and keep the
+      CORS headers.</li>
+  <li><strong>Decide fail-open or fail-closed deliberately</strong>, and check that no code path
+      escapes the decision.</li>
+</ul>
+
+<p>Two ideas here generalise well beyond rate limiting. The first is that <strong>a decision
+depending on a shared value must read and write it in one operation</strong> &mdash; the same
+principle that made a database constraint the right answer for double booking, applied to a
+different store. The second is that <strong>every protective component needs an explicit answer for
+what it does when it is broken</strong>, because the default answer is usually to fail closed, and
+a security component that takes down the thing it protects has traded one problem for a worse
+one.</p>
+
+<p>Next: <a href="/system-design/system-design-unique-id-generator">generating unique ids</a>
+&mdash; the last of the mechanisms before the case studies begin.</p>
