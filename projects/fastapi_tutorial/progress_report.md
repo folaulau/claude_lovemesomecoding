@@ -635,14 +635,98 @@ unaffected tracks  / /hasura /python /java /oracle all 200
 
 ---
 
+## Dates re-based to 2025 &mdash; 2026-08-23
+
+The track went out dated **2026-09-02 &rarr; 2026-10-23**, which was *in the future*: the publish
+happened on 2026-08-21, so every one of the eighteen posts carried a date one to two months ahead
+of the day it went live. Requirement given: post dates must fall in **2024&ndash;2025**.
+
+One constant moved &mdash; `START_DATE`, `datetime(2026, 9, 2)` &rarr; `datetime(2025, 9, 2)`.
+A pure year shift, so the 3-day cadence and the lesson order are untouched and the diff is one
+line. The track now runs **2025-09-02 &rarr; 2025-10-23**, all eighteen inside the band.
+
+**No post body was edited.** The date is metadata; `wordCount`, `readingMinutes` and every
+`contentHtml` byte are identical to what was already live. `check_content.py` passes unchanged.
+
+### Two things the re-seed needed
+
+`--force-dates` again, and that is not a one-off after all. The docstrings said "expect to pass it
+exactly once per tree", which was wrong: `upsert_post` never overwrites an existing date, so once
+a post is published its date is sticky. The nine 2023 rewrites were the first case; **any** later
+re-base of `START_DATE` is the same case, now for all eighteen. Both docstrings corrected.
+
+The `new`-slug collision guard in `seed.py` fired on all nine `new` slugs, correctly by its own
+logic and uselessly in fact &mdash; they exist because *this track created them*. It was written
+for a first seed and could never pass a second. Narrowed to what it actually protects against: a
+`new` slug that exists **in a different category**, which is the case where upserting would drag a
+stranger's page into `/fastapi` and rewrite its body. Mere existence inside `/fastapi` now prints
+a note. Deliberately not reduced to a warning &mdash; that would let a real collision through on
+every seed from the second one onward.
+
+### Verified live
+
+```
+seed          18 update, 0 create; 687 posts before -> 687 after
+indexes       index/posts.json, index/by-category/fastapi.json, index/categories.json
+              all report 18 fastapi entries, 2025-09-02 -> 2025-10-23, count 18
+verify-build  687/687 posts, 42/42 categories, index cross-check agrees
+edge          build 394b0bd (match), all 18 URLs 200
+rendered      /fastapi/fastapi-introduction shows "September 2, 2025"
+```
+
+### The cost, which is worth knowing
+
+The site has **314 posts dated 2026**, the newest 2026-09-27 &mdash; also in the future. Against
+that, a 2025 track sits at global archive positions **315&ndash;332** (pages 63&ndash;67) and no
+longer appears on the homepage. The date rule fixed the future-dating on `/fastapi`; the same
+problem is untouched on every other track, and until it is, backdating this one buries it.
+
+### One thing deliberately left alone
+
+Six places in the post bodies mention **2026-08-21** &mdash; the day the code was actually built,
+run and measured (`13` and `15` quote it inside code comments that live in the StayHub source and
+are byte-checked by `check_snippets.py`; `07`, `08`, `14`, `16` are free prose or sample output).
+They read oddly under a 2025 dateline. They were not changed, because they are records of when
+something was really run and a publication date chosen after the fact does not make them untrue.
+Say the word and the four free ones can lose the stamp while keeping the claim
+("Built and inspected:" rather than "Built and inspected on 2026-08-21:"); the two in source stay.
+
+---
+
+## ⚠️ The demo app moved out from under the published posts &mdash; found 2026-08-23
+
+`check_snippets.py` now exits 1: **7 drifted quotes and 1 undeclared file**. Nothing in this
+project caused it. `lovemesomecoding_demo_project` commit `b176be2` landed after the publish and
+refactored the code the live posts quote &mdash; +2,510 lines across 24 files, adding a Redis
+cache, a rate limiter and a **transactional outbox**.
+
+The damaging one: `create_booking` no longer takes `background: BackgroundTasks`. `bookings.py`
+says so in a comment dated 2026-08-22 &mdash; the confirmation email is now a `booking.created`
+outbox event. Lesson 11 (`fastapi-background-tasks`) is *about* that call, and lessons 02, 04 and
+11 all quote the old signature. `get_property` also changed: it now calls a cached service method
+instead of `PropertyResponse.model_validate(...)`.
+
+So four live posts quote code that no longer exists in the app they claim to be quoting. That is
+exactly the failure `check_snippets.py` was built to catch, and it caught it. Not fixed here
+&mdash; it is a content change, not a date change, and it deserves its own pass.
+
+```
+fastapi-routes-request-handling  block 0, block 17
+fastapi-project-structure        block 1
+fastapi-database-integration     block 12
+fastapi-error-handling           block 2, block 4
+fastapi-background-tasks         block 0; block 17 quotes an undeclared file
+```
+
+---
+
 ## Outstanding
 
-1. **Decide on length** &mdash; the posts are live at 13&ndash;15 min against an agreed
+1. **Re-quote the four posts the outbox refactor broke** &mdash; see above. `check_snippets.py`
+   exits 1 until then, and lesson 11's subject matter has changed, not just its formatting.
+2. **Decide on length** &mdash; the posts are live at 13&ndash;15 min against an agreed
    15&ndash;20. Accept, or merge two adjacent pairs (13+15, 11+12) and republish.
-2. **Commit the StayHub additions** &mdash; 23 uncommitted files in
-   `lovemesomecoding_demo_project` (middleware, logging, uploads, notifications, async session,
-   Dockerfile, 42 new tests). The published posts quote this code, so it should not stay
-   uncommitted.
-3. **Commit this project** &mdash; `manifest.py`, both checkers, `seed.py`, `posts/`, this report.
-4. **`--force-dates` has now been used on both trees.** Do not pass it again unless the manifest
-   dates change; a re-run without it is safe and idempotent.
+3. **The rest of the site is still future-dated** &mdash; 314 posts in 2026, newest 2026-09-27.
+   If the 2024&ndash;2025 rule is meant site-wide, `/fastapi` is one track of many.
+4. **`--force-dates` is needed on every re-base**, not once per tree. Passing it when the manifest
+   dates have not changed is harmless; a re-run without it is safe and idempotent.
