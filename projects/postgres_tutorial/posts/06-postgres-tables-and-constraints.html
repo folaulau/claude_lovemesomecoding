@@ -1,0 +1,170 @@
+<p>A constraint is a rule the database will not let you break, no matter which application, script
+or person is connected. Everything you enforce in application code is a rule that holds until
+someone writes a second application, runs a fix-up script, or edits a row by hand at 3am.</p>
+
+<p>This post builds a table properly, then works through the constraints in the order you should
+reach for them.</p>
+
+<h2>CREATE TABLE</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE payouts (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    host_id     integer     NOT NULL REFERENCES users(id),
+    amount      numeric(10,2) NOT NULL CHECK (amount > 0),
+    currency    char(3)     NOT NULL DEFAULT 'USD',
+    paid_at     timestamptz,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);</code></pre>
+
+<p>Six columns, five rules. Nothing in there is optional decoration — each one removes a class of
+row that would otherwise reach production.</p>
+
+<h2>Identity, not serial</h2>
+
+<pre class="language-sql"><code class="language-sql">id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY   -- do this
+id bigserial PRIMARY KEY                             -- not this</code></pre>
+
+<p><code>serial</code> is not a type. It is shorthand that creates an integer column, a sequence,
+and a default — and then the sequence is a separate object with its own ownership and its own
+permissions, which is why <em>permission denied for sequence</em> is such a common first error
+after a careful <code>GRANT</code>.</p>
+
+<p><code>GENERATED ALWAYS AS IDENTITY</code> is the standard SQL replacement and it is stricter in
+the way you want: an <code>INSERT</code> that supplies its own <code>id</code> is rejected rather
+than quietly desynchronising the sequence. When you genuinely need to supply one — restoring a
+backup — <code>OVERRIDING SYSTEM VALUE</code> says so out loud.</p>
+
+<h2>NOT NULL and DEFAULT</h2>
+
+<p>The cheapest constraint there is, and the most under-used. Before adding a nullable column, ask
+what a NULL there would <em>mean</em>. If the answer is "nothing, it just wasn't filled in yet",
+the column wants <code>NOT NULL DEFAULT</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">created_at timestamptz NOT NULL DEFAULT now()</code></pre>
+
+<p><code>now()</code> is evaluated per row at insert time, not frozen when the table was created —
+it is stored as an expression. Note that <code>now()</code> returns the time the
+<em>transaction</em> started, so every row written in one transaction shares a timestamp. That is
+usually what you want; <code>clock_timestamp()</code> is the one that moves.</p>
+
+<h2>Primary and foreign keys</h2>
+
+<pre class="language-sql"><code class="language-sql">host_id integer NOT NULL REFERENCES users(id)</code></pre>
+
+<p>That guarantees every <code>host_id</code> matches a real user, and it costs you a lookup on
+every insert. The part worth deciding deliberately is what happens when the user is deleted:</p>
+
+<table>
+  <thead><tr><th>Clause</th><th>On deleting the parent</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td><code>ON DELETE RESTRICT</code></td><td>Refuse</td><td>The default, and the right
+        answer for anything financial.</td></tr>
+    <tr><td><code>ON DELETE CASCADE</code></td><td>Delete the children too</td><td>Rows that have
+        no meaning alone — a property's images.</td></tr>
+    <tr><td><code>ON DELETE SET NULL</code></td><td>NULL the reference</td><td>Optional links.
+        Requires a nullable column.</td></tr>
+  </tbody>
+</table>
+
+<p>The booking schema uses <code>CASCADE</code> from properties to their images, and leaves
+bookings on <code>RESTRICT</code>. Deleting a user with bookings should fail loudly, because the
+answer is almost always that the user should be marked deleted rather than removed.</p>
+
+<p><strong>Postgres does not index a foreign key column for you.</strong> The parent's key is
+indexed because it is a primary key; the child's is not. Without one, deleting a parent scans the
+whole child table to check for references — which is how a delete on a small table takes thirty
+seconds.</p>
+
+<h2>UNIQUE</h2>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE payouts ADD CONSTRAINT uq_payouts_host_day UNIQUE (host_id, paid_at);</code></pre>
+
+<p>A unique constraint is implemented as a unique index, so it costs the same and gives you the
+lookup for free. One thing surprises people: <strong>NULLs do not conflict</strong>. Two rows with
+the same <code>host_id</code> and a NULL <code>paid_at</code> are both allowed, because the two
+NULLs are not equal. Postgres 15 added <code>UNIQUE NULLS NOT DISTINCT</code> for when you want the
+other behaviour.</p>
+
+<h2>CHECK</h2>
+
+<pre class="language-sql"><code class="language-sql">CHECK (amount > 0)</code></pre>
+
+<p>Any expression over the columns of a single row. The booking table uses one to state something
+that is otherwise only true by convention:</p>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR:  new row for relation "bookings" violates check constraint
+--         "ck_bookings_checkout_after_checkin"
+INSERT INTO bookings (property_id, guest_id, check_in, check_out, guests, nights, nightly_rate,
+                      subtotal, cleaning_fee, service_fee, total, status, public_id)
+VALUES (1, 1, DATE '2026-01-10', DATE '2026-01-05', 2, 1, 100, 100, 10, 12, 122, 'PENDING',
+        gen_random_uuid());</code></pre>
+
+<p>Name your constraints. Postgres will generate a name if you do not, and the generated one is
+what your application sees in the error — so the difference between a helpful message and
+<em>violates check constraint "bookings_check1"</em> is one clause.</p>
+
+<h2>The one that does real work</h2>
+
+<p>Two guests must not book the same property on overlapping nights. That is not a uniqueness rule
+— the dates differ — and it is the kind of thing usually left to the application: read the
+calendar, decide it is free, insert. Between the read and the insert, someone else books it.</p>
+
+<p>An <strong>exclusion constraint</strong> states it directly:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+-- The booking table already carries this one, so drop it before re-creating it if
+-- you are following along against the sample database.
+ALTER TABLE bookings DROP CONSTRAINT IF EXISTS no_overlapping_bookings;
+
+ALTER TABLE bookings ADD CONSTRAINT no_overlapping_bookings
+    EXCLUDE USING gist (
+        property_id                          WITH =,
+        daterange(check_in, check_out, '[)') WITH &&
+    )
+    WHERE (status IN ('PENDING', 'CONFIRMED', 'COMPLETED'));</code></pre>
+
+<p>Read it as: no two rows may have the same <code>property_id</code> <em>and</em> overlapping date
+ranges — considering only rows whose status blocks the calendar, so a cancelled booking frees its
+nights. <code>btree_gist</code> is what lets an integer equality and a range overlap live in one
+GiST index.</p>
+
+<p>Trying to double-book is now impossible rather than unlikely:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ERROR:  conflicting key value violates exclusion constraint "no_overlapping_bookings"
+DETAIL:  Key (property_id, daterange(check_in, check_out, '[)'))=(100, [2024-04-10,2024-04-15))
+         conflicts with existing key (property_id, daterange(check_in, check_out, '[)'))
+         =(100, [2024-04-10,2024-04-15)).</code></pre>
+
+<p>No lock taken by the application, no race to lose, and it holds against every client — the API,
+a migration, a person in psql. The application still checks availability first, because a clean
+"those dates are taken" beats a database error, but correctness no longer depends on that check
+winning the race.</p>
+
+<p><code>'[)'</code> is the range's bounds: inclusive start, exclusive end. It is the reason a
+checkout on the 15th does not collide with a check-in on the 15th, which is exactly how hotels
+work.</p>
+
+<h2>Generated columns</h2>
+
+<p>A column computed from the others, stored and maintained by Postgres. Useful when a derived
+value is queried often enough that recomputing it in every query is wasteful — and better than a
+column the application has to remember to update:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings
+    ADD COLUMN stay daterange
+    GENERATED ALWAYS AS (daterange(check_in, check_out, '[)')) STORED;</code></pre>
+
+<p>You cannot write to it, and it cannot reference another table or anything non-deterministic —
+no <code>now()</code>. That restriction is the point: the value is always consistent with the row,
+because there is no path by which it could not be.</p>
+
+<h2>Adding a constraint to a table that already has rows</h2>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings ADD CONSTRAINT ck_guests_positive CHECK (guests > 0) NOT VALID;
+ALTER TABLE bookings VALIDATE CONSTRAINT ck_guests_positive;</code></pre>
+
+<p><code>NOT VALID</code> applies the rule to new and changed rows immediately without reading the
+existing ones, so it takes a brief lock rather than a long one. <code>VALIDATE</code> then checks
+the rest with a weaker lock that does not block writes. On a large table this is the difference
+between a deploy and an outage, and the migrations post returns to it.</p>

@@ -1,0 +1,366 @@
+<p>The write side is four operations &mdash; index, get, update, delete &mdash; and two ideas that
+are not obvious from the operations themselves: what a document id is for, and why a document you
+just wrote is not immediately searchable.</p>
+
+<h2>Indexing a document</h2>
+
+<p>Two forms, and the difference is whether you choose the id.</p>
+
+<pre class="language-bash"><code class="language-bash"># you choose the id — idempotent
+PUT /stayhub-properties/_doc/8f1e-...
+{ "title": "Cedar Cabin", "city": "Big Bear Lake" }
+
+# Elasticsearch chooses — a new document every time
+POST /stayhub-properties/_doc
+{ "title": "Cedar Cabin", "city": "Big Bear Lake" }</code></pre>
+
+<p>Use the first. Always, when the document corresponds to something that already has an identity in
+your system:</p>
+
+<pre class="language-python"><code class="language-python">        client.index(
+            index=settings.elasticsearch_index,
+            id=str(prop.public_id),
+            document=to_document(prop),
+        )</code></pre>
+
+<p>Because the document id <em>is</em> the listing's public id, indexing the same listing twice
+updates rather than duplicating, deleting it is a one-line call with no lookup, and a rebuild
+produces byte-for-byte the same index. That is what makes indexing <strong>idempotent</strong>, and
+idempotence is what makes every retry strategy in lesson 8 safe rather than merely hopeful.</p>
+
+<p>Let Elasticsearch generate ids and a retried write silently becomes two documents. There is no
+uniqueness constraint to save you.</p>
+
+<h3>The response, and the four numbers in it</h3>
+
+<pre class="language-json"><code class="language-json">{
+  "_index": "stayhub-properties-000002",
+  "_id": "8f1e-...",
+  "_version": 1,
+  "result": "created",
+  "_seq_no": 0,
+  "_primary_term": 1
+}</code></pre>
+
+<p><code>result</code> is <code>created</code> the first time and <code>updated</code> after that.
+That is a genuinely useful signal &mdash; it tells you whether your idea of "new" agrees with the
+index's.</p>
+
+<p><code>_version</code> increments on every write. It is <em>not</em> for concurrency control any
+more, despite what older documentation says; it is informational.</p>
+
+<p><code>_seq_no</code> and <code>_primary_term</code> are the pair that replaced it, and they are
+covered below.</p>
+
+<h3>Refusing to overwrite</h3>
+
+<p>When creating something that must not already exist, say so:</p>
+
+<pre class="language-bash"><code class="language-bash">PUT /stayhub-properties/_doc/8f1e-...?op_type=create</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">409 version_conflict_engine_exception
+[1]: version conflict, document already exists (current version [2])</code></pre>
+
+<p>A clean 409 instead of a silent overwrite. This is the closest thing Elasticsearch has to a
+unique constraint, and it only works on the <code>_id</code>.</p>
+
+<h2>The thing that confuses everyone</h2>
+
+<p>Index a document and immediately search for it:</p>
+
+<pre class="language-bash"><code class="language-bash">PUT /doc-test/_doc/1        {"title": "Cedar Cabin"}    # "result": "created"
+
+GET /doc-test/_search       {"query": {"match_all": {}}}
+# hits: 0</code></pre>
+
+<p>Zero hits. The write succeeded &mdash; it said so. Now fetch it by id:</p>
+
+<pre class="language-bash"><code class="language-bash">GET /doc-test/_doc/1
+# { "found": true, "_source": { "title": "Cedar Cabin" } }</code></pre>
+
+<p>Found. The same document, in the same index, at the same moment: invisible to search, visible to
+a direct lookup.</p>
+
+<p>This is not a bug and it is not a race you can wait out with a sleep. Elasticsearch is
+<strong>near-real-time</strong>, and the two operations read from different places.</p>
+
+<p>A write goes into an in-memory buffer and the transaction log. <code>GET</code> by id reads the
+translog, so it always sees the newest version &mdash; it is "realtime" by design. Search reads
+<em>segments</em>, which are immutable files, and a document is only searchable once it has been
+written into one. That step is called a <strong>refresh</strong>, and by default it happens once a
+second on any index that has been searched recently.</p>
+
+<h3>refresh, and what it costs</h3>
+
+<pre class="language-bash"><code class="language-bash">POST /doc-test/_refresh                  # refresh the index now
+PUT  /doc-test/_doc/1?refresh=true       # write, then refresh, then return
+PUT  /doc-test/_doc/1?refresh=wait_for   # write, return when the next refresh happens</code></pre>
+
+<p>The distinction between the last two matters more than it looks.
+<code>refresh=true</code> <em>forces</em> a refresh, creating a new segment immediately. Do that on
+every write and you create a segment per write, and the background merging of thousands of tiny
+segments will consume the cluster.</p>
+
+<p><code>refresh=wait_for</code> does not force anything &mdash; it holds your request open until
+the scheduled refresh comes round. Same visibility guarantee, none of the segment churn. It is
+almost always the right choice when a caller genuinely needs read-your-writes.</p>
+
+<p>StayHub keeps forcing to one place, with the reason written next to it:</p>
+
+<pre class="language-python"><code class="language-python">def refresh_index(*, es: Elasticsearch | None = None) -&gt; None:
+    """Force pending writes to become searchable NOW.
+
+    ⚠️ Elasticsearch is near-real-time: an indexed document is normally visible about a second
+    later, so a test that indexes and immediately searches finds nothing and looks like a broken
+    query. This exists for tests and the seed script — **never call it per write in production**,
+    it defeats the batching that makes indexing fast.
+    """</code></pre>
+
+<p>Going the other way is a real tuning lever. If an index is written far more than it is searched
+&mdash; a bulk load, a log ingest &mdash; raising the interval reduces segment creation
+significantly:</p>
+
+<pre class="language-bash"><code class="language-bash">PUT /stayhub-properties/_settings
+{ "index": { "refresh_interval": "30s" } }
+
+# or "-1" to disable it entirely during a bulk load, then set it back</code></pre>
+
+<p>What you must not do is design an application around one-second visibility. Show the user the
+value they just submitted from your own database, not from a search that may not see it yet.</p>
+
+<h2>Updating</h2>
+
+<p>Elasticsearch documents are immutable. Every "update" reads the current
+<code>_source</code>, applies the change, indexes the whole document again, and marks the old one
+deleted. Knowing that explains most of the behaviour.</p>
+
+<pre class="language-bash"><code class="language-bash">POST /doc-test/_update/1
+{ "doc": { "views": 5 } }
+# { "result": "updated", "_version": 3 }</code></pre>
+
+<p>Send the same update again and it notices:</p>
+
+<pre class="language-bash"><code class="language-bash">POST /doc-test/_update/1
+{ "doc": { "views": 5 } }
+# { "result": "noop", "_version": 3 }</code></pre>
+
+<p><code>noop</code>, and the version did not move. Elasticsearch compared the merged source to the
+existing one and skipped the write. This is free deduplication and it is worth knowing about,
+because it means re-sending unchanged documents is cheap &mdash; which makes "just reindex it
+again" a reasonable repair strategy.</p>
+
+<p>There is also a scripted form, for changes that depend on the current value:</p>
+
+<pre class="language-bash"><code class="language-bash">POST /doc-test/_update/1
+{ "script": { "source": "ctx._source.views += params.n", "params": { "n": 3 } } }</code></pre>
+
+<p>Useful, and not a substitute for a real counter. It still rewrites the whole document, it runs a
+script per call, and under concurrency it needs the version checks below. Lesson 6's advice stands:
+counters belong in your database.</p>
+
+<p>The <code>upsert</code> variant handles "update if present, create if not" in one call, which
+saves a round trip and a race:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "doc":       { "views": 1 },
+  "doc_as_upsert": true
+}</code></pre>
+
+<h3>Why "immutable" explains the rest of the behaviour</h3>
+
+<p>Several things that look unrelated are the same fact seen from different angles.</p>
+
+<p><strong>Updating one field costs the same as replacing the document.</strong> There is no partial
+write &mdash; the whole <code>_source</code> is re-indexed. So a document with a 50KB description
+and a hit counter is expensive to increment, which is the mechanical reason behind lesson 6's rule
+about volatile fields.</p>
+
+<p><strong>An update needs <code>_source</code> to exist.</strong> Disable
+<code>_source</code> to save disk and you lose the update API, reindexing, and the ability to see
+what you actually stored. Almost never worth it.</p>
+
+<p><strong>Deletes and updates both leave tombstones</strong>, so an index that is rewritten
+constantly grows and then shrinks in steps as merges catch up. A <code>docs.deleted</code> that is
+a large fraction of <code>docs.count</code> is a sign of a write pattern worth looking at, not
+usually an emergency.</p>
+
+<p><strong>The translog is what makes a write durable</strong> before it is in a segment. By default
+it is fsynced on every request, which is why an acknowledged write survives a crash. There is a
+setting to make that asynchronous for more throughput; it trades a few seconds of acknowledged
+writes on a hard failure, which for a derived index is often an acceptable trade and for a source
+of truth never is.</p>
+
+<h2>Concurrency: seq_no and primary_term</h2>
+
+<p>Two clients read the same document, both modify it, both write. The second overwrites the first
+and nobody notices. The fix is optimistic concurrency control: read the document, note its position,
+and make the write conditional on nothing having changed since.</p>
+
+<pre class="language-bash"><code class="language-bash">GET /doc-test/_doc/1
+# "_seq_no": 1, "_primary_term": 1
+
+PUT /doc-test/_doc/1?if_seq_no=0&if_primary_term=1
+{ "title": "stale write" }</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">409 version_conflict_engine_exception
+[1]: version conflict, required seqNo [0], primary term [1].
+current document has seqNo [1] and primary term [1]</code></pre>
+
+<p>Refused, with both the expected and the actual values. The caller re-reads and retries.</p>
+
+<p>Why two numbers rather than one? <code>_seq_no</code> is a counter per shard, incremented on
+every write. <code>_primary_term</code> increments whenever a shard gets a new primary, which
+happens after a failover. Together they are unique across the life of the shard even if a failover
+resets things &mdash; a single counter could repeat after a primary change, and the whole point is
+to be sure nothing was missed.</p>
+
+<p>In practice you need this rarely, and StayHub does not use it at all. That is not an oversight:
+Postgres is the source of truth, indexing is idempotent by document id, and the outbox handler
+re-reads from the database rather than writing a snapshot &mdash; so a lost update in the index is
+repaired by the next write rather than being a permanent divergence. Optimistic concurrency matters
+when Elasticsearch <em>is</em> the store, which lesson 1 argued against.</p>
+
+<h2>What "acknowledged" actually promises</h2>
+
+<p>A successful write response has a <code>_shards</code> block, and it is the part everyone skips:</p>
+
+<pre class="language-json"><code class="language-json">{ "result": "created", "_shards": { "total": 2, "successful": 1, "failed": 0 } }</code></pre>
+
+<p><code>total</code> counts the primary plus its replicas. <code>successful</code> is how many
+actually took the write. On a single-node cluster with no replicas that is 1 of 2 &mdash; the
+replica does not exist, so it cannot be written to, and the request still succeeded.</p>
+
+<p>That is the default consistency: a write is acknowledged once the <strong>primary</strong> has it
+and the replicas have been asked. If a replica fails to apply it, the response still says success
+and the cluster repairs the replica in the background.</p>
+
+<p>You can demand more with <code>wait_for_active_shards</code>, which refuses the write unless a
+given number of copies are available before it starts. What you cannot do is get a two-phase commit,
+because there is not one &mdash; which is another way of saying that if losing a write would be
+unacceptable, that write's home is not Elasticsearch.</p>
+
+<p>Reading <code>failed</code> is worth building into any indexing code that matters. It is
+non-zero far more often than people expect, and nothing surfaces it for you.</p>
+
+<h2>Deleting</h2>
+
+<pre class="language-bash"><code class="language-bash">DELETE /doc-test/_doc/1
+# { "result": "deleted" }
+
+DELETE /doc-test/_doc/nope
+# { "result": "not_found" }</code></pre>
+
+<p>Deleting something that is not there returns <code>not_found</code> with a 404 status rather than
+an error, and in most applications that is exactly right &mdash; removing a listing that was never
+indexed is a no-op, not a failure:</p>
+
+<pre class="language-python"><code class="language-python">        client.options(ignore_status=404).delete(index=settings.elasticsearch_index, id=public_id)</code></pre>
+
+<p>A delete does not free space immediately. It writes a tombstone; the document stays in its
+segment until a background merge rewrites that segment without it. So a heavily updated index is
+larger than the sum of its live documents, and
+<code>_cat/indices</code> shows both counts &mdash; <code>docs.count</code> and
+<code>docs.deleted</code>.</p>
+
+<p>There is also <code>_delete_by_query</code>, which finds matching documents and deletes them one
+at a time under the hood. It is not a fast bulk operation and it is not atomic; on a large index it
+is a task you launch and monitor. When you want to remove <em>most</em> of an index, reindexing what
+you want to keep into a fresh index is usually faster.</p>
+
+<h2>Routing: which shard a document lands on</h2>
+
+<p>One more thing decided at write time. By default the shard is chosen by hashing the document id,
+which spreads documents evenly and means a <code>GET</code> by id knows exactly which shard to ask.</p>
+
+<p>You can override it:</p>
+
+<pre class="language-bash"><code class="language-bash">PUT /stayhub-properties/_doc/8f1e-...?routing=tenant-42
+GET /stayhub-properties/_doc/8f1e-...?routing=tenant-42</code></pre>
+
+<p>All documents with the same routing value land on the same shard, so a query filtered to that
+tenant can be told to search one shard instead of all of them. On a large multi-tenant index this is
+a substantial win.</p>
+
+<p>It comes with a sharp edge worth stating plainly: <strong>once a document is written with a
+routing value, every subsequent get, update and delete must supply the same value</strong>. Forget
+it and the operation goes looking on the wrong shard and reports the document as missing &mdash;
+which looks exactly like data loss and is not. This is the main reason to leave routing alone until
+you have a measured reason to use it.</p>
+
+<h2>Reading documents back</h2>
+
+<pre class="language-bash"><code class="language-bash">GET /doc-test/_doc/1                     # source plus metadata
+GET /doc-test/_source/1                  # just the source
+HEAD /doc-test/_doc/1                     # exists? 200 or 404
+GET /doc-test/_doc/1?_source_includes=title,city</code></pre>
+
+<p>And <code>_mget</code> for several at once, which is one round trip instead of many:</p>
+
+<pre class="language-json"><code class="language-json">{ "docs": [
+    { "_id": "8f1e-..." },
+    { "_id": "3a20-..." }
+] }</code></pre>
+
+<p>That is the operation behind the fetch-by-id pattern from lesson 6 &mdash; search for the ids,
+then <code>_mget</code> the current records. Worth remembering it exists before writing a loop.</p>
+
+<p>One more parameter worth knowing on the search side rather than the get side:
+<code>_source_excludes</code>. A search that returns twenty listings returns twenty full
+<code>_source</code> documents, and if one field is a long description the page does not render, you
+are paying to serialise and transfer it twenty times per search. Excluding it is a one-line change
+with a measurable effect on response size, and it is one of the few optimisations here that costs
+nothing at all.</p>
+
+<h2>Absent beats flagged</h2>
+
+<p>One modelling decision belongs here because it is a decision about writes. When a listing is
+unpublished, StayHub does not update the document with a status flag &mdash; it deletes it:</p>
+
+<pre class="language-python"><code class="language-python">    """Upsert one property into the index, or remove it if it should no longer be findable.
+
+    A DRAFT, SUSPENDED or soft-deleted property is *deleted* from the index rather than indexed
+    with a status flag. Filtering on `status: PUBLISHED` at query time would work too, but then
+    every single query pays for the filter and one forgotten `.filter()` leaks a draft into public
+    search results. Absent is safer than filtered.
+    """</code></pre>
+
+<p>Both designs work. The difference is what happens when someone writes a new query and forgets
+the filter &mdash; with the flag, a draft listing appears in public search results; with deletion,
+there is nothing to leak.</p>
+
+<p>This generalises well beyond drafts. Soft-deleted records, suspended accounts, unpublished
+content: if it must never be found, the safest place for it is outside the index. And because
+indexing is idempotent and driven from the database, republishing is the ordinary write path
+&mdash; nothing special has to remember to un-delete it.</p>
+
+<h3>The one thing that makes it work</h3>
+
+<p>The whole design above rests on a single property, and it is worth naming: <strong>the same
+write, applied twice, produces the same index.</strong> Document id from the source record,
+whole-document writes rather than partial ones, delete-if-not-visible rather than a flag.</p>
+
+<p>That is what lets the next lesson retry a failed index minutes later without checking what
+happened in between, lets a crashed bulk load be restarted from the beginning, and lets a rebuild
+run against a live index without coordination. None of those are safe if a write depends on what was
+there before.</p>
+
+<h2>What this means for your application</h2>
+
+<p>Four rules fall out of the above, and they are the ones StayHub is built on.</p>
+
+<p><strong>Choose your own document ids</strong>, from something that already identifies the thing.
+Every retry, repair and rebuild becomes safe.</p>
+
+<p><strong>Never force a refresh on the request path.</strong> Use <code>wait_for</code> if a caller
+truly needs to see its own write, and otherwise read from your database.</p>
+
+<p><strong>Do not build read-your-writes into the UI via search.</strong> The one-second window is
+real, it is variable, and it will produce a bug report that cannot be reproduced.</p>
+
+<p><strong>Read the shard counts on writes that matter.</strong> A success with
+<code>"failed": 1</code> is a success with a caveat, and nobody will tell you.</p>
+
+<p><strong>Treat every index call as replaceable.</strong> If it fails, the next one fixes it; if it
+runs twice, nothing breaks. That property is what the next lesson relies on entirely, when the
+question becomes how to index tens of thousands of documents and how to keep them in step with a
+database that is still changing.</p>

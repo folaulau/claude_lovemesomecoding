@@ -1,0 +1,208 @@
+<p>Most warehouses end up with a pipeline: raw data lands, something transforms it, a modelled table
+appears. The usual answer is to add an orchestrator — Airflow, dbt Cloud, a cron box. Snowflake has
+the two pieces natively, and for a pipeline that lives entirely inside Snowflake they are enough:
+<strong>streams</strong> tell you what changed, <strong>tasks</strong> run SQL on a schedule.</p>
+
+<h2>A stream is an offset, not a copy</h2>
+
+<p>This is the sentence that makes everything else make sense. A stream does not store rows. It
+stores a <em>position</em> in the table's change history, and when you query it, Snowflake computes
+the difference between that position and the table's current state.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE STREAM learn_snowflake.staging.orders_stream
+  ON TABLE learn_snowflake.staging.raw_orders;
+
+-- Nothing yet: the stream starts at "now".
+SELECT COUNT(*) FROM learn_snowflake.staging.orders_stream;
+
+INSERT INTO learn_snowflake.staging.raw_orders (order_id, total)
+VALUES ('A-1002', 199.00), ('A-1003', 45.50);
+
+-- Now two rows, plus three metadata columns.
+SELECT order_id, total,
+       METADATA$ACTION,       -- INSERT or DELETE
+       METADATA$ISUPDATE,     -- TRUE if part of an UPDATE
+       METADATA$ROW_ID        -- a stable id for the row
+FROM   learn_snowflake.staging.orders_stream;</code></pre>
+
+<p>An <code>UPDATE</code> shows as a <code>DELETE</code> and an <code>INSERT</code> pair, both with
+<code>METADATA$ISUPDATE = TRUE</code>. That is how you tell a genuine delete from the removal half of
+an update — a distinction that matters as soon as you are maintaining a target table.</p>
+
+<h2>The consumption rule</h2>
+
+<p>Here is the part that surprises everyone. <strong>A stream advances when it is consumed inside a
+DML statement, and only then.</strong> Selecting from it does not move it; a
+<code>MERGE</code>, <code>INSERT</code> or <code>CREATE TABLE AS SELECT</code> that reads it does —
+and it advances to the transaction's start point.</p>
+
+<p>Two consequences follow, and both cause real bugs:</p>
+
+<ul>
+<li><strong>You can look as often as you like.</strong> A <code>SELECT</code> against a stream is a
+free peek, which makes debugging pleasant.</li>
+<li><strong>Reading it twice in one DML statement gives you the same rows twice, and consuming it
+once discards everything.</strong> If a single statement needs the changes for two different
+targets, either create two streams on the same table, or land the changes in a temporary table first
+and read that twice.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">-- Safe: look without consuming.
+SELECT COUNT(*) FROM learn_snowflake.staging.orders_stream;
+SELECT SYSTEM$STREAM_HAS_DATA('learn_snowflake.staging.orders_stream');
+
+-- Consumes: after this the stream is empty.
+INSERT INTO learn_snowflake.marts.orders_history
+SELECT order_id, total, CURRENT_TIMESTAMP()
+FROM   learn_snowflake.staging.orders_stream
+WHERE  METADATA$ACTION = 'INSERT';</code></pre>
+
+<p>A stream also has a staleness limit tied to the source table's Time Travel retention. If a stream
+is not consumed within that window it goes stale and cannot be read at all — you recreate it and
+backfill by other means. A stream on a table with retention set to zero is a stream that breaks the
+first time a job is paused for a day.</p>
+
+<h2>Stream types</h2>
+
+<table>
+<tr><th>Type</th><th>Records</th><th>Use for</th></tr>
+<tr><td>Standard</td><td>Inserts, updates and deletes</td><td>Keeping a target table in
+sync</td></tr>
+<tr><td>Append-only</td><td>Inserts only</td><td>Event tables. Cheaper, because deletes need not be
+tracked.</td></tr>
+<tr><td>Insert-only</td><td>Inserts only, on external tables</td><td>New files appearing in
+storage</td></tr>
+</table>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE STREAM events_stream
+  ON TABLE learn_snowflake.staging.events
+  APPEND_ONLY = TRUE;</code></pre>
+
+<p>Use append-only whenever the source is genuinely append-only. It is cheaper to maintain and the
+consuming SQL is simpler, since there is no <code>METADATA$ACTION</code> to branch on.</p>
+
+<h2>Tasks</h2>
+
+<p>A task runs one SQL statement — or a stored procedure, if you need several — on a schedule or
+after another task.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE TASK learn_snowflake.staging.load_orders
+  WAREHOUSE = loading_wh
+  SCHEDULE  = 'USING CRON 0 * * * * UTC'        -- hourly, on the hour
+  WHEN SYSTEM$STREAM_HAS_DATA('learn_snowflake.staging.orders_stream')
+AS
+MERGE INTO learn_snowflake.marts.dim_orders t
+USING learn_snowflake.staging.orders_stream s
+   ON t.order_id = s.order_id
+WHEN MATCHED AND s.METADATA$ACTION = 'DELETE' AND s.METADATA$ISUPDATE = FALSE
+     THEN DELETE
+WHEN MATCHED AND s.METADATA$ACTION = 'INSERT'
+     THEN UPDATE SET t.total = s.total, t.updated_at = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED AND s.METADATA$ACTION = 'INSERT'
+     THEN INSERT (order_id, total, updated_at)
+          VALUES (s.order_id, s.total, CURRENT_TIMESTAMP());
+
+-- ⚠️ Tasks are created SUSPENDED. This is the step everyone forgets.
+ALTER TASK learn_snowflake.staging.load_orders RESUME;</code></pre>
+
+<p>That <code>WHEN</code> clause is the whole pattern. It is evaluated before the warehouse is
+resumed, so a task that fires every hour against an empty stream costs nothing at all — you get
+frequent checking without paying for frequent running.</p>
+
+<p><code>SCHEDULE</code> takes either a cron expression with a time zone, or a simple interval such
+as <code>'5 MINUTE'</code>. Prefer cron for anything a human reasons about, since an interval drifts
+relative to the clock.</p>
+
+<h2>Serverless tasks</h2>
+
+<p>Omit <code>WAREHOUSE</code> and give the task a compute size instead, and Snowflake provides the
+compute:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE TASK refresh_summary
+  USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+  SCHEDULE = 'USING CRON 15 2 * * * UTC'
+AS
+  INSERT INTO marts.daily_summary SELECT * FROM staging.v_daily_summary;</code></pre>
+
+<p>Serverless tasks are billed per second of actual use with no 60-second minimum and no idle time,
+and Snowflake adjusts the size based on observed runs. For short, frequent tasks that is usually
+cheaper than a warehouse. For long tasks, or ones that should share a warehouse's warm cache with
+neighbouring work, a named warehouse still wins.</p>
+
+<h2>Task trees</h2>
+
+<p>Tasks chain with <code>AFTER</code>, forming a DAG with one root that carries the schedule:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TASK t_load    WAREHOUSE = loading_wh SCHEDULE = 'USING CRON 0 2 * * * UTC' AS ...;
+CREATE TASK t_clean   WAREHOUSE = loading_wh AFTER t_load  AS ...;
+CREATE TASK t_model   WAREHOUSE = loading_wh AFTER t_clean AS ...;
+CREATE TASK t_verify  WAREHOUSE = loading_wh AFTER t_clean AS ...;   -- runs beside t_model
+
+-- ⚠️ Resume children BEFORE the root, or the root fires with no children attached.
+ALTER TASK t_verify RESUME;
+ALTER TASK t_model  RESUME;
+ALTER TASK t_clean  RESUME;
+ALTER TASK t_load   RESUME;
+
+SELECT SYSTEM$TASK_DEPENDENTS_ENABLED('learn_snowflake.staging.t_load');</code></pre>
+
+<p>A child runs only if its parent succeeded. There is no retry and no branching — a task tree is a
+dependency graph, not a workflow engine. When you need conditional paths, retries with backoff, or
+steps that reach outside Snowflake, that is the point at which an orchestrator earns its keep.</p>
+
+<h2>When to use this instead of an orchestrator</h2>
+
+<p>Streams and tasks are not a replacement for Airflow or dbt, and pretending otherwise leads to a
+pipeline nobody can debug. The honest boundary is about where the work lives.</p>
+
+<table>
+<tr><th>Use streams and tasks when</th><th>Use an orchestrator when</th></tr>
+<tr><td>Every step is SQL inside Snowflake</td><td>Steps reach outside — an API call, a file drop,
+a report emailed</td></tr>
+<tr><td>The graph is small and static</td><td>The graph is large, or generated from
+config</td></tr>
+<tr><td>Failure means "try again next schedule"</td><td>You need retries, backoff, or a
+branch</td></tr>
+<tr><td>You would rather not run another service</td><td>You already run one for everything
+else</td></tr>
+</table>
+
+<p>The strongest argument for the native option is the last row. A three-step nightly pipeline does
+not justify a scheduler to install, monitor, secure and upgrade, and a task tree has no
+infrastructure at all. The strongest argument against is observability: an orchestrator gives you a
+UI, a history and alerting out of the box, whereas here you write the monitoring yourself — which is
+the next section.</p>
+
+<p>There is also a middle option worth knowing about. A <strong>dynamic table</strong> declares the
+query you want kept fresh and a target lag, and Snowflake works out the incremental refresh itself —
+no stream, no task, no <code>MERGE</code> to get right:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE DYNAMIC TABLE marts.daily_orders
+  TARGET_LAG = '1 hour'
+  WAREHOUSE  = loading_wh
+AS
+SELECT order_date, COUNT(*) AS orders, SUM(total) AS revenue
+FROM   staging.raw_orders
+GROUP  BY order_date;</code></pre>
+
+<p>When the transformation is expressible as one query, that is less code and less to get wrong.
+Reach for streams and tasks when it is not — multiple statements, procedural logic, or a
+<code>MERGE</code> whose behaviour on deletes you need to control precisely.</p>
+
+<h2>Monitoring</h2>
+
+<pre class="language-sql"><code class="language-sql">-- Did it run, and did it work?
+SELECT name, scheduled_time, state, error_message, query_id
+FROM   TABLE(information_schema.task_history(
+         SCHEDULED_TIME_RANGE_START =&gt; DATEADD('day', -2, CURRENT_TIMESTAMP())))
+WHERE  state != 'SUCCEEDED'
+ORDER  BY scheduled_time DESC;
+
+SHOW TASKS IN SCHEMA learn_snowflake.staging;   -- check `state` is `started`</code></pre>
+
+<p>A suspended task is silent, and a failing task is silent too unless something is watching. Both
+belong in the alerting from lesson 16. And when a task will not fire at all, check
+<code>SHOW TASKS</code> first: the answer is a suspended task nine times out of ten, usually because
+somebody replaced it with <code>CREATE OR REPLACE</code> and did not resume it again.</p>
+
+<p>Next: <a href="/snowflake/snowflake-access-control">roles and grants</a>.</p>

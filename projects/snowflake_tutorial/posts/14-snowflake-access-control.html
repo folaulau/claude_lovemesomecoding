@@ -1,0 +1,213 @@
+<p>Snowflake's access control is straightforward once two ideas land: <strong>privileges are granted to
+roles, never to users</strong>, and <strong>roles are granted to other roles</strong>, forming a
+hierarchy. Get those two right and the rest is detail. Get them wrong and you end up with an account
+where everything runs as <code>ACCOUNTADMIN</code>, which is where most Snowflake accounts start and
+too many stay.</p>
+
+<h2>The system roles</h2>
+
+<table>
+<tr><th>Role</th><th>For</th></tr>
+<tr><td><code>ORGADMIN</code></td><td>Managing accounts across an organisation.</td></tr>
+<tr><td><code>ACCOUNTADMIN</code></td><td>Everything. Billing, account parameters, the lot.</td></tr>
+<tr><td><code>SECURITYADMIN</code></td><td>Managing grants account-wide; inherits
+<code>USERADMIN</code>.</td></tr>
+<tr><td><code>USERADMIN</code></td><td>Creating users and roles.</td></tr>
+<tr><td><code>SYSADMIN</code></td><td>Creating warehouses, databases and objects.</td></tr>
+<tr><td><code>PUBLIC</code></td><td>Automatically held by everyone. Grant almost nothing to
+it.</td></tr>
+</table>
+
+<p><strong>Stop working as <code>ACCOUNTADMIN</code>.</strong> It is not a matter of taste. A stray
+<code>CREATE TABLE</code> as <code>ACCOUNTADMIN</code> produces an object that
+<code>ACCOUNTADMIN</code> owns, which means <code>SYSADMIN</code> — the role your team actually uses
+— cannot manage it, and the fix is a grant somebody has to remember to make.</p>
+
+<p>Use it for exactly three things: initial setup, billing and resource monitors, and account-level
+parameters. Give it to two people, both with MFA, and have those people work as something else.</p>
+
+<h2>Ownership versus privileges</h2>
+
+<p>Every object has exactly one owning role. Ownership is not a privilege — it is a separate thing,
+and it confers full control including the right to grant to others.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Whoever runs this owns the table. Check before you create.
+SELECT CURRENT_ROLE();
+CREATE TABLE analytics.marts.fact_orders (...);
+
+-- Hand it over. COPY CURRENT GRANTS keeps existing access working;
+-- without it, every grant on the object is revoked.
+GRANT OWNERSHIP ON TABLE analytics.marts.fact_orders
+  TO ROLE data_engineer COPY CURRENT GRANTS;
+
+SHOW GRANTS ON TABLE analytics.marts.fact_orders;</code></pre>
+
+<p>The rule that avoids most ownership problems: <strong>create objects as the role that should own
+them</strong>, and make <code>SYSADMIN</code> the parent of every functional role so it retains
+visibility over everything.</p>
+
+<h2>A role layout that works</h2>
+
+<p>The standard structure separates <em>access</em> roles, which hold privileges on objects, from
+<em>functional</em> roles, which are what people are granted. It looks like extra work for a small
+account and pays for itself the first time a fourth team appears.</p>
+
+<pre class="language-sql"><code class="language-sql">USE ROLE USERADMIN;
+
+-- Functional roles: what a person or service does.
+CREATE ROLE data_engineer;
+CREATE ROLE analyst;
+CREATE ROLE bi_service;
+
+-- Access roles: read or write on one schema.
+CREATE ROLE marts_reader;
+CREATE ROLE marts_writer;
+
+USE ROLE SECURITYADMIN;
+
+-- Compose. A writer is also a reader; SYSADMIN sits above everything.
+GRANT ROLE marts_reader TO ROLE marts_writer;
+GRANT ROLE marts_reader TO ROLE analyst;
+GRANT ROLE marts_reader TO ROLE bi_service;
+GRANT ROLE marts_writer TO ROLE data_engineer;
+GRANT ROLE data_engineer TO ROLE SYSADMIN;
+GRANT ROLE analyst       TO ROLE SYSADMIN;</code></pre>
+
+<p>Now the object privileges hang off the access roles only, and nothing has to change when a person
+joins a team:</p>
+
+<pre class="language-sql"><code class="language-sql">GRANT USAGE ON DATABASE analytics                TO ROLE marts_reader;
+GRANT USAGE ON SCHEMA   analytics.marts          TO ROLE marts_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA analytics.marts TO ROLE marts_reader;
+GRANT SELECT ON ALL VIEWS  IN SCHEMA analytics.marts TO ROLE marts_reader;
+
+GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA analytics.marts
+  TO ROLE marts_writer;
+
+GRANT USAGE ON WAREHOUSE bi_wh TO ROLE analyst;
+GRANT USAGE ON WAREHOUSE bi_wh TO ROLE bi_service;
+
+GRANT ROLE analyst TO USER sam;</code></pre>
+
+<p><code>USAGE</code> on the database and schema is the step people miss. Without it,
+<code>SELECT</code> on the table is unreachable and the error says the object "does not exist or not
+authorized" — which sends everyone hunting for a typo.</p>
+
+<h2>Future grants: the feature that stops permissions rotting</h2>
+
+<p><code>GRANT SELECT ON ALL TABLES</code> applies to the tables that exist <em>right now</em>. The
+table created tomorrow is not covered, and that is why every account without future grants
+eventually has an analyst who cannot see the newest table and nobody who knows why.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Everything created in this schema from now on.
+GRANT SELECT ON FUTURE TABLES IN SCHEMA analytics.marts TO ROLE marts_reader;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA analytics.marts TO ROLE marts_reader;
+
+-- Or at database level, covering schemas that do not exist yet.
+GRANT USAGE  ON FUTURE SCHEMAS IN DATABASE analytics    TO ROLE marts_reader;
+GRANT SELECT ON FUTURE TABLES  IN DATABASE analytics    TO ROLE marts_reader;
+
+SHOW FUTURE GRANTS IN SCHEMA analytics.marts;</code></pre>
+
+<p>Set future grants once, when the schema is created, alongside the <code>ALL</code> grants that
+catch what is already there. Doing both is the complete answer; doing only one is the bug.</p>
+
+<p>One subtlety: a database-level future grant and a schema-level one on the same object type do not
+combine — the more specific one wins. If a schema behaves differently from its siblings, look for a
+schema-level future grant overriding the database-level one.</p>
+
+<h2>Secondary roles</h2>
+
+<p>A session has one primary role, and privileges do not combine across roles unless you enable
+secondary roles:</p>
+
+<pre class="language-sql"><code class="language-sql">USE SECONDARY ROLES ALL;    -- union of every role the user holds
+SELECT CURRENT_SECONDARY_ROLES();
+USE SECONDARY ROLES NONE;   -- back to just the primary role</code></pre>
+
+<p>Convenient for an analyst joining across two teams' data. Avoid it for service accounts, where
+the point of the role is to be a precise, auditable boundary.</p>
+
+<h2>Masking and row access policies</h2>
+
+<p>Two features handle the cases a grant cannot express — column-level and row-level rules that
+follow the data everywhere, including through views.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE MASKING POLICY mask_email AS (val STRING) RETURNS STRING -&gt;
+  CASE WHEN CURRENT_ROLE() IN ('DATA_ENGINEER', 'ACCOUNTADMIN') THEN val
+       ELSE REGEXP_REPLACE(val, '.+@', '*****@')
+  END;
+
+ALTER TABLE analytics.marts.dim_customer
+  MODIFY COLUMN email SET MASKING POLICY mask_email;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE ROW ACCESS POLICY region_rows AS (region STRING) RETURNS BOOLEAN -&gt;
+  CURRENT_ROLE() = 'DATA_ENGINEER'
+  OR EXISTS (SELECT 1 FROM security.role_regions
+             WHERE role_name = CURRENT_ROLE() AND allowed_region = region);
+
+ALTER TABLE analytics.marts.fact_sales
+  ADD ROW ACCESS POLICY region_rows ON (region);</code></pre>
+
+<p>Both require Enterprise edition. The advantage over building the same logic into a view is that
+the policy cannot be bypassed by querying the base table — it travels with the column.</p>
+
+<h2>Service accounts</h2>
+
+<p>The account your pipeline logs in as deserves different treatment from a person's, and the
+difference is worth being deliberate about. A human gets MFA and browses; a service account gets a
+key, a fixed role, and nothing it does not need.</p>
+
+<ul>
+<li><strong>One service account per service.</strong> Sharing one between the loader and the BI
+tool means the audit log cannot tell you which of them ran the expensive query, and revoking access
+for one revokes it for both.</li>
+<li><strong>Key-pair authentication, not a password</strong> — lesson 3 covers the setup. Snowflake
+is progressively retiring password-only sign-in for programmatic users, so this is where things are
+heading regardless.</li>
+<li><strong>A default role and warehouse on the user.</strong> A service that forgets to set
+context then still runs with the intended privileges rather than falling back to
+<code>PUBLIC</code>.</li>
+<li><strong>A network policy</strong>, so a leaked key is only usable from your infrastructure.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">USE ROLE USERADMIN;
+
+CREATE USER etl_service
+  TYPE              = SERVICE          -- no password, no MFA, no UI login
+  DEFAULT_ROLE      = data_engineer
+  DEFAULT_WAREHOUSE = loading_wh
+  RSA_PUBLIC_KEY    = 'MIIBIjANBgkqh...'
+  COMMENT           = 'Nightly load pipeline. Owner: data platform team.';
+
+USE ROLE SECURITYADMIN;
+GRANT ROLE data_engineer TO USER etl_service;
+
+CREATE NETWORK POLICY etl_only ALLOWED_IP_LIST = ('203.0.113.0/24');
+ALTER USER etl_service SET NETWORK_POLICY = etl_only;</code></pre>
+
+<p>The <code>COMMENT</code> is not decoration. Eighteen months from now somebody will find this
+account in an audit and need to know whether it can be disabled; a sentence naming the owner is the
+difference between a five-minute answer and a week of asking around.</p>
+
+<h2>Auditing what you have</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW GRANTS TO ROLE analyst;
+SHOW GRANTS TO USER sam;
+SHOW GRANTS ON TABLE analytics.marts.fact_orders;
+
+-- Who can read this table, transitively through role inheritance?
+SELECT grantee_name, privilege, granted_on, name
+FROM   snowflake.account_usage.grants_to_roles
+WHERE  granted_on = 'TABLE'
+  AND  name = 'FACT_ORDERS'
+  AND  deleted_on IS NULL;
+
+-- Accounts nobody is using. Review quarterly.
+SELECT name, last_success_login, disabled, has_rsa_public_key
+FROM   snowflake.account_usage.users
+WHERE  deleted_on IS NULL
+  AND  (last_success_login &lt; DATEADD('day', -90, CURRENT_TIMESTAMP())
+        OR last_success_login IS NULL);</code></pre>
+
+<p>Next: <a href="/snowflake/snowflake-cost-management">controlling cost</a>.</p>

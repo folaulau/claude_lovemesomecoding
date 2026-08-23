@@ -1,0 +1,392 @@
+<p>Before the mechanics, the question underneath: <strong>does your index need a backup at all?</strong></p>
+
+<p>If it is derived from a database &mdash; which lesson 1 argued it should be &mdash; then a
+snapshot restores you to a stale copy of something you can regenerate exactly. A rebuild is both
+more current and, at moderate size, faster.</p>
+
+<p>Snapshots earn their place in two cases. When the index <em>is</em> the source of truth, which is
+normal for logs and metrics where nothing else holds the data. And when a rebuild is too slow to be
+an outage plan &mdash; a hundred million documents reindexed from Postgres is hours, restored from a
+snapshot it is minutes, because a restore copies segment files rather than re-analysing text.</p>
+
+<p>The mechanics are the same either way, which is why they are worth knowing before you need
+them.</p>
+
+<h2>What a snapshot is</h2>
+
+<p>Not a dump. Elasticsearch copies the Lucene <strong>segment files</strong> into a repository, and
+because segments are immutable, a second snapshot only stores segments the first one did not
+already have.</p>
+
+<p>Three consequences follow, and all three surprise people.</p>
+
+<p><strong>Snapshots are incremental but each one is complete.</strong> There is no "full versus
+incremental" distinction to manage. Snapshot 7 shares most of its files with snapshot 6 and can be
+restored on its own; deleting snapshot 6 keeps any files 7 still needs.</p>
+
+<p><strong>They are cheap after the first.</strong> A daily snapshot of a mostly-static index costs
+almost nothing, which makes daily the sensible default rather than a luxury.</p>
+
+<p><strong>A heavily updated index snapshots more than you expect</strong>, because merging rewrites
+segments and a rewritten segment is a new file even when its contents barely changed.</p>
+
+<p>There is a fourth consequence worth stating because it affects planning: <strong>deleting a
+snapshot does not reliably free the space you expect</strong>. Files shared with a snapshot you are
+keeping stay where they are. Repository size therefore tracks the union of everything retained, not
+the sum of individual snapshot sizes, and estimating it by multiplying index size by snapshot count
+badly overshoots.</p>
+
+<p>What a snapshot is <em>not</em> is a copy you can read. The files in the repository are internal
+Lucene structures with Elasticsearch metadata around them. There is no way to extract a document
+without restoring.</p>
+
+<h2>Registering a repository</h2>
+
+<p>A repository has to be declared before anything can be written to it, and for a filesystem
+repository the location has to be on an allow-list the cluster reads at startup:</p>
+
+<pre class="language-yaml"><code class="language-yaml">      path.repo: "/usr/share/elasticsearch/snapshots"</code></pre>
+
+<p>That setting is why adding a backup location needs a restart. It is a guard against a compromised
+cluster being told to write files anywhere on the host, and it is worth knowing about before you are
+trying to add a repository during an incident.</p>
+
+<pre class="language-python"><code class="language-python">    es.snapshot.create_repository(
+        name=REPO,
+        body={
+            "type": "fs",
+            "settings": {
+                "location": REPO_LOCATION,
+                "compress": True,
+            },
+        },
+    )</code></pre>
+
+<p><code>compress</code> applies to the metadata, not to the already-compressed segment files, so
+the win is small and free.</p>
+
+<p>Then verify it, which does more than it looks:</p>
+
+<pre class="language-python"><code class="language-python">    # `verify` writes and reads back a marker file from every node. On a single node this is
+    # ceremony; on a cluster it is the check that catches the classic misconfiguration — a repo on
+    # a local disk rather than shared storage, where every node writes its own private half of a
+    # snapshot that can never be restored.
+    result = es.snapshot.verify_repository(name=REPO)</code></pre>
+
+<p>That misconfiguration is the single most common way a backup strategy turns out not to be one. A
+filesystem repository <strong>must</strong> be shared storage mounted identically on every node
+&mdash; NFS, or the equivalent. Point it at a local path on each node and every snapshot succeeds,
+every listing looks right, and no restore will ever work.</p>
+
+<pre class="language-bash"><code class="language-bash">$ python -m scripts.snapshot --register
+registered stayhub-backups at /usr/share/elasticsearch/snapshots
+verified on nodes: ['ZqoP1OK1T-2rZP1xJgNDyw']</code></pre>
+
+<h3>In production, use object storage</h3>
+
+<p>The <code>fs</code> type is right for a single-node demo. Real clusters use
+<code>repository-s3</code>, <code>repository-gcs</code> or <code>repository-azure</code>:</p>
+
+<pre class="language-json"><code class="language-json">PUT /_snapshot/prod-backups
+{ "type": "s3", "settings": {
+    "bucket": "example-es-snapshots",
+    "base_path": "prod/",
+    "server_side_encryption": true
+} }</code></pre>
+
+<p>Everything below is identical. Only the registration body changes, which is the reason it is
+worth practising on the filesystem version first.</p>
+
+<h2>Taking one</h2>
+
+<pre class="language-python"><code class="language-python">    result = es.snapshot.create(
+        repository=REPO,
+        snapshot=name,
+        body={
+            # Snapshot the CONCRETE index. An alias is not a thing that can be snapshotted, but
+            # `include_global_state` carries the alias definition, so a restore brings it back
+            # pointing at the right index.
+            "indices": concrete,
+            "include_global_state": True,
+        },
+        wait_for_completion=True,
+    )</code></pre>
+
+<p>The alias detail matters if you followed lesson 15. Aliases live in the cluster state, not in the
+index, so a snapshot of the index alone restores the data with no alias pointing at it &mdash; and
+an application configured to use the alias sees an empty cluster.</p>
+
+<pre class="language-bash"><code class="language-bash">$ python -m scripts.snapshot --create
+snap-20260823-053637: SUCCESS  1/1 shards
+  indices: ['stayhub-properties-000002']
+  took: 0ms</code></pre>
+
+<p><code>wait_for_completion=True</code> is fine at this size and wrong at any real one. A large
+snapshot returns immediately without it and is monitored through
+<code>GET /_snapshot/&lt;repo&gt;/&lt;name&gt;/_status</code>.</p>
+
+<p>Snapshotting does not block writes. The snapshot captures the state at the moment it starts, and
+indexing continues throughout &mdash; which is the same "there is a gap" property as the reindex in
+lesson 15, and it matters for the same reason.</p>
+
+<h2>Restoring</h2>
+
+<p>The step that catches people first: <strong>an open index cannot be restored over.</strong></p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ An OPEN index cannot be restored over. Elasticsearch refuses rather than serving half of
+    # each. Closing it is the standard move; `rename_pattern` into a fresh name and flipping the
+    # alias is the zero-downtime alternative, and is the same alias trick as scripts/reindex.py.
+    es.options(ignore_status=404).indices.close(index=concrete)</code></pre>
+
+<p>Closing it means search stops for the duration. The alias alternative avoids that entirely:
+restore under a different name, verify it, then flip the alias &mdash; which is lesson 15's
+procedure with a snapshot as the source instead of a reindex:</p>
+
+<pre class="language-json"><code class="language-json">POST /_snapshot/stayhub-backups/snap-20260823-053637/_restore
+{
+  "indices": "stayhub-properties-000002",
+  "rename_pattern": "(.+)",
+  "rename_replacement": "restored-$1"
+}</code></pre>
+
+<p>And whichever route you take, reopen in a <code>finally</code>:</p>
+
+<pre class="language-python"><code class="language-python">    finally:
+        # Reopen even on failure — leaving the index closed is a silent outage that looks like an
+        # empty result set.
+        es.options(ignore_status=404).indices.open(index=concrete)</code></pre>
+
+<p>A closed index is not an error state anyone will recognise. Searches against it fail in a way
+that reads like a configuration problem, and a script that died halfway through a restore is a
+plausible cause nobody guesses.</p>
+
+<h3>Proving it works</h3>
+
+<p>A backup nobody has restored is a hypothesis. The full round trip on the demo index &mdash;
+destroy the data, restore, count:</p>
+
+<pre class="language-bash"><code class="language-bash">$ curl -XPOST "localhost:9200/stayhub-properties/_delete_by_query?refresh=true" \
+    -d '{"query": {"match_all": {}}}'
+{"deleted": 12}
+
+$ curl -s "localhost:9200/stayhub-properties/_count"
+{"count": 0}
+
+$ python -m scripts.snapshot --restore snap-20260823-053637
+restoring snap-20260823-053637
+restored 1/1 shards
+documents now: 12</code></pre>
+
+<p>Twelve, to zero, to twelve. That takes two minutes to run and it is the only evidence that any of
+the configuration above is correct.</p>
+
+<p>Do it on a schedule, not once. Restore into a scratch cluster monthly and compare document counts
+against production. Backups fail silently &mdash; a repository that filled up, a permission that
+changed, a node added without the shared mount &mdash; and every one of those looks perfectly
+healthy until the restore.</p>
+
+<h3>Restore options worth knowing</h3>
+
+<p>The restore body takes more than an index name, and three of the options come up regularly.</p>
+
+<pre class="language-json"><code class="language-json">POST /_snapshot/stayhub-backups/snap-20260823-053637/_restore
+{
+  "indices": "stayhub-properties-*",
+  "include_aliases": false,
+  "index_settings": { "index.number_of_replicas": 0 },
+  "ignore_index_settings": [ "index.refresh_interval" ]
+}</code></pre>
+
+<p><code>include_aliases: false</code> is the one to reach for when restoring production data into
+staging. Without it the restored index arrives carrying production's aliases, which in a cluster
+that already has an index behind that name is an immediate conflict &mdash; and in one that does
+not, is a staging cluster silently serving under production names.</p>
+
+<p><code>index_settings</code> overrides settings on the way in. Restoring with zero replicas and
+adding them afterwards is much faster, for the same reason it is faster during a bulk load.</p>
+
+<p><code>ignore_index_settings</code> drops a setting entirely so the restored index takes the
+default. Useful when the snapshot was taken from a cluster whose allocation filters or node
+attributes do not exist on the target &mdash; a restored index that references a node attribute
+nobody has will sit unassigned forever, and <code>allocation/explain</code> from lesson 16 is how
+you find that out.</p>
+
+<h3>What is in a snapshot besides indexes</h3>
+
+<p><code>include_global_state</code> has appeared twice above without a full explanation, and it is
+worth one because it is the difference between a restore that works and one that restores data
+nothing can use.</p>
+
+<p>The global state holds the cluster-level things: index templates, ingest pipelines, aliases,
+legacy settings, and stored scripts. Restore an index without it into a fresh cluster and you get
+the documents, with no template governing future indexes, no pipeline for enriching them, and no
+alias pointing at what you just restored.</p>
+
+<p>Restoring <em>with</em> it into an existing cluster is the opposite hazard: it overwrites that
+cluster's templates and settings with the snapshot's. So the rule is roughly &mdash; include it when
+taking the snapshot, always; include it when restoring into an empty or dedicated cluster; leave it
+out when restoring one index into a cluster that is already running.</p>
+
+<h2>Automating it: SLM</h2>
+
+<p>A snapshot script on a cron on one machine is a backup plan that fails the day that machine is
+rebuilt. Snapshot Lifecycle Management runs inside the cluster and reports its own failures:</p>
+
+<pre class="language-python"><code class="language-python">    es.slm.put_lifecycle(
+        policy_id=POLICY,
+        body={
+            "schedule": "0 30 2 * * ?",  # 02:30 daily — cron with a seconds field, Quartz style
+            "name": "&lt;stayhub-{now/d}&gt;",  # date maths in the name: stayhub-2026.08.22
+            "repository": REPO,
+            "config": {"indices": [f"{ALIAS}*"], "include_global_state": True},
+            "retention": {
+                "expire_after": "30d",
+                "min_count": 7,
+                "max_count": 30,
+            },
+        },
+    )</code></pre>
+
+<p>Two details in there are easy to get wrong.</p>
+
+<p>The <code>schedule</code> is a Quartz cron expression with a <strong>seconds field first</strong>,
+so it has six fields rather than five. A standard five-field crontab line pasted in either fails to
+parse or means something entirely different.</p>
+
+<p>The <code>name</code> uses date maths in angle brackets, so each run produces
+<code>stayhub-2026.08.22</code> rather than overwriting one name.</p>
+
+<h3>The retention setting that matters</h3>
+
+<pre class="language-python"><code class="language-python">                # ⚠️ `min_count` is the part that makes retention safe. Without it, a cluster that
+                # was off for a month deletes every snapshot it has the moment it comes back,
+                # because they are all older than `expire_after`.</code></pre>
+
+<p>Retention is evaluated as "delete anything older than <code>expire_after</code>", and on its own
+that is a rule with a catastrophic edge case. A cluster that was down, or a policy that stopped
+running, comes back to find every snapshot expired &mdash; and dutifully deletes all of them.</p>
+
+<p><code>min_count</code> is the floor: never go below this many, whatever their age.
+<code>max_count</code> is the ceiling. Always set the floor.</p>
+
+<p>SLM reports its own health, which is the point of it:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_slm/policy/stayhub-nightly?pretty"
+# "stats": { "snapshots_taken": 0, "snapshots_failed": 0 }, "next_execution_millis": ...</code></pre>
+
+<p><code>snapshots_failed</code> is what to alert on. A backup that has been failing for three weeks
+is worse than no backup, because you believed you had one.</p>
+
+<h2>The volume permission that will stop you first</h2>
+
+<p>Worth including because it costs an hour and the error names neither permissions nor
+ownership.</p>
+
+<p>Elasticsearch runs as uid 1000 inside its container. Docker creates a named volume owned by
+<strong>root</strong> unless the mount point already exists in the image, in which case it copies
+that directory's ownership. <code>/usr/share/elasticsearch/data</code> exists in the image, so the
+data volume is fine. A snapshot directory does not, so it arrives owned by root and the process
+cannot write to it.</p>
+
+<p>The failure is not a permission error you can read:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">500 repository_verification_exception
+failed to create blob container</code></pre>
+
+<p>The fix is to set the ownership before Elasticsearch starts, which a one-shot container does
+cleanly:</p>
+
+<pre class="language-yaml"><code class="language-yaml">  es-snapshot-init:
+    image: busybox:1.36
+    command: sh -c "mkdir -p /snapshots && chown -R 1000:0 /snapshots && chmod 775 /snapshots"
+    volumes:
+      - stayhub-essnapshots:/snapshots
+
+  elasticsearch:
+    depends_on:
+      es-snapshot-init:
+        condition: service_completed_successfully</code></pre>
+
+<p>The same class of problem exists in production with different clothes: an S3 bucket policy that
+allows <code>PutObject</code> but not <code>DeleteObject</code> produces snapshots that work and
+retention that silently never removes anything, until the bucket bill becomes the alert.</p>
+
+<p>Whatever the storage, <code>verify_repository</code> is what tells you before the first snapshot
+rather than during the first restore.</p>
+
+<h2>Restoring somewhere else</h2>
+
+<p>The interesting uses of snapshots are not disaster recovery.</p>
+
+<p><strong>Populating a staging environment</strong> with real data: snapshot production, restore
+into staging, done. Far simpler than a data pipeline, and the reason to keep the repository
+credentials separate is that this means staging can read production's backups.</p>
+
+<p><strong>Migrating between clusters</strong>, including across cloud providers. Register the same
+repository on both, snapshot from one, restore into the other.</p>
+
+<p><strong>Version upgrades.</strong> Here the compatibility rule bites: a snapshot can be restored
+into the same major version or the next one, and no further. A 7.x snapshot restores into 8.x; it
+does not restore into 9.x. So a cluster upgraded across two majors cannot recover its old snapshots,
+and the archive you kept for compliance may be unreadable by the cluster you are running.</p>
+
+<p>If snapshots are your only copy of anything, that constraint belongs in your upgrade plan
+explicitly &mdash; restore-and-re-snapshot at each major, or keep a cluster of the old version
+alive.</p>
+
+<h2>Searchable snapshots and frozen data</h2>
+
+<p>One more capability worth knowing exists, because it changes the calculation for time-series
+data.</p>
+
+<p>A <em>searchable snapshot</em> mounts an index directly from the repository and queries it there,
+fetching and caching blocks on demand rather than holding a full copy on local disk. The index
+behaves like any other for reads &mdash; slower on a cold cache, and considerably cheaper, because
+object storage costs a fraction of what fast local disk does.</p>
+
+<p>That is what the "frozen tier" means in practice: data old enough that nobody searches it often,
+kept queryable at storage prices instead of being deleted or archived somewhere unreadable. It is a
+commercial-licence feature, and the equivalent decision on any tier is the same one &mdash; how old
+does data have to be before it is worth trading query speed for cost.</p>
+
+<p>For a derived search index none of this applies, because there is no old data: the index is
+whatever the database currently says. It matters exactly where snapshots mattered in the first
+place, which is when the index is the only copy.</p>
+
+<h2>A minimum viable backup setup</h2>
+
+<p>If you decide you need one, this is the shortest complete version.</p>
+
+<p>Register a repository on shared or object storage and run
+<code>verify_repository</code> &mdash; not once, but as part of whatever provisions the cluster, so
+a node added later without the mount fails loudly.</p>
+
+<p>Create an SLM policy with a daily schedule, <code>include_global_state: true</code>, and a
+retention block with <code>min_count</code> set. Alert on <code>snapshots_failed</code> from the
+policy stats.</p>
+
+<p>Write the restore procedure down as a script, not a wiki page, and run it monthly against a
+scratch cluster. Compare document counts. That script is the backup; everything before it is a
+hypothesis.</p>
+
+<p>And record which major version the snapshots were taken with, next to the snapshots. It is the
+one piece of information that becomes unrecoverable and matters most.</p>
+
+<h2>Deciding, honestly</h2>
+
+<p>Ask what a restore would actually give you.</p>
+
+<p>If the answer is "a copy of the index as it was at 02:30, which I would then have to
+re-synchronise with the database anyway", you have a rebuild, not a backup, and the rebuild path is
+the one worth investing in &mdash; testing it, timing it, making sure it can run without a full
+outage.</p>
+
+<p>If the answer is "the only copy of that data", then snapshots are not optional, and everything
+above applies: shared storage, verified, automated with SLM, with a floor on retention, and restored
+on a schedule to prove it.</p>
+
+<p>Most search indexes are the first kind. The mistake is not knowing which kind yours is, and
+finding out during the incident.</p>
+
+<p>The last lesson pulls this together with everything else worth settling before real users arrive
+&mdash; shard sizing, replicas, heap, credentials and what to monitor.</p>

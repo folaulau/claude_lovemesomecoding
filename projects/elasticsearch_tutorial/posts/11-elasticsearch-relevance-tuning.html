@@ -1,0 +1,382 @@
+<p>"The wrong listing is first" is the hardest kind of bug report, because it has no stack trace and
+everyone in the room has an opinion. It is also, in Elasticsearch, one of the few bugs where you can
+get the actual arithmetic and settle it.</p>
+
+<h2>What a score is</h2>
+
+<p>Elasticsearch ranks with BM25, and for a single term in a single field it is three numbers
+multiplied together.</p>
+
+<p><strong>Term frequency (tf)</strong> &mdash; how often the term appears in this field of this
+document. More is better, with strongly diminishing returns.</p>
+
+<p><strong>Inverse document frequency (idf)</strong> &mdash; how rare the term is across the index. A
+term in 1 of 12 documents is a much stronger signal than one in 11 of 12. This is what makes "the"
+nearly worthless without configuring a stop-word list.</p>
+
+<p><strong>Field length</strong> &mdash; a term in a five-word title is worth more than the same term
+buried in a 500-word description.</p>
+
+<p>Two things follow from that shape and are worth holding on to.</p>
+
+<p><strong>Scores are not comparable between queries.</strong> A score of 8 for one search and 3 for
+another says nothing &mdash; they were computed over different terms with different rarities. There
+is no scale, no maximum, and no "70% relevant". A percentage bar built from <code>_score</code> is
+meaningless, and normalising by <code>max_score</code> only tells you how each hit compares to the
+best one in that result set.</p>
+
+<p><strong>Scores are computed per shard.</strong> Term frequencies are local to a shard, so on a
+multi-shard index the same document can score differently depending on where it landed. That is why
+this track's index uses a single shard, and why
+<code>"search_type": "dfs_query_then_fetch"</code> exists for when it matters.</p>
+
+<h2>Reading _explain</h2>
+
+<p><code>_explain</code> takes one document and one query and returns the tree of arithmetic:</p>
+
+<pre class="language-bash"><code class="language-bash">GET /stayhub-properties/_explain/8f1e-...
+{ "query": { "match": { "title": "cabin" } } }</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">4.3190  max of:
+  4.3190  weight(title:cabin in 1) [PerFieldSimilarity], result of:
+    4.3190  score(freq=1.0), computed as boost * idf * tf from:
+      4.4000  boost
+      2.1595  idf, computed as log(1 + (N - n + 0.5) / (n + 0.5)) from:
+        1.0000  n, number of documents containing term
+       12.0000  N, total number of documents with field
+      0.4545  tf, computed as freq / (freq + k1 * (1 - b + b * dl / avgdl)) from:
+        1.0000  freq, occurrences of term within document
+        1.2000  k1, term saturation parameter
+        0.7500  b, length normalization parameter
+        5.0000  dl, length of field
+        5.0000  avgdl, average length of field</code></pre>
+
+<p>Every number in a relevance argument is in there. <strong>idf is 2.1595</strong> because the term
+appears in 1 of 12 documents. <strong>tf is 0.4545</strong> because the term appears once in a
+five-word title, and the title is exactly average length. Multiply through and the score is
+<strong>4.3190</strong>.</p>
+
+<p>Two parameters are visible and worth knowing by name. <code>k1</code> controls saturation: how
+quickly extra occurrences stop helping. <code>b</code> controls how much field length matters
+&mdash; 0 ignores length entirely, 1 normalises fully. Both are tunable per field in the mapping,
+and both are best left alone until you have exhausted the levers below, because they change every
+score in the index at once.</p>
+
+<h3>The boost that is not the boost you wrote</h3>
+
+<p>The query was <code>title^2</code>, and <code>_explain</code> says the boost is
+<strong>4.4</strong>.</p>
+
+<p>Not a bug and not a typo. Lucene folds BM25's <code>(k1 + 1)</code> factor &mdash; 2.2 with the
+default <code>k1</code> of 1.2 &mdash; into the boost when it builds the query. So
+<code>2 &times; 2.2 = 4.4</code>.</p>
+
+<p>The practical consequence is that the <em>absolute</em> value of a boost means nothing. Only the
+<strong>ratio between fields</strong> matters. <code>city^3, title^2, description</code> is the same
+ranking as <code>city^30, title^20, description^10</code>. Nobody should be tuning a boost from 2.0
+to 2.1.</p>
+
+<h2>What a field boost actually buys</h2>
+
+<p>Less than people assume, and the reason is the <code>multi_match</code> type.</p>
+
+<pre class="language-python"><code class="language-python">TEXT_FIELDS = ["city^3", "title^2", "description", "state", "country"]</code></pre>
+
+<p>The default type is <code>best_fields</code>, which scores each field independently and keeps
+<strong>the best one</strong> &mdash; note the <code>max of:</code> at the top of the explain output
+above. It does not add the fields together.</p>
+
+<p>So a boost decides <em>which field wins</em>, not how much total score a document accumulates. A
+document matching in three fields does not beat one matching strongly in one.</p>
+
+<p><code>tie_breaker</code> softens that &mdash; it adds a fraction of the other fields' scores to
+the winner. Values around 0.3 are usual. It only changes anything when more than one field matches,
+which is worth knowing before you conclude it does nothing.</p>
+
+<h2>The bug best_fields caused</h2>
+
+<p>StayHub's search used one <code>multi_match</code> with <code>operator: and</code> and the default
+type. On the seeded index:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">query "san francisco loft"
+
+best_fields   ->  0 hits
+cross_fields  ->  1 hit</code></pre>
+
+<p>A perfectly reasonable search returned <strong>nothing</strong>. Work it through:
+<code>best_fields</code> scores each field separately, so <code>operator: and</code> means "every
+term in <em>one</em> field". "san francisco" is in <code>city</code>; "loft" is in
+<code>title</code>. No single field held all three terms.</p>
+
+<p>Nobody had noticed because every test query was single-field.</p>
+
+<p><code>cross_fields</code> is the fix. It treats the listed fields as one big field for
+term-matching, which is exactly the mental model a user has. And it <strong>cannot</strong> do
+fuzziness:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">400 parsing_exception
+Fuzziness not allowed for type [cross_fields]</code></pre>
+
+<p>A hard refusal, not a degradation &mdash; a fuzzy expansion has no stable per-term document
+frequency to blend across fields. So neither type alone is right, and the answer is both:</p>
+
+<pre class="language-python"><code class="language-python">    return {
+        "bool": {
+            "should": [
+                {
+                    "multi_match": {
+                        "query": req.q,
+                        "fields": TEXT_FIELDS,
+                        "type": "cross_fields",
+                        "operator": "and",
+                    }
+                },
+                {
+                    "multi_match": {
+                        "query": req.q,
+                        "fields": TEXT_FIELDS,
+                        "fuzziness": "AUTO",
+                        "operator": "and",
+                    }
+                },
+            ],
+            "minimum_should_match": 1,
+        }
+    }</code></pre>
+
+<p><code>cross_fields</code> catches terms spread across fields, exactly. <code>best_fields</code>
+with fuzziness catches typos within one field. <code>minimum_should_match: 1</code> makes it an OR,
+and a document matching both scores higher &mdash; which is the correct preference, since an exact
+cross-field hit should beat a fuzzy one.</p>
+
+<p>Verified after the change: "san francisco loft" finds the loft, and "cabbin" still finds
+cabins.</p>
+
+<h3>The other types, briefly</h3>
+
+<p><code>most_fields</code> adds the per-field scores instead of taking the best. It is for the same
+text analysed several ways &mdash; a field with a stemmer and a field without &mdash; where matching
+in both genuinely is a stronger signal.</p>
+
+<p><code>phrase</code> and <code>phrase_prefix</code> are <code>best_fields</code> with the terms
+required adjacent, the latter treating the last term as a prefix.</p>
+
+<p><code>bool_prefix</code> is the one to use with <code>search_as_you_type</code> fields.</p>
+
+<h2>Fuzziness</h2>
+
+<pre class="language-json"><code class="language-json">{ "match": { "title": { "query": "cabbin", "fuzziness": "AUTO" } } }</code></pre>
+
+<p>Fuzziness is Levenshtein edit distance &mdash; how many single-character changes turn one term
+into another. <code>AUTO</code> scales with term length: 0 edits for 1&ndash;2 characters, 1 edit up
+to 5, 2 edits beyond. That scaling is the point. A fixed <code>"fuzziness": 2</code> on a
+three-letter word matches almost every three-letter word in the index.</p>
+
+<p>Two things to know. Fuzzy matches score lower than exact ones, which is correct and means you
+rarely need to separate them. And fuzziness is expensive &mdash; it expands each term against the
+term dictionary &mdash; so it is not something to enable on every field of a large index without
+looking at the latency.</p>
+
+<p><code>prefix_length</code> is the usual mitigation: requiring the first one or two characters to
+match exactly cuts the expansion enormously and costs almost nothing in recall, since people rarely
+mistype the first letter.</p>
+
+<h2>Before you tune anything: check it is a relevance problem</h2>
+
+<p>Most "bad relevance" reports are not about ranking at all, and the tuning levers below will not
+touch them. Four checks, in order, and they take five minutes.</p>
+
+<p><strong>Is the document matching at all?</strong> Run <code>_explain</code> on it. If the answer
+is <em>"does not match"</em> rather than a score, no amount of boosting will help &mdash; this is an
+analysis or a query-type problem, and lesson 5's two-list comparison finds it.</p>
+
+<p><strong>Is it matching in the field you think?</strong> Name your clauses with
+<code>_name</code> and read <code>matched_queries</code> on the hit. A document matching only on
+<code>description</code> when you assumed <code>title</code> explains a low score immediately.</p>
+
+<p><strong>Is a filter excluding it?</strong> Remove the filters and re-run. A listing missing
+because its price is outside the range is not a relevance issue, however much it looks like one.</p>
+
+<p><strong>Is the field unusually short or long?</strong> BM25 divides by field length relative to
+the average. A one-word title scores strikingly high for its single term, which is why stub content
+sometimes outranks good content. That is a data problem with a data fix.</p>
+
+<p>Only when all four come back clean is the ranking itself the thing to change.</p>
+
+<h2>function_score</h2>
+
+<p>Text relevance alone will rank a barely-reviewed listing above an excellent one, because BM25
+knows nothing about ratings. <code>function_score</code> multiplies the text score by something
+about the document:</p>
+
+<pre class="language-python"><code class="language-python">    fs = {
+        "function_score": {
+            "query": query,
+            "field_value_factor": {
+                "field": "rating_average",
+                "modifier": "log1p",
+                "factor": 2.0,
+                "missing": 1.0,
+            },
+            "boost_mode": "multiply",
+        }
+    }</code></pre>
+
+<p>Three details, each of which is a mistake if you get it wrong.</p>
+
+<p><code>"modifier": "log1p"</code> rather than the raw value. Linear on a 0&ndash;5 rating makes
+rating the dominant term and text merely a tie-break, which is the usual overcorrection. A log
+compresses the top end so a 4.9 and a 4.7 are close, which is honest &mdash; they are close.</p>
+
+<p><code>"missing": 1.0</code>. Without it, a listing with no reviews scores zero and disappears
+entirely. A new host would never get a first booking.</p>
+
+<p><code>boost_mode</code> decides how the function combines with the text score:
+<code>multiply</code> (default), <code>sum</code>, <code>replace</code>, <code>max</code>,
+<code>min</code>, <code>avg</code>. <code>multiply</code> preserves the relevance ordering within
+similar ratings; <code>replace</code> throws relevance away entirely.</p>
+
+<h3>Decay functions</h3>
+
+<p>For "closer to this value is better" &mdash; a price near what the user was browsing, a date near
+today, a location near a map centre:</p>
+
+<pre class="language-json"><code class="language-json">{ "gauss": { "price_per_night": { "origin": 150, "scale": 80, "decay": 0.5 } } }</code></pre>
+
+<p>Score 1.0 at the origin, falling to <code>decay</code> (0.5) at <code>scale</code> away from it.
+On the seeded index with <code>boost_mode: replace</code>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">0.9489  $128  Quiet Studio near Zilker Park
+0.8481  $189  Cedar Cabin with Mountain Views
+0.7792  $198  Modern Condo, Downtown Skyline
+0.6328  $215  Sunlit Loft in the Mission</code></pre>
+
+<p>A smooth preference rather than a cliff. <code>gauss</code>, <code>linear</code> and
+<code>exp</code> differ in shape; <code>gauss</code> is the usual choice because it is flat near the
+origin, so small differences close to the target barely matter.</p>
+
+<p>This is much better than the instinct, which is to sort by distance from the value. Sorting
+discards relevance completely; a decay function keeps it and biases it.</p>
+
+<h2>Rescoring: expensive scoring on few documents</h2>
+
+<p>Some signals are too costly to compute for every match. <code>rescore</code> runs a second query
+over only the top N per shard:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "query": { "match": { "title": "cabin" } },
+  "rescore": {
+    "window_size": 50,
+    "query": {
+      "rescore_query": { "match_phrase": { "title": { "query": "cedar cabin", "slop": 1 } } },
+      "query_weight": 1,
+      "rescore_query_weight": 3
+    }
+  }
+}</code></pre>
+
+<p>The cheap query finds and ranks everything; the expensive one reorders the top 50. Phrase
+matching is the classic use &mdash; "the exact phrase should win, but I cannot afford to check
+phrases across the whole index".</p>
+
+<p>The trap is that <code>window_size</code> applies <em>per shard</em> and interacts with
+pagination: rescoring the top 50 while serving page 10 does nothing, because page 10 is past the
+window. Rescoring is for the first page or two, which is where it matters anyway.</p>
+
+<h3>Several functions at once</h3>
+
+<p>Real ranking usually blends more than one signal, and <code>function_score</code> takes a list
+with a <code>score_mode</code> saying how they combine:</p>
+
+<pre class="language-json"><code class="language-json">{ "function_score": {
+    "query": { "match": { "description": "mountain cabin" } },
+    "functions": [
+      { "field_value_factor": { "field": "rating_average", "modifier": "log1p", "missing": 1 } },
+      { "gauss": { "created_at": { "origin": "now", "scale": "180d", "decay": 0.5 } } },
+      { "filter": { "term": { "amenities": "hot-tub" } }, "weight": 1.2 }
+    ],
+    "score_mode": "multiply",
+    "boost_mode": "multiply",
+    "max_boost": 3
+} }</code></pre>
+
+<p>Rating, recency, and a flat boost for one amenity. Note the third form: a
+<code>filter</code> plus a <code>weight</code> is how you say "these documents are worth a bit
+more", and it is cheaper and clearer than a <code>should</code> clause doing the same job.</p>
+
+<p>Two parameters keep it under control. <code>score_mode</code> combines the functions with each
+other; <code>boost_mode</code> combines that result with the text score. And
+<code>max_boost</code> caps the total, which matters because multiplying three unbounded functions
+together produces occasional documents whose score has nothing to do with the query.</p>
+
+<p>The discipline worth applying: add one function, check the judgment list, keep it or drop it,
+then add the next. A <code>function_score</code> with five functions added at once cannot be
+reasoned about, and removing one later is a guess.</p>
+
+<h2>Knowing whether you improved anything</h2>
+
+<p>Everything above changes the ranking. None of it tells you whether the ranking got better, and
+"it looks better to me" is how relevance work turns into an argument.</p>
+
+<p>The cheap version: keep a list of queries with the documents that should be in their top few
+results &mdash; a judgment list &mdash; and check it after every change. Twenty queries collected
+from real logs is enough to catch the changes that make things dramatically worse, which is most of
+them.</p>
+
+<p>Elasticsearch has an API for exactly this, <code>_rank_eval</code>, which takes the judgments and
+returns standard metrics like precision at k and mean reciprocal rank. Its real value is not the
+metric &mdash; it is that it makes the judgments a file in your repository rather than an opinion.</p>
+
+<p>The honest version is user behaviour: click-through on the top result, how often people go to
+page two, how often they search again immediately. Slower and less comfortable, and the only thing
+that actually measures relevance.</p>
+
+<h2>A worked order of operations</h2>
+
+<p>When relevance genuinely needs work, this is the sequence that wastes the least time, roughly
+cheapest and most effective first.</p>
+
+<p><strong>One: fix the analysis.</strong> Accent folding, a stemmer on the right fields, a
+normalizer on the keyword ones. These change what <em>can</em> match, and no amount of ranking work
+compensates for a document that never matches. Lesson 5.</p>
+
+<p><strong>Two: fix the query type.</strong> <code>cross_fields</code> versus
+<code>best_fields</code>, <code>operator</code>, <code>minimum_should_match</code>. This is where
+the largest single improvements usually come from, and the StayHub bug above is the example &mdash;
+that was not a tuning problem, it was zero results.</p>
+
+<p><strong>Three: set field boosts.</strong> Coarse ratios, not decimals. Title and name fields
+above body text, and an exact-match field above an analysed one if you have both.</p>
+
+<p><strong>Four: add fuzziness</strong> with a <code>prefix_length</code>, if typos are a real
+source of empty results. Check the latency after.</p>
+
+<p><strong>Five: add business signals</strong> with <code>function_score</code> &mdash; rating,
+recency, popularity. One at a time.</p>
+
+<p><strong>Six: rescore the top window</strong> for anything expensive, such as phrase proximity.</p>
+
+<p>Most projects should stop after three. Steps five and six are where relevance work starts
+consuming time without obviously repaying it, and they are much easier to justify once you have the
+measurement in place.</p>
+
+<h2>What not to do</h2>
+
+<p><strong>Do not tune boosts by feel, one query at a time.</strong> Every change helps the query in
+front of you and may hurt ten you are not looking at. That is what the judgment list is for.</p>
+
+<p><strong>Do not sort by a field to fix relevance.</strong> A <code>sort</code> discards
+<code>_score</code> entirely &mdash; every carefully tuned signal, gone. If newer or better-rated
+should count for more, that is <code>function_score</code>, not <code>sort</code>.</p>
+
+<p><strong>Do not reach for <code>k1</code> and <code>b</code> early.</strong> They change every
+score in the index and their effects are hard to predict. Field boosts, query types and
+<code>function_score</code> first.</p>
+
+<p><strong>Do not add synonyms to fix one bad query.</strong> Each one broadens matching everywhere,
+and the cost is diffuse and shows up later.</p>
+
+<p><strong>Do not skip <code>_explain</code>.</strong> Almost every relevance surprise has a
+mundane explanation &mdash; a field not being matched at all, an analyzer disagreement, a document
+that is short so its terms are weighted heavily &mdash; and the tree tells you which in under a
+minute.</p>

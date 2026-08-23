@@ -1,0 +1,226 @@
+<p>Loading is where most Snowflake projects spend their first week, and where most of the avoidable
+pain lives. The mechanism itself is simple — put files somewhere Snowflake can see, then
+<code>COPY INTO</code> a table — but three things about it are not obvious: how stages differ, why
+file size matters so much, and what happens to the rows that fail.</p>
+
+<h2>Stages</h2>
+
+<p>A stage is a location holding files. There are four kinds, and picking the right one is mostly a
+question of who owns the storage.</p>
+
+<table>
+<tr><th>Stage</th><th>Reference</th><th>Storage</th><th>Use for</th></tr>
+<tr><td>User</td><td><code>@~</code></td><td>Snowflake</td><td>Your own ad-hoc files</td></tr>
+<tr><td>Table</td><td><code>@%tablename</code></td><td>Snowflake</td><td>Files destined for exactly
+one table</td></tr>
+<tr><td>Named internal</td><td><code>@my_stage</code></td><td>Snowflake</td><td>Shared loading; the
+usual internal choice</td></tr>
+<tr><td>Named external</td><td><code>@my_s3_stage</code></td><td>Your S3 / Blob /
+GCS</td><td>Production pipelines where data already lands in your bucket</td></tr>
+</table>
+
+<p>Internal stages are Snowflake-managed storage you upload to with <code>PUT</code>. External
+stages point at a bucket you already own, which is what most production pipelines use — the data is
+being written there anyway, and Snowpipe (lesson 8) can watch it.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Internal, for files from your laptop.
+CREATE STAGE learn_snowflake.staging.internal_stage
+  FILE_FORMAT = (TYPE = CSV);
+
+-- External, on S3. The storage integration holds the IAM role, so no keys
+-- appear in SQL and no key ends up in query history.
+CREATE STAGE learn_snowflake.staging.s3_stage
+  URL = 's3://my-bucket/incoming/'
+  STORAGE_INTEGRATION = my_s3_integration
+  FILE_FORMAT = (TYPE = CSV);
+
+LIST @learn_snowflake.staging.s3_stage;</code></pre>
+
+<p>Create the storage integration once, with an IAM role rather than embedded credentials. Putting
+an access key in a <code>CREATE STAGE</code> statement writes it into query history where anyone
+with the right role can read it.</p>
+
+<h2>File formats as objects</h2>
+
+<p>You can specify format options inline on every <code>COPY</code>, and you will get them subtly
+wrong somewhere. Define them once:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE FILE FORMAT learn_snowflake.staging.csv_standard
+  TYPE                         = CSV
+  FIELD_DELIMITER              = ','
+  SKIP_HEADER                  = 1
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'          -- quoted fields containing commas
+  NULL_IF                      = ('', 'NULL', 'null', '\\N')
+  EMPTY_FIELD_AS_NULL          = TRUE
+  TRIM_SPACE                   = FALSE
+  DATE_FORMAT                  = 'YYYY-MM-DD'
+  TIMESTAMP_FORMAT             = 'YYYY-MM-DD HH24:MI:SS'
+  COMPRESSION                  = AUTO;
+
+CREATE OR REPLACE FILE FORMAT learn_snowflake.staging.json_standard
+  TYPE                    = JSON
+  STRIP_OUTER_ARRAY       = TRUE      -- a file that is one big [ ... ]
+  COMPRESSION             = AUTO;</code></pre>
+
+<p><code>FIELD_OPTIONALLY_ENCLOSED_BY</code> is the one people forget. Without it, a quoted address
+field containing a comma splits into two columns and every row after it is shifted — which fails
+loudly if the types differ and, far worse, silently if they do not.</p>
+
+<h2>Getting files in, and loading them</h2>
+
+<pre class="language-bash"><code class="language-bash"># PUT is a client-side command: it runs in the CLI, not in a worksheet.
+# Files are compressed and encrypted in transit by default.
+snow sql -q "PUT file:///data/orders_*.csv @learn_snowflake.staging.internal_stage \
+             AUTO_COMPRESS=TRUE PARALLEL=8"</code></pre>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE learn_snowflake.staging.orders (
+  order_id     INT,
+  customer_id  INT,
+  order_date   DATE,
+  status       STRING,
+  total        NUMBER(12,2)
+);
+
+COPY INTO learn_snowflake.staging.orders
+FROM   @learn_snowflake.staging.internal_stage
+FILE_FORMAT = (FORMAT_NAME = learn_snowflake.staging.csv_standard)
+PATTERN     = '.*orders_.*[.]csv[.]gz'
+ON_ERROR    = 'ABORT_STATEMENT';</code></pre>
+
+<p><code>COPY INTO</code> can also transform on the way in, which saves a staging table when the
+change is simple. The source is referenced positionally as <code>$1</code>, <code>$2</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">COPY INTO learn_snowflake.staging.orders (order_id, customer_id, order_date, status, total)
+FROM (
+  SELECT $1::INT,
+         $2::INT,
+         TRY_TO_DATE($3, 'YYYY-MM-DD'),
+         UPPER($4),
+         TRY_TO_NUMBER($5, 12, 2)
+  FROM @learn_snowflake.staging.internal_stage
+)
+FILE_FORMAT = (FORMAT_NAME = learn_snowflake.staging.csv_standard);</code></pre>
+
+<h2>File size is the performance lever</h2>
+
+<p>This is the part that is genuinely counter-intuitive, and it is the difference between a load
+that keeps up and one that does not.</p>
+
+<p>A <code>COPY</code> distributes files across the threads of the warehouse. One thread handles one
+file. So the shape of your input, not the size of your warehouse, sets the ceiling:</p>
+
+<ul>
+<li><strong>One enormous file</strong> — one thread does everything. A larger warehouse cannot
+help, because there is nothing to hand the other nodes. This is the most common reason a load is
+slow.</li>
+<li><strong>Thousands of tiny files</strong> — per-file overhead dominates. Snowflake spends its
+time opening and closing rather than reading.</li>
+<li><strong>Many medium files</strong> — every thread stays busy, and doubling the warehouse
+roughly halves the time.</li>
+</ul>
+
+<p>Snowflake's own guidance is to aim for files of roughly <strong>100–250 MB compressed</strong>.
+If your source produces one huge export, split it before loading — <code>split -l</code>, or a
+partitioned unload — and the load parallelises for free.</p>
+
+<p>The same applies in reverse when unloading. <code>COPY INTO &lt;location&gt;</code> splits output
+into multiple files by default, and that default is right:</p>
+
+<pre class="language-sql"><code class="language-sql">COPY INTO @learn_snowflake.staging.internal_stage/export/
+FROM   learn_snowflake.staging.orders
+FILE_FORMAT = (TYPE = PARQUET)
+MAX_FILE_SIZE = 128000000            -- ~128 MB per file
+HEADER = TRUE;</code></pre>
+
+<h2>When rows fail</h2>
+
+<p><code>ON_ERROR</code> decides what a bad row does to the rest of the batch:</p>
+
+<table>
+<tr><th>Value</th><th>Effect</th></tr>
+<tr><td><code>ABORT_STATEMENT</code></td><td>Default for <code>COPY</code>. One bad row rolls the
+whole statement back.</td></tr>
+<tr><td><code>CONTINUE</code></td><td>Skip the bad rows, load the rest.</td></tr>
+<tr><td><code>SKIP_FILE</code></td><td>Skip any file containing an error.</td></tr>
+<tr><td><code>SKIP_FILE_&lt;n&gt;</code></td><td>Skip a file once it has more than
+<code>n</code> errors.</td></tr>
+</table>
+
+<p>Check before you commit to anything. <code>VALIDATION_MODE</code> runs the load without writing
+and reports what would have happened:</p>
+
+<pre class="language-sql"><code class="language-sql">COPY INTO learn_snowflake.staging.orders
+FROM   @learn_snowflake.staging.internal_stage
+FILE_FORMAT     = (FORMAT_NAME = learn_snowflake.staging.csv_standard)
+VALIDATION_MODE = 'RETURN_ERRORS';
+
+-- Or: show me the first 10 rows as they would be parsed.
+COPY INTO learn_snowflake.staging.orders
+FROM   @learn_snowflake.staging.internal_stage
+FILE_FORMAT     = (FORMAT_NAME = learn_snowflake.staging.csv_standard)
+VALIDATION_MODE = 'RETURN_10_ROWS';</code></pre>
+
+<h2>Choosing a file format for the source</h2>
+
+<p>If you control what the upstream system writes, the format is worth a moment's thought — it
+affects load speed, and it affects how much of the schema you have to restate.</p>
+
+<table>
+<tr><th>Format</th><th>Good for</th><th>Watch out for</th></tr>
+<tr><td>CSV / delimited</td><td>Universally produced; fastest to parse</td><td>No types, no
+schema. Quoting and encoding problems are yours to solve.</td></tr>
+<tr><td>Parquet</td><td>Columnar, typed, compact. The best default for a pipeline you
+control.</td><td>Larger files; the writer has to get types right.</td></tr>
+<tr><td>JSON / NDJSON</td><td>Nested data, changing shape</td><td>Load into a
+<code>VARIANT</code> and shred later (lesson 9), rather than flattening on the way in.</td></tr>
+<tr><td>Avro, ORC, XML</td><td>Supported; usually because something upstream emits
+them</td><td>Rarely the right choice if you are picking freely.</td></tr>
+</table>
+
+<p>For Parquet and other self-describing formats, <code>INFER_SCHEMA</code> saves writing the DDL
+by hand and, more usefully, saves getting one column's type subtly wrong:</p>
+
+<pre class="language-sql"><code class="language-sql">-- What does Snowflake think is in these files?
+SELECT *
+FROM TABLE(INFER_SCHEMA(
+  LOCATION =&gt; '@learn_snowflake.staging.s3_stage/orders/',
+  FILE_FORMAT =&gt; 'learn_snowflake.staging.parquet_standard'));
+
+-- Create the table straight from that inference.
+CREATE TABLE learn_snowflake.staging.orders_inferred
+  USING TEMPLATE (
+    SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
+    FROM TABLE(INFER_SCHEMA(
+      LOCATION =&gt; '@learn_snowflake.staging.s3_stage/orders/',
+      FILE_FORMAT =&gt; 'learn_snowflake.staging.parquet_standard')));</code></pre>
+
+<p>Read the inferred DDL before you trust it. Inference will happily give you a
+<code>FLOAT</code> for a money column, which lesson 6 explains is the one place that matters.</p>
+
+<h2>The load metadata that skips your file</h2>
+
+<p>Snowflake records which files a table has already loaded and, for 64 days, refuses to load the
+same file again. That idempotence is a gift — a retried pipeline does not double-count — and it is
+also the source of the most confusing loading bug there is: <strong>you fix a file, re-upload it
+under the same name, run <code>COPY</code>, and nothing happens.</strong> No error. Zero rows
+loaded.</p>
+
+<pre class="language-sql"><code class="language-sql">-- What did this table load, and what happened?
+SELECT file_name, status, row_count, row_parsed, first_error_message, last_load_time
+FROM   TABLE(information_schema.copy_history(
+         TABLE_NAME  =&gt; 'LEARN_SNOWFLAKE.STAGING.ORDERS',
+         START_TIME  =&gt; DATEADD('day', -7, CURRENT_TIMESTAMP())))
+ORDER  BY last_load_time DESC;
+
+-- Deliberately reload files already recorded as loaded.
+COPY INTO learn_snowflake.staging.orders
+FROM   @learn_snowflake.staging.internal_stage
+FILE_FORMAT = (FORMAT_NAME = learn_snowflake.staging.csv_standard)
+FORCE       = TRUE;</code></pre>
+
+<p><code>FORCE = TRUE</code> is the escape hatch, and it is a loaded gun: it will happily load the
+same rows twice. The better habit is to give every file a unique name — a timestamp or a batch id in
+the path — so the question never arises.</p>
+
+<p>Next: <a href="/snowflake/snowflake-snowpipe-and-continuous-loading">Snowpipe</a>, for when a
+nightly <code>COPY</code> is not often enough.</p>

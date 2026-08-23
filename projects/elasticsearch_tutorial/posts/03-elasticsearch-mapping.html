@@ -1,0 +1,392 @@
+<p>A mapping is the schema of an index: which fields exist, what type each one is, and how the text
+ones are analysed. You do not have to write one. Elasticsearch will infer it from the first document
+you send &mdash; and that is the problem, because it infers from <em>one</em> document.</p>
+
+<p>This lesson shows what that costs with a worked example you can run, then how to write a mapping
+properly, and finishes with the constraint that shapes every operational decision later in this
+track: <strong>a field's type cannot be changed once it has been written.</strong></p>
+
+<h2>What dynamic mapping actually does</h2>
+
+<p>Create nothing. Just index a document into an index that does not exist:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPOST 'localhost:9200/dyn-test/_doc/1?refresh=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"price": 120, "city": "San Francisco", "when": "2026-08-22"}'</code></pre>
+
+<p>The index was created, and so was a mapping. Ask what it decided:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/dyn-test/_mapping?pretty</code></pre>
+
+<pre class="language-json"><code class="language-json">{
+  "dyn-test": { "mappings": { "properties": {
+    "city":  { "type": "text",
+               "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } } },
+    "price": { "type": "long" },
+    "when":  { "type": "date" }
+  } } }
+}</code></pre>
+
+<p>Three guesses, and they are reasonable guesses. <code>"San Francisco"</code> became
+<code>text</code> with a <code>keyword</code> sub-field, so it can be both matched loosely and
+grouped exactly. <code>"2026-08-22"</code> was recognised as a date. And <code>120</code> became a
+<code>long</code>, because it is a whole number.</p>
+
+<p>That last one is the whole lesson.</p>
+
+<h2>The bug this causes, in full</h2>
+
+<p>The next listing is priced at 119.50. What happens?</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPOST 'localhost:9200/dyn-test/_doc/2?refresh=true' -H 'Content-Type: application/json' \
+  -d '{"price": 119.50}'
+# {"result":"created", ...}
+
+curl -XPOST 'localhost:9200/dyn-test/_doc/3?refresh=true' -H 'Content-Type: application/json' \
+  -d '{"price": 119.99}'
+# {"result":"created", ...}</code></pre>
+
+<p>Both accepted. No error, no warning. Read one back and it looks perfect:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/dyn-test/_doc/3
+# "_source": { "price": 119.99 }</code></pre>
+
+<p>Which is exactly why this is dangerous. <code>_source</code> is the JSON you sent, stored
+verbatim &mdash; it is not the indexed value. The indexed value went through the
+<code>long</code> field's coercion and was <strong>truncated</strong>. So the API response your
+users see is right, and every query is wrong:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/dyn-test/_search -H 'Content-Type: application/json' \
+  -d '{"query": {"term": {"price": 119}}, "_source": ["price"]}'
+# hits: [ {"price": 119.5}, {"price": 119.99} ]        <- both are 119 in the index</code></pre>
+
+<p>Now the failure a user actually reports. Filter for listings at 119.60 or more:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/dyn-test/_search -H 'Content-Type: application/json' \
+  -d '{"query": {"range": {"price": {"gte": 119.6}}}, "_source": ["price"]}'
+# hits: [ {"price": 120} ]        <- the 119.99 listing is missing</code></pre>
+
+<p>A listing that costs 119.99 does not appear in a search for listings costing 119.60 and up. And
+sorting agrees with the index, not with the source:</p>
+
+<pre class="language-json"><code class="language-json">[
+  [ {"price": 119.5},  "sort": [119] ],
+  [ {"price": 119.99}, "sort": [119] ],
+  [ {"price": 120},    "sort": [120] ]
+]</code></pre>
+
+<p>Nothing here logged an error. Nothing looked broken. A support ticket about "search sometimes
+misses a listing" is roughly the worst possible way to find out, and the fix requires reindexing
+every document, because the truncation already happened at write time.</p>
+
+<h2>Writing the mapping yourself</h2>
+
+<p>The alternative is fifteen lines. Create the index before anything writes to it, and say what
+you mean:</p>
+
+<pre class="language-python"><code class="language-python">INDEX_SETTINGS: dict[str, Any] = {
+    "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
+    },
+    "mappings": {
+        "dynamic": "strict",
+        "properties": {
+            "public_id": {"type": "keyword"},
+            "title": {"type": "text", "analyzer": "stayhub_text"},
+            "city": {
+                "type": "text",
+                "analyzer": "stayhub_text",
+                "fields": {"raw": {"type": "keyword"}},
+            },
+            "property_type": {"type": "keyword"},
+            "amenities": {"type": "keyword"},
+            "price_per_night": {"type": "scaled_float", "scaling_factor": 100},
+            "max_guests": {"type": "integer"},
+            "location": {"type": "geo_point"},
+            "created_at": {"type": "date"},
+        },
+    },
+}</code></pre>
+
+<p>Every decision in there is a decision that dynamic mapping would have made differently, and
+lesson 4 goes through the types one by one. Two of them are worth pulling out now because they are
+about mapping structure rather than about types.</p>
+
+<h3>Multi-fields: one field, indexed twice</h3>
+
+<pre class="language-python"><code class="language-python">            "city": {
+                "type": "text",
+                "analyzer": "stayhub_text",
+                "fields": {"raw": {"type": "keyword"}},
+            },</code></pre>
+
+<p>You send <code>city</code> once. Elasticsearch indexes it twice, under two names.
+<code>city</code> is analysed &mdash; "San Francisco" becomes the terms <code>san</code> and
+<code>francisco</code>, so a search for "san fran" can match it loosely. <code>city.raw</code> is a
+<code>keyword</code>, stored as the single exact term <code>San Francisco</code>.</p>
+
+<p>You need both, and for different jobs. Matching wants the analysed one. Sorting, exact filtering
+and <em>aggregations</em> want the raw one &mdash; group listings by <code>city</code> and you get
+buckets for "san" and "francisco" separately, because aggregations run on terms and the terms of a
+text field are its tokens. Lesson 13 has that mistake in full.</p>
+
+<p>Dynamic mapping does this for you automatically, under the name <code>.keyword</code> rather
+than <code>.raw</code>. That is one of the better things it does, and it is worth knowing the name
+it uses because half the examples online say <code>.keyword</code>.</p>
+
+<h3>dynamic: strict, and its two siblings</h3>
+
+<pre class="language-python"><code class="language-python">        "dynamic": "strict",</code></pre>
+
+<p>There are three settings and they mean very different things.</p>
+
+<p><code>"dynamic": true</code> is the default: an unknown field is added to the mapping and
+indexed.</p>
+
+<p><code>"dynamic": false</code> stores an unknown field in <code>_source</code> but does not index
+it. So it comes back in results and is invisible to every query &mdash; which is the most confusing
+of the three, because the data is plainly <em>there</em>.</p>
+
+<p><code>"dynamic": "strict"</code> rejects the whole document:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPOST localhost:9200/strict-test/_doc/1 -H 'Content-Type: application/json' \
+  -d '{"titel": "typo"}'</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">strict_dynamic_mapping_exception
+[1:10] mapping set to strict, dynamic introduction of [titel] within [_doc] is not allowed</code></pre>
+
+<p>That is a typo caught at write time, by name, with a line number. Under the default it would
+have created a field called <code>titel</code> that nothing will ever query, and the document would
+have been missing its title with no complaint from anyone.</p>
+
+<p>Strict is the right default for a mapping you own and write to from your own code. It is the
+wrong default for logs and metrics, where the whole point is that you do not know the field names
+in advance.</p>
+
+<h2>The constraint everything else follows from</h2>
+
+<p>Try to fix the <code>price</code> field from earlier:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPUT localhost:9200/dyn-test/_mapping -H 'Content-Type: application/json' \
+  -d '{"properties": {"price": {"type": "double"}}}'</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">illegal_argument_exception
+mapper [price] cannot be changed from type [long] to [double]</code></pre>
+
+<p>Not "will be slow", not "will apply to new documents". Refused. This is not Elasticsearch being
+awkward: the type decided how the values were encoded into the Lucene segment files on disk, those
+files are immutable, and there is no operation that rewrites them in place.</p>
+
+<p>So the answer is always the same shape &mdash; build a new index with the mapping you want, copy
+the documents into it, and switch over. Whether that is a routine afternoon or an outage depends on
+one decision you make on day one, which is lesson 15.</p>
+
+<h3>What you can change</h3>
+
+<p>Some things are fine. Adding a new field is always allowed:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPUT localhost:9200/dyn-test/_mapping -H 'Content-Type: application/json' \
+  -d '{"properties": {"newfield": {"type": "keyword"}}}'
+# {"acknowledged": true}</code></pre>
+
+<p>So is adding a multi-field to an existing field. And here is the trap, because it succeeds and
+then does not work:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPUT localhost:9200/dyn-test/_mapping -H 'Content-Type: application/json' \
+  -d '{"properties": {"city": {"type": "text", "fields": {"raw": {"type": "keyword"}}}}}'
+# {"acknowledged": true}
+
+curl -s localhost:9200/dyn-test/_search -H 'Content-Type: application/json' \
+  -d '{"query": {"term": {"city.raw": "San Francisco"}}}'
+# hits: 0</code></pre>
+
+<p>The mapping change was accepted. The existing documents do not have the new sub-field, because
+mapping changes apply at <em>index</em> time and those documents were indexed before it existed.
+New documents will have it; old ones never will until they are rewritten.</p>
+
+<p>This catches people constantly, and the tell is an aggregation that returns fewer buckets than
+there are documents. The fix is <code>_update_by_query</code> to reindex documents in place, or a
+full reindex &mdash; not another mapping change.</p>
+
+<h3>Runtime fields: the escape hatch</h3>
+
+<p>Reindexing is the real fix, and reindexing takes planning. When you need the query to work
+<em>this afternoon</em>, a runtime field computes a value at query time instead of reading one from
+the index:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "runtime_mappings": {
+    "price_exact": {
+      "type": "double",
+      "script": "emit(Double.parseDouble(params._source.price.toString()))"
+    }
+  },
+  "query": { "range": { "price_exact": { "gte": 119.6 } } },
+  "fields": ["price_exact"]
+}</code></pre>
+
+<p>Because it reads <code>_source</code> &mdash; which was never truncated &mdash; it sees 119.99
+and the query is correct. Nothing was reindexed and nothing was rewritten.</p>
+
+<p>The cost is exactly what you would expect: the script runs for every document the query touches,
+every time. That is fine for a filter that runs after other filters have narrowed things down,
+and it is not fine as the primary clause on a large index. Runtime fields are a bridge to a
+reindex, not an alternative to one &mdash; but they are a very good bridge, because they let you
+ship the fix and schedule the migration separately.</p>
+
+<p>They can also be declared in the mapping rather than per query, which makes them look like real
+fields to every caller. Same cost, better ergonomics.</p>
+
+<h2>What happens to bad data</h2>
+
+<p>Two settings decide this, and the defaults are stricter than people expect.</p>
+
+<p>By default, a value that cannot be parsed rejects the whole document:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPOST localhost:9200/mal-test/_doc/1 -H 'Content-Type: application/json'   -d '{"price": "not a number"}'</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">document_parsing_exception
+[1:10] failed to parse field [price] of type [long] in document with id '1'.
+Preview of field's value: 'not a number'</code></pre>
+
+<p>The whole document, not just the field. That is usually right &mdash; a listing with an
+unparseable price is not a listing you want in search results.</p>
+
+<p>When it is not right, <code>ignore_malformed</code> changes the deal:</p>
+
+<pre class="language-json"><code class="language-json">{ "mappings": { "properties": {
+  "guests": { "type": "integer", "ignore_malformed": true }
+} } }</code></pre>
+
+<p>Now the document is indexed, every other field works, and the bad field is silently skipped.
+Silently is the word to worry about &mdash; <code>_source</code> still shows
+<code>"guests": "lots"</code>, so the document looks complete, while
+<code>{"exists": {"field": "guests"}}</code> matches <strong>zero</strong> documents.</p>
+
+<p>Elasticsearch does keep a record, in a metadata field most people never hear about:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/mal-test/_search -H 'Content-Type: application/json'   -d '{"query": {"term": {"_ignored": "guests"}}}'
+# hits: [ { "_source": {"guests": "lots", "price": 5}, "_ignored": ["guests"] } ]</code></pre>
+
+<p>That query is worth putting on a dashboard the day you enable <code>ignore_malformed</code>
+anywhere. Otherwise you have chosen to accept broken data and given yourself no way to find out how
+much of it there is.</p>
+
+<p>The related setting is <code>coerce</code>, which is what quietly turned <code>119.99</code>
+into <code>119</code> and <code>"5"</code> into <code>5</code>. Setting
+<code>"coerce": false</code> on a numeric field makes those hard errors instead. On a field whose
+values come from your own code &mdash; where a string arriving in a numeric field means a bug, not
+a sloppy input &mdash; that is the setting you want.</p>
+
+<h2>Settings are not mappings, and some are static too</h2>
+
+<p>An index create body has two halves and they behave differently. Under <code>mappings</code> you
+have the field types. Under <code>settings</code> you have how the index is stored, and those split
+again into static and dynamic.</p>
+
+<p><strong>Static settings</strong> can only be set at creation. <code>number_of_shards</code> is
+the one that matters &mdash; you cannot change it later, and a badly chosen shard count is another
+reason to reindex. Lesson 18 covers how to pick it.</p>
+
+<p><strong>Dynamic settings</strong> can be changed on a live index:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPUT localhost:9200/dyn-test/_settings -H 'Content-Type: application/json' \
+  -d '{"index": {"number_of_replicas": 1, "refresh_interval": "30s"}}'</code></pre>
+
+<p><code>number_of_replicas</code> is dynamic, which is genuinely useful: set it to 0 during a big
+bulk load and back to 1 afterwards, and the load does not pay to write everything twice.
+<code>refresh_interval</code> is the same idea for a different cost &mdash; lesson 7 explains what
+refreshing is and why raising it speeds up indexing.</p>
+
+<h3>Fields you store but never search</h3>
+
+<p>Two more per-field settings earn their place once an index gets large, and both are about
+<em>not</em> building structures you will never use.</p>
+
+<pre class="language-python"><code class="language-python">            "cover_image_url": {"type": "keyword", "index": False},</code></pre>
+
+<p><code>"index": false</code> means the field is stored in <code>_source</code> and returned with
+every hit, but no inverted index is built for it. Nobody searches for a listing <em>by</em> its
+image URL &mdash; it is there to render the result card. Indexing it would build a term dictionary
+entry per document for a field with no repeated values, which is the worst shape an inverted index
+can have.</p>
+
+<p>The mirror image is <code>doc_values</code>. The inverted index answers "which documents contain
+this term"; doc values answer "what is this document's value for this field", which is what sorting
+and aggregating need. Both are built by default for most types. If a field is only ever matched and
+never sorted or aggregated, <code>"doc_values": false</code> saves the disk.</p>
+
+<p>Neither is worth thinking about on a small index. Both are worth knowing about the first time
+someone asks why the index is four times the size of the data.</p>
+
+<h2>Templates, for indexes you do not create by hand</h2>
+
+<p>Writing a mapping works when there is one index. It stops working when there is one index per
+day, per tenant or per version, because something has to apply the mapping to an index that does
+not exist yet. An index template does that:</p>
+
+<pre class="language-json"><code class="language-json">PUT _index_template/stayhub-properties
+{
+  "index_patterns": ["stayhub-properties-*"],
+  "priority": 200,
+  "template": {
+    "settings": { "number_of_shards": 1 },
+    "mappings": { "dynamic": "strict", "properties": { "title": { "type": "text" } } }
+  }
+}</code></pre>
+
+<p>Any index whose name matches the pattern is created with that mapping, whoever creates it. Two
+warnings. Templates apply <em>at creation only</em>, so editing one does nothing to indexes that
+already exist. And when several templates match, the highest <code>priority</code> wins outright
+&mdash; they are not merged, which is not what most people assume the first time.</p>
+
+<h2>Checking your work</h2>
+
+<pre class="language-bash"><code class="language-bash"># what the mapping is now
+curl -s localhost:9200/stayhub-properties/_mapping?pretty
+
+# one field, across every index that has it — the fastest way to spot a type that
+# disagrees with itself between indexes
+curl -s "localhost:9200/*/_field_caps?fields=price_per_night&pretty"
+
+# what a value would actually become, without indexing it
+curl -s localhost:9200/stayhub-properties/_analyze -H 'Content-Type: application/json' \
+  -d '{"field": "city", "text": "San Francisco"}'</code></pre>
+
+<p>That last one is lesson 5's subject and it is the single most useful debugging tool
+Elasticsearch has.</p>
+
+<h2>Getting a mapping change into an existing index</h2>
+
+<p>Since half of what you might want to change is refused and the other half only affects new
+documents, it is worth knowing the three tools by name and when each applies.</p>
+
+<p><strong><code>PUT /index/_mapping</code></strong> adds fields and sub-fields. Cheap, instant,
+and only affects documents indexed afterwards.</p>
+
+<p><strong><code>POST /index/_update_by_query</code></strong> reindexes every document in place,
+through the current mapping. This is what makes a newly added multi-field actually populate. It is
+a real rewrite of every document, so it costs what a reindex costs &mdash; but it needs no second
+index and no cutover.</p>
+
+<p><strong><code>POST /_reindex</code></strong> copies into a different index, which is the only
+option when a type has to change. Combined with an alias it is also the only one of the three that
+can happen with no visible downtime, which is lesson 15.</p>
+
+<p>A useful habit: when you add a field to a mapping, decide in the same commit whether existing
+documents need it. If they do, the <code>_update_by_query</code> belongs in that deployment too.
+The alternative is a field that works for new listings and not old ones, which surfaces weeks later
+as "search is missing some results" and takes a day to diagnose.</p>
+
+<h2>The short version</h2>
+
+<p>Write the mapping before anything writes a document. Set <code>dynamic: strict</code> for an
+index your own code owns. Give any string that will be sorted, filtered exactly or aggregated a
+<code>keyword</code> field, and any string that will be searched a <code>text</code> field &mdash;
+which usually means both, as a multi-field. Never let a numeric field be inferred, because
+<code>long</code> is a coin flip that costs a reindex.</p>
+
+<p>And assume from the start that you will one day have to change a type, because the mapping you
+write today is written with less information than you will have in six months. Lesson 15 makes that
+cheap; the alternative is discovering it during an incident.</p>

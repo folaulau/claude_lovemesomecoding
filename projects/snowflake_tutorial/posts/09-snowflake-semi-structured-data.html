@@ -1,0 +1,221 @@
+<p>Snowflake's handling of JSON is one of the genuinely good reasons to choose it. You load a document
+without designing a schema, query it with ordinary SQL, and decide later — with the data in front of
+you — which parts deserve real columns. This lesson covers the syntax, the two mistakes everyone
+makes, and the decision that actually matters.</p>
+
+<h2>The three types</h2>
+
+<table>
+<tr><th>Type</th><th>Holds</th><th>Roughly</th></tr>
+<tr><td><code>VARIANT</code></td><td>Any value: scalar, object or array</td><td>A JSON
+value</td></tr>
+<tr><td><code>OBJECT</code></td><td>Key–value pairs, values are
+<code>VARIANT</code></td><td>A JSON object</td></tr>
+<tr><td><code>ARRAY</code></td><td>An ordered list of <code>VARIANT</code></td><td>A JSON
+array</td></tr>
+</table>
+
+<p>In practice you declare <code>VARIANT</code> and let it hold whatever arrives. The limit is 16 MB
+compressed per value, which is generous for events and restrictive for documents.</p>
+
+<h2>Loading JSON</h2>
+
+<p>The pattern that works for almost every source is one <code>VARIANT</code> column plus whatever
+metadata you want alongside it:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE TABLE learn_snowflake.staging.raw_orders (
+  payload    VARIANT,
+  source_file STRING,
+  loaded_at  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+COPY INTO learn_snowflake.staging.raw_orders (payload, source_file)
+FROM (
+  SELECT $1, METADATA$FILENAME
+  FROM @learn_snowflake.staging.s3_stage
+)
+FILE_FORMAT = (TYPE = JSON, STRIP_OUTER_ARRAY = TRUE);</code></pre>
+
+<p><code>STRIP_OUTER_ARRAY = TRUE</code> is for files that are one big <code>[ {...}, {...} ]</code>
+— it loads one row per element rather than one enormous row. Newline-delimited JSON needs it off,
+since each line is already a separate document.</p>
+
+<p><code>METADATA$FILENAME</code> costs nothing and is worth taking every time. When a downstream
+model produces something strange, being able to trace a row back to the file it came from turns a
+day of guessing into a query.</p>
+
+<h2>Reading it back</h2>
+
+<p>Given a document like this:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "order_id": "A-1001",
+  "placed_at": "2026-08-22T14:05:00",
+  "customer": {"id": 42, "email": "sam@example.com", "segment": "BUILDING"},
+  "items": [
+    {"sku": "SKU-1", "qty": 2, "price": 19.99},
+    {"sku": "SKU-7", "qty": 1, "price": 45.00}
+  ],
+  "coupon": null
+}</code></pre>
+
+<p>the access syntax has three forms, and they are interchangeable:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT payload:order_id::STRING            AS order_id,      -- colon then dot
+       payload:customer.email::STRING      AS email,
+       payload['customer']['segment']::STRING AS segment,    -- bracket form
+       GET_PATH(payload, 'customer.id')::INT  AS customer_id, -- function form
+       payload:items[0].sku::STRING        AS first_sku,
+       ARRAY_SIZE(payload:items)           AS item_count
+FROM   learn_snowflake.staging.raw_orders;</code></pre>
+
+<p>Use the bracket form when a key contains a space or a hyphen, and when a key is case-sensitive —
+which brings us to the first of the two mistakes.</p>
+
+<h2>Mistake one: forgetting the cast</h2>
+
+<p>Every path expression returns a <code>VARIANT</code>, not a string or a number. A
+<code>VARIANT</code> holding text renders <em>with its JSON quotes</em>, and those quotes are part
+of the value:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT payload:order_id           AS uncast,   -- "A-1001"  &lt;- quotes included
+       payload:order_id::STRING   AS cast;     -- A-1001
+
+-- So this join matches nothing at all, and reports no error:
+SELECT *
+FROM   learn_snowflake.staging.raw_orders r
+JOIN   learn_snowflake.staging.orders     o
+       ON r.payload:order_id = o.order_ref;   -- VARIANT vs STRING
+
+-- This is the one you meant:
+       ON r.payload:order_id::STRING = o.order_ref;</code></pre>
+
+<p>The rule is simple and worth applying without thinking about it: <strong>cast at every
+extraction, every time.</strong> A view over the raw table that does all the casting once is the
+usual way to stop this leaking into every query downstream.</p>
+
+<h2>Mistake two: case sensitivity</h2>
+
+<p>Unquoted SQL identifiers are folded to upper case. JSON keys are not — they are data, and they
+are exactly as written in the document. So a document with <code>"orderId"</code> is not reachable
+as <code>payload:orderid</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT payload:orderId::STRING   AS works,        -- matches "orderId"
+       payload:ORDERID::STRING   AS returns_null, -- no such key
+       payload['orderId']::STRING AS also_works;</code></pre>
+
+<p>When a field is unexpectedly <code>NULL</code>, check the spelling in the source document before
+anything else. <code>OBJECT_KEYS</code> tells you exactly what is there:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT DISTINCT key
+FROM   learn_snowflake.staging.raw_orders,
+       LATERAL FLATTEN(input =&gt; OBJECT_KEYS(payload)) f(seq, key_, path, index, key, this);</code></pre>
+
+<h2>FLATTEN: turning arrays into rows</h2>
+
+<p>The order document above has two items in an array. To get one row per item —
+which is what any analysis of items needs — use <code>FLATTEN</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT r.payload:order_id::STRING AS order_id,
+       i.value:sku::STRING        AS sku,
+       i.value:qty::INT           AS qty,
+       i.value:price::NUMBER(10,2) AS price,
+       i.index                    AS line_no
+FROM   learn_snowflake.staging.raw_orders r,
+       LATERAL FLATTEN(input =&gt; r.payload:items) i;</code></pre>
+
+<p><code>FLATTEN</code> returns a table with six columns; the two you use constantly are
+<code>value</code> (the element) and <code>index</code> (its position). It behaves like an inner
+join, so <strong>an order with an empty items array disappears from the result entirely.</strong>
+Pass <code>OUTER =&gt; TRUE</code> to keep it with nulls:</p>
+
+<pre class="language-sql"><code class="language-sql">FROM   learn_snowflake.staging.raw_orders r,
+       LATERAL FLATTEN(input =&gt; r.payload:items, OUTER =&gt; TRUE) i;</code></pre>
+
+<p>For nested arrays — items each containing a list of options — either chain two
+<code>FLATTEN</code>s or pass <code>RECURSIVE =&gt; TRUE</code> to walk the whole document.
+Chaining is clearer and is what you want most of the time.</p>
+
+<h2>Building JSON, not just reading it</h2>
+
+<p>The same functions work in reverse, which is how you produce a JSON payload for an API or a
+downstream consumer without string concatenation:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT OBJECT_CONSTRUCT(
+         'order_id', o.order_id,
+         'total',    o.total,
+         'lines',    ARRAY_AGG(OBJECT_CONSTRUCT('sku', l.sku, 'qty', l.qty))
+       ) AS document
+FROM   learn_snowflake.staging.orders     o
+JOIN   learn_snowflake.staging.order_line l ON l.order_id = o.order_id
+GROUP  BY o.order_id, o.total;</code></pre>
+
+<p><code>OBJECT_CONSTRUCT</code> drops keys whose value is <code>NULL</code>, which is usually what
+you want and occasionally is not — <code>OBJECT_CONSTRUCT_KEEP_NULL</code> keeps them. To render
+the result as text rather than a <code>VARIANT</code>, wrap it in <code>TO_JSON</code>.</p>
+
+<h2>Handling documents whose shape moves</h2>
+
+<p>The reason to land raw JSON in the first place is usually that the upstream shape is not stable.
+Two habits keep that from becoming a surprise.</p>
+
+<p><strong>Watch the key set.</strong> A new key appearing, or an old one vanishing, is the earliest
+signal that a producer changed. It costs one query to notice:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT f.key, COUNT(*) AS documents, MIN(r.loaded_at) AS first_seen
+FROM   learn_snowflake.staging.raw_orders r,
+       LATERAL FLATTEN(input =&gt; r.payload) f
+GROUP  BY f.key
+ORDER  BY first_seen DESC;</code></pre>
+
+<p><strong>Use <code>TRY_CAST</code> in the projection.</strong> When a field that has always been a
+number arrives as <code>"12"</code> or <code>"n/a"</code>, a plain <code>::INT</code> fails the
+whole statement and the typed table stops refreshing. <code>TRY_TO_NUMBER</code> lands a
+<code>NULL</code> instead, and a count of nulls is something you can alert on.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT payload:order_id::STRING                    AS order_id,
+       TRY_TO_NUMBER(payload:total::STRING, 12, 2) AS total,
+       TYPEOF(payload:total)                       AS total_type_in_source
+FROM   learn_snowflake.staging.raw_orders
+WHERE  TYPEOF(payload:total) NOT IN ('DECIMAL', 'INTEGER', 'DOUBLE');</code></pre>
+
+<p><code>TYPEOF</code> reports what a <code>VARIANT</code> actually holds, and that last query is
+the one to run when a field has started behaving oddly — it finds the rows where the source type is
+not what you assumed.</p>
+
+<h2>The decision that matters: leave it or shred it</h2>
+
+<p>Queries against <code>VARIANT</code> are not free. Snowflake stores semi-structured data
+columnar-ised where it can — repeated paths with consistent types get extracted internally and prune
+almost as well as real columns — but paths that vary, or hold mixed types, fall back to reading the
+whole document.</p>
+
+<p>So the choice is between two shapes, and most teams end up wanting both:</p>
+
+<table>
+<tr><th></th><th>Leave in VARIANT</th><th>Shred to columns</th></tr>
+<tr><td>Best when</td><td>The shape changes, or you query it rarely</td><td>Queried constantly, or
+filtered on</td></tr>
+<tr><td>Schema changes</td><td>Nothing to do</td><td>A migration</td></tr>
+<tr><td>Pruning</td><td>Good for stable paths, poor otherwise</td><td>Full</td></tr>
+<tr><td>Cost</td><td>Higher per query</td><td>Higher to maintain</td></tr>
+</table>
+
+<p>The standard pattern keeps the raw payload as the record of truth and projects a typed table
+from it, so nothing is lost and the common queries are fast:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE TABLE learn_snowflake.staging.orders_typed AS
+SELECT payload:order_id::STRING              AS order_id,
+       payload:placed_at::TIMESTAMP_NTZ      AS placed_at,
+       payload:customer.id::INT              AS customer_id,
+       payload:customer.segment::STRING      AS segment,
+       ARRAY_SIZE(payload:items)             AS item_count,
+       payload                               AS raw   -- keep the original
+FROM   learn_snowflake.staging.raw_orders;</code></pre>
+
+<p>Keeping <code>raw</code> alongside the typed columns costs storage and buys you the ability to
+answer a question nobody anticipated without re-loading anything. On a transient staging table that
+is a good trade almost every time.</p>
+
+<p>Next: <a href="/snowflake/snowflake-querying-data">querying data</a> — the SQL worth knowing
+beyond <code>SELECT … WHERE</code>.</p>

@@ -1,0 +1,185 @@
+<p>Every plan in this post was taken from a 400,000-row booking table, before and after creating
+the index being discussed. The timings are from one machine on one day and will differ on yours;
+the shape of the plan is the part that transfers.</p>
+
+<h2>What an index is</h2>
+
+<p>A separate structure holding the indexed values in sorted order, each with a pointer to its row.
+Postgres uses it when finding a few rows through it is cheaper than reading the whole table — and
+that comparison, not the existence of the index, is what decides. On a small table or a query
+returning most of the rows, a sequential scan genuinely is faster, and the planner choosing one is
+usually right.</p>
+
+<h2>B-tree, and column order</h2>
+
+<p>The default, and the answer for almost everything: equality, ranges, sorting, and
+<code>LIKE 'prefix%'</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">-- already on the booking table; drop it first if you are following along
+DROP INDEX IF EXISTS ix_bookings_property_dates;
+CREATE INDEX ix_bookings_property_dates ON bookings (property_id, check_in, check_out);</code></pre>
+
+<p>A composite index is usable <strong>left to right</strong>. That one serves:</p>
+
+<ul>
+  <li><code>WHERE property_id = 42</code> — leading column, yes</li>
+  <li><code>WHERE property_id = 42 AND check_in &gt; '2024-06-01'</code> — yes, and this is what
+      it is for</li>
+  <li><code>WHERE check_in &gt; '2024-06-01'</code> — <strong>no</strong>. The leading column is
+      missing, so there is no range of the index to scan</li>
+</ul>
+
+<p>The ordering rule that follows: <strong>equality columns first, then the one you range over or
+sort by.</strong> An index on <code>(check_in, property_id)</code> for the second query above would
+have to scan every entry in the date range and check <code>property_id</code> on each.</p>
+
+<h2>Partial indexes</h2>
+
+<p>An index over only the rows matching a condition. Smaller, and often dramatically faster.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total FROM bookings WHERE guests = 3 AND status = 'PENDING';</code></pre>
+
+<p>With only the existing index on <code>status</code>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Bitmap Heap Scan on bookings (actual rows=6720 loops=1)
+  Recheck Cond: (status = 'PENDING')
+  Filter: (guests = 3)
+  Rows Removed by Filter: 18762
+  Heap Blocks: exact=4213
+  ->  Bitmap Index Scan on ix_bookings_status (actual rows=25482 loops=1)
+Execution Time: 37.070 ms</code></pre>
+
+<p>It finds 25,482 pending bookings, reads all of them, and throws away 18,762. Now the partial
+index:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX ix_bookings_pending_guests ON bookings (guests) WHERE status = 'PENDING';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Bitmap Heap Scan on bookings (actual rows=6720 loops=1)
+  Recheck Cond: ((guests = 3) AND (status = 'PENDING'))
+  Heap Blocks: exact=1137
+  ->  Bitmap Index Scan on ix_bookings_pending_guests (actual rows=6720 loops=1)
+Execution Time: 1.481 ms</code></pre>
+
+<p>6,720 rows found, none discarded, and a quarter of the heap blocks touched. The index also
+covers only 6% of the table, so it is small and cheap to maintain.</p>
+
+<p>This is the highest-value index shape in most applications, because most applications query one
+state of a workflow far more than the others — pending jobs, unsent messages, active users. The
+condition in the index must appear in the query for it to be used.</p>
+
+<h2>Expression indexes</h2>
+
+<p>An index on a column is no use when the query wraps the column in a function:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id FROM users WHERE lower(email) = 'guest42@stayhub.test';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Seq Scan on users (actual rows=1 loops=1)
+Execution Time: 24.935 ms</code></pre>
+
+<p>Even though <code>ix_users_email</code> exists — it stores emails, not lowercased emails. Index
+the expression instead:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX ix_users_lower_email ON users (lower(email));</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Bitmap Heap Scan on users (actual rows=1 loops=1)
+  ->  Bitmap Index Scan on ix_users_lower_email (actual rows=1 loops=1)
+Execution Time: 0.055 ms</code></pre>
+
+<p>The expression in the query must match the one in the index exactly.</p>
+
+<h2>Covering indexes and index-only scans</h2>
+
+<p>If every column a query needs is in the index, Postgres can answer without touching the table
+at all:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX ix_bookings_property_total ON bookings (property_id) INCLUDE (total);</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Index Only Scan using ix_bookings_property_total on bookings (actual rows=20 loops=1)
+  Heap Fetches: 0
+Execution Time: 0.050 ms</code></pre>
+
+<p><code>INCLUDE</code> columns are stored in the index but not sorted by it — they cannot be
+searched on, only returned. That keeps the index smaller than adding them as key columns.</p>
+
+<p><strong><code>Heap Fetches: 0</code> is the line to look for.</strong> An index-only scan still
+has to check row visibility, and it uses the visibility map to do so. If the table has been written
+to recently and not vacuumed, the map is stale, heap fetches climb, and the "index-only" scan reads
+the table anyway. An index-only scan that is not performing is usually a vacuum problem, not an
+index problem.</p>
+
+<h2>Why the index you added is not being used</h2>
+
+<p>Four reasons, in the order they are worth checking:</p>
+
+<ol>
+  <li><strong>The query does not match the index.</strong> The column is wrapped in a function, the
+      leading column of a composite index is missing, or the expression differs by a cast. This is
+      most of them.</li>
+  <li><strong>The index is not selective enough to be worth it.</strong> An index on a boolean, or
+      on a status where 90% of rows share one value, saves nothing — reading most of the table
+      through an index is slower than reading it directly, and the planner knows.</li>
+  <li><strong>The statistics are stale.</strong> The planner works from a sample collected by
+      <code>ANALYZE</code>. Right after a bulk load, it may believe the table is empty. Run
+      <code>ANALYZE bookings;</code> and try again.</li>
+  <li><strong>Types do not match.</strong> Comparing a <code>bigint</code> column to a
+      <code>numeric</code> literal, or <code>text</code> to <code>varchar</code> across a join, can
+      force a cast on the column side and lose the index.</li>
+</ol>
+
+<p>To find out which, ask the planner rather than guessing — and read the next post, which is about
+nothing else.</p>
+
+<h2>The other index types</h2>
+
+<table>
+  <thead><tr><th>Type</th><th>For</th></tr></thead>
+  <tbody>
+    <tr><td><strong>B-tree</strong></td><td>The default. Equality, ranges, sorting, prefix
+        matching.</td></tr>
+    <tr><td><strong>GIN</strong></td><td>Values containing many items: <code>jsonb</code>, arrays,
+        full-text. Slow to update, fast to search.</td></tr>
+    <tr><td><strong>GiST</strong></td><td>Geometric and range types. This is what makes the
+        booking table's overlap constraint possible.</td></tr>
+    <tr><td><strong>BRIN</strong></td><td>Huge tables whose values correlate with physical order —
+        an append-only log by timestamp. Tiny index, approximate answers.</td></tr>
+    <tr><td><strong>Hash</strong></td><td>Equality only. B-tree does that too, so rarely
+        worth it.</td></tr>
+  </tbody>
+</table>
+
+<h2>What an index costs</h2>
+
+<p>Reading the index list of a busy table is usually more productive than adding to it:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT indexrelname AS index, idx_scan AS times_used,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM   pg_stat_user_indexes
+WHERE  relname = 'bookings'
+ORDER  BY idx_scan;</code></pre>
+
+<p>Every index is updated on every insert, and on every update that touches its columns. An index
+nobody reads is pure cost — disk, write amplification, and slower <code>VACUUM</code>. A table with
+twelve indexes is a table whose write throughput is a fraction of what it could be.</p>
+
+<p>Three habits worth having:</p>
+
+<ul>
+  <li><strong>Index foreign keys.</strong> Postgres does not do it for you, and deleting a parent
+      scans the whole child table without one.</li>
+  <li><strong>Drop indexes with <code>idx_scan = 0</code></strong> after a representative period —
+      and check every replica, since the counter is per server.</li>
+  <li><strong>Build on a live table with <code>CONCURRENTLY</code></strong>, which is the
+      migrations post's subject.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX CONCURRENTLY ix_bookings_guest ON bookings (guest_id);</code></pre>
+
+<p>One last thing that is easy to miss: <strong>a unique constraint already is an index</strong>.
+The booking table's <code>public_id</code> is unique, so it has a b-tree whether you asked for one
+or not, and adding another on the same column is pure waste. The same goes for a primary key.
+Check what is already there before creating anything:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'bookings' ORDER BY indexname;</code></pre>
+
+<p>Or <code>\d bookings</code> in psql, which prints the indexes and the constraints together —
+and shows you which of the indexes exist only because a constraint needed them.</p>

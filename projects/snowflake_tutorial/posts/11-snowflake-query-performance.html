@@ -1,0 +1,190 @@
+<p>The instinct when a query is slow is to make the warehouse bigger. Sometimes that is right. More
+often the query is reading data it does not need, and a bigger warehouse reads the same data faster
+and bills more for it. This lesson is about finding out which case you are in, in the order worth
+checking.</p>
+
+<h2>Start with the profile, not the guess</h2>
+
+<p>Every query in the last 14 days has a Query Profile: Snowsight → Monitoring → Query History →
+click the query → Query Profile. It shows the plan as a tree of operators with the time and rows
+each one accounted for.</p>
+
+<p>Four numbers on that page answer most questions before you have read the tree.</p>
+
+<table>
+<tr><th>What to read</th><th>Where</th><th>What it tells you</th></tr>
+<tr><td>Partitions scanned / total</td><td>The TableScan node</td><td>Whether pruning worked. This
+is the first thing to look at, always.</td></tr>
+<tr><td>Bytes spilled to local / remote storage</td><td>Statistics panel</td><td>The working set
+did not fit in memory.</td></tr>
+<tr><td>Most expensive node</td><td>Highlighted in the tree</td><td>Where the time actually
+went.</td></tr>
+<tr><td>Rows out of a join vs rows in</td><td>The Join node</td><td>An exploding join — see
+below.</td></tr>
+</table>
+
+<p>The same numbers are available in SQL, which is what you want for anything recurring:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT query_id,
+       LEFT(query_text, 60)                       AS query,
+       total_elapsed_time / 1000                  AS seconds,
+       partitions_scanned,
+       partitions_total,
+       bytes_spilled_to_local_storage             AS spill_local,
+       bytes_spilled_to_remote_storage            AS spill_remote,
+       warehouse_size
+FROM   snowflake.account_usage.query_history
+WHERE  start_time &gt;= DATEADD('day', -1, CURRENT_TIMESTAMP())
+  AND  total_elapsed_time &gt; 60000
+ORDER  BY total_elapsed_time DESC
+LIMIT  20;</code></pre>
+
+<h2>1. Pruning</h2>
+
+<p>If <code>partitions_scanned</code> is close to <code>partitions_total</code> on a filtered query,
+nothing else matters until that is fixed. Lesson 2 explained why: Snowflake skips micro-partitions
+whose recorded min/max cannot contain your filter value, and anything that hides the column from
+that comparison defeats it.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Defeats pruning: the metadata knows l_shipdate, not YEAR(l_shipdate).
+SELECT COUNT(*) FROM snowflake_sample_data.tpch_sf100.lineitem
+WHERE  YEAR(l_shipdate) = 1995;
+
+-- Prunes: the comparison is against the stored column.
+SELECT COUNT(*) FROM snowflake_sample_data.tpch_sf100.lineitem
+WHERE  l_shipdate &gt;= '1995-01-01' AND l_shipdate &lt; '1996-01-01';</code></pre>
+
+<p>The same trap appears as <code>WHERE UPPER(status) = 'DONE'</code>, as
+<code>WHERE CAST(id AS STRING) = '42'</code>, and as any filter on a column that is a
+<code>VARIANT</code> path with an inconsistent type. In each case the fix is to move the
+transformation to the other side of the comparison, or to store the derived value as a real
+column.</p>
+
+<p>The second reason pruning fails is that the data is not ordered by the column you filter on. A
+table loaded daily prunes well on the load date and badly on customer id, because every partition
+contains a wide spread of customer ids. Nothing about the query is wrong; the physical layout does
+not suit the question. That is what clustering is for, and it is the last section here rather than
+the first for a reason.</p>
+
+<h2>2. Spilling</h2>
+
+<p>When an operation's working set exceeds the memory available, Snowflake spills to the node's
+local SSD, and if that fills, to remote object storage. Local spilling costs some time. Remote
+spilling is dramatically worse and is usually the explanation for a query that is far slower than
+its neighbours.</p>
+
+<p>Sorts, large joins, and <code>GROUP BY</code> on a high-cardinality key are the usual causes.
+Three fixes, in the order to try them:</p>
+
+<ul>
+<li><strong>Reduce what is being sorted or joined.</strong> Filter earlier, project fewer columns,
+aggregate before joining rather than after. This is free.</li>
+<li><strong>Remove a needless <code>ORDER BY</code>.</strong> Sorting a large intermediate result
+for no reason is common in queries that grew by accretion — the final ordering is the only one that
+matters.</li>
+<li><strong>Size up.</strong> A bigger warehouse has proportionally more memory. This is the case
+where sizing up genuinely is the answer, and the profile tells you so.</li>
+</ul>
+
+<h2>3. Exploding joins</h2>
+
+<p>A join whose output row count is much larger than either input is nearly always a mistake — a
+duplicated key on one side turning a one-to-many into a many-to-many. It is easy to miss because the
+query returns plausible-looking rows, just too many of them, and the aggregate over the top is
+quietly inflated.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Before blaming the warehouse, check the join key is unique where you
+-- assumed it was. Snowflake enforces nothing (lesson 5), so assume nothing.
+SELECT o_custkey, COUNT(*) AS n
+FROM   snowflake_sample_data.tpch_sf1.orders
+GROUP  BY o_custkey
+HAVING COUNT(*) &gt; 1
+LIMIT  10;</code></pre>
+
+<p>The Query Profile makes this obvious: the Join node shows rows in and rows out, and a large
+multiplier there is the whole story.</p>
+
+<h2>4. The caches</h2>
+
+<p>Before concluding a query is slow, check you are not comparing a cold run to a warm one. Lesson 2
+covered the three caches; the practical point when measuring is that a repeated identical query may
+be answered from the result cache and appear instantaneous, and a second run on a warm warehouse
+reads from local SSD rather than object storage.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Compare like with like while investigating, then put it back.
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;
+-- ... run the variants ...
+ALTER SESSION SET USE_CACHED_RESULT = TRUE;</code></pre>
+
+<h2>Rewrites that reliably help</h2>
+
+<p>Before touching infrastructure, a handful of query-level changes are worth trying because they
+cost nothing and frequently account for the whole problem.</p>
+
+<p><strong>Select fewer columns.</strong> Storage is columnar, so <code>SELECT *</code> on a
+sixty-column table reads sixty columns' worth of data to answer a question about three. This is the
+single highest-leverage change on a wide table, and it is the one most often left undone because
+<code>SELECT *</code> is what you typed while exploring.</p>
+
+<p><strong>Aggregate before joining.</strong> Joining two large tables and then grouping makes the
+join carry every row. Grouping each side first, then joining the much smaller results, does the same
+work on a fraction of the data — and it is usually the difference between spilling and not.</p>
+
+<p><strong>Filter inside the CTE, not after it.</strong> Snowflake's optimiser pushes predicates
+down in most cases, but not through every construct — a window function or a
+<code>DISTINCT</code> in the middle blocks it. Putting the filter where the data is first read
+removes any question.</p>
+
+<p><strong>Prefer <code>APPROX_COUNT_DISTINCT</code> when exactness is not required.</strong>
+An exact distinct count over a high-cardinality column is one of the most expensive things you can
+ask for, because it cannot be computed independently per partition. The approximate version is
+dramatically cheaper and accurate to within a small margin — for a dashboard tile showing "active
+users", that is the right trade.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Expensive: an exact distinct over millions of values.
+SELECT COUNT(DISTINCT l_orderkey) FROM snowflake_sample_data.tpch_sf100.lineitem;
+
+-- Approximate, and much cheaper. HyperLogLog under the hood.
+SELECT APPROX_COUNT_DISTINCT(l_orderkey) FROM snowflake_sample_data.tpch_sf100.lineitem;</code></pre>
+
+<p>There is also a whole class of "slow query" that is not slow at all — it is queued. If the
+profile shows most of the elapsed time in queuing rather than execution, the warehouse is saturated
+and the fix is concurrency, not the query. Lesson 4 covers that distinction.</p>
+
+<h2>5. Clustering — last, not first</h2>
+
+<p>A clustering key tells Snowflake to keep a table physically ordered by an expression, which makes
+pruning work on that expression. Snowflake maintains it continuously in the background, and
+<strong>that maintenance is serverless compute you pay for, indefinitely</strong>.</p>
+
+<p>So the bar is high. Clustering is worth it when all of the following hold: the table is large
+(hundreds of gigabytes at least), it is queried far more often than it is written, the queries
+consistently filter on the same column, and the profile shows that pruning is currently poor. If any
+one of those is false, it is a recurring cost buying very little.</p>
+
+<pre class="language-sql"><code class="language-sql">-- How well is the table currently clustered on this expression?
+SELECT SYSTEM$CLUSTERING_INFORMATION('my_db.my_schema.events', '(event_date)');
+-- average_overlaps and average_depth near 1 = well clustered.
+-- Large numbers = a filter on event_date will scan most partitions.
+
+ALTER TABLE my_db.my_schema.events CLUSTER BY (event_date);
+
+-- What has that cost since?
+SELECT table_name, SUM(credits_used) AS credits
+FROM   snowflake.account_usage.automatic_clustering_history
+WHERE  start_time &gt;= DATEADD('day', -30, CURRENT_TIMESTAMP())
+GROUP  BY table_name
+ORDER  BY credits DESC;
+
+ALTER TABLE my_db.my_schema.events DROP CLUSTERING KEY;</code></pre>
+
+<p>Two rules for choosing the expression. Put the column you filter on most first, and keep the key
+to one or two columns — more than that dilutes it. And prefer low-to-moderate cardinality: clustering
+on a truncated date works well, clustering on a unique id is close to useless because every partition
+ends up holding a narrow, unhelpful range.</p>
+
+<p>Before reaching for it, ask whether reloading the table in the right order would do. A one-off
+<code>CREATE TABLE … AS SELECT … ORDER BY</code> gives you the same physical layout with no ongoing
+cost, and for a table that is rebuilt nightly anyway it is strictly better.</p>
+
+<p>Next: <a href="/snowflake/snowflake-time-travel-and-cloning">Time Travel and cloning</a>.</p>

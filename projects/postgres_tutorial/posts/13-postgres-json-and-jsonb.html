@@ -1,0 +1,180 @@
+<p>Postgres has two JSON types. <code>json</code> stores the text you gave it, exactly, including
+whitespace and duplicate keys. <code>jsonb</code> parses it into a binary form: keys are sorted,
+duplicates dropped, whitespace gone — and it is the only one you can index usefully.</p>
+
+<p>Use <code>jsonb</code>. The only reason for <code>json</code> is needing the document back
+byte-for-byte as it arrived.</p>
+
+<h2>Getting values out</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT '{"guests": 4, "pets": true, "arrival": {"time": "15:00", "flight": "NZ102"}}'::jsonb AS doc,
+       '{"guests": 4}'::jsonb -> 'guests'       AS arrow,        -- 4      (jsonb)
+       '{"guests": 4}'::jsonb ->> 'guests'      AS double_arrow, -- "4"    (text)
+       '{"a": {"b": {"c": 1}}}'::jsonb #> '{a,b}'   AS path,
+       '{"a": {"b": {"c": 1}}}'::jsonb #>> '{a,b,c}' AS path_text;</code></pre>
+
+<table>
+  <thead><tr><th>Operator</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td><code>-&gt;</code></td><td>jsonb. Chainable: <code>doc -&gt; 'a' -&gt; 'b'</code></td></tr>
+    <tr><td><code>-&gt;&gt;</code></td><td>text. Always the last step, never chainable</td></tr>
+    <tr><td><code>#&gt;</code> / <code>#&gt;&gt;</code></td><td>The same two, by path</td></tr>
+  </tbody>
+</table>
+
+<p>The one-arrow versus two-arrow distinction is where the time goes. <code>-&gt;</code> on a
+number gives you jsonb, and comparing that to an SQL integer needs a cast; <code>-&gt;&gt;</code>
+gives text, and comparing <em>that</em> to a number needs a cast the other way. Decide at the end
+of the chain what type you actually want:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT ('{"guests": 4}'::jsonb ->> 'guests')::int > 2 AS more_than_two;</code></pre>
+
+<h2>Searching</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT '{"pets": true, "guests": 4}'::jsonb @> '{"pets": true}'::jsonb  AS contains,
+       '{"pets": true}'::jsonb ? 'pets'                                 AS has_key,
+       '{"a": 1, "b": 2}'::jsonb ?| array['b','z']                      AS has_any,
+       '{"a": 1, "b": 2}'::jsonb ?& array['a','b']                      AS has_all;</code></pre>
+
+<p><strong><code>@&gt;</code> is the important one.</strong> "Contains this structure", at any
+depth, and it is the operator a GIN index can answer. Reach for it rather than pulling a key out
+with <code>-&gt;&gt;</code> and comparing, because the second form cannot use the index.</p>
+
+<h2>Indexing</h2>
+
+<p>Without an index, every jsonb query reads every row and parses every document. There are two
+kinds worth knowing and they are not interchangeable.</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. the whole document, for @> and ? queries
+CREATE INDEX ix_outbox_payload ON outbox USING gin (payload);
+
+-- 2. smaller and faster, but ONLY supports @>
+CREATE INDEX ix_outbox_payload_ops ON outbox USING gin (payload jsonb_path_ops);
+
+-- 3. one key, as if it were a column — a plain b-tree
+CREATE INDEX ix_outbox_topic ON outbox ((payload ->> 'bookingId'));</code></pre>
+
+<p>The third is the one people miss. If you always query the same key, an expression index on that
+key is far smaller than a GIN index over the whole document and supports ranges and sorting, which
+GIN does not.</p>
+
+<p>The query has to match the index's shape exactly. An index on
+<code>(payload -&gt;&gt; 'bookingId')</code> is used by
+<code>WHERE payload -&gt;&gt; 'bookingId' = '42'</code> and not by
+<code>WHERE (payload -&gt;&gt; 'bookingId')::int = 42</code>, because the cast makes it a different
+expression.</p>
+
+<h2>What jsonb changes about your data on the way in</h2>
+
+<p>Because <code>jsonb</code> parses rather than stores text, a document does not come back the way
+it went in:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT '{"b": 1, "a": 2, "b": 3}'::json  AS as_json,
+       '{"b": 1, "a": 2, "b": 3}'::jsonb AS as_jsonb;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">         as_json          |     as_jsonb
+--------------------------+------------------
+ {"b": 1, "a": 2, "b": 3} | {"a": 2, "b": 3}</code></pre>
+
+<p>Keys sorted, whitespace normalised, and the duplicate <code>b</code> resolved to the last one.
+All three are usually improvements, and together they are why <code>jsonb</code> can be compared
+and indexed at all while <code>json</code> cannot.</p>
+
+<p>Numbers are the corner worth knowing. jsonb stores them as <code>numeric</code>, so a large
+integer keeps its precision — better than JavaScript manages — but trailing zeros are part of a
+numeric, so <code>1.10</code> is rendered back as <code>1.10</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT '{"x": 1.10}'::jsonb                            AS printed,
+       '{"x": 1.10}'::jsonb = '{"x": 1.1}'::jsonb      AS equal_as_jsonb,
+       '{"x": 1.10}'::jsonb::text = '{"x": 1.1}'::jsonb::text AS equal_as_text;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">   printed   | equal_as_jsonb | equal_as_text
+-------------+----------------+---------------
+ {"x": 1.10} | t              | f</code></pre>
+
+<p>The two documents are equal, and their texts are not. Compare jsonb as jsonb — casting to text
+to check whether something changed is a bug that only shows up on the rows where it matters.</p>
+
+<h2>Modifying a document</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT jsonb_set('{"guests": 4, "pets": true}'::jsonb, '{guests}', '6')          AS updated,
+       '{"guests": 4}'::jsonb || '{"pets": false}'::jsonb                        AS merged,
+       '{"guests": 4, "pets": true}'::jsonb - 'pets'                             AS key_removed,
+       jsonb_set('{"a": {}}'::jsonb, '{a,b}', '"new"', true)                     AS created;</code></pre>
+
+<p><code>jsonb_set</code>'s fourth argument decides whether a missing key is created; it defaults
+to true. Without it, setting a path that does not exist silently returns the document unchanged —
+no error, no new key.</p>
+
+<p>Every one of these returns a <em>new</em> document. Updating one key means rewriting the whole
+column, and therefore the whole row. On a large document updated often, that is the cost that
+makes jsonb the wrong choice.</p>
+
+<h2>Turning JSON into rows, and back</h2>
+
+<pre class="language-sql"><code class="language-sql">-- expand an array into rows
+SELECT value ->> 'name' AS guest, (value ->> 'age')::int AS age
+FROM   jsonb_array_elements('[{"name":"Ana","age":34},{"name":"Ben","age":9}]'::jsonb);
+
+-- build JSON from rows: a property and its bookings in one round trip
+SELECT jsonb_build_object(
+           'id',    p.id,
+           'title', p.title,
+           'stays', (SELECT jsonb_agg(jsonb_build_object('checkIn', b.check_in, 'total', b.total)
+                                      ORDER BY b.check_in)
+                     FROM   bookings b WHERE b.property_id = p.id AND b.check_in > DATE '2025-01-01')
+       ) AS document
+FROM   properties p
+WHERE  p.id = 42;</code></pre>
+
+<p>The second shape is worth knowing well. It replaces an N+1 query — fetch the parent, then loop
+fetching children — with one statement returning one document, assembled by the database.</p>
+
+<h2>jsonb_path_query</h2>
+
+<p>SQL/JSON path expressions, standardised in SQL:2016, for anything a chain of arrows gets
+unwieldy for:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT jsonb_path_query_array(
+           '{"guests":[{"name":"Ana","age":34},{"name":"Ben","age":9}]}'::jsonb,
+           '$.guests[*] ? (@.age >= 18).name') AS adults;</code></pre>
+
+<p><code>@@</code> tests a path predicate and is GIN-indexable, which makes it the right tool when
+a containment check is not expressive enough.</p>
+
+<h2>When jsonb is the wrong answer</h2>
+
+<p>This is the section that matters. jsonb is excellent for data that is genuinely
+document-shaped — a webhook payload, an audit record, per-tenant settings, an outbox message —
+where the shape varies and you mostly read the whole thing.</p>
+
+<p>The booking schema uses it in exactly one place: the <code>outbox</code> table's
+<code>payload</code>. That is the right sort of use. Every message on that table has a different
+shape depending on its topic, nothing joins to the inside of a payload, each row is written once
+and read once, and the alternative would be a column per field of every event type the system will
+ever publish. Everything else in that schema — prices, dates, statuses, guest counts — is a
+column, and none of it would be better as JSON.</p>
+
+<p>It is the wrong choice when any of these are true:</p>
+
+<ul>
+  <li><strong>Every row has the key.</strong> Then it is a column, and a column gets a type, a
+      NOT NULL, a check constraint, a default and a cheap b-tree index. jsonb gives you none of
+      those.</li>
+  <li><strong>You join on it, or sort by it, or aggregate it.</strong> Every one of those needs a
+      cast per row unless you have built exactly the right expression index.</li>
+  <li><strong>It has a foreign key in it.</strong> A <code>propertyId</code> inside a document
+      references nothing. Nothing stops it pointing at a property that no longer exists.</li>
+  <li><strong>It is updated frequently.</strong> Every change rewrites the whole document.</li>
+</ul>
+
+<p>The middle path is the one most schemas should take: promote the keys you query to real columns,
+keep the rest in a jsonb column beside them. Postgres 12 makes that cheap, because a generated
+column can extract the key and stay in step automatically:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE outbox
+    ADD COLUMN booking_id bigint
+    GENERATED ALWAYS AS ((payload ->> 'bookingId')::bigint) STORED;</code></pre>
+
+<p>Now it is an ordinary column — indexable, sortable, and typed — computed from the document you
+already store, with no application code to keep them agreeing.</p>

@@ -1,0 +1,212 @@
+<p>Most of your schema decisions are cheap to change. A handful are not: the type of a column with
+a hundred million rows in it, and anything that has already been wrong for six months. This post is
+about that handful.</p>
+
+<h2>Text</h2>
+
+<p>Postgres has three string types and you should use one of them.</p>
+
+<table>
+  <thead><tr><th>Type</th><th>Use it</th></tr></thead>
+  <tbody>
+    <tr><td><code>text</code></td><td>Almost always. No length limit, no cost for that.</td></tr>
+    <tr><td><code>varchar(n)</code></td><td>When the limit is a real business rule — a
+        three-letter currency code.</td></tr>
+    <tr><td><code>char(n)</code></td><td>Never.</td></tr>
+  </tbody>
+</table>
+
+<p>The three are the same type underneath, with a length check bolted on. There is no performance
+difference between <code>text</code> and <code>varchar(50)</code> — including on storage, since
+Postgres stores the actual length either way:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT pg_column_size('hello'::text)        AS text,
+       pg_column_size('hello'::varchar(50)) AS varchar,
+       pg_column_size('hello'::char(50))    AS char;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext"> text | varchar | char
+------+---------+------
+    9 |       9 |   54</code></pre>
+
+<p><code>char(n)</code> pads with spaces to the full width, forever. That is the whole reason for
+the "never".</p>
+
+<p>Raising a <code>varchar</code> limit is instant; lowering it rewrites the table. So a limit you
+picked defensively is a limit you will have to schedule a maintenance window to relax. Prefer
+<code>text</code> and a <code>CHECK</code> constraint if you want a rule you can change.</p>
+
+<h2>Numbers, and the one that must never be a float</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT 0.1::float8 + 0.2::float8 AS as_float,
+       0.1::numeric + 0.2::numeric AS as_numeric,
+       (0.1::float8 + 0.2::float8) = 0.3 AS float_equals_point_three;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">      as_float       | as_numeric | float_equals_point_three
+---------------------+------------+--------------------------
+ 0.30000000000000004 |        0.3 | f</code></pre>
+
+<p>That is not a Postgres quirk, it is binary floating point, and it is why every money column in
+the booking schema this track uses is <code>numeric(10,2)</code>. Sum a million of those floats and
+the total is wrong by an amount an accountant will find.</p>
+
+<table>
+  <thead><tr><th>Type</th><th>For</th></tr></thead>
+  <tbody>
+    <tr><td><code>integer</code></td><td>Counts, quantities. ±2.1 billion.</td></tr>
+    <tr><td><code>bigint</code></td><td>Primary keys. See below.</td></tr>
+    <tr><td><code>numeric(p,s)</code></td><td>Money, and anything where the decimal representation
+        is the truth. Exact, slower, unlimited size.</td></tr>
+    <tr><td><code>double precision</code></td><td>Measurements and scientific values, where you
+        already accept approximation.</td></tr>
+  </tbody>
+</table>
+
+<p>Make primary keys <code>bigint</code> from the start. An <code>integer</code> key runs out at
+2,147,483,647, which sounds distant until a table of events reaches it, and widening the column on
+a live table is a rewrite plus every foreign key that references it. The extra four bytes are the
+cheapest insurance in this post.</p>
+
+<h2>Time</h2>
+
+<p>There are two timestamp types and one of them is right nearly every time.</p>
+
+<pre class="language-sql"><code class="language-sql">SET timezone = 'Pacific/Auckland';
+SELECT now()::timestamptz AS with_zone,
+       now()::timestamp   AS without_zone;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">           with_zone           |        without_zone
+-------------------------------+----------------------------
+ 2026-08-23 17:47:58.344067+12 | 2026-08-23 17:47:58.344067</code></pre>
+
+<p><strong><code>timestamptz</code> does not store a timezone.</strong> It stores an absolute
+moment in UTC, and renders it in the session's timezone on the way out. That is exactly what you
+want for "when did this happen": one unambiguous instant, displayed correctly for whoever is
+looking.</p>
+
+<p><code>timestamp</code> stores the digits you gave it with no idea what they mean. Two servers in
+different regions will disagree about what it represents, and neither will tell you.</p>
+
+<p>Use <code>timestamptz</code> for events. Use <code>date</code> for a calendar day that is not a
+moment — a check-in date is the 4th of March whatever timezone you read it in, which is why the
+booking table stores dates rather than timestamps:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT check_in, check_out, check_out - check_in AS nights
+FROM   bookings LIMIT 3;</code></pre>
+
+<p>Subtracting two <code>date</code> values gives an integer number of days. Subtracting two
+timestamps gives an <code>interval</code>, which is a different and occasionally surprising
+animal — an interval of one month has no fixed length until it is added to a date.</p>
+
+<h2>Identifiers</h2>
+
+<p>The booking schema carries both an integer primary key and a UUID on every table, and that is
+deliberate rather than indecisive:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, public_id FROM properties LIMIT 2;</code></pre>
+
+<ul>
+  <li><code>id bigint</code> — the key. Small, sequential, and a b-tree index on it stays compact
+      because new rows land at the end.</li>
+  <li><code>public_id uuid</code> — what appears in a URL. It leaks no count and cannot be guessed
+      by adding one.</li>
+</ul>
+
+<p>Making a random UUID the primary key costs more than it looks. It is 16 bytes rather than 8 in
+every index and every foreign key, and because the values are random each insert lands in a
+different page of the index. In the lab database the UUID index on bookings is 16 MB against
+3968 kB for the index on the integer <code>property_id</code>.</p>
+
+<h2>Booleans, enums and the choice StayHub made</h2>
+
+<p>Postgres has a real <code>boolean</code>, and a real <code>ENUM</code> type. The booking schema
+uses the boolean and refuses the enum, storing statuses as <code>varchar(20)</code> instead:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT DISTINCT status FROM bookings ORDER BY 1;
+-- CANCELLED, COMPLETED, CONFIRMED, PENDING</code></pre>
+
+<p>The reasoning is worth borrowing. A native <code>ENUM</code> gives you validation, but adding a
+value needs <code>ALTER TYPE</code>, removing one is close to impossible, and reordering is
+impossible. A <code>varchar</code> plus a <code>CHECK</code> constraint gives you the same
+validation and an ordinary migration when the list changes — and the list always changes.</p>
+
+<h2>Types you will be glad exist</h2>
+
+<table>
+  <thead><tr><th>Type</th><th>What it is for</th></tr></thead>
+  <tbody>
+    <tr><td><code>jsonb</code></td><td>Structured data you query but do not want columns for.
+        Has its own post later.</td></tr>
+    <tr><td><code>text[]</code></td><td>A small list belonging to one row. Not a substitute for a
+        join table — you cannot put a foreign key on an array element.</td></tr>
+    <tr><td><code>daterange</code>, <code>tstzrange</code></td><td>A span with real operators:
+        overlap, containment. The booking table uses one to make double-booking impossible.</td></tr>
+    <tr><td><code>inet</code>, <code>cidr</code></td><td>Addresses and networks, with containment
+        operators. Better than text for an audit log.</td></tr>
+  </tbody>
+</table>
+
+<h2>NULL is not the empty string</h2>
+
+<p>Postgres keeps these firmly apart, and if you are arriving from Oracle — where an empty string
+<em>is</em> NULL — this is the difference that will bite first:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT ''  IS NULL       AS empty_is_null,      -- false
+       '' = NULL         AS empty_equals_null,  -- null, not false
+       NULL IS NOT DISTINCT FROM NULL AS null_matches_null;</code></pre>
+
+<p>Nothing equals NULL, including NULL, because <code>=</code> asks a question about two values and
+NULL is the absence of one. Comparisons return NULL rather than false, and a <code>WHERE</code>
+clause keeps only rows that are true — so <code>WHERE status &lt;&gt; 'CANCELLED'</code> silently
+drops every row whose status is NULL. Use <code>IS NULL</code>, or
+<code>IS DISTINCT FROM</code> when you want NULL treated as an ordinary value.</p>
+
+<p>Decide per column which one means what, then make it impossible to get the other:
+<code>NOT NULL</code> plus a default, or <code>CHECK (name &lt;&gt; '')</code>. A column that
+allows both has two spellings of "nothing", and every query has to handle both forever.</p>
+
+<h2>Changing a type later</h2>
+
+<p>The reason this post exists. <code>ALTER TABLE ... ALTER COLUMN ... TYPE</code> takes an
+<code>ACCESS EXCLUSIVE</code> lock, and whether that lock is held for a millisecond or an hour
+depends entirely on whether the new type needs the rows rewritten:</p>
+
+<table>
+  <thead><tr><th>Change</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td><code>varchar(50)</code> → <code>varchar(200)</code> or <code>text</code></td>
+        <td>Instant. Metadata only.</td></tr>
+    <tr><td><code>varchar(200)</code> → <code>varchar(50)</code></td>
+        <td>Full rewrite — every row has to be re-checked.</td></tr>
+    <tr><td><code>integer</code> → <code>bigint</code></td>
+        <td>Full rewrite, plus every index and every referencing foreign key.</td></tr>
+    <tr><td><code>numeric(10,2)</code> → <code>numeric(12,2)</code></td>
+        <td>Instant, as long as the scale is unchanged.</td></tr>
+    <tr><td>Anything → <code>jsonb</code></td><td>Full rewrite.</td></tr>
+  </tbody>
+</table>
+
+<p>A rewrite on a 400,000-row table is a few seconds. On a table with two hundred million rows it
+is an outage, because the exclusive lock blocks every read as well as every write. The migrations
+post covers how to do it in steps instead; the cheaper habit is to pick <code>bigint</code> and
+<code>text</code> now.</p>
+
+<h2>Mapping to your language</h2>
+
+<table>
+  <thead><tr><th>Postgres</th><th>Python</th><th>Java</th></tr></thead>
+  <tbody>
+    <tr><td><code>text</code></td><td><code>str</code></td><td><code>String</code></td></tr>
+    <tr><td><code>bigint</code></td><td><code>int</code></td><td><code>Long</code></td></tr>
+    <tr><td><code>numeric</code></td><td><code>decimal.Decimal</code></td><td><code>BigDecimal</code></td></tr>
+    <tr><td><code>boolean</code></td><td><code>bool</code></td><td><code>Boolean</code></td></tr>
+    <tr><td><code>date</code></td><td><code>datetime.date</code></td><td><code>LocalDate</code></td></tr>
+    <tr><td><code>timestamptz</code></td><td><code>datetime</code> (aware)</td><td><code>OffsetDateTime</code></td></tr>
+    <tr><td><code>uuid</code></td><td><code>uuid.UUID</code></td><td><code>UUID</code></td></tr>
+    <tr><td><code>jsonb</code></td><td><code>dict</code> / <code>list</code></td><td><code>JsonNode</code></td></tr>
+  </tbody>
+</table>
+
+<p>The row worth checking in your own code is <code>numeric</code>. A driver that hands you a
+<code>float</code> for a money column has undone the reason you chose the type — in Python that
+means confirming you get <code>Decimal</code>, and in Java that nobody has mapped the column to
+<code>double</code>.</p>

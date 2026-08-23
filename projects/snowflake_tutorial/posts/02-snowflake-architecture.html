@@ -1,0 +1,187 @@
+<p>Snowflake is three layers, and almost every question you will have later — why is this query slow,
+why did that cost so much, why is there no index — resolves at one of them. They are worth twenty
+minutes now because the rest of the track assumes them.</p>
+
+<h2>The three layers</h2>
+
+<table>
+<tr><th>Layer</th><th>What it is</th><th>What it does</th><th>Billed as</th></tr>
+<tr><td>Database storage</td><td>Cloud object storage — S3, Azure Blob or GCS</td><td>Holds every
+table as compressed, immutable files</td><td>Terabytes per month</td></tr>
+<tr><td>Query processing</td><td>Virtual warehouses — clusters of compute nodes</td><td>Runs your
+queries</td><td>Credits per second running</td></tr>
+<tr><td>Cloud services</td><td>Snowflake's own always-on services</td><td>Authentication, metadata,
+query planning, transactions, caching</td><td>Usually free</td></tr>
+</table>
+
+<p>The important word in that table is <strong>immutable</strong>. Everything else follows from it.</p>
+
+<h2>Storage: micro-partitions instead of indexes</h2>
+
+<p>When you load data, Snowflake does not append rows to a file. It writes new files, each holding
+somewhere in the region of 50–500 MB of uncompressed data, stored in columnar form and compressed.
+These are <strong>micro-partitions</strong>, and you never create, name, or manage one. There is no
+DDL for them.</p>
+
+<p>For every micro-partition, the services layer records metadata: for each column, the minimum and
+maximum value, the number of distinct values, the count of nulls. That metadata is the reason there
+are no indexes. When a query says <code>WHERE o_orderdate = '1996-03-13'</code>, Snowflake reads the
+min/max for <code>o_orderdate</code> in every micro-partition and skips the ones whose range cannot
+contain that date. It never opens them.</p>
+
+<p>This is called <strong>pruning</strong>, and it is the single most important performance concept
+in Snowflake. A well-pruned query on a billion-row table might touch a handful of partitions. A
+badly-pruned one reads all of them, and no amount of extra compute makes that cheap.</p>
+
+<p>Two consequences worth internalising now:</p>
+
+<ul>
+<li><strong>Pruning works on the natural ordering of the data as loaded.</strong> If you load
+orders daily, the date column is naturally clustered — each day's partitions hold a narrow date
+range, so date filters prune beautifully. A column that was random at load time prunes badly no
+matter how selective the filter looks.</li>
+<li><strong>Wrapping a column in a function usually defeats it.</strong>
+<code>WHERE YEAR(o_orderdate) = 1996</code> asks about a computed value the metadata knows nothing
+about. <code>WHERE o_orderdate &gt;= '1996-01-01' AND o_orderdate &lt; '1997-01-01'</code> asks the
+same question in terms the min/max can answer.</li>
+</ul>
+
+<p>Some questions are answered from metadata alone, without any compute at all:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Answered from metadata. Returns instantly, even on a suspended warehouse.
+SELECT COUNT(*) FROM snowflake_sample_data.tpch_sf100.lineitem;
+
+-- Also metadata-only: MIN and MAX of a column are already recorded.
+SELECT MIN(l_shipdate), MAX(l_shipdate)
+FROM   snowflake_sample_data.tpch_sf100.lineitem;
+
+-- NOT metadata-only. An average has to be computed, so this scans.
+SELECT AVG(l_quantity) FROM snowflake_sample_data.tpch_sf100.lineitem;</code></pre>
+
+<p>Because files are immutable, an <code>UPDATE</code> does not edit anything. Snowflake writes new
+micro-partitions containing the changed rows and marks the old ones as no longer part of the current
+table. The old files stay on disk for the table's retention window — which is what makes Time Travel
+in lesson 12 possible, and also what makes a large <code>UPDATE</code> more expensive than it looks:
+touching one column in a partition rewrites the whole partition.</p>
+
+<h2>Seeing pruning happen</h2>
+
+<p>Pruning is not folklore — Snowflake reports it. Run a filtered query against a large table and
+look at what it actually read:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT SUM(l_extendedprice)
+FROM   snowflake_sample_data.tpch_sf100.lineitem
+WHERE  l_shipdate BETWEEN '1995-01-01' AND '1995-01-31';
+
+-- Then read what that query touched.
+SELECT query_text,
+       partitions_scanned,
+       partitions_total,
+       ROUND(100 * partitions_scanned / NULLIF(partitions_total, 0), 1) AS pct_scanned,
+       bytes_scanned
+FROM   TABLE(information_schema.query_history())
+WHERE  query_text ILIKE '%l_shipdate BETWEEN%'
+ORDER  BY start_time DESC
+LIMIT  1;</code></pre>
+
+<p><code>partitions_scanned</code> against <code>partitions_total</code> is the number that
+matters. TPC-H data is generated in ship-date order, so a one-month filter over seven years of data
+opens a small fraction of the partitions. Rewrite the same filter as
+<code>WHERE MONTH(l_shipdate) = 1 AND YEAR(l_shipdate) = 1995</code> and the ratio goes to 100% —
+same rows returned, every partition opened, because the metadata cannot answer a question about a
+function's output.</p>
+
+<p>That comparison is the whole of query tuning in Snowflake, and lesson 11 is mostly variations on
+it.</p>
+
+<h2>Compute: warehouses that share nothing</h2>
+
+<p>A virtual warehouse is a cluster of compute nodes that Snowflake provisions for you. It has a
+size, it can be running or suspended, and it holds no permanent data — when it starts, it starts
+empty and reads what it needs from storage.</p>
+
+<p>That is why several warehouses can query the same table at the same time without contention.
+They are not sharing a machine and not taking locks against each other; they are separate compute
+reading the same immutable files. Ten analysts on one warehouse queue behind each other. Ten
+analysts on ten warehouses do not.</p>
+
+<p>Each warehouse does keep a local SSD cache of the micro-partitions it has read. This is the
+<em>warehouse cache</em>, and it is why the second run of a similar query on the same warehouse is
+usually quicker — the data is already local. Suspending the warehouse drops that cache, which is a
+genuine trade-off against the credits saved. Lesson 4 covers where the line sits.</p>
+
+<h2>Cloud services: the part you never see</h2>
+
+<p>The services layer is a permanently-running set of Snowflake-managed services shared across
+accounts. It authenticates you, holds all the metadata described above, compiles and optimises every
+query, manages transactions, and enforces access control.</p>
+
+<p>It is also where two of the three caches live, and where a class of query gets answered without
+ever waking a warehouse. Cloud services usage is billed, but only the portion exceeding 10% of your
+daily compute credits — in normal use that threshold is not reached, so treat it as free and stop
+thinking about it unless you are issuing enormous numbers of trivial metadata queries.</p>
+
+<h2>The three caches</h2>
+
+<p>People conflate these constantly, and they behave very differently.</p>
+
+<table>
+<tr><th>Cache</th><th>Lives in</th><th>Holds</th><th>Survives warehouse suspend?</th><th>Costs
+credits?</th></tr>
+<tr><td>Result cache</td><td>Cloud services</td><td>The full result of a previous
+query</td><td>Yes</td><td>No</td></tr>
+<tr><td>Metadata cache</td><td>Cloud services</td><td>Min/max, counts, distincts per
+partition</td><td>Yes</td><td>No</td></tr>
+<tr><td>Warehouse cache</td><td>The warehouse's local SSD</td><td>Micro-partitions recently
+read</td><td><strong>No</strong></td><td>Yes, the warehouse is running</td></tr>
+</table>
+
+<p>The <strong>result cache</strong> is the striking one. If anyone in the account runs a query
+whose text matches one run in the last 24 hours, and the underlying data has not changed, and the
+role has the right privileges, Snowflake returns the stored result. No warehouse runs. No credits
+are consumed. A dashboard hitting the same query all morning is nearly free after the first hit.</p>
+
+<p>The conditions are strict, though, and it is easy to defeat by accident:</p>
+
+<ul>
+<li>The query text must match, including whitespace and case.</li>
+<li>Any change to the underlying tables invalidates it.</li>
+<li>Non-deterministic functions disqualify it — <code>CURRENT_TIMESTAMP()</code>,
+<code>RANDOM()</code>. A dashboard that stamps every query with "now" never hits the cache.</li>
+</ul>
+
+<p>You can check whether a query hit it, and you can turn it off when you are deliberately
+measuring something:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Did the last query hit the result cache?
+SELECT query_text, warehouse_name, bytes_scanned, execution_status
+FROM   TABLE(information_schema.query_history())
+ORDER  BY start_time DESC
+LIMIT  5;
+
+-- A result-cache hit shows no warehouse and zero bytes scanned.
+-- To force real execution while testing:
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;</code></pre>
+
+<p>Leave <code>USE_CACHED_RESULT</code> alone outside of testing. It is switched off per session,
+and forgetting to switch it back is a quiet way to pay for work you already did.</p>
+
+<h2>How a query actually flows</h2>
+
+<ol>
+<li>The client sends SQL to cloud services, which authenticates and parses it.</li>
+<li>If the result cache can answer it, it does, and nothing else happens.</li>
+<li>Otherwise the optimiser plans the query, using partition metadata to decide what can be
+skipped.</li>
+<li>The warehouse resumes if suspended, then reads the surviving micro-partitions — from its local
+cache where possible, from object storage where not.</li>
+<li>Nodes process their share in parallel; results are combined and returned, and the result is
+stored in the result cache.</li>
+</ol>
+
+<p>When lesson 11 opens the Query Profile, those steps are the boxes you will be reading. And the
+first question about any slow query is always the same one: how many partitions did it scan out of
+how many, and did it need to?</p>
+
+<p>Next: <a href="/snowflake/snowflake-getting-started">getting an account and connecting to
+it</a>.</p>

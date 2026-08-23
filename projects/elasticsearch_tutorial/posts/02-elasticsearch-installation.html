@@ -1,0 +1,377 @@
+<p>Installing Elasticsearch is five minutes of work and one surprise. The surprise is that
+<strong>security has been on by default since 8.0</strong>, so every tutorial written before 2022
+&mdash; including the one this post replaces &mdash; hands you a <code>docker run</code> that now
+answers <code>401 missing authentication credentials</code>, or refuses to talk plain HTTP at all.</p>
+
+<p>This lesson gets you a cluster you can develop against, then shows the secured version beside it
+so the difference is obvious rather than mysterious.</p>
+
+<h2>What changed in 8.0</h2>
+
+<p>Start a stock 8.x container with no configuration and it will, on first boot, generate a
+password for the built-in <code>elastic</code> user, generate a CA and a certificate, enable TLS on
+the HTTP layer, and print an enrollment token for Kibana. The endpoint is
+<code>https://localhost:9200</code>, not <code>http</code>, and an unauthenticated request is
+refused.</p>
+
+<p>That is the correct default and it is a bad first hour. You end up debugging certificate trust
+before you have indexed a document. So the usual approach &mdash; and the one this track takes
+&mdash; is to turn security off for local development, deliberately and visibly, and turn it back
+on as a separate exercise once search itself makes sense. Lesson 18 does that properly.</p>
+
+<h2>Docker Compose, with the settings that matter</h2>
+
+<p>Use Compose rather than <code>docker run</code>, because you will want the flags again tomorrow
+and a shell history is not a configuration. This is the service the whole track runs against:</p>
+
+<pre class="language-yaml"><code class="language-yaml">  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: stayhub-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      path.repo: "/usr/share/elasticsearch/snapshots"
+    ports:
+      - "9200:9200"
+    volumes:
+      - stayhub-esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20</code></pre>
+
+<p>Every line there is doing something.</p>
+
+<p><strong><code>discovery.type: single-node</code></strong> tells Elasticsearch not to look for
+peers and not to hold an election. Without it a single container waits for a quorum that will never
+arrive and logs <em>"master not discovered yet"</em> every ten seconds while refusing every
+request.</p>
+
+<p><strong><code>ES_JAVA_OPTS: "-Xms512m -Xmx512m"</code></strong> pins the JVM heap. Min and max
+are set to the same value on purpose &mdash; a growing heap means the JVM spends time resizing and
+the operating system may hand out memory it later wants back. The default is a quarter of the
+machine's RAM, which on a laptop running four other containers is more than you want to give it.</p>
+
+<p><strong><code>path.repo</code></strong> is the allow-list of directories snapshots may be
+written to. It is read at startup <em>only</em>, so adding a backup location later means a restart.
+Lesson 17.</p>
+
+<p><strong>The named volume</strong> is what makes the data survive
+<code>docker compose down</code>. Without it every restart is an empty cluster, which is briefly
+convenient and then very annoying.</p>
+
+<p><strong>The healthcheck</strong> matters more than it looks. Elasticsearch takes ten to thirty
+seconds to become ready, and anything that depends on it &mdash; a seed script, your API, a CI job
+&mdash; will otherwise fail on a connection refused that has nothing wrong with it.</p>
+
+<h2>Checking it is alive</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose up -d elasticsearch
+curl -s localhost:9200 | head -12</code></pre>
+
+<p>A working cluster answers with its own description, and the two version numbers are worth
+reading rather than skipping:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "name" : "afb55bfad1a7",
+  "cluster_name" : "docker-cluster",
+  "version" : {
+    "number" : "8.15.3",
+    "lucene_version" : "9.11.1"
+  },
+  "tagline" : "You Know, for Search"
+}</code></pre>
+
+<p>Then health, which is the request you will type most often:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cluster/health?pretty"
+curl -s "localhost:9200/_cat/health?v"
+curl -s "localhost:9200/_cat/indices?v"</code></pre>
+
+<p>The <code>_cat</code> family returns aligned columns instead of JSON, which is why it is what
+people actually type at a terminal. <code>?v</code> adds the header row. Lesson 16 covers the rest
+of the family.</p>
+
+<p>On a fresh single-node cluster with no indexes, health is <code>green</code>. Add an index that
+asks for a replica and it drops to <code>yellow</code> and stays there &mdash; a replica may never
+share a node with its primary, so on one node it can never be assigned. That is arithmetic, not a
+fault.</p>
+
+<h2>Running it with security on</h2>
+
+<p>Rather than switching the development cluster back and forth, run a second one beside it. The
+same image, a different port, security enabled:</p>
+
+<pre class="language-yaml"><code class="language-yaml">  elasticsearch-secure:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: stayhub-elasticsearch-secure
+    profiles: ["secure"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "true"
+      ELASTIC_PASSWORD: stayhub-elastic
+      xpack.security.http.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9201:9200"</code></pre>
+
+<p><code>ELASTIC_PASSWORD</code> sets the built-in superuser's password at first start, which saves
+you fishing it out of the startup log or running
+<code>bin/elasticsearch-reset-password</code>. <code>profiles: ["secure"]</code> means the service
+only starts when you ask for it:</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose --profile secure up -d elasticsearch-secure
+
+curl -s localhost:9201/_cluster/health
+# {"error":{"type":"security_exception","reason":"missing authentication credentials..."}}
+
+curl -s -u elastic:stayhub-elastic localhost:9201/_cluster/health
+# {"cluster_name":"docker-cluster","status":"green", ...}</code></pre>
+
+<p>Note what is <em>not</em> here: <code>xpack.security.http.ssl.enabled</code> is
+<code>false</code>, so this is authentication over plain HTTP. That is a teaching shortcut and not
+a production configuration &mdash; basic auth over HTTP puts the password in every request in the
+clear, and an API key is a bearer token, so it is no better. Real deployments enable HTTP TLS and
+give the client the CA certificate. Roles and API keys work identically either way, which is why
+they are worth learning apart from the certificate work. Lesson 18.</p>
+
+<p>One thing to know now: <strong>the <code>elastic</code> user is a bootstrap credential, not a
+runtime one.</strong> Anything holding it can delete every index in the cluster. Your application
+should get an API key scoped to the one index it uses.</p>
+
+<h3>What the untouched 8.x default actually does</h3>
+
+<p>The configuration above skips a flow you will meet eventually, so it is worth knowing what it
+skipped. Start the image with no security settings at all and the first boot prints a block like
+this, once, into the container log:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">-> Password for the elastic user: kJ2*fQ7wRt+xZm0pLn9v
+-> HTTP CA certificate SHA-256 fingerprint:
+   a1b2c3...9f
+-> Configure Kibana to use this cluster:
+   eyJ2ZXIiOiI4LjE1LjMiLCJhZHIiOlsiMTcyLjE4...</code></pre>
+
+<p>Three separate things, and they are easy to confuse. The <strong>password</strong> is for the
+<code>elastic</code> superuser. The <strong>fingerprint</strong> is how a client verifies the
+self-signed CA the cluster just generated for itself. The long base64 blob is an
+<strong>enrollment token</strong>, which is a short-lived credential that lets Kibana or a second
+node join without you copying certificates by hand.</p>
+
+<p>If you miss that block &mdash; and you will, because it scrolls past &mdash; both are
+recoverable from inside the container:</p>
+
+<pre class="language-bash"><code class="language-bash">docker exec -it es bin/elasticsearch-reset-password -u elastic
+docker exec -it es bin/elasticsearch-create-enrollment-token -s kibana</code></pre>
+
+<p>Connecting to that cluster from Python then needs the certificate as well as the password, and
+this is the shape to copy:</p>
+
+<pre class="language-python"><code class="language-python">Elasticsearch(
+    "https://localhost:9200",
+    basic_auth=("elastic", password),
+    # Either the CA file copied out of the container...
+    ca_certs="./http_ca.crt",
+    # ...or the fingerprint printed at first boot, which needs no file at all.
+    # ssl_assert_fingerprint="a1b2c3...9f",
+)</code></pre>
+
+<p>What you must not do is reach for <code>verify_certs=False</code>. It makes the error go away
+and it turns TLS into decoration &mdash; an encrypted channel to whoever answered, which is exactly
+what a certificate exists to prevent. It appears in a great many blog posts. Copy
+<code>http_ca.crt</code> out of the container instead:
+<code>docker cp es:/usr/share/elasticsearch/config/certs/http_ca.crt .</code></p>
+
+<h2>Connecting from Python</h2>
+
+<pre class="language-bash"><code class="language-bash">pip install "elasticsearch==8.15.1"</code></pre>
+
+<p>Pin the client to your server's major version. The 8.x client refuses to talk to a 7.x cluster
+by design, and the failure is a clear error rather than a subtle one &mdash; but a 9.x client
+against 8.15 will surprise you eventually.</p>
+
+<p>Build the client once per process. It owns a connection pool, so constructing one per request
+means a new pool per request:</p>
+
+<pre class="language-python"><code class="language-python">@lru_cache
+def get_es() -&gt; Elasticsearch:
+    """One client, reused. It holds a connection pool, so building a new one per request would
+    open a new pool per request."""
+    return Elasticsearch(
+        settings.elasticsearch_url,
+        request_timeout=5,
+        retry_on_timeout=True,
+        max_retries=2,
+        **_auth(),
+    )</code></pre>
+
+<p><code>request_timeout=5</code> is the line to argue about, and the argument is worth having
+early. The client's default is ten seconds and no application should use it. A search that hangs
+must not hang your API &mdash; better a fast failure the route can turn into "search is temporarily
+unavailable" than a request that occupies a worker for ten seconds while the queue behind it grows.
+Pick a number your users would accept waiting, not a number Elasticsearch would like.</p>
+
+<h3>Credentials, or the absence of them</h3>
+
+<p>The credential handling has one trap in it worth stating plainly:</p>
+
+<pre class="language-python"><code class="language-python">def _auth() -&gt; dict:
+    if settings.elasticsearch_api_key:
+        return {"api_key": settings.elasticsearch_api_key}
+    if settings.elasticsearch_username and settings.elasticsearch_password:
+        return {"basic_auth": (settings.elasticsearch_username, settings.elasticsearch_password)}
+    return {}</code></pre>
+
+<p>Sending credentials to a cluster running with <code>xpack.security.enabled: false</code> is not
+a harmless no-op. It returns <code>401 missing authentication credentials</code> &mdash; on a
+cluster that has no authentication at all. That error message sends people looking for a wrong
+password that does not exist. So: send nothing unless something is configured.</p>
+
+<p>Also note that <code>api_key</code> and <code>basic_auth</code> are mutually exclusive. Passing
+both raises <code>ValueError</code> at construction time, which is a crash on the first search
+rather than a warning at startup.</p>
+
+<h2>A first document</h2>
+
+<p>The smoke test, worth running before you build anything on top:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XPOST "localhost:9200/hello/_doc/1?refresh=true" \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "Cedar Cabin with Mountain Views", "city": "Big Bear Lake"}'
+
+curl -s "localhost:9200/hello/_search?q=cabin&pretty"
+
+curl -XDELETE localhost:9200/hello</code></pre>
+
+<p>Two things happened without you asking. The index <code>hello</code> was created on first write,
+and its mapping was <em>inferred</em> from that one document. Both are conveniences that become
+problems at exactly the wrong moment, which is what lesson 3 is about.</p>
+
+<p><code>?refresh=true</code> is there because Elasticsearch is near-real-time: without it, the
+search a moment later can legitimately return nothing. Never use it in application code &mdash;
+lesson 7 explains what it costs.</p>
+
+<h2>Kibana, and whether you need it</h2>
+
+<p>Kibana is the web UI: dashboards, index management, and &mdash; the part that is actually useful
+while learning &mdash; the Dev Tools console, which is a query editor with autocomplete against
+your own mappings.</p>
+
+<pre class="language-yaml"><code class="language-yaml">  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy</code></pre>
+
+<p>Two details there are the ones people get wrong. The host is
+<code>http://elasticsearch:9200</code> &mdash; the <em>service name</em> and the container's own
+port, because Kibana is talking over the Compose network, not through your machine. Writing
+<code>localhost:9200</code> there points Kibana at itself. And <code>condition:
+service_healthy</code> is why the healthcheck earlier was worth writing: Kibana started before
+Elasticsearch is ready will retry for a while and then give up.</p>
+
+<p>With security on, Kibana also needs credentials, and specifically <strong>not</strong> the
+<code>elastic</code> user &mdash; there is a dedicated <code>kibana_system</code> account for it,
+whose password you set the same way you reset any other.</p>
+
+<p>Whether you want it is a real question. Dev Tools is genuinely pleasant, and it is roughly half
+a gigabyte of RAM to have an editor. This track does not use it: every example here is a
+<code>curl</code> or a Python call, because that is what your application will be doing, and
+because a query you can only build by clicking is a query you cannot put in a code review.</p>
+
+<h2>What runs in production is not this</h2>
+
+<p>Compose is right for development and wrong for production, and it is worth knowing the three
+real options before you build habits around the wrong one.</p>
+
+<p><strong>Elastic Cloud</strong> is the managed service from the people who write it. You get the
+newest versions the day they ship, the commercial features, and someone else's pager. It is the
+default answer unless you have a reason.</p>
+
+<p><strong>Amazon OpenSearch Service</strong> is AWS's managed fork. If the rest of your
+infrastructure is in AWS, the IAM integration and the VPC story are worth a lot. The cost is that
+OpenSearch forked from Elasticsearch 7.10, so newer Elasticsearch features are not there and the
+clients are different packages. Everything up to lesson 14 in this track works unchanged; the
+operational lessons mostly do too, with different names.</p>
+
+<p><strong>Self-managed</strong> means you own the JVM tuning, the rolling upgrades, the snapshot
+repository, the certificate rotation and the capacity planning. It is entirely doable and it is a
+part-time job. Choose it when you have a compliance reason or a scale where the managed bill stops
+being reasonable, not to save money on a small cluster.</p>
+
+<p>In all three cases the thing that actually changes is the URL and the credentials. Which is why
+both belong in configuration rather than in code:</p>
+
+<pre class="language-python"><code class="language-python">    elasticsearch_url: str = "http://localhost:9200"
+    elasticsearch_index: str = "stayhub-properties"
+    elasticsearch_api_key: str = ""
+    elasticsearch_username: str = ""
+    elasticsearch_password: str = ""</code></pre>
+
+<p>One deliberate detail in there for later: <code>elasticsearch_index</code> is not an index. It
+is an alias, and lesson 15 is about why that distinction is the difference between a routine
+mapping change and an outage.</p>
+
+<h2>Where the data actually lives</h2>
+
+<p>Inside the container, everything is under
+<code>/usr/share/elasticsearch/data</code> &mdash; the Lucene segment files, the translog, and the
+cluster state. That is the directory the named volume is protecting, and it is the only thing worth
+backing up at the filesystem level. Even then, do not: taking a filesystem copy of a running
+cluster gives you a torn snapshot of files being written to. Use the snapshot API, which is lesson
+17.</p>
+
+<p>Disk sizing has one rule of thumb worth carrying: <strong>leave headroom</strong>. Elasticsearch
+watermarks disk usage and starts refusing to allocate shards at 85%, moves shards away at 90%, and
+at 95% it sets every index in the cluster to read-only. That last one is the incident nobody sees
+coming, because the symptom is writes failing with
+<code>cluster_block_exception</code> long after somebody noticed the disk was filling.</p>
+
+<h2>When it will not start</h2>
+
+<p>Three failures account for nearly all of them, and none announces itself clearly.</p>
+
+<p><strong>The container exits with code 137.</strong> That is the kernel killing it for using too
+much memory, not an Elasticsearch error. Give Docker Desktop more RAM or lower
+<code>ES_JAVA_OPTS</code>. There is often nothing useful in the logs at all, which is what makes it
+confusing.</p>
+
+<p><strong><code>max virtual memory areas vm.max_map_count [65530] is too low</code></strong>.
+Elasticsearch memory-maps its index files and needs a higher limit than the Linux default. On
+Docker Desktop this is usually already fine; on a Linux host it is
+<code>sysctl -w vm.max_map_count=262144</code>, and it needs to go in
+<code>/etc/sysctl.conf</code> to survive a reboot.</p>
+
+<p><strong>The port is already taken.</strong> 9200 is a popular port and the failure mode is not
+always a clean bind error &mdash; sometimes you connect to somebody else's cluster and spend twenty
+minutes wondering why your index is not there. <code>curl -s localhost:9200</code> and read the
+<code>cluster_name</code> before assuming anything.</p>
+
+<p><strong>It starts, then the client cannot reach it.</strong> Almost always a
+<code>network.host</code> problem or a port mapping one. Inside Docker, check that the container is
+listening on all interfaces rather than its own loopback &mdash;
+<code>docker logs</code> will show <code>publish_address {172.18.0.4:9200}</code> if it is right
+and <code>{127.0.0.1:9200}</code> if it is not. From another container, the address is the service
+name and the container's own port, never <code>localhost</code>.</p>
+
+<h2>What you should have now</h2>
+
+<p>A cluster on 9200 you can develop against, a second one on 9201 that demands credentials so the
+difference is concrete, and a Python client with a timeout short enough to protect your API. That
+is the whole of the setup, and it is worth checking all three work before moving on &mdash; nearly
+every confusing error later in a search project turns out to be one of these three things half
+configured.</p>
+
+<p>One habit to start now: keep the version you are running written down somewhere your code can
+see it. Elasticsearch changes real behaviour between minor versions, deprecates parameters with a
+warning header rather than an error, and removes them a version or two later. A track, a runbook or
+a bug report that does not say which version it was written against ages badly and silently.</p>
+
+<p>With a cluster running and a client that can reach it, the next question is what shape the data
+should be &mdash; and the answer starts with not letting Elasticsearch guess.</p>

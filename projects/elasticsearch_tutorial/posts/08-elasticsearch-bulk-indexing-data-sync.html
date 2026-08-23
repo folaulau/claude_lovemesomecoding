@@ -1,0 +1,340 @@
+<p>Two problems live in this lesson. Getting a lot of documents into Elasticsearch quickly, which is
+the easy one. And keeping them in step with a database that keeps changing, which is the one that
+decides whether your search results are trustworthy.</p>
+
+<h2>Why bulk</h2>
+
+<p>Indexing 200 documents into a fresh index, same documents, same machine, same mapping:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">one call per document    526 ms
+one bulk request          47 ms</code></pre>
+
+<p>Roughly 11x, and the ratio grows with the number of documents because what you are removing is
+per-request overhead: an HTTP round trip, a request parse, a routing decision and a response, 200
+times over.</p>
+
+<p>The measurement is on a local single-node cluster, which is the <em>best</em> case for the
+one-at-a-time version &mdash; there is no real network. Across a network the gap is wider.</p>
+
+<h2>The bulk API</h2>
+
+<p>The format is unusual and it is worth understanding rather than copying: newline-delimited JSON,
+two lines per operation. An action line, then the document.</p>
+
+<pre class="language-json"><code class="language-json">POST /stayhub-properties/_bulk
+{"index": {"_id": "8f1e-..."}}
+{"title": "Cedar Cabin", "city": "Big Bear Lake"}
+{"index": {"_id": "3a20-..."}}
+{"title": "Sunlit Loft", "city": "San Francisco"}
+{"delete": {"_id": "77c4-..."}}
+</code></pre>
+
+<p>Two rules that cause most of the failures. The content type is
+<code>application/x-ndjson</code>, not <code>application/json</code>. And <strong>the body must end
+with a newline</strong> &mdash; without it the last action is silently dropped, which is a
+maddening bug to chase.</p>
+
+<p>The format exists so the coordinating node can split the body on newlines and route each action
+without parsing the whole request. That is also why a bulk request should be sized in
+<em>megabytes</em>, not in documents: 5&ndash;15MB per request is the usual guidance, and a
+100MB bulk request will be rejected or will cause memory pressure.</p>
+
+<p>Four actions are available: <code>index</code> (create or replace), <code>create</code> (fail if
+it exists), <code>update</code> (partial), and <code>delete</code> (no document line).</p>
+
+<h2>The trap: a 200 that failed</h2>
+
+<p>Send a bulk request where one document is invalid:</p>
+
+<pre class="language-json"><code class="language-json">{"index": {"_id": "1"}}
+{"n": 1}
+{"index": {"_id": "2"}}
+{"n": "not a number"}
+{"index": {"_id": "3"}}
+{"n": 3}
+</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">HTTP 200
+
+errors: True
+  index 1 201
+  index 2 400 document_parsing_exception
+  index 3 201</code></pre>
+
+<p><strong>HTTP 200.</strong> Two of the three documents were indexed and one was not, and the
+status code says everything is fine.</p>
+
+<p>This is correct behaviour &mdash; a bulk request is not a transaction, and there is no single
+status that describes a partial result. But it means that <em>checking the HTTP status of a bulk
+request tells you nothing</em>. You have to read <code>errors</code> in the body, and when it is
+true, walk <code>items</code> to find out which ones failed and why.</p>
+
+<p>Code that does not do this loses documents silently. The index simply has fewer things in it than
+the database, nobody notices, and eventually a user reports that a listing does not come up in
+search.</p>
+
+<h2>helpers.bulk</h2>
+
+<p>The Python client's helper handles the newline format, chunking and the error walk for you:</p>
+
+<pre class="language-python"><code class="language-python">    actions = [
+        {
+            "_index": settings.elasticsearch_index,
+            "_id": str(p.public_id),
+            "_source": to_document(p),
+        }
+        for p in properties
+    ]
+    success, _ = bulk(client, actions, refresh="wait_for")
+    logger.info("Reindexed %s properties", success)
+    return success</code></pre>
+
+<p>By default it raises <code>BulkIndexError</code> if any document fails, carrying the per-document
+errors:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">raised BulkIndexError: 1 document(s) failed to index.
+raise_on_error=False -> ok: 1  errors: 1</code></pre>
+
+<p>Which of the two you want depends on the job. For a rebuild, raising is right &mdash; a partial
+index is worse than an obvious failure. For an ingest pipeline where a few malformed records are
+expected, <code>raise_on_error=False</code> and log what came back.</p>
+
+<p>Two more helpers are worth knowing. <code>streaming_bulk</code> yields a result per document, so
+you can process a generator of millions without building the list in memory.
+<code>parallel_bulk</code> runs several threads, which helps when serialising the documents is the
+bottleneck rather than the cluster.</p>
+
+<h3>Settings that make a big load faster</h3>
+
+<p>Three, applied before and reverted after:</p>
+
+<pre class="language-bash"><code class="language-bash">PUT /stayhub-properties/_settings
+{ "index": { "refresh_interval": "-1", "number_of_replicas": 0 } }
+
+# ... load ...
+
+PUT /stayhub-properties/_settings
+{ "index": { "refresh_interval": "1s", "number_of_replicas": 1 } }
+POST /stayhub-properties/_forcemerge?max_num_segments=1</code></pre>
+
+<p>Disabling refresh stops a segment being created every second during the load. Dropping replicas
+to zero halves the write work, and building them afterwards is a bulk copy rather than a
+document-by-document one. The <code>_forcemerge</code> at the end is only appropriate for an index
+that will not be written to again &mdash; it is expensive and it defeats the normal merge policy.</p>
+
+<h3>Backpressure, and what a rejection looks like</h3>
+
+<p>Push harder than the cluster can absorb and you do not get a slowdown &mdash; you get rejections.
+Elasticsearch has a bounded write queue per node, and when it is full new bulk requests are refused
+with a distinctive error:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">429 es_rejected_execution_exception
+rejected execution of coordinating operation ... queue capacity 10000</code></pre>
+
+<p>A 429 is the cluster telling you to slow down, and the correct response is to slow down: retry
+that batch after a delay, with the delay growing each time. The client does some of this for you
+&mdash; <code>retry_on_timeout</code> and <code>max_retries</code> &mdash; and
+<code>helpers.bulk</code> accepts <code>max_retries</code> and
+<code>initial_backoff</code> to retry only the rejected items rather than the whole batch.</p>
+
+<p>What does not work is more threads. That is the instinct when a load feels slow, and it makes the
+rejections worse while producing no more throughput. Watch
+<code>_cat/thread_pool/write?v</code> during a load: if <code>queue</code> is climbing and
+<code>rejected</code> is non-zero, the answer is smaller batches or fewer of them, not more
+concurrency.</p>
+
+<h3>Sizing a batch</h3>
+
+<p>The guidance to size by bytes rather than documents is easy to say and easy to get wrong, because
+the documents you are testing with are rarely the biggest ones you will ever index. Two habits
+help.</p>
+
+<p>Cap both: <code>chunk_size</code> in documents <em>and</em>
+<code>max_chunk_bytes</code> in bytes, so one unusually large document cannot produce a request ten
+times the intended size. And start at a batch you are confident is too small &mdash; 500 documents,
+or 5MB &mdash; then increase it while watching throughput. It flattens out well before it starts
+failing, and the flat part is where you want to be.</p>
+
+<h2>The harder half: staying in step</h2>
+
+<p>A bulk load gets the index correct once. The interesting question is what happens on the next
+write to the database.</p>
+
+<p>There are three families of answer.</p>
+
+<p><strong>Change data capture.</strong> Something reads the database's replication log &mdash;
+Debezium reading the Postgres WAL &mdash; and turns every row change into an index update. It
+catches every write, including ones made by a migration or by hand in a psql session, which nothing
+else does. The cost is real infrastructure: a connector, a message broker, and a second system to
+operate.</p>
+
+<p><strong>Periodic reindex.</strong> A job runs every N minutes and rewrites what changed. Simple,
+robust, and the index is up to N minutes stale. Perfectly acceptable for a catalogue that changes
+daily; not acceptable for a listing a host just published and is now looking for.</p>
+
+<p><strong>From application code.</strong> Every write path that changes a listing indexes it. Fast,
+no extra infrastructure, and it misses anything that does not go through your application.</p>
+
+<p>StayHub uses the third, because every write already goes through one FastAPI service, which is a
+design decision that makes the simple option viable. If writes come from three services and a batch
+job, it is not.</p>
+
+<h2>Three rules for indexing from application code</h2>
+
+<h3>1. Index after the commit, never before</h3>
+
+<pre class="language-python"><code class="language-python">"""
+⚠️ **Index AFTER the commit, never before.** Indexing first means a rolled-back transaction leaves
+a listing in search results that does not exist in the database — and the guest who clicks it gets
+a 404 from a page that just told them it was available.
+"""</code></pre>
+
+<p>Indexing inside the transaction is the instinct, because it feels more atomic. It is strictly
+worse. A transaction that rolls back after indexing leaves a phantom in search results, and nothing
+will ever remove it &mdash; there is no row left to trigger a correction.</p>
+
+<p>Indexing after the commit has a real gap too: the process can die between the two. But that gap
+leaves a document <em>missing</em> from the index, which the next write or a rebuild repairs.
+Missing is a recoverable state; phantom is not.</p>
+
+<h3>2. A failed index must not fail the write</h3>
+
+<pre class="language-python"><code class="language-python">    except Exception:  # noqa: BLE001 — see the module docstring: never fail a write over this
+        logger.exception("Failed to index property %s", prop.public_id)</code></pre>
+
+<p>A host publishing a listing must not get a 500 because a search cluster is restarting. The
+listing is correct in Postgres, which is what matters; search is a derived view that is briefly
+behind.</p>
+
+<p>This is only defensible because of lesson 1's rule. If the index were the source of truth,
+swallowing the error would be data loss.</p>
+
+<h3>3. Do not merely log the failure &mdash; retry it</h3>
+
+<p>Logging alone means a thirty-second Elasticsearch outage silently drops every change made during
+it, and nothing repairs them until somebody notices and runs a rebuild. StayHub turns a failure into
+an outbox message:</p>
+
+<pre class="language-python"><code class="language-python">"""
+**And a failure is now retried, not merely logged** (added 2026-08-22). `index_property` returns
+False when the write did not land, and `property_service._sync` turns that False into an outbox
+message — so a listing indexed during an Elasticsearch outage is re-indexed by the worker minutes
+later instead of waiting for somebody to notice and run `rebuild_index`.
+"""</code></pre>
+
+<p>The shape is worth naming: <strong>try inline, fall back to the queue</strong>. Doing only one is
+worse in both directions. Queue everything and the common case &mdash; Elasticsearch is fine &mdash;
+pays a worker round trip for no reason, and search is seconds stale after every edit. Queue nothing
+and an outage loses changes.</p>
+
+<h2>The retry that re-reads</h2>
+
+<p>One detail in the retry handler is worth the whole section, because it inverts the usual advice
+about message payloads:</p>
+
+<pre class="language-python"><code class="language-python">    """Re-index one property, reading it fresh from Postgres.
+
+    ⚠️ It RE-READS rather than indexing a snapshot from the payload, and that is the opposite of
+    what `models/outbox.py` says payloads are usually for. The reasoning inverts here because the
+    index is *derived data whose only job is to match the database right now*. If the listing was
+    edited three more times while Elasticsearch was down, indexing the first snapshot would write a
+    stale document and then be marked DONE — leaving search confidently wrong. Re-reading
+    collapses all four changes into one correct write.
+    """</code></pre>
+
+<p>The usual guidance is that an event carries what happened, so a consumer is not coupled to the
+current state. That is right for a booking confirmation email, which describes a moment.</p>
+
+<p>It is wrong here. The index's only job is to match the database <em>now</em>. Four edits during
+an outage produce four queued messages; indexing four stale snapshots in order happens to end
+correctly, and indexing the first one and marking it done does not. Re-reading collapses all four
+into one correct write and is immune to ordering.</p>
+
+<p>Ask what the consumer needs: the event as it happened, or the world as it is.</p>
+
+<h2>Why any of this is safe</h2>
+
+<p>At-least-once delivery means a handler can run twice. That is only acceptable because of lesson
+7's property:</p>
+
+<pre class="language-python"><code class="language-python">    """
+    **Idempotent by construction.** The document id is the property's public id, so running this
+    handler once or five times produces exactly the same index — which is the property that makes
+    at-least-once delivery safe here rather than merely tolerable.
+    """</code></pre>
+
+<p>Note also that failure handling is <em>inverted</em> between the two callers. On the request path
+an exception is swallowed, because a host should not see a 500. In the worker an exception is how
+you say "not done yet" &mdash; swallowing it would mark the message done and discard the retry:</p>
+
+<pre class="language-python"><code class="language-python">        # ⚠️ `raise_on_error` is for the WORKER, and only for the worker. On the request path a
+        # False keeps a host's save working; in the worker a False would be read as success and
+        # the message marked DONE, quietly discarding the retry this function exists to enable.
+        # Same code, two callers, opposite correct behaviours — so the caller chooses.</code></pre>
+
+<h2>Choosing between the three strategies</h2>
+
+<p>Worth being concrete, because the decision is usually made by accident.</p>
+
+<p>Use <strong>application-code indexing</strong> when every write already goes through one service
+you control, and when a few seconds of staleness is acceptable. It is by far the least
+infrastructure, and the code is small enough to read in one sitting. Its failure mode is writes that
+bypass the service &mdash; a migration, a support script, a second service added later &mdash; and
+you will not get an alert when that happens.</p>
+
+<p>Use <strong>change data capture</strong> when writes come from more than one place, or when
+missing one is genuinely unacceptable. It catches the manual <code>UPDATE</code> somebody ran at
+2am, which is exactly the change nobody remembers to re-index. Budget for the connector as a
+production system with its own monitoring, because that is what it is.</p>
+
+<p>Use <strong>a periodic reindex</strong> when the data changes on a schedule anyway &mdash; a
+nightly catalogue import, a daily price feed. It is the most robust of the three precisely because
+it makes no attempt to be clever: it just rewrites the world, so there is no accumulated drift to
+detect.</p>
+
+<p>And note they combine well. Application-code indexing for freshness, plus a periodic rebuild as
+the backstop, gets you most of CDC's correctness for none of its operational cost. That is the
+combination StayHub ends up with, and it is a reasonable default for a system where the index is
+derived.</p>
+
+<h3>What each one does when Elasticsearch is down</h3>
+
+<p>This is the question that separates them, and it is worth answering before you need it.</p>
+
+<p>CDC keeps its position in the log, so it resumes where it stopped and nothing is lost &mdash;
+that is its main advantage and the reason it is worth the operational weight.</p>
+
+<p>A periodic reindex simply catches up on the next run, with no special handling. It is the least
+exciting answer and the least likely to be wrong.</p>
+
+<p>Application-code indexing loses every change made during the outage <em>unless</em> the failure
+is queued, which is the whole argument for the outbox above. Without it, the recovery procedure is
+a human noticing and running a rebuild &mdash; and "a human notices" is not a recovery procedure.</p>
+
+<h2>Keep the rebuild</h2>
+
+<p>Whatever sync strategy you choose, keep a way to rebuild the whole index from the source of
+truth, and run it occasionally rather than only in emergencies.</p>
+
+<pre class="language-bash"><code class="language-bash">python -m scripts.reindex --rebuild
+# rebuilt from Postgres: 12 documents</code></pre>
+
+<p>It is the repair path for every bug in the sync layer you have not found yet, it is the seed path
+for a new environment, and running it periodically against a copy and diffing the result is the only
+honest way to know whether your sync is actually working.</p>
+
+<p>The rebuild being cheap is also what makes the rest of this lesson's advice affordable. Every
+"log it and move on" decision above rests on there being a way to put the index right without
+anybody reconstructing what was lost. Take that away &mdash; by letting a field exist only in the
+index &mdash; and swallowing an indexing error stops being pragmatic and becomes data loss.</p>
+
+<p>A drift check is cheap and worth having: count documents in the index, count eligible rows in the
+database, alert when they differ by more than a threshold. It will not catch a wrong field value,
+but it catches the whole class of "the sync silently stopped" problems, which is the class that
+tends to go unnoticed for weeks.</p>
+
+<p>A stronger version, when it is worth the effort: sample a few hundred documents, compare each
+against the database row it came from, and alert on any field that disagrees. That catches the
+subtler failure &mdash; a sync that runs, succeeds, and writes the wrong value because a mapping
+changed or a field was renamed. Both checks are a few dozen lines, and they are the only evidence
+you will ever have that the index is telling the truth rather than merely responding.</p>

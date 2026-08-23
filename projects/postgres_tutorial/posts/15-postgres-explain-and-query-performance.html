@@ -1,0 +1,192 @@
+<p>When a query is slow, there are two things you can do: guess, or ask. <code>EXPLAIN</code> is how
+you ask. This post is how to read the answer.</p>
+
+<h2>EXPLAIN and EXPLAIN ANALYZE</h2>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT b.id FROM bookings b WHERE b.property_id = 4242;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Bitmap Heap Scan on bookings b  (cost=4.58..81.68 rows=20 width=4)
+  Recheck Cond: (property_id = 4242)
+  ->  Bitmap Index Scan on ix_bookings_property_id  (cost=0.00..4.57 rows=20 width=0)
+        Index Cond: (property_id = 4242)</code></pre>
+
+<p>Plain <code>EXPLAIN</code> shows the plan without running it. Everything in it is an
+<em>estimate</em>:</p>
+
+<ul>
+  <li><code>cost=4.58..81.68</code> — startup cost, then total cost, in arbitrary units. Only
+      useful for comparing two plans for the same query.</li>
+  <li><code>rows=20</code> — how many rows the planner expects.</li>
+  <li><code>width=4</code> — expected average row size in bytes.</li>
+</ul>
+
+<p><code>EXPLAIN ANALYZE</code> actually runs the query and adds what really happened.
+<strong>It runs the query.</strong> On an <code>UPDATE</code> or <code>DELETE</code> that means the
+rows change — wrap it in a transaction you roll back:</p>
+
+<pre class="language-sql"><code class="language-sql">BEGIN;
+EXPLAIN ANALYZE DELETE FROM outbox WHERE status = 'DONE';
+ROLLBACK;</code></pre>
+
+<h2>Reading a plan</h2>
+
+<p>Plans are trees, printed with children indented under their parent. <strong>Read them
+inside-out and bottom-up</strong>: the most indented node runs first and passes its rows up.</p>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT p.city, count(*) FROM bookings b
+JOIN   properties p ON p.id = b.property_id
+WHERE  b.status = 'PENDING'
+GROUP  BY p.city ORDER BY 2 DESC LIMIT 3;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Limit (actual time=29.476..29.478 rows=3 loops=1)
+  ->  Sort (actual time=29.475..29.477 rows=3 loops=1)
+        Sort Key: (count(*)) DESC
+        Sort Method: top-N heapsort  Memory: 25kB
+        ->  HashAggregate (actual time=29.452..29.455 rows=16 loops=1)
+              Group Key: p.city
+              ->  Hash Join (actual time=12.971..26.971 rows=25482 loops=1)
+                    Hash Cond: (b.property_id = p.id)
+                    ->  Bitmap Heap Scan on bookings b (actual rows=25482 loops=1)
+                          Heap Blocks: exact=4213
+                          Buffers: shared hit=4235
+                          ->  Bitmap Index Scan on ix_bookings_status (actual rows=25482 loops=1)
+                                Index Cond: (status = 'PENDING')
+                    ->  Hash (actual time=11.644..11.645 rows=20000 loops=1)
+                          Buckets: 32768  Batches: 1  Memory Usage: 1131kB</code></pre>
+
+<p>Bottom-up: find 25,482 pending bookings through the status index; build a hash of all 20,000
+properties; join them; group into 16 cities; sort; take 3.</p>
+
+<p><code>actual time=12.971..26.971</code> is <strong>startup..total, per loop</strong>. The first
+number is when the node produced its first row, the second when it finished. And because a child's
+time is included in its parent's, the cost of one node alone is its total minus its children's.</p>
+
+<p><code>loops=1</code> matters more than it looks. On the inner side of a nested loop it is not 1,
+and <strong>the times shown are per loop</strong> — a node reading <code>actual time=0.05</code>
+with <code>loops=20000</code> took a second, not 0.05ms.</p>
+
+<h2>The single most useful signal</h2>
+
+<p>Add <code>ANALYZE</code> and compare <code>rows=</code> (estimated) with
+<code>actual rows=</code>. When they are close, the planner understood the data and its choices
+were reasonable. When they are out by an order of magnitude, everything above that node is built on
+a wrong assumption — and that is nearly always the real problem.</p>
+
+<p>A planner expecting 20 rows and getting 200,000 will have picked a nested loop, and it will now
+run 200,000 times. The fix is rarely a different index; it is usually one of:</p>
+
+<ul>
+  <li><code>ANALYZE the_table;</code> — the statistics are stale.</li>
+  <li><code>ALTER TABLE t ALTER COLUMN c SET STATISTICS 500;</code> — the default sample is too
+      small for a skewed column.</li>
+  <li><code>CREATE STATISTICS</code> — for correlated columns. Postgres assumes independence, so
+      it multiplies selectivities: <code>WHERE city = 'Oslo' AND country = 'Norway'</code> is
+      estimated as far rarer than it is, because those two are not independent at all.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">CREATE STATISTICS stat_property_place (dependencies)
+    ON city, country FROM properties;
+ANALYZE properties;</code></pre>
+
+<h2>BUFFERS</h2>
+
+<p>Always add it. <code>BUFFERS</code> reports pages read, and pages are the actual work:</p>
+
+<ul>
+  <li><code>shared hit</code> — found in the cache. Cheap.</li>
+  <li><code>shared read</code> — went to the operating system, and possibly to disk. Expensive.</li>
+  <li><code>temp read/written</code> — <strong>a sort or hash spilled to disk</strong>. This is the
+      finding, and the fix is usually more <code>work_mem</code>.</li>
+</ul>
+
+<p>Timing varies with cache state, so the same query looks fast on the second run and you conclude
+you fixed it. Buffer counts barely move, which makes them the honest measure of whether a change
+helped.</p>
+
+<h2>The nodes you will meet</h2>
+
+<table>
+  <thead><tr><th>Node</th><th>Means</th></tr></thead>
+  <tbody>
+    <tr><td>Seq Scan</td><td>Read the whole table. Correct for small tables and for queries
+        returning most rows.</td></tr>
+    <tr><td>Index Scan</td><td>Walk the index, fetch each row. Good for few rows.</td></tr>
+    <tr><td>Index Only Scan</td><td>Answered from the index alone. Check
+        <code>Heap Fetches</code>.</td></tr>
+    <tr><td>Bitmap Heap Scan</td><td>Collect row locations from the index, then read the table in
+        physical order. The middle ground.</td></tr>
+    <tr><td>Nested Loop</td><td>For each outer row, look up inner rows. Fast when the outer side is
+        small, catastrophic when the estimate was wrong.</td></tr>
+    <tr><td>Hash Join</td><td>Build a hash of one side, probe with the other. The usual choice for
+        two large sets.</td></tr>
+    <tr><td>Merge Join</td><td>Both sides sorted, walked together. Good when they are sorted
+        already.</td></tr>
+  </tbody>
+</table>
+
+<p>None of these is a defect on its own. A <code>Seq Scan</code> on a 12-row table is right, and a
+<code>Nested Loop</code> over a 200,000-row estimate error is wrong even though nested loops are
+usually fine.</p>
+
+<h2>The settings that change what you see</h2>
+
+<p>Two knobs are worth knowing before you conclude a plan is the best available.</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW work_mem;                 -- memory per sort or hash node, per query
+SET  work_mem = '64MB';        -- for this session only
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT property_id, count(*) FROM bookings GROUP BY property_id ORDER BY 2 DESC LIMIT 5;
+RESET work_mem;</code></pre>
+
+<p><code>work_mem</code> is allocated <strong>per node, per parallel worker</strong>, not per
+query — a plan with three sorts and two workers can use many times the number you set. That is why
+the global default is small and why raising it for one heavy query in its own session is the safer
+move.</p>
+
+<p>The other is a diagnostic trick rather than a fix. To find out whether an index would actually
+help, ask the planner to avoid the alternative and compare:</p>
+
+<pre class="language-sql"><code class="language-sql">SET enable_seqscan = off;
+EXPLAIN (ANALYZE, COSTS OFF) SELECT count(*) FROM bookings WHERE guests = 3;
+RESET enable_seqscan;</code></pre>
+
+<p>These <code>enable_*</code> settings do not truly disable a node type; they make it enormously
+expensive, so the planner uses it only when there is no other way. <strong>Never leave one set in
+production.</strong> They exist to answer "would the other plan have been faster", and when the
+answer is yes, the fix is an index or better statistics — not the setting.</p>
+
+<h2>Finding the query worth fixing</h2>
+
+<p>Everything above assumes you know which query is slow. <code>pg_stat_statements</code> tells
+you — it aggregates by normalised query text, so a thousand executions of the same statement with
+different parameters are one row:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT round(total_exec_time::numeric, 1) AS total_ms,
+       calls,
+       round(mean_exec_time::numeric, 2)  AS mean_ms,
+       left(query, 60)                    AS query
+FROM   pg_stat_statements
+ORDER  BY total_exec_time DESC
+LIMIT  10;</code></pre>
+
+<p>Sort by <code>total_exec_time</code>, not <code>mean_exec_time</code>. A 2-second report run
+once a day matters less than a 4-millisecond query run two million times, and only the total tells
+you which is which.</p>
+
+<p>It needs <code>shared_preload_libraries = 'pg_stat_statements'</code> and a restart, so it is
+something to turn on before you need it. Every managed Postgres offers it; it is the first thing to
+enable on a new database.</p>
+
+<p>Reset the counters when you start looking at something, so the numbers describe the period you
+care about rather than everything since the server last restarted:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT pg_stat_statements_reset();</code></pre>
+
+<p>One habit ties this post together. When a query is slow, resist changing anything until you have
+the plan, the buffer counts, and the estimated-versus-actual row counts in front of you. Adding an
+index because a query is slow is guessing; adding one because the plan shows 200,000 rows removed
+by a filter is engineering — and the second kind of change is the one you can explain afterwards
+and undo when it turns out not to help.</p>

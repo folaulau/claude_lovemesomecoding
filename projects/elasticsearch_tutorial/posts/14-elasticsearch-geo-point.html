@@ -1,0 +1,342 @@
+<p>"Places near here" is one of the few things Elasticsearch does that has no reasonable equivalent
+in a plain relational query, and it is one of the easiest features to turn on. It also has a trap in
+the very first step that puts your data on the wrong continent without any error at all.</p>
+
+<h2>Mapping a geo_point</h2>
+
+<pre class="language-python"><code class="language-python">            "latitude": {"type": "double"},
+            "longitude": {"type": "double"},
+            "location": {"type": "geo_point"},</code></pre>
+
+<p>StayHub stores the coordinates twice, and that is deliberate rather than wasteful. The two
+<code>double</code> fields are what a result card renders. <code>location</code> is a
+<code>geo_point</code>, which is an entirely different structure &mdash; a BKD tree over encoded
+coordinates &mdash; and only it can answer "within 10km".</p>
+
+<p>You cannot query two numeric fields as a location. Distance is not expressible as two range
+filters; a box is, and a box is not a circle &mdash; and even the box gets the wrong answer near the
+poles or across the 180th meridian, where longitude wraps and a naive range comparison does not.</p>
+
+<h2>Five formats, and the one that will get you</h2>
+
+<p>A <code>geo_point</code> accepts several input shapes, all meaning San Francisco:</p>
+
+<pre class="language-json"><code class="language-json">{ "loc": { "lat": 37.7749, "lon": -122.4194 } }   // object
+{ "loc": "37.7749,-122.4194" }                     // string:  "lat,lon"
+{ "loc": [ -122.4194, 37.7749 ] }                  // array:   [lon, lat]   <-- note the order
+{ "loc": "POINT (-122.4194 37.7749)" }             // WKT:     (lon lat)
+{ "loc": "9q8yy" }                                 // geohash</code></pre>
+
+<p>Read those two middle lines again. <strong>The string form is <code>"lat,lon"</code>. The array
+form is <code>[lon, lat]</code>.</strong> Opposite orders, in the same API, for the same field.</p>
+
+<p>The array follows GeoJSON, which specifies longitude first. The string follows the convention
+everyone says out loud. Both are defensible and together they are a trap.</p>
+
+<p>Sometimes it fails loudly. Writing San Francisco as <code>[37.7749, -122.4194]</code>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">document_parsing_exception
+illegal latitude value [-122.4194] for loc</code></pre>
+
+<p>Rejected, because -122 is not a valid latitude. That is the lucky case.</p>
+
+<p>The unlucky case is any location where both numbers are within both valid ranges &mdash;
+anywhere within 90 degrees of the equator <em>and</em> 90 degrees of Greenwich, which is most of
+Europe, Africa and the Middle East. Write <code>[10, 20]</code> meaning latitude 10, longitude 20:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">created
+
+distance from lat=20, lon=10:  0.0 km</code></pre>
+
+<p>Accepted, stored as longitude 10 and latitude 20, and it is exactly zero kilometres from the
+wrong place. A dataset of European addresses loaded this way is silently mirrored across the
+diagonal, every distance query returns plausible-looking wrong answers, and nothing anywhere logs a
+complaint.</p>
+
+<p>The defence is to use the explicit object form in application code, where the field names make
+the order impossible to get wrong:</p>
+
+<pre class="language-python"><code class="language-python">    # geo_point only when both halves exist — ES rejects a half-populated one, and that rejection
+    # would fail the whole bulk request, not just this document.
+    if lat is not None and lon is not None:
+        doc["location"] = {"lat": lat, "lon": lon}</code></pre>
+
+<p>Note the second trap in that comment. A half-populated point is refused, and in a bulk request
+that failure is not isolated to the document &mdash; it can take the request with it. Build the
+field only when both halves are present.</p>
+
+<h2>geo_distance</h2>
+
+<pre class="language-python"><code class="language-python">        groups["geo"] = [{"geo_distance": {"distance": f"{req.radius_km}km", "location": origin}}]</code></pre>
+
+<p>Everything within a radius. Distances accept units &mdash; <code>km</code>, <code>mi</code>,
+<code>m</code>, <code>yd</code>, <code>ft</code>, <code>nmi</code> &mdash; and a bare number means
+metres, which is a good way to search a 10-metre radius by accident.</p>
+
+<p>It is a <strong>filter</strong>, and the reason is worth stating:</p>
+
+<pre class="language-python"><code class="language-python">        # `geo_distance` is a filter, not a query: "within 10km" is a yes/no, and how far inside
+        # the circle a listing sits should not change its ranking. If you want nearer to rank
+        # higher, that is `sort=distance`, below — or a `function_score` decay, which is post 11's
+        # subject rather than this one's.</code></pre>
+
+<p>Lesson 10's rule applied to geography. "Within 10km" is not a matter of degree, so it belongs in
+<code>filter</code>, where it costs no scoring and can be cached.</p>
+
+<h3>Distance is not exact, and that is a setting</h3>
+
+<p><code>distance_type</code> defaults to <code>arc</code>, which computes great-circle distance on a
+sphere. <code>plane</code> uses a flat approximation: much faster, and increasingly wrong as the
+radius grows or the latitude gets extreme.</p>
+
+<p>For a city-scale radius the difference is under a metre and <code>plane</code> is a free win. For
+a country-scale one it is kilometres. If you are unsure, leave it on <code>arc</code> &mdash; the
+cost is small and a wrong distance is a wrong result.</p>
+
+<h2>geo_bounding_box, for a map</h2>
+
+<p>A map viewport is a rectangle, not a circle, so the matching query is a rectangle:</p>
+
+<pre class="language-json"><code class="language-json">{ "geo_bounding_box": { "location": {
+    "top_left":     { "lat": 38.0, "lon": -123.0 },
+    "bottom_right": { "lat": 37.0, "lon": -122.0 }
+} } }</code></pre>
+
+<p>Cheaper than <code>geo_distance</code> &mdash; two range comparisons rather than a distance
+calculation &mdash; and exactly what a "search as I move the map" feature wants, because the corners
+come straight out of the map library.</p>
+
+<p>The one edge case: a box crossing the 180th meridian, where the left longitude is greater than
+the right. Elasticsearch handles it correctly. Code that validates
+<code>left &lt; right</code> before sending does not.</p>
+
+<p>There is also <code>geo_polygon</code> for an arbitrary shape, which is what a "draw your own
+search area" tool needs. It is deprecated in favour of <code>geo_shape</code>, below.</p>
+
+<h2>Sorting by distance</h2>
+
+<pre class="language-python"><code class="language-python">        sort.append(
+            {
+                "_geo_distance": {
+                    "location": origin,
+                    "order": "asc",
+                    "unit": "km",
+                    # A listing with no coordinates sorts last instead of failing the query.
+                    "ignore_unmapped": True,
+                }
+            }
+        )</code></pre>
+
+<p><code>ignore_unmapped</code> is the small detail that stops one listing without coordinates from
+turning a whole search into a 400.</p>
+
+<p>The interesting part is that the sort gives you the distance for free. Every hit carries its sort
+values, so the number Elasticsearch computed in order to rank is already in the response:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">geo, within 300km of San Francisco, sorted by distance:
+
+    1.72 km  San Francisco    Sunlit Loft in the Mission
+  254.60 km  Lake Tahoe       Lakefront A-Frame</code></pre>
+
+<p>That is why StayHub appends a <code>_geo_distance</code> entry whenever coordinates are supplied,
+even when the user asked to sort by relevance &mdash; the distance is wanted as a number on every
+result card regardless of the ordering. With an explicit <code>"_score"</code> in front so the
+ranking is untouched:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">q=cabin, coordinates supplied, sort=relevance:
+
+  score=4.439  dist=631.94  Big Bear Lake  Cedar Cabin with Mountain Views</code></pre>
+
+<p>Reading it back is a matter of knowing where in the sort array it landed:</p>
+
+<pre class="language-python"><code class="language-python">        distance = None
+        if geo_index is not None:
+            values = hit.get("sort") or []
+            if geo_index &lt; len(values):
+                value = values[geo_index]
+                # ES sorts unmapped/missing coordinates to the end with Infinity, which is not a
+                # number any client should try to render as "1.8e308 km away".
+                if isinstance(value, (int, float)) and value != float("inf"):
+                    distance = round(float(value), 2)</code></pre>
+
+<p>The infinity check is not paranoia. A document without a location sorts last with
+<code>Double.MAX_VALUE</code>, and serialising that into JSON produces a number your frontend will
+happily render.</p>
+
+<h2>Half a coordinate is not a coordinate</h2>
+
+<p>The API takes latitude and longitude as separate optional parameters, which raises a question
+with only one right answer:</p>
+
+<pre class="language-python"><code class="language-python">    @property
+    def geo_point(self) -&gt; dict[str, float] | None:
+        """The origin for geo filtering and distance sorting, or None if geo is not in play.
+
+        ⚠️ Half a coordinate is not a coordinate. A `lat` with no `lon` has to mean "no geo" rather
+        than "assume the prime meridian" — Elasticsearch would happily accept `lon: 0` and return
+        listings in the Gulf of Guinea for a search of Austin.
+        """
+        if self.lat is None or self.lon is None:
+            return None
+        return {"lat": self.lat, "lon": self.lon}</code></pre>
+
+<p>Defaulting a missing coordinate to zero is the kind of decision that looks like defensive
+programming and produces results from the middle of the Atlantic. One place decides whether geo is
+active, and it requires both halves.</p>
+
+<p>The radius is separate again: coordinates without one produce distances but filter nothing, which
+is a genuinely useful combination for "sort by nearest, but show me everything".</p>
+
+<h2>Wiring it to a map</h2>
+
+<p>The API surface a map needs is small, and it is worth seeing all of it together because the
+parameters interact:</p>
+
+<pre class="language-python"><code class="language-python">    # Geo — the map viewport. All three are optional, and `lat`/`lon` are only honoured together;
+    # see SearchRequest.geo_point for why half a coordinate has to mean "no geo".
+    lat: float | None = Query(default=None, ge=-90, le=90),
+    lon: float | None = Query(default=None, ge=-180, le=180),
+    radius_km: float | None = Query(default=None, gt=0, le=500, alias="radiusKm"),</code></pre>
+
+<p>Three things in there are load-bearing.</p>
+
+<p><strong>The ranges are validated at the boundary.</strong> A latitude outside
+&plusmn;90 is a 422 from the API rather than a parse error from the cluster, which is both a better
+message and one fewer way for a malformed request to reach Elasticsearch.</p>
+
+<p><strong>The radius is capped.</strong> An uncapped radius is a slower
+<code>match_all</code> &mdash; it filters nothing and pays for the distance calculation anyway. 500km
+is roughly "a region", and anything larger is a request that should not have geo on it.</p>
+
+<p><strong>The radius is optional even when coordinates are present</strong>, which gives three
+distinct behaviours from three parameters: no geo at all; distances on every hit with no filtering;
+and a genuine radius filter. A map that shows distances while the user browses nationally, and
+narrows when they zoom, is those three states.</p>
+
+<h3>The one that catches people: pan versus search</h3>
+
+<p>A map has two events that look alike and should not behave alike. Panning or zooming re-queries
+the visible area &mdash; a bounding box, no facets, small page size, fired often. Submitting a search
+is the full request with facets and ranking.</p>
+
+<p>Sending the expensive one on every pan is the standard way to make a map feel slow and to
+multiply search load by ten. This is exactly what the <code>facets</code> parameter from lesson 13
+exists for, and a pan handler is its main customer.</p>
+
+<h2>Aggregating on geography</h2>
+
+<p>Two bucket aggregations are geo-specific, and both solve the same real problem: a map with ten
+thousand pins on it is not a map.</p>
+
+<p><code>geohash_grid</code> buckets points into a grid whose cell size is set by
+<code>precision</code>:</p>
+
+<pre class="language-bash"><code class="language-bash">{ "size": 0, "aggs": { "g": { "geohash_grid": { "field": "location", "precision": 5 } } } }
+# [('9q8yy', 4)]</code></pre>
+
+<p>Four listings in one cell. Raise the precision as the user zooms in and the clusters split apart
+&mdash; which is how every map with numbered circles on it works. <code>geotile_grid</code> is the
+same idea aligned to standard map tiles, which is usually easier to place on a slippy map because
+the cells line up with the tiles you are already fetching.</p>
+
+<p><code>geo_distance</code> also exists as an aggregation, bucketing by distance band, which is
+where "within 1km (12) &middot; within 5km (48)" comes from.</p>
+
+<p>And <code>geo_centroid</code> returns the average position of the documents in a bucket, which is
+where to put the cluster marker so it sits over the listings rather than in the middle of the
+cell.</p>
+
+<h2>Where the coordinates come from</h2>
+
+<p>Everything above assumes a latitude and longitude already exist on the record. Getting them there
+is its own problem and it is worth two paragraphs, because it is where the data quality that all of
+this depends on is decided.</p>
+
+<p>Geocoding &mdash; turning "742 Evergreen Terrace, Springfield" into a point &mdash; is an external
+service, it costs money per lookup, and it is wrong often enough to matter. Do it once, at write
+time, and store the result. Doing it at query time makes every search depend on a third party's
+availability, which is a bad trade for a feature that is meant to make search faster.</p>
+
+<p>Store what the geocoder told you about its own confidence, if it offers it. A rooftop-accurate
+match and a "we found the city, roughly" match are both a point, and treating them identically is
+how a listing ends up pinned to the centre of a metropolitan area. A precision field lets you
+exclude the vague ones from a tight-radius search rather than showing them and being wrong.</p>
+
+<p>And validate before indexing. Latitude and longitude of exactly <code>0, 0</code> is Null Island
+&mdash; a point in the Gulf of Guinea that is the single most populated location in careless
+geographic datasets, because it is what a failed parse produces. A check for it, and for points
+outside the countries you actually operate in, catches an entire class of import bug on the way in
+rather than in a support ticket.</p>
+
+<h2>When a point is not enough</h2>
+
+<p>A <code>geo_point</code> is one location. <code>geo_shape</code> holds polygons, lines,
+multi-polygons and collections &mdash; a neighbourhood boundary, a delivery zone, a river.</p>
+
+<pre class="language-json"><code class="language-json">{ "boundary": { "type": "geo_shape" } }
+
+{ "geo_shape": {
+    "boundary": {
+      "shape": { "type": "point", "coordinates": [-122.4194, 37.7749] },
+      "relation": "contains"
+} } }</code></pre>
+
+<p>The <code>relation</code> is the interesting parameter: <code>intersects</code>,
+<code>disjoint</code>, <code>within</code>, <code>contains</code>. "Which delivery zones contain
+this address" and "which listings fall inside this drawn area" are the same query with the shape and
+the point swapped round.</p>
+
+<p>The costs are real. Shapes are far larger to index and slower to query than points, and a
+polygon with self-intersections or the wrong winding order is rejected with an error that takes some
+reading. Use <code>geo_point</code> unless you genuinely need an area, and note that the coordinates
+inside a shape are GeoJSON, so they are <code>[lon, lat]</code> &mdash; the same order as the array
+format, and the same trap.</p>
+
+<h2>What geo costs</h2>
+
+<p>Worth knowing, because the intuition is usually that it is expensive and it mostly is not.</p>
+
+<p>A <code>geo_point</code> is indexed into a BKD tree, the same structure numeric ranges use, so a
+bounding box is roughly as cheap as two numeric range filters &mdash; which is very cheap.
+<code>geo_distance</code> costs a little more: it uses a bounding box internally to reject most
+candidates, then computes actual distances only for what survives. Both are filters, so both cache.</p>
+
+<p>What is genuinely expensive is sorting by distance over a large result set, because the distance
+is computed for every match rather than for the ones that survive a filter. Pairing a distance sort
+with a radius filter is not just a product decision &mdash; the filter is what keeps the sort
+affordable.</p>
+
+<p>And <code>geo_shape</code> is a different order of magnitude from <code>geo_point</code> in both
+index size and query time. A complex polygon is decomposed into many indexed triangles, so a
+country boundary is thousands of entries. When a shape field is slow, simplifying the geometry
+usually helps more than any query change.</p>
+
+<h2>Getting it right</h2>
+
+<p>Four habits cover nearly every geo bug.</p>
+
+<p><strong>Use the object form on the way in.</strong> <code>{"lat": ..., "lon": ...}</code> cannot
+be reversed by a refactor.</p>
+
+<p><strong>Assert on a known distance in a test.</strong> One document at a known location, one
+query from another, and an assertion that the distance is what a map says it is. It fails
+immediately if the order is wrong, and nothing else will:</p>
+
+<pre class="language-python"><code class="language-python">    def test_geo_distance_filters_and_sorts(self, index):
+        """From San Francisco: the Mission loft is next door, Big Bear is ~600km, Málaga is a
+        different continent."""
+        result = run(index, lat=37.7749, lon=-122.4194, radius_km=50, sort="distance")
+        assert [h.city for h in result.hits] == ["San Francisco"]
+        assert result.hits[0].distance_km &lt; 5</code></pre>
+
+<p><strong>Index the point only when both halves exist</strong>, and keep the display coordinates as
+plain numbers separately.</p>
+
+<p><strong>Filter, do not score.</strong> If nearer should rank higher, that is a decay function
+from lesson 11, not a distance in <code>must</code>.</p>
+
+<p>Two of those four are mapping and indexing decisions, which puts them back in lesson 3's
+territory: a <code>geo_point</code> cannot be added to documents that already exist without a
+reindex, and neither can the precision field. If there is any chance a location will ever be
+searched geographically, index it as a point from the start &mdash; it costs almost nothing and it
+is the difference between shipping the feature and scheduling a migration.</p>

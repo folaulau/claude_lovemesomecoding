@@ -1,0 +1,368 @@
+<p>Real searches are not one clause. They are a text query plus five filters, and
+<code>bool</code> is how you assemble them. It has four slots, and choosing the right one decides
+both whether your results are correct and how fast they come back.</p>
+
+<h2>The four clauses</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "query": {
+    "bool": {
+      "must":     [ ... ],   // must match, and it SCORES
+      "filter":   [ ... ],   // must match, no score, cacheable
+      "should":   [ ... ],   // may match — see below, this one is subtle
+      "must_not": [ ... ]    // must not match, no score, cacheable
+    }
+  }
+}</code></pre>
+
+<p>Every slot takes a list of queries, and any of those queries can be another
+<code>bool</code>.</p>
+
+<p>The two-word summary: <strong><code>must</code> and <code>should</code> run in query context;
+<code>filter</code> and <code>must_not</code> run in filter context.</strong> Everything else
+follows from that distinction.</p>
+
+<h2>must versus filter</h2>
+
+<p>Both require a match. The difference is what happens to the score, and it is measurable.</p>
+
+<p>Search for "cabin" in the title, no filter:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">must only:      _score = 2.2335923</code></pre>
+
+<p>Now add a filter for cabins &mdash; a condition the matching document satisfies:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">must + filter:  _score = 2.2335923</code></pre>
+
+<p>Identical, to seven decimal places. The filter changed which documents came back and contributed
+exactly nothing to how they were ranked.</p>
+
+<p>Move that same clause into <code>must</code>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">both in must:   _score = 3.956359</code></pre>
+
+<p>Now it scores, and "is a cabin" is inflating the relevance of a text search. That is the bug this
+distinction prevents: put <code>max_guests &gt;= 4</code> in <code>must</code> and "sleeps more
+people" starts outranking "actually matches what you searched for".</p>
+
+<h3>And the speed part</h3>
+
+<p>Filter context is <strong>cacheable</strong>. A clause that only decides yes/no produces the same
+answer for the same segment every time, so Elasticsearch can remember it as a bitset &mdash; one bit
+per document &mdash; and reuse it across queries.</p>
+
+<p>A scoring clause never can, because the score depends on the query terms.</p>
+
+<p>So the rule is simple and worth applying mechanically: <strong>if the condition is not a matter
+of degree, it goes in <code>filter</code>.</strong> Price ranges, guest counts, categories,
+amenities, dates, booleans, ids. Only free text belongs in <code>must</code>.</p>
+
+<p>StayHub does exactly that, and says so where it happens:</p>
+
+<pre class="language-python"><code class="language-python">    """Every non-scoring clause, grouped under the facet it belongs to.
+
+    Why these are `filter` and not `must`: filter clauses do NOT score, they only include or
+    exclude — and they are **cacheable**, which a scoring clause can never be. Putting
+    `max_guests >= 4` in `must` is not wrong, exactly; it just makes every query slower and lets
+    "sleeps more people" quietly outrank "actually matches what you searched for".
+    """</code></pre>
+
+<h2>should, and the trap in it</h2>
+
+<p><code>should</code> means "may match", and its behaviour changes depending on what else is in the
+<code>bool</code>. This surprises everyone once.</p>
+
+<p><strong>With only <code>should</code> clauses</strong>, at least one must match &mdash;
+<code>minimum_should_match</code> defaults to 1, so it behaves as an OR:</p>
+
+<pre class="language-bash"><code class="language-bash">{"bool": {"should": [
+    {"term": {"property_type": "CABIN"}},
+    {"term": {"property_type": "LOFT"}}
+]}}
+# 3 hits: CABIN, CABIN, LOFT</code></pre>
+
+<p><strong>With a <code>must</code> or <code>filter</code> alongside</strong>,
+<code>minimum_should_match</code> defaults to <strong>0</strong>, and the should clauses become
+purely optional &mdash; they boost matching documents but exclude nothing:</p>
+
+<pre class="language-bash"><code class="language-bash">{"bool": {
+    "must":   [{"match_all": {}}],
+    "should": [{"term": {"property_type": "CABIN"}}]
+}}
+# 12 hits — all of them. The `should` filtered nothing.</code></pre>
+
+<p>Twelve, not two. Somebody expecting an AND-of-ORs writes this and gets back the entire index,
+with the cabins at the top so it briefly looks correct.</p>
+
+<p>The fix is to say what you mean rather than rely on a default that changes:</p>
+
+<pre class="language-json"><code class="language-json">{ "bool": {
+    "must":   [ { "match": { "title": "loft" } } ],
+    "should": [ { "term": { "property_type": "CABIN" } },
+                { "term": { "property_type": "LOFT" } } ],
+    "minimum_should_match": 1
+} }</code></pre>
+
+<p>Better still: if it is a requirement, it is not a <code>should</code>. Put the OR in its own
+nested <code>bool</code> inside <code>filter</code>, where it cannot be misread:</p>
+
+<pre class="language-json"><code class="language-json">{ "bool": { "filter": [
+    { "bool": { "should": [ { "term": { "property_type": "CABIN" } },
+                            { "term": { "property_type": "LOFT" } } ],
+                "minimum_should_match": 1 } }
+] } }</code></pre>
+
+<p>Verbose, and it says exactly one thing. Use <code>should</code> at the top level for what it is
+actually good at: optional signals that improve ranking &mdash; "boost listings with a hot tub"
+&mdash; without narrowing the results.</p>
+
+<h2>must_not</h2>
+
+<p><code>must_not</code> excludes, runs in filter context, and is cached.</p>
+
+<pre class="language-json"><code class="language-json">{ "bool": { "must_not": [ { "term": { "room_type": "SHARED_ROOM" } } ] } }</code></pre>
+
+<p>One thing to watch: <code>must_not</code> on a field means "does not have this value", and a
+document where the field is <em>absent</em> also does not have that value, so it matches. That is
+usually what you want and occasionally a surprise. Pair it with an <code>exists</code> filter when
+you mean "has the field, and it is not this".</p>
+
+<h2>term or terms: it is not a style choice</h2>
+
+<p>A filter panel with two amenity boxes ticked can be expressed two ways, and they mean different
+things.</p>
+
+<pre class="language-json"><code class="language-json">// OR — has wifi, or parking, or both
+{ "terms": { "amenities": ["wifi", "parking"] } }
+
+// AND — has both
+[ { "term": { "amenities": "wifi" } },
+  { "term": { "amenities": "parking" } } ]</code></pre>
+
+<p>A single <code>terms</code> clause is an OR. Ticking two boxes in a filter panel means "both", so
+StayHub emits one <code>term</code> per amenity:</p>
+
+<pre class="language-python"><code class="language-python">    if req.amenities:
+        # One `term` per amenity, so they AND together: "wifi AND parking". A single `terms` clause
+        # with the whole list would be OR — "wifi OR parking" — which is not what a filter panel
+        # means when a guest ticks two boxes.
+        groups["amenities"] = [{"term": {"amenities": slug}} for slug in req.amenities]</code></pre>
+
+<p>This is easy to get backwards, and the symptom is not an error &mdash; it is a filter panel that
+returns <em>more</em> results as the user narrows their criteria. Worth an explicit test.</p>
+
+<p>The interesting part is that both are correct in general: a <em>property type</em> panel usually
+does mean OR, because a listing has exactly one type and "cabin or loft" is the only sensible
+reading. Same widget, opposite semantics, decided by whether the underlying field is single- or
+multi-valued.</p>
+
+<h2>The filter that quietly matches the wrong things</h2>
+
+<p>A <code>term</code> filter on a <code>text</code> field is lesson 4's bug arriving in filter
+context, where it is harder to spot because filters are not usually the thing you debug.</p>
+
+<pre class="language-json"><code class="language-json">{ "term": { "city": "San Francisco" } }      // 0 hits
+{ "term": { "city": "san" } }                // matches every San-anything
+{ "term": { "city.raw": "San Francisco" } }  // correct</code></pre>
+
+<p>The middle one is the dangerous case: it returns results, so nothing looks broken, and it matches
+San Francisco, San Diego and San Jose alike. Filters go on <code>keyword</code> fields. If your
+filter is on a field without <code>.raw</code> or <code>.keyword</code> in the name, check the
+mapping.</p>
+
+<h2>The filter cache, concretely</h2>
+
+<p>Worth knowing what is actually cached, because the rules are not obvious.</p>
+
+<p>Elasticsearch caches filter results as a bitset per <strong>segment</strong>, not per index. It
+does this only for filters it has seen used repeatedly, and only on segments above a size threshold
+&mdash; caching a filter over a tiny segment that is about to be merged away is wasted work.</p>
+
+<p>Because segments are immutable, a cached bitset is never invalidated. New documents go into new
+segments, which get their own entries; merged segments discard the old ones. There is no staleness
+problem, which is the elegant part.</p>
+
+<p>What does <em>not</em> cache well:</p>
+
+<p><strong>Anything containing an unrounded <code>now</code></strong>. A range with
+<code>"gte": "now-1h"</code> is a different value every millisecond, so every request is a cache
+miss. Rounding fixes it: <code>"now-1h/m"</code> changes only once a minute, and
+<code>"now/d"</code> once a day. This one change can make a dashboard's queries an order of
+magnitude cheaper.</p>
+
+<p><strong>Very high-cardinality term filters</strong>, where each distinct value is used once
+&mdash; a filter on user id has no reuse to exploit.</p>
+
+<p><strong>Scripts and runtime fields</strong>, which have to be evaluated.</p>
+
+<p>Two habits follow. Round your date maths. And put the <em>reusable</em> filters in
+<code>filter</code> even when a query already narrows things down &mdash; a tenant filter or a
+status filter is used by every query and is exactly what the cache is for.</p>
+
+<h2>Nesting, and how deep is too deep</h2>
+
+<p><code>bool</code> composes: any clause can be another <code>bool</code>, so an arbitrary boolean
+expression is expressible. "A cabin or a loft, under $300, that is not a shared room, and either has
+a hot tub or sleeps six" is one structure:</p>
+
+<pre class="language-json"><code class="language-json">{ "bool": {
+  "must": [ { "match": { "description": "mountain" } } ],
+  "filter": [
+    { "bool": { "should": [ { "term": { "property_type": "CABIN" } },
+                            { "term": { "property_type": "LOFT" } } ],
+                "minimum_should_match": 1 } },
+    { "range": { "price_per_night": { "lt": 300 } } },
+    { "bool": { "should": [ { "term": { "amenities": "hot-tub" } },
+                            { "range": { "max_guests": { "gte": 6 } } } ],
+                "minimum_should_match": 1 } }
+  ],
+  "must_not": [ { "term": { "room_type": "SHARED_ROOM" } } ]
+} }</code></pre>
+
+<p>Note the inner <code>bool</code>s sit inside <code>filter</code>, so they inherit filter context
+and stay non-scoring even though they use <code>should</code>. That inheritance is the part people
+miss: <strong>context propagates downwards</strong>. A <code>match</code> nested three levels deep
+inside a <code>filter</code> does not score.</p>
+
+<p>There is a depth limit (<code>indices.query.bool.max_nested_depth</code>, 30 by default), and you
+will not reach it by hand. What you can reach is a query so deeply generated that nobody can read
+it, which is a maintainability problem rather than a performance one. If you are generating filters
+from user input, keep the generator flat and readable &mdash; group by control, as below, and
+flatten once.</p>
+
+<h2>constant_score</h2>
+
+<p>To run a query in filter context without a <code>bool</code>:</p>
+
+<pre class="language-json"><code class="language-json">{ "constant_score": { "filter": { "term": { "property_type": "CABIN" } }, "boost": 1.0 } }</code></pre>
+
+<p>Every match gets the same score. Useful when you want a scoring clause's <em>matching</em>
+behaviour without its ranking &mdash; and as a deliberate flattening: a browse page that should be
+ordered by price, not by an accidental relevance signal, is clearer as a
+<code>constant_score</code> than as a <code>bool</code> whose scores are then overridden by a
+<code>sort</code>.</p>
+
+<h2>Finding out which clause matched</h2>
+
+<p>Once a query has eight clauses, "why did this document come back" is a real question. Name the
+clauses:</p>
+
+<pre class="language-json"><code class="language-json">{ "bool": {
+    "must":   [ { "match": { "title": { "query": "cabin", "_name": "title_match" } } } ],
+    "filter": [ { "term": { "property_type": { "value": "CABIN", "_name": "is_cabin" } } } ]
+} }</code></pre>
+
+<p>Every hit then carries the list:</p>
+
+<pre class="language-json"><code class="language-json">"matched_queries": ["is_cabin", "title_match"]</code></pre>
+
+<p>This costs very little and it turns a guess into a fact. It is especially good with
+<code>should</code> clauses, where the whole question is which optional signals fired.</p>
+
+<h2>How StayHub assembles a filter set</h2>
+
+<p>The filters are built grouped by the control that produced them, rather than as a flat list:</p>
+
+<pre class="language-python"><code class="language-python">    groups: dict[str, list[dict[str, Any]]] = {}
+
+    if req.guests:
+        groups["guests"] = [{"range": {"max_guests": {"gte": req.guests}}}]
+
+    if req.min_price is not None or req.max_price is not None:
+        price_range: dict[str, float] = {}
+        if req.min_price is not None:
+            price_range["gte"] = float(req.min_price)
+        if req.max_price is not None:
+            price_range["lte"] = float(req.max_price)
+        groups["price"] = [{"range": {"price_per_night": price_range}}]
+
+    if req.property_type:
+        groups["property_type"] = [{"term": {"property_type": req.property_type}}]</code></pre>
+
+<p>Flattened into the query with one helper:</p>
+
+<pre class="language-python"><code class="language-python">def _flatten(groups: dict[str, list[dict[str, Any]]], *, exclude: str | None = None) -&gt; list[dict[str, Any]]:
+    return [clause for name, clauses in groups.items() if name != exclude for clause in clauses]</code></pre>
+
+<p>The <code>exclude</code> parameter is the reason for the grouping, and it is not tidiness. Lesson
+13 needs to rebuild the filter list <em>minus one group</em> for each facet, and a flat list cannot
+be un-filtered &mdash; once the clauses lose track of which control produced them, there is no way
+to ask "what would the results be without this one".</p>
+
+<p>That is a small design decision made early that turns a hard feature into an easy one, which is
+worth noticing.</p>
+
+<h3>Why the grouping is worth the extra indirection</h3>
+
+<p>A flat list is shorter to write and it forecloses a feature. Once the clauses are anonymous, the
+only thing you can do with them is send them; you cannot ask "what would this result set look like
+without the price filter", which is the question every facet count is secretly asking.</p>
+
+<p>The general shape is worth stealing regardless of Elasticsearch: when you build a query from
+several independent user controls, keep the association between control and clause until the last
+possible moment. It costs one dictionary and it keeps every "what if" question answerable.</p>
+
+<h2>One filter that is not there</h2>
+
+<p>StayHub never filters on <code>status</code>, even though the field is in the mapping:</p>
+
+<pre class="language-python"><code class="language-python">    # Only PUBLISHED documents are ever indexed (see indexer.py), so no status filter is needed
+    # here. That is the payoff for removing rather than flagging.</code></pre>
+
+<p>The alternative &mdash; index everything, filter at query time &mdash; works, and it costs a
+clause on every query forever, plus the risk that one query somewhere forgets it and leaks a draft
+listing into public results. Lesson 7 made that call on the write side; this is where the benefit
+shows up.</p>
+
+<p>It is the general principle for filters worth remembering: the cheapest filter is the one you can
+delete because the documents it excludes were never indexed.</p>
+
+<h2>Does clause order matter?</h2>
+
+<p>A reasonable question, and the answer is mostly no &mdash; with one caveat worth knowing.</p>
+
+<p>Within <code>filter</code>, Elasticsearch does not simply evaluate your clauses left to right. It
+estimates the cost of each and runs the cheap, selective ones first, using the results to skip work
+on the rest. A <code>term</code> filter matching 3 documents runs before a <code>range</code>
+matching 10,000, whatever order you wrote them in.</p>
+
+<p>So do not spend effort ordering filters for speed. Order them for readability &mdash; group them
+the way the UI groups them &mdash; and let the query planner do its job.</p>
+
+<p>The caveat is that this only works for clauses it can estimate. A <code>script</code> filter has
+no estimable cost, so it runs against everything that reaches it. If you must use one, make sure it
+sits alongside selective filters rather than being the only clause.</p>
+
+<h2>Testing filter logic</h2>
+
+<p>Filters are unusually worth unit testing, because the failures are silent: a wrong filter returns
+results, just the wrong ones. And they are unusually easy to test, because building the query body
+is a pure function of the request.</p>
+
+<pre class="language-python"><code class="language-python">    def test_amenities_and_together(self):
+        """Two ticked boxes mean "both", so two `term` clauses — not one `terms`, which is OR."""
+        filters = self._filters(amenities=["wifi", "parking"])
+        assert filters == [{"term": {"amenities": "wifi"}}, {"term": {"amenities": "parking"}}]</code></pre>
+
+<p>No cluster, no fixtures, runs in milliseconds, and it pins the exact decision that is easy to get
+backwards. A handful of these covering each control is the cheapest insurance in a search codebase.</p>
+
+<p>Worth pairing with a small number of tests that <em>do</em> hit a real cluster, for the claims a
+dict comparison cannot make &mdash; that two ticked amenities really do narrow rather than widen the
+result set:</p>
+
+<pre class="language-python"><code class="language-python">    def test_amenities_and_rather_than_or(self, index):
+        assert run(index, amenities=["wifi"]).total == 2
+        assert run(index, amenities=["wifi", "hot-tub"]).total == 1
+        assert run(index, amenities=["hot-tub", "kitchen"]).total == 0</code></pre>
+
+<h2>The rules, short</h2>
+
+<p>Free text in <code>must</code>. Everything else in <code>filter</code>. Never put a plain
+<code>should</code> next to a <code>must</code> and expect it to narrow anything &mdash; set
+<code>minimum_should_match</code> explicitly, or move the OR into a nested <code>bool</code> under
+<code>filter</code>. One <code>term</code> per value for AND, one <code>terms</code> for OR, chosen
+by what the UI means. Filters on <code>keyword</code> fields. Round your date maths.</p>
+
+<p>With filtering settled, the remaining question about <code>must</code> is what those scores
+actually are &mdash; and how to change them when the ranking is wrong.</p>

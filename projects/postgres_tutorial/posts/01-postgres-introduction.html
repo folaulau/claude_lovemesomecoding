@@ -1,0 +1,171 @@
+<p>PostgreSQL is an open-source relational database that has been shipping since 1996 and is
+owned by nobody — no single company can change its licence or its direction. That matters more
+than it sounds: it is the reason it turns up equally in a weekend project and in a bank.</p>
+
+<p>Most introductions stop at the feature list. This one covers the three mechanisms that explain
+almost every surprising thing Postgres does later in this track: <strong>one process per
+connection</strong>, the <strong>write-ahead log</strong>, and <strong>MVCC</strong>.</p>
+
+<h2>One process per connection</h2>
+
+<p>When your application opens a connection, the supervisor process forks a new operating-system
+process to serve it. Not a thread — a process, with its own memory.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT pid, backend_type, state, query
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend';</code></pre>
+
+<p>Each of those rows is a real process you could see in <code>ps</code>. A connection costs a
+few megabytes before it has done any work, and the default ceiling is deliberately low:</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW max_connections;   -- 100 out of the box</code></pre>
+
+<p>This is the single most common way a Postgres application falls over in production. A web app
+with 40 instances, each holding a pool of 10 connections, wants 400 backends from a database
+willing to give 100. The answer is not a bigger number — it is a connection pooler, and it gets a
+section of its own in the production post at the end of the track.</p>
+
+<h2>Cluster, database, schema, table</h2>
+
+<p>Four words that get used loosely everywhere else and precisely in the Postgres documentation.
+Getting them straight now saves an argument with an error message later.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Cluster            one running Postgres server, one data directory, one port
+ |
+ +-- Database       stayhub, stayhub_lab, postgres, template1
+      |             a connection is to ONE database and cannot see across
+      |
+      +-- Schema    public, or one per tenant/component
+           |
+           +-- Table, view, index, sequence, function</code></pre>
+
+<p>A "cluster" here has nothing to do with clustering for high availability. It is one server
+process managing one directory of files, serving several databases on one port.</p>
+
+<p>The important consequence is on the second line: <strong>a connection belongs to one
+database</strong>. There is no <code>USE otherdb</code>. If you come from MySQL, where a "database"
+is closer to what Postgres calls a schema, this is the first thing that will trip you — a query
+joining two Postgres databases does not work, and the answer is usually that they should have been
+two schemas.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT current_database(), current_schema, current_user;</code></pre>
+
+<p>Every table you create without saying otherwise lands in the <code>public</code> schema, and
+that default is worth revisiting before you go to production — the roles post covers why.</p>
+
+<h2>The write-ahead log</h2>
+
+<p>Postgres never writes your change straight to the table file. It writes a description of the
+change to the <strong>write-ahead log</strong> (WAL) first, flushes that to disk, and only then
+reports the commit as successful. The table file itself is updated later, in the background.</p>
+
+<p>Everything else follows from that ordering:</p>
+
+<ul>
+  <li><strong>Crash recovery</strong> — on restart, Postgres replays the WAL and rebuilds
+      everything the crash caught in memory.</li>
+  <li><strong>Replication</strong> — a replica is a server applying the primary's WAL stream.</li>
+  <li><strong>Point-in-time recovery</strong> — keep a base backup plus the WAL that followed it
+      and you can restore the database to any second in between.</li>
+  <li><strong>Commit latency</strong> — a <code>COMMIT</code> waits for a disk flush. This is why
+      inserting 10,000 rows in 10,000 transactions is so much slower than in one.</li>
+</ul>
+
+<h2>MVCC, and why VACUUM has to exist</h2>
+
+<p>Postgres uses <strong>multiversion concurrency control</strong>. An <code>UPDATE</code> does not
+overwrite a row. It writes a <em>new version</em> of the row and marks the old one as no longer
+visible to transactions that start after it.</p>
+
+<p>You can watch it happen. <code>ctid</code> is the physical location of a row version — block
+number and offset within the block:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TEMP TABLE t (id int, note text);
+INSERT INTO t VALUES (1, 'first');
+SELECT ctid, xmin, id, note FROM t;
+
+UPDATE t SET note = 'second' WHERE id = 1;
+SELECT ctid, xmin, id, note FROM t;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext"> ctid  | xmin | id | note
+-------+------+----+-------
+ (0,1) | 4667 |  1 | first
+
+ ctid  | xmin | id |  note
+-------+------+----+--------
+ (0,2) | 4667 |  1 | second</code></pre>
+
+<p>Same row, new address. The version at <code>(0,1)</code> is still on disk, invisible and taking
+up space. Two consequences run through the whole track:</p>
+
+<ul>
+  <li><strong>A reader never blocks a writer, and a writer never blocks a reader.</strong> A long
+      report reads the versions that were current when it started, while writes carry on beside
+      it. No read locks, and no <code>WITH (NOLOCK)</code> folklore.</li>
+  <li><strong>Dead row versions accumulate</strong>, and something has to reclaim them. That is
+      <code>VACUUM</code>, and the autovacuum daemon that runs it for you. A table that is updated
+      heavily and never vacuumed grows without its row count growing — the condition everyone
+      calls bloat. Autovacuum is on by default and mostly does the right thing; the two occasions
+      it does not are covered in the production post.</li>
+</ul>
+
+<h2>Which version to run</h2>
+
+<p>One major release a year, supported for five years from release. The version number is a single
+integer: 15, 16, 17. There is no meaningful reason to start a new project on anything but the
+newest major your managed provider offers, and every example in this track was run on:</p>
+
+<pre class="language-bash"><code class="language-bash">psql -U stayhub -d stayhub -c 'SHOW server_version;'
+# 16.15</code></pre>
+
+<p>Minor releases — 16.15 to 16.16 — are bug and security fixes only, and upgrading is a restart.
+Major upgrades rewrite the on-disk format and need <code>pg_upgrade</code> and a maintenance
+window, which is the argument for starting current rather than inheriting the problem.</p>
+
+<h2>Postgres or MySQL</h2>
+
+<p>Both are excellent and either will serve a normal application for years. The honest differences
+that have held for years and still hold:</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Postgres</th><th>MySQL (InnoDB)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Data types</td><td>Rich: arrays, ranges, <code>jsonb</code>, network and geometric
+        types, and you can add your own</td><td>The standard set plus JSON</td></tr>
+    <tr><td>Constraints</td><td><code>CHECK</code> and exclusion constraints enforced by the
+        database</td><td><code>CHECK</code> since 8.0; no exclusion constraints</td></tr>
+    <tr><td>Indexes</td><td>B-tree, GIN, GiST, BRIN, hash, partial, expression</td>
+        <td>B-tree, plus full-text and spatial</td></tr>
+    <tr><td>Writes</td><td>MVCC by copy — needs VACUUM</td><td>MVCC by undo log — needs purge</td></tr>
+    <tr><td>Extensions</td><td>PostGIS, pgvector, TimescaleDB and hundreds more</td>
+        <td>Plugins, far fewer</td></tr>
+    <tr><td>Replication</td><td>Physical and logical, built in</td><td>Mature, and simpler to
+        operate at large scale</td></tr>
+  </tbody>
+</table>
+
+<p>Choosing on benchmark numbers you read somewhere is choosing on noise — both are fast, and
+your schema will matter more than either. Three questions actually decide it:</p>
+
+<ol>
+  <li><strong>Is the shape of the data interesting?</strong> Geospatial, time series, documents
+      sitting beside relations, vectors for search. If yes, Postgres, and it is not close — that
+      is what the extension ecosystem is for.</li>
+  <li><strong>Do you want the database to refuse bad data, or the application to prevent it?</strong>
+      If the database, Postgres gives you more to work with, up to and including "no two bookings
+      may overlap at the same property" as a constraint the database enforces.</li>
+  <li><strong>Who runs it at 3am?</strong> A team with ten years of MySQL operational habits will
+      keep a MySQL cluster up better than a Postgres one, whatever the feature table says.</li>
+</ol>
+
+<h2>What this track covers</h2>
+
+<p>Eighteen posts, in order, each meant to be read in under ten minutes. Install and psql first,
+then roles, types and constraints, then the SQL you write daily, then <code>jsonb</code>, indexes
+and <code>EXPLAIN</code>, then transactions, migrations and the production checklist.</p>
+
+<p>Every query in the track is executed before it ships, against a copy of a real booking
+application's schema holding 400,000 bookings. When you see a query plan here, it is a plan
+Postgres actually chose.</p>

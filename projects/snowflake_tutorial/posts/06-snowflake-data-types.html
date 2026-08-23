@@ -1,0 +1,195 @@
+<p>Snowflake's type list is short, which is a relief after Postgres. Most of it needs no thought. But
+three areas — numbers, timestamps and <code>VARIANT</code> — produce real bugs, and they are the
+kind that pass every test and then go wrong in production against real data. This lesson is mostly
+about those three.</p>
+
+<h2>The list</h2>
+
+<table>
+<tr><th>Family</th><th>Types</th><th>Notes</th></tr>
+<tr><td>Numeric</td><td><code>NUMBER(p,s)</code>, <code>FLOAT</code></td><td><code>INT</code>,
+<code>BIGINT</code>, <code>DECIMAL</code>, <code>NUMERIC</code> are all aliases for
+<code>NUMBER</code>. <code>DOUBLE</code> and <code>REAL</code> alias <code>FLOAT</code>.</td></tr>
+<tr><td>String</td><td><code>VARCHAR(n)</code>, <code>STRING</code>,
+<code>TEXT</code></td><td>All the same type. Unicode, up to 16 MB.</td></tr>
+<tr><td>Binary</td><td><code>BINARY</code>, <code>VARBINARY</code></td><td>Up to 8 MB.</td></tr>
+<tr><td>Logical</td><td><code>BOOLEAN</code></td><td>True, false, or null.</td></tr>
+<tr><td>Date &amp; time</td><td><code>DATE</code>, <code>TIME</code>, <code>TIMESTAMP_NTZ</code>,
+<code>TIMESTAMP_LTZ</code>, <code>TIMESTAMP_TZ</code></td><td>Three timestamps. See below.</td></tr>
+<tr><td>Semi-structured</td><td><code>VARIANT</code>, <code>OBJECT</code>,
+<code>ARRAY</code></td><td>JSON, essentially. Lesson 9.</td></tr>
+<tr><td>Geospatial</td><td><code>GEOGRAPHY</code>, <code>GEOMETRY</code></td><td>Real, and out of
+scope here.</td></tr>
+<tr><td>Vector</td><td><code>VECTOR(type, n)</code></td><td>For similarity search and AI
+features.</td></tr>
+</table>
+
+<p>Note what is absent. There is no separate <code>SERIAL</code>, no enum, no array-of-typed-values
+in the Postgres sense — an <code>ARRAY</code> holds <code>VARIANT</code> elements — and no
+unsigned integers.</p>
+
+<h2>Numbers: use NUMBER for money, always</h2>
+
+<p><code>NUMBER(precision, scale)</code> is exact. <code>FLOAT</code> is IEEE 754 binary floating
+point and is not. The difference shows up the first time somebody sums a large column of currency
+and reconciles it against another system:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT 0.1::FLOAT + 0.2::FLOAT       AS float_sum,     -- 0.30000000000000004
+       0.1::NUMBER(10,2) + 0.2::NUMBER(10,2) AS exact_sum;   -- 0.30</code></pre>
+
+<p>So: <code>NUMBER(19,4)</code> or <code>NUMBER(12,2)</code> for money, always. Use
+<code>FLOAT</code> for measurements and scientific values where a fractional error is meaningless
+and speed matters.</p>
+
+<p>Two details save trouble later. <code>INT</code> is exactly <code>NUMBER(38,0)</code> — there is
+no separate small-integer type and no storage saving from pretending there is, because Snowflake
+compresses by the values actually present. And declaring a precision does not reserve space; a
+<code>NUMBER(38,0)</code> column holding only small values costs the same as
+<code>NUMBER(5,0)</code>. Declare precision for correctness, not for size.</p>
+
+<p>Watch the scale in division, though. It is the one arithmetic surprise:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Integer division keeps a limited scale by default.
+SELECT 10 / 3;                          -- 3.333333
+SELECT (10 / 3)::NUMBER(20,10);         -- 3.3333330000  &mdash; precision already lost
+SELECT 10::NUMBER(20,10) / 3;           -- 3.3333333333  &mdash; cast BEFORE dividing</code></pre>
+
+<h2>Strings: VARCHAR(n) buys you validation, not space</h2>
+
+<p><code>VARCHAR</code>, <code>STRING</code> and <code>TEXT</code> are one type. The maximum length
+is 16,777,216 characters, and <code>VARCHAR</code> with no length is exactly that maximum.</p>
+
+<p>Crucially, <strong>the declared length does not affect storage or performance.</strong>
+<code>VARCHAR(10)</code> and <code>VARCHAR(16777216)</code> holding "hello" occupy the same space.
+The only thing a length gives you is a rejection when something longer arrives:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE t (code VARCHAR(3));
+INSERT INTO t VALUES ('ABCD');
+-- String 'ABCD' is too long and would be truncated in column 'CODE'</code></pre>
+
+<p>Which is a feature when the column really is a three-letter code, and an obstacle when a supplier
+starts sending four. Constrain what is genuinely constrained; leave the rest as
+<code>STRING</code>.</p>
+
+<h2>Timestamps: pick one and standardise</h2>
+
+<p>This is the type decision that causes the most confusion, because the three variants look
+interchangeable and behave differently.</p>
+
+<table>
+<tr><th>Type</th><th>Stores</th><th>Behaviour</th></tr>
+<tr><td><code>TIMESTAMP_NTZ</code></td><td>Wall-clock time, no zone</td><td>What you put in is what
+you get out, anywhere.</td></tr>
+<tr><td><code>TIMESTAMP_LTZ</code></td><td>An absolute instant</td><td>Displayed in the
+<em>session's</em> time zone. Two users see different text for one stored value.</td></tr>
+<tr><td><code>TIMESTAMP_TZ</code></td><td>An instant plus the original offset</td><td>Preserves the
+zone the value arrived with.</td></tr>
+</table>
+
+<p><code>TIMESTAMP</code> on its own is an alias controlled by the
+<code>TIMESTAMP_TYPE_MAPPING</code> parameter, which defaults to <code>TIMESTAMP_NTZ</code>. That
+default is fine, but relying on a parameter someone can change is not — write the variant you mean.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE events (
+  event_id     INT,
+  occurred_at  TIMESTAMP_NTZ,   -- explicitly stored in UTC by convention
+  loaded_at    TIMESTAMP_LTZ    -- an instant; display follows the reader
+);
+
+-- The session zone changes what LTZ shows, and nothing about what is stored.
+ALTER SESSION SET TIMEZONE = 'America/Los_Angeles';
+SELECT loaded_at FROM events;
+
+ALTER SESSION SET TIMEZONE = 'UTC';
+SELECT loaded_at FROM events;   -- same row, different text</code></pre>
+
+<p>The recommendation, for a warehouse anyone else will query: <strong>store UTC in
+<code>TIMESTAMP_NTZ</code> and convert at the edges.</strong> It makes every value mean the same
+thing regardless of who is querying, and it makes date arithmetic reproducible. Use
+<code>TIMESTAMP_LTZ</code> deliberately, when you want the display to follow the reader; use
+<code>TIMESTAMP_TZ</code> when the originating offset is data you must not lose.</p>
+
+<p>The conversion functions worth knowing:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT CONVERT_TIMEZONE('UTC', 'America/New_York', occurred_at) AS local_time,
+       DATE_TRUNC('month', occurred_at)                          AS month,
+       DATEADD('day', -7, occurred_at)                           AS a_week_earlier,
+       DATEDIFF('hour', occurred_at, CURRENT_TIMESTAMP())        AS hours_ago
+FROM   events;</code></pre>
+
+<h2>VARIANT: the type that holds anything</h2>
+
+<p>A <code>VARIANT</code> column stores any of the other types, and in practice stores JSON. It is
+what makes Snowflake pleasant with semi-structured data — you can load a JSON document without
+designing a schema for it and still query it in SQL.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE raw_events (payload VARIANT);
+
+INSERT INTO raw_events
+SELECT PARSE_JSON('{"user": {"id": 42, "email": "a@example.com"},
+                    "tags": ["beta", "eu"], "score": 9.5}');
+
+SELECT payload:user.id::INT       AS user_id,
+       payload:user.email::STRING AS email,
+       payload:tags[0]::STRING    AS first_tag
+FROM   raw_events;</code></pre>
+
+<p><strong>The cast is not optional.</strong> Without <code>::STRING</code>, a text value comes back
+as a VARIANT still carrying its JSON quotes — <code>"a@example.com"</code>, with the quote marks
+part of the value — and every comparison and join against it silently fails to match. This is the
+single most common semi-structured bug, and lesson 9 goes through it properly along with
+<code>FLATTEN</code>.</p>
+
+<p>A <code>VARIANT</code> holds up to 16 MB compressed per row, so it is not a place to put a large
+document.</p>
+
+<h2>What a type does not control</h2>
+
+<p>Coming from a row-store, it is natural to assume the type declaration drives storage layout and
+therefore performance. In Snowflake it largely does not, and knowing that removes a whole category
+of premature optimisation.</p>
+
+<p>Data is stored columnar and compressed per micro-partition, and the compression is chosen from
+the values actually present. A <code>NUMBER(38,0)</code> column holding order ids under a million
+compresses to about what <code>NUMBER(20,0)</code> would. A <code>STRING</code> column holding
+two-letter country codes compresses to almost nothing regardless of the declared maximum.</p>
+
+<p>So the reasons to declare a narrow type are correctness reasons, not storage ones:</p>
+
+<ul>
+<li>A length or precision limit <strong>rejects bad data at load time</strong>, which is usually
+where you want to find out.</li>
+<li>The declared type is <strong>documentation</strong> that survives the person who wrote the
+pipeline.</li>
+<li>Downstream tools — BI, dbt, an ORM — read the type and generate from it.</li>
+</ul>
+
+<p>The one place type choice does affect performance is the column you filter on. Comparing a
+<code>DATE</code> against a <code>DATE</code> lets partition pruning work; storing dates as strings
+and comparing them against string literals mostly works too, until somebody writes
+<code>'2024-1-5'</code> and the ordering silently stops being chronological.</p>
+
+<h2>Casting and NULLs</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT '42'::INT,                     -- 42
+       CAST('42' AS INT),             -- the same thing, ANSI spelling
+       TRY_CAST('banana' AS INT),     -- NULL, no error
+       '42'::INT;                     -- errors on 'banana'</code></pre>
+
+<p><code>TRY_CAST</code> and its siblings — <code>TRY_TO_NUMBER</code>,
+<code>TRY_TO_DATE</code>, <code>TRY_TO_TIMESTAMP</code> — return <code>NULL</code> instead of
+failing. In a loading pipeline that is usually what you want: land the row, flag the bad value, and
+keep going rather than aborting a batch of a million because one field was empty.</p>
+
+<p>One Snowflake-specific null trap. Semi-structured data has two kinds of nothing: SQL
+<code>NULL</code>, meaning absent, and JSON <code>null</code>, which is a value. They are not equal
+to each other, and <code>IS NULL</code> does not catch the second:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT PARSE_JSON('null')            IS NULL AS json_null_is_sql_null,  -- FALSE
+       PARSE_JSON('{"a": 1}'):b      IS NULL AS missing_key_is_null,    -- TRUE
+       IS_NULL_VALUE(PARSE_JSON('null'))     AS is_json_null;           -- TRUE</code></pre>
+
+<p>If a filter on JSON data is dropping rows you expected, this is usually why.</p>
+
+<p>Next: <a href="/snowflake/snowflake-loading-data">loading data</a> — stages,
+<code>COPY INTO</code>, and why file size matters more than you would guess.</p>

@@ -1,0 +1,196 @@
+<p>An aggregate collapses rows. A window function keeps every row and adds a column computed from
+its neighbours. That one difference covers running totals, rankings, "compare this row to the
+previous one", and top-N-per-group.</p>
+
+<h2>The difference, in one query</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT b.id, b.total,
+       avg(b.total) OVER ()               AS avg_all,       -- 400,000 rows out
+       b.total - avg(b.total) OVER ()     AS vs_average
+FROM   bookings b
+WHERE  b.status = 'CONFIRMED'
+LIMIT  5;</code></pre>
+
+<p><code>OVER ()</code> is what makes it a window function. Without it, <code>avg(b.total)</code>
+would be an aggregate and the query would return one row. With it, the average is computed across
+the window and attached to every row.</p>
+
+<h2>PARTITION BY</h2>
+
+<p><code>PARTITION BY</code> is <code>GROUP BY</code> for windows — it restarts the calculation per
+group, without collapsing anything:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.city, p.title, p.price_per_night,
+       round(avg(p.price_per_night) OVER (PARTITION BY p.city), 2) AS city_avg,
+       count(*)      OVER (PARTITION BY p.city)                    AS in_city
+FROM   properties p
+WHERE  p.status = 'PUBLISHED' AND p.city IN ('Oslo', 'Lisbon')
+ORDER  BY p.city, p.price_per_night DESC
+LIMIT  6;</code></pre>
+
+<p>Every row keeps its own price and gains its city's average beside it. Doing that with
+<code>GROUP BY</code> takes a subquery and a join.</p>
+
+<h2>Ranking, and picking the right one</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT city, title, price_per_night,
+       row_number() OVER w AS row_number,
+       rank()       OVER w AS rank,
+       dense_rank() OVER w AS dense_rank
+FROM   properties
+WHERE  status = 'PUBLISHED' AND city = 'Oslo'
+WINDOW w AS (ORDER BY price_per_night DESC)
+LIMIT  8;</code></pre>
+
+<table>
+  <thead><tr><th>Function</th><th>On a tie</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td><code>row_number()</code></td><td>Arbitrary distinct numbers</td><td>Deduplication,
+        pagination cursors. Never for a leaderboard.</td></tr>
+    <tr><td><code>rank()</code></td><td>Same number, then a gap</td><td>Competition ranking —
+        two firsts, then third.</td></tr>
+    <tr><td><code>dense_rank()</code></td><td>Same number, no gap</td><td>"Which price band is
+        this" — two firsts, then second.</td></tr>
+    <tr><td><code>ntile(4)</code></td><td>Splits into equal buckets</td><td>Quartiles.</td></tr>
+  </tbody>
+</table>
+
+<p>The <code>WINDOW w AS (…)</code> clause is worth the habit: define the window once, use it in
+every column, and change it in one place.</p>
+
+<p><code>row_number()</code> is not deterministic when the <code>ORDER BY</code> has ties — two
+rows with the same price can swap between runs. If the numbering is stored or paged on, add a
+unique tiebreaker: <code>ORDER BY price_per_night DESC, id</code>.</p>
+
+<h2>Top-N per group</h2>
+
+<p>The query that makes the whole feature worth learning. The three most expensive properties in
+each city:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT city, title, price_per_night
+FROM (
+    SELECT city, title, price_per_night,
+           row_number() OVER (PARTITION BY city ORDER BY price_per_night DESC, id) AS rn
+    FROM   properties
+    WHERE  status = 'PUBLISHED'
+) ranked
+WHERE  rn <= 3
+ORDER  BY city, price_per_night DESC
+LIMIT  9;</code></pre>
+
+<p>The subquery is not optional. A window function is computed <em>after</em> <code>WHERE</code>,
+so you cannot filter on <code>rn</code> in the same query level — that ordering is why
+<code>WHERE rn &lt;= 3</code> fails with "column rn does not exist".</p>
+
+<p>Compare it with the <code>LATERAL</code> version from the joins post: this one ranks every
+property and throws most away, while <code>LATERAL</code> seeks the top three per city and stops.
+When the groups are few and large, <code>LATERAL</code> with a matching index wins; when you need
+the rank itself, or the groups are many and small, this one does.</p>
+
+<h2>Running totals and the frame</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT b.check_in, b.total,
+       sum(b.total) OVER (ORDER BY b.check_in, b.id
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+FROM   bookings b
+WHERE  b.property_id = 42
+ORDER  BY b.check_in, b.id
+LIMIT  6;</code></pre>
+
+<p>The <code>ROWS BETWEEN</code> clause is the <strong>frame</strong>: which rows of the partition
+this row's calculation sees. It is also the source of the most common surprise in this post.</p>
+
+<p><strong>Adding <code>ORDER BY</code> to a window changes the default frame.</strong> With no
+<code>ORDER BY</code>, the frame is the whole partition. With one, the default becomes
+<code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> — so
+<code>avg(x) OVER (ORDER BY d)</code> is a running average, not the overall one. That is rarely
+what someone means the first time they write it.</p>
+
+<p>And <code>RANGE</code> is not <code>ROWS</code>. <code>RANGE</code> includes every row that ties
+on the ordering value, so with duplicate dates a "running total" jumps to the day's full total on
+the first row of the day. Write <code>ROWS</code> when you mean rows.</p>
+
+<pre class="language-sql"><code class="language-sql">-- a 3-row moving average, centred
+SELECT b.check_in, b.total,
+       round(avg(b.total) OVER (ORDER BY b.check_in, b.id
+                                ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), 2) AS moving_avg
+FROM   bookings b
+WHERE  b.property_id = 42
+ORDER  BY b.check_in, b.id
+LIMIT  6;</code></pre>
+
+<h2>Comparing a row to its neighbours</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT check_in, total,
+       lag(total)  OVER w                    AS previous,
+       total - lag(total) OVER w             AS change,
+       first_value(total) OVER w             AS first_of_series
+FROM   bookings
+WHERE  property_id = 42
+WINDOW w AS (ORDER BY check_in, id)
+ORDER  BY check_in, id
+LIMIT  6;</code></pre>
+
+<p><code>lag()</code> reaches backwards, <code>lead()</code> forwards; both take an offset and a
+default — <code>lag(total, 1, 0)</code> gives 0 rather than NULL on the first row, which keeps the
+arithmetic from turning into NULL.</p>
+
+<p>Note the third column. <code>first_value()</code> respects the frame, and the default frame here
+ends at the current row — so <code>last_value()</code> in the same window returns the current row,
+not the last of the partition. That is the second frame surprise, and the fix is to say what you
+meant: <code>ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING</code>.</p>
+
+<h2>Deduplication</h2>
+
+<p>The most useful thing in this post that is not a report. Given rows that should be unique and
+are not, keep one of each and delete the rest — with the <code>ORDER BY</code> deciding which one
+survives:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH duplicates AS (
+    SELECT id,
+           row_number() OVER (PARTITION BY property_id, check_in
+                              ORDER BY created_at DESC, id DESC) AS rn
+    FROM   bookings
+)
+SELECT count(*) AS would_delete FROM duplicates WHERE rn > 1;</code></pre>
+
+<p>Run it as a <code>SELECT</code> first, every time. Turning it into
+<code>DELETE FROM bookings WHERE id IN (SELECT id FROM duplicates WHERE rn &gt; 1)</code> is one
+edit, and the <code>PARTITION BY</code> list is the definition of "duplicate" — get it wrong and
+you delete rows that were not.</p>
+
+<h2>Windows over aggregates</h2>
+
+<p>Because window functions run after grouping, they can be applied to aggregate results. This
+ranks cities by revenue and gives each its share of the total, in one pass:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.city,
+       count(*)                                              AS stays,
+       round(sum(b.total), 2)                                AS revenue,
+       rank() OVER (ORDER BY sum(b.total) DESC)              AS by_revenue,
+       round(100 * sum(b.total) / sum(sum(b.total)) OVER (), 1) AS pct_of_total
+FROM   bookings b
+JOIN   properties p ON p.id = b.property_id
+WHERE  b.status = 'CONFIRMED'
+GROUP  BY p.city
+ORDER  BY revenue DESC
+LIMIT  5;</code></pre>
+
+<p><code>sum(sum(b.total)) OVER ()</code> is not a typo. The inner <code>sum</code> is the
+aggregate producing each city's revenue; the outer one is a window function totalling those
+results. Nested like that it is legal exactly once — you cannot nest a window function inside
+another.</p>
+
+<h2>Where they run</h2>
+
+<p>Window functions run after <code>WHERE</code>, <code>GROUP BY</code> and
+<code>HAVING</code>, and before <code>ORDER BY</code> and <code>LIMIT</code>. So they can see
+aggregate results — <code>rank() OVER (ORDER BY count(*) DESC)</code> in a grouped query is legal
+and useful — and they cannot be filtered on without another query level.</p>
+
+<p>They also run after <code>LIMIT</code> has <em>not</em> yet been applied, which is worth saying
+out loud: a window function over a query with <code>LIMIT 10</code> sees every row the
+<code>WHERE</code> clause allowed, not ten. That is what makes <code>avg(total) OVER ()</code>
+beside a ten-row page the average of everything rather than of the page — usually what you wanted,
+and occasionally an expensive surprise on a large table, because the whole set has to be computed
+to produce ten rows.</p>

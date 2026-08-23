@@ -1,0 +1,393 @@
+<p>Almost every "why does my search return nothing?" is the same bug. The analyzer that ran when the
+document was indexed and the analyzer that ran on the query produced different terms, so nothing
+matched &mdash; and because both sides look correct, you can stare at the query for an hour.</p>
+
+<p>This lesson is about seeing the terms instead of guessing at them.</p>
+
+<h2>What an analyzer is</h2>
+
+<p>An analyzer turns a string into a list of terms. It has exactly three stages, always in this
+order:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   "&lt;p&gt;Sunlit &lt;b&gt;Loft&lt;/b&gt;&lt;/p&gt;"
+        |
+        v   character filters   (0 or more)  — rewrite the raw string
+   "Sunlit Loft"
+        |
+        v   tokenizer           (exactly 1)  — split it into tokens
+   ["Sunlit", "Loft"]
+        |
+        v   token filters       (0 or more)  — change, add or drop tokens
+   ["sunlit", "loft"]</code></pre>
+
+<p><strong>Character filters</strong> operate on the whole string before anything is split. The
+common one is <code>html_strip</code>, which removes markup:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/_analyze -H 'Content-Type: application/json' -d '{
+  "tokenizer": "standard",
+  "char_filter": ["html_strip"],
+  "text": "<p>Sunlit <b>Loft</b></p>"
+}'
+# ["Sunlit", "Loft"]</code></pre>
+
+<p><strong>The tokenizer</strong> decides where the boundaries are. There is exactly one, and it is
+the decision that matters most, because no later filter can put back a distinction the tokenizer
+threw away.</p>
+
+<p><strong>Token filters</strong> then reshape the tokens: lowercase them, strip accents, remove
+stop words, stem them, add synonyms.</p>
+
+<h2>The _analyze API</h2>
+
+<p>This is the tool. It runs an analyzer and shows you the tokens, without indexing anything.</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/_analyze -H 'Content-Type: application/json' \
+  -d '{"analyzer": "standard", "text": "wi-fi Loft #2"}'</code></pre>
+
+<p>Compare a few tokenizers on the same input and the point of choosing one becomes obvious:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">standard      ['wi', 'fi', 'loft', '2']
+whitespace    ['wi-fi', 'enabled', 'loft', '#2']
+keyword       ['wi-fi enabled loft #2']
+simple        ['wi', 'fi', 'loft']</code></pre>
+
+<p><code>standard</code> split the hyphen and kept the digit. <code>whitespace</code> kept the
+hyphen and the hash but did not lowercase &mdash; it is a tokenizer with no filters.
+<code>keyword</code> produced one token, which is the "analyzer" a <code>keyword</code> field
+effectively uses. <code>simple</code> dropped the digit entirely, because it splits on anything
+that is not a letter.</p>
+
+<p>If your search for "wi-fi" fails, one of those four behaviours is why, and thirty seconds with
+<code>_analyze</code> tells you which.</p>
+
+<h3>Analysing by field, which is the one you want</h3>
+
+<p>Naming an analyzer tests an analyzer. Naming a <em>field</em> tests what your index is actually
+doing:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/stayhub-properties/_analyze -H 'Content-Type: application/json' \
+  -d '{"field": "city", "text": "San Francisco"}'
+# ['san', 'francisco']
+
+curl -s localhost:9200/stayhub-properties/_analyze -H 'Content-Type: application/json' \
+  -d '{"field": "city.raw", "text": "San Francisco"}'
+# ['San Francisco']</code></pre>
+
+<p>Same input, same document, two fields, two completely different indexes behind them. That is the
+multi-field from lesson 3 made visible, and it is why aggregations use <code>city.raw</code> and
+matching uses <code>city</code>.</p>
+
+<h3>explain: true, when the tokens are not enough</h3>
+
+<p>Add <code>"explain": true</code> and you get the output of every stage rather than just the end:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/stayhub-properties/_analyze -H 'Content-Type: application/json' \
+  -d '{"analyzer": "stayhub_text", "text": "Málaga LOFTS", "explain": true}'</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">tokenizer: standard       ['Málaga', 'LOFTS']
+filter:    lowercase      ['málaga', 'lofts']
+filter:    asciifolding   ['malaga', 'lofts']</code></pre>
+
+<p>You can see the accent survive the tokenizer, survive lowercasing, and disappear at
+<code>asciifolding</code>. When a custom analyzer does something you did not expect, this shows you
+which filter did it.</p>
+
+<h2>The built-in analyzers</h2>
+
+<p><code>standard</code> is the default and a good one: Unicode-aware word splitting, lowercasing,
+no stop words. Use it until you have a reason not to.</p>
+
+<p><code>english</code> (and its equivalents for other languages) adds stop words and stemming, and
+the difference is dramatic:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">standard   "The Cabins are Running"  ->  ['the', 'cabins', 'are', 'running']
+english    "The Cabins are Running"  ->  ['cabin', 'run']</code></pre>
+
+<p>Four tokens become two. "the" and "are" are dropped as stop words; "cabins" is stemmed to
+<code>cabin</code> and "running" to <code>run</code>. Now a search for "cabin" finds documents
+containing "cabins", which is usually what a user means.</p>
+
+<p>Usually. Stemming is lossy and occasionally embarrassing &mdash; it is an algorithm, not a
+dictionary, so it produces stems that are not words and sometimes collapses words that should stay
+apart. And stop words mean a search for the band "The The" finds nothing at all.</p>
+
+<p>Whether to use a language analyzer depends on the field. Descriptions: yes. Titles, where the
+exact words matter more: often not. Names, product codes, cities: no.</p>
+
+<h2>Building your own</h2>
+
+<p>A custom analyzer is a named combination, declared in the index settings:</p>
+
+<pre class="language-python"><code class="language-python">        "analysis": {
+            "analyzer": {
+                "stayhub_text": {
+                    "type": "custom",
+                    "tokenizer": "standard",
+                    "filter": ["lowercase", "asciifolding"],
+                }
+            }
+        },</code></pre>
+
+<p>Then a field asks for it by name:</p>
+
+<pre class="language-python"><code class="language-python">            "title": {"type": "text", "analyzer": "stayhub_text"},</code></pre>
+
+<p>Two filters, and the second one is doing real work. <code>asciifolding</code> strips diacritics,
+so "M&aacute;laga" is indexed as <code>malaga</code> &mdash; and a guest who does not type the
+accent, which is most of them, still finds the listing. Without it they get nothing and conclude
+the city has no listings.</p>
+
+<p>The order matters and is not arbitrary: filters run in sequence, so
+<code>["lowercase", "asciifolding"]</code> lowercases first. With most Latin text either order
+works; with Turkish dotted and dotless I it does not, which is the general warning about assuming
+filter order does not matter.</p>
+
+<h3>The tokenizers worth knowing by name</h3>
+
+<p>There are a dozen or so. Five cover nearly everything.</p>
+
+<p><code>standard</code> splits on word boundaries using the Unicode text segmentation rules. It
+handles most languages sensibly and is the right default.</p>
+
+<p><code>keyword</code> emits the input unchanged as a single token. Useless on its own, and the
+building block for a normalizer &mdash; keyword tokenizer plus <code>lowercase</code> gives you
+case-insensitive exact matching.</p>
+
+<p><code>whitespace</code> splits only on whitespace, keeping punctuation attached. Right for
+identifiers and code-like values where <code>ORD-1234</code> must stay one token.</p>
+
+<p><code>pattern</code> splits on a regular expression, which is the escape hatch for a format
+nothing else understands.</p>
+
+<p><code>edge_ngram</code> emits every prefix, which is the autocomplete building block shown
+below. Its sibling <code>ngram</code> emits every substring, which supports
+"contains" matching and produces an enormous index &mdash; a 20-character field with
+<code>min_gram: 2, max_gram: 20</code> is hundreds of terms per value. Reach for it knowingly.</p>
+
+<p>Worth adding <code>path_hierarchy</code> to the list, because it solves a problem people
+usually solve badly: it turns <code>/us/ca/san-francisco</code> into <code>/us</code>,
+<code>/us/ca</code>, <code>/us/ca/san-francisco</code>, so a filter on any level of a hierarchy is
+one term query.</p>
+
+<h3>Positions, and why phrase search depends on them</h3>
+
+<p>An analyzer emits more than the token text. Each token carries a <strong>position</strong> and
+character <strong>offsets</strong>, and both matter.</p>
+
+<p>Positions are what make <code>match_phrase</code> possible. Searching for the phrase
+"mountain views" is really "the term <code>mountain</code> at some position <em>n</em>, and
+<code>views</code> at <em>n+1</em>". If a token filter removes or reorders tokens, the positions
+shift and phrases break in ways that look arbitrary.</p>
+
+<p>The classic instance is stop words. Remove "the" from "the mission" at index time and the two
+remaining terms sit next to each other; a phrase search for "in the mission" then depends on
+whether the query side removed it too. This is the real reason modern advice is to leave stop words
+in and let BM25 handle common terms &mdash; it does that well, and it never breaks a phrase.</p>
+
+<p>Offsets are what highlighting uses to find the original substring to wrap in
+<code>&lt;mark&gt;</code>. A character filter that changes the string length &mdash; such as
+<code>html_strip</code> &mdash; adjusts offsets so highlighting still lands on the right characters
+in the original text.</p>
+
+<h2>The bug, in full</h2>
+
+<p>Analysis happens twice: once when a document is indexed, once when a query runs. Elasticsearch
+uses the field's analyzer for both, which is why this mostly works without thinking about it.</p>
+
+<p>You can override the query side, and that is where it goes wrong. Here is an index whose field
+uses one analyzer to index and a different one to search:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "settings": { "analysis": { "analyzer": {
+      "idx": { "tokenizer": "standard", "filter": ["lowercase"] },
+      "qry": { "tokenizer": "standard", "filter": ["lowercase", "asciifolding"] }
+  } } },
+  "mappings": { "properties": {
+      "t": { "type": "text", "analyzer": "idx", "search_analyzer": "qry" }
+  } }
+}</code></pre>
+
+<p>Index "M&aacute;laga" and search for it. Both ways:</p>
+
+<pre class="language-bash"><code class="language-bash">query 'malaga'  ->  0 hits
+query 'málaga'  ->  0 hits</code></pre>
+
+<p>Zero for both &mdash; <em>including</em> the query where the user spelled it exactly as it is
+stored. Work it through: the index holds <code>málaga</code>, because <code>idx</code> does not
+fold. Every query goes through <code>qry</code>, which folds, so both queries become
+<code>malaga</code>. That term is not in the index. Nothing can ever match this field.</p>
+
+<p>No error, no warning, no clue in the query. The only thing that reveals it is running
+<code>_analyze</code> on both sides and noticing they disagree.</p>
+
+<h3>When a different search analyzer is right</h3>
+
+<p>The feature exists for a reason: autocomplete. Index with an <code>edge_ngram</code> filter so
+"cabin" is stored as every prefix &mdash;</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">edge_ngram(2,6) "cabin"  ->  ['ca', 'cab', 'cabi', 'cabin']</code></pre>
+
+<p>&mdash; and search with a plain analyzer, so a user typing "cab" produces the single term
+<code>cab</code> and matches. If you n-grammed the query too, "cab" would become
+<code>['ca', 'cab']</code> and start matching things it should not.</p>
+
+<p>That is the rule: a different search analyzer is correct when it is <em>deliberately</em>
+narrower than the index one. It is a bug whenever the two merely drifted apart.</p>
+
+<h2>Two traps that follow</h2>
+
+<h3>keyword fields are not analysed at all</h3>
+
+<p>No analyzer runs, so <code>lowercase</code> does not apply and neither does
+<code>asciifolding</code>. A <code>keyword</code> field holding <code>"Cabin"</code> will never
+match <code>"cabin"</code>.</p>
+
+<p>The fix for keyword fields is a <strong>normalizer</strong>, which is an analyzer with no
+tokenizer &mdash; character filters and token filters only, producing exactly one token:</p>
+
+<pre class="language-json"><code class="language-json">{ "settings": { "analysis": { "normalizer": {
+      "lowercase_exact": { "type": "custom", "filter": ["lowercase", "asciifolding"] }
+} } } }</code></pre>
+
+<p>Use it on email addresses, usernames and slugs, where you want exactness and case-insensitivity
+at the same time.</p>
+
+<h3>Changing an analyzer does nothing to existing documents</h3>
+
+<p>This is lesson 3's constraint wearing a different hat. Analysis happens at write time, so the
+terms in the index were produced by whatever the analyzer was <em>then</em>. Change it and the old
+documents keep their old terms.</p>
+
+<p>Worse, the change is not even allowed on an open index &mdash; adding an analyzer requires
+closing the index, and pointing an existing field at a different one is refused outright, because
+it would make the field's stored terms unreachable.</p>
+
+<p>So the sequence for an analysis change is always: new index, new mapping, reindex, swap. Which
+is lesson 15, and is the third time in five lessons that the answer has been the same. That
+repetition is the argument for reading lesson 15 before you need it.</p>
+
+<h2>A worked example: autocomplete</h2>
+
+<p>Putting the pieces together on a real requirement &mdash; a city box that suggests as the user
+types.</p>
+
+<pre class="language-json"><code class="language-json">{
+  "settings": { "analysis": {
+    "filter": {
+      "city_prefix": { "type": "edge_ngram", "min_gram": 2, "max_gram": 15 }
+    },
+    "analyzer": {
+      "city_index":  { "tokenizer": "standard",
+                       "filter": ["lowercase", "asciifolding", "city_prefix"] },
+      "city_search": { "tokenizer": "standard",
+                       "filter": ["lowercase", "asciifolding"] }
+    }
+  } },
+  "mappings": { "properties": {
+    "city_suggest": { "type": "text",
+                      "analyzer": "city_index",
+                      "search_analyzer": "city_search" }
+  } }
+}</code></pre>
+
+<p>"San Francisco" is indexed as <code>sa, san, fr, fra, fran, franc, ...</code> &mdash; every
+prefix of every token. A user typing <code>fran</code> produces the single term <code>fran</code>,
+which matches. Typing <code>f</code> produces nothing, because <code>min_gram</code> is 2; that is
+deliberate, since one-letter prefixes match nearly everything and are not worth the index.</p>
+
+<p>Three things this gets right that the naive version does not. The
+<code>search_analyzer</code> does <em>not</em> n-gram, for the reason above. Accents are folded on
+both sides, so typing "malaga" suggests "M&aacute;laga". And because this is an ordinary
+<code>text</code> field, the suggestions can be combined with the user's other filters in the same
+<code>bool</code> query &mdash; which the dedicated <code>completion</code> type cannot easily do.</p>
+
+<p>The cost is index size. Every value becomes a dozen or more terms. On a field of city names that
+is nothing; do the same to descriptions and the index will surprise you.</p>
+
+<h2>More than one language</h2>
+
+<p>If your content is in several languages, one analyzer cannot be right for all of it &mdash; an
+English stemmer applied to German produces nonsense. Two approaches work.</p>
+
+<p><strong>A field per language</strong>, populated by whichever one applies:
+<code>description_en</code>, <code>description_es</code>, each with its own analyzer, queried with
+a <code>multi_match</code> across all of them. Simple, and the mapping grows with the languages you
+support.</p>
+
+<p><strong>An index per language</strong>, with the same field names, searched together through an
+alias or a comma-separated index list. Better when the languages have very different volumes, since
+each index can be sized independently.</p>
+
+<p>What does not work is guessing the language at query time from the query itself. Two words are
+not enough to identify a language, and a wrong guess applies the wrong stemmer to everything.</p>
+
+<h2>Synonyms, briefly</h2>
+
+<p>A synonym filter maps terms to other terms:</p>
+
+<pre class="language-json"><code class="language-json">{ "filter": { "stay_synonyms": {
+    "type": "synonym_graph",
+    "synonyms": ["flat, apartment", "cabin, cottage, chalet"]
+} } }</code></pre>
+
+<p>Two decisions come with it. <strong>Index-time or query-time?</strong> Query-time is almost
+always right &mdash; a synonym list changes often, and at query time changing it takes effect
+immediately instead of requiring a reindex. Use <code>synonym_graph</code> in the
+<code>search_analyzer</code>, which is one of the legitimate uses of that setting.</p>
+
+<p><strong>Where does the list live?</strong> Inline in the mapping is fine for ten entries and
+unmanageable at a thousand. The alternative is a file on every node, or the synonyms API, which
+stores the set in the cluster and can be reloaded.</p>
+
+<p>Be sparing. Every synonym broadens matching, and broad matching makes relevance worse in ways
+that are hard to attribute later.</p>
+
+<h2>Keeping analysis honest as the index changes</h2>
+
+<p>Analysis config is the part of a mapping most likely to be edited by someone who is not thinking
+about the documents already in the index. Two habits keep that from becoming an incident.</p>
+
+<p><strong>Test the analyzer, not the search.</strong> A test that indexes a document and asserts a
+search returns it passes for many wrong reasons &mdash; a different clause matched, a fuzzy
+expansion covered the gap. Asserting on <code>_analyze</code> output pins the actual behaviour:</p>
+
+<pre class="language-python"><code class="language-python">def analyze(text: str, *, analyzer: str | None = None, field: str | None = None) -&gt; list[str]:
+    body: dict = {"text": text}
+    if analyzer:
+        body["analyzer"] = analyzer
+    if field:
+        body["field"] = field
+    result = es.indices.analyze(index=ALIAS, body=body)
+    return [t["token"] for t in result["tokens"]]</code></pre>
+
+<p>With that, <code>assert analyze("M&aacute;laga", analyzer="stayhub_text") == ["malaga"]</code> is
+a one-line regression test for the entire accent-folding behaviour, and it fails the moment somebody
+removes the filter.</p>
+
+<p><strong>Treat an analysis change as a schema migration</strong>, because it is one. It needs a
+new index and a reindex, the same as a type change, and it deserves the same review. The dangerous
+version is the one that looks small &mdash; adding a stemmer, adding a stop-word list &mdash;
+because the change is accepted on the new documents and nobody notices that half the index now
+behaves differently from the other half.</p>
+
+<h2>A routine for when search returns nothing</h2>
+
+<p>In order, and it takes about two minutes.</p>
+
+<p><strong>One.</strong> Confirm the document is there at all: <code>GET /index/_doc/&lt;id&gt;</code>,
+or <code>match_all</code>. If it is not, this is an indexing problem, not an analysis one.</p>
+
+<p><strong>Two.</strong> Run <code>_analyze</code> with <code>"field"</code> set to the field you are
+querying, and the <em>document's</em> text. Those are the terms in the index.</p>
+
+<p><strong>Three.</strong> Run it again with the <em>query</em> string. Those are the terms being
+looked for.</p>
+
+<p><strong>Four.</strong> Compare the two lists. If they share nothing, you have found it. If they
+do overlap, the analysis is fine and the problem is the query &mdash; most often a
+<code>term</code> where a <code>match</code> belongs, or an <code>operator: and</code> requiring
+every term when the document only has some.</p>
+
+<p>That routine turns the vaguest failure in Elasticsearch into a two-list comparison, and it works
+whether the cause is a keyword field, a stemmer, a missing <code>asciifolding</code>, or an
+analyzer somebody changed six months ago and never reindexed.</p>

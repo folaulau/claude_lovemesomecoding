@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the FastAPI category and its posts into a content tree.
+"""Write the Snowflake category and its posts into a content tree.
 
 Runs the backend's own service layer rather than touching S3 directly, so the post objects, the
 post index, the category archive, the category counts and the search index are all maintained by
@@ -7,23 +7,22 @@ the same code the admin API uses. Anything else would risk the derived indexes d
 posts, and the static build reads only the indexes.
 
     # dry run against the local tree (default)
-    python projects/fastapi_tutorial/seed.py
+    python projects/snowflake_tutorial/seed.py
 
-    python projects/fastapi_tutorial/seed.py --env local --write
-    python projects/fastapi_tutorial/seed.py --env prod  --write
+    python projects/snowflake_tutorial/seed.py --env local --write
+    python projects/snowflake_tutorial/seed.py --env prod  --write
 
 Idempotent: re-running updates the posts in place. `date` is only applied when a post is new, so a
 re-run never reshuffles the archive.
 
-⚠️ `--force-dates` stamps the manifest date onto a post that already exists, before upserting
-it. Two situations need it. The first was the original seed: nine of the eighteen slugs were
-published in June 2023 and already carried dates, so without it the archive interleaved nine 2023
-posts with the new ones and the pager read nonsense. The second is any re-base of START_DATE --
-every post is published now, so all eighteen dates are sticky and a plain re-run moves none of
-them.
+⚠️ ONE of the sixteen slugs — `snowflake-introduction` — was published in April 2019 and therefore
+already carries a date that upsert_post will not overwrite. `--force-dates` stamps the manifest
+date onto an existing post before upserting it, which is what makes the rewritten track read in
+lesson order. Without it lesson 1 sits seven years behind lessons 2-16, so the archive opens on
+lesson 16 and the pager walks from the last lesson straight back to the first.
 
 It is not the default: without it a re-run leaves the archive alone, which is the behaviour you
-want every other time. Pass it only when the manifest dates are deliberately meant to win.
+want every other time. Expect to pass it exactly once per tree.
 """
 
 import argparse
@@ -68,9 +67,10 @@ def read_post_html(entry: dict) -> str:
     if not path.exists():
         raise SystemExit(
             f"missing content file: {path}\n"
-            "Every code sample in this track is quoted from the StayHub FastAPI backend in "
-            "lovemesomecoding_demo_project/stayhub/stayhub-fastapi-backend. Run "
-            "check_content.py and check_snippets.py before seeding — see progress_report.md."
+            "Every query in this track runs against SNOWFLAKE_SAMPLE_DATA, which every account "
+            "already has. NOTHING in the track was executed — there is no Snowflake account on "
+            "this machine — so run check_content.py before seeding, and read the verification "
+            "note in progress_report.md before publishing to prod."
         )
     return path.read_text(encoding="utf-8")
 
@@ -82,7 +82,7 @@ def main() -> int:
                         help="actually write. Without it, only report what would happen.")
     parser.add_argument("--force-dates", action="store_true",
                         help="stamp the manifest date onto posts that already exist. "
-                             "Needed once, to reorder the nine rewritten 2023 posts.")
+                             "Needed once, to move the rewritten 2019 post to its lesson slot.")
     parser.add_argument("--only", default=None,
                         help="comma-separated slugs to seed, instead of the whole track. "
                              "For previewing a post while the rest are still unwritten — the "
@@ -123,35 +123,40 @@ def main() -> int:
             message = "frozen slugs not present in this tree: " + ", ".join(absent)
             if args.env == "prod":
                 raise SystemExit(
-                    message + "\nThese are supposed to be the indexed 2023 URLs being rewritten "
-                    "in place. Seeding would create new pages instead. Check the slugs before "
+                    message + "\nThis is supposed to be the indexed 2019 URL being rewritten "
+                    "in place. Seeding would create a new page instead. Check the slug before "
                     "writing to prod.")
             print(f"note: {message}")
         else:
             print(f"all {len(manifest.FROZEN_SLUGS)} frozen slugs present — "
                   "every rewrite lands on its existing URL")
 
-        # ⚠️ And the reverse: a NEW slug that already exists may be an accidental overwrite of
-        # somebody else's page, because post slugs are global across categories.
+        # ⚠️ And the reverse: a NEW slug that already exists is not a new post, it is an
+        # accidental overwrite of somebody else's page. Post slugs are global across categories.
         #
-        # "May be", not "is" — once the track has been seeded once, every `new` slug exists, and
-        # it is ours. What still has to fail is a slug that landed in a DIFFERENT category:
-        # upserting it would move a stranger's page into /fastapi and rewrite its body. So the
-        # check is on the category, not on mere existence. Keep it that way — reducing this to
-        # "warn if it exists" would let a real collision through on the second seed and every
-        # seed after it.
-        taken = [(slug, existing["category"])
-                 for slug in sorted(manifest.NEW_SLUGS)
-                 if (existing := post_service.get_post(slug))]
-        foreign = [f"{slug} (in '{cat}')" for slug, cat in taken
-                   if cat != manifest.CATEGORY["slug"]]
-        if foreign:
+        # ⚠️ But ONLY when the existing post belongs to a DIFFERENT category. The first version of
+        # this guard compared against every existing slug, which made the script refuse to run a
+        # second time against a tree this same track had already been seeded into — it flagged its
+        # own 15 posts as collisions. That contradicts the "idempotent" promise in the docstring
+        # above, and the tempting fix (delete the guard, or reach for --only) throws away the
+        # protection that matters. A slug already sitting in OUR category is this track's own
+        # earlier seed; a slug sitting in someone else's is the accident worth stopping.
+        collisions = []
+        for slug in sorted(manifest.NEW_SLUGS):
+            existing = post_service.get_post(slug)
+            if existing and existing.get("category") != manifest.CATEGORY["slug"]:
+                collisions.append(f"{slug} (in '{existing.get('category')}')")
+        if collisions:
             raise SystemExit(
-                "slugs marked `new` already belong to another category: " + ", ".join(foreign) +
+                "slugs marked `new` already exist in ANOTHER category in this tree: "
+                + ", ".join(collisions) +
                 "\nSeeding would overwrite them. Either they are not new, or the slug is wrong.")
-        if taken:
-            print(f"{len(taken)} slug(s) marked `new` already exist in /"
-                  f"{manifest.CATEGORY['slug']} — this track has been seeded here before")
+
+        reseeded = [slug for slug in sorted(manifest.NEW_SLUGS)
+                    if post_service.get_post(slug)]
+        if reseeded:
+            print(f"note: {len(reseeded)} of the `new` slugs are already in this tree — "
+                  "this is a re-seed, and they will be updated in place")
 
     # Fail early rather than half-seeding: every file must exist and no slug may already belong to
     # a different category.

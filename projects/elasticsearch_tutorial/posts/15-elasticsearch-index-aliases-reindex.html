@@ -1,0 +1,352 @@
+<p>Three times so far this track has arrived at the same wall. A field's type cannot be changed. An
+analyzer cannot be changed. A shard count cannot be changed. In every case the answer was "build a
+new index and copy the data into it", and every time it was deferred to this lesson.</p>
+
+<p>Here is the thing that decides whether that is a routine afternoon or an outage, and it is a
+decision you make on day one, long before you need it: <strong>never let your application name a
+concrete index.</strong></p>
+
+<h2>What an alias is</h2>
+
+<p>An alias is a name that points at one or more indexes. Searches, gets and writes can all use it,
+and nothing on the outside can tell the difference:</p>
+
+<pre class="language-bash"><code class="language-bash">GET /stayhub-properties/_search      # the alias
+# "_index": "stayhub-properties-000002"</code></pre>
+
+<p>The application asked for <code>stayhub-properties</code>; the hit came from
+<code>stayhub-properties-000002</code>. The concrete index behind the name can change, and moving it
+is a single atomic operation.</p>
+
+<p>That is the entire mechanism, and everything below is a consequence.</p>
+
+<p>It is worth being clear about what an alias is <em>not</em>. It is not a copy, so it costs no
+disk and no indexing work. It is not a view in the SQL sense &mdash; there is no transformation,
+though a filter can be attached. And it is not a redirect the client can see: the response says
+which concrete index answered, which is occasionally the only clue that a flip happened.</p>
+
+<p>Aliases live in the cluster state, so creating and moving them is nearly instant and is
+replicated to every node before the call returns. That is what makes an atomic flip possible at
+all.</p>
+
+<h2>The rule</h2>
+
+<p>Configure the alias, never the index:</p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ An ALIAS, not an index. `app/search/index.py` keeps the concrete indices behind it
+    # (`stayhub-properties-000001`, …) so a mapping change can be a reindex + alias flip with no
+    # downtime instead of a delete and a rebuild.
+    elasticsearch_index: str = "stayhub-properties"</code></pre>
+
+<p>Nothing outside the search module needs to know the generations exist. The naming convention is
+worth a moment though:</p>
+
+<pre class="language-python"><code class="language-python">def _generation_name(n: int) -&gt; str:
+    """`stayhub-properties-000007`. Zero-padded so the names sort lexicographically, which is what
+    makes `_cat/indices` and a wildcard listing come back in creation order."""
+    return f"{ALIAS}-{n:06d}"</code></pre>
+
+<p>Zero-padding is not cosmetic. Without it <code>...-10</code> sorts before <code>...-9</code> in
+every listing, wildcard and shell glob you will ever use.</p>
+
+<h3>Create the index and the alias in one call</h3>
+
+<pre class="language-python"><code class="language-python">    index = _generation_name(1)
+    # Created with the alias attached IN THE SAME CALL. Create-then-alias is two requests, and a
+    # crash between them leaves an index no reader can find and a startup that thinks it is done.
+    es.indices.create(index=index, body={**INDEX_SETTINGS, "aliases": {ALIAS: {}}})</code></pre>
+
+<p>Two requests would leave a window in which the index exists and the alias does not, and startup
+code that crashed in that window would come back believing its work was done.</p>
+
+<h2>The zero-downtime reindex</h2>
+
+<p>Four steps, and the order is the whole point:</p>
+
+<pre class="language-python"><code class="language-python">    """Build a new index with the CURRENT mapping, copy the data in, and flip the alias.
+
+    This is the zero-downtime mapping change, and the order of the four steps is the whole point:
+
+    1. create `…-00000N+1` from `INDEX_SETTINGS` as it stands in this file
+    2. `_reindex` from the alias into it — readers are still on the old index, unaffected
+    3. `update_aliases` with remove + add **in one call**, which Elasticsearch applies atomically;
+       there is no instant at which the alias points at nothing
+    4. only then delete the old index
+    """</code></pre>
+
+<p>Step three is the one that matters:</p>
+
+<pre class="language-python"><code class="language-python">    es.indices.update_aliases(
+        body={
+            "actions": [
+                {"remove": {"index": old, "alias": ALIAS}},
+                {"add": {"index": new, "alias": ALIAS}},
+            ]
+        }
+    )</code></pre>
+
+<p>Both actions in <strong>one request</strong>. Elasticsearch applies the list atomically, so there
+is no moment at which the alias resolves to nothing, or to both. Two separate calls give you a
+window &mdash; small, real, and guaranteed to be hit eventually by whatever runs most often.</p>
+
+<p>Running it against the demo index:</p>
+
+<pre class="language-bash"><code class="language-bash">$ python -m scripts.reindex
+stayhub-properties-000001 -> stayhub-properties-000002 (12 documents)
+previous index kept for rollback. Delete it with:  curl -XDELETE $ES/stayhub-properties-000001
+
+$ python -m scripts.reindex --status
+alias:  stayhub-properties
+points at: stayhub-properties-000002
+
+indices:
+  stayhub-properties-000001            12 docs   aliases: -
+  stayhub-properties-000002            12 docs   aliases: stayhub-properties &lt;- alias</code></pre>
+
+<p>Search never stopped.</p>
+
+<h3>Keeping the old index is the rollback</h3>
+
+<pre class="language-python"><code class="language-python">    ⚠️ `drop_old=False` by default. Keeping the previous index costs disk and buys the rollback: if
+    the new mapping is wrong, flipping the alias back is one call and takes no time at all. Delete
+    it once the new one has served real traffic.</code></pre>
+
+<p>This is the underrated half. A mapping change that turns out to be wrong &mdash; a stemmer that
+mangles product codes, a type that loses precision &mdash; is usually discovered by users, minutes
+or hours after the deploy. If the previous index is still there, recovery is one
+<code>update_aliases</code> call and is instant. If you deleted it, recovery is another full
+reindex while search is wrong.</p>
+
+<p>Disk is cheap. Keep the previous generation until the new one has served real traffic for a day.</p>
+
+<h3>Writes that land during the copy</h3>
+
+<p>The honest caveat:</p>
+
+<pre class="language-python"><code class="language-python">    ⚠️ Writes that land DURING step 2 go to the old index and are not copied. StayHub can shrug
+    that off — Postgres is the source of truth and `rebuild_index` repairs anything missed — but a
+    system where the index is the source of truth needs dual writes or a replay from a log here,
+    and this is the exact gap it needs them for.</code></pre>
+
+<p><code>_reindex</code> takes a snapshot at the moment it starts. Anything written after that goes
+to the old index and is lost at the flip.</p>
+
+<p>Three ways to handle it, in increasing order of effort. <strong>Ignore it</strong>, if the index
+is derived and a rebuild or the next write repairs the gap &mdash; which is the case here.
+<strong>Dual-write</strong> to both indexes for the duration, which needs your indexing layer to
+know a migration is happening. <strong>Catch up</strong> afterwards by reindexing everything
+modified since the copy started, which needs a reliable timestamp on every document and is the
+standard answer when the index is authoritative.</p>
+
+<p>Whichever you pick, decide it before you start, because discovering it mid-migration is how a
+"zero-downtime" reindex becomes a data loss incident.</p>
+
+<h2>Migrating a cluster that got this wrong</h2>
+
+<p>Most people arrive here with a concrete index already in production, and an alias cannot share a
+name with an index. So something has to give, and the migration is not zero-downtime &mdash; there
+is a moment when the name resolves to nothing:</p>
+
+<pre class="language-bash"><code class="language-bash">$ python -m scripts.reindex --adopt
+stayhub-properties is a concrete index with 12 documents.
+  1. create stayhub-properties-000001
+  2. reindex stayhub-properties -> stayhub-properties-000001
+  3. delete stayhub-properties  (frees the name; SEARCH IS DOWN from here)
+  4. create alias stayhub-properties -> stayhub-properties-000001
+proceed? [y/N] y
+adopted: stayhub-properties -> stayhub-properties-000001 (12 documents)</code></pre>
+
+<p>The gap is milliseconds and it is real. It is also why this is a script with a prompt rather than
+something startup code does:</p>
+
+<pre class="language-python"><code class="language-python">    ⚠️ It also refuses to guess when it finds a CONCRETE index sitting on the alias's name. That is
+    the pre-alias layout — a cluster created before 2026-08-22 — and Elasticsearch will not let an
+    alias and an index share a name, so something has to give. Fixing it means moving real
+    documents, which is not a thing a process should do silently while starting up: two API
+    instances booting at once would both start it.</code></pre>
+
+<p>Note also the check before the destructive step:</p>
+
+<pre class="language-python"><code class="language-python">    copied = result.get("created", 0)
+    if copied != docs:
+        # Bail before the destructive step. The old index is still there and still serving.
+        print(f"ERROR: copied {copied} of {docs} documents. Old index untouched; fix and retry.")
+        es.options(ignore_status=404).indices.delete(index=new)
+        return 1</code></pre>
+
+<p>Count before you delete. A migration script that deletes the source because the copy returned
+without raising is a migration script that will one day delete the source after copying half of
+it.</p>
+
+<h2>The refusal that catches you first</h2>
+
+<p>Once the name is an alias, this stops working:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -XDELETE localhost:9200/stayhub-properties</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">illegal_argument_exception
+The provided expression [stayhub-properties] matches an alias, specify the
+corresponding concrete indices instead.</code></pre>
+
+<p>Elasticsearch refuses to let a name that could hide many indexes be the target of a destructive
+call. That refusal is a feature, and it means any code that deletes an index has to resolve the name
+first:</p>
+
+<pre class="language-python"><code class="language-python">    # ⚠️ Delete the CONCRETE index, not the alias. `DELETE /stayhub-properties` fails with
+    # "the provided expression matches an alias, specify the corresponding concrete indices
+    # instead" — Elasticsearch refuses to let a name that many indices could hide behind be the
+    # target of a destructive call. That refusal is a feature; resolve the name first.
+    concrete = current_index(client)</code></pre>
+
+<h2>Rehearsing the flip</h2>
+
+<p>A migration you have never run is a migration you are running for the first time in production.
+Three things make the rehearsal cheap, and all three are worth building into the script rather than
+into a runbook.</p>
+
+<p><strong>Make it idempotent and re-runnable.</strong> A reindex into a fresh generation can be run
+as many times as you like &mdash; each run makes a new index and flips to it. That means you can run
+it on a copy of production data, inspect the result, and run it again after fixing the mapping,
+without ever being in a half-migrated state.</p>
+
+<p><strong>Make the status visible in one command.</strong></p>
+
+<pre class="language-python"><code class="language-python">def status(es) -&gt; None:
+    print(f"alias:  {ALIAS}")
+    target = current_index(es)
+    print(f"points at: {target or '(no alias — see --adopt)'}")
+    print(f"next generation would be: {next_generation(es)}")
+    print("\nindices:")
+    for name in sorted(es.indices.get(index=f"{ALIAS}*", ignore_unavailable=True)):
+        count = es.count(index=name)["count"]
+        aliases = ", ".join(es.indices.get_alias(index=name).get(name, {}).get("aliases", {})) or "-"
+        marker = " &lt;- alias" if name == target else ""
+        print(f"  {name:32} {count:6} docs   aliases: {aliases}{marker}")</code></pre>
+
+<p>Which index is live, how many documents each generation holds, and what the next one will be
+called. During a migration that is the only question anyone asks, and answering it by hand from
+three <code>_cat</code> calls under pressure is how mistakes happen.</p>
+
+<p><strong>Verify the new index before flipping, not after.</strong> The document count is the
+minimum. Better: run a handful of representative queries against the new index by its concrete name
+and compare the results to the same queries against the alias. A mapping change that quietly breaks
+one filter will show up there and nowhere in a count.</p>
+
+<h2>What else aliases do</h2>
+
+<p>The reindex flip is the headline. Three more uses are worth knowing.</p>
+
+<p><strong>A filtered alias</strong> is a saved query attached to a name:</p>
+
+<pre class="language-bash"><code class="language-bash">POST /_aliases
+{ "actions": [ { "add": {
+    "index": "stayhub-properties-000001",
+    "alias": "cabins-only",
+    "filter": { "term": { "property_type": "CABIN" } }
+} } ] }
+
+GET /cabins-only/_count        # 2
+GET /stayhub-properties/_count # 12</code></pre>
+
+<p>Every query through <code>cabins-only</code> silently carries that filter. This is a real
+multi-tenancy tool &mdash; an alias per tenant over a shared index &mdash; and it is stronger than a
+filter in application code, because it cannot be forgotten. It is not a security boundary on its
+own: anyone who can name the underlying index bypasses it. Pair it with role-based access that only
+grants the alias, which lesson 18 covers.</p>
+
+<p><strong>One alias over several indexes</strong> searches them together, which is how monthly log
+indexes are queried as one. Reads are fine. Writes are not, until you say where they go:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">no write index is defined for alias [multi]. The write index may be explicitly
+disabled using is_write_index=false or the alias points to multiple indices
+without one being designated as a write index</code></pre>
+
+<pre class="language-bash"><code class="language-bash">POST /_aliases
+{ "actions": [ { "add": { "index": "tmp-c", "alias": "multi", "is_write_index": true } } ] }
+# now writes through `multi` land in tmp-c</code></pre>
+
+<p><strong>Rollover</strong> builds on exactly that. <code>POST /alias/_rollover</code> creates the
+next generation and moves the write alias to it when a condition is met &mdash; age, document count,
+size. Reads keep hitting every generation, writes go to the newest. That is the whole model behind
+time-series indexes and, in its modern form, data streams. Lesson 18.</p>
+
+<h2>Two aliases are better than one</h2>
+
+<p>A refinement worth adopting once the basic pattern is in place: give the index a
+<strong>read alias and a write alias</strong>, rather than one alias doing both.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">stayhub-properties        -> read  -> …-000002
+stayhub-properties-write  -> write -> …-000002</code></pre>
+
+<p>Most of the time they point at the same index and nothing is different. During a migration they
+can be moved separately, which unlocks the dual-write strategy from earlier: point the write alias
+at the new index first so incoming changes land there, let the reindex catch up the backlog, then
+move the read alias.</p>
+
+<p>It also makes a whole class of accident impossible. Code that only holds the read alias
+<em>cannot</em> write, because a read-only alias with no write index refuses writes with the error
+shown above. That is a stronger guarantee than a code review.</p>
+
+<p>The cost is one more name to keep straight, and it is worth it on any index where the migration
+is expected to be more than a flip.</p>
+
+<h2>Reindexing something large</h2>
+
+<p>The demo copies twelve documents instantly. Two parameters matter once it is millions.</p>
+
+<pre class="language-json"><code class="language-json">POST /_reindex?wait_for_completion=false&slices=auto
+{
+  "source": { "index": "stayhub-properties", "size": 1000 },
+  "dest":   { "index": "stayhub-properties-000003" }
+}</code></pre>
+
+<p><code>wait_for_completion=false</code> returns a task id immediately instead of holding an HTTP
+connection open for an hour. Poll it with <code>GET /_tasks/&lt;id&gt;</code>, which reports progress,
+and cancel it with <code>POST /_tasks/&lt;id&gt;/_cancel</code> if it is hurting the cluster.</p>
+
+<p><code>slices=auto</code> parallelises the copy, one slice per shard. On a multi-shard index this
+is most of the speed available.</p>
+
+<p>You can also throttle it &mdash; <code>requests_per_second</code> &mdash; which is the polite
+thing to do when reindexing a production cluster that is also serving traffic. And
+<code>_reindex</code> can read from a <em>remote</em> cluster, which is how a version upgrade that
+crosses an incompatible index format is usually done.</p>
+
+<p>One more capability worth knowing: a <code>script</code> in the reindex body transforms documents
+on the way through. Renaming a field, splitting one into two, or backfilling a default is a
+migration and a mapping change in one pass, which beats doing them separately.</p>
+
+<h2>When a reindex is not the answer</h2>
+
+<p>Everything here assumes copying is the cheapest way to get the new index. Sometimes it is not,
+and it is worth recognising the two cases.</p>
+
+<p><strong>When the index is derived and the source is fast.</strong> StayHub's twelve listings come
+out of Postgres in milliseconds, so <code>--rebuild</code> is simpler than a reindex and produces a
+guaranteed-current index rather than a snapshot with a gap. The crossover is roughly where reading
+the source system becomes slower than copying segments &mdash; usually a lot further out than people
+assume, because a reindex re-analyses every field while a rebuild also has to serialise every row.</p>
+
+<p>The tell is whether the new mapping needs data the old index does not have. A new field
+backfilled from the database cannot come from a reindex at all, whatever its size.</p>
+
+<p><strong>When the change does not need a new index.</strong> Adding a field is a plain mapping
+update. Populating a newly added multi-field on existing documents is
+<code>_update_by_query</code>, which rewrites documents in place through the current mapping and
+needs no second index, no cutover and no alias flip. Reach for those first; a reindex is for what
+they cannot do.</p>
+
+<h2>The habits</h2>
+
+<p>Point applications at an alias from the very first deploy, even when there is one index and no
+plan to change it. It costs nothing and it is the only part of this that cannot be added later
+without downtime.</p>
+
+<p>Number your indexes with zero-padded generations. Create index and alias in one call. Flip with
+remove and add in one <code>update_aliases</code>. Keep the previous generation until the new one has
+served real traffic. Count documents before deleting anything. And decide what happens to writes
+during the copy <em>before</em> starting the copy.</p>
+
+<p>Do that and the three walls this track kept hitting stop being walls. A type change, an analyzer
+change and a shard-count change all become the same routine operation &mdash; which is the point of
+learning it before you need it rather than during an incident.</p>

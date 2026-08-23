@@ -1,0 +1,186 @@
+<p>Joins are the reason to use a relational database, and the counts below are real — every number
+in this post comes from running the query against a booking database with 400,000 bookings and
+374,518 payments in it. Seeing the counts change is how the difference between the join types
+stops being abstract.</p>
+
+<p>The shape: every booking may have a payment, but a booking still waiting to be paid has none.
+That gap is what the join types disagree about.</p>
+
+<h2>INNER JOIN</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*)
+FROM   bookings b
+JOIN   payments p ON p.booking_id = b.id;
+-- 374,518</code></pre>
+
+<p>Rows that match on both sides. The 25,482 bookings with no payment are gone. <code>JOIN</code>
+with no qualifier means <code>INNER JOIN</code>, and this is the one you want most of the time.</p>
+
+<h2>LEFT JOIN</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*)
+FROM   bookings b
+LEFT   JOIN payments p ON p.booking_id = b.id;
+-- 400,000</code></pre>
+
+<p>Every row from the left table, with NULLs where the right side has nothing. The count is the
+count of <code>bookings</code>, which is the useful property: a left join cannot lose rows from the
+table you started with.</p>
+
+<p>That makes it the tool for "find the ones with nothing":</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*)
+FROM   bookings b
+LEFT   JOIN payments p ON p.booking_id = b.id
+WHERE  p.id IS NULL;
+-- 25,482</code></pre>
+
+<h2>The mistake everyone makes once</h2>
+
+<p>Put a condition on the right-hand table in the <code>WHERE</code> clause and the left join
+quietly becomes an inner join:</p>
+
+<pre class="language-sql"><code class="language-sql">-- looks like a LEFT JOIN, behaves like an INNER JOIN: 374,518 rows.
+-- Every unpaid booking has p.status = NULL, and NULL <> 'REFUNDED' is not true.
+SELECT count(*)
+FROM   bookings b
+LEFT   JOIN payments p ON p.booking_id = b.id
+WHERE  p.status <> 'REFUNDED';
+
+-- keep the condition in the JOIN, and the unmatched rows survive: 400,000 rows.
+SELECT count(*)
+FROM   bookings b
+LEFT   JOIN payments p ON p.booking_id = b.id AND p.status <> 'REFUNDED';</code></pre>
+
+<p>The rule is worth memorising because nothing warns you: <strong>a condition in
+<code>ON</code> decides what counts as a match; a condition in <code>WHERE</code> filters the rows
+that came out.</strong> For the left table it makes no difference. For the right table it is the
+difference between a left join and an inner one.</p>
+
+<h2>RIGHT, FULL and CROSS</h2>
+
+<table>
+  <thead><tr><th>Join</th><th>Keeps</th></tr></thead>
+  <tbody>
+    <tr><td><code>RIGHT JOIN</code></td><td>Every row from the right table. Identical to a
+        <code>LEFT JOIN</code> with the tables swapped — and easier to read that way, which is why
+        you rarely see one.</td></tr>
+    <tr><td><code>FULL OUTER JOIN</code></td><td>Every row from both sides, NULL-padded where
+        there is no match. For reconciling two lists.</td></tr>
+    <tr><td><code>CROSS JOIN</code></td><td>Every combination. 20,000 properties by 12 months is
+        240,000 rows — which is exactly how you build a calendar with no gaps.</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-sql"><code class="language-sql">-- one row per property per month, whether or not anything was booked
+SELECT p.id, m.month, count(b.id) AS bookings
+FROM   properties p
+CROSS  JOIN generate_series(DATE '2024-01-01', DATE '2024-06-01', INTERVAL '1 month') AS m(month)
+LEFT   JOIN bookings b ON b.property_id = p.id
+                      AND b.check_in >= m.month
+                      AND b.check_in <  m.month + INTERVAL '1 month'
+WHERE  p.id <= 3
+GROUP  BY p.id, m.month
+ORDER  BY p.id, m.month;</code></pre>
+
+<p>The cross join generates the rows that <em>should</em> exist and the left join attaches the data
+that does. Without it, a month with no bookings is simply missing from the result, and a chart
+drawn from it has no gap where the gap should be.</p>
+
+<h2>Anti-joins: NOT EXISTS</h2>
+
+<p>The <code>LEFT JOIN ... WHERE IS NULL</code> above works. <code>NOT EXISTS</code> says the same
+thing more directly, and it is the one to reach for:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*)
+FROM   bookings b
+WHERE  NOT EXISTS (SELECT 1 FROM payments p WHERE p.booking_id = b.id);
+-- 25,482</code></pre>
+
+<p>Postgres plans both as an anti-join, so they perform the same. <code>NOT EXISTS</code> wins on
+two counts: it says what it means, and it is safe. <code>NOT IN (SELECT …)</code> is the version to
+avoid — a single NULL in the subquery's results makes the whole thing return nothing, silently.</p>
+
+<h2>Self-joins</h2>
+
+<p>A table joined to itself, with two aliases. Overlapping stays at the same property, which is the
+condition the exclusion constraint on this table forbids:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT a.id, b.id, a.check_in, b.check_in
+FROM   bookings a
+JOIN   bookings b ON b.property_id = a.property_id
+                 AND b.id > a.id
+                 AND a.check_in < b.check_out
+                 AND b.check_in < a.check_out
+LIMIT  5;</code></pre>
+
+<p><code>b.id &gt; a.id</code> is doing real work: without it every pair appears twice, once in
+each direction, and every row also matches itself.</p>
+
+<h2>LATERAL</h2>
+
+<p>An ordinary subquery in <code>FROM</code> cannot see the columns of the tables beside it.
+<code>LATERAL</code> lets it, which turns "for each row, run this query" into one statement:</p>
+
+<pre class="language-sql"><code class="language-sql">-- the three most recent bookings for each of five properties
+SELECT p.id, p.city, recent.check_in, recent.total
+FROM   properties p
+CROSS  JOIN LATERAL (
+    SELECT b.check_in, b.total
+    FROM   bookings b
+    WHERE  b.property_id = p.id          -- only legal because of LATERAL
+    ORDER  BY b.check_in DESC
+    LIMIT  3
+) AS recent
+WHERE  p.id <= 5
+ORDER  BY p.id, recent.check_in DESC;</code></pre>
+
+<p>This is top-N-per-group, and it is the version that stays fast when N is small and the inner
+query has an index to seek with — Postgres runs the inner query once per outer row and stops after
+three. The window-function version reads more elegantly and has to sort every booking of every
+property first. Both are in the next posts; which is faster depends on how many rows you are
+skipping.</p>
+
+<p><code>CROSS JOIN LATERAL</code> drops an outer row when the inner query returns nothing. Use
+<code>LEFT JOIN LATERAL (…) ON true</code> when you want to keep it.</p>
+
+<h2>Joining more than two tables</h2>
+
+<p>Joins are evaluated left to right, and each one narrows what the next sees. The order you write
+them in does not change the result — the planner reorders freely — but it changes how readable the
+query is, and putting the most restrictive filter first is a habit worth keeping:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.city,
+       count(*)                    AS stays,
+       round(avg(b.total), 2)      AS avg_total,
+       round(avg(r.rating), 2)     AS avg_rating
+FROM   bookings b
+JOIN   properties p ON p.id = b.property_id
+JOIN   payments   pay ON pay.booking_id = b.id AND pay.status = 'SUCCEEDED'
+LEFT   JOIN reviews r ON r.booking_id = b.id
+WHERE  b.check_in >= DATE '2024-06-01'
+  AND  b.check_in <  DATE '2024-07-01'
+GROUP  BY p.city
+ORDER  BY stays DESC
+LIMIT  5;</code></pre>
+
+<p>Three things in there are the whole post. <code>pay.status = 'SUCCEEDED'</code> sits in the
+<code>ON</code> of an inner join, where it means the same as it would in <code>WHERE</code> — inner
+joins do not care. The reviews join is <code>LEFT</code>, because an unreviewed stay should still
+be counted. And <code>avg(r.rating)</code> ignores the NULLs that left join produces, which is
+what you want and is worth knowing rather than assuming.</p>
+
+<h2>USING and NATURAL</h2>
+
+<pre class="language-sql"><code class="language-sql">-- the usual case: the columns have different names, so ON is the only option
+SELECT count(*) FROM bookings b JOIN properties p ON p.id = b.property_id;
+
+-- USING needs the SAME name on both sides
+SELECT count(*) FROM property_images JOIN property_amenities USING (property_id);</code></pre>
+
+<p><code>USING</code> is shorthand for when both columns have the same name, and it collapses them
+into one output column. Notice how rarely it applies here: a foreign key called
+<code>property_id</code> points at a column called <code>id</code>, so most joins in a normally
+named schema cannot use it at all. <code>NATURAL JOIN</code> takes that further and joins on every
+same-named column automatically — which means adding a <code>created_at</code> to both tables
+silently changes what the query returns. Never use it.</p>

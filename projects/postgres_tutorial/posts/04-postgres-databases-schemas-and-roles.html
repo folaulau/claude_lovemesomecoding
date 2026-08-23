@@ -1,0 +1,182 @@
+<p>Almost every application starts life connecting to Postgres as a superuser, because that is
+what the container gives you. It is worth about twenty minutes to fix, and the twenty minutes are
+best spent before there is data worth losing.</p>
+
+<p>This post covers the three-level namespace, what a role actually is, and the grants that give
+an application exactly the access it needs.</p>
+
+<h2>Database, schema, table</h2>
+
+<p>A connection belongs to one database and cannot see across to another. Inside a database,
+schemas are namespaces:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE DATABASE stayhub;
+CREATE SCHEMA billing;
+CREATE TABLE billing.invoices (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY);</code></pre>
+
+<p>Most applications need exactly one schema and should use <code>public</code>. Reach for more
+when you have genuinely separate concerns in one database — a per-tenant schema, or an
+<code>audit</code> schema nobody may write to.</p>
+
+<p>Unqualified names are resolved through the <strong>search path</strong>:</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW search_path;        -- "$user", public
+SET search_path TO billing, public;</code></pre>
+
+<p><code>"$user"</code> means "a schema named after the connecting role, if one exists". Setting
+the path per session is fine for exploring; for an application, set it on the role once so nothing
+has to remember — there is an example at the end of the next section.</p>
+
+<h2>A role is a user and a group</h2>
+
+<p>Postgres has one concept, <code>ROLE</code>, and it covers both. <code>CREATE USER</code> is
+literally an alias for <code>CREATE ROLE ... LOGIN</code>. A role with <code>LOGIN</code> is what
+you would call a user; a role without it is what you would call a group, and other roles are
+granted membership in it.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE ROLE readonly NOLOGIN;                       -- a group
+CREATE ROLE alice LOGIN PASSWORD 'secret';          -- a user
+GRANT readonly TO alice;                            -- membership
+
+SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname NOT LIKE 'pg\_%';</code></pre>
+
+<p>Roles are cluster-wide, not per database. One <code>readonly</code> role covers every database
+on the server, which is usually what you want and occasionally a surprise.</p>
+
+<p>Settings can be attached to a role, which is where the search path belongs:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER ROLE alice SET search_path TO public;
+ALTER ROLE alice SET statement_timeout TO '30s';</code></pre>
+
+<p>Both apply from that role's next connection onwards. The second one is worth doing for any
+human-facing role: a runaway analytics query then kills itself rather than holding resources until
+someone notices.</p>
+
+<h2>The three roles worth having</h2>
+
+<p>The split that keeps a production database safe, and it is not complicated:</p>
+
+<table>
+  <thead><tr><th>Role</th><th>Logs in</th><th>Can</th></tr></thead>
+  <tbody>
+    <tr><td><code>app_owner</code></td><td>No</td><td>Owns every table. Migrations run <em>as</em>
+        this role. Nothing else uses it.</td></tr>
+    <tr><td><code>stayhub_app</code></td><td>Yes</td><td><code>SELECT/INSERT/UPDATE/DELETE</code>.
+        Cannot drop a table. This is what the application connects as.</td></tr>
+    <tr><td><code>stayhub_readonly</code></td><td>Yes</td><td><code>SELECT</code>. Analytics,
+        dashboards, the person debugging production at 3am.</td></tr>
+  </tbody>
+</table>
+
+<p>The point of the first row: if the application's own credentials cannot execute
+<code>DROP TABLE</code>, then no bug, injection or mistyped script in the application can drop a
+table. Migrations get the dangerous role, and they run once, watched.</p>
+
+<h2>Setting it up</h2>
+
+<p>Every statement here runs against a real database; this is the whole sequence:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE ROLE app_owner NOLOGIN;
+CREATE ROLE stayhub_app LOGIN PASSWORD 'from-your-secret-store';
+CREATE ROLE stayhub_readonly LOGIN PASSWORD 'also-from-there';
+
+-- Close the default door first. Out of the box, EVERY role can connect to a new
+-- database and create objects in its public schema.
+REVOKE ALL ON DATABASE stayhub_lab FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+
+GRANT CONNECT ON DATABASE stayhub_lab TO stayhub_app, stayhub_readonly;
+GRANT USAGE   ON SCHEMA public        TO stayhub_app, stayhub_readonly;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO stayhub_app;
+GRANT USAGE                          ON ALL SEQUENCES IN SCHEMA public TO stayhub_app;
+GRANT SELECT                         ON ALL TABLES    IN SCHEMA public TO stayhub_readonly;</code></pre>
+
+<p><code>PUBLIC</code> in those <code>REVOKE</code> statements is not the schema — it is the
+implicit group every role belongs to. Since Postgres 15 a new database is less permissive than it
+used to be, but revoking explicitly costs nothing and does not depend on which version someone
+provisioned.</p>
+
+<p><code>USAGE</code> on sequences is the grant everybody forgets. Without it, the application can
+<code>INSERT</code> into a table with a generated key and gets
+<em>permission denied for sequence</em> on the first row.</p>
+
+<h2>The grant that keeps working</h2>
+
+<p><code>GRANT ... ON ALL TABLES</code> is a one-time operation. It grants on the tables that exist
+at that moment. The table your next migration creates has none of it, and the failure surfaces in
+production the day after a deploy, not during it.</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO stayhub_app;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT ON TABLES TO stayhub_readonly;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT USAGE ON SEQUENCES TO stayhub_app;</code></pre>
+
+<p>Read <code>FOR ROLE app_owner</code> carefully, because it is the part that goes wrong: default
+privileges attach to <strong>the role that creates the object</strong>, not to the schema. If your
+migrations run as <code>app_owner</code>, that is the role to name. Run them as somebody else one
+day and the new tables arrive with no grants, exactly as before.</p>
+
+<h2>Two attributes worth setting on a login role</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE ROLE reporting LOGIN PASSWORD 'x'
+    CONNECTION LIMIT 5
+    VALID UNTIL '2027-01-01';</code></pre>
+
+<p><code>CONNECTION LIMIT</code> stops one misconfigured analytics tool from consuming every
+backend the server has and locking your application out. It is a much better first line of defence
+than raising <code>max_connections</code>.</p>
+
+<p><code>VALID UNTIL</code> expires the password on a date. Excellent for the contractor's account
+you will otherwise forget; a genuine outage waiting to happen on a service account, because nothing
+warns you and the application simply stops authenticating one morning. Use it on humans, not on
+applications.</p>
+
+<p>Passwords are stored hashed, and which hash is a server setting:</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW password_encryption;   -- scram-sha-256 on any modern install</code></pre>
+
+<p>If that says <code>md5</code>, you are on an old configuration; switch it and have every role
+set its password again, because changing the setting does not rehash the existing ones.</p>
+
+<h2>Checking what you did</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT grantee, privilege_type
+FROM   information_schema.role_table_grants
+WHERE  table_name = 'bookings'
+ORDER  BY grantee, privilege_type;</code></pre>
+
+<p>Or <code>\dp bookings</code> in psql, which prints the same thing more compactly. The real test
+is the direct one — connect as the application role and try to do something it should not be able
+to do:</p>
+
+<pre class="language-bash"><code class="language-bash">psql "postgresql://stayhub_app:...@localhost:5433/stayhub" -c 'DROP TABLE bookings;'
+# ERROR:  must be owner of table bookings</code></pre>
+
+<p>That error message is the twenty minutes paying for itself.</p>
+
+<h2>Before any of this applies: pg_hba.conf</h2>
+
+<p>Grants decide what a role may do once it is connected. Whether it may connect at all is decided
+earlier, by <code>pg_hba.conf</code> — host-based authentication — which is a file of rules matched
+top to bottom on connection type, database, role and client address.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext"># TYPE  DATABASE  USER          ADDRESS        METHOD
+local   all       all                          trust
+host    stayhub   stayhub_app   10.0.0.0/8     scram-sha-256
+host    all       all           0.0.0.0/0      reject</code></pre>
+
+<p>The first line is why <code>docker exec ... psql</code> needs no password, and the last is the
+one worth adding deliberately rather than relying on the absence of a rule. First match wins, so
+order matters. After editing it, <code>SELECT pg_reload_conf();</code> — no restart needed.</p>
+
+<h2>What this does not cover</h2>
+
+<p>Row-level security, which restricts <em>which rows</em> a role may see rather than which tables,
+is a genuinely good feature for multi-tenant applications and a genuinely easy way to lock yourself
+out of your own data. Get the role split above in place first; it prevents the accidents that
+actually happen.</p>

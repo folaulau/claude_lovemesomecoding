@@ -1,0 +1,182 @@
+<p>Reading is where SQL tutorials spend their time and writing is where the bugs are. This post is
+the four statements that change data, plus the clauses that stop you needing a second round trip
+or a lock.</p>
+
+<h2>INSERT, and RETURNING</h2>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO amenities (slug, name, icon)
+VALUES ('sauna', 'Sauna', 'flame')
+RETURNING id, slug, created_at;</code></pre>
+
+<p><code>RETURNING</code> is the clause worth adopting first. Without it, inserting a row with a
+generated key means a second query to find out what the key was — and the naive version of that
+second query (<code>SELECT max(id)</code>) is wrong under concurrency. <code>RETURNING</code> gives
+you the row that was actually written, including defaults and generated columns, in the same round
+trip. It works on <code>UPDATE</code> and <code>DELETE</code> too.</p>
+
+<p>Insert many rows in one statement rather than many:</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO amenities (slug, name, icon) VALUES
+    ('piano',   'Piano',   'music'),
+    ('kayak',   'Kayak',   'waves'),
+    ('hammock', 'Hammock', 'palmtree')
+RETURNING id, slug;</code></pre>
+
+<p>One statement, one round trip, one WAL flush. Inserting a thousand rows in a thousand
+statements is slower by more than a factor of a thousand, because each one pays a network round
+trip and a commit.</p>
+
+<h2>Upsert</h2>
+
+<p><code>ON CONFLICT</code> turns "insert it, or update it if it is already there" into one
+statement with no race between the check and the write:</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO amenities (slug, name, icon)
+VALUES ('sauna', 'Sauna', 'flame')
+ON CONFLICT (slug) DO UPDATE
+    SET name = EXCLUDED.name,
+        icon = EXCLUDED.icon,
+        updated_at = now()
+RETURNING id, slug, name;</code></pre>
+
+<p>Three things to know:</p>
+
+<ul>
+  <li><strong><code>EXCLUDED</code> is the row you tried to insert.</strong> The bare column names
+      refer to the row already in the table, so
+      <code>SET name = EXCLUDED.name</code> means "take the new value".</li>
+  <li><strong>The conflict target needs a unique constraint or index.</strong>
+      <code>ON CONFLICT (slug)</code> works because <code>uq_amenities_slug</code> exists. Without
+      one, Postgres cannot tell what "conflict" means and rejects the statement.</li>
+  <li><strong><code>DO NOTHING</code> is the other option</strong>, and it swallows every conflict
+      on the table, not only the one you were thinking of. Name the target unless you genuinely
+      mean any.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">-- only overwrite when something actually changed
+INSERT INTO amenities (slug, name, icon)
+VALUES ('sauna', 'Sauna', 'flame')
+ON CONFLICT (slug) DO UPDATE
+    SET name = EXCLUDED.name, updated_at = now()
+WHERE  amenities.name IS DISTINCT FROM EXCLUDED.name
+RETURNING id;</code></pre>
+
+<p>That <code>WHERE</code> is worth adding on any upsert that runs often. Without it, every run
+writes every row — new row versions, new index entries, more work for autovacuum — even when
+nothing changed. With it, an unchanged row returns nothing and costs nothing.</p>
+
+<h2>UPDATE, and UPDATE ... FROM</h2>
+
+<pre class="language-sql"><code class="language-sql">UPDATE bookings
+SET    status = 'CANCELLED',
+       cancelled_at = now(),
+       cancellation_reason = 'guest request'
+WHERE  id = 12345
+RETURNING id, status, cancelled_at;</code></pre>
+
+<p>To set values from another table, Postgres has <code>UPDATE ... FROM</code> — a join in an
+update:</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE properties p
+SET    rating_average = s.avg_rating,
+       rating_count   = s.n
+FROM  (SELECT property_id, round(avg(rating), 2) AS avg_rating, count(*) AS n
+       FROM   reviews GROUP BY property_id) s
+WHERE  p.id = s.property_id
+  AND  (p.rating_average, p.rating_count) IS DISTINCT FROM (s.avg_rating, s.n);</code></pre>
+
+<p>The last line is the same idea again: touch only the rows whose values would change. On a table
+of 20,000 properties it turns a full rewrite into a handful of updated rows.</p>
+
+<p><code>DELETE ... USING</code> is the same shape for deletes. Both are Postgres extensions and
+both are much faster than the correlated-subquery version.</p>
+
+<h2>DELETE, and why production rarely does</h2>
+
+<pre class="language-sql"><code class="language-sql">DELETE FROM outbox
+WHERE  status = 'DONE' AND created_at < now() - INTERVAL '30 days'
+RETURNING id;</code></pre>
+
+<p>Most rows in a production database should never be deleted. The booking schema carries a
+<code>deleted boolean</code> on properties and users for that reason — a soft delete keeps foreign
+keys valid, keeps history readable, and is reversible when somebody asks.</p>
+
+<p>The cost is that every query must remember it, which is a real cost. A view is the usual
+answer:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE VIEW live_properties AS
+    SELECT * FROM properties WHERE NOT deleted;</code></pre>
+
+<p>When you do delete, delete in batches. A single <code>DELETE</code> of ten million rows is one
+transaction holding locks for its whole duration, and it produces ten million dead row versions for
+autovacuum to deal with at once:</p>
+
+<pre class="language-sql"><code class="language-sql">DELETE FROM outbox
+WHERE  id IN (SELECT id FROM outbox
+              WHERE  status = 'DONE' AND created_at < now() - INTERVAL '30 days'
+              LIMIT  10000);</code></pre>
+
+<p>Loop that until it reports zero rows. Each batch commits, releases its locks, and lets
+autovacuum keep up.</p>
+
+<p><code>TRUNCATE</code> is the exception that empties a table in constant time — it drops the
+underlying files instead of marking rows dead. It takes an exclusive lock, cannot be filtered, and
+does not fire row triggers.</p>
+
+<h2>Locks, and the order rows are touched in</h2>
+
+<p>An <code>UPDATE</code> or <code>DELETE</code> takes a row-level lock on everything it changes,
+held until the transaction commits. Two things follow, and both cause outages rather than
+errors.</p>
+
+<p><strong>A statement that changes many rows blocks every writer of those rows for its whole
+duration.</strong> Readers are unaffected — that is MVCC doing its job — but a backfill over a
+million rows is a million locked rows, and any request that touches one waits. Batching is the
+answer, and it is the same batching as for deletes.</p>
+
+<p><strong>Two statements touching the same rows in different orders deadlock.</strong> Postgres
+detects it in about a second, kills one transaction and reports
+<code>deadlock detected</code>. The fix is never a retry loop on its own — it is making every
+writer touch rows in the same order:</p>
+
+<pre class="language-sql"><code class="language-sql">-- deterministic order: two concurrent runs of this cannot deadlock against each other
+UPDATE bookings SET status = 'COMPLETED'
+WHERE  id IN (SELECT id FROM bookings
+              WHERE  status = 'CONFIRMED' AND check_out < DATE '2024-03-01'
+              ORDER  BY id
+              LIMIT  5000);</code></pre>
+
+<p><code>ORDER BY id</code> in the subquery is doing the work. Without it two batches can pick
+overlapping sets in opposite orders, and the deadlock appears under load and never in testing.</p>
+
+<h2>Bulk loading with COPY</h2>
+
+<pre class="language-bash"><code class="language-bash">psql "$DATABASE_URL" -c "\copy amenities (slug, name, icon) FROM 'amenities.csv' CSV HEADER"</code></pre>
+
+<p><code>COPY</code> is an order of magnitude faster than <code>INSERT</code> for bulk data: one
+statement, one parse, minimal per-row overhead. Every language driver exposes it — in Python,
+psycopg's <code>copy()</code>; in Java, the JDBC driver's <code>CopyManager</code>.</p>
+
+<p>Two habits for a large load: drop non-essential indexes first and rebuild them afterwards, since
+maintaining an index per row is most of the cost, and <code>ANALYZE</code> when you are done so the
+planner knows what arrived.</p>
+
+<h2>Everything above is already in a transaction</h2>
+
+<p>A statement sent on its own runs in its own transaction and commits when it succeeds. That is
+why a <code>DELETE</code> with a mistyped <code>WHERE</code> is final the moment you press
+enter — and why the habit that saves you is one line:</p>
+
+<pre class="language-sql"><code class="language-sql">BEGIN;
+UPDATE bookings SET status = 'CANCELLED' WHERE property_id = 42;
+-- read the row count. If it is not what you expected: ROLLBACK;
+COMMIT;</code></pre>
+
+<p>In an application the same protection comes from the framework's transaction boundary, and the
+thing to check is where it is drawn. A web request that opens a transaction per statement gets the
+behaviour above — each write final on its own — while one transaction per request means a failure
+half way through leaves nothing behind. The second is almost always what you want, and it is a
+configuration decision rather than something the SQL tells you.</p>
+
+<p>The transactions post later in this track is about what that <code>BEGIN</code> actually
+promises, and what it does not.</p>

@@ -1,0 +1,211 @@
+<p>Snowflake's object model is short enough to learn in one sitting, and two of its choices differ
+sharply from Postgres or Oracle in ways that cause real bugs. This lesson covers the hierarchy, the
+DDL you write daily, the three table types and what each one costs, and the constraints that are not
+constraints.</p>
+
+<h2>The hierarchy</h2>
+
+<pre class="language-bash"><code class="language-bash">Account
+└── Database
+    └── Schema
+        ├── Tables
+        ├── Views / Materialized views
+        ├── Stages, File formats, Pipes
+        ├── Streams, Tasks
+        └── Functions, Procedures</code></pre>
+
+<p>Objects are addressed as <code>database.schema.object</code>. Unlike Postgres, a query can
+reference several databases at once without anything resembling a foreign data wrapper — a join
+across two databases is an ordinary join:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT o.o_orderkey, c.c_name
+FROM   snowflake_sample_data.tpch_sf1.orders   AS o
+JOIN   learn_snowflake.staging.customer_notes  AS c
+       ON c.customer_id = o.o_custkey;</code></pre>
+
+<p>That is why "database" in Snowflake is closer to a namespace than to a server. Splitting
+environments across databases in one account costs nothing and is the standard pattern (lesson 16).</p>
+
+<p>Every database is created with two schemas you did not ask for. <code>PUBLIC</code> is a default
+place to put things. <code>INFORMATION_SCHEMA</code> is a set of views over metadata for that
+database — the same metadata as the account-level <code>SNOWFLAKE.ACCOUNT_USAGE</code> views, but
+current rather than delayed, and scoped to one database.</p>
+
+<h2>Creating databases and schemas</h2>
+
+<pre class="language-sql"><code class="language-sql">USE ROLE SYSADMIN;
+
+CREATE DATABASE analytics
+  DATA_RETENTION_TIME_IN_DAYS = 7          -- Time Travel window, inherited by objects
+  COMMENT = 'Curated data for reporting';
+
+CREATE SCHEMA analytics.raw     COMMENT = 'Landed, untransformed';
+CREATE SCHEMA analytics.marts   COMMENT = 'Modelled, for consumption';
+
+-- A transient schema: no Fail-safe, so cheaper storage for rebuildable data.
+CREATE TRANSIENT SCHEMA analytics.scratch DATA_RETENTION_TIME_IN_DAYS = 0;</code></pre>
+
+<p><code>DATA_RETENTION_TIME_IN_DAYS</code> set on a database is inherited by schemas and tables
+created inside it unless they override it. Getting it right at the database level is much easier
+than fixing it per table later.</p>
+
+<h2>Three kinds of table</h2>
+
+<p>This is the choice with the clearest cost consequence, and the one people leave on the default
+without thinking.</p>
+
+<table>
+<tr><th></th><th>Permanent</th><th>Transient</th><th>Temporary</th></tr>
+<tr><td>Lives until</td><td>Dropped</td><td>Dropped</td><td>The session ends</td></tr>
+<tr><td>Time Travel</td><td>0–90 days</td><td>0 or 1 day</td><td>0 or 1 day</td></tr>
+<tr><td>Fail-safe</td><td>7 days</td><td><strong>None</strong></td><td><strong>None</strong></td></tr>
+<tr><td>Visible to others</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+<tr><td>Storage cost</td><td>Highest</td><td>Lower</td><td>Lower</td></tr>
+</table>
+
+<p>Fail-safe is a 7-day period after Time Travel expires during which Snowflake — not you — can
+recover data. You cannot query it, you cannot use it yourself, and you pay to store it. For a table
+you can rebuild from source in twenty minutes, that is money for nothing.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE          dim_customer (id INT, name STRING);   -- permanent
+CREATE TRANSIENT TABLE stg_orders    (id INT, total NUMBER(12,2));
+CREATE TEMPORARY TABLE tmp_ids       (id INT);               -- gone at logout</code></pre>
+
+<p>The rule of thumb: <strong>permanent for anything that is a source of truth, transient for
+anything derived from something else you still have.</strong> Staging tables, intermediate models
+and scratch space are all transient.</p>
+
+<p>One trap: a temporary table shadows a permanent one of the same name for the whole session.
+Create <code>TEMPORARY TABLE orders</code> and every unqualified reference to <code>orders</code>
+hits the temporary one until you disconnect — including in stored procedures you did not write.</p>
+
+<h2>Constraints that are not enforced</h2>
+
+<p>Snowflake accepts <code>PRIMARY KEY</code>, <code>FOREIGN KEY</code> and <code>UNIQUE</code>, and
+records them in the metadata. <strong>It does not check any of them.</strong> Only
+<code>NOT NULL</code> is enforced.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE customer (
+  customer_id  INT           NOT NULL,   -- enforced
+  email        STRING        NOT NULL,   -- enforced
+  segment      STRING,
+  created_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  CONSTRAINT pk_customer PRIMARY KEY (customer_id)   -- NOT enforced
+);
+
+-- Both of these succeed. There is no error and no warning.
+INSERT INTO customer (customer_id, email) VALUES (1, 'a@example.com');
+INSERT INTO customer (customer_id, email) VALUES (1, 'b@example.com');</code></pre>
+
+<p>Declare them anyway. The optimiser uses them for join elimination, BI tools read them to infer
+relationships, and they document intent. But uniqueness is your loader's responsibility — usually a
+<code>MERGE</code> on the key rather than an <code>INSERT</code>, which lesson 13 uses throughout.
+If you need to know whether duplicates crept in, ask:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_id, COUNT(*) AS n
+FROM   customer
+GROUP  BY customer_id
+HAVING COUNT(*) &gt; 1;</code></pre>
+
+<h2>Creating tables from other tables</h2>
+
+<p>Three forms, and the difference between them matters:</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. CTAS: structure and data, from a query.
+CREATE TABLE big_orders AS
+SELECT * FROM snowflake_sample_data.tpch_sf1.orders WHERE o_totalprice &gt; 400000;
+
+-- 2. LIKE: structure only &mdash; columns, types, defaults, constraints. No rows.
+CREATE TABLE orders_backup LIKE snowflake_sample_data.tpch_sf1.orders;
+
+-- 3. CLONE: structure AND data, instantly, at no storage cost.
+CREATE TABLE orders_snapshot CLONE snowflake_sample_data.tpch_sf1.orders;</code></pre>
+
+<p>The third is the one without an equivalent elsewhere. A clone copies metadata, not data — both
+tables point at the same micro-partitions, and storage is only consumed as one of them diverges. It
+is instant regardless of table size. Cloning a whole database to get a development copy of
+production is a single statement, and lesson 12 is largely about that.</p>
+
+<h2>Views and materialized views</h2>
+
+<pre class="language-sql"><code class="language-sql">-- A view is stored SQL. It runs every time it is queried.
+CREATE OR REPLACE VIEW vw_order_summary AS
+SELECT o_orderdate,
+       COUNT(*)            AS orders,
+       SUM(o_totalprice)   AS revenue
+FROM   snowflake_sample_data.tpch_sf1.orders
+GROUP  BY o_orderdate;
+
+-- A secure view hides its definition and blocks optimisations that could
+-- leak rows. Use it whenever a view is the security boundary.
+CREATE OR REPLACE SECURE VIEW vw_my_orders AS
+SELECT * FROM orders WHERE owner = CURRENT_USER();</code></pre>
+
+<p>A <strong>materialized view</strong> stores its results and keeps them up to date automatically
+as the base table changes. That maintenance is serverless and billed, so it is worth it only when a
+view is expensive and queried far more often than its base table changes. They also come with real
+restrictions — one table only, no joins, no window functions — and require Enterprise edition.</p>
+
+<p>Reach for a materialized view when an expensive aggregate over a slow-changing table is queried
+constantly. Reach for a regular view, or a table refreshed by a task, for everything else.</p>
+
+<h2>Altering tables</h2>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE customer ADD COLUMN country STRING;
+ALTER TABLE customer RENAME COLUMN segment TO market_segment;
+ALTER TABLE customer DROP COLUMN market_segment;
+
+-- Widening is free. Narrowing a type is not allowed.
+ALTER TABLE customer ALTER COLUMN email SET DATA TYPE STRING;
+
+ALTER TABLE customer SET DATA_RETENTION_TIME_IN_DAYS = 30;</code></pre>
+
+<p>Adding a column is a metadata change — instant, on a table of any size, because existing
+micro-partitions simply have no value for it. Dropping a column is likewise metadata. This is one of
+the pleasant surprises of the architecture: schema changes that would be an overnight maintenance
+window on a row-store are a statement here.</p>
+
+<h2>A schema layout that survives</h2>
+
+<p>Since databases and schemas are free, the useful question is not how few you can get away with
+but what division makes permissions and dependencies obvious. The layout that most teams converge
+on separates data by how trustworthy it is:</p>
+
+<table>
+<tr><th>Schema</th><th>Holds</th><th>Table type</th><th>Who can read</th></tr>
+<tr><td><code>RAW</code></td><td>Landed data, exactly as it arrived</td><td>Transient</td><td>Data
+engineers only</td></tr>
+<tr><td><code>STAGING</code></td><td>Cleaned and typed, not yet
+modelled</td><td>Transient</td><td>Data engineers only</td></tr>
+<tr><td><code>MARTS</code></td><td>Modelled tables people query</td><td>Permanent</td><td>Analysts,
+BI tools</td></tr>
+</table>
+
+<p>The reason it works is that the read boundary and the rebuild boundary fall in the same place.
+Everything before <code>MARTS</code> can be dropped and rebuilt from source, so it is transient and
+nobody outside the pipeline depends on it. Everything in <code>MARTS</code> is what other people
+build on, so it is permanent and it is where Time Travel is worth paying for. Lesson 14 grants
+against exactly these three names.</p>
+
+<p>Two other table kinds exist and are worth knowing by name rather than by heart.
+<strong>External tables</strong> put a schema over files sitting in your own cloud storage without
+loading them, which is useful for data you query rarely. <strong>Dynamic tables</strong> declare a
+query and let Snowflake keep the result fresh on a lag you specify, which is a simpler alternative
+to the streams-and-tasks pipeline in lesson 13 when the transformation is expressible as one
+query.</p>
+
+<h2>Finding out what exists</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW DATABASES;
+SHOW SCHEMAS IN DATABASE analytics;
+SHOW TABLES IN SCHEMA analytics.marts;
+DESCRIBE TABLE customer;
+
+-- Size and row counts, from metadata &mdash; no scanning.
+SELECT table_name, row_count, ROUND(bytes / POWER(1024, 3), 2) AS gb
+FROM   analytics.information_schema.tables
+WHERE  table_schema = 'MARTS'
+ORDER  BY bytes DESC;</code></pre>
+
+<p>Next: <a href="/snowflake/snowflake-data-types">data types</a>, and the three that cause real
+bugs.</p>

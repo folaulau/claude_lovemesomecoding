@@ -1,0 +1,342 @@
+<p>The hardest habit to unlearn coming from SQL is normalising. In a relational database, storing a
+city name in forty thousand rows is a mistake you fix with a foreign key. In Elasticsearch it is
+usually the right answer.</p>
+
+<p>This lesson is about why, and about the four ways to model a relationship when flattening is not
+enough.</p>
+
+<h2>Start with the question, not the data</h2>
+
+<p>Before anything else: <strong>what is one search result?</strong></p>
+
+<p>For StayHub the answer is a listing. A guest searches and gets back listing cards, so one
+document is one listing &mdash; not a booking, not a review, not a host. Everything else in the
+model is downstream of that one sentence.</p>
+
+<p>This sounds obvious and it is where most bad models start. A team indexes their
+<code>orders</code> table because it is the biggest one, then discovers that the search page shows
+products. Or they index everything into one index with a <code>type</code> field, and every query
+carries a filter that would not exist if the model were right.</p>
+
+<p>An index holds one kind of thing. If a page shows two kinds of results, that is two indexes and
+one multi-index search, not one index with a discriminator.</p>
+
+<h2>Denormalise on purpose</h2>
+
+<p>Once you know what a result is, the document should contain everything that result needs. In
+Postgres, a StayHub listing's amenities live in a join table and its images in another. In the
+search document they are just there:</p>
+
+<pre class="language-python"><code class="language-python">    doc: dict[str, Any] = {
+        "public_id": str(prop.public_id),
+        "title": prop.title,
+        "city": prop.city,
+        "amenities": [a.slug for a in prop.amenities],
+        "price_per_night": float(prop.price_per_night),
+        "cover_image_url": prop.cover_image_url,
+    }</code></pre>
+
+<p>The reason is not laziness. It is that <strong>a join at query time is exactly the work the
+index exists to avoid</strong>. A result card needs the cover image and the amenity list; fetching
+those separately for twenty results is twenty round trips, or a second database query that
+reintroduces the load you built the index to remove.</p>
+
+<p>Elasticsearch has no joins across indexes at all, so the choice is not "denormalise or join" but
+"denormalise or make two queries from your application".</p>
+
+<h3>What denormalising costs</h3>
+
+<p><strong>Documents get stale.</strong> The city name is copied into every listing in that city, so
+renaming the city means rewriting all of them. In a normalised store you update one row.</p>
+
+<p><strong>Documents get large.</strong> <code>_source</code> stores the whole JSON, so every copied
+field costs disk on every document.</p>
+
+<p><strong>Updates fan out.</strong> This is the one that actually bites, and it is worth sizing
+before you commit. A host changing their display name, when the name is copied into every listing
+they own, is an update to a handful of documents &mdash; fine. The same field copied into every
+<em>booking</em> would be thousands.</p>
+
+<p>So the test is not "is this duplicated" but <strong>"how many documents change when this
+changes, and how often does it change?"</strong> A city name copied 40,000 times is fine, because
+cities do not get renamed. A live availability count copied 40,000 times is not, because it changes
+every minute.</p>
+
+<h2>The four ways to model a relationship</h2>
+
+<h3>1. Flatten it in</h3>
+
+<p>Copy the fields you need onto the parent document. This is the default and it should be your
+first instinct.</p>
+
+<pre class="language-json"><code class="language-json">{ "title": "Cedar Cabin", "host_name": "Ana", "host_rating": 4.9 }</code></pre>
+
+<p>Right when the related thing is small, changes rarely, and you only need a few of its fields.</p>
+
+<h3>2. An array of objects</h3>
+
+<pre class="language-json"><code class="language-json">{ "title": "Cedar Cabin", "images": [
+    { "url": "/a.jpg", "caption": "The deck" },
+    { "url": "/b.jpg", "caption": "Kitchen" }
+] }</code></pre>
+
+<p>Right when you need the objects <em>returned</em> but never need to query two of their fields
+together. Remember lesson 4: the arrays are flattened in the index, so
+"an image whose caption is 'Kitchen'" is not a question this can answer correctly.</p>
+
+<h3>3. nested</h3>
+
+<p>Same shape, mapped as <code>nested</code>, queried through a <code>nested</code> clause. Right
+when you genuinely must query two fields of one array element together &mdash; "a review by bob
+rated 5" &mdash; and only then. Each element becomes its own Lucene document, updating the parent
+rewrites all of them, and aggregating requires a nested wrapper everywhere.</p>
+
+<h3>4. join fields (parent-child)</h3>
+
+<p>Elasticsearch does have a real parent-child relationship, within a single index. Children are
+separate documents that can be updated independently of the parent.</p>
+
+<pre class="language-json"><code class="language-json">{ "mappings": { "properties": {
+    "listing_review": { "type": "join", "relations": { "listing": "review" } }
+} } }</code></pre>
+
+<p>It is almost always the wrong answer, and it is worth knowing exactly why so you can rule it out
+quickly. Parent and child must live on the same shard, so the shard distribution is driven by the
+relationship rather than by data volume. Queries across the relation
+(<code>has_child</code>, <code>has_parent</code>) are substantially slower than the flat
+equivalent. And the model is harder to reason about than either flattening or nesting.</p>
+
+<p>The narrow case where it earns its place: a small number of parents, a very large number of
+children, and children that change constantly. Product with millions of price updates. If you are
+not in that shape, flatten or nest.</p>
+
+<h3>5. Two queries from your application</h3>
+
+<p>Frequently the best answer, and frequently forgotten because it feels like giving up. Search
+Elasticsearch for the ids, then fetch the full records from your database by primary key. That is
+one indexed lookup per result set, not per result, and your database is extremely good at it.</p>
+
+<p>This keeps the search document small &mdash; only the fields you match, filter, sort and
+aggregate on &mdash; and it means the data a user sees is never stale, because it came from the
+source of truth. The cost is a second round trip and a page that cannot render until both return.</p>
+
+<p>StayHub does not do this, deliberately: the result cards render straight from
+<code>_source</code>, which is the whole reason the index is worth maintaining. But for a page where
+correctness matters more than latency, fetch-by-id is the safer design.</p>
+
+<h3>The same data, three ways, side by side</h3>
+
+<p>Reviews on a listing, to make the difference concrete. As a flat array of objects:</p>
+
+<pre class="language-json"><code class="language-json">{ "reviews": [ {"author": "ana", "rating": 5}, {"author": "bob", "rating": 1} ] }
+
+// "any 5-star review?"          -> correct
+{ "term": { "reviews.rating": 5 } }
+
+// "a 5-star review BY BOB?"     -> WRONG, matches
+{ "bool": { "must": [ {"term": {"reviews.author": "bob"}},
+                      {"term": {"reviews.rating": 5}} ] } }</code></pre>
+
+<p>As <code>nested</code>, the same question is scoped to one element and answers correctly:</p>
+
+<pre class="language-json"><code class="language-json">{ "nested": { "path": "reviews", "query": { "bool": { "must": [
+    { "term": { "reviews.author": "bob" } },
+    { "term": { "reviews.rating": 5 } }
+] } } } }</code></pre>
+
+<p>And flattened, which is what you do when the query above is not one anyone asks:</p>
+
+<pre class="language-json"><code class="language-json">{ "rating_average": 4.9, "rating_count": 12, "reviewer_slugs": ["ana", "bob"] }</code></pre>
+
+<p>That third version is the one StayHub uses, and it is the one to reach for by default. It answers
+"how well rated is this" and "has ana reviewed it" in one term lookup each, costs three fields, and
+has none of nested's write amplification. The individual reviews are still in Postgres, where the
+listing page reads them &mdash; they were never search data in the first place.</p>
+
+<p>That last point generalises. A field belongs in the search document if it is used to
+<em>find</em> or <em>rank</em> or <em>display in a result card</em>. Data that is only read once the
+user has clicked through belongs in your database.</p>
+
+<h2>How to choose, quickly</h2>
+
+<p>Ask three questions in order.</p>
+
+<p><strong>Do I need to query these fields together?</strong> If no, flatten or use an object array.
+If yes, keep going.</p>
+
+<p><strong>How many children per parent, and how often do they change?</strong> Tens, rarely &rarr;
+<code>nested</code>. Millions, constantly &rarr; consider <code>join</code>. In between &rarr;
+still <code>nested</code>.</p>
+
+<p><strong>Does the data need to be current to the second?</strong> If yes, do not put it in the
+index at all. Store the id and fetch it live.</p>
+
+<h2>One index or many?</h2>
+
+<p>The other structural decision, and the one where "it depends" is genuinely the answer.</p>
+
+<p><strong>One index, filtered.</strong> All tenants' data together, every query carrying
+<code>{"term": {"tenant_id": ...}}</code>. Simple, efficient, and one forgotten filter is a data
+leak. If you go this way, the filter belongs in one place in your code that every query must pass
+through &mdash; never in the individual queries.</p>
+
+<p><strong>An index per tenant.</strong> Isolation by construction, and a per-tenant restore or
+delete becomes trivial. The cost is real: every index carries shard overhead and cluster-state
+entries, so a thousand small tenants is a thousand shards and a cluster that struggles to do
+anything.</p>
+
+<p><strong>An index per time period</strong> &mdash; <code>logs-2026.08.22</code> &mdash; for
+anything append-only that expires. Deleting old data becomes dropping an index, which is instant,
+rather than a delete-by-query, which rewrites segments. This is what index lifecycle management
+automates, and it is the correct model for logs, metrics and events.</p>
+
+<p>A middle path worth knowing: <strong>routing</strong>. Keep one index but pass a routing value
+so all of a tenant's documents land on the same shard. Queries for that tenant then hit one shard
+instead of all of them. It is a real win at scale and it introduces a real hazard &mdash; a large
+tenant creates a hot shard that cannot be split.</p>
+
+<h2>What not to put in a document</h2>
+
+<p>Three things, each of which someone tries.</p>
+
+<p><strong>Anything that only lives here.</strong> The moment a field exists in Elasticsearch and
+nowhere else, you can no longer rebuild the index, and every operational option in lessons 15 and 17
+narrows.</p>
+
+<p><strong>Counters you increment in place.</strong> Elasticsearch has no atomic increment worth
+relying on across concurrent writers, and every update rewrites the whole document. Keep counters in
+your database or in Redis and copy the value across when it is worth updating.</p>
+
+<p><strong>Large blobs you never search.</strong> A full document body, a base64 image. They inflate
+<code>_source</code>, and <code>_source</code> is read for every hit. If you must keep them, use
+<code>"index": false</code>, or better, store a URL.</p>
+
+<h2>Model for the queries, not the data</h2>
+
+<p>The relational instinct is to model the domain and then write queries against it. Here it goes
+the other way: write down the queries first, then build the document that answers them cheaply.</p>
+
+<p>StayHub's search page needs five things &mdash; free-text matching over title, description and
+city; filters on price, guests, type and amenities; sorting by price, rating or distance; facet
+counts for the filter panel; and enough data to render a card. Every field in the mapping is there
+because one of those five needs it, and nothing is there because the database has it.</p>
+
+<p>That is why <code>status</code> is in the mapping but never filtered on. Only published listings
+are indexed at all &mdash; unpublishing removes the document rather than flagging it:</p>
+
+<pre class="language-python"><code class="language-python">        should_be_visible = prop.status == PropertyStatus.PUBLISHED and not prop.deleted
+        if not should_be_visible:
+            return remove_property(str(prop.public_id), es=client, raise_on_error=raise_on_error)</code></pre>
+
+<p>Filtering at query time would work too. Removing is better: every query would otherwise pay for
+the filter, and one forgotten <code>.filter()</code> leaks a draft listing into public results.
+Absent is safer than filtered &mdash; and that is a modelling decision, not a query one.</p>
+
+<h2>The whole document, and where each field came from</h2>
+
+<p>StayHub's mapping is worth reading as a set of answers rather than a schema. Every entry is one
+of the five requirements above:</p>
+
+<pre class="language-python"><code class="language-python">        "properties": {
+            "public_id": {"type": "keyword"},
+            "title": {"type": "text", "analyzer": "stayhub_text"},
+            "description": {"type": "text", "analyzer": "stayhub_text"},
+            "city": {
+                "type": "text",
+                "analyzer": "stayhub_text",
+                "fields": {"raw": {"type": "keyword"}},
+            },
+            "state": {"type": "keyword"},
+            "country": {"type": "keyword"},
+            "property_type": {"type": "keyword"},
+            "room_type": {"type": "keyword"},
+            "status": {"type": "keyword"},
+            "amenities": {"type": "keyword"},
+            "price_per_night": {"type": "scaled_float", "scaling_factor": 100},
+            "max_guests": {"type": "integer"},
+            "rating_average": {"type": "scaled_float", "scaling_factor": 100},
+            "rating_count": {"type": "integer"},
+            "cover_image_url": {"type": "keyword", "index": False},
+            "location": {"type": "geo_point"},
+            "created_at": {"type": "date"},
+        },</code></pre>
+
+<p><code>title</code> and <code>description</code> are <code>text</code> because they are matched.
+<code>property_type</code> and <code>amenities</code> are <code>keyword</code> because they come
+from tick-boxes. <code>city</code> is both, because a guest types it <em>and</em> the filter panel
+groups by it. <code>cover_image_url</code> is <code>"index": false</code> because it is only ever
+rendered. <code>location</code> exists because of one query, and <code>created_at</code> exists
+because of one sort.</p>
+
+<p>What is <em>not</em> in there is as informative. No host name, because the card does not show
+one. No booking history. No availability &mdash; and that omission is a real decision worth
+looking at.</p>
+
+<h3>The field that deliberately is not there</h3>
+
+<p>A booking site obviously wants "available on these dates". StayHub's API accepts the parameters
+and does not filter on them:</p>
+
+<pre class="language-python"><code class="language-python">    """Search published listings.
+
+    ⚠️ `checkIn` / `checkOut` are accepted but do NOT filter results yet. Date availability lives
+    in Postgres (the bookings table), not in the index, so filtering on it here would mean either
+    denormalising every booking into the document or a second query per hit. The listing page
+    checks availability properly. Saying so out loud beats a filter that quietly does nothing.
+    """</code></pre>
+
+<p>Work through the options and the trade is clear. Denormalising every booking into the listing
+document means every booking, cancellation and date change rewrites a listing document &mdash; the
+volatile-field problem, at the highest write rate in the system. A <code>date_range</code> array of
+blocked periods is better and still rewrites the document on every booking. A second query per hit
+puts the database back in the search path.</p>
+
+<p>The fourth option, and the one a mature system usually lands on, is a separate availability index
+keyed by listing and date, written by the booking service, joined in the application. That is real
+work, and the honest thing at StayHub's size is to say the filter is not implemented rather than
+ship one that silently does nothing.</p>
+
+<h2>Sizing the fan-out before you commit</h2>
+
+<p>The "how many documents change" question deserves an actual number, and the arithmetic is quick.</p>
+
+<p>Take a field you are thinking of copying in. Multiply how many documents carry a copy by how
+often the source value changes. StayHub's <code>rating_average</code> is copied into one document
+per listing and changes when a review lands &mdash; say 12 listings and a handful of reviews a day,
+which is nothing. Now imagine the same field on a <em>booking</em> document: 40,000 bookings, and a
+single new review rewrites every booking for that listing.</p>
+
+<p>The rule of thumb worth carrying: if one source change rewrites more than a few hundred
+documents, or if it happens more than a few times a minute, that field does not belong in the
+document. Either fetch it live, or accept a scheduled refresh and be explicit that the value is
+minutes old.</p>
+
+<p>There is a middle option people forget. Copy a <em>bucketed</em> version instead of the exact
+one &mdash; a rating band rather than the average, a price tier rather than the price. The bucket
+changes far less often than the value, and it is usually all the filter panel needed.</p>
+
+<h2>Signs the model is wrong</h2>
+
+<p>Worth recognising early, because all four are cheap to fix in week one and expensive in month
+six.</p>
+
+<p><strong>Every query has the same filter in it.</strong> That filter is a modelling decision
+leaking into the query layer. Either it should be a separate index, or the documents that need
+filtering out should not be indexed.</p>
+
+<p><strong>You are making a second query to render results.</strong> Either denormalise the missing
+fields in, or commit to fetch-by-id properly and stop storing display fields.</p>
+
+<p><strong>Your aggregations are wrong in a way you cannot explain.</strong> Almost always an
+array-of-objects that needed to be <code>nested</code>, or an aggregation on a
+<code>text</code> field instead of its <code>keyword</code> sibling.</p>
+
+<p><strong>A single field change rewrites most of the index.</strong> Something volatile got
+denormalised. Move it out and fetch it live.</p>
+
+<p>None of these is fatal on its own. What makes them worth watching is that every one of them gets
+more expensive with the size of the index, and the fix is always a reindex &mdash; so the cheapest
+day to notice is the first one.</p>
+
+<p>With the model settled, the next question is how documents actually get in there &mdash; and
+what "indexed" does and does not mean.</p>

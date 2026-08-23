@@ -1,0 +1,334 @@
+<p>Elasticsearch is a search engine you run alongside your database, not instead of it. That
+sentence is the whole of this lesson, and almost everything else in this track is a consequence of
+it.</p>
+
+<p>It is worth being precise about what it gives you, because "fast search" is not an answer &mdash;
+your database is fast too. What Elasticsearch does that a relational database will not is answer
+questions about <em>text</em>, and rank the answers.</p>
+
+<h2>The query your database cannot answer</h2>
+
+<p>Suppose you have a table of short-let listings and a guest types <code>cabin</code> into a search
+box. In SQL you reach for:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT * FROM properties
+WHERE title ILIKE '%cabin%' OR description ILIKE '%cabin%';</code></pre>
+
+<p>This works, and it is wrong in four separate ways.</p>
+
+<p>It cannot use an index. A B-tree index is sorted by the <em>whole</em> value, so it can find
+everything starting with "cabin" and nothing containing it. A leading wildcard means a full scan of
+every row, every time.</p>
+
+<p>It has no idea which result is better. A listing titled "Cedar Cabin" and one whose description
+mentions "a short drive to the cabin rentals" come back in whatever order the scan produced.</p>
+
+<p>It is exact. A guest who types <code>cabbin</code> gets nothing. So does one who types
+<code>cabins</code>, unless you thought to write <code>ILIKE '%cabin%'</code> rather than
+<code>= 'cabin'</code> &mdash; and a guest searching for <code>M&aacute;laga</code> without the
+accent gets nothing at all.</p>
+
+<p>And it cannot tell you anything about the results as a set. A real search page wants "Austin
+(48)&nbsp;&middot; Denver (31)" next to the results, which in SQL is a second query, and a third for
+the price ranges, and a fourth for the amenity counts.</p>
+
+<h2>What an inverted index actually is</h2>
+
+<p>A database index maps a row to its values. An inverted index maps a value to its rows &mdash;
+and it does it after chopping text into terms.</p>
+
+<p>Index three listings titled "Cedar Cabin with Mountain Views", "Sunlit Loft in the Mission" and
+"Lakefront A-Frame", and what is stored is roughly:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">term        documents
+--------    ---------
+a-frame     [3]
+cabin       [1]
+cedar       [1]
+lakefront   [3]
+loft        [2]
+mission     [2]
+mountain    [1]
+sunlit      [2]
+views       [1]</code></pre>
+
+<p>Now "which documents contain <code>cabin</code>?" is a lookup, not a scan, and it stays a lookup
+whether there are twelve documents or twelve million. That is the trick, and it is the only trick.
+Everything else Elasticsearch does is built on top of it.</p>
+
+<p>Two things follow immediately, and both catch people out later.</p>
+
+<p><strong>The text you sent is not what is searched.</strong> "Cedar Cabin" became
+<code>cedar</code> and <code>cabin</code> &mdash; lowercased, split on the space. That transformation
+is called analysis, it is configurable, and when a search mysteriously returns nothing it is almost
+always because the analysis at index time and the analysis at query time disagreed. Lesson 5 is
+entirely about this.</p>
+
+<p><strong>The index is built when the document is written, not when it is queried.</strong> So
+indexing costs something, changing how a field is analysed does not retroactively change documents
+already stored, and a document is not searchable the instant you write it. Lessons 3, 7 and 15 all
+turn on some version of that.</p>
+
+<h2>Relevance, for free</h2>
+
+<p>Because the index already knows how many documents contain each term, it can score them. A term
+in 1 document out of 12 is a much stronger signal than one in 11 of 12 &mdash; that is
+<em>inverse document frequency</em>, and it is why searching for "cabin in the mountains" ranks on
+"cabin" and largely ignores "in" and "the" without you configuring anything.</p>
+
+<p>Ask Elasticsearch to explain a score and it shows you the arithmetic. On the twelve-listing index
+this track uses, the top hit for <code>cabin</code> scores <strong>4.3190</strong>, and it will
+tell you exactly why:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">4.3190  score(freq=1.0), computed as boost * idf * tf from:
+  4.4000    boost
+  2.1595    idf, computed as log(1 + (N - n + 0.5) / (n + 0.5)) from:
+    1.0000      n, number of documents containing term
+   12.0000      N, total number of documents with field
+  0.4545    tf, computed as freq / (freq + k1 * (1 - b + b * dl / avgdl))</code></pre>
+
+<p>You do not need to understand that yet &mdash; lesson 11 takes it apart. The point is that
+relevance here is a computation you can inspect and adjust, not a black box. Very few arguments
+about search results survive contact with <code>_explain</code>.</p>
+
+<h2>What a document and a search actually look like</h2>
+
+<p>Before the vocabulary, it is worth seeing one round trip end to end, because the shape of the
+response explains several later lessons at a glance.</p>
+
+<p>A document is just JSON. Here is a StayHub listing as it is stored &mdash; already flattened, so
+the amenities that live in a join table in Postgres are an array here:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "public_id": "8f1e...",
+  "title": "Sunlit Loft in the Mission",
+  "description": "A bright corner loft two blocks from Dolores Park.",
+  "city": "San Francisco",
+  "country": "US",
+  "property_type": "LOFT",
+  "amenities": ["wifi", "kitchen"],
+  "price_per_night": 250.0,
+  "max_guests": 4,
+  "rating_average": 4.8,
+  "location": { "lat": 37.7599, "lon": -122.4148 }
+}</code></pre>
+
+<p>A search is also JSON, sent to <code>GET /&lt;index&gt;/_search</code>:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "query": {
+    "bool": {
+      "must":   [ { "match": { "title": "loft" } } ],
+      "filter": [ { "range": { "price_per_night": { "lte": 300 } } } ]
+    }
+  },
+  "size": 20
+}</code></pre>
+
+<p>Two clauses, and the difference between them is the single most useful thing to know early.
+<code>must</code> <strong>scores</strong> &mdash; how well a listing matches "loft" affects its
+rank. <code>filter</code> only includes or excludes, contributes nothing to the score, and is
+cacheable as a result. "Under $300" is not a matter of degree, so it goes in
+<code>filter</code>. Lesson 10 is this idea in full.</p>
+
+<p>And the response:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "took": 2,
+  "hits": {
+    "total": { "value": 1, "relation": "eq" },
+    "max_score": 8.64,
+    "hits": [
+      {
+        "_index": "stayhub-properties-000002",
+        "_id": "8f1e...",
+        "_score": 8.64,
+        "_source": { "title": "Sunlit Loft in the Mission", "city": "San Francisco" }
+      }
+    ]
+  }
+}</code></pre>
+
+<p>Four details in there are worth naming now.</p>
+
+<p><code>took</code> is the cluster's own timing in milliseconds &mdash; query execution only. It
+does not include the network, JSON serialisation, or the time your client spent waiting. On the
+index used throughout this track, a typical search reports <code>took: 2</code> while the round
+trip measured from Python is <strong>4.5 ms</strong>. Neither number is wrong; they measure
+different things, and quoting <code>took</code> as "our search takes 2ms" is how a latency budget
+goes missing.</p>
+
+<p><code>total.relation</code> is <code>"eq"</code> here, meaning the count is exact. By default
+Elasticsearch stops counting at 10,000 and returns <code>"gte"</code>, because counting every match
+is work nobody usually needs. If your UI says "page 3 of 512", you need to ask for an exact count
+explicitly. Lesson 9.</p>
+
+<p><code>_source</code> is the original JSON, stored verbatim alongside the index. That is why a
+result can carry the cover image and the amenity list without a second lookup, and it is why
+denormalising is the right instinct here rather than a compromise.</p>
+
+<p>And <code>_index</code> says <code>stayhub-properties-000002</code>, not
+<code>stayhub-properties</code>, even though that is the name the application searched. The
+application talks to an <em>alias</em>. That one decision is what makes a mapping change something
+you do on a Tuesday afternoon rather than an outage, and it is lesson 15.</p>
+
+<h2>What it costs</h2>
+
+<p>Running Elasticsearch means running a second datastore, and it brings three real problems.</p>
+
+<p><strong>The data is a copy, so it can be wrong.</strong> Something has to write every change
+into the index, and that something can fail, lag, or be skipped by a code path nobody remembered.
+Lesson 8 is about nothing else.</p>
+
+<p><strong>There are no transactions and no joins.</strong> You cannot index a document and update
+a row atomically. You cannot join two indexes at query time. Both constraints push you towards
+denormalised documents &mdash; one document per thing a user searches for, carrying everything the
+result card needs &mdash; which is a genuinely different way to model data. That is lesson 6.</p>
+
+<p><strong>It is near-real-time, not real-time.</strong> A document you just wrote is typically
+searchable about a second later. This is a deliberate trade for indexing throughput, and it is the
+reason a test that indexes a document and immediately searches for it finds nothing and looks like
+a broken query. Lesson 7.</p>
+
+<h2>So when should you use one?</h2>
+
+<p>Reach for it when the query is about text and the answer has an order: a search box over
+descriptions, autocomplete, "more like this", log search. Reach for it when one request has to
+return results <em>and</em> the counts that go beside them &mdash; faceted search is the case where
+Elasticsearch is not just faster but structurally simpler than the SQL equivalent. And reach for it
+for time-series and log data at volumes where a relational database stops being cheap.</p>
+
+<p>Do not reach for it as your primary store. It has no foreign keys, no constraints, no
+transactions, and losing it should be an inconvenience rather than an incident.</p>
+
+<p>Do not reach for it for exact lookups by primary key &mdash; your database already does that in
+under a millisecond and does not need a copy of the row to do it.</p>
+
+<p>And do not reach for it because reporting queries are slow. That is usually an index, a
+materialised view, or a read replica, and all three are less work than a second datastore with a
+sync problem.</p>
+
+<h3>What about Postgres full-text search?</h3>
+
+<p>This is the honest comparison, because it is the alternative most teams actually have. Postgres
+has <code>tsvector</code>, <code>tsquery</code>, GIN indexes, <code>pg_trgm</code> for fuzzy
+matching and <code>ts_rank</code> for scoring. For a search box over a few hundred thousand rows it
+is genuinely good, and it has one enormous advantage: the data cannot drift, because there is only
+one copy.</p>
+
+<p>Start there. Move when you hit something it does not do well &mdash; per-field boosting, decent
+relevance tuning you can inspect, faceted counts in the same round trip as the results, or analysis
+per language. Those are the things Elasticsearch is actually for, and "our search feels slow" is
+usually not one of them.</p>
+
+<p>The same reasoning applies to OpenSearch, the fork of Elasticsearch 7.10 that AWS maintains. The
+query DSL in this track works on both; the divergence is mostly in licensing, newer features and
+tooling. Everything up to lesson 14 transfers unchanged.</p>
+
+<h2>The words you need</h2>
+
+<p>The vocabulary is small and mostly means what you would guess. It is worth pinning down now
+because every error message uses it.</p>
+
+<p>A <strong>document</strong> is a JSON object. It is the unit of indexing and the unit of a
+result. In this track one document is one listing.</p>
+
+<p>An <strong>index</strong> is a collection of documents that share a mapping. It is roughly a
+table, and the analogy is safe until you try to join two of them.</p>
+
+<p>A <strong>mapping</strong> is the schema: which fields exist and what type each one is. You can
+let Elasticsearch infer it. Lesson 3 explains at length why you should not.</p>
+
+<p>A <strong>shard</strong> is a piece of an index &mdash; a self-contained Lucene index holding
+some of the documents. An index is split across shards so it can outgrow one machine, and searches
+run on every shard in parallel and merge.</p>
+
+<p>A <strong>replica</strong> is a copy of a shard on a different node. Replicas serve reads and
+take over when a node dies.</p>
+
+<p>A <strong>node</strong> is one Elasticsearch process; a <strong>cluster</strong> is the nodes
+that have agreed to work together.</p>
+
+<h3>Shards: fewer than you think</h3>
+
+<p>The instinct is that more shards means more speed. It does not. Each shard is a separate Lucene
+index with its own overhead, every search fans out to all of them, and the results have to be
+merged. Over-sharding a small index makes it slower and uses more memory.</p>
+
+<p>There is a second, subtler reason to keep the count low while you are learning: <em>relevance
+scores are computed per shard</em>. Term frequencies are local to a shard, so on a small
+multi-shard index the same query can rank documents differently depending on where they landed
+&mdash; the classic "why did this move?" surprise. The index in this track uses one shard partly
+for that reason:</p>
+
+<pre class="language-python"><code class="language-python">"settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,</code></pre>
+
+<h3>Green, yellow, red</h3>
+
+<p>Cluster health has three states and they mean exactly one thing each. <strong>Green</strong>:
+every shard and every replica is assigned. <strong>Yellow</strong>: every primary shard is
+assigned but at least one replica is not &mdash; all your data is there and searchable, you have
+lost redundancy. <strong>Red</strong>: at least one primary shard is missing, so some of your data
+is not available.</p>
+
+<p>A single-node cluster that asks for one replica sits at yellow forever, because a replica may
+never live on the same node as its primary. That is not a fault to chase; it is arithmetic. Lesson
+16 covers reading health properly.</p>
+
+<h2>The one rule to carry through the rest of the track</h2>
+
+<p>Your database is the source of truth. The index is a derived copy, and it should be disposable.</p>
+
+<p>Everything gets easier once that is true. You can delete the index and rebuild it. You can
+change a mapping by building a new index and copying into it. A failed write to Elasticsearch can
+be logged and retried rather than failing the user's request, because the real data is already
+safe. In this track's demo app, the repair path is one function:</p>
+
+<pre class="language-python"><code class="language-python">def rebuild_index(properties: list[Property], *, es: Elasticsearch | None = None) -&gt; int:
+    """Drop the index and refill it from Postgres. The repair path, and the seed path.
+
+    Because the index is derived data, a full rebuild is always safe — this is the payoff for
+    treating Postgres as the single source of truth.
+    """</code></pre>
+
+<p>The moment something lives only in Elasticsearch, all of that stops being true. It happens
+gradually &mdash; a field the API writes straight to the index, a counter incremented in place
+&mdash; and it is very hard to walk back.</p>
+
+<h2>The app behind every example</h2>
+
+<p>Every query, mapping and measurement in this track comes from StayHub, a working short-let
+booking app. It is worth a sentence because it shapes what the examples look like: listings have a
+title and description to match on, a city that needs both loose matching and exact grouping, a
+price that has to sort correctly, amenities that behave like tick-boxes, and coordinates.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                 ┌── writes ──> FastAPI ──> Postgres
+   React apps ───┤                              │
+                 ├── reads  ──> Hasura ─────────┘
+                 └── search ──> FastAPI ──> Elasticsearch
+                                              ▲
+                        sunk in application code from every write path</code></pre>
+
+<p>Postgres holds the listings. Elasticsearch holds a flattened copy of the published ones, written
+from the application's own code on every change. Search is the one read that does not go to the
+database &mdash; which is the entire point of maintaining the index.</p>
+
+<h2>What is in this track</h2>
+
+<p>Eighteen lessons, in order. Lessons 2 to 6 get you a cluster and a well-designed index. Lessons
+7 and 8 cover writing to it and keeping it in step with a database. Lessons 9 to 14 are querying:
+the DSL, filters, relevance, sorting, aggregations and geo. Lessons 15 to 18 are running it &mdash;
+aliases and reindexing, reading a cluster's health, backups, and what to settle before you put it
+in front of users.</p>
+
+<p>Each lesson assumes the ones before it and nothing else &mdash; no prior Lucene knowledge, and
+no Kibana. Everything here is done with HTTP requests and the Python client, because that is what
+your application will be doing, and because a query you can only build by clicking is a query you
+cannot put in a code review.</p>
+
+<p>Everything is written against <strong>Elasticsearch 8.15.3</strong> with the
+<code>elasticsearch</code> Python client 8.15.1. The version matters more than usual here: security
+is on by default from 8.0, which means most tutorials written before 2022 give you a
+<code>docker run</code> that now answers <code>401</code>. That is where lesson 2 starts.</p>

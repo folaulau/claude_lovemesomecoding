@@ -1,0 +1,156 @@
+<p>Every schema change takes a lock. On an empty development database you will never notice. On a
+table with fifty million rows serving live traffic, the same statement is an outage — and the
+difference is usually one clause.</p>
+
+<p>This post is the changes worth knowing how to do safely, and the setting that makes all of them
+safer.</p>
+
+<h2>The lock that stops everything</h2>
+
+<p>Most <code>ALTER TABLE</code> forms take an <code>ACCESS EXCLUSIVE</code> lock, which conflicts
+with every other lock including the one a plain <code>SELECT</code> takes. While it is held, nothing
+can read the table.</p>
+
+<p>That is usually fine, because most of these locks are held for microseconds. The danger is the
+queue. Your <code>ALTER TABLE</code> waits behind a long-running <code>SELECT</code> — and every
+query that arrives after it queues behind <em>your</em> statement, because a lock request does not
+jump ahead of one already waiting. A migration that needed a millisecond takes the site down for
+the length of one slow report.</p>
+
+<pre class="language-sql"><code class="language-sql">SET lock_timeout = '3s';
+ALTER TABLE bookings ADD COLUMN internal_note text;</code></pre>
+
+<p><strong>Set <code>lock_timeout</code> on every migration.</strong> It turns "block the site
+until this succeeds" into "give up and let me try again in a minute", which is an entirely
+different kind of bad day. Put it in the migration tool's session setup so nobody has to
+remember.</p>
+
+<h2>Adding a column</h2>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings ADD COLUMN source  varchar(20);
+ALTER TABLE bookings ADD COLUMN channel varchar(20) NOT NULL DEFAULT 'web';</code></pre>
+
+<p>Both are metadata-only and instant, at any table size. The second used to rewrite the whole
+table; since Postgres 11 the default is stored once and applied on read, so it no longer does.</p>
+
+<p>The exception is a <strong>volatile</strong> default, which has to be computed per row and does
+rewrite everything:</p>
+
+<pre class="language-sql"><code class="language-sql">-- rewrites the table: every row needs its own value
+ALTER TABLE bookings ADD COLUMN tracking_id uuid NOT NULL DEFAULT gen_random_uuid();</code></pre>
+
+<p>Do that one in steps: add the column nullable, backfill in batches, then add the constraint.</p>
+
+<h2>Adding NOT NULL to an existing column</h2>
+
+<p><code>ALTER COLUMN ... SET NOT NULL</code> scans the whole table under an exclusive lock to
+prove no NULLs exist. On a large table that is the outage. Two steps avoid it:</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. instant: the rule applies to new and changed rows, existing rows are not read
+ALTER TABLE bookings ADD CONSTRAINT ck_source_not_null CHECK (source IS NOT NULL) NOT VALID;
+
+-- 2. backfill the rows that predate it — in batches on a large table, see below
+UPDATE bookings SET source = 'web' WHERE source IS NULL;
+
+-- 3. reads the table, but under a lock that does NOT block reads or writes
+ALTER TABLE bookings VALIDATE CONSTRAINT ck_source_not_null;</code></pre>
+
+<p><strong>Step 2 is not optional and the order is not negotiable.</strong>
+<code>VALIDATE</code> checks every existing row, so running it before the backfill fails with
+<em>constraint is violated by some row</em> — and it fails after doing the whole scan. The
+<code>NOT VALID</code> constraint added in step 1 is what makes the backfill safe: from that moment
+nothing new can be written NULL, so the set of rows needing repair stops growing.</p>
+
+<p>Since Postgres 12, once that check constraint is validated,
+<code>SET NOT NULL</code> can use it as proof and completes without a scan — so you can convert it
+to a real <code>NOT NULL</code> and drop the check:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings ALTER COLUMN source SET NOT NULL;
+ALTER TABLE bookings DROP CONSTRAINT ck_source_not_null;</code></pre>
+
+<h2>Building an index without blocking writes</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX CONCURRENTLY ix_bookings_source ON bookings (source);</code></pre>
+
+<p>An ordinary <code>CREATE INDEX</code> blocks writes for its whole duration — minutes, on a large
+table. <code>CONCURRENTLY</code> makes two passes and lets writes continue. The costs:</p>
+
+<ul>
+  <li><strong>It cannot run inside a transaction block.</strong> Migration tools that wrap
+      everything in one need to be told; most have a flag for it.</li>
+  <li><strong>It takes roughly twice as long.</strong></li>
+  <li><strong>It can fail and leave an invalid index behind</strong> — which is not used for
+      queries but <em>is</em> maintained on every write, so it is pure cost until dealt with.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">SELECT c.relname AS index
+FROM   pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+WHERE  NOT i.indisvalid;</code></pre>
+
+<p>The fix is always <code>DROP INDEX CONCURRENTLY</code> and build it again; an invalid index
+cannot be repaired. Check for one after any failed migration.</p>
+
+<h2>Renaming a column</h2>
+
+<p>The rename itself is instant. The problem is that old and new application code are both running
+during a deploy, and no single moment exists when a rename is safe. It takes four deploys:</p>
+
+<table>
+  <thead><tr><th>Step</th><th>Database</th><th>Application</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Add the new column</td><td>unchanged</td></tr>
+    <tr><td>2</td><td>—</td><td>Write both, read the old</td></tr>
+    <tr><td>3</td><td>Backfill in batches</td><td>Read the new</td></tr>
+    <tr><td>4</td><td>Drop the old column</td><td>Write only the new</td></tr>
+  </tbody>
+</table>
+
+<p>Tedious, and it is the only way that does not require downtime. The same shape applies to
+changing a column's type, splitting a column, or moving data to another table — and it is the
+reason experienced teams pick <code>text</code> and <code>bigint</code> up front.</p>
+
+<h2>Backfilling</h2>
+
+<pre class="language-sql"><code class="language-sql">UPDATE bookings SET source = 'web'
+WHERE  id IN (SELECT id FROM bookings WHERE source IS NULL ORDER BY id LIMIT 10000);</code></pre>
+
+<p>Loop until it reports zero rows. Never write the single-statement version: it holds row locks on
+everything it touches until it commits, generates one enormous WAL burst, and produces millions of
+dead rows for autovacuum to face at once. <code>ORDER BY id</code> makes concurrent batches
+deadlock-free.</p>
+
+<h2>What a migration tool gives you</h2>
+
+<p>Alembic, Flyway, Liquibase, Rails migrations — they differ in syntax and agree on the parts that
+matter: an ordered, version-controlled list of changes, a table recording which have been applied,
+and one command that brings any database to the current version.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT version_num FROM alembic_version;</code></pre>
+
+<p>Two rules that apply whichever you use:</p>
+
+<ul>
+  <li><strong>Never edit a migration that has run anywhere.</strong> Write a new one. The applied
+      version is the record of what a database actually contains.</li>
+  <li><strong>Write the down migration, and expect not to use it.</strong> Rolling forward with a
+      fix is nearly always safer than rolling back, because a down migration that drops a column
+      destroys the data written since. Reverting a deploy is the real rollback.</li>
+</ul>
+
+<p>Postgres makes one thing genuinely easier than most databases here: <strong>DDL is
+transactional.</strong> A migration containing five statements either applies completely or not at
+all, so a failure halfway leaves a consistent schema. The exceptions are the ones already
+mentioned — <code>CREATE INDEX CONCURRENTLY</code>, and anything the tool runs outside a
+transaction on purpose.</p>
+
+<h2>The checklist</h2>
+
+<ol>
+  <li><code>SET lock_timeout</code>, always.</li>
+  <li>Additive changes first: new columns and tables are safe and instant.</li>
+  <li><code>CONCURRENTLY</code> for indexes on a live table, outside a transaction.</li>
+  <li><code>NOT VALID</code> then <code>VALIDATE</code> for constraints on a populated table.</li>
+  <li>Backfill in batches, ordered by primary key.</li>
+  <li>Destructive changes — dropping a column, dropping a table — last, in a separate deploy,
+      after the code that used them is gone.</li>
+</ol>

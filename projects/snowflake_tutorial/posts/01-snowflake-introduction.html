@@ -1,0 +1,170 @@
+<p>Snowflake is a SQL data warehouse you rent by the second. You do not install it, you do not size a
+cluster, and you do not have a DBA tuning it. You create an account, point a client at it, and write
+<code>SELECT</code>. What makes it worth a sixteen-lesson track is not that it is hosted — plenty of
+databases are hosted — but one structural decision the rest of this track keeps coming back to:
+<strong>storage and compute are separate, and you pay for them separately.</strong></p>
+
+<h2>The problem it was built for</h2>
+
+<p>Analytical work has an awkward shape. Most of the day nobody is querying. Then the daily load
+runs, or a dashboard refreshes for forty people at once, or an analyst asks a question that touches
+two years of history. Demand is spiky by an order of magnitude, and it is spiky in different
+directions at once — a heavy write job and a heavy read job frequently want the machine at the same
+moment.</p>
+
+<p>The two older answers both handle that badly.</p>
+
+<p>A relational database like Postgres keeps data and processing on the same machine. That is
+exactly what you want for an application — a row you just wrote is already on the disk the next
+query reads. But it means capacity is one number. Scale up for the worst hour and you pay for it
+during the twenty-three quiet ones, and the loading job still competes with the dashboards for the
+same CPU.</p>
+
+<p>Hadoop-era systems split the work across many machines but kept data on those machines' disks,
+so growing storage meant adding compute you did not need, and shrinking compute meant moving data.
+They also asked you to run them, which turned out to be most of the cost.</p>
+
+<p>Snowflake's answer is to put the data in cloud object storage — S3, Azure Blob, GCS — and treat
+compute as a thing you switch on when a query arrives and switch off when it finishes. Storage grows
+without touching compute. Compute resizes without touching storage. And because the data is not
+attached to any particular machine, you can point several independent compute clusters at the same
+table simultaneously, at full speed, without them contending.</p>
+
+<p>That is the whole idea. Everything else in this track is a consequence of it.</p>
+
+<p><img alt="Snowflake architecture overview: storage, compute and cloud services" class="aligncenter size-full" decoding="async" height="485" loading="lazy" src="https://d2q2snz6diubfd.cloudfront.net/media/2019/04/architecture-overview.png" width="858"/></p>
+
+<h2>What that gets you in practice</h2>
+
+<p>Four things follow directly, and each one is a lesson later in the track.</p>
+
+<p><strong>Workloads stop fighting.</strong> Give the loading pipeline its own warehouse and the BI
+tool another, and a slow load cannot make a dashboard slow. They are different machines reading the
+same files.</p>
+
+<p><strong>Scale is a one-line change.</strong> Resizing a warehouse is an <code>ALTER</code>
+statement that takes effect on the next query. There is no rebalancing and no downtime, so sizing
+becomes something you adjust rather than something you commit to.</p>
+
+<p><strong>Copies are free.</strong> Because a table is a set of immutable files plus metadata
+describing which files belong to it, a clone is a new set of metadata pointing at the same files.
+Copying a production database for a dev branch costs nothing until somebody changes something.</p>
+
+<p><strong>The past is still there.</strong> Updates never overwrite files; they write new ones. So
+querying a table as it was before a bad <code>UPDATE</code> is a normal query with an extra clause,
+not a restore from backup.</p>
+
+<h2>What you pay for</h2>
+
+<p>Three meters, and it helps to keep them separate in your head.</p>
+
+<table>
+<tr><th>Meter</th><th>Charged on</th><th>Runs when</th></tr>
+<tr><td>Compute</td><td>Credits per second a warehouse is running</td><td>You query, load, or
+otherwise use a warehouse</td></tr>
+<tr><td>Storage</td><td>Average compressed terabytes per month</td><td>Always</td></tr>
+<tr><td>Serverless</td><td>Credits, per feature</td><td>Snowpipe, serverless tasks, automatic
+clustering and similar run without a warehouse of yours</td></tr>
+</table>
+
+<p>In almost every account, compute dominates — usually by a wide margin. Storage is compressed and
+priced like object storage, which is to say it is rarely the thing anyone notices on an invoice.
+This matters because it tells you where to look when a bill surprises you, and the answer is nearly
+always a warehouse that was left running. Lesson 15 is about exactly that.</p>
+
+<p>Credit <em>consumption</em> is fixed and public — an X-Small warehouse burns one credit per hour
+it runs, and each size up doubles that. What a credit costs in money depends on your edition, your
+cloud and your region, so this track quotes credits and never dollars. The current dollar figures
+live on <a href="https://www.snowflake.com/en/pricing-options/" rel="nofollow">Snowflake's pricing page</a>.</p>
+
+<h2>Your first query</h2>
+
+<p>Every account is created with a shared database called <code>SNOWFLAKE_SAMPLE_DATA</code>
+already attached, holding the TPC-H benchmark data at several sizes. You do not load it, you do not
+pay to store it, and it is there the minute your trial account exists.</p>
+
+<p>This track uses it for every query lesson, so you can follow along from a free trial without
+loading a byte. Set your session context and ask it something:</p>
+
+<pre class="language-sql"><code class="language-sql">USE WAREHOUSE COMPUTE_WH;
+USE DATABASE SNOWFLAKE_SAMPLE_DATA;
+USE SCHEMA TPCH_SF1;
+
+SELECT c_mktsegment,
+       COUNT(*)              AS customers,
+       ROUND(AVG(c_acctbal)) AS avg_balance
+FROM   customer
+GROUP BY c_mktsegment
+ORDER BY customers DESC;</code></pre>
+
+<p>Five rows come back, one per market segment, each covering roughly a fifth of the
+150,000 customers in <code>TPCH_SF1</code>:</p>
+
+<table>
+<tr><th>C_MKTSEGMENT</th><th>CUSTOMERS</th><th>AVG_BALANCE</th></tr>
+<tr><td>MACHINERY</td><td>30,142</td><td>4,504</td></tr>
+<tr><td>AUTOMOBILE</td><td>30,003</td><td>4,510</td></tr>
+<tr><td>BUILDING</td><td>30,142</td><td>4,489</td></tr>
+<tr><td>FURNITURE</td><td>29,968</td><td>4,517</td></tr>
+<tr><td>HOUSEHOLD</td><td>29,745</td><td>4,498</td></tr>
+</table>
+
+<p><em>Result shapes throughout this track are illustrative — run the query and read your own
+numbers.</em> TPC-H is generated data, so the segments come out close to evenly split, which is
+worth knowing before you draw a conclusion from a chart of it.</p>
+
+<p>What is more interesting is what you did not have to do. Six columns of thinking, 150,000 rows
+of scanning, and there was no index to create, no statistics to gather and no partitioning scheme
+to choose. That absence is not laziness on Snowflake's part — lesson 2 explains what replaced them,
+and it is also the reason the same query over a hundred times as much data is not a hundred times
+the work.</p>
+
+<h2>When it is the wrong tool</h2>
+
+<p>Snowflake is an analytical warehouse. It is genuinely bad at things that are not that, and being
+clear about it now saves an expensive discovery later.</p>
+
+<ul>
+<li><strong>It is not an application database.</strong> Single-row lookups by primary key take
+tens or hundreds of milliseconds because there is a warehouse to wake and a query to compile. Your
+web app's user table belongs in Postgres.</li>
+<li><strong>It does not enforce most constraints.</strong> You can declare a primary key and a
+foreign key; Snowflake records them for query optimisation and tooling, and does not check them.
+Only <code>NOT NULL</code> is enforced. Uniqueness is your loader's job.</li>
+<li><strong>It is not for high-frequency small writes.</strong> Inserting one row at a time works
+and is a bad idea — each statement writes new files. Batch, or use the streaming paths in lesson
+8.</li>
+<li><strong>Idle cost is real if you are careless.</strong> A warehouse with auto-suspend disabled
+bills for every second it is up, whether or not anybody queried it.</li>
+</ul>
+
+<p>The shape it fits is: data arrives in batches or streams from somewhere else, several teams
+query it in ways nobody predicted, and the volume is larger than one machine would enjoy.</p>
+
+<h2>How this track is arranged</h2>
+
+<p>Sixteen lessons, in the order you would actually meet these things while building something.</p>
+
+<ol>
+<li><strong>Introduction</strong> — this page.</li>
+<li><strong>Architecture</strong> — the three layers, micro-partitions, and the caches.</li>
+<li><strong>Getting started</strong> — account, Snowsight, and connecting from code.</li>
+<li><strong>Virtual warehouses</strong> — sizing, auto-suspend, and splitting workloads.</li>
+<li><strong>Databases, schemas and tables</strong> — the object model and the daily DDL.</li>
+<li><strong>Data types</strong> — the short list, and the three that cause bugs.</li>
+<li><strong>Loading data</strong> — stages, <code>COPY INTO</code>, and file sizing.</li>
+<li><strong>Snowpipe</strong> — continuous loading and how its billing differs.</li>
+<li><strong>Semi-structured data</strong> — <code>VARIANT</code>, JSON, and
+<code>FLATTEN</code>.</li>
+<li><strong>Querying data</strong> — CTEs, window functions and <code>QUALIFY</code>.</li>
+<li><strong>Query performance</strong> — the Query Profile, pruning, spilling, clustering.</li>
+<li><strong>Time Travel and cloning</strong> — undoing mistakes and branching data.</li>
+<li><strong>Streams and tasks</strong> — change tracking and scheduling, without a new tool.</li>
+<li><strong>Access control</strong> — roles, grants, and future grants.</li>
+<li><strong>Cost management</strong> — where credits go and how to cap them.</li>
+<li><strong>In production</strong> — environments, CI, service accounts, monitoring.</li>
+</ol>
+
+<p>Lessons 1 to 4 are worth reading in order; after that they mostly stand alone. Next up:
+<a href="/snowflake/snowflake-architecture">the architecture</a>, because the reason there was no
+index to create above is the reason most of the rest of this works.</p>

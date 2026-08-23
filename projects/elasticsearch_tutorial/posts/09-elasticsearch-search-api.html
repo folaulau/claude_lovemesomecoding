@@ -1,0 +1,533 @@
+<p>Everything so far has been about getting data in. This is where it pays off. The search API is
+one endpoint and a JSON body, and the body is the Query DSL &mdash; a small language that composes
+well once you know its four or five shapes.</p>
+
+<h2>The request</h2>
+
+<pre class="language-bash"><code class="language-bash">GET /stayhub-properties/_search
+{
+  "query":  { "match": { "title": "cabin" } },
+  "from":   0,
+  "size":   20,
+  "sort":   [ { "price_per_night": "asc" } ],
+  "_source": ["title", "city", "price_per_night"]
+}</code></pre>
+
+<p>Five top-level keys, and they are separate concerns on purpose. <code>query</code> decides which
+documents match and how well. <code>from</code>/<code>size</code> decide which slice comes back.
+<code>sort</code> decides the order. <code>_source</code> decides how much of each document to send.
+You can change any one without touching the others.</p>
+
+<p>There is also a URI form, which is handy at a terminal and nowhere else:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/stayhub-properties/_search?q=cabin&size=5&pretty"</code></pre>
+
+<p>Fine for a quick check. Do not build an application on it: <code>q</code> is parsed with the
+query-string syntax, which has its own operators, and a user typing a stray <code>:</code> or
+<code>[</code> gets a parse error rather than a search.</p>
+
+<h2>The response</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "took": 2,
+  "timed_out": false,
+  "_shards": { "total": 1, "successful": 1, "skipped": 0, "failed": 0 },
+  "hits": {
+    "total": { "value": 12, "relation": "eq" },
+    "max_score": 8.64,
+    "hits": [
+      { "_index": "stayhub-properties-000002",
+        "_id": "8f1e-...",
+        "_score": 8.64,
+        "_source": { "title": "Sunlit Loft in the Mission" } }
+    ]
+  }
+}</code></pre>
+
+<p><code>took</code> is the cluster's own query time in milliseconds. It excludes the network and
+your client's deserialisation. On the index used throughout this track a search reports
+<code>took: 2</code> while the round trip measured from Python is <strong>4.5 ms</strong>. Report
+the second number to anyone asking about latency.</p>
+
+<p><code>_shards.failed</code> is the field nobody reads. A search can partially fail &mdash; one
+shard errors, the rest answer &mdash; and you get <strong>HTTP 200 with fewer results than
+exist</strong>. Same shape as the bulk trap in lesson 8. If results matter, check it.</p>
+
+<p><code>timed_out</code> is the same idea for a different cause. There is a
+<code>timeout</code> parameter, and it does not cancel the search &mdash; it returns whatever was
+collected so far, with this flag set. Partial results that look complete unless you look.</p>
+
+<h2>match and term, one more time</h2>
+
+<p>Lesson 4 covered this from the mapping side. From the query side it is the single most common bug
+in Elasticsearch, so it is worth stating as a decision rule.</p>
+
+<p><strong><code>match</code> analyses your query string</strong> with the field's analyzer, then
+looks for the resulting terms. Use it on <code>text</code> fields &mdash; anything a human typed.</p>
+
+<p><strong><code>term</code> does not analyse anything.</strong> It looks for the exact term you
+gave. Use it on <code>keyword</code> fields, numbers, booleans and dates.</p>
+
+<p>Using <code>term</code> on a <code>text</code> field returns nothing, silently, because the field
+contains lowercased tokens and you asked for the original string.</p>
+
+<h3>The match family</h3>
+
+<pre class="language-json"><code class="language-json">{ "match": { "title": "mountain cedar" } }</code></pre>
+
+<p>By default the terms are OR-ed: a document with either word matches, and one with both scores
+higher. Change that with <code>operator</code>:</p>
+
+<pre class="language-json"><code class="language-json">{ "match": { "title": { "query": "mountain cedar", "operator": "and" } } }</code></pre>
+
+<p>Or ask for some of them, which is often the better answer than either extreme:</p>
+
+<pre class="language-json"><code class="language-json">{ "match": { "title": { "query": "cedar mountain lakefront", "minimum_should_match": "2" } } }
+// matches "Cedar Cabin with Mountain Views" — two of the three terms</code></pre>
+
+<p><code>minimum_should_match</code> takes a number, a percentage (<code>"75%"</code>), or a
+combination expression. On a real search box, "at least 75% of the terms" behaves far better than
+<code>and</code>, which returns nothing the moment a user adds a word, or <code>or</code>, which
+returns everything.</p>
+
+<p><strong><code>match_phrase</code></strong> requires the terms adjacent and in order:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">match         "mountain cedar"   ->  1 hit    (both words present, any order)
+match_phrase  "mountain cedar"   ->  0 hits   (not adjacent, wrong order)
+match_phrase  "mountain views"   ->  1 hit</code></pre>
+
+<p>This is what token positions from lesson 5 are for. <code>slop</code> loosens it &mdash;
+<code>"slop": 2</code> allows terms to be up to two positions apart, so "mountain with views" would
+still match "mountain views".</p>
+
+<p><strong><code>match_phrase_prefix</code></strong> treats the last term as a prefix, which makes
+it the cheapest search-as-you-type there is. It is genuinely useful and it has a limit worth
+knowing: it expands the prefix against the index, capped by
+<code>max_expansions</code> (50 by default), so on a large index it silently considers only some of
+the matching terms.</p>
+
+<h3>multi_match</h3>
+
+<p>One query, several fields:</p>
+
+<pre class="language-python"><code class="language-python">TEXT_FIELDS = ["city^3", "title^2", "description", "state", "country"]</code></pre>
+
+<p>The <code>^</code> is a boost. <code>city^3</code> says a match on the city counts for three
+times as much as one in the description &mdash; a guest typing "Austin" means the place, not a
+description mentioning it in passing.</p>
+
+<p>The parameter that decides its behaviour is <code>type</code>, and the default is not always what
+you want. Lesson 11 takes that apart properly, including a real bug it caused; for now it is enough
+to know that <code>best_fields</code> (the default) scores each field separately and keeps the best,
+which has consequences when you combine it with <code>operator: and</code>.</p>
+
+<h2>The other query types</h2>
+
+<p>The <code>match</code> family covers text. These cover everything else, and between them and
+<code>bool</code> you can express nearly any real search.</p>
+
+<p><strong><code>term</code> and <code>terms</code></strong>. One exact value, or a list of them:</p>
+
+<pre class="language-json"><code class="language-json">{ "term":  { "property_type": "CABIN" } }
+{ "terms": { "property_type": ["CABIN", "LOFT"] } }</code></pre>
+
+<p><code>terms</code> is an OR. That matters when a filter panel has two boxes ticked, and lesson 10
+covers why StayHub deliberately does not use it for amenities.</p>
+
+<p><strong><code>range</code></strong>, for numbers and dates:</p>
+
+<pre class="language-json"><code class="language-json">{ "range": { "price_per_night": { "gte": 100, "lte": 250 } } }
+{ "range": { "created_at": { "gte": "now-7d/d", "lt": "now/d" } } }</code></pre>
+
+<p>Date maths is evaluated by the cluster. <code>now-7d/d</code> is "seven days ago, rounded down to
+midnight", and the rounding is what makes the query cacheable &mdash; an unrounded
+<code>now</code> is a different value every millisecond, so nothing can be reused.</p>
+
+<p><strong><code>exists</code></strong> asks whether a field has any indexed value:</p>
+
+<pre class="language-json"><code class="language-json">{ "exists": { "field": "rating_average" } }</code></pre>
+
+<p>Remember lesson 4: a null, an empty array and a value skipped by
+<code>ignore_malformed</code> all count as absent. There is no "is null" query, because there is no
+null in the index &mdash; only present and absent.</p>
+
+<p><strong><code>prefix</code>, <code>wildcard</code>, <code>regexp</code></strong> match against
+the term dictionary rather than a term:</p>
+
+<pre class="language-json"><code class="language-json">{ "prefix":   { "city.raw": "San" } }
+{ "wildcard": { "city.raw": "San*" } }</code></pre>
+
+<p>Use sparingly. A leading wildcard (<code>"*Francisco"</code>) forces a scan of every term in the
+field, which is the same problem as <code>LIKE '%...'</code> in SQL and for the same reason. If you
+need prefix matching at speed, index prefixes with <code>edge_ngram</code> as lesson 5 showed.</p>
+
+<p><strong><code>ids</code></strong> fetches by document id inside a query, which is how you
+combine "these specific documents" with other clauses.</p>
+
+<p><strong><code>match_all</code> and <code>match_none</code></strong> do what they say.
+<code>match_all</code> is not a placeholder to be embarrassed about &mdash; a browse page with no
+search term is genuinely a <code>match_all</code> with filters, and it is what StayHub sends when
+the search box is empty:</p>
+
+<pre class="language-python"><code class="language-python">    if not req.q:
+        # No text query still needs a scoreable clause, or ES has nothing to rank by.
+        return {"match_all": {}}</code></pre>
+
+<h3>Letting users type operators</h3>
+
+<p>Two queries accept a syntax rather than a plain string.
+<code>query_string</code> is the full one: <code>AND</code>, <code>OR</code>, <code>NOT</code>,
+field prefixes, wildcards, ranges, fuzzy operators. It is powerful and it throws a parse error on
+malformed input &mdash; which means an unbalanced quote from a user is a 400, not a search.</p>
+
+<p><code>simple_query_string</code> is the one to expose. Same idea, a smaller syntax
+(<code>+</code>, <code>|</code>, <code>-</code>, <code>"</code>, <code>*</code>), and
+<strong>it never throws</strong>: bad syntax is treated as literal text.</p>
+
+<pre class="language-json"><code class="language-json">{ "simple_query_string": {
+    "query": "cabin -shared \"mountain views\"",
+    "fields": ["title^2", "description"],
+    "default_operator": "and"
+} }</code></pre>
+
+<p>Whether to offer this at all is a product decision. Most users never type an operator, and the
+ones who do expect them to work exactly as Google's do, which they do not. For most search boxes a
+well-tuned <code>multi_match</code> beats teaching a syntax.</p>
+
+<h2>Choosing what comes back</h2>
+
+<p><code>_source</code> is the whole stored document, and returning all of it for twenty hits is
+often the largest part of a response:</p>
+
+<pre class="language-json"><code class="language-json">"_source": false
+"_source": ["title", "city", "price_per_night"]
+"_source": { "excludes": ["description"] }</code></pre>
+
+<p>The exclude form is usually the practical one: keep everything except the two fields that are
+long and are not shown in a result card. It costs nothing and can halve a response.</p>
+
+<p>Note this is purely about transfer. The document is read from disk either way, so this saves
+bandwidth and serialisation, not I/O.</p>
+
+<h2>Pagination, and the wall</h2>
+
+<pre class="language-json"><code class="language-json">{ "from": 40, "size": 20 }   // page 3</code></pre>
+
+<p>Simple, and it stops working at a specific point:</p>
+
+<pre class="language-bash"><code class="language-bash">{ "from": 10000, "size": 10 }</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">illegal_argument_exception
+Result window is too large, from + size must be less than or equal to: [10000]
+but was [10010]. ... This limit can be set by changing the [index.max_result_window]</code></pre>
+
+<p>The limit is not arbitrary. To return results 10,000 to 10,010, every shard must find and rank
+its top 10,010 matches and send them to the coordinating node, which merges and throws away 10,000
+of them. The cost is borne per shard, so on a ten-shard index that is 100,100 documents ranked to
+return ten.</p>
+
+<p>The error suggests raising <code>index.max_result_window</code>. Resist it. The setting exists to
+stop you doing this, and raising it converts a clear error into an out-of-memory failure on a bigger
+page.</p>
+
+<p>The real answers are: do not let users page that deep &mdash; nobody reaches page 500 of a
+search, and a crawler doing so is a load problem to fix rather than to serve &mdash; or use
+<code>search_after</code>, which pages by the sort value of the last hit instead of an offset.
+Lesson 12 covers it, because it depends on understanding sort values.</p>
+
+<p>You may still see <code>scroll</code> recommended. It is for exporting an entire index in a batch
+job, not for user-facing pagination: it holds a consistent snapshot open, which costs resources on
+every shard for as long as the scroll lives. For pagination use <code>search_after</code>; for
+export use a point-in-time plus <code>search_after</code>, which is what replaced scroll.</p>
+
+<h3>track_total_hits</h3>
+
+<p>By default, Elasticsearch stops counting matches at 10,000:</p>
+
+<pre class="language-json"><code class="language-json">"total": { "value": 10000, "relation": "gte" }</code></pre>
+
+<p><code>relation</code> is the field to read. <code>"eq"</code> means exact, <code>"gte"</code>
+means "at least this many, we stopped counting". Rendering "10,000 results" from that is wrong, and
+it is wrong in a way that looks suspiciously round.</p>
+
+<p>Counting every match is real work, which is why it is off by default. Ask for it when you need
+it:</p>
+
+<pre class="language-python"><code class="language-python">        "track_total_hits": True,</code></pre>
+
+<p>StayHub does, because the UI shows a page count, and honest pagination counts matter more than
+the microseconds it costs at this scale. On a large index, consider
+<code>"track_total_hits": 1000</code> &mdash; count exactly up to a thousand, then stop &mdash; which
+gives you "About 1,000+ results" cheaply.</p>
+
+<h2>Highlighting</h2>
+
+<p>Marking the matched terms in the result is one block:</p>
+
+<pre class="language-python"><code class="language-python">    return {
+        "pre_tags": ["&lt;mark&gt;"],
+        "post_tags": ["&lt;/mark&gt;"],
+        "encoder": "html",
+        "fields": {
+            "title": {"number_of_fragments": 0},  # 0 = return the whole field, marked up
+            "city": {"number_of_fragments": 0},
+            "description": {"fragment_size": 140, "number_of_fragments": 1},
+        },
+    }</code></pre>
+
+<p>The result arrives per hit, alongside <code>_source</code>:</p>
+
+<pre class="language-json"><code class="language-json">"highlight": {
+  "city":  ["&lt;mark&gt;San&lt;/mark&gt; &lt;mark&gt;Francisco&lt;/mark&gt;"],
+  "title": ["Sunlit &lt;mark&gt;Loft&lt;/mark&gt; in the Mission"],
+  "description": ["A bright corner &lt;mark&gt;loft&lt;/mark&gt; two blocks from Dolores Park."]
+}</code></pre>
+
+<p><code>number_of_fragments: 0</code> returns the whole field marked up, which is right for a
+title. For a long description you want a fragment around the match instead, which is what
+<code>fragment_size</code> and a fragment count give you.</p>
+
+<h3>The setting that is not optional</h3>
+
+<p><code>encoder: "html"</code>. Here is why, with a description containing a script tag:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">without an encoder:
+  "A lovely &lt;script&gt;alert(1)&lt;/script&gt; &lt;mark&gt;cabin&lt;/mark&gt; retreat"
+
+with encoder: "html":
+  "A lovely &amp;lt;script&amp;gt;alert(1)&amp;lt;&amp;#x2F;script&amp;gt; &lt;mark&gt;cabin&lt;/mark&gt; retreat"</code></pre>
+
+<p>Highlighting inserts markup into the original text and hands you back a string your UI is
+expected to render <em>as HTML</em>. Without the encoder, any HTML that was in the source text comes
+through live. The encoder escapes the source first, then adds the marks.</p>
+
+<p>This is a genuine cross-site scripting hole in a feature nobody thinks of as a security surface,
+and it is one setting.</p>
+
+<p>One performance note: highlighting re-analyses the field per hit, so it is not free. StayHub only
+asks for it when there is a query term that could be marked:</p>
+
+<pre class="language-python"><code class="language-python">    if req.q:
+        body["highlight"] = _highlight_spec()</code></pre>
+
+<h2>Collapsing: one result per group</h2>
+
+<p>A problem that turns up on every search page eventually. A host has eight near-identical
+listings in the same building, and a search for that neighbourhood returns all eight, pushing
+everything else off the page.</p>
+
+<p><code>collapse</code> solves it in one clause:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "query": { "match": { "description": "loft" } },
+  "collapse": {
+    "field": "host_id",
+    "inner_hits": { "name": "more", "size": 2 }
+  }
+}</code></pre>
+
+<p>One hit per <code>host_id</code> &mdash; the highest scoring one &mdash; with two more available
+under <code>inner_hits</code> for a "3 more from this host" link. The collapse field must be a
+<code>keyword</code> or a number, because it groups on terms.</p>
+
+<p>One caveat that matters for pagination: <code>hits.total</code> still counts the
+<em>uncollapsed</em> matches. So a page showing 10 collapsed results out of a reported 80 is not
+lying, exactly, but it is not what a user will assume. If you need the group count, that is a
+<code>cardinality</code> aggregation alongside &mdash; lesson 13.</p>
+
+<h2>Did you mean?</h2>
+
+<p>Suggesters are a separate top-level key, and they can ride along with a normal search:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "query": { "match": { "title": "cabbin" } },
+  "suggest": {
+    "did_you_mean": {
+      "text": "cabbin",
+      "term": { "field": "title" }
+    }
+  }
+}</code></pre>
+
+<p>The <code>term</code> suggester works word by word against the terms actually in the index, so
+its suggestions are always things that would return results. <code>phrase</code> is the better one
+for a multi-word query &mdash; it scores whole candidate phrases rather than correcting each word in
+isolation, which stops "cabin in tahoe" being corrected into a phrase nobody wrote.</p>
+
+<p>The practical pattern: run the search, and if it returns few or no hits, show the suggestion. The
+mistake is showing "did you mean" above a page of perfectly good results.</p>
+
+<p>Note that fuzziness on the query and a suggester solve overlapping problems differently.
+Fuzziness silently finds the results; a suggester tells the user what you think they meant. A search
+box usually wants both, and it wants the fuzzy match not to be so broad that the suggester never
+fires.</p>
+
+<h2>Searching more than one index</h2>
+
+<pre class="language-bash"><code class="language-bash">GET /stayhub-properties,stayhub-experiences/_search
+GET /logs-2026.08.*/_search
+GET /_all/_search</code></pre>
+
+<p>Comma-separated names, wildcards, or an alias standing for several indexes. The results interleave
+and are ranked together, and <code>_index</code> on each hit tells you where it came from.</p>
+
+<p>Two things to know. Fields with the same name must have compatible types across the indexes, or
+the search fails &mdash; which is the failure <code>_field_caps</code> from lesson 4 exists to
+predict. And relevance across indexes with very different sizes is unreliable, because term
+frequencies are per shard, so a term that is rare in one index and common in another scores
+inconsistently.</p>
+
+<p>When it matters, <code>"search_type": "dfs_query_then_fetch"</code> gathers global term
+statistics first and ranks with those. It costs an extra round trip across the shards and it is the
+correct fix for "the same query ranks differently depending on which shard a document landed on".</p>
+
+<h2>Long-running and consistent searches</h2>
+
+<p>Two features that come up once a system gets large enough.</p>
+
+<p><strong>Point in time.</strong> A normal search sees whatever the index looks like at that
+instant, so paging through results while documents are being written can show a document twice or
+skip one. A PIT freezes a view of the index:</p>
+
+<pre class="language-bash"><code class="language-bash">POST /stayhub-properties/_pit?keep_alive=1m
+# { "id": "46ToAwMD..." }</code></pre>
+
+<p>Pass that id in subsequent searches (instead of an index name) and every page sees the same
+snapshot. Combined with <code>search_after</code> this is the modern replacement for
+<code>scroll</code>, and it is what you want for any export.</p>
+
+<p><strong>Async search.</strong> For a query over months of data that will take a minute,
+<code>_async_search</code> returns immediately with an id and lets you poll for partial results as
+shards report in. Right for analytics, wrong for a search box &mdash; if a user-facing search needs
+this, the fix is the query or the model, not asynchrony.</p>
+
+<h2>Tools for when a query misbehaves</h2>
+
+<p><code>_validate/query?explain</code> tells you whether a query is even well-formed, and how it
+was parsed, without running it. Useful for a query built by string concatenation.</p>
+
+<p><code>_explain</code> takes one document id and one query and returns the scoring arithmetic.
+This is lesson 11's main tool.</p>
+
+<p><code>"profile": true</code> added to a search returns a per-shard breakdown of where the time
+went &mdash; which Lucene query ran, how long it built, how long it collected. The output is large
+and it is the only way to answer "which clause is slow" rather than guessing.</p>
+
+<p>And <code>_count</code> when you want a number and no documents:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/stayhub-properties/_count -H 'Content-Type: application/json' \
+  -d '{"query": {"term": {"property_type": "CABIN"}}}'</code></pre>
+
+<h3>Several searches in one request</h3>
+
+<p><code>_msearch</code> takes the same newline-delimited format as bulk and runs several searches
+in one round trip:</p>
+
+<pre class="language-json"><code class="language-json">POST /_msearch
+{"index": "stayhub-properties"}
+{"query": {"term": {"property_type": "CABIN"}}, "size": 3}
+{"index": "stayhub-properties"}
+{"query": {"term": {"property_type": "LOFT"}}, "size": 3}
+</code></pre>
+
+<p>Right for a homepage that renders four independent carousels. Not a substitute for aggregations
+&mdash; if the searches differ only by a filter and you want counts, one aggregation does it in one
+pass. Lesson 13.</p>
+
+<h2>Guarding a search endpoint</h2>
+
+<p>Two parameters worth knowing, and one of them behaves differently from how it reads.</p>
+
+<p><code>"timeout": "2s"</code> does not abort the search. It returns whatever has been collected so
+far with <code>timed_out: true</code>. Useful as a backstop, useless as a guarantee.</p>
+
+<p><code>"terminate_after": 100</code> stops each shard after it has collected that many matches. On
+a small index it does nothing at all:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">{"terminate_after": 3, "size": 0}
+-> total: {"value": 12, "relation": "eq"}, terminated_early: false</code></pre>
+
+<p>Twelve, not three, and <code>terminated_early: false</code> &mdash; the shard finished before it
+had a reason to stop. It only bites when there is genuinely more work than the limit, which is
+exactly when you want it and exactly why it is hard to test.</p>
+
+<p>Neither replaces a client-side timeout. StayHub sets one on the client and turns a failure into
+an honest error rather than an empty result:</p>
+
+<pre class="language-python"><code class="language-python">    if not es_available():
+        raise ApiException(
+            "Search is temporarily unavailable. Please try again in a moment.",
+            status_code=503,
+        )</code></pre>
+
+<p>That distinction matters more than it looks. "No listings match your search" and "search is
+broken" look identical to a user, and only one of them is their fault.</p>
+
+<h2>What actually makes a search slow</h2>
+
+<p>Worth knowing before you start optimising, because the usual first guess is wrong.</p>
+
+<p><strong>Deep pagination</strong> is the biggest one, and it is entirely self-inflicted. Every
+shard ranks <code>from + size</code> documents regardless of how many you keep.</p>
+
+<p><strong>Returning too much.</strong> Twenty full <code>_source</code> documents with long
+descriptions is often more time in serialisation and transfer than in the search itself. This is
+the cheapest thing to fix and the least often looked at.</p>
+
+<p><strong>Scoring things that do not need scoring.</strong> A clause in
+<code>must</code> computes a relevance contribution for every matching document and can never be
+cached. The same clause in <code>filter</code> does neither. Lesson 10.</p>
+
+<p><strong>Wildcards, regexes and scripts</strong>, which run against terms or documents rather than
+using the index.</p>
+
+<p><strong>Too many shards</strong>, so every search fans out further than it needs to and pays a
+merge across all of them. Lesson 18.</p>
+
+<p>Note what is not on the list: the number of documents. An inverted index lookup barely cares
+whether there are ten thousand documents or ten million &mdash; that is the entire point of it. A
+search that got slower as the index grew is usually one of the five above becoming more expensive,
+not the lookup itself.</p>
+
+<p>Measure before changing anything. <code>"profile": true</code> attributes time to individual
+query components per shard, and <code>took</code> versus your client's own timing tells you whether
+the problem is even inside Elasticsearch. On the index in this track, a search without facets is
+<strong>4.5 ms</strong> from Python and reports <code>took: 2</code> &mdash; more than half the wall
+clock is not the search.</p>
+
+<h2>Putting it together</h2>
+
+<p>StayHub's search body, assembled from everything above:</p>
+
+<pre class="language-python"><code class="language-python">    body: dict[str, Any] = {
+        "query": {"bool": {"must": [_text_clause(req)], "filter": _flatten(groups)}},
+        "from": (req.page - 1) * req.page_size,
+        "size": req.page_size,
+        "track_total_hits": True,
+    }
+    if sort:
+        body["sort"] = sort
+    if req.q:
+        body["highlight"] = _highlight_spec()
+    if with_facets:
+        body["aggs"] = build_aggs(req)
+    return body</code></pre>
+
+<p>Note what is conditional. Highlighting only when there is a term to mark. Sort only when it is
+not the default. Aggregations only when the caller renders them &mdash; the result page wants
+facets, a map's pan handler does not, and asking for them anyway is the easiest way to double the
+cost of a search without noticing.</p>
+
+<p>Two habits are worth adopting from that shape rather than from the details. Build the body as a
+data structure and assemble it from small named functions, not as a template string &mdash; a query
+built by string concatenation cannot be unit tested, and it is where injection bugs live. And keep
+each optional part behind the condition that justifies it, so the cost of a feature is paid only by
+the callers who use it.</p>
+
+<p>Both matter more than they sound. A search body grows: filters, facets, highlighting, sorting,
+suggestions, collapse. The difference between a query builder you can still reason about after a
+year and one nobody wants to touch is almost entirely whether those pieces stayed separable.</p>
+
+<p>The one piece not yet explained is <code>bool</code>, and specifically why the text query goes in
+<code>must</code> while everything else goes in <code>filter</code>. That is the next lesson, and it
+is the single decision with the largest effect on both correctness and speed.</p>

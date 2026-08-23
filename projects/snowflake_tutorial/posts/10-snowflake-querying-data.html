@@ -1,0 +1,219 @@
+<p>Snowflake's SQL is ANSI-compliant, so most of what you know transfers unchanged. This lesson is
+about the parts that repay learning deliberately — the constructs that turn a nested mess of
+subqueries into something readable, plus the handful of things Snowflake has that Postgres does not.
+Every query here runs against <code>SNOWFLAKE_SAMPLE_DATA</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">USE WAREHOUSE learn_wh;
+USE DATABASE SNOWFLAKE_SAMPLE_DATA;
+USE SCHEMA TPCH_SF1;</code></pre>
+
+<h2>CTEs, and why to prefer them</h2>
+
+<p>A common table expression names a result so the next step can use it. Nothing is materialised;
+it is a readability device with no cost:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH monthly AS (
+    SELECT DATE_TRUNC('month', o_orderdate) AS month,
+           SUM(o_totalprice)                AS revenue,
+           COUNT(*)                         AS orders
+    FROM   orders
+    WHERE  o_orderdate &gt;= '1996-01-01'
+    GROUP  BY 1
+),
+with_growth AS (
+    SELECT month,
+           revenue,
+           orders,
+           LAG(revenue) OVER (ORDER BY month) AS prev_revenue
+    FROM   monthly
+)
+SELECT month,
+       revenue,
+       ROUND(100 * (revenue - prev_revenue) / NULLIF(prev_revenue, 0), 1) AS pct_change
+FROM   with_growth
+ORDER  BY month;</code></pre>
+
+<p>Three CTE habits worth having. Name each step for what it <em>is</em>, so the final
+<code>SELECT</code> reads as a sentence. Keep the filtering as early as possible, so later steps work
+on less. And <code>NULLIF(x, 0)</code> in every denominator — a division by zero fails the whole
+statement, and a null is almost always the honest answer.</p>
+
+<p>Recursive CTEs handle hierarchies, and the shape is the standard one:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH RECURSIVE parts AS (
+    SELECT part_id, parent_id, 1 AS depth
+    FROM   bill_of_materials WHERE parent_id IS NULL
+  UNION ALL
+    SELECT b.part_id, b.parent_id, p.depth + 1
+    FROM   bill_of_materials b JOIN parts p ON b.parent_id = p.part_id
+)
+SELECT * FROM parts ORDER BY depth;</code></pre>
+
+<h2>Window functions</h2>
+
+<p>A window function computes across a set of rows related to the current one without collapsing
+them, which is what separates it from <code>GROUP BY</code>. Rankings, running totals and
+period-over-period comparisons are all this.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT c.c_mktsegment,
+       c.c_name,
+       SUM(o.o_totalprice) AS customer_revenue,
+
+       -- Rank within the segment. RANK leaves gaps after ties;
+       -- DENSE_RANK does not; ROW_NUMBER breaks ties arbitrarily.
+       RANK() OVER (PARTITION BY c.c_mktsegment
+                    ORDER BY SUM(o.o_totalprice) DESC) AS rank_in_segment,
+
+       -- Every customer's share of their segment.
+       ROUND(100 * SUM(o.o_totalprice)
+             / SUM(SUM(o.o_totalprice)) OVER (PARTITION BY c.c_mktsegment), 2) AS pct_of_segment
+FROM   customer c
+JOIN   orders   o ON o.o_custkey = c.c_custkey
+GROUP  BY c.c_mktsegment, c.c_name;</code></pre>
+
+<p>A running total needs an explicit frame. The default frame when you supply an
+<code>ORDER BY</code> is "everything up to and including the current row", which is what a running
+total means — but writing it out stops the next reader wondering:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT o_orderdate,
+       SUM(o_totalprice) AS daily,
+       SUM(SUM(o_totalprice)) OVER (
+         ORDER BY o_orderdate
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+       AVG(SUM(o_totalprice)) OVER (
+         ORDER BY o_orderdate
+         ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving_avg_7d
+FROM   orders
+WHERE  o_orderdate BETWEEN '1996-01-01' AND '1996-03-31'
+GROUP  BY o_orderdate
+ORDER  BY o_orderdate;</code></pre>
+
+<h2>QUALIFY</h2>
+
+<p>This one is worth the price of admission. <code>WHERE</code> filters before window functions are
+computed, and <code>HAVING</code> filters groups — so filtering <em>on a window function's result</em>
+conventionally requires wrapping the whole query in a subquery. <code>QUALIFY</code> does it
+directly:</p>
+
+<pre class="language-sql"><code class="language-sql">-- The three largest orders per market segment. No subquery.
+SELECT c.c_mktsegment, c.c_name, o.o_orderkey, o.o_totalprice
+FROM   orders   o
+JOIN   customer c ON c.c_custkey = o.o_custkey
+QUALIFY ROW_NUMBER() OVER (PARTITION BY c.c_mktsegment
+                           ORDER BY o.o_totalprice DESC) &lt;= 3;</code></pre>
+
+<p>The deduplication idiom falls out of it, and this is the one you will use most:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Keep only the newest row per key. Snowflake enforces no uniqueness
+-- (lesson 5), so this is a routine need rather than an exotic one.
+SELECT *
+FROM   learn_snowflake.staging.raw_orders
+QUALIFY ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY loaded_at DESC) = 1;</code></pre>
+
+<p>The evaluation order is <code>WHERE</code> → <code>GROUP BY</code> → <code>HAVING</code> →
+window functions → <code>QUALIFY</code>. Anything that can go in <code>WHERE</code> should, because
+it reduces what the window has to sort.</p>
+
+<h2>Conveniences worth knowing</h2>
+
+<pre class="language-sql"><code class="language-sql">-- GROUP BY ALL: group by every non-aggregated column. No more renumbering
+-- 1, 2, 3, 4 every time you add a column.
+SELECT c_mktsegment, c_nationkey, COUNT(*), AVG(c_acctbal)
+FROM   customer
+GROUP  BY ALL;
+
+-- SELECT * EXCLUDE / RENAME: everything but, or everything with a rename.
+SELECT * EXCLUDE (c_comment, c_phone) FROM customer LIMIT 5;
+SELECT * RENAME (c_name AS customer_name) FROM customer LIMIT 5;
+
+-- SAMPLE: explore a big table without scanning it.
+SELECT * FROM lineitem SAMPLE (0.1);        -- 0.1% of rows
+SELECT * FROM lineitem SAMPLE (1000 ROWS);  -- approximately 1000 rows</code></pre>
+
+<p><code>SAMPLE</code> is the underused one. Working out the shape of an unfamiliar table by
+running <code>SELECT *</code> with a <code>LIMIT</code> still scans; <code>SAMPLE</code> reads a
+fraction of the micro-partitions and costs proportionally less.</p>
+
+<h2>Joins, and the one that gets written by accident</h2>
+
+<pre class="language-sql"><code class="language-sql">-- LATERAL: a subquery that can see the row it is joined to.
+SELECT c.c_name, recent.o_orderkey, recent.o_totalprice
+FROM   customer c,
+       LATERAL (SELECT o_orderkey, o_totalprice
+                FROM   orders
+                WHERE  o_custkey = c.c_custkey       -- references the outer row
+                ORDER  BY o_orderdate DESC
+                LIMIT  1) recent
+LIMIT 20;
+
+-- ASOF: match each row to the nearest earlier row in another table.
+SELECT t.trade_id, t.traded_at, q.price
+FROM   trades t
+ASOF JOIN quotes q
+  MATCH_CONDITION (t.traded_at &gt;= q.quoted_at)
+  ON t.symbol = q.symbol;</code></pre>
+
+<p><code>ASOF JOIN</code> replaces a window-function-and-filter construction that everyone writes
+badly at least once, and it is much faster besides.</p>
+
+<p>The join to be careful with is the accidental cross join. Snowflake will happily run
+<code>FROM a, b</code> with no join condition against two large tables and produce a result set
+larger than either input. Sizing up the warehouse makes it finish sooner and no less wrong — check
+the row count against what you expected before assuming the machine is slow.</p>
+
+<h2>How Snowflake SQL differs from what you know</h2>
+
+<p>Most of the friction when moving from another database is not missing features, it is small
+behavioural differences that produce a wrong answer rather than an error. Five are worth committing
+to memory.</p>
+
+<table>
+<tr><th>Behaviour</th><th>Snowflake</th><th>Compared to</th></tr>
+<tr><td>Unquoted identifiers</td><td>Folded to <strong>upper</strong> case</td><td>Postgres folds
+to lower case, so a quoted <code>"id"</code> column migrated across breaks in both
+directions</td></tr>
+<tr><td>String comparison</td><td>Case-<strong>sensitive</strong> by default</td><td>MySQL's
+default collation is not. <code>ILIKE</code> and <code>COLLATE</code> are the ways
+round</td></tr>
+<tr><td><code>||</code></td><td>String concatenation</td><td>The same as Postgres; not MySQL's
+logical OR</td></tr>
+<tr><td>Constraints</td><td>Only <code>NOT NULL</code> is enforced</td><td>Everywhere else
+enforces them — see lesson 5</td></tr>
+<tr><td>Transactions</td><td>Autocommit is on; DDL commits implicitly</td><td>Postgres wraps DDL in
+transactions and can roll it back</td></tr>
+</table>
+
+<p>That last row deserves a sentence of its own. Snowflake supports multi-statement transactions
+with <code>BEGIN</code> and <code>COMMIT</code>, but a DDL statement inside one commits the
+transaction it finds itself in. A migration script that mixes <code>CREATE TABLE</code> with
+<code>INSERT</code> and expects to roll the whole thing back on failure does not behave the way it
+would in Postgres, and finds out at the worst moment.</p>
+
+<p>One more difference is more pleasant than dangerous: <strong>an alias defined in the
+<code>SELECT</code> list can be used in <code>WHERE</code>, <code>GROUP BY</code>,
+<code>HAVING</code> and <code>ORDER BY</code>.</strong> Repeating a long expression three times, or
+wrapping the query in a subquery just to filter on a computed column, is unnecessary here.</p>
+
+<h2>Functions that come up constantly</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT DATE_TRUNC('quarter', o_orderdate)              AS quarter,
+       LAST_DAY(o_orderdate)                           AS month_end,
+       DATEDIFF('day', o_orderdate, CURRENT_DATE())    AS days_ago,
+       TO_CHAR(o_orderdate, 'YYYY-MM')                 AS ym,
+
+       COALESCE(o_clerk, 'unassigned')                 AS clerk,
+       IFF(o_totalprice &gt; 200000, 'large', 'normal')   AS size_band,
+       CASE WHEN o_orderpriority LIKE '1-%' THEN 'urgent'
+            WHEN o_orderpriority LIKE '2-%' THEN 'high'
+            ELSE 'normal' END                          AS priority,
+
+       SPLIT_PART(o_orderpriority, '-', 2)             AS priority_word,
+       COUNT_IF(o_orderstatus = 'F') OVER ()           AS fulfilled_total
+FROM   orders
+LIMIT  20;</code></pre>
+
+<p><code>COUNT_IF</code> and <code>SUM(IFF(...))</code> replace the
+<code>COUNT(CASE WHEN … THEN 1 END)</code> construction, and read better for it.</p>
+
+<p>Next: <a href="/snowflake/snowflake-query-performance">making queries fast</a>, which is mostly
+about reading what a query actually did.</p>

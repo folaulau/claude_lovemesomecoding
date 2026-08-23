@@ -1,0 +1,190 @@
+<p>A transaction is a group of statements that either all happen or none do. That much is
+familiar. What is worth your time is the second promise — what one transaction sees while another
+is running — because the default is not the strongest option and the difference causes real bugs.</p>
+
+<h2>The basics</h2>
+
+<pre class="language-sql"><code class="language-sql">BEGIN;
+UPDATE bookings SET status = 'CANCELLED', cancelled_at = now() WHERE id = 12345;
+INSERT INTO outbox (topic, payload, status, attempts, available_at, public_id)
+VALUES ('booking.cancelled', '{"bookingId": 12345}'::jsonb, 'PENDING', 0, now(),
+        gen_random_uuid());
+COMMIT;</code></pre>
+
+<p>Both rows appear together or neither does. A statement outside an explicit transaction gets its
+own — there is no such thing as a statement running outside one.</p>
+
+<p><strong>Postgres DDL is transactional.</strong> <code>CREATE TABLE</code>,
+<code>ALTER TABLE</code> and <code>DROP TABLE</code> all roll back, which is why a failed migration
+here leaves nothing half-applied. If you are used to MySQL or Oracle, this is a genuine
+difference.</p>
+
+<p>Savepoints give partial rollback inside a transaction — and they are what an ORM uses to
+implement nested transactions, which is worth knowing when you go looking for one in a log:</p>
+
+<pre class="language-sql"><code class="language-sql">BEGIN;
+INSERT INTO amenities (slug, name) VALUES ('sauna', 'Sauna');
+SAVEPOINT before_risky;
+INSERT INTO amenities (slug, name) VALUES ('sauna', 'Duplicate');  -- fails
+ROLLBACK TO SAVEPOINT before_risky;
+COMMIT;   -- the first insert survives</code></pre>
+
+<p>Without the savepoint, that error would poison the whole transaction: every subsequent statement
+answers <em>current transaction is aborted</em> until you roll back.</p>
+
+<h2>Isolation levels</h2>
+
+<p>Postgres offers three, and the default is the weakest.</p>
+
+<table>
+  <thead><tr><th>Level</th><th>Prevents</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Read Committed</strong> (default)</td><td>Dirty reads</td><td>Each
+        <em>statement</em> sees its own fresh snapshot.</td></tr>
+    <tr><td><strong>Repeatable Read</strong></td><td>Also non-repeatable reads and phantoms</td>
+        <td>One snapshot for the whole transaction; concurrent writes to the same rows fail with a
+        serialization error you must retry.</td></tr>
+    <tr><td><strong>Serializable</strong></td><td>Everything, including write skew</td>
+        <td>As if transactions ran one at a time. More serialization failures.</td></tr>
+  </tbody>
+</table>
+
+<p>Note that Postgres has no Read Uncommitted — asking for it gives you Read Committed. Dirty reads
+simply cannot happen.</p>
+
+<p>The default's sharp edge: <strong>each statement gets a new snapshot</strong>, so two identical
+queries in one transaction can return different answers.</p>
+
+<pre class="language-sql"><code class="language-sql">-- session A
+BEGIN;
+SELECT count(*) FROM bookings WHERE property_id = 42;   -- 20
+-- session B commits an insert here
+SELECT count(*) FROM bookings WHERE property_id = 42;   -- 21, in the SAME transaction
+COMMIT;</code></pre>
+
+<p>Any logic that reads a value, decides something, and writes based on that decision is unsafe at
+Read Committed unless it locks. That is the whole of the next section.</p>
+
+<h2>The lost update, and SELECT FOR UPDATE</h2>
+
+<p>Two sessions read the same row, both compute a new value from it, both write. One update is
+silently lost:</p>
+
+<pre class="language-sql"><code class="language-sql">-- session A                                    -- session B
+BEGIN;                                          BEGIN;
+SELECT rating_count FROM properties             SELECT rating_count FROM properties
+WHERE id = 42;               -- 10              WHERE id = 42;               -- 10
+UPDATE properties SET rating_count = 11         UPDATE properties SET rating_count = 11
+WHERE id = 42;                                  WHERE id = 42;
+COMMIT;                                         COMMIT;                      -- still 11</code></pre>
+
+<p>Two reviews arrived, the count went up by one. Three fixes, in order of preference:</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. best: let the database do the arithmetic. No read, nothing to lose.
+UPDATE properties SET rating_count = rating_count + 1 WHERE id = 42;
+
+-- 2. when you genuinely must read first, lock the row while you think
+BEGIN;
+SELECT rating_count FROM properties WHERE id = 42 FOR UPDATE;
+UPDATE properties SET rating_count = 11 WHERE id = 42;
+COMMIT;
+
+-- 3. optimistic: fail rather than overwrite, and retry
+UPDATE properties SET rating_count = 11, updated_at = now()
+WHERE  id = 42 AND rating_count = 10;    -- 0 rows means somebody else got there first</code></pre>
+
+<p><code>FOR UPDATE</code> holds the row until the transaction ends, and a second session's
+<code>FOR UPDATE</code> on the same row waits. Two variants matter:
+<code>FOR UPDATE NOWAIT</code> errors immediately rather than waiting, and
+<code>FOR UPDATE SKIP LOCKED</code> ignores locked rows — which is how you build a work queue that
+several workers can pull from without handing anyone the same job:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, payload FROM outbox
+WHERE  status = 'PENDING' AND available_at <= now()
+ORDER  BY available_at
+LIMIT  10
+FOR UPDATE SKIP LOCKED;</code></pre>
+
+<h2>Deadlocks</h2>
+
+<p>Two transactions each holding a lock the other wants. Postgres detects it after about a second,
+kills one, and reports <code>deadlock detected</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">-- session A                        -- session B
+BEGIN;                              BEGIN;
+UPDATE properties SET ... id = 1;   UPDATE properties SET ... id = 2;
+UPDATE properties SET ... id = 2;   UPDATE properties SET ... id = 1;
+-- waits for B                      -- waits for A: deadlock</code></pre>
+
+<p>The cure is not a retry loop, although you want one anyway. It is <strong>touching rows in a
+consistent order</strong> — always ascending by primary key — so the cycle cannot form. Add
+<code>ORDER BY id</code> to the subquery of any batch update.</p>
+
+<h2>The locks that block a deploy</h2>
+
+<p>Row locks are rarely the problem. Table-level locks taken by DDL are, because
+<code>ACCESS EXCLUSIVE</code> blocks even <code>SELECT</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT a.pid, a.state, now() - a.xact_start AS open_for,
+       a.wait_event_type, left(a.query, 50) AS query
+FROM   pg_stat_activity a
+WHERE  a.backend_type = 'client backend' AND a.state <> 'idle'
+ORDER  BY a.xact_start;</code></pre>
+
+<p>The state to hunt for is <code>idle in transaction</code>: a connection that ran
+<code>BEGIN</code>, did something, and then went away without committing. It holds every lock it
+took and it stops <code>VACUUM</code> from cleaning up anything newer than its snapshot. One of
+those, left open by a crashed worker, will block your next migration indefinitely.</p>
+
+<p>Set a limit rather than relying on applications to behave:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER DATABASE stayhub_lab SET idle_in_transaction_session_timeout = '60s';
+ALTER DATABASE stayhub_lab SET lock_timeout = '5s';
+ALTER DATABASE stayhub_lab SET statement_timeout = '30s';</code></pre>
+
+<p><code>lock_timeout</code> is the one that turns a migration from an outage into a retry: rather
+than queueing behind a long query — and blocking everything that queues behind <em>it</em> — the
+DDL gives up after five seconds and you run it again.</p>
+
+<h2>When to raise the isolation level</h2>
+
+<p>Read Committed plus explicit locks handles nearly everything, and it is what you should reach
+for first because it never fails with a serialization error. The level worth raising for is
+<strong>write skew</strong>, which locking rows does not prevent — because the problem is a row
+that does not exist yet.</p>
+
+<p>The booking case is the textbook one. Two guests request overlapping dates at the same property
+simultaneously. Each transaction reads the calendar, finds no conflict, and inserts. Neither read
+the other's row, because neither row existed at the time, so <code>FOR UPDATE</code> has nothing to
+lock.</p>
+
+<pre class="language-sql"><code class="language-sql">BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT 1 FROM bookings
+WHERE  property_id = 42 AND daterange(check_in, check_out, '[)') && daterange('2025-07-01','2025-07-05','[)')
+  AND  status IN ('PENDING','CONFIRMED','COMPLETED');
+-- decide it is free, then insert
+COMMIT;</code></pre>
+
+<p>At <code>SERIALIZABLE</code>, Postgres tracks the read and fails one of the two transactions
+with <code>could not serialize access due to read/write dependencies</code>. That is not an error
+to log and forget — it means "retry this transaction", and any code using serializable isolation
+needs a retry loop around the whole transaction, not around one statement.</p>
+
+<p>The alternative, and the one this schema actually uses, is to make the conflict a constraint —
+the exclusion constraint from the constraints post. Then Read Committed is sufficient, because the
+database rejects the second insert whatever order things happened in. <strong>Prefer a constraint
+to an isolation level where you can express it as one</strong>: it needs no retry loop, no
+discipline from callers, and it holds for clients that never heard of your rule.</p>
+
+<h2>Advisory locks</h2>
+
+<p>A named lock with no row attached, for coordinating things outside the database — one scheduler
+across several instances, or a nightly job that must not overlap itself:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT pg_try_advisory_lock(4242);   -- true if you got it, false if someone else holds it
+SELECT pg_advisory_unlock(4242);</code></pre>
+
+<p>Use <code>pg_try_advisory_lock</code>, which returns immediately, rather than
+<code>pg_advisory_lock</code>, which waits forever. Session-level advisory locks are released on
+disconnect but <strong>not</strong> on commit, so a pooled connection can carry one into the next
+request — the <code>_xact</code> variants, released at commit, are usually what you want.</p>

@@ -1,0 +1,215 @@
+<p>Getting from nothing to a running query takes about ten minutes, and most of that is waiting for a
+confirmation email. This lesson covers the account choices that are annoying to change later, the
+four settings every session needs, and how to connect from outside the browser.</p>
+
+<h2>The trial account</h2>
+
+<p>Sign up at <a href="https://signup.snowflake.com/" rel="nofollow">signup.snowflake.com</a>. It is
+30 days and a fixed amount of free credit, and it does not ask for a card. Two of the choices on
+that form are worth thinking about for a moment.</p>
+
+<p><strong>Edition.</strong> The trial defaults to Enterprise, which is the right pick for learning
+because it enables things Standard does not — multi-cluster warehouses, materialised views, and 90
+days of Time Travel instead of 1. Just be aware that a feature working on your trial does not prove
+it works on the Standard account your employer bought.</p>
+
+<p><strong>Cloud and region.</strong> Pick the cloud and region your data already lives in. Loading
+from an S3 bucket in <code>us-west-2</code> into a Snowflake account in Azure Europe works, and you
+pay egress for the privilege on every load. This one is genuinely hard to change afterwards — an
+account cannot be moved between regions, only replicated to a new one.</p>
+
+<p>Your account has a URL of the form
+<code>https://&lt;org&gt;-&lt;account&gt;.snowflakecomputing.com</code>, and the
+<code>&lt;org&gt;-&lt;account&gt;</code> half is the account identifier every connector asks for.
+Note it down now; it is under Admin → Accounts in the UI.</p>
+
+<h2>What a new account already has</h2>
+
+<ul>
+<li><code>SNOWFLAKE_SAMPLE_DATA</code> — the shared TPC-H and TPC-DS data this track queries. It is
+a <em>share</em>, not a copy: you are reading Snowflake's data, you pay nothing to store it, and you
+cannot write to it.</li>
+<li><code>SNOWFLAKE</code> — a read-only database of your own account's usage and metadata. Lesson
+15 lives in here.</li>
+<li>A warehouse, usually <code>COMPUTE_WH</code>, sized X-Small.</li>
+<li>The system roles: <code>ACCOUNTADMIN</code>, <code>SECURITYADMIN</code>,
+<code>USERADMIN</code>, <code>SYSADMIN</code>, <code>PUBLIC</code>. Lesson 14 explains why you
+should stop using the first one almost immediately.</li>
+</ul>
+
+<h2>Snowsight and the four context settings</h2>
+
+<p>Snowsight is the web UI, and a worksheet in it is where most people write their first thousand
+queries. The thing to understand about it is <strong>session context</strong>: every statement runs
+as a role, on a warehouse, in a database and a schema. Get one wrong and you get either a permission
+error or, worse, the right query against the wrong data.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Where am I?
+SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE(), CURRENT_DATABASE(), CURRENT_SCHEMA();
+
+-- Set all four explicitly. Do this at the top of any script you care about.
+USE ROLE SYSADMIN;
+USE WAREHOUSE COMPUTE_WH;
+USE DATABASE SNOWFLAKE_SAMPLE_DATA;
+USE SCHEMA TPCH_SF1;</code></pre>
+
+<p>Snowsight has dropdowns for all four, and they are per-worksheet, not global. A script that runs
+in one worksheet and fails in another is nearly always this.</p>
+
+<p>Fully-qualified names sidestep the problem entirely, and are worth the extra typing in anything
+saved to a file:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) FROM snowflake_sample_data.tpch_sf1.orders;</code></pre>
+
+<h2>Creating somewhere to work</h2>
+
+<p>You cannot write to the sample share, so make a database of your own. This track uses
+<code>LEARN_SNOWFLAKE</code> for anything it creates:</p>
+
+<pre class="language-sql"><code class="language-sql">USE ROLE SYSADMIN;
+
+CREATE DATABASE IF NOT EXISTS learn_snowflake;
+CREATE SCHEMA   IF NOT EXISTS learn_snowflake.staging;
+
+-- A small warehouse of our own, suspending aggressively.
+CREATE WAREHOUSE IF NOT EXISTS learn_wh
+  WAREHOUSE_SIZE      = XSMALL
+  AUTO_SUSPEND        = 60      -- seconds idle before it stops
+  AUTO_RESUME         = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+USE WAREHOUSE learn_wh;
+USE SCHEMA   learn_snowflake.staging;</code></pre>
+
+<p><code>INITIALLY_SUSPENDED = TRUE</code> matters more than it looks. Without it the warehouse
+starts running the moment you create it and bills until something suspends it, which for a warehouse
+you created to use next week is pure waste.</p>
+
+<h2>Identifiers are upper case</h2>
+
+<p>This surprises everyone exactly once. Unquoted identifiers are folded to upper case, so
+<code>customer</code>, <code>Customer</code> and <code>CUSTOMER</code> are the same object. Quoted
+identifiers are case-sensitive and stored exactly as written.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE my_table (id INT);      -- stored as MY_TABLE
+CREATE TABLE "my_table" (id INT);    -- a DIFFERENT table, stored as my_table
+
+SELECT * FROM my_table;              -- finds MY_TABLE
+SELECT * FROM "my_table";            -- finds the quoted one</code></pre>
+
+<p>The rule that keeps you out of trouble: <strong>never quote an identifier you created
+yourself.</strong> Quoting shows up when a loading tool creates columns from a CSV header —
+<code>"Order Date"</code> — and from then on every query has to quote it too.</p>
+
+<h2>What else is in Snowsight</h2>
+
+<p>Four parts of the UI earn their keep, and knowing they exist saves writing SQL to find things
+out.</p>
+
+<ul>
+<li><strong>Worksheets</strong> — SQL editors with results below. Each one carries its own context,
+keeps a history, and can be shared with a colleague.</li>
+<li><strong>Databases</strong> — a browser over every object your current role can see. Useful as a
+permissions check: if a table is not listed, the role cannot read it, and no amount of retyping the
+name will help.</li>
+<li><strong>Query History</strong> (Monitoring → Query History) — every query in the account for the
+last 14 days, with duration, the warehouse used, bytes scanned, and the Query Profile behind each
+one. Lesson 11 lives here.</li>
+<li><strong>Admin → Usage</strong> — credits consumed, broken down by warehouse. Worth a look on
+day one so the shape of it is familiar before there is a bill to explain.</li>
+</ul>
+
+<p>Snowsight also charts results directly from a worksheet and pins them to a dashboard, which is
+enough for internal monitoring without buying a BI tool.</p>
+
+<h2>The four errors everyone hits first</h2>
+
+<table>
+<tr><th>Message</th><th>What it actually means</th></tr>
+<tr><td>No active warehouse selected in the current session</td><td>You have no warehouse in
+context. <code>USE WAREHOUSE …</code>, or pick one from the dropdown.</td></tr>
+<tr><td>Object 'X' does not exist or not authorized</td><td>Two very different problems behind one
+message: the name is wrong, or your current role has no privilege on it. Check
+<code>CURRENT_ROLE()</code> before you check your spelling.</td></tr>
+<tr><td>Cannot perform CREATE. This session does not have a current database</td><td>No database in
+context. <code>USE DATABASE …</code>, or fully qualify the name.</td></tr>
+<tr><td>Insufficient privileges to operate on schema</td><td>Usually <code>SYSADMIN</code> creating
+inside a database owned by another role. Ownership, not grants — lesson 14.</td></tr>
+</table>
+
+<h2>Connecting from outside the browser</h2>
+
+<p>Three clients cover almost everything.</p>
+
+<table>
+<tr><th>Client</th><th>Use it for</th></tr>
+<tr><td>Snowflake CLI (<code>snow</code>)</td><td>Scripts, CI, running <code>.sql</code> files. The
+current CLI; <code>snowsql</code> is the older one you will still see referenced.</td></tr>
+<tr><td>Python connector</td><td>Application code, pipelines, notebooks.</td></tr>
+<tr><td>JDBC / ODBC driver</td><td>Java and .NET applications, and most BI tools.</td></tr>
+</table>
+
+<p>The CLI, installed with <code>pip install snowflake-cli</code>:</p>
+
+<pre class="language-bash"><code class="language-bash"># One-time: create a named connection. Prompts for the details.
+snow connection add --connection-name learn
+
+snow connection test --connection-name learn
+
+# Run a statement, or a whole file.
+snow sql --connection-name learn -q "SELECT CURRENT_VERSION();"
+snow sql --connection-name learn -f setup.sql</code></pre>
+
+<p>From Python, with <code>pip install snowflake-connector-python</code>:</p>
+
+<pre class="language-python"><code class="language-python">import os
+import snowflake.connector
+
+conn = snowflake.connector.connect(
+    account=os.environ["SNOWFLAKE_ACCOUNT"],      # e.g. myorg-myaccount
+    user=os.environ["SNOWFLAKE_USER"],
+    private_key_file=os.environ["SNOWFLAKE_KEY"], # not a password &mdash; see below
+    role="SYSADMIN",
+    warehouse="LEARN_WH",
+    database="LEARN_SNOWFLAKE",
+    schema="STAGING",
+)
+
+with conn.cursor() as cur:
+    cur.execute("SELECT c_mktsegment, COUNT(*) "
+                "FROM snowflake_sample_data.tpch_sf1.customer "
+                "GROUP BY 1")
+    for segment, customers in cur:
+        print(segment, customers)
+
+conn.close()</code></pre>
+
+<h2>Use key-pair authentication, not a password</h2>
+
+<p>Passwords for service accounts are a problem in any system, and Snowflake has been progressively
+removing the option — password-only sign-in for programmatic users is being retired in favour of
+key pairs. Set it up once and stop thinking about it:</p>
+
+<pre class="language-bash"><code class="language-bash"># Generate an encrypted private key and the matching public key.
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out sf_key.p8
+openssl rsa -in sf_key.p8 -pubout -out sf_key.pub
+
+# Strip the header, footer and newlines &mdash; Snowflake wants the body only.
+grep -v 'PUBLIC KEY' sf_key.pub | tr -d '\n'</code></pre>
+
+<p>Then attach the public key to the user. Human users get MFA; service accounts get a key and the
+<code>TYPE = SERVICE</code> marker, which makes their purpose explicit:</p>
+
+<pre class="language-sql"><code class="language-sql">USE ROLE SECURITYADMIN;
+
+ALTER USER etl_service SET RSA_PUBLIC_KEY = 'MIIBIjANBgkqh...';
+
+-- Confirm it took. The fingerprint should match your key.
+DESCRIBE USER etl_service;</code></pre>
+
+<p>Keep the private key out of the repository and out of the image — an environment variable
+injected at runtime, or a secrets manager. Lesson 16 comes back to this alongside network policies,
+which are the other half of locking a service account down.</p>
+
+<p>Next: <a href="/snowflake/snowflake-virtual-warehouses">virtual warehouses</a> — the thing you
+are actually paying for.</p>

@@ -1,0 +1,185 @@
+<p>A subquery is a query inside another one. A CTE is the same thing given a name and moved to the
+top, where it can be read. Which you reach for is mostly about legibility — with two exceptions
+where it changes the answer or the plan, and those are the parts worth knowing.</p>
+
+<h2>The three shapes of subquery</h2>
+
+<pre class="language-sql"><code class="language-sql">-- scalar: returns exactly one value, usable anywhere a value is
+SELECT id, total,
+       total - (SELECT avg(total) FROM bookings) AS vs_average
+FROM   bookings
+WHERE  status = 'CONFIRMED'
+LIMIT  5;
+
+-- list: feeds IN
+SELECT count(*) FROM bookings
+WHERE  property_id IN (SELECT id FROM properties WHERE city = 'Oslo');
+
+-- table: sits in FROM and needs an alias
+SELECT city, avg_price FROM (
+    SELECT city, round(avg(price_per_night), 2) AS avg_price
+    FROM   properties GROUP BY city
+) AS by_city
+WHERE  avg_price > 200;</code></pre>
+
+<p>A scalar subquery that returns more than one row is a runtime error, not a syntax error, so it
+will pass every test until the day the data changes.</p>
+
+<h2>EXISTS beats IN</h2>
+
+<pre class="language-sql"><code class="language-sql">-- properties that have ever been booked
+SELECT count(*) FROM properties p
+WHERE  EXISTS (SELECT 1 FROM bookings b WHERE b.property_id = p.id);
+
+-- and the ones that have not
+SELECT count(*) FROM properties p
+WHERE  NOT EXISTS (SELECT 1 FROM bookings b WHERE b.property_id = p.id);</code></pre>
+
+<p><code>EXISTS</code> stops at the first matching row rather than building the full list, and it
+correlates — the inner query references <code>p.id</code> from the outer one. Postgres plans it as
+a semi-join, and the <code>SELECT 1</code> is conventional: nothing reads the value.</p>
+
+<p><strong><code>NOT IN</code> with a nullable column is the bug to know about.</strong> If the
+subquery returns even one NULL, the whole condition can never be true and you get zero rows, with
+no error and no warning:</p>
+
+<pre class="language-sql"><code class="language-sql">-- returns 0 if ANY booking has a NULL property_id — silently
+SELECT count(*) FROM properties
+WHERE  id NOT IN (SELECT property_id FROM bookings WHERE property_id <= 100);
+
+-- says the same thing, and is NULL-safe
+SELECT count(*) FROM properties p
+WHERE  NOT EXISTS (SELECT 1 FROM bookings b WHERE b.property_id = p.id
+                                              AND b.property_id <= 100);</code></pre>
+
+<p>It follows from three-valued logic — <code>x NOT IN (1, NULL)</code> means
+<code>x &lt;&gt; 1 AND x &lt;&gt; NULL</code>, and the second half is never true — but knowing why
+does not help you notice it in review. Use <code>NOT EXISTS</code>.</p>
+
+<p>There is a second reason, and it is the one that shows up as a page that never loads.
+<strong>When the subquery's column is nullable, Postgres cannot plan <code>NOT IN</code> as an
+anti-join at all</strong> — it has to keep the whole list and check every value against it, because
+one NULL anywhere changes the answer for every row. Against the full 400,000-row booking table the
+unrestricted version of that first query does not finish inside a 20-second timeout on the machine
+that wrote this post; the <code>NOT EXISTS</code> form answers in milliseconds. Same result, same
+data, and the difference is entirely which one the planner is allowed to turn into an
+anti-join.</p>
+
+<h2>CTEs</h2>
+
+<p><code>WITH</code> names a subquery and puts it first, so the query reads in the order it
+happens:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH confirmed AS (
+    SELECT property_id, count(*) AS stays, sum(total) AS revenue
+    FROM   bookings
+    WHERE  status = 'CONFIRMED'
+    GROUP  BY property_id
+),
+ranked AS (
+    SELECT c.*, p.city, p.title
+    FROM   confirmed c
+    JOIN   properties p ON p.id = c.property_id
+    WHERE  c.stays >= 5
+)
+SELECT city, count(*) AS properties, round(sum(revenue), 2) AS revenue
+FROM   ranked
+GROUP  BY city
+ORDER  BY revenue DESC
+LIMIT  5;</code></pre>
+
+<p>The same query written with nested subqueries is the same plan and much harder to read. That is
+the main reason to use a CTE, and it is a good enough reason on its own.</p>
+
+<h2>MATERIALIZED, and the optimisation fence</h2>
+
+<p>Until Postgres 12 a CTE was always executed separately and its result held in memory — an
+"optimisation fence". Since 12 the planner may inline it, which is usually faster because filters
+from the outer query can be pushed inside.</p>
+
+<p>You can force either behaviour:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH expensive AS MATERIALIZED (
+    SELECT property_id, count(*) AS stays FROM bookings GROUP BY property_id
+)
+SELECT (SELECT count(*) FROM expensive WHERE stays > 10) AS busy,
+       (SELECT count(*) FROM expensive WHERE stays <= 10) AS quiet;</code></pre>
+
+<p><code>MATERIALIZED</code> earns its place when the CTE is expensive and referenced more than
+once — without it the planner may compute it twice. <code>NOT MATERIALIZED</code> forces inlining
+when you know the outer filter is highly selective. Reach for either only after reading a plan;
+the default is right nearly always.</p>
+
+<h2>Correlated subqueries and the N+1 in SQL</h2>
+
+<p>A correlated subquery runs once per row of the outer query. Sometimes that is exactly right —
+<code>EXISTS</code> above stops at the first match. In a <code>SELECT</code> list it is the same
+mistake as an N+1 query in application code, moved into the database:</p>
+
+<pre class="language-sql"><code class="language-sql">-- one subquery execution per property returned
+SELECT p.id, p.title,
+       (SELECT count(*) FROM bookings b WHERE b.property_id = p.id) AS stays
+FROM   properties p
+WHERE  p.city = 'Oslo';
+
+-- one pass, grouped once
+SELECT p.id, p.title, count(b.id) AS stays
+FROM   properties p
+LEFT   JOIN bookings b ON b.property_id = p.id
+WHERE  p.city = 'Oslo'
+GROUP  BY p.id;</code></pre>
+
+<p>The planner will sometimes rewrite the first into the second, and sometimes not — it depends on
+the aggregate, on whether the outer query is itself grouped, and on the row estimates. Write the
+join. Reach for a correlated subquery in a <code>SELECT</code> list only when it returns at most
+one row and you have looked at the plan.</p>
+
+<h2>Recursive CTEs</h2>
+
+<p>For hierarchies, and for generating rows from nothing. The shape is always the same: a base
+case, <code>UNION ALL</code>, and a step that refers back to the CTE's own name.</p>
+
+<pre class="language-sql"><code class="language-sql">WITH RECURSIVE calendar AS (
+    SELECT DATE '2024-06-01' AS day                      -- base
+    UNION ALL
+    SELECT day + 1 FROM calendar WHERE day < DATE '2024-06-30'   -- step
+)
+SELECT c.day, count(b.id) AS check_ins
+FROM   calendar c
+LEFT   JOIN bookings b ON b.check_in = c.day
+GROUP  BY c.day
+ORDER  BY c.day
+LIMIT  7;</code></pre>
+
+<p>Always give the step a termination condition. Without one it runs until the disk fills — there
+is no depth limit by default, and a cycle in the data does the same thing. Postgres 14 added
+<code>CYCLE</code> to detect that case directly.</p>
+
+<p>For a plain series of dates or numbers, <code>generate_series</code> is simpler and faster; keep
+recursion for genuine trees — a category with parents, an org chart, a thread of replies.</p>
+
+<h2>Writing from a CTE</h2>
+
+<p>A CTE may contain <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code> with
+<code>RETURNING</code>, which lets one statement move rows from one table to another:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH cancelled AS (
+    UPDATE bookings
+    SET    status = 'CANCELLED', cancelled_at = now()
+    WHERE  status = 'PENDING' AND check_in < DATE '2024-02-01'
+    RETURNING id, property_id, total
+)
+INSERT INTO outbox (topic, payload, status, attempts, available_at, public_id)
+SELECT 'booking.cancelled',
+       jsonb_build_object('bookingId', id, 'propertyId', property_id),
+       'PENDING', 0, now(), gen_random_uuid()
+FROM   cancelled;</code></pre>
+
+<p>One statement, one transaction: either both the update and the outbox rows happen, or neither
+does. That is the whole outbox pattern, and it is why the events cannot be lost when the process
+dies between two statements.</p>
+
+<p>One rule makes this safe to reason about: <strong>every part of the statement sees the same
+snapshot</strong>, taken before any of it ran. A CTE that updates a table and a second one that
+reads it will not see the update. Sub-statements also run in an unspecified order, so two CTEs
+writing to the same rows is undefined — do not.</p>

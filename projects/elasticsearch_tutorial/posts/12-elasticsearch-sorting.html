@@ -1,0 +1,351 @@
+<p>Sorting looks like the simplest thing in the search API, and then the first field you try refuses
+outright. This lesson covers why, what to do about it, and the thing sort values are secretly for
+&mdash; paginating past the 10,000-result wall.</p>
+
+<h2>The basics</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "query": { "match_all": {} },
+  "sort": [
+    { "price_per_night": "asc" },
+    { "rating_count": "desc" }
+  ]
+}</code></pre>
+
+<p>A list, applied in order. Ties on the first key are broken by the second. Without any
+<code>sort</code>, results come back by <code>_score</code> descending, which is why a relevance
+search needs no sort at all.</p>
+
+<p>The shorthand forms are worth recognising too, since most examples online use them.
+<code>"sort": "price_per_night"</code> is a plain ascending sort on one field, and
+<code>"sort": ["price_per_night", "rating_count"]</code> sorts ascending on both. The expanded
+object form is the one to write in application code, because every option below &mdash; order,
+missing, mode, unmapped type &mdash; only exists there.</p>
+
+<h2>Why sorting on your title field fails</h2>
+
+<pre class="language-bash"><code class="language-bash">{ "sort": [ { "title": "asc" } ] }</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">illegal_argument_exception
+Fielddata is disabled on [title] in [stayhub-properties-000001]. Text fields are not
+optimised for operations that require per-document field data like aggregations and
+sorting, so these operations are disabled by default.</code></pre>
+
+<p>The error is unusually good, and the reason behind it is worth understanding because the same
+constraint governs aggregations in the next lesson.</p>
+
+<p>The inverted index answers "which documents contain this term". Sorting needs the opposite:
+"what is this document's value". That is a different data structure, called <strong>doc
+values</strong>, built at index time for most field types.</p>
+
+<p><code>text</code> fields do not get doc values, because a text field does not have <em>a</em>
+value &mdash; it has a list of tokens. "Cedar Cabin with Mountain Views" is five terms, and sorting
+by them means nothing.</p>
+
+<p>Elasticsearch can build the equivalent structure on the fly, in memory, which is what
+<code>fielddata</code> means. It is disabled by default because on a large text field it consumes
+enormous heap and is the classic way to make a cluster fall over. Enabling it is almost always the
+wrong answer.</p>
+
+<p>The right answer is the multi-field from lesson 3:</p>
+
+<pre class="language-bash"><code class="language-bash">{ "sort": [ { "city.raw": "asc" } ] }
+# ['Austin', 'Big Bear Lake', 'Brooklyn']</code></pre>
+
+<p>The <code>keyword</code> sibling has one value, has doc values, and sorts. If you plan to sort or
+group by a string, that is the mapping decision that makes it possible, and it has to be made before
+the documents are indexed.</p>
+
+<h3>And it sorts by bytes, not by language</h3>
+
+<p>A <code>keyword</code> sort is a byte-order sort of the raw value. So uppercase sorts before
+lowercase, and accented characters sort after every unaccented one &mdash; "Zurich" before
+"&Eacute;vian". For an internal tool nobody cares. For a user-facing A&ndash;Z list it looks broken.</p>
+
+<p>The fix is an <code>icu_collation_keyword</code> field from the ICU analysis plugin, which stores
+a locale-aware sort key. That is a plugin install and a mapping change, so it is worth deciding
+early whether alphabetical order will ever be shown to a user.</p>
+
+<h2>What happens to _score</h2>
+
+<p>Add a sort to a scored query and look at the response:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">{"query": {"match": {"title": "cabin"}}, "sort": [{"price_per_night": "asc"}]}
+
+max_score: null
+hit _score: [null]
+hit sort:   [[189.0]]</code></pre>
+
+<p><code>_score</code> is <strong>null</strong>. Not zero, not preserved &mdash; not computed at
+all. Elasticsearch skips scoring entirely when it does not need it, which is a real optimisation and
+a real trap.</p>
+
+<p>The trap: every relevance signal you tuned in lesson 11 is gone the moment a user clicks "sort by
+price". That is fine and expected. What is not fine is a "sort by relevance" option implemented as a
+sort on some field, or a secondary sort added to a relevance search "just to make it stable" &mdash;
+which silently demotes <code>_score</code> to a tie-breaker.</p>
+
+<p>To keep scores while sorting, ask for them explicitly, or sort on <code>_score</code> first:</p>
+
+<pre class="language-json"><code class="language-json">{ "track_scores": true, "sort": [ { "price_per_night": "asc" } ] }
+
+{ "sort": [ "_score", { "rating_average": "desc" } ] }</code></pre>
+
+<p>The second is a genuinely useful pattern: rank by relevance, break ties by rating.</p>
+
+<h2>Tie-breakers, and why you need one</h2>
+
+<pre class="language-python"><code class="language-python">    elif req.sort == "rating":
+        # Tie-break on review count: a lone 5-star review should not outrank forty 4.9s.
+        sort = [{"rating_average": "desc"}, {"rating_count": "desc"}]</code></pre>
+
+<p>Two reasons to add a second key, and the second one is not obvious.</p>
+
+<p>The first is meaning. Sorting purely by average rating puts a listing with one five-star review
+above one with forty at 4.9. Review count as a tie-break fixes the ordering people actually expect.</p>
+
+<p>The second is <strong>stability</strong>. When two documents have identical sort values, their
+relative order is undefined &mdash; and it can differ between requests, because it depends on
+segment layout and which shard replied first. With paging, that means a document can appear on both
+page 1 and page 2, or on neither.</p>
+
+<p>The cure is a final tie-break on something unique:</p>
+
+<pre class="language-json"><code class="language-json">{ "sort": [ { "price_per_night": "asc" }, { "public_id": "asc" } ] }</code></pre>
+
+<p>This bug is invisible in testing, because it needs enough documents with equal values to matter,
+and it produces a support ticket that reads "sometimes a listing is missing".</p>
+
+<h2>Sorting is a mapping decision made early</h2>
+
+<p>Nearly everything above traces back to a choice made before any document was indexed, which is
+worth stating plainly because it is the practical lesson.</p>
+
+<p>Sorting alphabetically needs a <code>keyword</code> field, so the multi-field has to be in the
+mapping. Sorting correctly by locale needs an <code>icu_collation_keyword</code>, which needs a
+plugin. Stable pagination needs a unique field to tie-break on, which means an id in the document
+rather than relying on <code>_id</code> &mdash; sorting on <code>_id</code> works but is expensive
+and discouraged, because it has no doc values. Sorting on a computed total needs that total stored.
+And sorting by distance needs a <code>geo_point</code>, not two doubles.</p>
+
+<p>None of those can be added to existing documents without a reindex, as lesson 3 established. So
+the useful exercise, before an index goes live, is to write down every ordering the UI might ever
+offer &mdash; including "A to Z" and "nearest first", which are the two people forget &mdash; and
+check the mapping supports each of them.</p>
+
+<h2>Missing values</h2>
+
+<p>A document with no value for the sort field has to go somewhere:</p>
+
+<pre class="language-json"><code class="language-json">{ "sort": [ { "rating_average": { "order": "asc", "missing": "_last" } } ] }</code></pre>
+
+<p><code>_last</code> is the default for ascending, <code>_first</code> for descending &mdash; so
+"missing" always sorts as though it were the worst value, which is usually right. You can substitute
+a value instead: <code>"missing": 0</code> treats unrated listings as zero-rated.</p>
+
+<p>Note the difference from <code>null_value</code> in lesson 4. That one changes what is
+<em>indexed</em> and affects every query. <code>missing</code> affects only this sort. Prefer
+<code>missing</code> when the choice is presentational, which it usually is.</p>
+
+<h3>Fields that are not in the mapping</h3>
+
+<p>Sorting on a field that does not exist is an error, not an empty result:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">query_shard_exception
+No mapping found for [nope] in order to sort on</code></pre>
+
+<p>That is right for a typo and wrong when searching several indexes where only some have the field.
+<code>unmapped_type</code> tells the shards without it to treat it as missing:</p>
+
+<pre class="language-bash"><code class="language-bash">{ "sort": [ { "nope": { "order": "asc", "unmapped_type": "long" } } ] }
+# ok — sort values: [9223372036854775807]</code></pre>
+
+<p>That value is <code>Long.MAX_VALUE</code>, which is how "missing, sorted last ascending" is
+represented. Seeing it in a sort array is a reliable sign that a field you expected is absent.</p>
+
+<h2>Sorting on a field with many values</h2>
+
+<p>Lesson 4 noted that any field can hold an array. So what does sorting on an array do?</p>
+
+<pre class="language-json"><code class="language-json">{ "sort": [ { "prices": { "order": "asc", "mode": "min" } } ] }</code></pre>
+
+<p><code>mode</code> picks which of the values represents the document: <code>min</code>,
+<code>max</code>, <code>sum</code>, <code>avg</code>, or <code>median</code>. The default is
+<code>min</code> for ascending and <code>max</code> for descending &mdash; which is to say, the
+value that puts the document earliest.</p>
+
+<p>This is quietly the right behaviour for the common case: sorting listings by price when each has
+several seasonal rates should use the cheapest one, because that is the number a user is comparing.
+But it is a default worth stating explicitly in the query, because "why is this listing ranked at
+$78 when its page says $210" is a confusing bug to receive.</p>
+
+<p>Sorting on a <code>nested</code> field needs a <code>nested</code> clause in the sort itself,
+naming the path and optionally a filter &mdash; "sort by the rating of reviews written this year"
+is expressible, and it is one of the few places where nested's cost buys something a flat field
+cannot.</p>
+
+<h2>What sorting costs</h2>
+
+<p>Less than people fear, and in one specific case much more.</p>
+
+<p>A sort on a numeric or keyword field with doc values is cheap. The values are stored in a
+column-oriented structure built for exactly this, read sequentially, and the shard keeps only the
+top <code>from + size</code> in a small heap. It is often <em>faster</em> than sorting by
+<code>_score</code>, because no scoring happens at all.</p>
+
+<p>What is expensive: script sorts, which run per document; sorts on <code>fielddata</code>-enabled
+text fields, which build an in-memory structure over every term; and any sort combined with deep
+pagination, where the heap the shard maintains has to hold <code>from + size</code> entries.</p>
+
+<p>There is also an optimisation worth knowing about because it explains a puzzling result. When you
+sort by a field, do not need a total count, and the index is sorted the same way, Elasticsearch can
+stop early &mdash; it knows nothing later can rank higher. The tell is
+<code>"total": {"relation": "gte"}</code> on a query you expected an exact count for. Asking for
+<code>track_total_hits: true</code> disables the shortcut, which is the trade: an honest count, or
+the speed.</p>
+
+<h2>Sorting by distance</h2>
+
+<pre class="language-python"><code class="language-python">        sort.append(
+            {
+                "_geo_distance": {
+                    "location": origin,
+                    "order": "asc",
+                    "unit": "km",
+                    # A listing with no coordinates sorts last instead of failing the query.
+                    "ignore_unmapped": True,
+                }
+            }
+        )</code></pre>
+
+<p>A computed sort rather than a stored field, and lesson 14 covers the geo side. What belongs here
+is the trick it enables, because it applies to every sort key.</p>
+
+<h2>Sort values come back on every hit</h2>
+
+<p>Each hit carries the values it was sorted by, in the same order as the sort array:</p>
+
+<pre class="language-json"><code class="language-json">"sort": [128.0, "6e6e5150-78f0-4a65-bc9d-eaae63aac4f6"]</code></pre>
+
+<p>That is free information &mdash; Elasticsearch computed it in order to sort &mdash; and it is
+worth using rather than recomputing.</p>
+
+<p>StayHub reads distance out of it instead of running a script field:</p>
+
+<pre class="language-python"><code class="language-python">    """The `sort` array, and the index within it that carries the distance (or None).
+
+    Elasticsearch returns each hit's sort values in the same order as the sort array, so once a
+    `_geo_distance` entry is in there its position IS how you read the distance back out. That is
+    cheaper than a `script_field` and exact, because ES already computed it to sort by it.
+    """</code></pre>
+
+<p>Which is why a coordinate supplied without <code>sort=distance</code> still appends a geo entry
+&mdash; and why an explicit <code>"_score"</code> has to come first, or the appended entry would
+silently reorder a relevance search by proximity:</p>
+
+<pre class="language-python"><code class="language-python">        if req.sort != "distance":
+            # Distance is wanted as a NUMBER on every hit, not as the ordering. An explicit
+            # `_score` first is required once anything else is in the array, because a bare
+            # `[_geo_distance]` would silently reorder a relevance search by proximity.
+            if not sort:
+                sort = ["_score"]
+            geo_index = len(sort)</code></pre>
+
+<h2>search_after: the wall, solved</h2>
+
+<p>Lesson 9 left <code>from + size</code> failing at 10,000. Sort values are the way past it.</p>
+
+<p>Instead of "skip 10,000 documents", say "start after this one". Page one is ordinary:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "size": 2,
+  "sort": [ { "price_per_night": "asc" }, { "public_id": "asc" } ]
+}</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">page1: [ (78.0,  [78.0,  "a05193d5-eb94-49bf-8d16-137682aaa33e"]),
+         (128.0, [128.0, "6e6e5150-78f0-4a65-bc9d-eaae63aac4f6"]) ]</code></pre>
+
+<p>Take the last hit's <code>sort</code> array verbatim and hand it back:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "size": 2,
+  "sort": [ { "price_per_night": "asc" }, { "public_id": "asc" } ],
+  "search_after": [128.0, "6e6e5150-78f0-4a65-bc9d-eaae63aac4f6"]
+}</code></pre>
+
+<p>Now every shard seeks directly to that position instead of ranking everything before it. The cost
+is the same for page 2 and page 2,000 &mdash; which is the whole point.</p>
+
+<p>Three requirements come with it. The sort <strong>must</strong> end in a unique tie-break, or the
+seek point is ambiguous and you will skip or repeat documents. You cannot jump to an arbitrary page,
+only forward one at a time &mdash; so this gives you infinite scroll and "next", not "go to page
+57". And by default each page sees the index as it is <em>now</em>, so concurrent writes can shift
+things; pair it with a point-in-time from lesson 9 when consistency matters.</p>
+
+<h3>Implementing it without leaking the cursor</h3>
+
+<p>The sort array becomes the pagination cursor, and it is worth thinking for a moment about how it
+reaches the client. Handing back a raw JSON array of internal sort values works and exposes exactly
+what your sort keys are, including any internal identifier used as the tie-break.</p>
+
+<p>The usual treatment is to encode it &mdash; base64 the array, or better, sign it &mdash; and
+return it as an opaque <code>nextCursor</code> string. That keeps the API honest about what it is
+(a resume token, not a page number) and lets you change the sort keys later without breaking
+clients holding old cursors.</p>
+
+<p>It also solves a subtler problem. A client that can construct arbitrary
+<code>search_after</code> values can ask a shard to seek anywhere, which is harmless with your own
+sort keys and less harmless once one of them is a user id. Opaque and validated beats transparent
+and trusted.</p>
+
+<p>One design consequence worth accepting up front: an API paginated this way cannot offer "page 57"
+and should not pretend to. Infinite scroll and a "load more" button are the honest UI, and they are
+also what users of a search result set actually do.</p>
+
+<h2>Sorting by something you did not store</h2>
+
+<p>Occasionally the order depends on a computation:</p>
+
+<pre class="language-json"><code class="language-json">{ "sort": [ { "_script": {
+    "type": "number",
+    "script": { "source": "doc['price_per_night'].value + doc['cleaning_fee'].value" },
+    "order": "asc"
+} } ] }</code></pre>
+
+<p>It works, and it runs for every matching document, which makes it the slowest sort available. On
+a large result set it is a bad idea.</p>
+
+<p>The alternative is nearly always better: compute the value at index time and store it. A
+<code>total_price</code> field costs a few bytes per document and turns a script sort into a doc
+values lookup. That is a general principle in Elasticsearch &mdash; work moved from query time to
+index time is paid once per document instead of once per document per query.</p>
+
+<h2>The sort options a search page needs</h2>
+
+<p>Putting it together, StayHub's four:</p>
+
+<pre class="language-python"><code class="language-python">    if req.sort == "price_asc":
+        sort = [{"price_per_night": "asc"}]
+    elif req.sort == "price_desc":
+        sort = [{"price_per_night": "desc"}]
+    elif req.sort == "rating":
+        sort = [{"rating_average": "desc"}, {"rating_count": "desc"}]
+    elif req.sort == "distance" and origin:
+        sort = []  # the geo entry appended below becomes the primary sort</code></pre>
+
+<p>And "relevance" leaves the list empty, which means <code>_score</code> &mdash; the default, and
+the whole point of having a text query at all.</p>
+
+<p>Two things worth copying from that. The sort choice is a small closed set validated at the API
+boundary, not a field name from the query string &mdash; letting a user name the sort field means
+letting them sort by a text field and get a 400, or by a field you never intended to expose. And
+"relevance" is the default, because a search page that defaults to price ascending is a search page
+where the cheapest listing always wins regardless of what was typed.</p>
+
+<p>The last of those is worth one more sentence, because it is a decision with a name. A search
+page that defaults to <em>anything but relevance</em> has effectively turned off the search engine
+&mdash; the ranking work from lesson 11 does nothing, and the query becomes a filter. That is a
+legitimate choice for a browse page. It is rarely the right one for a page with a search box on it.</p>
+
+<p>Sorting answers "in what order". The next lesson answers the question a filter panel asks
+instead: how many of each.</p>

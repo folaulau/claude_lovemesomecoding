@@ -1,0 +1,411 @@
+<p>Aggregations are the other half of Elasticsearch. Search answers "which documents"; aggregations
+answer "how many, grouped how" &mdash; and they do it in the same request, over the same result set,
+which is the thing that makes a filter panel possible at all.</p>
+
+<p>Most of this lesson is ordinary. The last third is the part almost every tutorial leaves out, and
+it is the part that decides whether your filter panel works.</p>
+
+<h2>Three kinds</h2>
+
+<p><strong>Metric</strong> aggregations compute a number over a set of documents: <code>avg</code>,
+<code>sum</code>, <code>min</code>, <code>max</code>, <code>stats</code>,
+<code>cardinality</code>, <code>percentiles</code>.</p>
+
+<p><strong>Bucket</strong> aggregations group documents: <code>terms</code>, <code>range</code>,
+<code>date_histogram</code>, <code>histogram</code>, <code>filters</code>, <code>nested</code>.</p>
+
+<p><strong>Pipeline</strong> aggregations operate on the output of other aggregations rather than on
+documents &mdash; a moving average over a date histogram, the bucket with the highest value.</p>
+
+<p>Bucket aggregations can contain other aggregations, which is where the power is: group, then
+compute, then group again.</p>
+
+<h2>A first aggregation</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "size": 0,
+  "aggs": {
+    "cities": { "terms": { "field": "city.raw", "size": 20 } }
+  }
+}</code></pre>
+
+<p><code>"size": 0</code> is doing real work there. Aggregations are computed regardless, so this
+says "I want the counts, not the documents" &mdash; and skipping the fetch phase for twenty full
+<code>_source</code> documents is a meaningful saving on a request that does not use them.</p>
+
+<pre class="language-json"><code class="language-json">"aggregations": {
+  "cities": {
+    "doc_count_error_upper_bound": 0,
+    "sum_other_doc_count": 9,
+    "buckets": [
+      { "key": "Austin",        "doc_count": 1 },
+      { "key": "Big Bear Lake", "doc_count": 1 },
+      { "key": "Brooklyn",      "doc_count": 1 }
+    ]
+  }
+}</code></pre>
+
+<p>Two fields above the buckets that matter and are routinely ignored. Both are covered below.</p>
+
+<h2>Aggregate on keyword, never on text</h2>
+
+<pre class="language-bash"><code class="language-bash">{ "aggs": { "c": { "terms": { "field": "city" } } } }</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Fielddata is disabled on [city]. Text fields are not optimised for operations that
+require per-document field data like aggregations and sorting...</code></pre>
+
+<p>The same error as sorting in lesson 12, for the same reason: aggregations need doc values, and a
+<code>text</code> field has tokens rather than a value.</p>
+
+<p>Even if you enable <code>fielddata</code>, the result is wrong rather than slow. Aggregating a
+text field buckets its <em>terms</em>, so "San Francisco" produces buckets for <code>san</code> and
+<code>francisco</code>, and a city with a two-word name is counted twice under names nobody
+recognises.</p>
+
+<p>This is what the multi-field is for, and StayHub says so at the point of use:</p>
+
+<pre class="language-python"><code class="language-python">                # `city.raw`, not `city`. The analyzed `text` field would count "san", "francisco"
+                # and "san francisco" as three different cities — aggregations run on TERMS, and
+                # the terms of a text field are its tokens. That is what the `.raw` multi-field in
+                # the mapping is for.
+                "cities": scoped("city", {"terms": {"field": "city.raw", "size": 20}}),</code></pre>
+
+<h2>terms is approximate, and it tells you so</h2>
+
+<p>This surprises people, and it is why those two extra fields exist.</p>
+
+<p>A <code>terms</code> aggregation runs on every shard independently. Each shard returns its own top
+N, and the coordinating node adds them up. A term that is 11th on every shard but would be 3rd
+overall can be missing entirely, and a term that is returned may have an undercounted total, because
+some shard did not include it in its top N.</p>
+
+<p><code>doc_count_error_upper_bound</code> is the worst-case error on the counts &mdash; 0 means
+exact. <code>sum_other_doc_count</code> is how many documents fell outside the returned buckets:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">doc_count_error_upper_bound: 0
+sum_other_doc_count: 9
+buckets: 3</code></pre>
+
+<p>Three buckets asked for, nine documents in cities not shown. If your UI says "showing all
+cities", that number is how you know whether it is lying.</p>
+
+<p>The lever is <code>shard_size</code> &mdash; how many buckets each shard returns before the merge,
+defaulting to a multiple of <code>size</code>. Raising it improves accuracy and costs memory. On a
+single-shard index none of this applies and the counts are exact, which is one more reason a small
+index with one shard is a pleasant place to learn.</p>
+
+<p><code>cardinality</code> has the same caveat in a stronger form: it is a
+HyperLogLog++ approximation, accurate to within a percent or so, and it is designed that way because
+counting exact distinct values across shards would mean shipping every value to one node.</p>
+
+<pre class="language-bash"><code class="language-bash">{ "aggs": { "cities": { "cardinality": { "field": "city.raw" } } } }
+# { "value": 12 }</code></pre>
+
+<p>Do not use it for anything that must reconcile &mdash; billing, an invoice line, a compliance
+count. Do use it for "roughly how many distinct users", which is what it is for.</p>
+
+<h2>Nesting</h2>
+
+<p>Bucket first, then compute inside each bucket:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "size": 0,
+  "aggs": {
+    "by_type": {
+      "terms": { "field": "property_type", "size": 3 },
+      "aggs": {
+        "avg_price": { "avg": { "field": "price_per_night" } }
+      }
+    }
+  }
+}</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">HOUSE         5 docs  avg $235.60
+APARTMENT     2 docs  avg $186.50
+CABIN         2 docs  avg $265.50</code></pre>
+
+<p>Nest as deeply as you like &mdash; city, then property type, then price statistics. The warning is
+that bucket counts multiply. Twenty cities by ten types by twelve months is 2,400 buckets, each
+carrying its sub-aggregations, all held in memory while the request runs. There is a
+<code>search.max_buckets</code> limit (65,536) that exists to stop a single query taking a node
+down, and hitting it means the query needs rethinking rather than the limit raising.</p>
+
+<h2>The bucket types worth knowing</h2>
+
+<p><code>range</code> puts documents into bounds you define. The bounds are half-open &mdash;
+<code>from</code> inclusive, <code>to</code> exclusive &mdash; which is exactly right for money and
+catches people who expect both ends inclusive:</p>
+
+<pre class="language-python"><code class="language-python">PRICE_RANGES: list[dict[str, Any]] = [
+    {"key": "0-100", "to": 100.0},
+    {"key": "100-200", "from": 100.0, "to": 200.0},
+    {"key": "200-350", "from": 200.0, "to": 350.0},
+    {"key": "350-500", "from": 350.0, "to": 500.0},
+    {"key": "500+", "from": 500.0},
+]</code></pre>
+
+<p>Note these are hard-coded, and the comment above them explains why: a filter panel whose buckets
+move as you filter is unusable, because the row you were aiming at slides away as you click.</p>
+
+<p><code>date_histogram</code> buckets by time, and <code>calendar_interval</code> is the one to
+use over <code>fixed_interval</code> for anything a human reads &mdash; a calendar month is a real
+month, not 30 days:</p>
+
+<pre class="language-json"><code class="language-json">{ "date_histogram": {
+    "field": "created_at",
+    "calendar_interval": "month",
+    "min_doc_count": 0,
+    "time_zone": "America/Los_Angeles"
+} }</code></pre>
+
+<p><code>min_doc_count: 0</code> keeps empty buckets, which a chart needs and a list does not. And
+<code>time_zone</code> matters more than it looks: without it, "daily signups" are bucketed by UTC
+midnight, so every chart is shifted by your users' offset and nobody can say why the numbers
+disagree with the dashboard.</p>
+
+<p><code>filters</code> is the escape hatch &mdash; arbitrary named buckets from arbitrary queries,
+for groupings that are not a field:</p>
+
+<pre class="language-json"><code class="language-json">{ "filters": { "filters": {
+    "budget":  { "range": { "price_per_night": { "lt": 120 } } },
+    "family":  { "range": { "max_guests": { "gte": 5 } } }
+} } }</code></pre>
+
+<h3>Pipeline aggregations</h3>
+
+<p>The third family, and the one most people never reach for. A pipeline aggregation takes the
+output of a sibling or parent aggregation rather than documents:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "size": 0,
+  "aggs": {
+    "monthly": {
+      "date_histogram": { "field": "created_at", "calendar_interval": "month" },
+      "aggs": { "revenue": { "sum": { "field": "price_per_night" } } }
+    },
+    "trend":    { "moving_fn": { "buckets_path": "monthly>revenue",
+                                 "window": 3, "script": "MovingFunctions.unweightedAvg(values)" } },
+    "best":     { "max_bucket": { "buckets_path": "monthly>revenue" } },
+    "running":  { "cumulative_sum": { "buckets_path": "monthly>revenue" } }
+  }
+}</code></pre>
+
+<p>A three-month moving average, the best month, and a running total &mdash; computed in the cluster
+rather than in your application. <code>buckets_path</code> is the syntax to learn: <code>&gt;</code>
+descends into a sub-aggregation, and the last segment names the metric.</p>
+
+<p>Whether to use them is a genuine judgement call. Doing the arithmetic in your application is
+easier to read, easier to test, and moves a small amount of data. Doing it in the cluster is right
+when the intermediate buckets are large and the result is small &mdash; a moving average over ten
+thousand daily buckets is worth computing where the data already is.</p>
+
+<h3>Getting documents out of a bucket</h3>
+
+<p>Two aggregations return documents rather than numbers, and they answer questions that otherwise
+need a second request.</p>
+
+<p><code>top_hits</code> nested inside a bucket returns the best few documents <em>per group</em>
+&mdash; "the three highest-rated listings in each city" in one query:</p>
+
+<pre class="language-json"><code class="language-json">{ "terms": { "field": "city.raw", "size": 5 },
+  "aggs": { "best": { "top_hits": {
+      "size": 3,
+      "sort": [ { "rating_average": "desc" } ],
+      "_source": ["title", "price_per_night"]
+  } } } }</code></pre>
+
+<p>This is the aggregation-side answer to the same problem <code>collapse</code> solved in lesson 9.
+Use <code>collapse</code> when you want one flat, paginated result list; use
+<code>top_hits</code> when you want genuine groups with their counts.</p>
+
+<p><code>significant_terms</code> is the more interesting one. Rather than returning the most common
+terms, it returns the ones that are <em>unusually</em> common in this result set compared to the
+index as a whole. Applied to search results it produces "people who searched for this also cared
+about..." with no model and no training data.</p>
+
+<h2>Faceted search, and the part nobody explains</h2>
+
+<p>Here is the whole reason aggregations exist on a search page. A filter panel shows
+"Austin (48) &middot; Denver (31)", and the counts have to answer the question the user is actually
+asking, which is <em>"how many results would I get if I picked this instead"</em>.</p>
+
+<p>The obvious implementation does not do that.</p>
+
+<p>Put the aggregation in the same request as the query and it is scoped to the query &mdash;
+including the filters. So the moment a guest ticks "Austin", the city aggregation only sees Austin
+listings, the city list collapses to a single row, and there is now no way to switch cities without
+clearing the filter first.</p>
+
+<p>Same for every multi-select. Tick "wifi" and every other amenity count becomes "wifi AND that",
+which reads as though the catalogue shrank.</p>
+
+<h3>The fix: each facet blind to its own filter</h3>
+
+<pre class="language-python"><code class="language-python">    def scoped(exclude: str, inner: dict[str, Any]) -&gt; dict[str, Any]:
+        return {
+            "filter": {"bool": {"must": [text], "filter": _flatten(groups, exclude=exclude)}},
+            "aggs": {"buckets": inner},
+        }
+
+    return {
+        "facets": {
+            "global": {},
+            "aggs": {
+                "cities": scoped("city", {"terms": {"field": "city.raw", "size": 20}}),
+                "property_types": scoped("property_type", {"terms": {"field": "property_type", "size": 20}}),
+                "amenities": scoped("amenities", {"terms": {"field": "amenities", "size": 30}}),
+                "price_ranges": scoped(
+                    "price", {"range": {"field": "price_per_night", "keyed": False, "ranges": PRICE_RANGES}}
+                ),
+                "price_stats": scoped("price", {"stats": {"field": "price_per_night"}}),
+            },
+        }
+    }</code></pre>
+
+<p>Three layers, and each one is load-bearing:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">global          -> escape the main query entirely
+  filter        -> re-apply text + all filters EXCEPT this facet's
+    terms/range -> count</code></pre>
+
+<p><code>global</code> is what makes the re-application possible. Without it the aggregation is
+still scoped to the main query, and dropping a clause changes nothing at all.</p>
+
+<p>This is also why lesson 10 built the filters grouped by control rather than as a flat list: you
+cannot un-apply a clause that has forgotten which control produced it.</p>
+
+<h3>What it looks like when it works</h3>
+
+<p>Filtering by one amenity on the twelve-listing index:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">?amenities=hot-tub    ->  3 results
+
+amenities facet (own filter dropped):
+  kitchen 12 · wifi 12 · free-parking 8 · heating 7 · washer 7 ...
+
+cities facet (narrowed, as it should be):
+  Big Bear Lake 1 · Joshua Tree 1 · Lake Tahoe 1</code></pre>
+
+<p>The amenities list stays complete, so the guest can switch. The cities list narrows to the three
+cities that have hot tubs, which is the useful answer to "where could I go next".</p>
+
+<h3>post_filter, the simpler version</h3>
+
+<p>There is a lighter-weight approach for the single-facet case:</p>
+
+<pre class="language-bash"><code class="language-bash">{
+  "query": { "match_all": {} },
+  "post_filter": { "term": { "property_type": "CABIN" } },
+  "aggs": { "t": { "terms": { "field": "property_type" } } }
+}
+# hits: 2
+# buckets: HOUSE 5, APARTMENT 2, CABIN 2, CONDO 1, LOFT 1, VILLA 1</code></pre>
+
+<p><code>post_filter</code> runs <em>after</em> the aggregations, so the hits are filtered and the
+counts are not. Two hits, six full buckets.</p>
+
+<p>That is exactly right when there is one facet. It stops working with several, because
+<code>post_filter</code> is all-or-nothing &mdash; every facet is computed without every filter, so
+the counts stop reflecting the other selections. The <code>global</code>-plus-<code>filter</code>
+construction is the general answer, and <code>post_filter</code> is the one to reach for when there
+genuinely is only one multi-select.</p>
+
+<h2>What it costs</h2>
+
+<p>Facets are not free, and the arithmetic is easy: one <code>filter</code> aggregation per facet,
+all inside one request. Measured on the twelve-listing index, median of 30 round trips:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">search without facets   4.5 ms
+search with facets     11.0 ms</code></pre>
+
+<p>Roughly two and a half times, for six facets. Fine at this scale, and a real cost at a larger
+one &mdash; which is why it is a parameter rather than a default behaviour:</p>
+
+<pre class="language-python"><code class="language-python">    # Facets cost one `filter` aggregation per control (see queries.build_aggs). The result page
+    # wants them; "load more" and the map's pan handler do not, and asking for them anyway is the
+    # easiest accidental way to double a search's cost.
+    facets: bool = Query(default=True),</code></pre>
+
+<p>On a large index the options are to cut it down to the facets the panel actually shows, or to
+accept self-confirming counts on the single-select controls where nobody notices the difference.</p>
+
+<h3>Making them cheaper</h3>
+
+<p>Four things help, roughly in order of how much.</p>
+
+<p><strong>Ask for fewer facets.</strong> The cost is per aggregation, so a panel that computes eight
+facets and displays four is paying double. This sounds too obvious to mention and it is the most
+common cause.</p>
+
+<p><strong>Lower <code>size</code> on the <code>terms</code> aggregations.</strong> A facet showing
+the top ten values does not need <code>"size": 100</code>, and the shard-level work scales with it.</p>
+
+<p><strong>Use <code>execution_hint</code> deliberately on high-cardinality fields.</strong> The
+default builds a map of global ordinals, which is fast and memory-hungry;
+<code>"execution_hint": "map"</code> is the opposite trade and is better when the field has many
+values but the query matches few documents.</p>
+
+<p><strong>Cache what you can.</strong> A request with <code>"size": 0</code> is eligible for the
+shard request cache, which caches the whole aggregation result per shard and is invalidated on
+refresh. That makes an unfiltered facet computation &mdash; the one every user sees on the landing
+page &mdash; essentially free after the first request. Note the condition: it only applies when no
+documents are returned, which is one more reason to set <code>"size": 0</code> when you mean it.</p>
+
+<h2>Reading the response</h2>
+
+<p>The nesting in the request is mirrored in the response, so parsing it means walking the same
+names back down:</p>
+
+<pre class="language-python"><code class="language-python">def _facets(aggs: dict[str, Any] | None) -&gt; Facets | None:
+    if not aggs or "facets" not in aggs:
+        return None
+    f = aggs["facets"]
+
+    def inner(name: str) -&gt; dict[str, Any] | None:
+        return f.get(name, {}).get("buckets")</code></pre>
+
+<p>Two details worth stealing. Everything uses <code>.get</code> rather than indexing, because an
+aggregation over an empty result set returns nulls for <code>min</code>, <code>max</code> and
+<code>avg</code> rather than omitting them &mdash; an empty result is not an error. And the
+facets are turned into a typed object at the boundary rather than passed through as raw
+Elasticsearch JSON, so the shape of a response does not become an accidental part of your public
+API.</p>
+
+<p>The typed boundary earns its place a second time here. A facet response is the part of a search
+API most likely to be consumed by a frontend written by someone else, and Elasticsearch's shape
+&mdash; buckets nested under an aggregation name, keys that are sometimes labels and sometimes
+values, <code>from</code> and <code>to</code> present only on range buckets &mdash; is an
+implementation detail you do not want to promise to keep:</p>
+
+<pre class="language-python"><code class="language-python">class FacetBucket(ApiModel):
+    """One row of a filter panel: a value and how many listings would remain if you ticked it."""
+
+    key: str
+    count: int
+    # Present on range facets only ("under $100"), so the UI can render the bounds it filters on.
+    from_: Decimal | None = Field(default=None, alias="from")
+    to: Decimal | None = None</code></pre>
+
+<p>One reader handles both bucket shapes because both arrive as <code>key</code> &mdash; a range
+bucket's key is the label you defined, a terms bucket's key is the value itself.</p>
+
+<h2>The mistakes</h2>
+
+<p><strong>Aggregating on a text field.</strong> An error if you are lucky, wrong buckets if
+somebody enabled <code>fielddata</code>.</p>
+
+<p><strong>Trusting <code>terms</code> counts on a multi-shard index</strong> without reading
+<code>doc_count_error_upper_bound</code>.</p>
+
+<p><strong>Forgetting <code>"size": 0</code></strong> when you only want counts, and paying for
+twenty documents on every request.</p>
+
+<p><strong>Facets that include their own filter</strong>, which is the one that makes a filter panel
+a dead end.</p>
+
+<p><strong>Aggregating over a <code>nested</code> field without a <code>nested</code>
+aggregation</strong>, which silently aggregates the flattened values &mdash; the same wrong-pairing
+problem lesson 4 showed, arriving in the counts instead of the hits.</p>
+
+<p><strong>Using <code>cardinality</code> where an exact count is required.</strong> It is an
+estimate, and it says so in the documentation and nowhere in the response.</p>

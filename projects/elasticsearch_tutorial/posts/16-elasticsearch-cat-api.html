@@ -1,0 +1,351 @@
+<p>The <code>_cat</code> APIs return aligned columns instead of JSON, which is why they are what you
+actually type when something is wrong. This lesson is the handful worth memorising, and more usefully
+the questions they answer &mdash; what yellow means, which shard is unassigned and why, and where
+the disk went.</p>
+
+<h2>The three parameters that make them usable</h2>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cat/indices"                       # no header, all columns
+curl -s "localhost:9200/_cat/indices?v"                     # with the header row
+curl -s "localhost:9200/_cat/indices?v&h=index,docs.count,store.size"   # chosen columns
+curl -s "localhost:9200/_cat/indices?v&h=index,store.size&s=store.size:desc"  # sorted</code></pre>
+
+<p><code>v</code> adds the header. <code>h</code> selects columns. <code>s</code> sorts, with
+<code>:desc</code> for descending.</p>
+
+<p>Two more worth knowing. <code>help</code> lists every available column for that endpoint, which
+is how you discover the two dozen fields <code>_cat/nodes</code> can show. And
+<code>format=json</code> turns the output back into JSON, which matters because <strong>the column
+layout is not a stable API</strong> &mdash; it changes between versions. Never parse the aligned
+output in a script.</p>
+
+<h2>Health first</h2>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cat/health?v"</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">epoch      timestamp cluster        status node.total node.data shards pri relo init unassign
+1787466514 06:28:34  docker-cluster green           1         1      1   1    0    0        0</code></pre>
+
+<p>The columns that matter are <code>status</code>, <code>unassign</code>, <code>relo</code> and
+<code>init</code>.</p>
+
+<p><strong>Green</strong>: every primary and every replica is assigned.
+<strong>Yellow</strong>: every primary is assigned, at least one replica is not &mdash; all your data
+is present and searchable, you have lost redundancy. <strong>Red</strong>: at least one primary is
+missing, so some of your data is not available and searches over it return partial results.</p>
+
+<p>The distinction people get wrong is that <strong>red does not mean the cluster is down</strong>.
+It means part of it is. Searches keep working and quietly return fewer results &mdash; which brings
+back <code>_shards.failed</code> from lesson 9, the field nobody reads.</p>
+
+<p><code>relo</code> and <code>init</code> being non-zero is normal and temporary: shards are moving
+or being built. A cluster that sits with <code>init</code> above zero for a long time is one worth
+looking at.</p>
+
+<h2>Why a single-node cluster is yellow</h2>
+
+<p>The most common "problem" that is not one. Create an index that asks for a replica:</p>
+
+<pre class="language-bash"><code class="language-bash">PUT /yellow-demo
+{ "settings": { "number_of_shards": 1, "number_of_replicas": 1 } }</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">status yellow  ...  shards 2  pri 2  unassign 1  active_shards_percent 66.7%</code></pre>
+
+<p><code>_cat/shards</code> says exactly which one:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">index       shard prirep state      docs store  node
+yellow-demo 0     p      STARTED       0  227b  1ca063334783
+yellow-demo 0     r      UNASSIGNED</code></pre>
+
+<p>The primary (<code>p</code>) is fine. The replica (<code>r</code>) is unassigned, because a
+replica may never live on the same node as its primary &mdash; a copy on the same machine protects
+against nothing.</p>
+
+<p>On one node this is arithmetic, not a fault. It is why the demo index in this track sets
+<code>"number_of_replicas": 0</code>: a single-node development cluster that asks for a replica is
+permanently yellow, and a permanently yellow cluster trains you to ignore the one signal you most
+need to notice.</p>
+
+<h2>allocation/explain: the answer, not a guess</h2>
+
+<p>When a shard is unassigned and the reason is not obvious, there is an API that simply tells you:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cluster/allocation/explain?pretty" \
+  -H 'Content-Type: application/json' \
+  -d '{"index": "yellow-demo", "shard": 0, "primary": false}'</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">Elasticsearch isn't allowed to allocate this shard to any of the nodes in the cluster.
+
+node 1ca063334783: no
+  decider: same_shard   NO
+  a copy of this shard is already allocated to this node</code></pre>
+
+<p>Every node, every decider, and the reason each one said no. This is the single most useful
+diagnostic API in Elasticsearch and almost nobody reaches for it, because the instinct is to search
+the internet for a symptom instead.</p>
+
+<p>Call it with no body at all and it explains the first unassigned shard it finds, which is usually
+the one you meant.</p>
+
+<p>The deciders you will actually meet: <code>same_shard</code> (the replica-on-one-node case
+above), <code>disk_threshold</code> (the node is above the watermark), <code>awareness</code> (zone
+rules), <code>filter</code> (an index or cluster allocation filter excludes the node), and
+<code>max_retry</code> &mdash; which means allocation was attempted five times and failed, and the
+shard will not be retried until you say
+<code>POST /_cluster/reroute?retry_failed=true</code>.</p>
+
+<h2>The rest of the family</h2>
+
+<h3>_cat/indices</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">health status index                     pri rep docs.count docs.deleted store.size
+green  open   stayhub-properties-000001   1   0         12            1     43.4kb</code></pre>
+
+<p><code>docs.deleted</code> is the column worth reading and the one nobody does. Deletes and
+updates leave tombstones until a merge rewrites the segment, so a large
+<code>docs.deleted</code> relative to <code>docs.count</code> means the index is carrying dead
+weight. A ratio near half on a heavily updated index is normal; a ratio that keeps climbing means
+merging is not keeping up.</p>
+
+<p><code>status</code> is <code>open</code> or <code>close</code>. A closed index does not serve
+searches and does not consume much memory &mdash; and a closed index that somebody closed during an
+incident and forgot is a genuinely mystifying "the data is gone" report.</p>
+
+<h3>_cat/nodes</h3>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cat/nodes?v&h=ip,name,heap.percent,ram.percent,cpu,load_1m,node.role,master"</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">ip         name         heap.percent ram.percent cpu load_1m node.role   master
+172.19.0.2 1ca063334783           57          99   3    6.43 cdfhilmrstw *</code></pre>
+
+<p><code>heap.percent</code> is the number to watch. Sustained above 85% means garbage collection is
+running constantly and the node is about to become slow and then unresponsive. It is the single best
+early warning Elasticsearch offers.</p>
+
+<p><code>ram.percent</code> at 99 is not a problem &mdash; that is the operating system's file cache
+using memory that would otherwise be idle, and Lucene depends on it.</p>
+
+<p><code>node.role</code> is a letter per role: <code>m</code> master-eligible, <code>d</code> data,
+<code>i</code> ingest, <code>c</code> cold, and so on. The <code>*</code> in
+<code>master</code> marks the elected master. On a small cluster every node has every role, which is
+what the string of letters above means.</p>
+
+<h3>_cat/shards</h3>
+
+<p>One line per shard, and the endpoint to reach for when health is not green. The useful trick is
+filtering and sorting:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cat/shards?v&h=index,shard,prirep,state,unassigned.reason&s=state"
+curl -s "localhost:9200/_cat/shards?v&h=index,shard,store&s=store:desc"   # the biggest shards</code></pre>
+
+<p><code>unassigned.reason</code> gives a one-word cause &mdash; <code>NODE_LEFT</code>,
+<code>ALLOCATION_FAILED</code>, <code>INDEX_CREATED</code>. It is the fast version of
+<code>allocation/explain</code>, and it is usually enough.</p>
+
+<h3>_cat/allocation</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">shards disk.indices disk.used disk.avail disk.total disk.percent node
+     1       43.4kb   111.5gb    895.2gb   1006.8gb           11 1ca063334783</code></pre>
+
+<p>Shards and disk per node. This is where you find out that one node is holding most of the data
+and most of the shards, which is the usual explanation for one node being slow.</p>
+
+<p>The <code>disk.percent</code> thresholds are worth memorising, because they are the incident
+nobody sees coming: at <strong>85%</strong> Elasticsearch stops allocating new shards to the node, at
+<strong>90%</strong> it starts moving shards away, and at <strong>95%</strong> it sets every index
+in the cluster to read-only. That last one turns a slow disk fill into a total write outage, and the
+error &mdash; <code>cluster_block_exception</code> &mdash; does not mention disk at all.</p>
+
+<h3>_cat/thread_pool</h3>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cat/thread_pool/write?v"</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">node_name    name  active queue rejected
+1ca063334783 write      0     0        0</code></pre>
+
+<p><code>rejected</code> is a cumulative counter since the node started, and any non-zero value
+means requests were refused &mdash; the 429 from lesson 8. Watch <code>write</code> during an
+indexing load and <code>search</code> during a traffic spike. A climbing <code>queue</code> with
+rising <code>rejected</code> means the answer is smaller batches or fewer of them, never more
+threads.</p>
+
+<h3>_cat/aliases and _cat/count</h3>
+
+<p>Two small ones that come up constantly once lesson 15's alias pattern is in place.</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cat/aliases?v"
+curl -s "localhost:9200/_cat/count/stayhub-properties?v"</code></pre>
+
+<p><code>_cat/aliases</code> shows which alias points at which index, plus any filter and routing
+attached &mdash; the fastest way to confirm a flip landed. <code>_cat/count</code> takes an index or
+an alias and returns the document count, which is the one-line version of the drift check.</p>
+
+<p>There is also <code>_cat/pending_tasks</code>, which is nearly always empty and is very
+informative when it is not. Pending tasks are cluster-state changes queued behind the master &mdash;
+index creations, mapping updates, alias changes. A backlog there means the master is overloaded,
+which is a different problem from a slow data node and is usually caused by too many indexes,
+too many shards, or something creating indexes in a loop.</p>
+
+<h2>Beyond _cat</h2>
+
+<p><code>_cat</code> is for reading at a terminal. Three JSON APIs are what you actually alert on.</p>
+
+<p><code>GET /_cluster/health</code> is the structured version of the first command in this lesson,
+and it takes parameters worth knowing:
+<code>?wait_for_status=green&timeout=30s</code> blocks until the cluster is green or the timeout
+expires, which makes it a real readiness gate in a deploy script rather than a poll loop.
+<code>?level=indices</code> breaks it down per index, so you can find the red one immediately.</p>
+
+<p><code>GET /_nodes/stats</code> is the firehose &mdash; JVM, garbage collection, thread pools,
+per-index operation counts, filesystem. It is what a monitoring agent scrapes, and it is far too
+much to read by hand.</p>
+
+<p><code>GET /_cluster/stats</code> is the cluster-wide summary: total documents, total store size,
+field count, node roles. Useful for capacity conversations and for noticing that the field count is
+climbing towards the limit from lesson 4.</p>
+
+<p>And <code>GET /_tasks?detailed&actions=*search</code> lists what is running right now, which is
+how you find the one query that is eating the cluster. Tasks can be cancelled.</p>
+
+<h2>What a shard actually is, briefly</h2>
+
+<p>Half the output above is about shards, so it is worth pinning down what one is before reading
+more of it.</p>
+
+<p>A shard is a complete, self-contained Lucene index. It has its own inverted index, its own doc
+values, its own segments on disk. An Elasticsearch index is a set of shards, and a search runs on
+every one of them in parallel and merges the results.</p>
+
+<p>That explains several things that otherwise look arbitrary. Relevance scores are per shard,
+because term frequencies are per shard. <code>terms</code> aggregations are approximate, because
+each shard returns its own top N. A shard is the unit of allocation, so it is the thing that moves
+between nodes, and the reason a node "holding more shards" is a meaningful complaint. And a shard
+has a fixed cost in memory and file handles regardless of how much data is in it, which is why
+lesson 1 warned against over-sharding and lesson 18 comes back to it.</p>
+
+<p>A <strong>primary</strong> shard takes writes first and replicates them. A
+<strong>replica</strong> is a copy that serves reads and can be promoted if the primary is lost.
+Replica count is changeable on a live index; shard count is not.</p>
+
+<h2>Recovering from red</h2>
+
+<p>Red means at least one primary shard is unavailable, and the correct first action is almost never
+the one people take.</p>
+
+<p><strong>Find out which.</strong></p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cluster/health?level=indices&pretty" | grep -B2 '"status" : "red"'
+curl -s "localhost:9200/_cat/shards?v&h=index,shard,prirep,state,unassigned.reason&s=state"</code></pre>
+
+<p><strong>Find out why</strong>, with <code>allocation/explain</code>. The answer usually falls into
+one of three categories, and each has a different response.</p>
+
+<p><strong>A node is gone and is coming back.</strong> Do nothing. Elasticsearch delays reallocating
+shards from a departed node for a minute by default, precisely so a restart does not trigger a
+cluster-wide rebalance. Waiting is the correct action, and impatience here causes far more damage
+than the outage would have.</p>
+
+<p><strong>A node is gone and is not coming back.</strong> If the shard had replicas, the cluster
+promotes one and recovers on its own. If it did not, the data is gone and the options are a restore
+from a snapshot or a rebuild from the source of truth &mdash; which is the whole argument of lessons
+1 and 17.</p>
+
+<p><strong>Allocation is being refused.</strong> Disk watermarks, allocation filters, or
+<code>max_retry</code>. All three are fixable and <code>allocation/explain</code> names which.</p>
+
+<p>The thing to resist is <code>_cluster/reroute</code> with
+<code>allocate_empty_primary</code>. It makes the cluster green by declaring an empty shard to be
+the primary, which is to say it makes the symptom go away by discarding the data. It is a genuine
+last resort for a case where the data is already unrecoverable and you need the index writable, and
+it is not a fix.</p>
+
+<h2>Reading a shard's story</h2>
+
+<p>Two more endpoints answer "what is this shard doing right now", which is the question during a
+recovery.</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cat/recovery?v&active_only=true"
+curl -s "localhost:9200/_cat/segments?v&h=index,shard,segment,docs.count,size"</code></pre>
+
+<p><code>_cat/recovery</code> shows shards currently being copied or replayed, with a percentage
+complete and bytes transferred. During a node restart this is the difference between "it is working,
+give it ten minutes" and "it is stuck".</p>
+
+<p><code>_cat/segments</code> lists the Lucene segments inside each shard. Mostly you do not need
+it, and it is the right place to look when an index is much larger than its documents or when a
+forcemerge is being considered &mdash; many small segments is what merging exists to fix.</p>
+
+<h2>Working through a real symptom</h2>
+
+<p>Someone reports that search is slow. The sequence that finds the cause fastest:</p>
+
+<p><strong>Is the cluster healthy?</strong> <code>_cat/health?v</code>. Yellow or red, or a non-zero
+<code>unassign</code>, and you are looking at a cluster problem rather than a query problem &mdash;
+go to <code>_cat/shards</code> and then <code>allocation/explain</code>.</p>
+
+<p><strong>Is a node struggling?</strong> <code>_cat/nodes?v</code>. Heap above 85%, or one node's
+CPU far above the others. If so, <code>_cat/allocation?v</code> to see whether that node is holding
+more than its share.</p>
+
+<p><strong>Is anything being rejected?</strong> <code>_cat/thread_pool?v</code>. Rejections mean the
+cluster is saturated and no query change will help.</p>
+
+<p><strong>Is it actually the query?</strong> Compare <code>took</code> with the time your client
+measured. If <code>took</code> is small and the wall clock is not, the cluster is not the problem
+&mdash; it is the network, the response size, or your own serialisation. If <code>took</code> is
+large, use <code>"profile": true</code> from lesson 9 to find out which clause.</p>
+
+<p><strong>Is it one query or all of them?</strong> <code>_tasks?detailed&actions=*search</code>
+while it is happening. One enormous aggregation from a dashboard is a much more common cause than
+general slowness.</p>
+
+<p>That sequence goes from cheapest to most specific, and it distinguishes the three cases that
+matter &mdash; a broken cluster, a saturated cluster, and a bad query &mdash; before you have
+changed anything.</p>
+
+<h2>Making the cluster's state visible in your own tools</h2>
+
+<p>A search feature has one dependency that can be healthy, degraded or gone, and the application
+should be able to say which. The cheapest version is a ping behind a readiness check:</p>
+
+<pre class="language-python"><code class="language-python">def es_available() -&gt; bool:
+    """Used by the health check and by the indexer, which must not crash writes when ES is down."""
+    try:
+        return bool(get_es().ping())
+    except Exception:  # noqa: BLE001 — any transport failure means "not available"
+        return False</code></pre>
+
+<p>That distinguishes "gone" from "fine", which is what lets the search endpoint return an honest
+503 rather than an empty result set. It does not distinguish "degraded", and for that the useful
+addition is the cluster status, which is one call and worth surfacing in whatever dashboard your
+team already looks at:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s "localhost:9200/_cluster/health?format=json" | jq '{status, unassigned_shards, active_shards_percent_as_number}'</code></pre>
+
+<p>The reason to put it beside your application's own metrics rather than in a separate
+Elasticsearch dashboard is mundane and important: during an incident, nobody opens the second
+dashboard. A yellow cluster next to a latency graph gets noticed; a yellow cluster in a tool you
+check weekly does not.</p>
+
+<p>The same argument applies to the index-level facts worth alerting on. Document count against the
+source of truth, from lesson 8's drift check, belongs next to the same graphs &mdash; it is the one
+number that catches a sync that stopped, and no Elasticsearch health metric will ever show it,
+because from the cluster's point of view an index missing half its documents is perfectly
+healthy.</p>
+
+<h2>What to keep an eye on</h2>
+
+<p>Five numbers cover most of it. Cluster status not green. Unassigned shards above zero for more
+than a few minutes. Heap above 85% on any node. Disk above 80% on any node, which gives you room
+before the 85% watermark bites. And thread pool rejections greater than zero.</p>
+
+<p>Two of the five deserve a rehearsal rather than just an alert. Fill a disk on a test cluster and
+watch the read-only block arrive, so the error message is familiar when it matters. And stop a node
+in a multi-node test cluster and watch the shards reallocate, so you know how long it takes and what
+"normal recovery" looks like in <code>_cat/recovery</code>. Both take twenty minutes and both turn
+an unfamiliar incident into a recognised one.</p>
+
+<p>None of those needs a monitoring stack to start with. A script that hits
+<code>_cluster/health</code> and <code>_cat/nodes?format=json</code> every minute and shouts when one
+of the five is out of range is an afternoon's work and catches the failures that actually
+happen.</p>

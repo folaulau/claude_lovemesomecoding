@@ -1,0 +1,197 @@
+<p>Aggregation collapses many rows into one. The syntax is small; what trips people up is which
+columns are allowed in the <code>SELECT</code> list, where a filter belongs, and what
+<code>count()</code> does with NULL.</p>
+
+<h2>The aggregates</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*)                        AS bookings,
+       sum(total)                      AS revenue,
+       round(avg(total), 2)            AS average,
+       min(check_in)                   AS earliest,
+       max(check_in)                   AS latest
+FROM   bookings
+WHERE  status = 'CONFIRMED';</code></pre>
+
+<p>With no <code>GROUP BY</code>, the whole table is one group and you get exactly one row — even
+if the table is empty, in which case <code>count(*)</code> is 0 and every other aggregate is
+NULL.</p>
+
+<h2>count(*) is not count(column)</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*)                  AS rows,
+       count(cancelled_at)       AS actually_cancelled,
+       count(DISTINCT property_id) AS distinct_properties
+FROM   bookings;</code></pre>
+
+<ul>
+  <li><code>count(*)</code> counts rows.</li>
+  <li><code>count(column)</code> counts rows where that column is <strong>not NULL</strong>. This
+      is genuinely useful — the second column above is a count of cancellations — and it is also
+      the reason a count you expected to match does not.</li>
+  <li><code>count(DISTINCT column)</code> counts distinct non-NULL values, and is much more
+      expensive than the other two.</li>
+</ul>
+
+<p>Every aggregate except <code>count(*)</code> ignores NULL. <code>avg()</code> over a column
+where half the rows are NULL divides by the half that are not, which is usually right and
+occasionally very wrong.</p>
+
+<h2>GROUP BY</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT status,
+       count(*)               AS bookings,
+       round(avg(nights), 2)  AS avg_nights
+FROM   bookings
+GROUP  BY status
+ORDER  BY bookings DESC;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">  status   | bookings | avg_nights
+-----------+----------+------------
+ COMPLETED |   200612 |       3.49
+ CONFIRMED |   152854 |       3.52
+ PENDING   |    25482 |       3.52
+ CANCELLED |    21052 |       3.50</code></pre>
+
+<p>The rule: every column in the <code>SELECT</code> list must either be in the
+<code>GROUP BY</code> or be inside an aggregate. Postgres enforces it, which is a mercy — MySQL
+historically did not and would return an arbitrary row's value for the ungrouped column.</p>
+
+<p>There is one exception, and it is a good one. Group by a primary key and Postgres knows every
+other column of that table is determined by it, so you may select them freely:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.id, p.title, p.city, count(b.id) AS stays
+FROM   properties p
+LEFT   JOIN bookings b ON b.property_id = p.id
+GROUP  BY p.id                      -- title and city come along, because id is the PK
+ORDER  BY stays DESC
+LIMIT  5;</code></pre>
+
+<h2>WHERE, then GROUP BY, then HAVING</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.city, count(*) AS stays, round(avg(b.total), 2) AS avg_total
+FROM   bookings b
+JOIN   properties p ON p.id = b.property_id
+WHERE  b.status = 'CONFIRMED'          -- filters ROWS, before grouping
+GROUP  BY p.city
+HAVING count(*) > 5000                 -- filters GROUPS, after
+ORDER  BY stays DESC;</code></pre>
+
+<p>The difference is not stylistic. <code>WHERE</code> runs first and removes rows before the
+aggregation does any work; <code>HAVING</code> runs after and can only test aggregate results. A
+condition that could go in either belongs in <code>WHERE</code>, because it makes the grouping
+smaller.</p>
+
+<p>The full order Postgres evaluates in, which explains most "column does not exist" errors:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">FROM / JOIN  ->  WHERE  ->  GROUP BY  ->  HAVING  ->  SELECT  ->  ORDER BY  ->  LIMIT</code></pre>
+
+<p><code>SELECT</code> is nearly last, which is why an alias defined there cannot be used in
+<code>WHERE</code> — it does not exist yet — but can be used in <code>ORDER BY</code>, which comes
+after.</p>
+
+<h2>FILTER: several counts in one pass</h2>
+
+<p>The alternative to running the same query four times with different <code>WHERE</code>
+clauses:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.city,
+       count(*)                                        AS all_stays,
+       count(*) FILTER (WHERE b.status = 'CONFIRMED')  AS confirmed,
+       count(*) FILTER (WHERE b.status = 'CANCELLED')  AS cancelled,
+       sum(b.total) FILTER (WHERE b.status <> 'CANCELLED') AS revenue
+FROM   bookings b
+JOIN   properties p ON p.id = b.property_id
+GROUP  BY p.city
+ORDER  BY all_stays DESC
+LIMIT  5;</code></pre>
+
+<p>One scan, four answers. You will also see this written as
+<code>sum(CASE WHEN … THEN 1 ELSE 0 END)</code>, which works and predates <code>FILTER</code>;
+<code>FILTER</code> is standard SQL, reads better, and handles NULL correctly without thinking
+about it.</p>
+
+<h2>Collecting values instead of counting them</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.city,
+       count(*)                                   AS properties,
+       string_agg(DISTINCT p.property_type, ', ' ORDER BY p.property_type) AS types
+FROM   properties p
+WHERE  p.status = 'PUBLISHED'
+GROUP  BY p.city
+ORDER  BY properties DESC
+LIMIT  5;</code></pre>
+
+<p><code>string_agg</code> joins values with a separator; <code>array_agg</code> gives you an
+array; <code>json_agg</code> and <code>jsonb_agg</code> give you JSON, which is how you return a
+parent and its children in a single round trip instead of an N+1 query. All four take an
+<code>ORDER BY</code> inside the parentheses, and without one the order is undefined.</p>
+
+<h2>Medians and percentiles</h2>
+
+<p>There is no <code>median()</code>, because a median needs the values sorted and an ordinary
+aggregate does not sort. The ordered-set aggregates do, and they take their
+<code>ORDER BY</code> in a <code>WITHIN GROUP</code> clause:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT round(avg(total), 2)                                              AS mean,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY total)::numeric(10,2) AS median,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY total)::numeric(10,2) AS p95,
+       mode() WITHIN GROUP (ORDER BY nights)                             AS most_common_nights
+FROM   bookings
+WHERE  status = 'CONFIRMED';</code></pre>
+
+<p>Report the median rather than the mean whenever a few large values would drag the average
+somewhere no real row sits — which is true of nearly every price, duration and response time you
+will ever aggregate. <code>percentile_cont</code> interpolates between rows;
+<code>percentile_disc</code> returns an actual value from the data. For money, the second one is
+usually what you meant.</p>
+
+<h2>Subtotals without a second query</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.country, p.property_type, count(*) AS stays
+FROM   bookings b
+JOIN   properties p ON p.id = b.property_id
+WHERE  p.country IN ('Norway', 'Portugal')
+GROUP  BY ROLLUP (p.country, p.property_type)
+ORDER  BY p.country NULLS LAST, p.property_type NULLS LAST;</code></pre>
+
+<p><code>ROLLUP</code> adds a subtotal row per country and a grand total, with NULL in the columns
+being totalled over. <code>CUBE</code> gives every combination; <code>GROUPING SETS</code> lets you
+name exactly the ones you want. Use <code>GROUPING(column)</code> to tell a genuine NULL from a
+subtotal marker.</p>
+
+<h2>Grouping is a sort or a hash, and it matters which</h2>
+
+<p>Postgres has two ways to group. <strong>HashAggregate</strong> builds a hash table of groups in
+memory and is the faster one; <strong>GroupAggregate</strong> sorts the rows first and reads the
+groups off in order. It picks the sort when the groups will not fit in <code>work_mem</code>, or
+when the input arrives sorted already.</p>
+
+<p>Two consequences worth knowing before the <code>EXPLAIN</code> post:</p>
+
+<ul>
+  <li><strong>Group by fewer, narrower columns where you have the choice.</strong> Grouping by a
+      city name builds a hash table of sixteen entries; grouping by a UUID builds one entry per
+      row, and then it does not fit.</li>
+  <li><strong>An index on the grouping column can remove the sort entirely</strong>, because the
+      rows already arrive in group order. That is why a <code>GROUP BY status</code> and a
+      <code>GROUP BY public_id</code> over the same table behave nothing alike.</li>
+</ul>
+
+<h2>The count(*) that is slower than you expect</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*) FROM bookings;</code></pre>
+
+<p>Because of MVCC, Postgres cannot answer that from a counter — it has to check which row versions
+are visible to your transaction, which means reading the table or a whole index. On 400,000 rows
+that is milliseconds. On a hundred million it is not, and a "total results" count on a paginated
+screen becomes the slowest thing on the page.</p>
+
+<p>When an estimate will do, the planner already has one:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT reltuples::bigint AS estimated_rows
+FROM   pg_class
+WHERE  relname = 'bookings';</code></pre>
+
+<p>It is only as fresh as the last <code>ANALYZE</code>, which is exactly the trade you are making
+when the alternative is a full scan on every page load. For a search screen, "about 12,000 results"
+is what the user wanted anyway, and it costs nothing.</p>

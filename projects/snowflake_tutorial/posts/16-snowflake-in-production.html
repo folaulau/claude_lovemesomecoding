@@ -1,0 +1,247 @@
+<p>Everything so far has been about making Snowflake do something. This lesson is about the gap between
+a warehouse that works and one other people depend on — environments, deployment, service accounts,
+monitoring, and the failure modes worth having an answer for before they happen.</p>
+
+<h2>Environments</h2>
+
+<p>Because databases in Snowflake are namespaces rather than servers, the cheapest and most common
+split is <strong>one account, three databases</strong>:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE DATABASE analytics_prod DATA_RETENTION_TIME_IN_DAYS = 30;
+CREATE DATABASE analytics_stg  DATA_RETENTION_TIME_IN_DAYS = 1;
+CREATE DATABASE analytics_dev  DATA_RETENTION_TIME_IN_DAYS = 1;
+
+-- Development against real data, instantly, at no storage cost.
+CREATE OR REPLACE DATABASE analytics_dev CLONE analytics_prod;</code></pre>
+
+<p>That clone is the argument for this layout. Every engineer can have production data to develop
+against, refreshed on demand, with no possibility of touching production — which is a much stronger
+guarantee than "be careful" and much cheaper than a second copy of the data.</p>
+
+<p>Separate <em>accounts</em> per environment are the stronger isolation: separate credentials,
+separate billing, no chance of a script pointed at the wrong database. The cost is that cloning
+across accounts is not possible, so refreshing dev from prod becomes a real data movement. Use
+separate accounts when regulation or a security review requires it, and separate databases
+otherwise.</p>
+
+<p>Either way, make the environment explicit in every connection rather than relying on a default:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Every script starts here. No exceptions, no defaults.
+USE ROLE      data_engineer;
+USE WAREHOUSE loading_wh;
+USE DATABASE  analytics_prod;
+USE SCHEMA    marts;</code></pre>
+
+<h2>DDL belongs in git</h2>
+
+<p>The single biggest difference between a warehouse that is maintainable and one that is not is
+whether its objects were created by a person in a worksheet or by a script in a repository. Aim for
+a state where dropping every object and re-running the repository reproduces the warehouse.</p>
+
+<pre class="language-bash"><code class="language-bash">warehouse/
+  migrations/
+    V001__create_databases.sql
+    V002__marts_schema.sql
+    V003__roles_and_grants.sql
+    V004__add_region_to_fact_sales.sql
+  scripts/
+    deploy.sh
+  tests/
+    row_counts.sql</code></pre>
+
+<p>Two properties make migrations safe to re-run, which is what CI needs:</p>
+
+<ul>
+<li><strong>Idempotence.</strong> <code>CREATE … IF NOT EXISTS</code> for anything holding data;
+<code>CREATE OR REPLACE</code> for views, procedures, tasks and file formats, which hold none.</li>
+<li><strong>No <code>CREATE OR REPLACE TABLE</code> in a migration.</strong> It silently discards
+the data. <code>ALTER TABLE … ADD COLUMN</code> is the change you meant.</li>
+</ul>
+
+<p>A deployment is then a script, and it runs the same way on every environment:</p>
+
+<pre class="language-bash"><code class="language-bash">#!/usr/bin/env bash
+set -euo pipefail
+
+ENVIRONMENT="${1:?usage: deploy.sh <dev|stg|prod&gt;}"
+
+for file in migrations/*.sql; do
+  echo "applying ${file}"
+  snow sql --connection "$ENVIRONMENT" -f "$file"
+done
+
+snow sql --connection "$ENVIRONMENT" -f tests/row_counts.sql</code></pre>
+
+<pre class="language-yaml"><code class="language-yaml">name: deploy-warehouse
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install snowflake-cli
+      - name: Deploy to prod
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ETL_SERVICE
+          SNOWFLAKE_PRIVATE_KEY_RAW: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: ./scripts/deploy.sh prod</code></pre>
+
+<p>If a transformation tool is already in the picture, let it own the modelling layer and keep these
+migrations for what it does not manage — databases, warehouses, roles, grants, tasks and pipes.
+Splitting on that line avoids two systems both believing they own a table.</p>
+
+<h2>Service accounts and network policies</h2>
+
+<p>Lesson 14 covered the shape; the production checklist is short:</p>
+
+<ul>
+<li>One service account per service, with <code>TYPE = SERVICE</code> and a comment naming the
+owning team.</li>
+<li>Key-pair authentication. Rotate keys on a schedule you actually keep — Snowflake supports two
+keys at once (<code>RSA_PUBLIC_KEY</code> and <code>RSA_PUBLIC_KEY_2</code>) precisely so rotation
+does not need downtime.</li>
+<li>A network policy restricting each service account to your infrastructure's addresses.</li>
+<li>The private key from a secrets manager at runtime — never in the repository, never baked into
+an image.</li>
+<li>MFA on every human user, and <code>ACCOUNTADMIN</code> on as few of them as possible.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">-- Rotation without downtime: add the new key, cut over, remove the old.
+ALTER USER etl_service SET RSA_PUBLIC_KEY_2 = 'MIIBIjANBgkqh...new...';
+-- ... deploy clients using the new key, confirm logins succeed ...
+ALTER USER etl_service UNSET RSA_PUBLIC_KEY;</code></pre>
+
+<h2>Monitoring</h2>
+
+<p>Four things are worth alerting on, and all four are queries you already have from earlier
+lessons. Snowflake's own <code>ALERT</code> object can run them on a schedule without an external
+scheduler:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE ALERT failed_tasks_alert
+  WAREHOUSE = loading_wh
+  SCHEDULE  = '30 MINUTE'
+  IF (EXISTS (
+    SELECT 1
+    FROM   TABLE(information_schema.task_history(
+             SCHEDULED_TIME_RANGE_START =&gt; DATEADD('hour', -1, CURRENT_TIMESTAMP())))
+    WHERE  state = 'FAILED'))
+  THEN CALL SYSTEM$SEND_EMAIL(
+    'ops_notifications',
+    'data-team@example.com',
+    'Snowflake: a scheduled task failed',
+    'Check task_history in the last hour.');
+
+ALTER ALERT failed_tasks_alert RESUME;   -- created suspended, like tasks</code></pre>
+
+<table>
+<tr><th>Watch</th><th>Source</th><th>From</th></tr>
+<tr><td>Failed or suspended tasks</td><td><code>task_history</code>,
+<code>SHOW TASKS</code></td><td>Lesson 13</td></tr>
+<tr><td>Pipes stalled or backing up</td><td><code>SYSTEM$PIPE_STATUS</code>,
+<code>copy_history</code></td><td>Lesson 8</td></tr>
+<tr><td>Credit spikes</td><td><code>warehouse_metering_history</code></td><td>Lesson 15</td></tr>
+<tr><td>Freshness — did the table update?</td><td><code>MAX(loaded_at)</code> on your own
+tables</td><td>This lesson</td></tr>
+</table>
+
+<p>That last one is the one people leave out and then wish they had. Every other check tells you a
+component failed; a freshness check tells you the <em>outcome</em> is wrong, which catches the
+failures nobody anticipated — including the pipeline that succeeded while loading zero rows.</p>
+
+<pre class="language-sql"><code class="language-sql">-- The check that catches what the others miss.
+SELECT 'fact_orders' AS table_name,
+       MAX(loaded_at) AS last_loaded,
+       DATEDIFF('hour', MAX(loaded_at), CURRENT_TIMESTAMP()) AS hours_stale
+FROM   analytics_prod.marts.fact_orders
+HAVING hours_stale &gt; 6;</code></pre>
+
+<h2>Testing data, not just code</h2>
+
+<p>A deployment that applies cleanly can still leave the warehouse wrong, because the thing that
+broke is the data rather than the DDL. A handful of assertions run after every load catches most of
+it, and they are ordinary SQL — no framework required.</p>
+
+<p>Four checks cover most real failures:</p>
+
+<ul>
+<li><strong>Row count in a plausible range.</strong> Zero rows is the classic silent failure; ten
+times yesterday's count is the other one.</li>
+<li><strong>Uniqueness on keys.</strong> Snowflake enforces none of it (lesson 5), so the only
+place a duplicate primary key gets caught is here.</li>
+<li><strong>No unexpected nulls</strong> in the columns downstream consumers join on.</li>
+<li><strong>Referential integrity</strong> against the dimension tables, for the same reason.</li>
+</ul>
+
+<pre class="language-sql"><code class="language-sql">-- tests/row_counts.sql &mdash; returns rows ONLY when something is wrong,
+-- so an empty result means the deployment is good.
+SELECT 'fact_orders is empty' AS failure
+FROM   analytics_prod.marts.fact_orders
+HAVING COUNT(*) = 0
+
+UNION ALL
+SELECT 'duplicate order_id: ' || order_id
+FROM   analytics_prod.marts.fact_orders
+GROUP  BY order_id HAVING COUNT(*) &gt; 1
+
+UNION ALL
+SELECT 'null customer_id on ' || COUNT(*) || ' rows'
+FROM   analytics_prod.marts.fact_orders
+WHERE  customer_id IS NULL
+HAVING COUNT(*) &gt; 0
+
+UNION ALL
+SELECT 'orphan customer_id: ' || f.customer_id
+FROM   analytics_prod.marts.fact_orders f
+LEFT   JOIN analytics_prod.marts.dim_customer d ON d.customer_id = f.customer_id
+WHERE  d.customer_id IS NULL
+GROUP  BY f.customer_id;</code></pre>
+
+<p>The convention that makes this work in CI is the one above: <strong>a passing test returns no
+rows.</strong> Then the deploy script fails the build if the result set is non-empty, and each row
+is its own readable error message.</p>
+
+<h2>Failure modes worth an answer</h2>
+
+<table>
+<tr><th>What happens</th><th>What you do</th></tr>
+<tr><td>A bad <code>UPDATE</code> or <code>MERGE</code></td><td>Clone
+<code>BEFORE(STATEMENT =&gt; …)</code>, verify, <code>SWAP WITH</code>. Lesson 12.</td></tr>
+<tr><td>A table dropped by accident</td><td><code>UNDROP</code>, within the retention
+window.</td></tr>
+<tr><td>A pipe stops silently</td><td><code>SYSTEM$PIPE_STATUS</code> alert;
+<code>ALTER PIPE … REFRESH</code> with a prefix.</td></tr>
+<tr><td>A task suspends and nobody notices</td><td>Alert on <code>SHOW TASKS</code> state, not only
+on failures.</td></tr>
+<tr><td>Credits spike overnight</td><td>Resource monitor with <code>DO SUSPEND</code> already in
+place. Lesson 15.</td></tr>
+<tr><td>A key leaks</td><td>Network policy limits the blast radius;
+<code>ALTER USER … UNSET RSA_PUBLIC_KEY</code> revokes it immediately.</td></tr>
+<tr><td>A whole region is unavailable</td><td>Database replication to a second region, if the
+business needs it. It is a real cost — decide deliberately.</td></tr>
+</table>
+
+<h2>Before you call it production</h2>
+
+<ul>
+<li>Every warehouse has <code>AUTO_SUSPEND</code>, a <code>STATEMENT_TIMEOUT_IN_SECONDS</code> that
+is not the two-day default, and a resource monitor.</li>
+<li>Nothing runs as <code>ACCOUNTADMIN</code>. Service accounts use key pairs and network
+policies.</li>
+<li>Future grants are set on every schema, so tomorrow's table is readable without a ticket.</li>
+<li>Retention is deliberate: long on sources of truth, zero on anything rebuildable, and rebuildable
+tables are transient.</li>
+<li>Every object was created by a script in a repository, and CI can re-run it.</li>
+<li>The four monitors above exist and have alerted at least once in a drill.</li>
+<li>Somebody other than the author has restored a table from Time Travel, on purpose, to prove the
+runbook works.</li>
+</ul>
+
+<p>That last one is the item most often skipped and the only one that proves any of the others. A
+recovery procedure nobody has executed is a hypothesis.</p>
+
+<p>That is the track. Back to <a href="/snowflake/snowflake-introduction">the introduction</a> for
+the full lesson index.</p>

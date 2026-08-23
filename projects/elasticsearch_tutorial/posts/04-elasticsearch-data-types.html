@@ -1,0 +1,367 @@
+<p>Elasticsearch has around forty field types. You need about eight, and one distinction among them
+causes more confusion than everything else combined. This lesson covers the types a real project
+actually uses, and the decision behind each one.</p>
+
+<h2>text and keyword</h2>
+
+<p>Both hold strings. They behave nothing alike, and understanding why is most of the work.</p>
+
+<p>A <strong><code>text</code></strong> field is <em>analysed</em>: the value is split into terms,
+lowercased, and those terms go into the inverted index. "San Francisco" is stored as
+<code>san</code> and <code>francisco</code>. The original string is not searchable at all &mdash;
+only its terms are.</p>
+
+<p>A <strong><code>keyword</code></strong> field is not analysed. The whole value becomes one term,
+exactly as given. "San Francisco" is stored as <code>San Francisco</code>, capital letters and space
+included.</p>
+
+<p>So: <code>text</code> for anything a human types into a search box. <code>keyword</code> for
+anything you filter on exactly, sort by, or group by.</p>
+
+<h3>The bug this causes</h3>
+
+<p>Map a field as <code>text</code> and query it with <code>term</code>, which looks for one exact
+term:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/txt-test/_search -H 'Content-Type: application/json' \
+  -d '{"query": {"term": {"city": "San Francisco"}}}'
+# 0 hits</code></pre>
+
+<p>Zero. The document is right there. The field name is right. The value is spelled correctly. And
+the query matches nothing, because the index contains <code>san</code> and <code>francisco</code>,
+and <code>term</code> is looking for the single term <code>San Francisco</code>, which was never
+stored.</p>
+
+<p>Prove it by asking for a term that <em>does</em> exist:</p>
+
+<pre class="language-bash"><code class="language-bash">-d '{"query": {"term": {"city": "san"}}}'          # 1 hit
+-d '{"query": {"match": {"city": "San Francisco"}}}'  # 1 hit</code></pre>
+
+<p><code>match</code> works because it analyses the query string with the same analyzer the field
+uses, producing <code>san</code> and <code>francisco</code>, which do match. That is the whole
+difference between <code>match</code> and <code>term</code>, and it is worth stating as a rule:
+<strong><code>term</code> on a <code>text</code> field is almost always a bug.</strong></p>
+
+<h3>Which is why you usually want both</h3>
+
+<pre class="language-python"><code class="language-python">            "city": {
+                "type": "text",
+                "analyzer": "stayhub_text",
+                "fields": {"raw": {"type": "keyword"}},
+            },</code></pre>
+
+<p>One field on the way in, two on the way out. <code>city</code> matches loosely,
+<code>city.raw</code> filters, sorts and aggregates exactly. Dynamic mapping does this
+automatically and calls the sub-field <code>.keyword</code>; when you write the mapping yourself you
+pick the name.</p>
+
+<p>The one thing to avoid is doing this to <em>every</em> string out of habit. A field like
+<code>property_type</code>, whose values are <code>HOUSE</code>, <code>CABIN</code> and so on, is
+never typed into a search box &mdash; it comes from a dropdown. It should be a plain
+<code>keyword</code>, and giving it a text half builds an inverted index nothing will query.</p>
+
+<h3>keyword has limits worth knowing</h3>
+
+<p>Dynamic mapping adds <code>"ignore_above": 256</code> to the keyword sub-fields it creates, and
+that is not decoration: a keyword field's terms go into the term dictionary whole, so indexing a
+2KB description as a keyword is both useless and expensive. Values longer than the limit are
+skipped &mdash; stored in <code>_source</code>, absent from the index. Same silent-absence problem
+as <code>ignore_malformed</code>, and worth remembering when a long value mysteriously does not
+match.</p>
+
+<p>The other thing keyword does not do is case-insensitivity. <code>"cabin"</code> will not match a
+keyword holding <code>"Cabin"</code>. If you need exact-but-case-insensitive &mdash; email
+addresses, usernames, slugs &mdash; use a <code>normalizer</code>, which is a stripped-down analyzer
+for keyword fields that can lowercase without tokenising.</p>
+
+<h2>Numbers, and money in particular</h2>
+
+<p>Elasticsearch has the numeric types you would expect: <code>byte</code>, <code>short</code>,
+<code>integer</code>, <code>long</code>, <code>float</code>, <code>double</code>,
+<code>half_float</code>, <code>scaled_float</code>.</p>
+
+<p>Choose by the range of values, not by habit. A <code>max_guests</code> field holding 1 to 50 does
+not need a <code>long</code>; <code>integer</code> is plenty and smaller. Contrary to the SQL
+instinct, the width mostly affects disk rather than query speed here, but it is free to get right.</p>
+
+<p>Money is the one that needs a real decision:</p>
+
+<pre class="language-python"><code class="language-python">            "price_per_night": {"type": "scaled_float", "scaling_factor": 100},
+            "cleaning_fee": {"type": "scaled_float", "scaling_factor": 100},
+            "bathrooms": {"type": "scaled_float", "scaling_factor": 10},
+            "rating_average": {"type": "scaled_float", "scaling_factor": 100},</code></pre>
+
+<p><code>scaled_float</code> stores the value as a long, multiplied by the scaling factor. A price of
+119.99 with a factor of 100 is stored as the integer 11999. It is exact to the penny, sorts and
+ranges correctly, and compresses better than a <code>double</code> because integers do.</p>
+
+<p>The alternative is <code>double</code>, which works and carries the usual binary floating-point
+surprises into your price filters. <code>float</code> is worse: it has about seven significant
+digits, so a price of 1234567.89 is already imprecise.</p>
+
+<p>Note <code>bathrooms</code> uses a factor of 10, not 100. Half-bathrooms exist; quarter-bathrooms
+do not. The factor is a statement about the precision the data actually has.</p>
+
+<h3>Numbers that are not numbers</h3>
+
+<p>An identifier made of digits &mdash; a phone number, a postcode, an order reference &mdash;
+should be a <code>keyword</code>, not a numeric type. You never sum them and you never range over
+them; you look them up exactly. Numeric types are optimised for range queries and keyword fields
+for exact lookups, so the wrong choice is slower at the only thing you do.</p>
+
+<p>And a numeric type will happily eat the leading zero off a postcode.</p>
+
+<h2>date</h2>
+
+<pre class="language-python"><code class="language-python">            "created_at": {"type": "date"},</code></pre>
+
+<p>Internally a date is a long: milliseconds since the epoch, UTC. What it accepts on the way in is
+more forgiving &mdash; an ISO 8601 string, a number of milliseconds, or a number of seconds if you
+say so:</p>
+
+<pre class="language-json"><code class="language-json">{ "type": "date", "format": "strict_date_optional_time||epoch_millis" }</code></pre>
+
+<p>That is the default. Adding your own formats is a common need, and the <code>strict_</code>
+prefix is worth preferring: without it, <code>2026-8-2</code> parses, and a date field that accepts
+sloppy input is a date field that will one day accept the wrong thing.</p>
+
+<p>Two practical notes. A date with no timezone is treated as UTC, so a naive local timestamp is
+silently shifted &mdash; always send an offset. And date maths in queries (<code>now-7d</code>,
+<code>now/d</code>) is evaluated by the cluster, in the cluster's clock, which is what you want for
+"last 7 days" and not what you want for "since midnight in the user's timezone".</p>
+
+<h2>boolean</h2>
+
+<p>Accepts <code>true</code>/<code>false</code> and the strings <code>"true"</code>/
+<code>"false"</code>. The thing worth knowing is that a missing boolean is not
+<code>false</code> &mdash; it is missing, and
+<code>{"term": {"deleted": false}}</code> will not match a document where the field is absent. Use
+<code>exists</code>, or set the field explicitly at index time, which is what a well-defined
+document shape gets you.</p>
+
+<h2>geo_point</h2>
+
+<pre class="language-python"><code class="language-python">            "latitude": {"type": "double"},
+            "longitude": {"type": "double"},
+            "location": {"type": "geo_point"},</code></pre>
+
+<p>Note that StayHub stores the coordinates <em>three</em> times: two plain doubles for display, and
+a <code>geo_point</code> for querying. That is not waste. The doubles are what the result card
+renders; the <code>geo_point</code> is a different data structure entirely, and only it can answer
+"within 10km of here". Lesson 14 covers the queries, including the format that silently reverses
+latitude and longitude.</p>
+
+<h2>object and nested</h2>
+
+<p>This is the second big trap, and unlike <code>term</code>-on-<code>text</code> it produces a
+plausible wrong answer rather than an empty one.</p>
+
+<p>A JSON object inside a document is mapped as an <code>object</code> by default, and its fields
+are flattened into dotted paths. Given reviews:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "title": "Cedar Cabin",
+  "reviews": [
+    { "author": "ana", "rating": 5 },
+    { "author": "bob", "rating": 1 }
+  ]
+}</code></pre>
+
+<p>What is actually indexed is:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">reviews.author: ["ana", "bob"]
+reviews.rating: [5, 1]</code></pre>
+
+<p>Two flat lists. The pairing is gone. So ask a question that depends on the pairing &mdash; did
+bob leave a 5-star review? &mdash; and:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -s localhost:9200/nest-test/_search -H 'Content-Type: application/json' -d '{
+  "query": {"bool": {"must": [
+    {"term": {"reviews.author": "bob"}},
+    {"term": {"reviews.rating": 5}}
+  ]}}
+}'
+# hits: 1</code></pre>
+
+<p>One hit. Bob gave it one star. The document matches because <code>bob</code> is somewhere in the
+authors list and <code>5</code> is somewhere in the ratings list, and nothing recorded that they
+came from different objects.</p>
+
+<p><code>nested</code> fixes it, by indexing each object in the array as its own hidden document:</p>
+
+<pre class="language-json"><code class="language-json">{ "reviews": { "type": "nested", "properties": {
+    "author": { "type": "keyword" },
+    "rating":  { "type": "integer" }
+} } }</code></pre>
+
+<p>Queried through a <code>nested</code> clause, which scopes the inner conditions to a single
+object:</p>
+
+<pre class="language-bash"><code class="language-bash">-d '{"query": {"nested": {"path": "reviews", "query": {"bool": {"must": [
+      {"term": {"reviews.author": "bob"}},
+      {"term": {"reviews.rating": 5}}
+]}}}}}'
+# hits: 0        <- correct
+
+# and the same query for ana:
+# hits: 1        <- also correct</code></pre>
+
+<h3>What nested costs</h3>
+
+<p>It is not free, which is why it is not the default. Each array element becomes a separate Lucene
+document, so a listing with 200 reviews is 201 documents on disk. Updating any part of the parent
+reindexes all of them. Nested fields cannot be aggregated or sorted without a
+<code>nested</code> wrapper, and there are cluster-level limits on how many nested fields and
+objects an index may have, precisely because it is easy to blow up an index this way.</p>
+
+<p>So the rule is narrow: use <code>nested</code> when you need to query two fields of the same
+array element <em>together</em>. If you only ever ask "does this listing have any 5-star review",
+plain <code>object</code> is correct and cheaper.</p>
+
+<p>And often the best answer is neither &mdash; do not put the array in the document at all.
+StayHub's amenities are a flat <code>keyword</code> array because a filter panel only ever asks
+"does this listing have wifi", never "does it have wifi at a particular price". Lesson 6 is about
+making that call deliberately.</p>
+
+<h2>Arrays are not a type</h2>
+
+<p>Worth stating because it surprises people: there is no array type. <em>Every</em> field can hold
+an array of its type, with no mapping change:</p>
+
+<pre class="language-json"><code class="language-json">{ "amenities": ["wifi", "kitchen"] }
+{ "amenities": "wifi" }</code></pre>
+
+<p>Both are valid against <code>{"amenities": {"type": "keyword"}}</code>. A query for
+<code>{"term": {"amenities": "wifi"}}</code> matches both. This is why "does this listing have
+wifi" needs no special handling at all &mdash; and it is also the mechanism behind the
+<code>nested</code> problem above, since flattening an array of objects is what a field holding
+multiple values looks like.</p>
+
+<h2>The specialised ones worth knowing exist</h2>
+
+<p>You will not need these on day one, but knowing the names saves reinventing them.</p>
+
+<p><code>ip</code> stores IPv4 and IPv6 and supports CIDR range queries &mdash;
+<code>{"term": {"client_ip": "10.0.0.0/8"}}</code> works. Better than a keyword the moment you want
+subnets.</p>
+
+<p><code>search_as_you_type</code> and <code>completion</code> are the two autocomplete answers.
+The first builds n-gram-ish sub-fields you query normally; the second is a separate in-memory
+structure that is very fast and cannot be filtered easily. Pick by whether suggestions need to
+respect the user's other filters.</p>
+
+<p>The <em>range</em> types &mdash; <code>integer_range</code>, <code>date_range</code>,
+<code>float_range</code> &mdash; store a range in one field and answer "which ranges contain this
+point" or "which overlap this range". For availability windows and price bands this is much better
+than a pair of fields.</p>
+
+<p><code>dense_vector</code> holds an embedding for k-nearest-neighbour search, which is what
+"semantic search" means in practice.</p>
+
+<p><code>flattened</code> maps an entire object as one field of keywords, avoiding the mapping
+explosion you get when documents carry arbitrary user-defined keys. You lose per-field types; you
+gain an index that does not acquire a thousand fields.</p>
+
+<h2>What null means, which is not what you expect</h2>
+
+<p>A JSON <code>null</code>, an empty array, and an array of nulls are all treated the same way:
+<strong>the field is not indexed at all</strong>. It is not indexed as "empty" and it is not indexed
+as zero &mdash; it simply is not there.</p>
+
+<pre class="language-json"><code class="language-json">{ "rating_average": null }
+{ "rating_average": [] }
+{ "rating_average": [null, null] }</code></pre>
+
+<p>For all three, <code>{"exists": {"field": "rating_average"}}</code> is false, and every range or
+term query on it misses the document. That is usually right, and it becomes wrong the moment
+somebody writes a filter like "listings rated under 3 stars" and quietly excludes every listing that
+has no rating yet &mdash; which is exactly the set a new host cares about.</p>
+
+<p><code>null_value</code> substitutes something searchable:</p>
+
+<pre class="language-json"><code class="language-json">{ "rating_average": { "type": "scaled_float", "scaling_factor": 100, "null_value": 0 } }</code></pre>
+
+<p>Now a null arrives in the index as 0. Note carefully that <code>_source</code> still says
+<code>null</code> &mdash; the substitution happens on the way into the index only, so what you
+search and what you display disagree. That is either exactly what you want or a trap, and it depends
+entirely on whether the caller reads the field from <code>_source</code> or from the query.</p>
+
+<p>The alternative, and usually the better one, is to decide the default in your application and
+send a real value. A document shape with no nulls in it is easier to reason about than a mapping
+full of <code>null_value</code> rules.</p>
+
+<h2>The types that do not exist</h2>
+
+<p>Three absences trip up people arriving from SQL.</p>
+
+<p><strong>There is no decimal type.</strong> <code>scaled_float</code> is the answer, and it is a
+long underneath. If you need arbitrary precision, store the string and a numeric copy for sorting.</p>
+
+<p><strong>There is no enum.</strong> A <code>keyword</code> plus <code>dynamic: strict</code> gets
+you the field-name safety; nothing validates the <em>value</em>. Elasticsearch will index
+<code>"HOSUE"</code> without complaint, and the symptom is a facet with a bucket of one. Validate
+before indexing &mdash; in StayHub the values come from a Python enum, and the index never sees a
+string the application did not produce.</p>
+
+<p><strong>There are no foreign keys and no uniqueness constraints.</strong> The only uniqueness you
+get is the document <code>_id</code>, which is why choosing your own id matters so much &mdash;
+lesson 7.</p>
+
+<h2>How many fields is too many</h2>
+
+<p>An index has a limit of 1,000 fields by default, and hitting it is a real production failure with
+a distinctive shape: indexing starts throwing
+<code>Limit of total fields [1000] has been exceeded</code>, usually at 3am, usually because some
+upstream system started sending an object keyed by user id or by timestamp.</p>
+
+<p>Every distinct key becomes a mapping entry, and mapping entries live in the cluster state, which
+is held in memory on every node and replicated to all of them. So a runaway mapping is not just
+untidy; it degrades the whole cluster.</p>
+
+<p>Raising the limit is possible and is nearly always the wrong first move. The right moves are
+<code>dynamic: strict</code> on indexes you control, so an unexpected field is an error rather than
+a new mapping entry, and the <code>flattened</code> type for the genuinely dynamic ones.</p>
+
+<h2>Choosing, in one pass</h2>
+
+<p>Ask what you will <em>do</em> with the field, not what it looks like.</p>
+
+<p>Typed into a search box, matched loosely &rarr; <code>text</code>, with an analyzer you chose.
+Filtered exactly, sorted, or aggregated &rarr; <code>keyword</code>. Both &rarr; <code>text</code>
+with a <code>keyword</code> multi-field.</p>
+
+<p>Money &rarr; <code>scaled_float</code> with a factor matching the real precision. Other numbers
+&rarr; the smallest type that fits the range. Digits that are an identifier &rarr;
+<code>keyword</code>.</p>
+
+<p>A timestamp &rarr; <code>date</code> with a <code>strict_</code> format and an explicit timezone
+on the way in. Coordinates you will search by &rarr; <code>geo_point</code>, in addition to any
+plain numbers you display. An array of objects whose fields you query together &rarr;
+<code>nested</code>, and only then.</p>
+
+<p>Returned but never queried &rarr; whatever type, with <code>"index": false</code>.</p>
+
+<h2>Reading a mapping you did not write</h2>
+
+<p>You will inherit indexes. Two requests tell you most of what you need:</p>
+
+<pre class="language-bash"><code class="language-bash"># the mapping, as it stands
+curl -s localhost:9200/stayhub-properties/_mapping?pretty
+
+# every field's type across every index — the fastest way to find a field that is
+# a `long` in one index and a `keyword` in another, which breaks cross-index search
+curl -s "localhost:9200/*/_field_caps?fields=*&pretty" | head -40</code></pre>
+
+<p>What to look for, in order. Numeric fields that should be <code>scaled_float</code> and are
+<code>long</code> &mdash; lesson 3's bug, already shipped. Strings that are <code>text</code> and
+only ever filtered on, which means every filter is quietly matching tokens. Strings that are
+<code>keyword</code> and are typed into a search box, which means the search only works when the
+user's spelling and capitalisation match exactly. And <code>object</code> arrays that are queried
+on two fields at once.</p>
+
+<p>All four are silent. None of them raises an error; each returns results that are merely wrong,
+which is why reading the mapping is a better use of an hour than reading the query.</p>
+
+<p>Get these right the first time, because lesson 3 already showed what changing one costs. The
+next lesson is about the other half of a <code>text</code> field &mdash; the analyzer, which
+decides what those terms actually are.</p>

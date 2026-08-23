@@ -13,9 +13,11 @@ lesson re-bases in order.
 changing one of those slugs changes a live URL, and `verify-build.mjs` fails the frontend build
 when an indexed post URL stops resolving.
 
-Because all nine carry 2023 dates and `upsert_post` never overwrites an existing date, seeding
-needs `seed.py --force-dates` or the archive interleaves nine 2023 posts with nine 2026 ones and
-the pager reads nonsense. See progress_report.md.
+Because all nine carried 2023 dates and `upsert_post` never overwrites an existing date, seeding
+needs `seed.py --force-dates` or the archive interleaves nine 2023 posts with nine 2025 ones and
+the pager reads nonsense. The same applies to any later re-base of START_DATE: once a post is
+published its stored date is sticky, so moving the whole track means --force-dates again. See
+progress_report.md.
 """
 
 from datetime import datetime, timedelta
@@ -239,7 +241,7 @@ SNIPPET_SOURCES = {
 # ---------------------------------------------------------------------------
 # Lesson 1 is stamped START_DATE and each following lesson is STEP_DAYS later, so the archive
 # reads as a course rather than a pile.
-START_DATE = datetime(2026, 9, 2, 9, 0, 0)
+START_DATE = datetime(2025, 9, 2, 9, 0, 0)
 STEP_DAYS = 3
 
 

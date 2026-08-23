@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the FastAPI category and its posts into a content tree.
+"""Write the Elasticsearch category and its posts into a content tree.
 
 Runs the backend's own service layer rather than touching S3 directly, so the post objects, the
 post index, the category archive, the category counts and the search index are all maintained by
@@ -7,23 +7,26 @@ the same code the admin API uses. Anything else would risk the derived indexes d
 posts, and the static build reads only the indexes.
 
     # dry run against the local tree (default)
-    python projects/fastapi_tutorial/seed.py
+    python projects/elasticsearch_tutorial/seed.py
 
-    python projects/fastapi_tutorial/seed.py --env local --write
-    python projects/fastapi_tutorial/seed.py --env prod  --write
+    python projects/elasticsearch_tutorial/seed.py --env local --write
+    python projects/elasticsearch_tutorial/seed.py --env prod  --write
 
 Idempotent: re-running updates the posts in place. `date` is only applied when a post is new, so a
 re-run never reshuffles the archive.
 
-⚠️ `--force-dates` stamps the manifest date onto a post that already exists, before upserting
-it. Two situations need it. The first was the original seed: nine of the eighteen slugs were
-published in June 2023 and already carried dates, so without it the archive interleaved nine 2023
-posts with the new ones and the pager read nonsense. The second is any re-base of START_DATE --
-every post is published now, so all eighteen dates are sticky and a plain re-run moves none of
-them.
+⚠️ THIRTEEN of the eighteen slugs were published between 2019 and 2021 and therefore already carry
+dates that upsert_post will not overwrite. `--force-dates` stamps the manifest date onto an
+existing post before upserting it, which is what makes the rewritten track read in LESSON order
+rather than in the order the originals happened to be published. Without it the pager walks the
+track out of sequence — `elasticsearch-data-types` (2019-06-28) would come before
+`what-is-elasticsearch` (2020-09-24), which is backwards for a course.
+
+The manifest dates the track into 2020-2021 deliberately, close to where these URLs already sit;
+see the note on START_DATE in manifest.py.
 
 It is not the default: without it a re-run leaves the archive alone, which is the behaviour you
-want every other time. Pass it only when the manifest dates are deliberately meant to win.
+want every other time. Expect to pass it exactly once per tree.
 """
 
 import argparse
@@ -68,9 +71,9 @@ def read_post_html(entry: dict) -> str:
     if not path.exists():
         raise SystemExit(
             f"missing content file: {path}\n"
-            "Every code sample in this track is quoted from the StayHub FastAPI backend in "
-            "lovemesomecoding_demo_project/stayhub/stayhub-fastapi-backend. Run "
-            "check_content.py and check_snippets.py before seeding — see progress_report.md."
+            "Every code sample in this track is quoted from the StayHub search package in "
+            "lovemesomecoding_demo_project/stayhub. Run check_content.py and check_snippets.py "
+            "before seeding — see progress_report.md."
         )
     return path.read_text(encoding="utf-8")
 
@@ -82,7 +85,7 @@ def main() -> int:
                         help="actually write. Without it, only report what would happen.")
     parser.add_argument("--force-dates", action="store_true",
                         help="stamp the manifest date onto posts that already exist. "
-                             "Needed once, to reorder the nine rewritten 2023 posts.")
+                             "Needed once, to reorder the thirteen rewritten 2019-2021 posts.")
     parser.add_argument("--only", default=None,
                         help="comma-separated slugs to seed, instead of the whole track. "
                              "For previewing a post while the rest are still unwritten — the "
@@ -123,7 +126,7 @@ def main() -> int:
             message = "frozen slugs not present in this tree: " + ", ".join(absent)
             if args.env == "prod":
                 raise SystemExit(
-                    message + "\nThese are supposed to be the indexed 2023 URLs being rewritten "
+                    message + "\nThese are supposed to be the indexed 2019-2021 URLs being rewritten "
                     "in place. Seeding would create new pages instead. Check the slugs before "
                     "writing to prod.")
             print(f"note: {message}")
@@ -131,27 +134,14 @@ def main() -> int:
             print(f"all {len(manifest.FROZEN_SLUGS)} frozen slugs present — "
                   "every rewrite lands on its existing URL")
 
-        # ⚠️ And the reverse: a NEW slug that already exists may be an accidental overwrite of
-        # somebody else's page, because post slugs are global across categories.
-        #
-        # "May be", not "is" — once the track has been seeded once, every `new` slug exists, and
-        # it is ours. What still has to fail is a slug that landed in a DIFFERENT category:
-        # upserting it would move a stranger's page into /fastapi and rewrite its body. So the
-        # check is on the category, not on mere existence. Keep it that way — reducing this to
-        # "warn if it exists" would let a real collision through on the second seed and every
-        # seed after it.
-        taken = [(slug, existing["category"])
-                 for slug in sorted(manifest.NEW_SLUGS)
-                 if (existing := post_service.get_post(slug))]
-        foreign = [f"{slug} (in '{cat}')" for slug, cat in taken
-                   if cat != manifest.CATEGORY["slug"]]
-        if foreign:
+        # ⚠️ And the reverse: a NEW slug that already exists is not a new post, it is an
+        # accidental overwrite of somebody else's page. Post slugs are global across categories.
+        collisions = [slug for slug in sorted(manifest.NEW_SLUGS)
+                      if post_service.get_post(slug)]
+        if collisions:
             raise SystemExit(
-                "slugs marked `new` already belong to another category: " + ", ".join(foreign) +
+                "slugs marked `new` already exist in this tree: " + ", ".join(collisions) +
                 "\nSeeding would overwrite them. Either they are not new, or the slug is wrong.")
-        if taken:
-            print(f"{len(taken)} slug(s) marked `new` already exist in /"
-                  f"{manifest.CATEGORY['slug']} — this track has been seeded here before")
 
     # Fail early rather than half-seeding: every file must exist and no slug may already belong to
     # a different category.

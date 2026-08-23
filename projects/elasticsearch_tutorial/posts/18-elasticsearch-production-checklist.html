@@ -1,0 +1,354 @@
+<p>Everything up to here was about making search work. This is about what to settle before real
+users depend on it &mdash; roughly in the order the decisions bite, and with the ones that cannot be
+changed later marked as such.</p>
+
+<h2>Shard count, which you cannot change</h2>
+
+<p>Start here because <code>number_of_shards</code> is a static setting: it is fixed at index
+creation, and changing it means a reindex.</p>
+
+<p>The instinct is that more shards means more parallelism means more speed. It usually does not.
+Every shard is a complete Lucene index with its own memory, file handles and merge activity; every
+search fans out to all of them and pays a merge across the results. Over-sharding a small index
+makes it slower and uses more memory for nothing.</p>
+
+<p>The working guidance is <strong>10&ndash;50GB per shard</strong>, and no more than about
+<strong>20 shards per GB of heap</strong> on a node. So estimate your index size in a year, divide
+by 30GB, and round up. If that gives you one, use one.</p>
+
+<pre class="language-python"><code class="language-python">    "settings": {
+        # One shard: this is a demo, and a single shard also makes relevance scores stable.
+        # Scores are computed per shard, so small multi-shard indexes give oddly inconsistent
+        # ordering — the classic "why did the same query rank differently?" surprise.
+        "number_of_shards": 1,
+        "number_of_replicas": 0,</code></pre>
+
+<p>For data that grows forever &mdash; logs, events &mdash; do not size one enormous index. Use
+rollover from lesson 15, so each generation stays a sensible size and old ones can be deleted by
+dropping an index rather than by a delete-by-query.</p>
+
+<h2>Replicas, which you can</h2>
+
+<p><code>number_of_replicas</code> is dynamic, and it is what <code>green</code> actually
+promises.</p>
+
+<p>Zero replicas means one node failure loses data. That is correct for a derived index that can be
+rebuilt and for a development cluster, and wrong for anything else. One replica &mdash; the default
+&mdash; survives one node loss and roughly doubles read capacity. Two is for clusters where a second
+failure during recovery is a real concern.</p>
+
+<p>Two practical notes. Replicas cost write throughput and disk proportionally, so setting them to
+zero during a bulk load and back afterwards is a genuine speedup. And a replica needs somewhere to
+live: on a single-node cluster it can never be assigned, and asking for one is how you end up
+permanently yellow and stop noticing yellow.</p>
+
+<h2>Heap, and the two rules</h2>
+
+<p><strong>Give the JVM half the machine's RAM, and no more than about 30GB.</strong> Both halves
+matter.</p>
+
+<p>The half is because Lucene reads its index files through the operating system's page cache, so
+the memory you do <em>not</em> give the JVM is doing real work. A node with all its RAM in the heap
+reads from disk constantly.</p>
+
+<p>The 30GB ceiling is because the JVM uses compressed object pointers below roughly 32GB. Cross
+that line and pointers get larger, so a 33GB heap holds <em>fewer</em> objects than a 30GB one. If a
+machine has 128GB, run several nodes rather than one enormous heap.</p>
+
+<pre class="language-yaml"><code class="language-yaml">      ES_JAVA_OPTS: "-Xms512m -Xmx512m"</code></pre>
+
+<p>Min and max the same, always. A growing heap means the JVM spends time resizing and the operating
+system may hand out memory it later wants back.</p>
+
+<p>Also: disable swap. A swapped-out JVM heap causes garbage collection pauses measured in seconds,
+and a node that pauses for seconds is treated as dead by the rest of the cluster, which then starts
+reallocating its shards. <code>bootstrap.memory_lock: true</code>, or no swap at all.</p>
+
+<h2>Security, past the point most guides stop</h2>
+
+<p>Turning <code>xpack.security</code> on is the first step and it is not the interesting one. Most
+guides then hand every client the <code>elastic</code> superuser, which is roughly the same as
+giving every service your database's root password.</p>
+
+<p>StayHub's search code needs to read and write <strong>one</strong> alias. So that is the role:</p>
+
+<pre class="language-python"><code class="language-python">ROLE_BODY = {
+    "cluster": ["monitor"],  # _cluster/health for the readiness probe. NOT `manage`.
+    "indices": [
+        {
+            # A wildcard over the generations, so a reindex into `-000003` needs no new grant.
+            # It is still scoped: this key cannot touch an index called anything else.
+            "names": [f"{ALIAS}*"],
+            "privileges": ["read", "view_index_metadata", "index", "delete", "manage"],
+        }
+    ],
+}</code></pre>
+
+<p>Then an API key derived from it, rather than a password:</p>
+
+<pre class="language-python"><code class="language-python">    result = es.security.create_api_key(
+        body={
+            "name": KEY_NAME,
+            "role_descriptors": {ROLE: ROLE_BODY},
+            # A key with no expiry is a credential you will still be running in three years.
+            "expiration": "90d",
+        }
+    )</code></pre>
+
+<p>API keys beat passwords for a service because they are individually revocable, they carry their
+own scope, and they expire. A password shared between three services cannot be rotated without
+coordinating three deploys.</p>
+
+<p>One subtlety worth knowing before it confuses you:</p>
+
+<pre class="language-python"><code class="language-python">            # ⚠️ `role_descriptors` here is an INTERSECTION with the creating user's privileges,
+            # not a grant on top of them. A key can never be more powerful than whoever made it —
+            # which is why minting keys from `elastic` works and minting them from a limited
+            # service account silently produces a key that can do less than you wrote.</code></pre>
+
+<h3>Check that the scope actually bites</h3>
+
+<p>A role you have not tested is a role you hope is right. Run the negative cases:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">what the scoped key CAN do:
+  index a document:        ok
+  search:                  ok
+  cluster health:          yellow
+
+what it CANNOT do — this is the whole point:
+  read someone else's index  refused  (403 unauthorized)
+  delete an unrelated index  refused  (403 unauthorized)
+  list users                 refused  (403 unauthorized)
+  mint another API key       refused  (403 unauthorized)</code></pre>
+
+<p>That last one matters most. A credential that can create credentials is not scoped, whatever its
+index privileges say.</p>
+
+<h3>And TLS</h3>
+
+<p>The demo's secure profile runs authentication over plain HTTP, and says so:</p>
+
+<pre class="language-yaml"><code class="language-yaml">      xpack.security.http.ssl.enabled: "false"</code></pre>
+
+<p>That is a teaching shortcut. Basic auth over HTTP puts the password in every request in the clear,
+and an API key is a bearer token, so it is no better. Production needs HTTP TLS with the client
+trusting the CA &mdash; and transport TLS between nodes, which is separate and is what stops an
+attacker who can reach the transport port from simply joining the cluster as a node.</p>
+
+<p>Then: bind to a private network, never expose 9200 publicly, and do not put credentials in a
+frontend bundle. Elasticsearch has no rate limiting and no query-cost limits of its own, so a
+publicly reachable cluster is a resource-exhaustion target even when authenticated.</p>
+
+<h2>Client configuration is part of production too</h2>
+
+<p>Half of what makes a search feature survive an incident is on your side of the connection.</p>
+
+<pre class="language-python"><code class="language-python">    return Elasticsearch(
+        settings.elasticsearch_url,
+        # A search that hangs must not hang the API. Better a fast failure the route can turn
+        # into "search is unavailable" than a request that ties up a worker for a minute.
+        request_timeout=5,
+        retry_on_timeout=True,
+        max_retries=2,
+        **_auth(),
+    )</code></pre>
+
+<p>A timeout your users would accept waiting, not one Elasticsearch would like. Retries bounded.
+And a failure turned into an honest error rather than an empty result set:</p>
+
+<pre class="language-python"><code class="language-python">    if not es_available():
+        # An honest 503 beats an empty result set. "No listings match" and "search is down" look
+        # identical to a user otherwise, and the second one is not their fault.
+        raise ApiException(
+            "Search is temporarily unavailable. Please try again in a moment.",
+            status_code=503,
+        )</code></pre>
+
+<p>And on the write side, the opposite decision, for the reason lesson 8 gave: a failed index must
+not fail the user's write, but it must be retried rather than merely logged.</p>
+
+<h2>Node roles, once there is more than one node</h2>
+
+<p>A single node does everything. As soon as there are several, splitting the roles matters more
+than adding capacity.</p>
+
+<p><strong>Dedicated master-eligible nodes.</strong> The master maintains cluster state &mdash;
+mappings, aliases, shard allocation. A master node that is also serving heavy searches can be
+starved of CPU or paused by garbage collection, and a master that stops responding triggers an
+election and a cascade of shard reallocation. Three small dedicated masters is the standard answer,
+and the number three is not arbitrary.</p>
+
+<p><strong>Always an odd number of master-eligible nodes.</strong> Cluster state changes need a
+majority. Two master-eligible nodes have no majority when they cannot see each other, so each half
+refuses to elect, and the cluster stops accepting changes. Three tolerates one loss; five tolerates
+two.</p>
+
+<p><strong>Coordinating-only nodes</strong> &mdash; no data, no master role &mdash; handle the
+fan-out and the merging of results. Worth adding when heavy aggregations are causing memory pressure
+on the data nodes, and not before.</p>
+
+<p>Two more settings worth naming. <code>discovery.seed_hosts</code> tells a node where to look for
+peers; <code>cluster.initial_master_nodes</code> is used <em>only</em> on the very first bootstrap
+and must be removed afterwards &mdash; leaving it in place is a documented way to end up with two
+clusters that both think they are the real one.</p>
+
+<h2>Circuit breakers, and what they are protecting you from</h2>
+
+<p>Elasticsearch has a set of memory circuit breakers that refuse a request rather than let it take
+the node down. When one trips you get a distinctive error:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">429 circuit_breaking_exception
+[parent] Data too large, data for [&lt;http_request&gt;] would be [1.9gb]
+which is larger than the limit of [1.8gb]</code></pre>
+
+<p>This is a good error. It means the cluster protected itself from an out-of-memory kill, which is
+what would otherwise have happened.</p>
+
+<p>The causes are nearly always one of three: an aggregation with too many buckets, a
+<code>from + size</code> that is too deep, or a bulk request that is too large. Raising the breaker
+limit converts a refused request into a dead node, so the fix is the query.</p>
+
+<p>Worth setting <code>indices.query.bool.max_clause_count</code> and
+<code>search.max_buckets</code> deliberately rather than discovering the defaults during an
+incident, and worth knowing that a generated query &mdash; a filter built from a user-supplied list
+of ids, say &mdash; is the usual way to blow past a clause limit.</p>
+
+<h2>Index lifecycle management</h2>
+
+<p>For any index that grows forever, ILM automates what lesson 15's rollover does by hand: create a
+new generation when the current one reaches a size or age, move older ones to cheaper nodes, and
+eventually delete them.</p>
+
+<pre class="language-json"><code class="language-json">PUT _ilm/policy/logs-policy
+{ "policy": { "phases": {
+    "hot":    { "actions": { "rollover": { "max_primary_shard_size": "30gb", "max_age": "7d" } } },
+    "warm":   { "min_age": "7d",  "actions": { "forcemerge": { "max_num_segments": 1 } } },
+    "delete": { "min_age": "90d", "actions": { "delete": {} } }
+} } }</code></pre>
+
+<p>The point is that <code>max_primary_shard_size</code> makes the shard-sizing decision automatic
+&mdash; you state the target rather than guessing an index size a year out.</p>
+
+<p>A derived search index with a bounded document count needs none of this. Logs, events and metrics
+need it from day one, because the alternative is discovering the disk is full on a Sunday.</p>
+
+<h2>What to monitor</h2>
+
+<p>Five cluster numbers, from lesson 16: status not green; unassigned shards persisting; heap above
+85% on any node; disk above 80%; thread pool rejections above zero.</p>
+
+<p>Two application numbers that no Elasticsearch metric will ever give you. <strong>Search latency
+measured at your API</strong>, not <code>took</code> &mdash; on this track's index a search reports
+<code>took: 2</code> while the round trip from Python is <strong>4.5 ms</strong>, and more than half
+the wall clock is outside the cluster. And <strong>document count against the source of
+truth</strong>, which is the only thing that catches a sync that silently stopped. An index missing
+half its documents looks perfectly healthy to every cluster metric there is.</p>
+
+<p>One number worth adding early: the rate of empty result sets. A jump in searches returning nothing
+is the signature of an analysis change, a mapping problem or a broken sync, and it usually shows up
+days before anyone files a ticket.</p>
+
+<h2>Upgrades</h2>
+
+<p>Worth planning once rather than improvising annually, because two of the constraints are
+awkward.</p>
+
+<p>Elasticsearch supports a <strong>rolling upgrade</strong> within a major version and from the
+last minor of one major to the next major. Nodes are upgraded one at a time, and the standard
+practice is to disable shard allocation first so the cluster does not start relocating everything
+each time a node goes down &mdash; then re-enable it and wait for green before taking the next
+node.</p>
+
+<p>The two constraints. An index created two majors ago cannot be read: 8.x reads indexes created by
+7.x, not by 6.x. And a snapshot restores into its own major or the next, not further. Together they
+mean an index or an archive can quietly become unreadable by simply skipping a version, and the fix
+&mdash; reindex it forward while you still can &mdash; has to happen before the upgrade, not
+after.</p>
+
+<p>For a derived index none of this is dangerous, because a rebuild produces a fresh index in the
+current format. It is one more thing that gets easier when Elasticsearch is not the source of
+truth.</p>
+
+<h2>Testing search like the rest of your code</h2>
+
+<p>Search tends to escape testing because it needs a cluster. Splitting the tests in two solves most
+of that.</p>
+
+<p><strong>Query construction is a pure function</strong> and needs no cluster at all &mdash; assert
+on the body your code builds. That covers the decisions that are silently wrong: a
+<code>terms</code> where a <code>term</code> belonged, a filter in <code>must</code>, a facet that
+includes its own filter.</p>
+
+<p><strong>Behaviour needs a real cluster</strong>, and should skip cleanly without one:</p>
+
+<pre class="language-python"><code class="language-python">es_required = pytest.mark.skipif(
+    not es_available(), reason="Elasticsearch is not running — `docker compose up -d elasticsearch`"
+)</code></pre>
+
+<p>Those tests index a handful of known documents into a throwaway index built from the
+<em>real</em> mapping, so analysis and multi-fields behave as they do in production. They are the
+only way to verify the claims that matter &mdash; that accent folding works, that a highlight is
+escaped, that two ticked amenities narrow rather than widen.</p>
+
+<p>Both halves together are what makes it safe to change a query later, which is the whole point:
+search code that nobody dares modify stops improving.</p>
+
+<h2>Failure modes to rehearse</h2>
+
+<p>All of these are cheap to practise and expensive to meet for the first time in production.</p>
+
+<p><strong>Elasticsearch is down.</strong> Stop the container. Does the site still work? Does search
+return an honest error? Do writes still succeed? Are the missed index updates queued, or lost?</p>
+
+<p><strong>The disk fills.</strong> Fill it on a test cluster and watch the read-only block arrive.
+The error is <code>cluster_block_exception</code> and it mentions nothing about disk.</p>
+
+<p><strong>A node dies.</strong> On a multi-node test cluster, stop one. Watch health go yellow,
+watch <code>_cat/recovery</code>, and find out how long recovery actually takes.</p>
+
+<p><strong>The index is wrong.</strong> Time a full rebuild from your source of truth. If it is
+hours, that is your recovery time objective, and it is worth knowing before you quote a different
+number to someone.</p>
+
+<p><strong>A mapping change.</strong> Run the alias flip on a copy of production data before you
+need it. It is the operation most likely to be attempted for the first time under pressure.</p>
+
+<h2>The checklist</h2>
+
+<p><strong>Cannot be changed later &mdash; decide before creating the index.</strong> Shard count,
+sized from a year's growth. An explicit mapping with <code>dynamic: strict</code>. Analyzers.
+Multi-fields on anything to be sorted, filtered exactly, or aggregated. A <code>geo_point</code> for
+anything that might ever be searched by location. And an <strong>alias</strong>, always, even with
+one index.</p>
+
+<p><strong>Cluster.</strong> Heap at half of RAM, under 30GB, min equals max. Swap off. Replicas at
+least 1. Dedicated master nodes once there are more than a handful of nodes.</p>
+
+<p><strong>Security.</strong> Security enabled. TLS on HTTP and transport. An API key per service,
+scoped to its own indexes, with an expiry. The <code>elastic</code> user used for bootstrap and
+nothing else. Nothing exposed publicly.</p>
+
+<p><strong>Data.</strong> A rebuild path that is tested and timed. A drift check against the source
+of truth. Snapshots if &mdash; and only if &mdash; the index is the only copy, with SLM, a retention
+floor, and a restore you have actually run. ILM for anything that grows without bound.</p>
+
+<p><strong>Application.</strong> A short timeout and bounded retries. An honest error when search is
+unavailable. Indexing that never fails a user's write, and never merely logs the failure either.
+Facets and highlighting requested only where they are rendered.</p>
+
+<p><strong>Monitoring.</strong> The five cluster numbers, the two application numbers, and the empty
+result rate.</p>
+
+<h2>The one that matters most</h2>
+
+<p>If only one thing from these eighteen lessons survives, make it the rule from lesson 1: <strong>the
+database is the source of truth and the index is a derived, disposable copy.</strong></p>
+
+<p>Everything easy about operating Elasticsearch comes from that. You can delete the index and
+rebuild it. A mapping change is a reindex rather than a migration with data at risk. An indexing
+failure can be logged and retried instead of failing a user's request. Zero replicas is a defensible
+choice. Snapshots are optional. A bug in the sync layer is repairable rather than permanent.</p>
+
+<p>Every one of those stops being true the first time a field exists only in Elasticsearch. It
+happens gradually and it is very hard to walk back &mdash; so the useful discipline is to ask, of
+every field you add, whether you could rebuild it from somewhere else tomorrow morning.</p>

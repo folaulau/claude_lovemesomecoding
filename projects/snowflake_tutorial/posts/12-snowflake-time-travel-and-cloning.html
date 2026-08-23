@@ -1,0 +1,190 @@
+<p>These two features come from the same place — micro-partitions are immutable, so the old ones are
+still there — and between them they change how you work rather than just what you can recover. Time
+Travel means a bad <code>UPDATE</code> is a query away from being undone. Cloning means a full copy
+of production for a development branch costs nothing and takes a second.</p>
+
+<h2>Time Travel</h2>
+
+<p>Every table has a retention period during which its previous states remain queryable.</p>
+
+<table>
+<tr><th>Edition / table type</th><th>Retention</th><th>Default</th></tr>
+<tr><td>Standard edition</td><td>0 or 1 day</td><td>1 day</td></tr>
+<tr><td>Enterprise, permanent tables</td><td>0 to 90 days</td><td>1 day</td></tr>
+<tr><td>Transient and temporary tables</td><td>0 or 1 day</td><td>1 day</td></tr>
+</table>
+
+<p>Note the default: <strong>1 day, not 90</strong>, even on Enterprise. Discovering that after a
+week-old mistake is a bad way to learn it. Set it deliberately, at the database level so objects
+inherit it:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER DATABASE analytics SET DATA_RETENTION_TIME_IN_DAYS = 30;
+
+-- Long retention on the tables that are a source of truth...
+ALTER TABLE analytics.marts.fact_orders SET DATA_RETENTION_TIME_IN_DAYS = 30;
+
+-- ...and none on the ones rebuilt from scratch every night.
+ALTER TABLE analytics.staging.stg_orders SET DATA_RETENTION_TIME_IN_DAYS = 0;
+
+SELECT table_name, retention_time
+FROM   analytics.information_schema.tables
+WHERE  table_schema = 'MARTS';</code></pre>
+
+<p>Retention is not free: those old micro-partitions occupy storage you pay for. Thirty days on a
+rapidly-changing large table can hold a surprising amount, which is the trade-off — set it high
+where the data matters and zero where it does not.</p>
+
+<h2>Querying the past</h2>
+
+<p>Three clauses, all of which go straight after the table name:</p>
+
+<pre class="language-sql"><code class="language-sql">-- As of a point in time.
+SELECT * FROM fact_orders AT(TIMESTAMP =&gt; '2026-08-21 09:00:00'::TIMESTAMP_NTZ);
+
+-- As of N seconds ago. Negative numbers, always.
+SELECT * FROM fact_orders AT(OFFSET =&gt; -60 * 30);       -- 30 minutes back
+
+-- Immediately BEFORE a specific statement ran. This is the one you want
+-- when you know which statement did the damage.
+SELECT * FROM fact_orders BEFORE(STATEMENT =&gt; '01a2b3c4-0000-0000-0000-000000000000');</code></pre>
+
+<p><code>BEFORE(STATEMENT =&gt; …)</code> is the precise form, and finding the query id is part of
+the recovery:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT query_id, query_text, user_name, start_time, rows_updated, rows_deleted
+FROM   snowflake.account_usage.query_history
+WHERE  query_type IN ('UPDATE', 'DELETE', 'MERGE', 'INSERT')
+  AND  query_text ILIKE '%fact_orders%'
+  AND  start_time &gt;= DATEADD('hour', -6, CURRENT_TIMESTAMP())
+ORDER  BY start_time DESC;</code></pre>
+
+<h2>Recovering from a mistake</h2>
+
+<p>The instinct is to restore over the top of the damaged table. Resist it — you have exactly one
+chance to get this right, and overwriting destroys the evidence. Land the recovered state somewhere
+new first, check it, then swap.</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. Look at what you would restore. Nothing is changed yet.
+SELECT COUNT(*) FROM fact_orders BEFORE(STATEMENT =&gt; '01a2b3c4-...');
+
+-- 2. Materialise it beside the damaged table.
+CREATE TABLE fact_orders_recovered CLONE fact_orders
+  BEFORE(STATEMENT =&gt; '01a2b3c4-...');
+
+-- 3. Compare before committing to it.
+SELECT (SELECT COUNT(*) FROM fact_orders)           AS now,
+       (SELECT COUNT(*) FROM fact_orders_recovered) AS recovered;
+
+-- 4. Swap atomically. Both names exist throughout; nothing is dropped.
+ALTER TABLE fact_orders SWAP WITH fact_orders_recovered;
+
+-- 5. Only once you are certain.
+DROP TABLE fact_orders_recovered;</code></pre>
+
+<p><code>SWAP WITH</code> exchanges two tables' names and metadata in one atomic operation. It is
+the safe way to replace a table that queries are running against, and it is equally useful for a
+nightly rebuild — build the new version beside the old one, swap, drop.</p>
+
+<h2>UNDROP</h2>
+
+<p>A dropped object is recoverable for its retention period, which makes the usual catastrophe
+survivable:</p>
+
+<pre class="language-sql"><code class="language-sql">DROP TABLE fact_orders;
+UNDROP TABLE fact_orders;
+
+UNDROP SCHEMA analytics.marts;
+UNDROP DATABASE analytics;
+
+-- Dropped objects, including several generations of the same name.
+SHOW TABLES HISTORY LIKE 'fact_orders' IN SCHEMA analytics.marts;</code></pre>
+
+<p>One caveat worth knowing before you need it: <code>UNDROP</code> restores the most recent object
+of that name. If a table was dropped and a new one created with the same name, you must rename the
+current one out of the way first, or the <code>UNDROP</code> has nowhere to land.</p>
+
+<h2>Fail-safe is not your backup</h2>
+
+<p>After Time Travel expires, permanent tables enter a 7-day <strong>Fail-safe</strong> period. It is
+easy to mistake this for a second chance. It is not:</p>
+
+<ul>
+<li>You cannot query it and you cannot restore from it yourself.</li>
+<li>Recovery requires opening a support case, and takes hours to days.</li>
+<li>You pay to store it, for every permanent table, whether or not you ever use it.</li>
+<li>Transient and temporary tables have none at all — which is exactly why lesson 5 recommends
+transient for anything rebuildable.</li>
+</ul>
+
+<p>Treat Fail-safe as Snowflake's disaster insurance, not as your recovery plan. Your recovery plan
+is retention set appropriately plus, for anything genuinely irreplaceable, periodic clones.</p>
+
+<h2>Zero-copy cloning</h2>
+
+<p>A clone is a new object sharing the original's micro-partitions. It is created from metadata
+alone, so it is instant regardless of size and consumes no storage at creation. Storage accrues only
+as the two diverge — changed partitions are written for whichever side changed them.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE    orders_snapshot CLONE analytics.marts.fact_orders;
+CREATE SCHEMA   marts_test      CLONE analytics.marts;
+CREATE DATABASE analytics_dev   CLONE analytics;
+
+-- Clone as of a point in the past: a snapshot you forgot to take.
+CREATE TABLE orders_monday CLONE analytics.marts.fact_orders
+  AT(TIMESTAMP =&gt; '2026-08-17 00:00:00'::TIMESTAMP_NTZ);</code></pre>
+
+<p>Cloning a database clones its schemas, tables, views, streams, sequences and file formats.
+Internal named stages are <strong>not</strong> cloned, and neither is their content — a pipeline that
+reads from a stage needs that wired up separately in the clone.</p>
+
+<p>Three uses that change how a team works:</p>
+
+<ul>
+<li><strong>Development against real data.</strong> <code>CREATE DATABASE analytics_dev CLONE
+analytics</code> gives every engineer production data to develop against, at no storage cost, with
+no possibility of touching production.</li>
+<li><strong>Testing a migration.</strong> Clone, run the migration on the clone, inspect, throw the
+clone away. The rehearsal is free.</li>
+<li><strong>A snapshot before something risky.</strong> Clone the table before the bulk update. If
+it goes wrong, <code>SWAP WITH</code> and it never happened.</li>
+</ul>
+
+<p>Two things to know about permissions. A cloned object does <em>not</em> inherit the source's
+grants by default — the cloning role owns it, and access has to be granted again. And a clone is a
+fully independent object from the moment it exists: writing to it never affects the source, and
+dropping the source never affects the clone.</p>
+
+<h2>What retention actually costs</h2>
+
+<p>Both features are paid for in storage, and the bill is invisible until you look for it. Every
+version of a micro-partition kept for Time Travel is storage, and a clone that has diverged
+substantially from its source is storage too. One view shows all of it:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT table_catalog,
+       table_schema,
+       table_name,
+       ROUND(active_bytes       / POWER(1024, 3), 2) AS active_gb,
+       ROUND(time_travel_bytes  / POWER(1024, 3), 2) AS time_travel_gb,
+       ROUND(failsafe_bytes     / POWER(1024, 3), 2) AS failsafe_gb,
+       ROUND(retained_for_clone_bytes / POWER(1024, 3), 2) AS clone_gb
+FROM   snowflake.account_usage.table_storage_metrics
+WHERE  deleted = FALSE
+ORDER  BY time_travel_bytes DESC
+LIMIT  20;</code></pre>
+
+<p>A table where <code>time_travel_gb</code> dwarfs <code>active_gb</code> is one that is being
+rewritten heavily — a nightly full reload of a large table keeps every night's version for the whole
+retention window. That is precisely the table that should be transient with retention set to zero,
+because you can rebuild it from source anyway.</p>
+
+<p>The mirror-image mistake is setting retention to zero on the tables that matter to save a
+little storage, and then having no way back from a bad merge. The distinction is not size, it is
+whether the data can be regenerated: <strong>retention is for what you cannot rebuild.</strong></p>
+
+<p>Two more limits, so they are not a surprise. Changing retention downward does not immediately
+purge history — versions already outside the new window age out rather than vanishing. And a clone
+holds its source's historical partitions alive for as long as the clone exists, which means dropping
+a clone can reduce storage on a table you did not touch.</p>
+
+<p>Next: <a href="/snowflake/snowflake-streams-and-tasks">streams and tasks</a>, for pipelines that
+run themselves.</p>

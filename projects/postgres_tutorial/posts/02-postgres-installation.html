@@ -1,0 +1,223 @@
+<p>You do not need Postgres installed on your machine. You need a Postgres you can throw away and
+rebuild, which is a container, and a copy of <code>psql</code> to talk to it.</p>
+
+<p>This post gets you from nothing to a database you can connect to, then to a
+<code>docker-compose.yml</code> worth keeping in the repository.</p>
+
+<h2>One command</h2>
+
+<pre class="language-bash"><code class="language-bash">docker run --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 -d postgres:16-alpine
+
+docker exec -it pg psql -U postgres</code></pre>
+
+<p>That is a working database. Three things about it are worth knowing before you rely on it:</p>
+
+<ul>
+  <li><strong><code>POSTGRES_PASSWORD</code> is required.</strong> The image refuses to start
+      without it, on purpose.</li>
+  <li><strong>The data lives inside the container.</strong> <code>docker rm pg</code> and it is
+      gone. Fine for an experiment, not for the database you are developing against for a
+      month.</li>
+  <li><strong>The image only runs initialisation on an empty data directory.</strong> Change
+      <code>POSTGRES_DB</code> or an init script later and nothing happens, because the directory
+      is no longer empty. This confuses everyone exactly once.</li>
+</ul>
+
+<h2>Getting psql itself</h2>
+
+<p><code>docker exec</code> gets you a psql inside the container, which is fine until you want to
+run a file from your machine or copy a result out. Install the client tools natively — just the
+client, not the server:</p>
+
+<pre class="language-bash"><code class="language-bash"># macOS
+brew install libpq && brew link --force libpq
+
+# Debian/Ubuntu
+sudo apt install postgresql-client-16
+
+psql --version
+# psql (PostgreSQL) 16.15</code></pre>
+
+<p>Keep the client's major version at or above the server's. An older psql against a newer server
+mostly works and then fails on one meta-command with a message about a missing system column,
+which is not a fun half hour.</p>
+
+<h2>The version worth pinning</h2>
+
+<p>Use the same major version you will run in production, and pin it. <code>postgres:16-alpine</code>
+is a smaller image than <code>postgres:16</code> and behaves identically for everything in this
+track. Plain <code>postgres</code> means "whatever is newest today", which is how a team ends up
+with three different databases.</p>
+
+<pre class="language-bash"><code class="language-bash">docker exec pg psql -U postgres -c 'SHOW server_version;'
+# 16.15</code></pre>
+
+<h2>The compose file to keep</h2>
+
+<p>This is the Postgres service from the booking application every example in this track runs
+against, unedited:</p>
+
+<pre class="language-yaml"><code class="language-yaml">services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: stayhub-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: stayhub
+      POSTGRES_PASSWORD: stayhub
+      POSTGRES_DB: stayhub
+    ports:
+      - "5433:5432"
+    volumes:
+      - stayhub-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stayhub -d stayhub"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  stayhub-pgdata:</code></pre>
+
+<p>Four decisions in there are the whole point of using compose rather than <code>docker run</code>:</p>
+
+<table>
+  <thead><tr><th>Line</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>"5433:5432"</code></td><td>Postgres inside the container always listens on 5432.
+        The left number is the port on your machine, and shifting it means a native Postgres
+        install — or another project's container — does not collide with this one.</td></tr>
+    <tr><td><code>volumes:</code></td><td>A named volume outlives the container. <code>docker
+        compose down</code> stops the database; <code>down -v</code> deletes the data. Learn the
+        difference on a project you do not care about.</td></tr>
+    <tr><td><code>healthcheck</code></td><td><code>pg_isready</code> answers "is the database
+        accepting connections", which is not the same as "is the process running". Without it,
+        an application container started alongside will connect before the database is listening
+        and crash on boot.</td></tr>
+    <tr><td><code>restart: unless-stopped</code></td><td>Survives a reboot without coming back
+        after you deliberately stopped it.</td></tr>
+  </tbody>
+</table>
+
+<p>The healthcheck is the one people leave out. <code>depends_on</code> alone waits for the
+container to <em>start</em>, not for Postgres to be ready — and Postgres starts, initialises, and
+restarts itself once during first boot.</p>
+
+<pre class="language-yaml"><code class="language-yaml">  api:
+    depends_on:
+      postgres:
+        condition: service_healthy</code></pre>
+
+<h2>The password rule that looks like a bug</h2>
+
+<p>This works with no password at all:</p>
+
+<pre class="language-bash"><code class="language-bash">docker exec -it stayhub-postgres psql -U stayhub -d stayhub</code></pre>
+
+<p>and this asks for one:</p>
+
+<pre class="language-bash"><code class="language-bash">psql "postgresql://stayhub:stayhub@localhost:5433/stayhub"</code></pre>
+
+<p>Not a misconfiguration. The image's default <code>pg_hba.conf</code> trusts connections that
+originate inside the container and demands a password over the published port — which is how your
+application and every tool on your machine connect. A wrong password there is refused.</p>
+
+<h2>Connecting</h2>
+
+<p>One connection string format, understood by psql, JDBC drivers, SQLAlchemy, and every
+Postgres client worth using:</p>
+
+<pre class="language-bash"><code class="language-bash">postgresql://user:password@host:port/database
+
+# psql
+psql "postgresql://stayhub:stayhub@localhost:5433/stayhub"
+
+# non-interactive, one query
+psql "postgresql://stayhub:stayhub@localhost:5433/stayhub" -c 'SELECT count(*) FROM properties;'</code></pre>
+
+<p>Language drivers take the same string with their own scheme prefix:</p>
+
+<pre class="language-python"><code class="language-python"># SQLAlchemy with psycopg 3
+DATABASE_URL = "postgresql+psycopg://stayhub:stayhub@localhost:5433/stayhub"</code></pre>
+
+<p>Never put the password in the URL in anything committed. <code>psql</code> reads
+<code>PGPASSWORD</code> from the environment, and a <code>~/.pgpass</code> file
+(<code>chmod 600</code>) holds credentials per host so no command line carries them.</p>
+
+<h2>Seeding a fresh database</h2>
+
+<p>Files mounted into <code>/docker-entrypoint-initdb.d</code> run once, in filename order, when
+the data directory is empty:</p>
+
+<pre class="language-yaml"><code class="language-yaml">    volumes:
+      - stayhub-pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro</code></pre>
+
+<p>One setting can only be chosen here and never afterwards: the cluster's locale and encoding are
+fixed when the data directory is created, and changing them later means dumping and reloading the
+whole database. The defaults in the official image are UTF-8 already, so this matters mainly if
+someone hands you a cluster built with something else.</p>
+
+<pre class="language-yaml"><code class="language-yaml">    environment:
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8 --encoding=UTF8"</code></pre>
+
+<p>Use init scripts for the things that must exist before your application's own migrations run —
+an extension, a role, a schema. Do not use it for your schema itself. Schema belongs in a migration
+tool that also knows how to move an existing database forward, which is a post of its own later in
+this track.</p>
+
+<pre class="language-sql"><code class="language-sql">-- initdb/01-extensions.sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS btree_gist;</code></pre>
+
+<h2>Proving it works</h2>
+
+<p>Three checks, in the order worth running when something is wrong. Is the container healthy, is
+Postgres accepting connections, and can <em>you</em> authenticate?</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose ps postgres
+# STATUS: Up 2 minutes (healthy)
+
+docker exec stayhub-postgres pg_isready -U stayhub -d stayhub
+# /var/run/postgresql:5432 - accepting connections
+
+psql "postgresql://stayhub:stayhub@localhost:5433/stayhub" -c 'SELECT 1;'</code></pre>
+
+<p>If the first two pass and the third does not, the problem is the password, the port, or the
+host — not the database. If the container is unhealthy, the logs say why and they are the first
+place to look, not the last:</p>
+
+<pre class="language-bash"><code class="language-bash">docker compose logs --tail 50 postgres</code></pre>
+
+<p>The two messages you will actually meet there are
+<code>database files are incompatible with server</code>, which means a volume created by a
+different major version — the fix is a new volume, not a flag — and
+<code>role "postgres" does not exist</code>, which means you set <code>POSTGRES_USER</code> and
+are still connecting as <code>postgres</code>.</p>
+
+<h2>One container, several databases</h2>
+
+<p>A cluster serves many databases, so you do not need a second container to get a second
+database. This is worth doing early: keep the one your application migrates against separate from
+the one you are free to break.</p>
+
+<pre class="language-bash"><code class="language-bash">docker exec stayhub-postgres createdb -U stayhub scratch
+
+# same schema and data as an existing database, copied
+docker exec stayhub-postgres createdb -U stayhub -T stayhub scratch2
+
+docker exec stayhub-postgres psql -U stayhub -l</code></pre>
+
+<p><code>-T</code> copies an existing database as a template, and it requires that nobody is
+connected to the template at the time. Later posts in this track run against a database built
+exactly this way — the same schema as the application, filled with 400,000 bookings, so that a
+query plan has something real to plan against.</p>
+
+<h2>Starting over</h2>
+
+<pre class="language-bash"><code class="language-bash">docker compose down          # stop, keep the data
+docker compose down -v       # stop AND delete the volume
+docker compose up -d         # back up; init scripts run again on the now-empty volume</code></pre>
+
+<p>Being able to do that in ten seconds is what makes it safe to experiment for the rest of this
+track.</p>

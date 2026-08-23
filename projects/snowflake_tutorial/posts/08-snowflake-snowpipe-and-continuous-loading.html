@@ -1,0 +1,210 @@
+<p>A scheduled <code>COPY INTO</code> is the right answer more often than people expect. But when data
+arrives all day and users want it within minutes rather than by morning, running a
+<code>COPY</code> every sixty seconds is wasteful — the warehouse resumes, finds nothing, and bills
+its minimum anyway. Snowpipe exists for exactly that gap.</p>
+
+<h2>What Snowpipe is</h2>
+
+<p>A <strong>pipe</strong> is a stored <code>COPY INTO</code> statement that Snowflake runs for you
+when new files appear. Two things about it matter more than the syntax.</p>
+
+<p><strong>It is serverless.</strong> Snowpipe does not use your warehouses. Snowflake provides the
+compute, and you are billed per file processed plus the compute actually used. So a pipe that sees
+nothing for six hours costs nothing for six hours, which is the whole reason not to poll with a
+warehouse.</p>
+
+<p><strong>It is not instant.</strong> Snowpipe is designed for latency measured in minutes, not
+seconds. Files are queued and processed as capacity allows. If you need sub-second freshness, the
+answer is Snowpipe Streaming or a different architecture, not a more aggressive pipe.</p>
+
+<table>
+<tr><th></th><th>Scheduled COPY</th><th>Snowpipe</th><th>Snowpipe Streaming</th></tr>
+<tr><td>Triggered by</td><td>A task or external scheduler</td><td>A file arriving</td><td>Rows
+pushed by a client</td></tr>
+<tr><td>Compute</td><td>Your warehouse</td><td>Serverless</td><td>Serverless</td></tr>
+<tr><td>Typical latency</td><td>The schedule</td><td>Around a minute</td><td>Seconds</td></tr>
+<tr><td>Billed on</td><td>Warehouse seconds</td><td>Files + compute</td><td>Client seconds +
+compute</td></tr>
+<tr><td>Best for</td><td>Predictable batches</td><td>Files landing
+continuously</td><td>Event streams with no files</td></tr>
+</table>
+
+<h2>Creating a pipe</h2>
+
+<p>The <code>COPY</code> inside a pipe is an ordinary one — everything from lesson 7 applies. Build
+it as a plain statement first, get it loading correctly, then wrap it:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE OR REPLACE TABLE learn_snowflake.staging.events (
+  event_id    STRING,
+  occurred_at TIMESTAMP_NTZ,
+  payload     VARIANT,
+  loaded_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE PIPE learn_snowflake.staging.events_pipe
+  AUTO_INGEST = TRUE
+AS
+COPY INTO learn_snowflake.staging.events (event_id, occurred_at, payload)
+FROM (
+  SELECT $1:event_id::STRING,
+         $1:occurred_at::TIMESTAMP_NTZ,
+         $1
+  FROM @learn_snowflake.staging.s3_stage
+)
+FILE_FORMAT = (FORMAT_NAME = learn_snowflake.staging.json_standard)
+ON_ERROR    = 'SKIP_FILE';</code></pre>
+
+<p><code>ON_ERROR</code> deserves a thought here that it does not in a manual load. A pipe runs
+unattended, so <code>ABORT_STATEMENT</code> means one malformed file quietly stops that file loading
+forever with nobody watching. <code>SKIP_FILE</code> or <code>CONTINUE</code> keeps the pipeline
+moving, and the monitoring below is what tells you something was skipped.</p>
+
+<h2>Wiring up the notifications</h2>
+
+<p>This is the only genuinely fiddly part, and it is fiddly because it spans two clouds' permission
+models. <code>AUTO_INGEST = TRUE</code> means Snowflake listens to a notification queue in your
+cloud account; you have to point that queue at Snowflake and let it read.</p>
+
+<p>On AWS, the flow is: S3 event notification → SQS queue → Snowflake. Snowflake gives you the
+queue ARN to configure:</p>
+
+<pre class="language-sql"><code class="language-sql">-- The notification_channel column is the SQS ARN to point S3 at.
+SHOW PIPES LIKE 'events_pipe' IN SCHEMA learn_snowflake.staging;
+
+DESC PIPE learn_snowflake.staging.events_pipe;</code></pre>
+
+<pre class="language-bash"><code class="language-bash"># Take that ARN and register an S3 event notification against the prefix
+# the stage points at. ObjectCreated only &mdash; deletions are not loads.
+aws s3api put-bucket-notification-configuration \
+  --bucket my-bucket \
+  --notification-configuration '{
+    "QueueConfigurations": [{
+      "QueueArn": "arn:aws:sqs:us-west-2:123456789012:sf-snowpipe-...",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "incoming/"}]}}
+    }]
+  }'</code></pre>
+
+<p>Azure uses Event Grid and GCP uses Pub/Sub, with the same shape: Snowflake tells you what to
+notify, you configure the notification. The docs' <a
+href="https://docs.snowflake.com/en/user-guide/data-load-snowpipe-auto" rel="nofollow">automating
+Snowpipe</a> section has the per-cloud detail, and it is worth following exactly rather than from
+memory.</p>
+
+<p>Two things that catch people out. The prefix filter must match the stage's <code>URL</code>, or
+Snowflake is notified about files it will not load and silently ignores them. And a notification
+delivered while the pipe is paused is <em>not</em> replayed when you resume — you have to refresh
+manually, which is the next section.</p>
+
+<h2>The REST alternative</h2>
+
+<p>If your loader already knows which files it wrote, you can skip notifications entirely and tell
+Snowflake directly. Set <code>AUTO_INGEST = FALSE</code> and call the ingest endpoint, which the
+Python connector wraps:</p>
+
+<pre class="language-python"><code class="language-python">from snowflake.ingest import SimpleIngestManager, StagedFile
+
+manager = SimpleIngestManager(
+    account="myorg-myaccount",
+    host="myorg-myaccount.snowflakecomputing.com",
+    user="ETL_SERVICE",
+    pipe="LEARN_SNOWFLAKE.STAGING.EVENTS_PIPE",
+    private_key=private_key_pem,          # key-pair auth is required here
+)
+
+manager.ingest_files([StagedFile("incoming/events_2026-08-22_001.json.gz", None)])
+
+# Ingestion is asynchronous. Poll for what happened to those files.
+history = manager.get_history()
+for entry in history["files"]:
+    print(entry["path"], entry["status"], entry.get("errorsSeen", 0))</code></pre>
+
+<p>This is the better choice when files arrive somewhere Snowflake cannot watch, or when you want
+the loader to know for certain that a specific file was submitted.</p>
+
+<h2>Monitoring a pipe that has stopped</h2>
+
+<p>The failure mode with Snowpipe is not an error, it is silence. Nobody notices a pipe has stopped;
+they notice the dashboard is a day stale. Two checks belong in your monitoring from day one.</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. Is it running, and is anything backed up?
+SELECT SYSTEM$PIPE_STATUS('learn_snowflake.staging.events_pipe');
+-- Returns JSON: executionState, pendingFileCount, lastReceivedMessageTimestamp,
+-- lastForwardedMessageTimestamp, and any notificationChannelName error.</code></pre>
+
+<p><code>executionState</code> should be <code>RUNNING</code>. A <code>pendingFileCount</code> that
+grows and never drains means files are arriving faster than they are processed. And if
+<code>lastReceivedMessageTimestamp</code> is hours old while files are definitely landing, the
+notification wiring is broken rather than the pipe.</p>
+
+<pre class="language-sql"><code class="language-sql">-- 2. What has it actually loaded, and what failed?
+SELECT file_name, status, row_count, error_count, first_error_message, last_load_time
+FROM   TABLE(snowflake_sample_data.information_schema.copy_history(
+         TABLE_NAME =&gt; 'LEARN_SNOWFLAKE.STAGING.EVENTS',
+         START_TIME =&gt; DATEADD('hour', -24, CURRENT_TIMESTAMP())))
+WHERE  status != 'LOADED'
+ORDER  BY last_load_time DESC;</code></pre>
+
+<p>Alert on two conditions: any row in that second query, and <code>pendingFileCount</code> above a
+threshold you pick after watching normal behaviour for a week. Lesson 16 puts both into a scheduled
+task.</p>
+
+<h2>Fixing a pipe that missed files</h2>
+
+<pre class="language-sql"><code class="language-sql">-- Pause while you change the COPY or the stage.
+ALTER PIPE learn_snowflake.staging.events_pipe SET PIPE_EXECUTION_PAUSED = TRUE;
+
+-- Load anything in the stage that the pipe has not seen.
+-- ⚠️ Not a replay of notifications &mdash; it lists the stage and compares
+-- against load metadata. Restrict it, or it scans the whole prefix.
+ALTER PIPE learn_snowflake.staging.events_pipe REFRESH PREFIX = 'incoming/2026-08-22/';
+
+ALTER PIPE learn_snowflake.staging.events_pipe SET PIPE_EXECUTION_PAUSED = FALSE;</code></pre>
+
+<p>The same 64-day load metadata from lesson 7 governs a pipe, so <code>REFRESH</code> will not
+double-load a file it already handled. That is what makes it safe to run when you are unsure.</p>
+
+<h2>What a pipe costs, and why it is billed oddly</h2>
+
+<p>Snowpipe's bill has two parts, and the second one is the reason file sizing matters even more
+here than in a manual load.</p>
+
+<ul>
+<li><strong>Compute</strong> — the serverless resources used to parse and write the data. This
+scales with the volume, as you would expect.</li>
+<li><strong>An overhead charge per file</strong> — a fixed number of credits for every file the
+pipe processes, regardless of whether that file held ten rows or ten million.</li>
+</ul>
+
+<p>The consequence is worth stating plainly: <strong>a pipe fed a thousand tiny files can cost more
+than the same data in ten sensible ones.</strong> A producer writing a file per event is the
+pathological case, and it is a common one, because writing a file per event is the easy thing for
+an upstream service to do.</p>
+
+<p>If you control the producer, batch before writing — a file every minute or two, sized toward the
+100–250 MB guidance from lesson 7. If you do not control it, the usual fix is to land the small
+files in a staging prefix, and have a task consolidate them into larger ones that the pipe watches.
+You can see what a pipe has actually cost:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT pipe_name,
+       ROUND(SUM(credits_used), 3) AS credits,
+       SUM(bytes_inserted)         AS bytes,
+       SUM(files_inserted)         AS files
+FROM   snowflake.account_usage.pipe_usage_history
+WHERE  start_time &gt;= DATEADD('day', -7, CURRENT_TIMESTAMP())
+GROUP  BY pipe_name
+ORDER  BY credits DESC;</code></pre>
+
+<p>Divide credits by files. If that ratio is high and bytes per file is low, you have found the
+problem, and it is upstream rather than in Snowflake.</p>
+
+<h2>Which one should you use</h2>
+
+<p>Start with a scheduled <code>COPY</code> driven by a task (lesson 13). It is simpler, it is
+easier to debug, and for data that is consumed daily the extra freshness buys nothing. Move to
+Snowpipe when files genuinely arrive around the clock and someone can articulate why minutes matter.
+Move to Snowpipe Streaming only when there are no files at all — an application or a Kafka connector
+pushing rows.</p>
+
+<p>Next: <a href="/snowflake/snowflake-semi-structured-data">JSON and semi-structured data</a>,
+which is where those <code>VARIANT</code> payloads become queryable.</p>

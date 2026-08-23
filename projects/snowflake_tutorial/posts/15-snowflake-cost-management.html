@@ -1,0 +1,199 @@
+<p>Snowflake bills for what you use, which is excellent right up to the month somebody leaves a
+warehouse running. This lesson is about knowing where the credits go, capping them before they
+become a conversation with finance, and the handful of changes that move the number most.</p>
+
+<h2>Where the money goes</h2>
+
+<p>Three meters, and their proportions are wildly uneven in practice.</p>
+
+<table>
+<tr><th>Meter</th><th>Charged on</th><th>Typical share</th></tr>
+<tr><td>Virtual warehouses</td><td>Credits per second running</td><td>The large majority</td></tr>
+<tr><td>Storage</td><td>Average compressed TB per month</td><td>Usually small</td></tr>
+<tr><td>Serverless features</td><td>Credits per feature: Snowpipe, tasks, automatic clustering,
+materialized view maintenance, search optimization</td><td>Small, until one of them is
+misconfigured</td></tr>
+<tr><td>Cloud services</td><td>Only the part above 10% of daily compute</td><td>Usually
+nothing</td></tr>
+</table>
+
+<p>So the first question when a bill surprises you is always about warehouses, and specifically
+about warehouses that were <em>running</em> rather than warehouses that were <em>working</em>. This
+track quotes credits rather than dollars throughout, because the price per credit varies by edition,
+cloud and region — <a href="https://www.snowflake.com/en/pricing-options/" rel="nofollow">Snowflake's pricing
+page</a> has the current figures.</p>
+
+<h2>The queries that tell you</h2>
+
+<p>Everything below reads <code>SNOWFLAKE.ACCOUNT_USAGE</code>, which needs
+<code>ACCOUNTADMIN</code> or a role granted access to it. Its views lag reality by up to a few
+hours — fine for cost work, useless for live debugging, where
+<code>INFORMATION_SCHEMA</code> is the current-state equivalent.</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. Credits by warehouse, last 30 days. Start here every time.
+SELECT warehouse_name,
+       ROUND(SUM(credits_used), 1) AS credits,
+       ROUND(SUM(credits_used) / 30, 2) AS credits_per_day
+FROM   snowflake.account_usage.warehouse_metering_history
+WHERE  start_time &gt;= DATEADD('day', -30, CURRENT_TIMESTAMP())
+GROUP  BY warehouse_name
+ORDER  BY credits DESC;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">-- 2. Idle waste: hours where the warehouse ran but ran nothing.
+WITH busy AS (
+    SELECT warehouse_name, DATE_TRUNC('hour', start_time) AS hour,
+           COUNT(*) AS queries
+    FROM   snowflake.account_usage.query_history
+    WHERE  start_time &gt;= DATEADD('day', -7, CURRENT_TIMESTAMP())
+      AND  warehouse_name IS NOT NULL
+    GROUP  BY 1, 2
+),
+metered AS (
+    SELECT warehouse_name, DATE_TRUNC('hour', start_time) AS hour,
+           SUM(credits_used) AS credits
+    FROM   snowflake.account_usage.warehouse_metering_history
+    WHERE  start_time &gt;= DATEADD('day', -7, CURRENT_TIMESTAMP())
+    GROUP  BY 1, 2
+)
+SELECT m.warehouse_name,
+       ROUND(SUM(m.credits), 2) AS credits_with_no_queries
+FROM   metered m
+LEFT   JOIN busy b ON b.warehouse_name = m.warehouse_name AND b.hour = m.hour
+WHERE  b.queries IS NULL
+GROUP  BY 1
+ORDER  BY 2 DESC;</code></pre>
+
+<p>That second query is the one that pays for itself. Credits burned in hours with zero queries are
+pure waste, and the fix is always the same: an auto-suspend that is too long, or absent.</p>
+
+<pre class="language-sql"><code class="language-sql">-- 3. The expensive queries, and who ran them.
+SELECT user_name,
+       warehouse_name,
+       LEFT(query_text, 80) AS query,
+       ROUND(SUM(total_elapsed_time) / 1000 / 60, 1) AS total_minutes,
+       COUNT(*) AS runs
+FROM   snowflake.account_usage.query_history
+WHERE  start_time &gt;= DATEADD('day', -7, CURRENT_TIMESTAMP())
+  AND  warehouse_size IS NOT NULL
+GROUP  BY 1, 2, 3
+ORDER  BY total_minutes DESC
+LIMIT  20;</code></pre>
+
+<p>Group by query text, not by individual query. The thing that costs you is rarely one heroic
+report; it is a mediocre query on a dashboard that refreshes every five minutes.</p>
+
+<pre class="language-sql"><code class="language-sql">-- 4. Serverless features, in case one of them is the answer.
+SELECT 'snowpipe' AS feature, ROUND(SUM(credits_used), 2) AS credits
+FROM   snowflake.account_usage.pipe_usage_history
+WHERE  start_time &gt;= DATEADD('day', -30, CURRENT_TIMESTAMP())
+UNION ALL
+SELECT 'auto clustering', ROUND(SUM(credits_used), 2)
+FROM   snowflake.account_usage.automatic_clustering_history
+WHERE  start_time &gt;= DATEADD('day', -30, CURRENT_TIMESTAMP())
+UNION ALL
+SELECT 'materialized views', ROUND(SUM(credits_used), 2)
+FROM   snowflake.account_usage.materialized_view_refresh_history
+WHERE  start_time &gt;= DATEADD('day', -30, CURRENT_TIMESTAMP())
+UNION ALL
+SELECT 'serverless tasks', ROUND(SUM(credits_used), 2)
+FROM   snowflake.account_usage.serverless_task_history
+WHERE  start_time &gt;= DATEADD('day', -30, CURRENT_TIMESTAMP());</code></pre>
+
+<h2>Resource monitors</h2>
+
+<p>A resource monitor caps credits over a period and can <strong>suspend the warehouse</strong> —
+not merely email somebody, which is what most cost tooling elsewhere does.</p>
+
+<pre class="language-sql"><code class="language-sql">USE ROLE ACCOUNTADMIN;
+
+CREATE OR REPLACE RESOURCE MONITOR adhoc_monitor
+  WITH CREDIT_QUOTA = 100
+       FREQUENCY    = MONTHLY
+       START_TIMESTAMP = IMMEDIATELY
+  TRIGGERS
+    ON 75  PERCENT DO NOTIFY
+    ON 90  PERCENT DO NOTIFY
+    ON 100 PERCENT DO SUSPEND            -- let running queries finish
+    ON 110 PERCENT DO SUSPEND_IMMEDIATE; -- kill them
+
+ALTER WAREHOUSE adhoc_wh SET RESOURCE_MONITOR = adhoc_monitor;
+
+SHOW RESOURCE MONITORS;</code></pre>
+
+<p>Three things about them are easy to get wrong. Only <code>ACCOUNTADMIN</code> can create one.
+Notifications go to users who have <strong>enabled notifications on their own profile</strong> —
+without that, <code>DO NOTIFY</code> notifies nobody. And a monitor assigned at account level covers
+every warehouse, while one assigned to a warehouse covers only that warehouse; the usual arrangement
+is a generous account-level monitor as a backstop plus tight ones on the warehouses analysts
+touch.</p>
+
+<p>Put a monitor on every warehouse that a human can drive. A pipeline's usage is predictable; a
+person exploring is not, and a suspended warehouse at month's end is a much better outcome than a
+bill nobody budgeted for.</p>
+
+<h2>Attributing cost to teams</h2>
+
+<p>Once more than one team uses the account, "the bill went up" is only useful if you can say whose
+half of it moved. Two mechanisms do that, and they compose.</p>
+
+<p>The blunt one is <strong>a warehouse per team</strong>. Warehouse metering is per warehouse, so
+this makes attribution exact with no extra machinery, and suspended warehouses cost nothing —
+splitting has no downside beyond a slightly longer <code>SHOW WAREHOUSES</code>.</p>
+
+<p>The finer one is <strong>object tagging</strong>, which attaches key–value metadata to
+warehouses, databases, roles and users, and shows up in the usage views:</p>
+
+<pre class="language-sql"><code class="language-sql">USE ROLE ACCOUNTADMIN;
+
+CREATE TAG IF NOT EXISTS governance.tags.cost_center;
+
+ALTER WAREHOUSE bi_wh      SET TAG governance.tags.cost_center = 'analytics';
+ALTER WAREHOUSE loading_wh SET TAG governance.tags.cost_center = 'data_platform';
+
+-- Credits grouped by cost centre rather than by warehouse name.
+SELECT t.tag_value           AS cost_center,
+       ROUND(SUM(w.credits_used), 1) AS credits
+FROM   snowflake.account_usage.warehouse_metering_history w
+JOIN   snowflake.account_usage.tag_references t
+       ON t.object_name = w.warehouse_name
+      AND t.tag_name    = 'COST_CENTER'
+WHERE  w.start_time &gt;= DATEADD('day', -30, CURRENT_TIMESTAMP())
+GROUP  BY 1
+ORDER  BY 2 DESC;</code></pre>
+
+<p>Tagging needs Enterprise edition, and it is worth setting up before you need it rather than
+after — a tag applied today tells you nothing about last month.</p>
+
+<p>The third question people ask is what a <em>single</em> query cost, which the usage views do not
+answer directly. You can approximate it well enough for a conversation: take the query's execution
+time as a share of the warehouse's total running time in that window, and apportion the credits.
+It is an estimate, not an invoice line, and it is usually enough to identify the offender.</p>
+
+<h2>The changes that actually move the number</h2>
+
+<p>In rough order of how much they typically return for the effort:</p>
+
+<ol>
+<li><strong>Fix auto-suspend everywhere.</strong> Any warehouse with it disabled is burning credits
+overnight. This is usually most of the problem, and it takes one statement per warehouse.</li>
+<li><strong>Split workloads onto separate warehouses.</strong> Not because it saves credits
+directly — a suspended warehouse is free — but because it makes the credit report attributable, and
+you cannot fix what you cannot see.</li>
+<li><strong>Find the dashboard that refreshes too often.</strong> Query 3 above surfaces it. Halving
+a refresh interval nobody depends on is free money.</li>
+<li><strong>Let the result cache work.</strong> A dashboard whose queries embed
+<code>CURRENT_TIMESTAMP()</code> never hits it. Rounding the timestamp to the hour often makes an
+entire dashboard nearly free.</li>
+<li><strong>Make transient anything you can rebuild.</strong> Staging tables carrying 7 days of
+Fail-safe plus Time Travel are paying for recovery of data you would regenerate anyway.</li>
+<li><strong>Set retention deliberately.</strong> Thirty days of Time Travel on a table rewritten
+nightly is thirty copies. Lesson 12's storage query shows which tables those are.</li>
+<li><strong>Review clustering.</strong> Automatic clustering is a permanent serverless charge. If
+the table it was added for is no longer queried that way, drop the key.</li>
+</ol>
+
+<p>Two habits keep it from drifting back. Run query 1 weekly and look for anything new near the top,
+and put a resource monitor on every warehouse before anyone uses it rather than after. Both take
+minutes; the alternative is finding out a month late.</p>
+
+<p>Next: <a href="/snowflake/snowflake-in-production">putting it in production</a>.</p>

@@ -1,0 +1,201 @@
+<p>Every query in this post runs against a booking database with 20,000 properties and 400,000
+bookings in it. The syntax is the easy part; the parts that go wrong are NULL, operator precedence,
+and pagination.</p>
+
+<h2>SELECT</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, title, city, price_per_night
+FROM   properties
+WHERE  city = 'Lisbon' AND status = 'PUBLISHED'
+ORDER  BY price_per_night
+LIMIT  5;</code></pre>
+
+<p>Name your columns. <code>SELECT *</code> is fine at a psql prompt and a liability in
+application code: it breaks when a column is added, ships columns nobody reads across the network,
+and stops an index-only scan being possible. It also hides the moment when someone adds a
+<code>text</code> column holding a megabyte of description to a table you select from in a loop.</p>
+
+<h2>WHERE, and the parenthesis that changes the answer</h2>
+
+<p><code>AND</code> binds tighter than <code>OR</code>. These are different queries:</p>
+
+<pre class="language-sql"><code class="language-sql">-- "cabins anywhere, plus anything in Oslo"  — probably not what was meant
+SELECT count(*) FROM properties
+WHERE  property_type = 'CABIN' AND status = 'PUBLISHED' OR city = 'Oslo';
+
+-- "published cabins, in Oslo or Bergen"
+SELECT count(*) FROM properties
+WHERE  status = 'PUBLISHED' AND property_type = 'CABIN' AND city IN ('Oslo', 'Bergen');</code></pre>
+
+<p>The first returns every unpublished Oslo property too. Parenthesise anything mixing
+<code>AND</code> with <code>OR</code>, even when you are sure.</p>
+
+<h2>The operators worth knowing</h2>
+
+<table>
+  <thead><tr><th>Operator</th><th>Does</th></tr></thead>
+  <tbody>
+    <tr><td><code>IN (…)</code></td><td>Matches any of a list. Also takes a subquery.</td></tr>
+    <tr><td><code>BETWEEN a AND b</code></td><td>Inclusive at <strong>both</strong> ends. See the
+        warning below.</td></tr>
+    <tr><td><code>LIKE</code> / <code>ILIKE</code></td><td>Wildcards <code>%</code> and
+        <code>_</code>. <code>ILIKE</code> ignores case.</td></tr>
+    <tr><td><code>~</code> / <code>~*</code></td><td>Regular expression, case sensitive and
+        insensitive.</td></tr>
+    <tr><td><code>IS NULL</code> / <code>IS NOT NULL</code></td><td>The only way to test for
+        NULL.</td></tr>
+    <tr><td><code>IS DISTINCT FROM</code></td><td><code>&lt;&gt;</code>, but treating NULL as an
+        ordinary value.</td></tr>
+  </tbody>
+</table>
+
+<p><strong><code>BETWEEN</code> on dates and timestamps is a trap.</strong> It includes both
+endpoints, so a range over timestamps catches midnight exactly and nothing else that day:</p>
+
+<pre class="language-sql"><code class="language-sql">-- wrong: loses everything after midnight on the 30th
+SELECT count(*) FROM bookings
+WHERE  created_at BETWEEN '2024-06-01' AND '2024-06-30';
+
+-- right: half-open, and it is the habit to keep
+SELECT count(*) FROM bookings
+WHERE  created_at >= '2024-06-01' AND created_at < '2024-07-01';</code></pre>
+
+<p>Half-open ranges also compose: consecutive months cover every instant exactly once, with no
+gap at midnight and no double counting.</p>
+
+<h2>NULL will surprise you three times</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*) AS all_rows,
+       count(*) FILTER (WHERE cancelled_at IS NULL)     AS never_cancelled,
+       count(*) FILTER (WHERE cancelled_at IS NOT NULL) AS cancelled
+FROM   bookings;</code></pre>
+
+<ol>
+  <li><strong>A comparison with NULL is NULL, not false.</strong> <code>WHERE status &lt;&gt;
+      'CANCELLED'</code> drops rows where status is NULL, because NULL is not true.</li>
+  <li><strong><code>NOT IN</code> with a NULL in the list returns nothing at all.</strong>
+      <code>x NOT IN (1, 2, NULL)</code> can never be true. Use <code>NOT EXISTS</code>.</li>
+  <li><strong>NULL sorts last by default in <code>ORDER BY ... ASC</code></strong> and first
+      descending, which silently reverses which rows appear on page one.</li>
+</ol>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, cancelled_at FROM bookings
+ORDER  BY cancelled_at DESC NULLS LAST
+LIMIT  5;</code></pre>
+
+<h2>Sorting</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT city, price_per_night, rating_average
+FROM   properties
+WHERE  status = 'PUBLISHED'
+ORDER  BY city ASC, price_per_night DESC
+LIMIT  10;</code></pre>
+
+<p>Sort order on text depends on the database's collation, which is fixed when the cluster is
+created. If you need a specific, portable ordering, ask for it:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT city FROM properties ORDER BY city COLLATE "C" LIMIT 10;</code></pre>
+
+<p>And when a query has <code>LIMIT</code> but no <code>ORDER BY</code>, the rows you get are
+whatever came out first. It will look stable in testing and change the day the planner picks a
+different scan.</p>
+
+<h2>The shape of a WHERE clause decides whether an index can be used</h2>
+
+<p>Two queries that return the same rows, and only one of them can use an index on
+<code>check_in</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">-- the column is wrapped in a function, so an index on check_in cannot be used
+SELECT count(*) FROM bookings WHERE date_part('year', check_in) = 2024;
+
+-- the column is bare on one side, compared against a constant
+SELECT count(*) FROM bookings WHERE check_in >= '2024-01-01' AND check_in < '2025-01-01';</code></pre>
+
+<p>An index stores the values of <code>check_in</code>, not the values of
+<code>date_part('year', check_in)</code>. Once the column is inside a function call, the index no
+longer describes what you are asking about, and Postgres has to compute the expression for every
+row.</p>
+
+<p>The rule generalises. <code>WHERE lower(email) = 'a@b.com'</code>,
+<code>WHERE amount::text LIKE '1%'</code> and <code>WHERE created_at + interval '1 day' &gt; now()</code>
+all have the same problem. Keep the column bare on one side of the comparison and move the
+arithmetic to the other — or, when the function really is how you query, build an index on the
+expression itself, which the indexes post covers.</p>
+
+<p><code>LIKE</code> has its own version of this: a pattern anchored at the start can use a
+b-tree, and one that begins with a wildcard cannot.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT count(*) FROM properties WHERE title LIKE 'Sunny%';   -- can use an index
+SELECT count(*) FROM properties WHERE title LIKE '%loft%';   -- cannot</code></pre>
+
+<h2>DISTINCT, and DISTINCT ON</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT DISTINCT city FROM properties ORDER BY city;</code></pre>
+
+<p><code>DISTINCT ON</code> is a Postgres extension and one of its most useful: keep the first row
+of each group, where "first" is decided by the <code>ORDER BY</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">-- the cheapest published property in each city
+SELECT DISTINCT ON (city) city, id, title, price_per_night
+FROM   properties
+WHERE  status = 'PUBLISHED'
+ORDER  BY city, price_per_night ASC, id;</code></pre>
+
+<p>The rule that catches everyone: the leading <code>ORDER BY</code> expressions must match the
+<code>DISTINCT ON</code> list. Sort by <code>price_per_night</code> first and Postgres rejects the
+query rather than guessing.</p>
+
+<h2>Pagination that does not get slower</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, title FROM properties ORDER BY id LIMIT 20 OFFSET 10000;</code></pre>
+
+<p>That reads 10,020 rows and throws 10,000 away. Page 1 is instant, page 500 is not, and the cost
+grows with the page number — which is why deep pages of a listing feel broken while the first page
+feels fine.</p>
+
+<p><strong>Keyset pagination</strong> remembers where the last page ended instead of counting from
+the start:</p>
+
+<pre class="language-sql"><code class="language-sql">-- first page
+SELECT id, title FROM properties ORDER BY id LIMIT 20;
+
+-- next page: pass the last id you saw
+SELECT id, title FROM properties WHERE id > 5820 ORDER BY id LIMIT 20;</code></pre>
+
+<p>Every page costs the same, because the index seeks straight to the starting point. The
+trade-off is that you cannot jump to page 500 — which is fine, since nobody does — and that the
+sort key must be unique. For a non-unique sort, compare on the pair:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, title, price_per_night
+FROM   properties
+WHERE  (price_per_night, id) > (120.00, 5820)
+ORDER  BY price_per_night, id
+LIMIT  20;</code></pre>
+
+<p>That row-value comparison is doing real work: it means "price greater, or price equal and id
+greater", written once and matching an index on <code>(price_per_night, id)</code> exactly.</p>
+
+<h2>LIMIT without ORDER BY is not a shortcut</h2>
+
+<p>Worth stating on its own because it is the most common accidental bug in this post's subject.
+A <code>LIMIT</code> with no <code>ORDER BY</code> does not mean "any 20 rows, I do not care" — it
+means "whichever 20 the plan happens to emit first", and that changes when the table grows, when
+an index is added, or when autovacuum last ran.</p>
+
+<p>The consequence is a paginated list that skips and repeats rows between pages while every
+individual query looks correct. If the order genuinely does not matter, sort by the primary key
+anyway; it is nearly free when the index is already there and it makes the result reproducible.</p>
+
+<h2>CASE and COALESCE</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id,
+       COALESCE(state, country)         AS region,
+       CASE WHEN price_per_night < 100  THEN 'budget'
+            WHEN price_per_night < 300  THEN 'mid'
+            ELSE 'premium' END          AS bracket
+FROM   properties
+LIMIT  5;</code></pre>
+
+<p><code>COALESCE</code> returns its first non-NULL argument. <code>CASE</code> is evaluated in
+order and stops at the first match, so overlapping conditions are resolved top-down — put the
+narrowest first.</p>

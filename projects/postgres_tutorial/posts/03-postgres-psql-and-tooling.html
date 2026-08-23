@@ -1,0 +1,197 @@
+<p><code>psql</code> ships with Postgres, is present on every server you will ever have to debug,
+and is what every answer you find online assumes you are using. A GUI is a nice place to read
+data; psql is where you work.</p>
+
+<p>This post is the subset worth memorising, plus the settings that make it bearable.</p>
+
+<h2>Connecting</h2>
+
+<pre class="language-bash"><code class="language-bash">psql "postgresql://stayhub:stayhub@localhost:5433/stayhub_lab"
+
+# or as separate flags, with PGPASSWORD in the environment
+psql -h localhost -p 5433 -U stayhub -d stayhub_lab</code></pre>
+
+<p>Once connected, the prompt tells you which database you are in — which matters more than it
+sounds the first time you run a <code>DELETE</code> in the wrong window.</p>
+
+<p>Against anything that is not on your own machine, add <code>sslmode</code> and mean it. The
+default, <code>prefer</code>, will silently fall back to an unencrypted connection if the server
+does not offer TLS, which is exactly backwards for a production database:</p>
+
+<pre class="language-bash"><code class="language-bash">psql "postgresql://app@db.example.com:5432/app?sslmode=verify-full&sslrootcert=/etc/ssl/rds-ca.pem"</code></pre>
+
+<p><code>require</code> encrypts but does not check who you are talking to.
+<code>verify-full</code> checks the certificate and the hostname, and is the only setting that
+actually stops an interception.</p>
+
+<h2>The meta-commands worth knowing</h2>
+
+<p>Anything starting with a backslash is handled by psql itself, not sent to the server.</p>
+
+<table>
+  <thead><tr><th>Command</th><th>Shows</th></tr></thead>
+  <tbody>
+    <tr><td><code>\l</code></td><td>Databases in this cluster</td></tr>
+    <tr><td><code>\c dbname</code></td><td>Connect to a different database</td></tr>
+    <tr><td><code>\dn</code></td><td>Schemas</td></tr>
+    <tr><td><code>\dt</code></td><td>Tables in the search path</td></tr>
+    <tr><td><code>\d name</code></td><td>Everything about one table: columns, indexes, constraints,
+        foreign keys</td></tr>
+    <tr><td><code>\d+ name</code></td><td>The same plus storage, description and view definitions</td></tr>
+    <tr><td><code>\di+</code></td><td>Indexes with their sizes</td></tr>
+    <tr><td><code>\df</code></td><td>Functions</td></tr>
+    <tr><td><code>\du</code></td><td>Roles and their attributes</td></tr>
+    <tr><td><code>\dp</code></td><td>Table privileges — who may do what</td></tr>
+    <tr><td><code>\x</code></td><td>Expanded output: one column per line. Toggle it on a wide table</td></tr>
+    <tr><td><code>\timing</code></td><td>Print how long each statement took</td></tr>
+    <tr><td><code>\e</code></td><td>Open the last query in <code>$EDITOR</code></td></tr>
+    <tr><td><code>\?</code> / <code>\h SELECT</code></td><td>Help on meta-commands / on SQL syntax</td></tr>
+  </tbody>
+</table>
+
+<p><code>\d</code> on a table is the one you will run most. It answers most schema questions
+without a single query against the catalog:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">stayhub_lab=# \d bookings
+                                           Table "public.bookings"
+       Column        |           Type           | Collation | Nullable |               Default
+---------------------+--------------------------+-----------+----------+--------------------------------------
+ id                  | integer                  |           | not null | nextval('bookings_id_seq'::regclass)
+ property_id         | integer                  |           | not null |
+ check_in            | date                     |           | not null |
+ check_out           | date                     |           | not null |
+ total               | numeric(10,2)            |           | not null |
+ status              | character varying(20)    |           | not null |
+ created_at          | timestamp with time zone |           | not null | now()
+Indexes:
+    "pk_bookings" PRIMARY KEY, btree (id)
+    "ix_bookings_property_dates" btree (property_id, check_in, check_out)
+    "ix_bookings_status" btree (status)
+    "no_overlapping_bookings" EXCLUDE USING gist (property_id WITH =, ...)
+Check constraints:
+    "ck_bookings_checkout_after_checkin" CHECK (check_out > check_in)
+Foreign-key constraints:
+    "fk_bookings_property_id_properties" FOREIGN KEY (property_id) REFERENCES properties(id)</code></pre>
+
+<p>Note what is in there beyond the columns: every index, every constraint and every foreign key.
+Reading that before you write a query saves you writing the wrong one.</p>
+
+<h2>Sizes, without remembering catalog queries</h2>
+
+<p><code>\di+</code> answers "which indexes are expensive" directly:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">stayhub_lab=# \di+ ix_bookings*
+ Schema |            Name            | Table    | Access method |  Size
+--------+----------------------------+----------+---------------+---------
+ public | ix_bookings_guest_id       | bookings | btree         | 4632 kB
+ public | ix_bookings_property_dates | bookings | btree         | 17 MB
+ public | ix_bookings_property_id    | bookings | btree         | 3968 kB
+ public | ix_bookings_public_id      | bookings | btree         | 16 MB
+ public | ix_bookings_status         | bookings | btree         | 2560 kB</code></pre>
+
+<p>Two things jump out that no schema file would tell you: a three-column index costs four times
+one on a single integer, and the UUID index costs nearly as much again — because a random UUID
+gives a b-tree no locality at all. Both facts come back in the indexes post.</p>
+
+<h2>Running a file</h2>
+
+<p>This is the flag that matters, and leaving it out is how a migration half-applies:</p>
+
+<pre class="language-bash"><code class="language-bash">psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migration.sql</code></pre>
+
+<p>By default psql keeps going after an error, so a failed statement in the middle of a script
+scrolls past and the script reports success. <code>ON_ERROR_STOP=1</code> makes it exit non-zero
+on the first failure — which is what any script running it needs.</p>
+
+<p>Wrapping the file in a transaction makes the whole thing atomic, so a failure leaves nothing
+behind:</p>
+
+<pre class="language-bash"><code class="language-bash">psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f migration.sql</code></pre>
+
+<h2>Getting data out</h2>
+
+<pre class="language-bash"><code class="language-bash"># CSV, straight to a file on YOUR machine, not the server's
+psql "$DATABASE_URL" -c "\copy (SELECT id, city FROM properties LIMIT 100) TO 'out.csv' CSV HEADER"
+
+# quiet, unaligned, no headers — for shell scripts
+psql "$DATABASE_URL" -At -c 'SELECT count(*) FROM bookings'
+# 400000</code></pre>
+
+<p><code>\copy</code> and <code>COPY</code> are not the same thing. <code>COPY</code> is SQL, runs
+on the server, writes to the server's filesystem and needs superuser rights.
+<code>\copy</code> is psql, streams through your connection, and writes where you are sitting.
+For a developer it is almost always <code>\copy</code>.</p>
+
+<h2>Four interactive habits</h2>
+
+<p>These are the ones that change how the session feels rather than what it can do.</p>
+
+<pre class="language-bash"><code class="language-bash">SELECT * FROM properties WHERE id = 7 \gx   -- run, and show expanded, once
+
+SELECT count(*) FROM bookings WHERE status = 'PENDING' \watch 2
+
+\e                                          -- edit the last query in $EDITOR
+\i schema.sql                               -- run a file from inside the session</code></pre>
+
+<ul>
+  <li><code>\gx</code> ends a statement <em>and</em> shows it expanded, one column per line,
+      without leaving <code>\x</code> on for everything afterwards. The right way to look at one
+      wide row.</li>
+  <li><code>\watch 2</code> re-runs the statement every two seconds. This is the whole of your
+      monitoring during a migration or a backfill — watch the count move.</li>
+  <li><code>\e</code> opens the last query in your editor. Multi-line SQL is miserable to fix at
+      a prompt and pleasant to fix in vim.</li>
+  <li><code>Ctrl-C</code> cancels the running query without dropping the connection. It is safe:
+      the statement rolls back.</li>
+</ul>
+
+<p>When the query you need to stop is in somebody else's session, cancel it from yours:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT pid, state, now() - query_start AS running_for, query
+FROM   pg_stat_activity
+WHERE  state = 'active' AND backend_type = 'client backend'
+ORDER  BY running_for DESC;
+
+SELECT pg_cancel_backend(12345);      -- ask it to stop; the transaction rolls back
+SELECT pg_terminate_backend(12345);   -- drop the whole connection, if it ignores the first</code></pre>
+
+<p>Reach for <code>pg_cancel_backend</code> first. <code>pg_terminate_backend</code> kills the
+connection, and an application that was mid-transaction gets an error it may not handle well.</p>
+
+<h2>A .psqlrc worth having</h2>
+
+<p>Read once at startup, from your home directory:</p>
+
+<pre class="language-bash"><code class="language-bash"># ~/.psqlrc
+\set QUIET 1
+\timing on
+\set ON_ERROR_ROLLBACK interactive
+\pset null '(null)'
+\set COMP_KEYWORD_CASE upper
+\set HISTFILE ~/.psql_history-:DBNAME
+\unset QUIET</code></pre>
+
+<table>
+  <thead><tr><th>Setting</th><th>What it buys</th></tr></thead>
+  <tbody>
+    <tr><td><code>\timing on</code></td><td>Every statement reports its duration. You stop
+        guessing which query is slow.</td></tr>
+    <tr><td><code>ON_ERROR_ROLLBACK interactive</code></td><td>A typo inside a transaction no
+        longer poisons it. Without this, one mistake and every following statement answers
+        <em>current transaction is aborted</em> until you roll back.</td></tr>
+    <tr><td><code>\pset null '(null)'</code></td><td>NULL and the empty string stop looking
+        identical. This one prevents real bugs.</td></tr>
+    <tr><td><code>HISTFILE</code> per database</td><td>Up-arrow gives you the history for the
+        database you are actually in.</td></tr>
+  </tbody>
+</table>
+
+<h2>When a GUI is the right tool</h2>
+
+<p>pgAdmin, DBeaver, DataGrip and TablePlus all connect with the same URI. They earn their place
+for browsing an unfamiliar schema, editing a wide row by hand, and drawing a plan as a tree
+instead of indented text.</p>
+
+<p>They are the wrong tool for anything you need to repeat, anything you need to review, and
+anything running on a server you reached through SSH. Learn psql first; a GUI is easy to add
+later, and the reverse is not true.</p>

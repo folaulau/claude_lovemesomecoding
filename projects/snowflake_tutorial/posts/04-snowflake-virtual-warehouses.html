@@ -1,0 +1,193 @@
+<p>A virtual warehouse is the compute you rent. It is also, in nearly every account, the whole of the
+bill. This lesson is about the four decisions that determine what you spend: how big, how many, when
+it sleeps, and which workloads share one.</p>
+
+<h2>Sizes and what they cost</h2>
+
+<p>A warehouse has a T-shirt size. Each step up doubles the nodes, doubles the credits per hour, and
+— for work that parallelises — roughly halves the time.</p>
+
+<table>
+<tr><th>Size</th><th>Credits / hour</th><th>Relative compute</th></tr>
+<tr><td>X-Small</td><td>1</td><td>1×</td></tr>
+<tr><td>Small</td><td>2</td><td>2×</td></tr>
+<tr><td>Medium</td><td>4</td><td>4×</td></tr>
+<tr><td>Large</td><td>8</td><td>8×</td></tr>
+<tr><td>X-Large</td><td>16</td><td>16×</td></tr>
+<tr><td>2X-Large … 6X-Large</td><td>32 … 512</td><td>32× … 512×</td></tr>
+</table>
+
+<p>Read that table twice, because it contains the least intuitive fact about Snowflake pricing:
+<strong>doubling the size of a warehouse is free if the query scales perfectly.</strong> Twice the
+credits per hour for half as many hours is the same number of credits. You get the answer sooner at
+no extra cost.</p>
+
+<p>Which means the usual advice — "start small to save money" — is only half right. Starting small
+saves money when queries are small. When a query is genuinely large and parallelisable, a bigger
+warehouse is faster for the same spend, and the reason to hesitate is not cost.</p>
+
+<p>The reason to hesitate is that <strong>the scaling is not perfect</strong>. Credits are metered
+per second with a 60-second minimum each time a warehouse resumes, so a query that finishes in ten
+seconds on a Medium bills a full minute either way — doubling the size there buys nothing and costs
+double. And a query that does not parallelise, because it is one small file or one un-splittable
+step, runs at about the same speed on a 6X-Large as on an X-Small while burning 512 times the
+credits.</p>
+
+<p>So the practical rule: <strong>size up for large scans and heavy joins; do not size up for
+queries that are already fast.</strong> Change it and measure, because it is one statement:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER WAREHOUSE learn_wh SET WAREHOUSE_SIZE = MEDIUM;</code></pre>
+
+<p>Resizing takes effect for queries that start afterwards; anything already running finishes on the
+old size. There is no downtime and no data movement, which is the point of separating storage from
+compute in the first place.</p>
+
+<h2>Auto-suspend, and the setting people get wrong</h2>
+
+<p>A running warehouse bills whether or not anyone is querying it. Auto-suspend stops it after a
+period of idleness; auto-resume starts it again when a query arrives.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE WAREHOUSE bi_wh
+  WAREHOUSE_SIZE      = SMALL
+  AUTO_SUSPEND        = 300     -- seconds. NULL or 0 means never suspend.
+  AUTO_RESUME         = TRUE
+  INITIALLY_SUSPENDED = TRUE;</code></pre>
+
+<p>Two mistakes are common, in opposite directions.</p>
+
+<p><strong>Never suspending.</strong> <code>AUTO_SUSPEND = NULL</code> means the warehouse runs
+until somebody stops it by hand, and nobody ever does. This is the single most common source of a
+surprising Snowflake bill: not an expensive query, an idle warehouse nobody noticed over a weekend.
+There is essentially never a good reason for it.</p>
+
+<p><strong>Suspending too aggressively.</strong> Setting it to 60 seconds everywhere looks thrifty
+and can cost more. Suspending drops the warehouse's local SSD cache, so the next query re-reads from
+object storage — slower, and the extra seconds are billed. Worse, if a warehouse suspends and
+resumes repeatedly, each resume triggers the 60-second minimum charge again.</p>
+
+<p>Sensible starting points, adjusted after watching real usage:</p>
+
+<table>
+<tr><th>Workload</th><th>Auto-suspend</th><th>Why</th></tr>
+<tr><td>Interactive / BI dashboards</td><td>5–10 minutes</td><td>Users query in bursts; keeping the
+cache warm between them is worth the idle seconds.</td></tr>
+<tr><td>Scheduled ETL</td><td>1–2 minutes</td><td>The job either has more work immediately or is
+done. No human is waiting.</td></tr>
+<tr><td>Ad-hoc / development</td><td>1–5 minutes</td><td>Long gaps between queries. Idle time here
+is pure waste.</td></tr>
+</table>
+
+<h2>Multi-cluster: the other kind of scaling</h2>
+
+<p>Sizing up makes <em>one query</em> faster. It does nothing for <em>fifty users at once</em> —
+when a warehouse is saturated, further queries queue, and a bigger single cluster still has one
+queue.</p>
+
+<p>A multi-cluster warehouse (Enterprise edition and above) answers that by starting additional
+clusters of the same size when queries begin to queue, and shutting them down when the rush passes:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE WAREHOUSE bi_wh
+  WAREHOUSE_SIZE      = SMALL
+  MIN_CLUSTER_COUNT   = 1
+  MAX_CLUSTER_COUNT   = 4       -- up to 4 &times; SMALL, only while needed
+  SCALING_POLICY       = STANDARD
+  AUTO_SUSPEND        = 300
+  AUTO_RESUME         = TRUE;</code></pre>
+
+<p>The distinction is worth stating plainly, because interviews ask it and dashboards depend on it:</p>
+
+<ul>
+<li><strong>Scale up</strong> (bigger size) — for one slow query. More nodes on the same
+problem.</li>
+<li><strong>Scale out</strong> (more clusters) — for many concurrent queries. More copies of the
+same-sized machine.</li>
+</ul>
+
+<p><code>SCALING_POLICY</code> has two values. <code>STANDARD</code> starts a new cluster as soon as
+a query queues, favouring responsiveness. <code>ECONOMY</code> waits until there is enough backlog
+to keep a new cluster busy for several minutes, favouring credits. Use <code>STANDARD</code> where
+people are waiting and <code>ECONOMY</code> for batch.</p>
+
+<p>Setting <code>MIN_CLUSTER_COUNT</code> equal to <code>MAX_CLUSTER_COUNT</code> keeps that many
+clusters running permanently — maximised mode. It removes any warm-up delay and bills for every
+cluster the whole time. Reach for it only when you know you need it.</p>
+
+<h2>Separating workloads</h2>
+
+<p>The reason Snowflake accounts end up with several warehouses is not scale, it is isolation. Since
+warehouses share storage but not compute, giving each workload its own means one cannot slow another
+down — and, just as usefully, the credit report tells you who spent what.</p>
+
+<pre class="language-sql"><code class="language-sql">-- Loading: small, suspends fast, nobody is waiting on it.
+CREATE WAREHOUSE loading_wh WAREHOUSE_SIZE = SMALL
+  AUTO_SUSPEND = 60  AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;
+
+-- Dashboards: concurrency matters more than raw size.
+CREATE WAREHOUSE bi_wh WAREHOUSE_SIZE = SMALL
+  MIN_CLUSTER_COUNT = 1 MAX_CLUSTER_COUNT = 3
+  AUTO_SUSPEND = 600 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;
+
+-- Analysts running whatever they like. Capped by a resource monitor (lesson 15).
+CREATE WAREHOUSE adhoc_wh WAREHOUSE_SIZE = MEDIUM
+  AUTO_SUSPEND = 120 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;</code></pre>
+
+<p>Three warehouses that are idle most of the day cost nothing, because a suspended warehouse is
+free. The cost of splitting is zero; the cost of not splitting is a dashboard that goes slow every
+time the nightly load overruns.</p>
+
+<h2>Sizing in practice</h2>
+
+<p>Rather than guessing, change one thing and read the Query Profile (lesson 11). Three signals tell
+you which direction to move.</p>
+
+<table>
+<tr><th>What you see</th><th>What it means</th><th>Move</th></tr>
+<tr><td>Queries queue, each one is fast</td><td>Concurrency, not capacity</td><td>Add clusters, not
+size</td></tr>
+<tr><td>One query is slow and the profile shows spilling to remote storage</td><td>The working set
+does not fit in memory</td><td>Size up</td></tr>
+<tr><td>One query is slow and the profile shows a huge scan with little pruning</td><td>The query
+is reading data it does not need</td><td>Fix the query first; size up second</td></tr>
+</table>
+
+<p>That last row is the one worth holding onto. A bigger warehouse makes a badly-pruned query
+finish sooner while reading exactly as much data, and you pay for the privilege. Compute is the
+answer to "this is genuinely a lot of work"; it is not the answer to "this is doing work it should
+not be doing".</p>
+
+<p>Snowflake also offers a couple of specialised options once the basics are in place — Query
+Acceleration Service, which offloads bursty scan work off-cluster, and Snowpark-optimized
+warehouses with more memory per node for heavy Python or Java workloads. Both are documented under
+<a href="https://docs.snowflake.com/en/user-guide/warehouses" rel="nofollow">warehouses in the
+docs</a>, and neither is where to start.</p>
+
+<h2>Guard rails worth setting</h2>
+
+<p>Two parameters stop a single bad query doing unbounded damage:</p>
+
+<pre class="language-sql"><code class="language-sql">-- Kill any query running longer than 30 minutes on this warehouse.
+ALTER WAREHOUSE adhoc_wh SET STATEMENT_TIMEOUT_IN_SECONDS = 1800;
+
+-- Give up rather than sit in a queue for more than 5 minutes.
+ALTER WAREHOUSE adhoc_wh SET STATEMENT_QUEUED_TIMEOUT_IN_SECONDS = 300;</code></pre>
+
+<p>The default statement timeout is two days, which is not a limit anyone intends. Set it on every
+warehouse.</p>
+
+<h2>Checking what is running</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW WAREHOUSES;
+
+-- Credits per warehouse over the last week. Latency on this view is up to ~3 hours.
+SELECT warehouse_name,
+       ROUND(SUM(credits_used), 2) AS credits
+FROM   snowflake.account_usage.warehouse_metering_history
+WHERE  start_time &gt;= DATEADD('day', -7, CURRENT_TIMESTAMP())
+GROUP  BY warehouse_name
+ORDER  BY credits DESC;</code></pre>
+
+<p>Run that weekly. If a warehouse you have forgotten about is near the top, you have found the
+auto-suspend you did not set.</p>
+
+<p>Next: <a href="/snowflake/snowflake-databases-schemas-and-tables">databases, schemas and
+tables</a> — the objects the compute is pointed at.</p>
