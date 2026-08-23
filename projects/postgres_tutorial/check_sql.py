@@ -350,6 +350,25 @@ def classify(source: str) -> str:
 
 
 def main() -> int:
+    # ⚠️ One run at a time. Two concurrent runs share the scratch database and take locks on the
+    # same tables: the first to finish drops `stayhub_lab_scratch` out from under the second, and
+    # the migration post's ALTER TABLE statements fail on lock_timeout waiting for the other run's
+    # backfill. Every failure it produces blames a post that is correct.
+    lock_path = HERE / ".check_sql.lock"
+    try:
+        lock_file = open(lock_path, "x")
+    except FileExistsError:
+        print(f"error: another check_sql.py run holds {lock_path}.\n"
+              "       Wait for it, or delete the file if no run is active.", file=sys.stderr)
+        return 2
+    try:
+        return _run()
+    finally:
+        lock_file.close()
+        lock_path.unlink(missing_ok=True)
+
+
+def _run() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--post", default=None, help="check one slug instead of the whole track")
     parser.add_argument("--verbose", action="store_true", help="print every block, not just fails")

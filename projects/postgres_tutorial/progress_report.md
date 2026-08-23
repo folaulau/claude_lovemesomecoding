@@ -1,6 +1,7 @@
 # Postgres tutorial track — progress report
 
-**Status:** 🟡 **In progress** — decisions taken, lab database built, writing the posts.
+**Status:** 🟢 **All 18 posts written, verified and seeded to the LOCAL tree.** Not published to
+prod — that is one command away and waiting on Folau.
 **Started:** 2026-08-22
 **Where it lands:** https://lovemesomecoding.com/postgre
 
@@ -271,3 +272,111 @@ nothing:
 
 Queries mentioning `now()`, `random()`, a uuid, `xmin` or `ctid` are reported as `output-varies`
 and not compared — a check that always fails is a check everybody learns to ignore.
+
+
+---
+
+## Final state — 2026-08-23
+
+All 18 posts written, checked and seeded to `lovemesomecoding/local/`.
+
+| | |
+|---|---|
+| Posts | 18, every one at **6 reading-minutes** |
+| Words | 22,437 total — 17,171 prose, 5,266 code (**77% prose**, floor is 40%) |
+| Code blocks | 195 |
+| SQL blocks executed | **157**, all against `stayhub_lab` |
+| Quoted result tables re-derived | 5 |
+| Build | `708/708 posts served, 42/42 categories, index cross-check agrees, all indexed URLs accounted for` |
+
+Compare with what `/postgre` held before: two posts, 288 words, no headings, 2 reading-minutes.
+
+### Verified
+
+- `check_content.py` — all 18 pass, no warnings
+- `check_sql.py` — 157 SQL blocks run; 128 plain, 8 no-transaction, 4 fragment, 3 multi-session,
+  3 cluster-level, 2 unavailable, 1 expect-error, 1 recovers, 5 outputs re-derived, 2 output-varies
+- `seed.py --env local --write --force-dates` — 692 → 708 posts, archive holds 18, category count 18
+- `npm run build` with `CONTENT_ENV=local` — passes every `verify-build.mjs` guard
+- Both frozen URLs present in `out/`; syntax highlighting confirmed (73 Prism token spans on one page)
+- `stayhub` and `stayhub_lab` both verified byte-identical to their seeded state after the full run
+
+### Dates
+
+Folau asked for 2018–2020 rather than the 2026 slot the other tracks use. The eighteen lessons run
+**2018-03-06 → 2020-08-06**, one every 52 days.
+
+⚠️ **This moves the two frozen posts backwards**, from their stored 2020-02-19 to 2018-03-06 and
+2018-04-27, which is why `--force-dates` is required.
+
+### ⚠️ Open question: the dates and the content disagree
+
+The posts are written against **Postgres 16** and cite features by version. Several of those
+versions did not exist by 2020:
+
+| Post | Reference | Released |
+|---|---|---|
+| 1, 2 | `16.15` as the version everything was run on | 2023 (16.0) |
+| 4 | "Since Postgres 15 a new database is less permissive" | 2022 |
+| 6 | "Postgres 15 added `UNIQUE NULLS NOT DISTINCT`" | 2022 |
+| 10 | "Postgres 14 added `CYCLE`" | 2021 |
+| 17 | "since Postgres 11 the default is stored once" | 2018 — fine |
+| 10, 13, 17 | Postgres 12 behaviour (CTE inlining, generated columns, `SET NOT NULL` proof) | 2019 — fine for the later posts, not for one dated 2018 |
+
+Nothing is *wrong* as Postgres; it is wrong as of the post's date. One outright contradiction was
+removed ("differences that are still true in 2026" → "that have held for years"). The rest are the
+version references above.
+
+Three ways out, and it is Folau's call:
+
+1. **Leave it.** The dates are metadata, nobody diffs a tutorial against its publication year, and
+   the content is correct today. Zero work.
+2. **Move the dates later** — one line in `manifest.py` (`START_DATE`, `STEP_DAYS`) and a re-seed
+   with `--force-dates`. Ten minutes.
+3. **Rewrite to a 2018-era Postgres (10/11).** Not recommended: the lab runs 16, so every plan,
+   every output and every version claim would have to be re-derived on a different server, and the
+   track would teach an unsupported version.
+
+### To publish
+
+```bash
+AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python \
+    projects/postgres_tutorial/seed.py --env prod --write --force-dates
+cd lovemesomecoding_frontend && AWS_PROFILE=folau npm run deploy
+```
+
+⚠️ `--force-dates` is needed on the first prod seed **and on every later seed that changes a
+date**. A published date is sticky — `upsert_post` never overwrites one — so a re-base of
+`START_DATE` followed by a plain re-run moves nothing at all.
+
+### Left undone
+
+- Not seeded or published to **prod**. Deliberate — that is an outward-facing publish.
+- The **`postgre` slug stays wrong**. It should be `postgres`, it has been wrong since 2020, and
+  it is an indexed URL. Renaming it means 18 redirects in `postbuild.mjs` plus a CloudFront
+  Function republish. Not attempted.
+- **Full-text search** is still out of the track. See the note above the track table.
+
+
+---
+
+## Two corrections adopted from the FastAPI track — 2026-08-23
+
+`seed.py` here was ported from `projects/fastapi_tutorial/seed.py` before commit `d38048a`, so it
+carried two bugs that commit had already found and fixed. Both were ported across after reading it.
+
+**`--force-dates` is not "exactly once per tree".** The docstring said it was. It is wrong for the
+same reason in both tracks: `upsert_post` never overwrites an existing date, so a published post's
+date is sticky forever. The first seed is only the first instance — every re-base of `START_DATE`
+is the same problem, and after the first seed it applies to all eighteen posts rather than the two
+rewrites. Corrected in the docstring, the `--help` text, the README and above.
+
+**The `new`-slug collision guard failed on the second seed.** It rejected any `new` slug that
+already existed, which after one seed is all sixteen of them — because this track created them. It
+exists to stop a first seed silently overwriting a stranger's page, which is a real risk since post
+slugs are global, so it was not deleted: it now fails only when a `new` slug is found in a
+**different category**, and merely notes the ones already in `/postgre`. Verified by running a
+second dry-run seed against `local`: 18 updates, no false failure.
+
+Both were caught by reading `git log` rather than by any check, which is the argument for reading
+the other tracks' reports before porting their tooling.

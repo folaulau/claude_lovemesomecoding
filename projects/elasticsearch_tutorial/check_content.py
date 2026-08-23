@@ -82,7 +82,7 @@ MEASURED_STRINGS = {
     str(_M["search_no_facets_ms"]), str(_M["search_with_facets_ms"]),
     str(_M["index_one_by_one_200_ms"]), str(_M["index_bulk_200_ms"]),
     str(_M["bm25_score"]), str(_M["bm25_boost"]), str(_M["bm25_idf"]), str(_M["bm25_tf"]),
-    _M["bulk_speedup"],
+    _M["bulk_speedup"], _M["snapshot_took"],
 }
 
 # Posts that are REQUIRED to carry the measurements, because their whole argument rests on them.

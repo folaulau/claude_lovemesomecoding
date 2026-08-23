@@ -140,6 +140,11 @@ MEASURED = {
     "bm25_n": 1,
     "bm25_N": 12,
 
+    # `snapshot --create` on the 12-document index. Genuinely 0 — a snapshot of one small,
+    # already-written segment is a metadata operation, and quoting it matters because it is the
+    # number that makes "snapshots are incremental" concrete rather than a claim.
+    "snapshot_took": "0ms",
+
     "tests_before": 165,
     "tests_after": 193,
 }
@@ -161,7 +166,7 @@ ANTIPATTERN_MARKER = "data-antipattern"
 BACKEND = "stayhub-fastapi-backend"
 
 SNIPPET_SOURCES = {
-    "what-is-elasticsearch": [f"{BACKEND}/app/search/index.py"],
+    "what-is-elasticsearch": [f"{BACKEND}/app/search/index.py", f"{BACKEND}/app/search/indexer.py"],
     "elasticsearch-installation": [
         "docker-compose.yml", f"{BACKEND}/app/search/client.py", f"{BACKEND}/app/core/config.py",
     ],
@@ -172,6 +177,7 @@ SNIPPET_SOURCES = {
     ],
     "elasticsearch-modeling-data": [
         f"{BACKEND}/app/search/index.py", f"{BACKEND}/app/models/property.py",
+        f"{BACKEND}/app/search/indexer.py", f"{BACKEND}/app/api/v1/routes/search.py",
     ],
     "elasticsearch-document-api": [
         f"{BACKEND}/app/search/indexer.py", f"{BACKEND}/app/search/index.py",
@@ -184,7 +190,9 @@ SNIPPET_SOURCES = {
         f"{BACKEND}/app/search/queries.py", f"{BACKEND}/app/api/v1/routes/search.py",
         f"{BACKEND}/app/schemas/search.py",
     ],
-    "elasticsearch-filter": [f"{BACKEND}/app/search/queries.py"],
+        "elasticsearch-filter": [
+        f"{BACKEND}/app/search/queries.py", f"{BACKEND}/tests/test_search.py",
+    ],
     "elasticsearch-relevance-tuning": [
         f"{BACKEND}/app/search/queries.py", f"{BACKEND}/scripts/explain_search.py",
     ],
@@ -193,20 +201,26 @@ SNIPPET_SOURCES = {
     ],
     "elasticsearch-aggregation": [
         f"{BACKEND}/app/search/queries.py", f"{BACKEND}/app/schemas/search.py",
+        f"{BACKEND}/app/api/v1/routes/search.py",
     ],
     "elasticsearch-geo-point": [
         f"{BACKEND}/app/search/queries.py", f"{BACKEND}/app/search/index.py",
-        f"{BACKEND}/app/schemas/search.py",
+        f"{BACKEND}/app/schemas/search.py", f"{BACKEND}/app/api/v1/routes/search.py",
+        f"{BACKEND}/tests/test_search.py",
     ],
     "elasticsearch-index-aliases-reindex": [
         f"{BACKEND}/app/search/index.py", f"{BACKEND}/scripts/reindex.py",
-        f"{BACKEND}/app/search/indexer.py",
+        f"{BACKEND}/app/search/indexer.py", f"{BACKEND}/app/core/config.py",
     ],
-    "elasticsearch-cat-api": [f"{BACKEND}/scripts/reindex.py"],
+        "elasticsearch-cat-api": [
+        f"{BACKEND}/scripts/reindex.py", f"{BACKEND}/app/search/client.py",
+    ],
     "elasticsearch-snapshot": [f"{BACKEND}/scripts/snapshot.py", "docker-compose.yml"],
     "elasticsearch-production-checklist": [
         f"{BACKEND}/scripts/es_security.py", f"{BACKEND}/app/search/client.py",
         f"{BACKEND}/app/core/config.py", "docker-compose.yml",
+        f"{BACKEND}/app/search/index.py", f"{BACKEND}/app/api/v1/routes/search.py",
+        f"{BACKEND}/tests/test_search.py",
     ],
 }
 

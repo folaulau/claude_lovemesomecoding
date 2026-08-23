@@ -1,0 +1,186 @@
+<p>Everything up to here has been about writing SQL. This post is the list of things that have to be
+true before a database is in front of users, in roughly the order they bite.</p>
+
+<h2>Connections</h2>
+
+<p>Postgres forks a process per connection, and the default ceiling is 100. A modest application
+fleet wants far more than that, and raising the number is the wrong fix — a thousand backends
+means a thousand processes competing for the same CPUs.</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW max_connections;
+
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE state = 'active')             AS active,
+       count(*) FILTER (WHERE state = 'idle')               AS idle,
+       count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend';</code></pre>
+
+<p>Use a pooler. Every application framework has a client-side pool, and that is the first step:
+keep it small — ten per instance is plenty — and make sure it is actually shared rather than
+created per request.</p>
+
+<p>Beyond a handful of instances you want a server-side pooler as well, PgBouncer or pgcat, in
+transaction mode: a client gets a backend for the duration of a transaction rather than a
+connection. That is what lets 2,000 application connections sit on 40 backends.</p>
+
+<p>Transaction mode has one rule you must know: <strong>anything that spans transactions on the
+same connection breaks</strong>. Session-level advisory locks, <code>SET</code> without
+<code>SET LOCAL</code>, <code>LISTEN</code>/<code>NOTIFY</code>, and server-side prepared
+statements — check that your driver disables those or uses a compatible protocol.</p>
+
+<p>The <code>idle in transaction</code> count in that query is the one to alert on. Those hold
+locks and block cleanup, so cap it at the database rather than trusting applications:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER DATABASE stayhub SET idle_in_transaction_session_timeout = '60s';
+ALTER DATABASE stayhub SET statement_timeout = '30s';
+ALTER DATABASE stayhub SET lock_timeout = '5s';</code></pre>
+
+<h2>The settings worth changing</h2>
+
+<p>The defaults are tuned for a small machine, not yours. Five matter; the rest can wait until you
+have a measurement.</p>
+
+<table>
+  <thead><tr><th>Setting</th><th>Start at</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>shared_buffers</code></td><td>25% of RAM</td><td>Postgres's own cache. The OS
+        page cache does the rest, which is why 25% rather than most of it.</td></tr>
+    <tr><td><code>effective_cache_size</code></td><td>50–75% of RAM</td><td>Allocates nothing —
+        it tells the planner how much caching to assume, and therefore whether an index scan is
+        worth it.</td></tr>
+    <tr><td><code>work_mem</code></td><td>16–64MB</td><td>Per sort or hash node, per worker. Too
+        low spills to disk; too high runs the machine out of memory.</td></tr>
+    <tr><td><code>maintenance_work_mem</code></td><td>512MB–1GB</td><td>Used by VACUUM and index
+        builds. Cheap, because few run at once.</td></tr>
+    <tr><td><code>random_page_cost</code></td><td>1.1 on SSD</td><td>The default of 4.0 assumes
+        spinning disks and makes the planner avoid indexes it should use.</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-sql"><code class="language-sql">SELECT name, setting, unit, source
+FROM   pg_settings
+WHERE  name IN ('shared_buffers','effective_cache_size','work_mem','maintenance_work_mem',
+                'random_page_cost','max_connections','wal_level');</code></pre>
+
+<p><code>source</code> tells you whether a value is the default or something someone set — which
+is the first thing to check when a server behaves unlike its twin.</p>
+
+<h2>Autovacuum</h2>
+
+<p>MVCC leaves dead row versions behind, and autovacuum reclaims them. It is on by default and
+usually fine. The two ways it stops being fine are worth recognising.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT relname,
+       n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS pct_dead,
+       last_autovacuum, last_autoanalyze
+FROM   pg_stat_user_tables
+ORDER  BY n_dead_tup DESC
+LIMIT  10;</code></pre>
+
+<p><strong>It cannot keep up.</strong> The default threshold triggers a vacuum when 20% of a table
+is dead — on a table with a hundred million rows that is twenty million dead rows before it starts.
+Lower it per table for the busy ones:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE bookings SET (autovacuum_vacuum_scale_factor = 0.02,
+                          autovacuum_analyze_scale_factor = 0.01);</code></pre>
+
+<p><strong>Something is holding it back.</strong> Vacuum cannot remove a row version that any open
+transaction might still need. One long-running query, one abandoned <code>idle in transaction</code>
+connection, or one stale replication slot pins the horizon and dead rows accumulate everywhere —
+including tables that connection never touched. When bloat is growing and autovacuum is running
+constantly, look for the oldest transaction before touching any setting.</p>
+
+<h2>Backups</h2>
+
+<p>Two kinds, and you want both.</p>
+
+<pre class="language-bash"><code class="language-bash"># logical: portable, restores to a different version, slow on large databases
+pg_dump --format=custom --file=stayhub.dump "$DATABASE_URL"
+pg_restore --dbname="$TARGET_URL" --clean --if-exists stayhub.dump</code></pre>
+
+<p><code>pg_dump</code> gives you a consistent snapshot without blocking writers, and it is the
+right tool up to a few hundred gigabytes and for moving data between environments. It is a
+<em>snapshot</em>: whatever happened since is gone.</p>
+
+<p>For anything you cannot lose an hour of, you want <strong>physical backup plus WAL
+archiving</strong> — a base backup, plus every WAL segment since, which together allow recovery to
+any second in between. <code>pgBackRest</code> and <code>barman</code> are the tools; managed
+providers do this for you and call it point-in-time recovery.</p>
+
+<p>The only part that actually matters: <strong>restore it.</strong> On a schedule, into a real
+database, and time how long it takes. A backup nobody has restored is a hypothesis, and the number
+you need during an incident is how long recovery takes — which you cannot discover during the
+incident.</p>
+
+<h2>The queries to have ready</h2>
+
+<pre class="language-sql"><code class="language-sql">-- what is running right now, oldest first
+SELECT pid, state, now() - xact_start AS txn_age, wait_event_type, left(query, 60)
+FROM   pg_stat_activity
+WHERE  backend_type = 'client backend' AND state <> 'idle'
+ORDER  BY xact_start;
+
+-- who is blocked, and by whom
+SELECT blocked.pid AS blocked_pid, blocking.pid AS blocking_pid,
+       left(blocked.query, 40) AS blocked_query, left(blocking.query, 40) AS blocking_query
+FROM   pg_stat_activity blocked
+JOIN   pg_stat_activity blocking ON blocking.pid = ANY(pg_blocking_pids(blocked.pid));
+
+-- what is taking the space
+SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) AS total
+FROM   pg_stat_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 10;</code></pre>
+
+<p>Keep these somewhere you can reach without thinking. The second one — the blocking chain — is
+the query you will want at the worst possible moment, and <code>pg_blocking_pids</code> is hard to
+remember under pressure.</p>
+
+<h2>What to watch</h2>
+
+<ul>
+  <li><strong>Connection count against <code>max_connections</code></strong> — alert at 80%.</li>
+  <li><strong>Replication lag</strong>, if you have a replica. It grows quietly and matters
+      suddenly.</li>
+  <li><strong>Transaction age</strong>. The oldest open transaction, and the age of the oldest
+      unfrozen transaction id — the second is the one that ends in a forced shutdown if ignored
+      long enough.</li>
+  <li><strong>Cache hit ratio</strong>, from <code>pg_stat_database</code>. Below about 95% on a
+      steady workload means the working set no longer fits.</li>
+  <li><strong>Disk free.</strong> A full disk stops Postgres accepting writes, and WAL that cannot
+      be archived is a common way to fill one.</li>
+</ul>
+
+<h2>Managed Postgres</h2>
+
+<p>RDS, Cloud SQL, Azure Database, Neon, Supabase. They handle backups, failover, patching and
+point-in-time recovery, which is most of the operational burden and worth the money for almost
+every team.</p>
+
+<p>What they do not do: choose your indexes, write your queries, size your connection pool, or stop
+a migration taking an exclusive lock. Everything in the rest of this track is still yours.</p>
+
+<p>Two practical notes. You will not have superuser — the account you get is a role with a subset
+of privileges, so anything needing <code>ALTER SYSTEM</code> goes through their parameter groups
+instead. And a major version upgrade is still a scheduled event with downtime, so the argument for
+starting on a current version applies exactly as it did in the first post.</p>
+
+<h2>The checklist</h2>
+
+<ol>
+  <li>Application connects as a role that cannot drop tables.</li>
+  <li>A connection pooler, sized deliberately.</li>
+  <li><code>statement_timeout</code>, <code>lock_timeout</code> and
+      <code>idle_in_transaction_session_timeout</code> set on the database.</li>
+  <li><code>pg_stat_statements</code> enabled.</li>
+  <li>The five settings above reviewed against the machine.</li>
+  <li>Autovacuum monitored; thresholds lowered on the busiest tables.</li>
+  <li>Backups running, and <strong>a restore actually performed and timed</strong>.</li>
+  <li>Alerts on connections, replication lag, transaction age and disk.</li>
+  <li>Migrations that use <code>lock_timeout</code>, <code>CONCURRENTLY</code> and
+      <code>NOT VALID</code>.</li>
+  <li>TLS enforced, with <code>sslmode=verify-full</code> from the application.</li>
+</ol>
+
+<p>That is the track. Eighteen posts from a container to a checklist, and every query in them was
+run against a real database before it shipped.</p>

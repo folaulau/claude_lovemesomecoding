@@ -1,6 +1,7 @@
 # Elasticsearch tutorial track — progress report
 
-**Status:** 🟢 **StayHub additions built and verified. Ready to write.** 0 of 18 posts drafted.
+**Status:** ✅ **PUBLISHED AND LIVE** — 18 posts on https://lovemesomecoding.com/elasticsearch, all
+18 URLs plus the archive verified serving at the edge. Build `394b0bd`, deployed 2026-08-23.
 **Started:** 2026-08-22
 **Where it lands:** https://lovemesomecoding.com/elasticsearch
 
@@ -155,6 +156,53 @@ computed in `manifest.py` from a `START_DATE`, so the last lesson is the newest)
 | 17 | `elasticsearch-snapshot` | rewrite | snapshot repositories, SLM policies, restore, what a backup actually guarantees |
 | 18 | `elasticsearch-production-checklist` | **new** | shard sizing, replicas, JVM heap, API keys/TLS, ILM, monitoring, capacity |
 
+### As written — measured after seeding, 2026-08-23
+
+| # | date | slug | words | min | headings |
+|---:|---|---|---:|---:|---:|
+| 1 | 2020-02-04 | `what-is-elasticsearch` | 2,670 | 12 | 13 |
+| 2 | 2020-03-15 | `elasticsearch-installation` | 2,641 | 12 | 13 |
+| 3 | 2020-04-24 | `elasticsearch-mapping` | 2,650 | 12 | 15 |
+| 4 | 2020-06-03 | `elasticsearch-data-types` | 2,710 | 12 | 18 |
+| 5 | 2020-07-13 | `elasticsearch-analyzers-text-analysis` | 2,652 | 12 | 18 |
+| 6 | 2020-08-22 | `elasticsearch-modeling-data` | 2,687 | 12 | 18 |
+| 7 | 2020-10-01 | `elasticsearch-document-api` | 2,644 | 12 | 15 |
+| 8 | 2020-11-10 | `elasticsearch-bulk-indexing-data-sync` | 2,669 | 12 | 17 |
+| 9 | 2020-12-20 | `elasticsearch-search-api` | 3,645 | 17 | 21 |
+| 10 | 2021-01-29 | `elasticsearch-filter` | 2,643 | 12 | 17 |
+| 11 | 2021-03-10 | `elasticsearch-relevance-tuning` | 2,669 | 12 | 15 |
+| 12 | 2021-04-19 | `elasticsearch-sorting` | 2,691 | 12 | 16 |
+| 13 | 2021-05-29 | `elasticsearch-aggregation` | 2,734 | 12 | 16 |
+| 14 | 2021-07-08 | `elasticsearch-geo-point` | 2,653 | 12 | 14 |
+| 15 | 2021-08-17 | `elasticsearch-index-aliases-reindex` | 2,678 | 12 | 14 |
+| 16 | 2021-09-26 | `elasticsearch-cat-api` | 2,684 | 12 | 18 |
+| 17 | 2021-11-05 | `elasticsearch-snapshot` | 2,662 | 12 | 15 |
+| 18 | 2021-12-15 | `elasticsearch-production-checklist` | 2,822 | 13 | 16 |
+| | | **total** | **49,195** | **220** | **328** |
+
+Against the 13 live posts: **10,827 words / 52 minutes / 0 `<h2>`** → **49,195 words / 220 minutes /
+328 headings**. Post 9 is the only one over 18 minutes, and deliberately: `check_content.py` rule 5
+requires a rewrite to beat the page it replaces, and the live `elasticsearch-search-api` is already
+3,519 words.
+
+### Dates — 2020-2021, decided 2026-08-23
+
+Folau asked for the track to be dated into **2020-2021** rather than 2026. `START_DATE` is
+2020-02-04 with `STEP_DAYS = 40`, spanning 2020-02-04 → 2021-12-15, which brackets the original
+2019-06 → 2021-09 range. The thirteen rewrites therefore land close to where their URLs already sit
+instead of moving thirteen indexed pages to the front of every archive at once.
+
+⚠️ **One conflict this creates, flagged rather than papered over.** The posts are written against
+**Elasticsearch 8.15.3**, which shipped in October 2024 — and 8.0 itself did not exist until
+February 2022. Post 2 is largely about "security is on by default since 8.0" and explicitly says
+older tutorials are stale. A reader who notices the byline date will find a 2020 post describing
+software from 2024. Three ways out, none taken yet:
+
+1. Leave it. The dates order the archive; the content states its own version in post 1 and post 2.
+2. Re-date the five NEW posts to 2026 and leave the thirteen rewrites where they are — honest about
+   which are rewrites, but the track no longer reads in lesson order.
+3. Move the whole track to 2026 (the original plan) and accept the archive churn.
+
 ---
 
 ## StayHub additions — build before writing
@@ -218,3 +266,48 @@ Measured on this machine, 2026-08-22, Elasticsearch **8.15.3**, client `elastics
   "san francisco loft"). Added `tests/test_search.py`; suite went 165 → **193 passing**, no
   regressions. Documented the lot in the demo app's `CLAUDE.md` and `progress_report.md`.
   Next: draft the 18 posts, starting at lesson 1.
+
+- **2026-08-23** — Wrote all **18 posts** (49,195 words, 328 headings, 188 code blocks). Built the
+  track tooling by adapting the FastAPI track's: `manifest.py`, `seed.py`, `check_content.py`,
+  `check_snippets.py`. Every non-trivial claim was run against the live 8.15.3 cluster first —
+  `long` coercion truncating 119.99 to 119, `strict_dynamic_mapping_exception`, the
+  index-then-search-returns-0-but-GET-works demo, bulk returning HTTP 200 with `errors: true`,
+  the analyzer-mismatch case where BOTH spellings return zero, `must + filter` scoring identically
+  to `must` alone, the `should`-next-to-`must` trap, `[lat, lon]` silently swapping, the
+  alias-delete refusal, and a full yellow-cluster `allocation/explain`.
+  `check_content.py`: **all 18 pass** (floor, cap, prose share, must-cite, rewrite-must-grow,
+  byte-for-byte code round-trip). `check_snippets.py`: **no drift**, 93 of 188 blocks traced to
+  files that run. Re-dated the track to 2020-2021 at Folau's request and recorded the version
+  conflict that creates. Seeded to the **local** tree with `--force-dates` and ran a full
+  `next build` + `verify-build.mjs`: **692/692 post URLs served, 42/42 categories, index
+  cross-check agrees**. Spot-checked the rendered HTML — Prism highlighting live, heading anchors
+  present, no WordPress wrapper divs. **Not seeded to prod.**
+
+- **2026-08-23 (later)** — Found that `seed.py` had been copied from the FastAPI track *before*
+  commit `d38048a` fixed two things in it, and ported both. (1) The `new`-slug collision guard
+  rejected mere existence, so the second seed of this track would have aborted on all five new
+  slugs; it now fails only when a `new` slug is found in a **different** category, which is the
+  case that would actually drag a stranger's page into `/elasticsearch`. (2) `--force-dates` is
+  **not** a one-off — `upsert_post` never overwrites an existing date, so after the first seed all
+  eighteen dates are sticky and every re-base of `START_DATE` needs the flag again. Both docstrings
+  corrected. Re-ran the dry run against the already-seeded local tree: 18 updates, guard prints a
+  note instead of aborting.
+  Also recorded `snapshot_took: "0ms"` in `MEASURED` — it was quoted from a real
+  `snapshot --create` run but `check_content.py` had no way to know that. **Zero warnings, zero
+  failures** across `check_content.py`, `check_snippets.py`, and the demo app's 193 tests.
+
+- **2026-08-23 — PUBLISHED.** Seeded to **prod** with `--force-dates`: 13 updates in place, 5
+  creates, tree 687 → **692 posts**, `/elasticsearch` archive holds 18, category count recorded 18.
+  `npm run deploy` — content synced from prod, `next build`, `verify-build.mjs` **692/692 post URLs
+  and 42/42 categories**, 1,805 files to `s3://lovemesomecoding.com`, CloudFront Function
+  republished (94 redirects, 6.2 KB of the 10 KB limit) and **LIVE**, invalidation
+  `ICDGLIF2LL1E2986A3LMV2SLGO` completed, edge verified serving build `394b0bd`.
+
+  Checked at the edge afterwards: archive **200** and all **18 post URLs 200**; served HTML carries
+  the new headings, Prism-highlighted code and **no** `boldgrid`/`col-md-12` wrappers; the archive
+  lists 18 distinct posts with the category standfirst; the sitemap contains all **5** new URLs.
+
+  ⚠️ The Elasticsearch-8.15-in-a-2020-post conflict recorded above is **live as written**. Folau
+  said publish with the dates as set; it is not resolved, only shipped. The three options are still
+  in the Dates section, and changing course later is a `START_DATE` edit plus a re-seed with
+  `--force-dates` — no post body would need touching.

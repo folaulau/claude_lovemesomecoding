@@ -15,14 +15,20 @@ posts, and the static build reads only the indexes.
 Idempotent: re-running updates the posts in place. `date` is only applied when a post is new, so a
 re-run never reshuffles the archive.
 
-⚠️ TWO of the eighteen slugs — `postgres-introduction` and `postgres-installation` — were
-published in February 2020 and therefore already carry dates that upsert_post will not overwrite.
-`--force-dates` stamps the manifest date onto an existing post before upserting it, which is what
-makes the rewritten track read in lesson order. Without it the archive buries the two rewritten
-posts six years under the other sixteen and the ‹ prev / next › pager reads nonsense.
+⚠️ `--force-dates` stamps the manifest date onto a post that already exists, before upserting it.
+Two situations need it, and the second is the one that surprises people.
 
-It is not the default: without it a re-run leaves the archive alone, which is the behaviour you
-want every other time. Expect to pass it exactly once per tree.
+The first is the original seed: `postgres-introduction` and `postgres-installation` were published
+2020-02-19 and already carry dates, so without it those two keep 2020 while the other sixteen take
+their manifest dates — the two rewrites land in the middle of the track instead of at its head and
+the ‹ prev / next › pager reads nonsense.
+
+The second is **any re-base of START_DATE afterwards**. `upsert_post` never overwrites an existing
+date, so once a post is published its date is sticky forever. After the first seed all eighteen are
+published, so a plain re-run moves none of them. This is NOT a one-off flag — the FastAPI track's
+2025 re-base is the commit that established it, after its docstring had promised the opposite.
+
+It is not the default, because leaving the archive alone is what you want when only a body changed.
 """
 
 import argparse
@@ -80,8 +86,9 @@ def main() -> int:
     parser.add_argument("--write", action="store_true",
                         help="actually write. Without it, only report what would happen.")
     parser.add_argument("--force-dates", action="store_true",
-                        help="stamp the manifest date onto posts that already exist. "
-                             "Needed once, to reorder the two rewritten 2020 posts.")
+                        help="stamp the manifest date onto posts that already exist. Needed on "
+                             "the first seed, and again after ANY change to START_DATE — a "
+                             "published date is sticky and a plain re-run moves nothing.")
     parser.add_argument("--only", default=None,
                         help="comma-separated slugs to seed, instead of the whole track. "
                              "For previewing a post while the rest are still unwritten — the "
@@ -130,14 +137,26 @@ def main() -> int:
             print(f"all {len(manifest.FROZEN_SLUGS)} frozen slugs present — "
                   "every rewrite lands on its existing URL")
 
-        # ⚠️ And the reverse: a NEW slug that already exists is not a new post, it is an
-        # accidental overwrite of somebody else's page. Post slugs are global across categories.
-        collisions = [slug for slug in sorted(manifest.NEW_SLUGS)
-                      if post_service.get_post(slug)]
-        if collisions:
+        # ⚠️ And the reverse: a NEW slug that already exists MAY be an accidental overwrite of
+        # somebody else's page, because post slugs are global across categories.
+        #
+        # "May be", not "is" — once this track has been seeded, every `new` slug exists and it is
+        # ours. What still has to fail is a slug sitting in a DIFFERENT category: upserting that
+        # would drag a stranger's page into /postgre and rewrite its body. So the check is on the
+        # category, not on mere existence. Keep it that way — reducing it to "warn if it exists"
+        # would wave a genuine collision through on the second seed and every seed after it.
+        taken = [(slug, existing["category"])
+                 for slug in sorted(manifest.NEW_SLUGS)
+                 if (existing := post_service.get_post(slug))]
+        foreign = [f"{slug} (in '{cat}')" for slug, cat in taken
+                   if cat != manifest.CATEGORY["slug"]]
+        if foreign:
             raise SystemExit(
-                "slugs marked `new` already exist in this tree: " + ", ".join(collisions) +
+                "slugs marked `new` already belong to another category: " + ", ".join(foreign) +
                 "\nSeeding would overwrite them. Either they are not new, or the slug is wrong.")
+        if taken:
+            print(f"{len(taken)} slug(s) marked `new` already exist in /"
+                  f"{manifest.CATEGORY['slug']} — this track has been seeded here before")
 
     # Fail early rather than half-seeding: every file must exist and no slug may already belong to
     # a different category.
