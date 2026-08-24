@@ -59,7 +59,9 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 9 | 81–90 | 3 — 81, 83, 88 | **live** since 2024-11 |
 | 10 | 91–100 | 4 — 91, 94, 98, 100 | **live** since 2024-11 |
 | 11 | 101–110 | 6 — 101, 102, 103, 104, 105, 110 | **live** since 2024-11 |
-| 12 | 111–120 | 5 — 111, 112, 114, 118, 119 | not started |
+| 12 | 111–120 | 5 — 111, 112, 114, 118, 119 | **live** since 2024-11/12 |
+| 13 | 121–130 | 3 — 122, 124, 125 (121 is already live) | not started |
+| 14 | 131–140 | 6 — 131, 133, 134, 136, 138, 139 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -91,14 +93,14 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 68 posts:
+Current distribution across the 73 posts:
 
 | Algorithm | Posts |
 |---|---|
+| Graph Theory | 14 |
+| Dynamic Programming | 12 |
 | Implementation | 11 |
-| Graph Theory | 11 |
 | Strings | 10 |
-| Dynamic Programming | 10 |
 | Recursion | 9 |
 | Sorting | 8 |
 | Searching | 6 |
@@ -164,8 +166,30 @@ reflex. Round 8 needed only four slots and the 12 days left after round 7 were p
 was moved. Round 10 was where it finally ran out, and rather than nudge 121 again the **whole
 interview-essentials block moved at once**: 121 to `2024-12-08`, 200 to `2024-12-14`, 347 to
 `2024-12-21`, 543 left at `2024-12-28`. The repo holds 15 posts numbered 91–120 that must sort
-before 121, so one operation buys rounds 10, 11 and 12 instead of three separate ones. Round 11 took `2024-11-14` to `2024-11-23`; round 12 has `2024-11-27` to `2024-12-08`
-left, which fits its five posts.
+before 121, so one operation buys rounds 10, 11 and 12 instead of three separate ones. Round 11 took `2024-11-14` to `2024-11-23` and round 12 `2024-11-24` to `2024-12-05`, which
+exhausted the reservation.
+
+### Where the window stands now
+
+The numbered rounds have caught up with the interview-essentials posts, so from here each round has
+to fit into the gap before the next one:
+
+| Gap | Days | Next round to use it |
+|---|---|---|
+| 121 (`2024-12-08`) → 200 (`2024-12-14`) | 6 | round 13 — three posts, fits |
+| 200 → 347 (`2024-12-21`) | 7 | round 14 — six posts, tight |
+| 347 → 543 (`2024-12-28`) | 7 | round 15 |
+| after 543 | 3 to year end | round 16 onward — **nothing left** |
+
+Round 13 is fine. Round 16 is not, and no amount of shuffling fixes it, because the repo holds
+roughly 240 more numbered problems and 2024 has three days left in it. **This needs a decision about
+the brief**, not another `--redate`:
+
+- **Re-spread the whole track** across 2022–2024. Rounds 1–5 are spaced generously; compressing them
+  frees months. It re-dates every published post once, which is one archive churn rather than a
+  recurring one.
+- **Let later rounds run past 2024.** The original instruction said 2022–2024, which was written when
+  the track was 27 posts and no one expected 300.
 
 **The 2022–2024 window is the real constraint and it is nearly spent.** Only 55 of roughly 300
 numbered problems in the repo are published, and the track already spans March 2022 to December 2024.

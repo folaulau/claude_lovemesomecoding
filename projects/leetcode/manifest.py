@@ -1069,6 +1069,86 @@ POSTS = [
             "exit for free."
         ),
     },
+    {
+        "number": 111,
+        "slug": "leetcode-111-minimum-depth-of-binary-tree",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 111 \u2013 Minimum Depth of Binary Tree",
+        "file": "111-minimum-depth-of-binary-tree.html",
+        "date": "2024-11-24T14:56:31",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "breadth-first-search", "depth-first-search"],
+        "excerpt": (
+            "The payoff for the trap set in problem 104: swapping max for min is wrong, because a "
+            "node with one child is not a leaf and its missing side still reports zero. A missing "
+            "child is infinity, not zero \u2014 and this is where BFS genuinely beats DFS, since it can "
+            "stop at the first leaf."
+        ),
+    },
+    {
+        "number": 112,
+        "slug": "leetcode-112-path-sum",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 112 \u2013 Path Sum",
+        "file": "112-path-sum.html",
+        "date": "2024-11-25T04:00:41",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
+        "excerpt": (
+            "A three-line recursion containing a base case almost everyone writes wrong. Returning "
+            "targetSum == 0 at a null accepts a path that stops at a non-leaf, and it passes the "
+            "examples while failing on a four-node tree. Null is not a leaf. Plus why negative "
+            "values kill the obvious pruning."
+        ),
+    },
+    {
+        "number": 114,
+        "slug": "leetcode-114-flatten-binary-tree-to-linked-list",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 114 \u2013 Flatten Binary Tree to Linked List",
+        "file": "114-flatten-binary-tree-to-linked-list.html",
+        "date": "2024-11-26T08:41:43",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "linked-list", "stack"],
+        "excerpt": (
+            "The best problem on the list for the idea that pointer surgery can replace a data "
+            "structure. Three solutions using O(n), O(h) and O(1) space \u2014 the last one splices the "
+            "right subtree onto the left subtree's rightmost node, which is Morris threading kept "
+            "rather than undone."
+        ),
+    },
+    {
+        "number": 118,
+        "slug": "leetcode-118-pascals-triangle",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 118 \u2013 Pascal's Triangle",
+        "file": "118-pascals-triangle.html",
+        "date": "2024-11-29T08:17:04",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "dynamic-programming"],
+        "excerpt": (
+            "The gentlest bottom-up DP there is, and on the list as the setup for its follow-up. "
+            "The edges are where the rule runs out of inputs rather than a special case bolted on, "
+            "the output size IS the complexity so there is nothing to optimise \u2014 which is exactly "
+            "why problem 119 asks for one row."
+        ),
+    },
+    {
+        "number": 119,
+        "slug": "leetcode-119-pascals-triangle-ii",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 119 \u2013 Pascal's Triangle II",
+        "file": "119-pascals-triangle-ii.html",
+        "date": "2024-12-05T01:41:56",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "dynamic-programming"],
+        "excerpt": (
+            "One row, in O(k) space, which turns a warm-up into a real exercise in updating an "
+            "array without destroying what you are about to read. Sweep right to left so the stale "
+            "values survive \u2014 the same rule that separates 0/1 knapsack from unbounded, and the "
+            "question is always which values the cell needs."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for

@@ -1729,6 +1729,158 @@ for n in range(1, 10):
             bad.append(xs)
 check("matches the naive definition on every small tree shape", bad, [])
 
+print("LeetCode 111 - Minimum Depth of Binary Tree")
+s = load("111-minimum-depth-of-binary-tree.html", extra=TREE)
+check("[3,9,20,null,null,15,7]", s.minDepth(build([3,9,20,None,None,15,7])), 2)
+check("[1,null,2] (THE case: 1 is not a leaf)", s.minDepth(build([1,None,2])), 2)
+check("[2,null,3,null,4,null,5,null,6] (right chain)",
+      s.minDepth(build([2,None,3,None,4,None,5,None,6])), 5)
+check("empty tree", s.minDepth(None), 0)
+check("single node", s.minDepth(build([1])), 1)
+check("[1,2,null,3] (left chain)", s.minDepth(build([1,2,None,3])), 3)
+check("[1,2,3]", s.minDepth(build([1,2,3])), 2)
+def min_depth_model(node):
+    if node is None:
+        return 0
+    if node.left is None and node.right is None:
+        return 1
+    best = float("inf")
+    if node.left:
+        best = min(best, min_depth_model(node.left))
+    if node.right:
+        best = min(best, min_depth_model(node.right))
+    return 1 + best
+
+bad = []
+for n in range(1, 10):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        if s.minDepth(build(xs)) != min_depth_model(build(xs)):
+            bad.append(xs)
+check("matches a leaf-aware model on every small tree shape", bad, [])
+# minDepth must never exceed maxDepth, and equals it exactly on perfect trees.
+maxd = load("104-maximum-depth-of-binary-tree.html", extra=TREE)
+bad = []
+for n in range(1, 9):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        if s.minDepth(build(xs)) > maxd.maxDepth(build(xs)):
+            bad.append(xs)
+check("minDepth never exceeds maxDepth", bad, [])
+check("equal on a perfect tree", s.minDepth(build([1,2,3,4,5,6,7])), maxd.maxDepth(build([1,2,3,4,5,6,7])))
+if hasattr(s, "minDepthBfs"):
+    bad = []
+    for n in range(1, 9):
+        for mask in range(1 << (n - 1)):
+            nxt = itertools.count(1)
+            xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+            if s.minDepthBfs(build(xs)) != s.minDepth(build(xs)):
+                bad.append(xs)
+    check("[BFS version] agrees with the recursion", bad, [])
+
+print("LeetCode 112 - Path Sum")
+s = load("112-path-sum.html", extra=TREE)
+big = build([5,4,8,11,None,13,4,7,2,None,None,None,1])
+check("the canonical example, target 22", s.hasPathSum(big, 22), True)
+check("same tree, target 26 (5+8+13)", s.hasPathSum(big, 26), True)
+check("same tree, target 100", s.hasPathSum(big, 100), False)
+check("[1,2,3] target 5", s.hasPathSum(build([1,2,3]), 5), False)
+check("[1,2,3] target 3", s.hasPathSum(build([1,2,3]), 3), True)
+check("empty tree, target 0 (no path at all)", s.hasPathSum(None, 0), False)
+check("[1,2] target 1 -- THE base-case bug", s.hasPathSum(build([1,2]), 1), False)
+check("[1,2] target 3", s.hasPathSum(build([1,2]), 3), True)
+check("[-2,null,-3] target -5 (negatives)", s.hasPathSum(build([-2,None,-3]), -5), True)
+check("single node matching", s.hasPathSum(build([7]), 7), True)
+check("single node not matching", s.hasPathSum(build([7]), 0), False)
+# Enumerate every root-to-leaf path and check membership.
+def leaf_paths(node, acc=0):
+    if node is None:
+        return []
+    acc += node.val
+    if node.left is None and node.right is None:
+        return [acc]
+    return leaf_paths(node.left, acc) + leaf_paths(node.right, acc)
+
+bad = []
+for n in range(1, 8):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        sums = set(leaf_paths(build(xs)))
+        for target in range(-2, 20):
+            if s.hasPathSum(build(xs), target) != (target in sums):
+                bad.append((xs, target))
+check("matches root-to-leaf path enumeration on every small tree", bad, [])
+
+print("LeetCode 114 - Flatten Binary Tree to Linked List")
+s = load("114-flatten-binary-tree-to-linked-list.html", extra=TREE)
+def flat(xs):
+    tree = build(xs)
+    s.flatten(tree)
+    out, node = [], tree
+    while node:
+        if node.left is not None:
+            return ("left pointer not nulled", out)
+        out.append(node.val)
+        node = node.right
+    return out
+
+def preorder_of(xs):
+    def walk(n):
+        return [] if n is None else [n.val] + walk(n.left) + walk(n.right)
+    return walk(build(xs))
+
+check("[1,2,5,3,4,null,6]", flat([1,2,5,3,4,None,6]), [1,2,3,4,5,6])
+check("empty tree", flat([]), [])
+check("single node", flat([0]), [0])
+check("already a right chain", flat([1,None,2,None,3]), [1,2,3])
+check("pure left chain", flat([1,2,None,3]), [1,2,3])
+check("returns None (mutates in place)", s.flatten(build([1,2,3])), None)
+bad = []
+for n in range(1, 10):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        if flat(xs) != preorder_of(xs):
+            bad.append((xs, flat(xs), preorder_of(xs)))
+check("equals preorder with every left pointer nulled, on every small tree", bad, [])
+
+print("LeetCode 118 - Pascal's Triangle")
+s = load("118-pascals-triangle.html")
+check("numRows=5", s.generate(5), [[1],[1,1],[1,2,1],[1,3,3,1],[1,4,6,4,1]])
+check("numRows=1", s.generate(1), [[1]])
+check("numRows=0", s.generate(0), [])
+bad = []
+for n in range(0, 31):
+    rows = s.generate(n)
+    if len(rows) != n:
+        bad.append(("count", n)); continue
+    for r, row in enumerate(rows):
+        if len(row) != r + 1:
+            bad.append(("width", n, r)); break
+        if row[0] != 1 or row[-1] != 1:
+            bad.append(("edges", n, r)); break
+        if row != [math.comb(r, c) for c in range(r + 1)]:
+            bad.append(("values", n, r)); break
+check("every row matches the binomial coefficients, for numRows 0..30", bad, [])
+
+print("LeetCode 119 - Pascal's Triangle II")
+s = load("119-pascals-triangle-ii.html")
+check("rowIndex=3", s.getRow(3), [1,3,3,1])
+check("rowIndex=0", s.getRow(0), [1])
+check("rowIndex=1", s.getRow(1), [1,1])
+check("rowIndex=4", s.getRow(4), [1,4,6,4,1])
+bad = [k for k in range(0, 34) if s.getRow(k) != [math.comb(k, c) for c in range(k + 1)]]
+check("matches the binomial coefficients for rowIndex 0..33", bad, [])
+# Must agree with problem 118's last row.
+triangle = load("118-pascals-triangle.html")
+bad = [k for k in range(0, 31) if s.getRow(k) != triangle.generate(k + 1)[-1]]
+check("agrees with the last row of problem 118 for every rowIndex 0..30", bad, [])
+check("reusable: two calls give the same row", (s.getRow(5), s.getRow(5)),
+      ([1,5,10,10,5,1], [1,5,10,10,5,1]))
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

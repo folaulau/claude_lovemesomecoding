@@ -105,6 +105,11 @@ solution("103-binary-tree-zigzag-level-order-traversal.html", "S103")
 solution("104-maximum-depth-of-binary-tree.html", "S104")
 solution("105-construct-binary-tree-from-preorder-and-inorder-traversal.html", "S105")
 solution("110-balanced-binary-tree.html", "S110")
+solution("111-minimum-depth-of-binary-tree.html", "S111")
+solution("112-path-sum.html", "S112")
+solution("114-flatten-binary-tree-to-linked-list.html", "S114")
+solution("118-pascals-triangle.html", "S118")
+solution("119-pascals-triangle-ii.html", "S119")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -221,6 +226,9 @@ fragment("100-same-tree.html", -1, "S100Iterative")
 
 # LeetCode 101: the queue-of-pairs variant, presented as a loose method.
 fragment("101-symmetric-tree.html", -1, "S101Iterative")
+
+# LeetCode 112: the two-parallel-stacks variant, presented as a loose method.
+fragment("112-path-sum.html", -1, "S112Iterative")
 
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
@@ -483,6 +491,32 @@ public class Main {
             out.add(xs);
         }
         return out;
+    }
+
+    /** Leaf-aware minimum depth, as an independent model. */
+    static int minDepthModel(TreeNode node) {
+        if (node == null) return 0;
+        if (node.left == null && node.right == null) return 1;
+        int best = Integer.MAX_VALUE;
+        if (node.left != null) best = Math.min(best, minDepthModel(node.left));
+        if (node.right != null) best = Math.min(best, minDepthModel(node.right));
+        return 1 + best;
+    }
+
+    /** Every root-to-leaf path sum. */
+    static void leafSums(TreeNode node, int acc, Set<Integer> out) {
+        if (node == null) return;
+        acc += node.val;
+        if (node.left == null && node.right == null) { out.add(acc); return; }
+        leafSums(node.left, acc, out);
+        leafSums(node.right, acc, out);
+    }
+
+    /** Binomial coefficient, built multiplicatively so it does not overflow early. */
+    static int binomial(int n, int k) {
+        long r = 1;
+        for (int i = 1; i <= k; i++) r = r * (n - k + i) / i;
+        return (int) r;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -2183,6 +2217,121 @@ public class Main {
             for (Integer[] xs : treeShapesOfSize(n))
                 if (s110.isBalanced(buildTree(xs)) != balancedModel(buildTree(xs))) balBad++;
         check("matches the naive definition on every small tree shape", balBad, 0);
+
+        System.out.println("LeetCode 111 - Minimum Depth of Binary Tree");
+        S111 s111 = new S111();
+        check("[3,9,20,null,null,15,7]", s111.minDepth(buildTree(3,9,20,null,null,15,7)), 2);
+        check("[1,null,2] (THE case: 1 is not a leaf)", s111.minDepth(buildTree(1,null,2)), 2);
+        check("right chain of 5", s111.minDepth(buildTree(2,null,3,null,4,null,5,null,6)), 5);
+        check("empty tree", s111.minDepth(null), 0);
+        check("single node", s111.minDepth(buildTree(1)), 1);
+        check("[1,2,null,3] (left chain)", s111.minDepth(buildTree(1,2,null,3)), 3);
+        int minDepthBad = 0, vsMaxBad = 0;
+        S104 s104ref = new S104();
+        for (int n = 1; n <= 9; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                if (s111.minDepth(buildTree(xs)) != minDepthModel(buildTree(xs))) minDepthBad++;
+                if (s111.minDepth(buildTree(xs)) > s104ref.maxDepth(buildTree(xs))) vsMaxBad++;
+            }
+        }
+        check("matches a leaf-aware model on every small tree shape", minDepthBad, 0);
+        check("minDepth never exceeds maxDepth", vsMaxBad, 0);
+        check("equal on a perfect tree",
+              s111.minDepth(buildTree(1,2,3,4,5,6,7)), s104ref.maxDepth(buildTree(1,2,3,4,5,6,7)));
+
+        System.out.println("LeetCode 112 - Path Sum");
+        S112 s112 = new S112();
+        S112Iterative s112i = new S112Iterative();
+        TreeNode pathTree = buildTree(5,4,8,11,null,13,4,7,2,null,null,null,1);
+        check("the canonical example, target 22", s112.hasPathSum(pathTree, 22), true);
+        check("same tree, target 26", s112.hasPathSum(pathTree, 26), true);
+        check("same tree, target 100", s112.hasPathSum(pathTree, 100), false);
+        check("[1,2,3] target 5", s112.hasPathSum(buildTree(1,2,3), 5), false);
+        check("[1,2,3] target 3", s112.hasPathSum(buildTree(1,2,3), 3), true);
+        check("empty tree, target 0 (no path at all)", s112.hasPathSum(null, 0), false);
+        check("[1,2] target 1 -- THE base-case bug", s112.hasPathSum(buildTree(1,2), 1), false);
+        check("[1,2] target 3", s112.hasPathSum(buildTree(1,2), 3), true);
+        check("[-2,null,-3] target -5 (negatives)", s112.hasPathSum(buildTree(-2,null,-3), -5), true);
+        int pathBadCount = 0, pathIterBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                Set<Integer> sums = new HashSet<>();
+                leafSums(buildTree(xs), 0, sums);
+                for (int target = -2; target <= 20; target++) {
+                    boolean model = sums.contains(target);
+                    if (s112.hasPathSum(buildTree(xs), target) != model) pathBadCount++;
+                    if (s112i.hasPathSumIterative(buildTree(xs), target) != model) pathIterBad++;
+                }
+            }
+        }
+        check("matches root-to-leaf enumeration on every small tree", pathBadCount, 0);
+        check("[iterative] agrees on the same trees", pathIterBad, 0);
+
+        System.out.println("LeetCode 114 - Flatten Binary Tree to Linked List");
+        S114 s114 = new S114();
+        int flatBad = 0;
+        for (int n = 1; n <= 9; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                TreeNode t = buildTree(xs);
+                List<Integer> flatWant = new ArrayList<>();
+                preorderModel(t, flatWant);
+
+                TreeNode flat = buildTree(xs);
+                s114.flatten(flat);
+
+                List<Integer> got = new ArrayList<>();
+                boolean leftNulled = true;
+                for (TreeNode node = flat; node != null; node = node.right) {
+                    if (node.left != null) leftNulled = false;
+                    got.add(node.val);
+                }
+                if (!leftNulled || !got.equals(flatWant)) flatBad++;
+            }
+        }
+        check("equals preorder with every left pointer nulled, on every small tree", flatBad, 0);
+        TreeNode single = buildTree(0);
+        s114.flatten(single);
+        check("single node", single.val + "," + (single.left == null) + "," + (single.right == null),
+              "0,true,true");
+        s114.flatten(null);   // must not throw
+        check("empty tree does not throw", true, true);
+
+        System.out.println("LeetCode 118 - Pascal's Triangle");
+        S118 s118 = new S118();
+        check("numRows=5", s118.generate(5),
+              List.of(List.of(1), List.of(1,1), List.of(1,2,1), List.of(1,3,3,1), List.of(1,4,6,4,1)));
+        check("numRows=1", s118.generate(1), List.of(List.of(1)));
+        check("numRows=0", s118.generate(0), List.of());
+        int triBad = 0;
+        for (int n = 0; n <= 30; n++) {
+            List<List<Integer>> rows = s118.generate(n);
+            if (rows.size() != n) { triBad++; continue; }
+            for (int r = 0; r < n; r++) {
+                List<Integer> row = rows.get(r);
+                if (row.size() != r + 1) { triBad++; break; }
+                for (int c = 0; c <= r; c++)
+                    if (row.get(c) != binomial(r, c)) { triBad++; break; }
+            }
+        }
+        check("every row matches the binomial coefficients, for numRows 0..30", triBad, 0);
+
+        System.out.println("LeetCode 119 - Pascal's Triangle II");
+        S119 s119 = new S119();
+        check("rowIndex=3", s119.getRow(3), List.of(1,3,3,1));
+        check("rowIndex=0", s119.getRow(0), List.of(1));
+        check("rowIndex=1", s119.getRow(1), List.of(1,1));
+        check("rowIndex=4", s119.getRow(4), List.of(1,4,6,4,1));
+        int pascalRowBad = 0, pascalAgreeBad = 0;
+        for (int k = 0; k <= 30; k++) {
+            List<Integer> row = s119.getRow(k);
+            if (row.size() != k + 1) { pascalRowBad++; continue; }
+            for (int c = 0; c <= k; c++) if (row.get(c) != binomial(k, c)) { pascalRowBad++; break; }
+            if (!row.equals(s118.generate(k + 1).get(k))) pascalAgreeBad++;
+        }
+        check("matches the binomial coefficients for rowIndex 0..30", pascalRowBad, 0);
+        check("agrees with the last row of problem 118", pascalAgreeBad, 0);
+        check("reusable: two calls give the same row",
+              s119.getRow(5).equals(s119.getRow(5)) && s119.getRow(5).equals(List.of(1,5,10,10,5,1)), true);
 
         System.out.println();
         if (failures > 0) {
