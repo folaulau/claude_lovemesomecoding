@@ -1554,6 +1554,181 @@ for xa in shapes[:60]:
             bad.append((xa, xb))
 check("matches an independent comparison on every pair of small trees", bad, [])
 
+print("LeetCode 101 - Symmetric Tree")
+s = load("101-symmetric-tree.html", extra=TREE)
+check("[1,2,2,3,4,4,3]", s.isSymmetric(build([1,2,2,3,4,4,3])), True)
+check("[1,2,2,null,3,null,3]", s.isSymmetric(build([1,2,2,None,3,None,3])), False)
+check("empty tree", s.isSymmetric(None), True)
+check("single node", s.isSymmetric(build([1])), True)
+check("[1,2,2] (mirrored leaves)", s.isSymmetric(build([1,2,2])), True)
+check("[1,2,3] (values differ)", s.isSymmetric(build([1,2,3])), False)
+check("[1,2,null] (one-sided)", s.isSymmetric(build([1,2,None])), False)
+# The tree that defeats the inorder-palindrome shortcut the post warns about.
+palindromic = ns94["TreeNode"](1)
+palindromic.left = ns94["TreeNode"](2); palindromic.left.left = ns94["TreeNode"](2)
+palindromic.right = ns94["TreeNode"](2); palindromic.right.left = ns94["TreeNode"](2)
+check("inorder is a palindrome but the tree is NOT symmetric",
+      (inorder_model(palindromic), s.isSymmetric(palindromic)), ([2, 2, 1, 2, 2], False))
+# Independent model: mirror the tree and compare.
+def mirror_model(a, b):
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return (a.val == b.val and mirror_model(a.left, b.right)
+            and mirror_model(a.right, b.left))
+
+bad = []
+for n in range(1, 8):
+    for vals in itertools.product([1, 2, None], repeat=n - 1):
+        xs = [1] + list(vals)
+        tree = build(xs)
+        want = tree is None or mirror_model(tree.left, tree.right)
+        if s.isSymmetric(build(xs)) != want:
+            bad.append(xs)
+check("matches a mirror model on every small tree", bad, [])
+
+print("LeetCode 102 - Binary Tree Level Order Traversal")
+s = load("102-binary-tree-level-order-traversal.html", extra=TREE)
+check("[3,9,20,null,null,15,7]",
+      s.levelOrder(build([3,9,20,None,None,15,7])), [[3],[9,20],[15,7]])
+check("empty tree returns [], not [[]]", s.levelOrder(None), [])
+check("single node", s.levelOrder(build([1])), [[1]])
+check("left chain", s.levelOrder(build([1,2,None,3])), [[1],[2],[3]])
+# Independent model by depth, on every small tree.
+def levels_model(node, depth=0, acc=None):
+    acc = [] if acc is None else acc
+    if node is None:
+        return acc
+    if depth == len(acc):
+        acc.append([])
+    acc[depth].append(node.val)
+    levels_model(node.left, depth + 1, acc)
+    levels_model(node.right, depth + 1, acc)
+    return acc
+
+bad = []
+for n in range(1, 9):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        if s.levelOrder(build(xs)) != levels_model(build(xs)):
+            bad.append(xs)
+check("matches a depth-indexed model on every small tree shape", bad, [])
+if hasattr(s, "levelOrderDfs"):
+    bad = [xs for xs in ([3,9,20,None,None,15,7], [1], [1,2,None,3], [1,2,3,4,5,6,7])
+           if s.levelOrderDfs(build(xs)) != s.levelOrder(build(xs))]
+    check("[DFS-by-depth version] agrees with BFS", bad, [])
+
+print("LeetCode 103 - Binary Tree Zigzag Level Order Traversal")
+s = load("103-binary-tree-zigzag-level-order-traversal.html", extra=TREE)
+check("[3,9,20,null,null,15,7]",
+      s.zigzagLevelOrder(build([3,9,20,None,None,15,7])), [[3],[20,9],[15,7]])
+check("empty tree", s.zigzagLevelOrder(None), [])
+check("single node", s.zigzagLevelOrder(build([1])), [[1]])
+check("four levels, so the alternation repeats",
+      s.zigzagLevelOrder(build([1,2,3,4,5,6,7,8])), [[1],[3,2],[4,5,6,7],[8]])
+# Must equal level order with every odd level reversed.
+plain = load("102-binary-tree-level-order-traversal.html", extra=TREE)
+bad = []
+for n in range(1, 9):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        want = [lvl if i % 2 == 0 else lvl[::-1]
+                for i, lvl in enumerate(plain.levelOrder(build(xs)))]
+        if s.zigzagLevelOrder(build(xs)) != want:
+            bad.append(xs)
+check("equals level order with every odd level reversed, on every small tree", bad, [])
+
+print("LeetCode 104 - Maximum Depth of Binary Tree")
+s = load("104-maximum-depth-of-binary-tree.html", extra=TREE)
+check("[3,9,20,null,null,15,7]", s.maxDepth(build([3,9,20,None,None,15,7])), 3)
+check("empty tree", s.maxDepth(None), 0)
+check("single node (depth counts NODES)", s.maxDepth(build([1])), 1)
+check("[1,null,2]", s.maxDepth(build([1,None,2])), 2)
+def depth_model(node):
+    return 0 if node is None else 1 + max(depth_model(node.left), depth_model(node.right))
+bad = []
+for n in range(1, 9):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        if s.maxDepth(build(xs)) != depth_model(build(xs)):
+            bad.append(xs)
+check("matches a recursive model on every small tree shape", bad, [])
+if hasattr(s, "maxDepthBfs"):
+    bad = []
+    for n in range(1, 8):
+        for mask in range(1 << (n - 1)):
+            nxt = itertools.count(1)
+            xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+            if s.maxDepthBfs(build(xs)) != s.maxDepth(build(xs)):
+                bad.append(xs)
+    check("[BFS version] agrees with the recursion", bad, [])
+
+print("LeetCode 105 - Construct Binary Tree from Preorder and Inorder")
+s = load("105-construct-binary-tree-from-preorder-and-inorder-traversal.html", extra=TREE)
+def preorder_model(node):
+    return [] if node is None else [node.val] + preorder_model(node.left) + preorder_model(node.right)
+
+def shape(node):
+    return None if node is None else (node.val, shape(node.left), shape(node.right))
+
+check("the canonical example",
+      shape(s.buildTree([3,9,20,15,7], [9,3,15,20,7])),
+      shape(build([3,9,20,None,None,15,7])))
+check("single node", shape(s.buildTree([1], [1])), shape(build([1])))
+check("empty input", s.buildTree([], []), None)
+check("left chain", shape(s.buildTree([1,2,3], [3,2,1])), shape(build([1,2,None,3])))
+check("right chain", shape(s.buildTree([1,2,3], [1,2,3])), shape(build([1,None,2,None,3])))
+# Round-trip: build a tree, take its traversals, reconstruct, compare shapes.
+bad = []
+for n in range(1, 9):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        original = build(xs)
+        pre, ino = preorder_model(original), inorder_model(original)
+        if shape(s.buildTree(pre, ino)) != shape(original):
+            bad.append(xs)
+check("round-trips every small tree through its own traversals", bad, [])
+# Instance state must be reset: a second call has to work.
+check("reusable: same object, two calls",
+      shape(s.buildTree([3,9,20,15,7], [9,3,15,20,7])),
+      shape(s.buildTree([3,9,20,15,7], [9,3,15,20,7])))
+
+print("LeetCode 110 - Balanced Binary Tree")
+s = load("110-balanced-binary-tree.html", extra=TREE)
+check("[3,9,20,null,null,15,7]", s.isBalanced(build([3,9,20,None,None,15,7])), True)
+check("[1,2,2,3,3,null,null,4,4]",
+      s.isBalanced(build([1,2,2,3,3,None,None,4,4])), False)
+check("empty tree", s.isBalanced(None), True)
+check("single node", s.isBalanced(build([1])), True)
+check("[1,2,null,3] (chain of 3)", s.isBalanced(build([1,2,None,3])), False)
+check("[1,2,3] ", s.isBalanced(build([1,2,3])), True)
+# Balanced at the root, unbalanced deeper: the case "at every node" is about.
+deep = ns94["TreeNode"](1)
+deep.left = ns94["TreeNode"](2); deep.right = ns94["TreeNode"](3)
+deep.left.left = ns94["TreeNode"](4); deep.left.left.left = ns94["TreeNode"](5)
+check("root looks fine, imbalance is deeper", s.isBalanced(deep), False)
+def balanced_model(node):
+    def h(n):
+        return 0 if n is None else 1 + max(h(n.left), h(n.right))
+    if node is None:
+        return True
+    return (abs(h(node.left) - h(node.right)) <= 1
+            and balanced_model(node.left) and balanced_model(node.right))
+
+bad = []
+for n in range(1, 10):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        if s.isBalanced(build(xs)) != balanced_model(build(xs)):
+            bad.append(xs)
+check("matches the naive definition on every small tree shape", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

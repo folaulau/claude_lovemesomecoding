@@ -58,7 +58,7 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 8 | 71–80 | 4 — 71, 72, 76, 78 | **live** since 2024-10/11 |
 | 9 | 81–90 | 3 — 81, 83, 88 | **live** since 2024-11 |
 | 10 | 91–100 | 4 — 91, 94, 98, 100 | **live** since 2024-11 |
-| 11 | 101–110 | 6 — 101, 102, 103, 104, 105, 110 | not started |
+| 11 | 101–110 | 6 — 101, 102, 103, 104, 105, 110 | **live** since 2024-11 |
 | 12 | 111–120 | 5 — 111, 112, 114, 118, 119 | not started |
 
 `seed.py --round N` publishes exactly one round.
@@ -91,17 +91,17 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 62 posts:
+Current distribution across the 68 posts:
 
 | Algorithm | Posts |
 |---|---|
 | Implementation | 11 |
+| Graph Theory | 11 |
 | Strings | 10 |
 | Dynamic Programming | 10 |
 | Recursion | 9 |
 | Sorting | 8 |
 | Searching | 6 |
-| Graph Theory | 5 |
 | Greedy | 2 |
 | Bit Manipulation | 1 |
 
@@ -164,8 +164,8 @@ reflex. Round 8 needed only four slots and the 12 days left after round 7 were p
 was moved. Round 10 was where it finally ran out, and rather than nudge 121 again the **whole
 interview-essentials block moved at once**: 121 to `2024-12-08`, 200 to `2024-12-14`, 347 to
 `2024-12-21`, 543 left at `2024-12-28`. The repo holds 15 posts numbered 91–120 that must sort
-before 121, so one operation buys rounds 10, 11 and 12 instead of three separate ones. Rounds 11 and
-12 have `2024-11-16` to `2024-12-08` to work with.
+before 121, so one operation buys rounds 10, 11 and 12 instead of three separate ones. Round 11 took `2024-11-14` to `2024-11-23`; round 12 has `2024-11-27` to `2024-12-08`
+left, which fits its five posts.
 
 **The 2022–2024 window is the real constraint and it is nearly spent.** Only 55 of roughly 300
 numbered problems in the repo are published, and the track already spans March 2022 to December 2024.

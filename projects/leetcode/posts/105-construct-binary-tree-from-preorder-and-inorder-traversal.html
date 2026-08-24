@@ -1,0 +1,190 @@
+<p>This is the problem that makes traversal orders click. Neither preorder nor inorder alone
+determines a tree — many different trees share each — but together they do, and the reason is a
+single sentence you should be able to say before writing anything.</p>
+
+<h2>The problem</h2>
+
+<p>Given the preorder and inorder traversals of a binary tree with <strong>distinct</strong> values,
+reconstruct the tree.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">preorder = [3, 9, 20, 15, 7]
+inorder  = [9, 3, 15, 20, 7]
+
+        3
+       / \        preorder: root, left subtree, right subtree
+      9   20      inorder:  left subtree, root, right subtree
+         /  \
+        15   7</code></pre>
+
+<p>"Distinct" is load-bearing and worth checking aloud. With duplicates the reconstruction is
+ambiguous, because you could not tell which occurrence of the root value in the inorder array is
+<em>the</em> root.</p>
+
+<h2>The two facts</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">preorder = [ROOT] [ ... left ... ] [ ... right ... ]
+inorder  = [ ... left ... ] [ROOT] [ ... right ... ]</code></pre>
+
+<p><strong>Preorder tells you the root. Inorder tells you the split.</strong> That is the whole
+algorithm. Take <code>preorder[0]</code> as the root, find it in the inorder array, and everything
+to its left is the left subtree while everything to its right is the right subtree. Recurse on both
+halves.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">root = preorder[0] = 3
+inorder: [9] 3 [15, 20, 7]
+          ^      ^
+     left subtree   right subtree, 3 nodes
+
+so preorder splits as: 3 | [9] | [20, 15, 7]
+                             ^      ^
+                        1 node   the remaining 3</code></pre>
+
+<p>The sizes come from the inorder split and then tell you where to cut the preorder array. That
+cross-reference is the mechanical heart of the problem.</p>
+
+<h2>Two things that make it O(n)</h2>
+
+<p><strong>Do not search the inorder array.</strong> Scanning for the root at every node is
+<code>O(n)</code> per call and <code>O(n²)</code> overall — quadratic on a degenerate tree, which is
+exactly the input designed to catch it. Build a <code>value → index</code> map once up front and each
+lookup becomes <code>O(1)</code>. This is the single change that matters.</p>
+
+<p><strong>Do not slice arrays.</strong> Passing <code>preorder[1:mid+1]</code> at every level copies
+<code>O(n)</code> elements per call and reintroduces the quadratic behaviour you just removed —
+quietly, since the code still looks linear. Pass index ranges instead.</p>
+
+<h2>The consumed-so-far pointer</h2>
+
+<p>The neat formulation keeps a single moving index into the preorder array. Because preorder visits
+root, then <em>all</em> of the left subtree, then the right, building the left subtree first leaves
+that index sitting exactly at the start of the right subtree:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">build(left, right):
+    root = preorder[preIndex++]
+    mid  = indexOf(root) in inorder
+    root.left  = build(left, mid - 1)      <- MUST be first
+    root.right = build(mid + 1, right)</code></pre>
+
+<p>Swap those two lines and the answer is wrong, with no error — the right subtree consumes the
+preorder values that belonged to the left. The ordering is not stylistic; it is the invariant.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution {
+    private int preIndex;
+    private Map&lt;Integer, Integer&gt; inorderIndex;
+
+    public TreeNode buildTree(int[] preorder, int[] inorder) {
+        // Reset both: without this, a second call on the same object starts
+        // partway through the preorder array and returns nonsense.
+        preIndex = 0;
+        inorderIndex = new HashMap&lt;&gt;();
+        for (int i = 0; i &lt; inorder.length; i++) {
+            inorderIndex.put(inorder[i], i);      // O(1) lookups instead of a scan
+        }
+
+        return build(preorder, 0, inorder.length - 1);
+    }
+
+    /** Builds the subtree occupying inorder[left..right]. */
+    private TreeNode build(int[] preorder, int left, int right) {
+        if (left &gt; right) return null;
+
+        int rootValue = preorder[preIndex++];
+        TreeNode root = new TreeNode(rootValue);
+        int mid = inorderIndex.get(rootValue);
+
+        root.left = build(preorder, left, mid - 1);    // left FIRST -- preIndex depends on it
+        root.right = build(preorder, mid + 1, right);
+
+        return root;
+    }
+}</code></pre>
+
+<p>The reset is not defensive padding. Instance state that survives between calls is a real bug
+class — the same one that made an earlier solution in this track return a stale answer on its second
+invocation — and an interviewer who calls your method twice will find it.</p>
+
+<p>If you would rather have no mutable state at all, the preorder start index can be computed instead
+of tracked: the left subtree has <code>mid - left</code> nodes, so the right subtree's preorder
+begins at <code>preStart + 1 + (mid - left)</code>. Four parameters instead of a field. Both are
+fine; say which trade you are making.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">class Solution:
+    def buildTree(self, preorder: list[int], inorder: list[int]) -&gt; TreeNode:
+        index_of = {value: i for i, value in enumerate(inorder)}
+        self.pre_index = 0
+
+        def build(left: int, right: int) -&gt; TreeNode:
+            if left &gt; right:
+                return None
+
+            root_value = preorder[self.pre_index]
+            self.pre_index += 1
+
+            root = TreeNode(root_value)
+            mid = index_of[root_value]
+
+            root.left = build(left, mid - 1)      # left first: pre_index advances in order
+            root.right = build(mid + 1, right)
+
+            return root
+
+        return build(0, len(inorder) - 1)</code></pre>
+
+<p><code>self.pre_index</code> is reassigned at the start of every call, so the reuse problem does
+not arise. A plain local would not work — the nested function would need <code>nonlocal</code>, which
+is the same mechanism <a href="/fundamental-problem/leetcode-543-diameter-of-binary-tree">Diameter of
+Binary Tree</a> needs and the same thing that silently breaks when it is forgotten.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th>Approach</th><th>Time</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Scan inorder each call</td><td><code>O(n²)</code></td><td><code>O(h)</code></td></tr>
+    <tr><td>Slice the arrays</td><td><code>O(n²)</code></td><td><code>O(n²)</code></td></tr>
+    <tr><td>Index map + ranges</td><td><code>O(n)</code></td><td><code>O(n)</code> map + <code>O(h)</code> stack</td></tr>
+  </tbody>
+</table>
+
+<p>Each node is created once and each preorder value consumed once. The map is <code>O(n)</code>
+space and buys a factor of <code>n</code> in time — the standard trade, and worth naming as such.</p>
+
+<h2>Which pairs of traversals are enough?</h2>
+
+<table>
+  <thead><tr><th>Given</th><th>Reconstructible?</th></tr></thead>
+  <tbody>
+    <tr><td>preorder + inorder</td><td>yes</td></tr>
+    <tr><td>postorder + inorder</td><td>yes — problem 106, root is the <em>last</em> preorder-style element</td></tr>
+    <tr><td>preorder + postorder</td><td><strong>not uniquely</strong> — ambiguous for nodes with one child</td></tr>
+  </tbody>
+</table>
+
+<p>Inorder is what supplies the split, so a pair without it cannot say which side a lone child sits
+on. Knowing that third row is the difference between having memorised the algorithm and having
+understood it.</p>
+
+<h2>The pattern</h2>
+
+<p><strong>Construct from Inorder and Postorder</strong> (106) is the mirror: consume postorder from
+the <em>back</em>, and build the <strong>right</strong> subtree first. <strong>Construct from
+Preorder and Postorder</strong> (889) returns any valid tree, precisely because the answer is not
+unique. <strong>Serialize and Deserialize</strong> (297) is the general version, and it works with a
+single traversal only because it writes the nulls down too — which is what removes the ambiguity.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That you state the two facts: preorder gives the root, inorder gives the split.</li>
+  <li>The hash map, and that you say why scanning is <code>O(n²)</code>.</li>
+  <li>Index ranges instead of array slices.</li>
+  <li>Left subtree built before right, and why swapping them silently breaks it.</li>
+  <li>That values must be distinct, and what breaks if they are not.</li>
+  <li>Empty input and a single node.</li>
+  <li>That instance state is reset, so a second call works.</li>
+  <li>Bonus: that preorder + postorder is <em>not</em> enough.</li>
+</ul>

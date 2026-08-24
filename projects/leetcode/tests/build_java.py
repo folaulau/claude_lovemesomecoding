@@ -99,6 +99,12 @@ solution("091-decode-ways.html", "S91")
 solution("094-binary-tree-inorder-traversal.html", "S94")
 solution("098-validate-binary-search-tree.html", "S98")
 solution("100-same-tree.html", "S100")
+solution("101-symmetric-tree.html", "S101")
+solution("102-binary-tree-level-order-traversal.html", "S102")
+solution("103-binary-tree-zigzag-level-order-traversal.html", "S103")
+solution("104-maximum-depth-of-binary-tree.html", "S104")
+solution("105-construct-binary-tree-from-preorder-and-inorder-traversal.html", "S105")
+solution("110-balanced-binary-tree.html", "S110")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -212,6 +218,9 @@ fragment("094-binary-tree-inorder-traversal.html", 0, "S94Recursive",
 
 # LeetCode 100: the queue-of-pairs variant, presented as a loose method.
 fragment("100-same-tree.html", -1, "S100Iterative")
+
+# LeetCode 101: the queue-of-pairs variant, presented as a loose method.
+fragment("101-symmetric-tree.html", -1, "S101Iterative")
 
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
@@ -423,6 +432,57 @@ public class Main {
         if (a == null && b == null) return true;
         if (a == null || b == null) return false;
         return a.val == b.val && sameModel(a.left, b.left) && sameModel(a.right, b.right);
+    }
+
+    static int depthModel(TreeNode node) {
+        return node == null ? 0 : 1 + Math.max(depthModel(node.left), depthModel(node.right));
+    }
+
+    static boolean balancedModel(TreeNode node) {
+        if (node == null) return true;
+        return Math.abs(depthModel(node.left) - depthModel(node.right)) <= 1
+                && balancedModel(node.left) && balancedModel(node.right);
+    }
+
+    static boolean mirrorModel(TreeNode a, TreeNode b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.val == b.val && mirrorModel(a.left, b.right) && mirrorModel(a.right, b.left);
+    }
+
+    static void preorderModel(TreeNode node, List<Integer> out) {
+        if (node == null) return;
+        out.add(node.val);
+        preorderModel(node.left, out);
+        preorderModel(node.right, out);
+    }
+
+    /** Structural rendering, so two trees can be compared as strings. */
+    static String shape(TreeNode node) {
+        if (node == null) return ".";
+        return "(" + node.val + " " + shape(node.left) + " " + shape(node.right) + ")";
+    }
+
+    /** Level-indexed traversal, as an independent model for problems 102 and 103. */
+    static void levelsModel(TreeNode node, int depth, List<List<Integer>> acc) {
+        if (node == null) return;
+        if (depth == acc.size()) acc.add(new ArrayList<>());
+        acc.get(depth).add(node.val);
+        levelsModel(node.left, depth + 1, acc);
+        levelsModel(node.right, depth + 1, acc);
+    }
+
+    /** Every distinct-valued tree shape on n slots, as level-order arrays. */
+    static List<Integer[]> treeShapesOfSize(int n) {
+        List<Integer[]> out = new ArrayList<>();
+        for (int mask = 0; mask < (1 << (n - 1)); mask++) {
+            Integer[] xs = new Integer[n];
+            int next = 1;
+            xs[0] = next++;
+            for (int i = 1; i < n; i++) xs[i] = (mask >> (i - 1) & 1) == 1 ? next++ : null;
+            out.add(xs);
+        }
+        return out;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -1986,6 +2046,143 @@ public class Main {
         }
         check("matches an independent comparison on every pair of small trees", sameBad, 0);
         check("[iterative] agrees on the same pairs", sameIterBad, 0);
+
+        System.out.println("LeetCode 101 - Symmetric Tree");
+        S101 s101 = new S101();
+        S101Iterative s101i = new S101Iterative();
+        check("[1,2,2,3,4,4,3]", s101.isSymmetric(buildTree(1,2,2,3,4,4,3)), true);
+        check("[1,2,2,null,3,null,3]", s101.isSymmetric(buildTree(1,2,2,null,3,null,3)), false);
+        check("empty tree", s101.isSymmetric(null), true);
+        check("single node", s101.isSymmetric(buildTree(1)), true);
+        check("[1,2,3] (values differ)", s101.isSymmetric(buildTree(1,2,3)), false);
+        // The tree that defeats the inorder-palindrome shortcut.
+        TreeNode palindromic = new TreeNode(1);
+        palindromic.left = new TreeNode(2); palindromic.left.left = new TreeNode(2);
+        palindromic.right = new TreeNode(2); palindromic.right.left = new TreeNode(2);
+        List<Integer> palSeq = new ArrayList<>();
+        inorderModel(palindromic, palSeq);
+        check("inorder is a palindrome but the tree is NOT symmetric",
+              palSeq + " " + s101.isSymmetric(palindromic), "[2, 2, 1, 2, 2] false");
+        int symBad = 0, symIterBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            int combos = (int) Math.pow(3, n - 1);
+            for (int mask = 0; mask < combos; mask++) {
+                Integer[] xs = new Integer[n];
+                xs[0] = 1;
+                int mm = mask;
+                for (int i = 1; i < n; i++) { int pick = mm % 3; mm /= 3; xs[i] = pick == 2 ? null : 1 + pick; }
+                TreeNode t = buildTree(xs);
+                boolean model = t == null || mirrorModel(t.left, t.right);
+                if (s101.isSymmetric(buildTree(xs)) != model) symBad++;
+                if (s101i.isSymmetricIterative(buildTree(xs)) != model) symIterBad++;
+            }
+        }
+        check("matches a mirror model on every small tree", symBad, 0);
+        check("[iterative] agrees on the same trees", symIterBad, 0);
+
+        System.out.println("LeetCode 102 - Binary Tree Level Order Traversal");
+        S102 s102 = new S102();
+        check("[3,9,20,null,null,15,7]",
+              s102.levelOrder(buildTree(3,9,20,null,null,15,7)),
+              List.of(List.of(3), List.of(9,20), List.of(15,7)));
+        check("empty tree returns [], not [[]]", s102.levelOrder(null), List.of());
+        check("single node", s102.levelOrder(buildTree(1)), List.of(List.of(1)));
+        check("left chain", s102.levelOrder(buildTree(1,2,null,3)),
+              List.of(List.of(1), List.of(2), List.of(3)));
+        int levelBad = 0;
+        for (int n = 1; n <= 8; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                List<List<Integer>> model = new ArrayList<>();
+                levelsModel(buildTree(xs), 0, model);
+                if (!s102.levelOrder(buildTree(xs)).equals(model)) levelBad++;
+            }
+        }
+        check("matches a depth-indexed model on every small tree shape", levelBad, 0);
+
+        System.out.println("LeetCode 103 - Binary Tree Zigzag Level Order Traversal");
+        S103 s103 = new S103();
+        check("[3,9,20,null,null,15,7]",
+              s103.zigzagLevelOrder(buildTree(3,9,20,null,null,15,7)),
+              List.of(List.of(3), List.of(20,9), List.of(15,7)));
+        check("empty tree", s103.zigzagLevelOrder(null), List.of());
+        check("single node", s103.zigzagLevelOrder(buildTree(1)), List.of(List.of(1)));
+        check("four levels, so the alternation repeats",
+              s103.zigzagLevelOrder(buildTree(1,2,3,4,5,6,7,8)),
+              List.of(List.of(1), List.of(3,2), List.of(4,5,6,7), List.of(8)));
+        int zigBad = 0;
+        for (int n = 1; n <= 8; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                List<List<Integer>> zigWant = new ArrayList<>();
+                for (List<Integer> lvl : s102.levelOrder(buildTree(xs))) {
+                    List<Integer> copy = new ArrayList<>(lvl);
+                    if (zigWant.size() % 2 == 1) Collections.reverse(copy);
+                    zigWant.add(copy);
+                }
+                if (!s103.zigzagLevelOrder(buildTree(xs)).equals(zigWant)) zigBad++;
+            }
+        }
+        check("equals level order with every odd level reversed, on every small tree", zigBad, 0);
+
+        System.out.println("LeetCode 104 - Maximum Depth of Binary Tree");
+        S104 s104 = new S104();
+        check("[3,9,20,null,null,15,7]", s104.maxDepth(buildTree(3,9,20,null,null,15,7)), 3);
+        check("empty tree", s104.maxDepth(null), 0);
+        check("single node (depth counts NODES)", s104.maxDepth(buildTree(1)), 1);
+        check("[1,null,2]", s104.maxDepth(buildTree(1,null,2)), 2);
+        int depthBad = 0;
+        for (int n = 1; n <= 8; n++)
+            for (Integer[] xs : treeShapesOfSize(n))
+                if (s104.maxDepth(buildTree(xs)) != depthModel(buildTree(xs))) depthBad++;
+        check("matches a recursive model on every small tree shape", depthBad, 0);
+
+        System.out.println("LeetCode 105 - Construct Binary Tree from Preorder and Inorder");
+        S105 s105 = new S105();
+        check("the canonical example",
+              shape(s105.buildTree(new int[]{3,9,20,15,7}, new int[]{9,3,15,20,7})),
+              shape(buildTree(3,9,20,null,null,15,7)));
+        check("single node", shape(s105.buildTree(new int[]{1}, new int[]{1})), shape(buildTree(1)));
+        check("empty input", s105.buildTree(new int[]{}, new int[]{}), null);
+        check("left chain", shape(s105.buildTree(new int[]{1,2,3}, new int[]{3,2,1})),
+              shape(buildTree(1,2,null,3)));
+        check("right chain", shape(s105.buildTree(new int[]{1,2,3}, new int[]{1,2,3})),
+              shape(buildTree(1,null,2,null,3)));
+        int buildBad = 0;
+        for (int n = 1; n <= 8; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                TreeNode original = buildTree(xs);
+                List<Integer> pre = new ArrayList<>(), ino = new ArrayList<>();
+                preorderModel(original, pre);
+                inorderModel(original, ino);
+                int[] preArr = pre.stream().mapToInt(Integer::intValue).toArray();
+                int[] inoArr = ino.stream().mapToInt(Integer::intValue).toArray();
+                if (!shape(s105.buildTree(preArr, inoArr)).equals(shape(original))) buildBad++;
+            }
+        }
+        check("round-trips every small tree through its own traversals", buildBad, 0);
+        // Instance state must be reset -- a second call on the same object has to work.
+        check("reusable: same object, two calls",
+              shape(s105.buildTree(new int[]{3,9,20,15,7}, new int[]{9,3,15,20,7})),
+              shape(s105.buildTree(new int[]{3,9,20,15,7}, new int[]{9,3,15,20,7})));
+
+        System.out.println("LeetCode 110 - Balanced Binary Tree");
+        S110 s110 = new S110();
+        check("[3,9,20,null,null,15,7]", s110.isBalanced(buildTree(3,9,20,null,null,15,7)), true);
+        check("[1,2,2,3,3,null,null,4,4]",
+              s110.isBalanced(buildTree(1,2,2,3,3,null,null,4,4)), false);
+        check("empty tree", s110.isBalanced(null), true);
+        check("single node", s110.isBalanced(buildTree(1)), true);
+        check("[1,2,null,3] (chain of 3)", s110.isBalanced(buildTree(1,2,null,3)), false);
+        // Balanced at the root, unbalanced deeper -- what "at every node" means.
+        TreeNode deepImbalance = new TreeNode(1);
+        deepImbalance.left = new TreeNode(2); deepImbalance.right = new TreeNode(3);
+        deepImbalance.left.left = new TreeNode(4);
+        deepImbalance.left.left.left = new TreeNode(5);
+        check("root looks fine, imbalance is deeper", s110.isBalanced(deepImbalance), false);
+        int balBad = 0;
+        for (int n = 1; n <= 9; n++)
+            for (Integer[] xs : treeShapesOfSize(n))
+                if (s110.isBalanced(buildTree(xs)) != balancedModel(buildTree(xs))) balBad++;
+        check("matches the naive definition on every small tree shape", balBad, 0);
 
         System.out.println();
         if (failures > 0) {

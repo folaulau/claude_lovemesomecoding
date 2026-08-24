@@ -973,6 +973,102 @@ POSTS = [
             "null dereference."
         ),
     },
+    {
+        "number": 101,
+        "slug": "leetcode-101-symmetric-tree",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 101 \u2013 Symmetric Tree",
+        "file": "101-symmetric-tree.html",
+        "date": "2024-11-14T18:05:22",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
+        "excerpt": (
+            "Same Tree with two characters changed, and worth doing straight after it for exactly "
+            "that reason. Symmetry is a property of a PAIR of nodes, so the recursion takes two "
+            "arguments and crosses them. Plus the inorder-palindrome shortcut, and the tree that "
+            "kills it."
+        ),
+    },
+    {
+        "number": 102,
+        "slug": "leetcode-102-binary-tree-level-order-traversal",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 102 \u2013 Binary Tree Level Order Traversal",
+        "file": "102-binary-tree-level-order-traversal.html",
+        "date": "2024-11-15T02:28:19",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "breadth-first-search", "queue"],
+        "excerpt": (
+            "The problem that teaches BFS on trees, and everything depends on one line: capture the "
+            "queue's size BEFORE draining the level. Looping on queue.size() re-evaluates a moving "
+            "target and takes a meaningless slice. Also why deque beats a list in Python by a whole "
+            "factor of n."
+        ),
+    },
+    {
+        "number": 103,
+        "slug": "leetcode-103-binary-tree-zigzag-level-order-traversal",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 103 \u2013 Binary Tree Zigzag Level Order Traversal",
+        "file": "103-binary-tree-zigzag-level-order-traversal.html",
+        "date": "2024-11-15T10:29:53",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "breadth-first-search", "queue"],
+        "excerpt": (
+            "Level order with the direction alternating, and the answer people reach for first \u2014 "
+            "reversing the queue \u2014 is the one that breaks. How you traverse and how you report are "
+            "different things, and modifying the traversal to change the output is a category "
+            "error."
+        ),
+    },
+    {
+        "number": 104,
+        "slug": "leetcode-104-maximum-depth-of-binary-tree",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 104 \u2013 Maximum Depth of Binary Tree",
+        "file": "104-maximum-depth-of-binary-tree.html",
+        "date": "2024-11-17T05:54:48",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
+        "excerpt": (
+            "Three lines, and the smallest problem where the recursive shape of tree algorithms is "
+            "visible. The real value is the trap it sets up: swapping max for min does NOT give "
+            "minimum depth, because a node with one child is not a leaf and the null branch reports "
+            "a path ending in mid-air."
+        ),
+    },
+    {
+        "number": 105,
+        "slug": "leetcode-105-construct-binary-tree-from-preorder-and-inorder-traversal",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 105 \u2013 Construct Binary Tree from Preorder and Inorder Traversal",
+        "file": "105-construct-binary-tree-from-preorder-and-inorder-traversal.html",
+        "date": "2024-11-22T00:19:17",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "hash-table", "divide-and-conquer"],
+        "excerpt": (
+            "The problem that makes traversal orders click: preorder tells you the root, inorder "
+            "tells you the split. Why the hash map is what makes it O(n), why slicing arrays "
+            "quietly reintroduces the quadratic, why the left subtree must be built first, and why "
+            "preorder plus postorder is not enough."
+        ),
+    },
+    {
+        "number": 110,
+        "slug": "leetcode-110-balanced-binary-tree",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 110 \u2013 Balanced Binary Tree",
+        "file": "110-balanced-binary-tree.html",
+        "date": "2024-11-23T17:51:05",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
+        "excerpt": (
+            "A correct answer most people write and a better one the same length. The gap is one "
+            "idea: make the return value carry two things. Heights are never negative, so -1 is a "
+            "free sentinel for \"unbalanced\" \u2014 and that turns O(n log n) into O(n) with an early "
+            "exit for free."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for
