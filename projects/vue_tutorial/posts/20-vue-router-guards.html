@@ -1,0 +1,198 @@
+<p>A guard runs before a navigation completes and can allow it, redirect it, or cancel it. It is how
+you keep people out of pages they are not allowed to see, and how you stop them leaving a page with
+unsaved work.</p>
+
+<h2>A global guard</h2>
+
+<p>The demo application's entire admin authorisation is nine lines:</p>
+
+<pre class="language-javascript"><code class="language-javascript">router.beforeEach((to) =&gt; {
+  const auth = useAuthStore();
+
+  if (to.meta.requiresAuth &amp;&amp; !auth.isAuthenticated) {
+    // Remember where they were headed so login can bounce them back.
+    return { name: "admin-login", query: { redirect: to.fullPath } };
+  }
+
+  if (to.meta.requiresAdmin &amp;&amp; !auth.isAdmin) {
+    return { name: "admin-dashboard" };
+  }
+
+  return true;
+});</code></pre>
+
+<p>Read the return values, because they are the whole API:</p>
+
+<p><strong>Return <code>true</code> or nothing</strong> — allow the navigation.</p>
+
+<p><strong>Return a route location</strong> — redirect there instead.</p>
+
+<p><strong>Return <code>false</code></strong> — cancel it, and the URL stays where it was.</p>
+
+<p>Vue Router 4 uses return values rather than the <code>next()</code> callback Vue Router 3 used.
+<code>next()</code> still works and is deprecated; if you see a tutorial calling <code>next()</code>
+three times in one guard — a classic source of "the navigation happened twice" bugs — it predates
+this.</p>
+
+<h3>Preserving where they were going</h3>
+
+<p>The redirect carries <code>query: { redirect: to.fullPath }</code>, and the login view spends it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">async function submit() {
+  try {
+    await auth.login(email.value, password.value);
+    // Honour ?redirect= so a deep link into the admin survives the login hop.
+    router.push(route.query.redirect ?? { name: "admin-dashboard" });
+  } catch {
+    /* auth.error is rendered below */
+  }
+}</code></pre>
+
+<p>Someone who clicks a link to <code>/admin/reels/abc123</code> while signed out lands on the login
+page and is returned to that exact reel afterwards, rather than being dumped on the dashboard to find
+their way back. It is a few extra characters and it is the difference between an application that feels
+considered and one that does not.</p>
+
+<h3>Guards are convenience, not security</h3>
+
+<p>Worth being blunt about. Everything in a guard runs in the browser, where the user can change it. The
+guard's job is to avoid showing a page that will fail; the server's job is to refuse the data. The demo
+application enforces the same roles on the backend, and the comment in its auth store says exactly that
+— the client-side check exists so the UI does not offer buttons that are going to come back 403.</p>
+
+<h2>meta drives it</h2>
+
+<p>The guard reads <code>to.meta</code>, and the route table declares intent:</p>
+
+<pre class="language-javascript"><code class="language-javascript">    path: "/admin",
+    component: AdminLayout,
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: "",
+        name: "admin-dashboard",
+        component: () =&gt; import("../views/admin/DashboardView.vue"),
+        meta: { title: "Dashboard" },
+      },
+      {
+        path: "reels",
+        name: "admin-reels",
+        component: () =&gt; import("../views/admin/ReelListView.vue"),
+        meta: { title: "Reels" },
+      },
+      {
+        path: "reels/new",
+        name: "admin-reel-new",
+        component: () =&gt; import("../views/admin/ReelEditView.vue"),
+        meta: { title: "New reel" },
+      },
+      {
+        path: "reels/:id",
+        name: "admin-reel-edit",
+        component: () =&gt; import("../views/admin/ReelEditView.vue"),
+        meta: { title: "Edit reel" },
+      },
+      {
+        path: "collections",
+        name: "admin-collections",
+        component: () =&gt; import("../views/admin/CollectionListView.vue"),
+        meta: { title: "Collections" },
+      },
+      {
+        path: "creators",
+        name: "admin-creators",
+        component: () =&gt; import("../views/admin/CreatorListView.vue"),
+        // ADMIN only: a creator has no business renaming other creators.
+        meta: { title: "Creators", requiresAdmin: true },
+      },
+    ],
+  },</code></pre>
+
+<p><strong><code>meta</code> is merged from the whole matched chain</strong>, so
+<code>requiresAuth</code> on the parent covers every child without being repeated. That is what makes
+this approach scale: a page added under <code>/admin</code> is protected by default, and forgetting to
+protect it is not a thing you can do.</p>
+
+<p>Compare with putting the check in each view's <code>onMounted</code> — a check per page, running
+after the component has already mounted and possibly fetched, and one careless merge away from being
+missed.</p>
+
+<h2>afterEach</h2>
+
+<p>Runs after a navigation is confirmed. It cannot change anything, which makes it right for side
+effects:</p>
+
+<pre class="language-javascript"><code class="language-javascript">router.afterEach((to) =&gt; {
+  document.title = to.meta.title ? `${to.meta.title} · ReelCMS` : "ReelCMS";
+});</code></pre>
+
+<p>The document title, in one place, driven by the same <code>meta</code> the guard reads. This is also
+where analytics page views belong.</p>
+
+<h2>The other guards</h2>
+
+<p><strong>Per-route</strong>, when only one route needs it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{
+  path: "/admin/reels/:id",
+  component: ReelEditView,
+  beforeEnter: (to) =&gt; {
+    if (!/^[a-f0-9]{24}$/.test(to.params.id)) return { name: "not-found" };
+  },
+}</code></pre>
+
+<p><strong>In-component</strong>, for the case that actually matters — leaving a page with unsaved
+changes:</p>
+
+<pre class="language-vue"><code class="language-vue">&lt;script setup&gt;
+import { onBeforeRouteLeave } from "vue-router";
+
+onBeforeRouteLeave(() =&gt; {
+  if (!isDirty.value) return true;
+  // Returning false cancels the navigation and the URL does not change.
+  return window.confirm("You have unsaved changes. Leave anyway?");
+});
+&lt;/script&gt;</code></pre>
+
+<p>A guard may return a promise, so a real application answers this with its own modal rather than
+<code>window.confirm</code> — resolve the promise with the user's choice.</p>
+
+<p>Note this only covers navigation <em>within</em> the app. Closing the tab or typing a new URL is the
+browser's <code>beforeunload</code> event, which is a separate thing you have to add yourself.</p>
+
+<p><code>onBeforeRouteUpdate</code> is the third: it fires when the route changes but the component is
+reused — <code>/r/one</code> to <code>/r/two</code>. Same problem the watcher in lesson 19 solves, and
+either answer is fine.</p>
+
+<h2>Order of execution</h2>
+
+<p>For a full navigation:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">onBeforeRouteLeave      (component being left)
+beforeEach              (global)
+beforeEnter             (route)
+setup / component created
+beforeResolve           (global, after all component guards)
+--- navigation confirmed ---
+afterEach               (global)</code></pre>
+
+<h2>Async guards</h2>
+
+<p>A guard can be <code>async</code>, and the navigation waits:</p>
+
+<pre class="language-javascript"><code class="language-javascript">router.beforeEach(async (to) =&gt; {
+  const auth = useAuthStore();
+  // Only on the first navigation -- restore a session from a refresh token
+  // before deciding whether this person is allowed in.
+  if (!auth.ready) await auth.restore();
+  if (to.meta.requiresAuth &amp;&amp; !auth.isAuthenticated) {
+    return { name: "admin-login", query: { redirect: to.fullPath } };
+  }
+});</code></pre>
+
+<p>Keep these fast, and make sure every path returns. A guard that awaits something slow leaves the
+user on the old page with nothing happening — no spinner, because no navigation has started. A guard
+that throws or never resolves aborts the navigation silently, which is one of the more baffling things
+that can happen to a Vue application.</p>
+
+<p>Next: <a href="/vue/vue-forms">Forms and Validation</a>.</p>

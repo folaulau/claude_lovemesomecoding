@@ -1,0 +1,196 @@
+<p>Vue has no built-in HTTP client, and does not want one. You use <code>fetch</code>, or axios, or
+whatever you like. What matters is the shape you put around it.</p>
+
+<p>The rule this lesson argues for: <strong>components should not contain
+<code>fetch</code></strong>. One module owns the transport, and everything else calls named
+functions.</p>
+
+<h2>One module, one import</h2>
+
+<pre class="language-javascript"><code class="language-javascript">import { mockApi } from "./mock";
+import { httpApi } from "./http";
+
+export const usingMock = import.meta.env.VITE_USE_MOCK !== "false";
+export const api = usingMock ? mockApi : httpApi;</code></pre>
+
+<p>Every component imports <code>{ api }</code> from here and nothing else. No component imports
+<code>http.js</code> or <code>mock.js</code> directly, and that discipline is the entire reason
+<code>VITE_USE_MOCK</code> can be a one-line switch instead of a hunt through thirty files.</p>
+
+<p>The payoff is that the UI can be built and reviewed with <strong>no backend running at all</strong>.
+The mock defines the contract; the real client implements it. In this project the frontend was built
+first and <code>http.js</code> exists to satisfy an interface the UI already assumed — which is a good
+way round, because it means the API was designed against a real consumer.</p>
+
+<h2>The transport</h2>
+
+<p>One <code>request</code> function that everything goes through:</p>
+
+<pre class="language-javascript"><code class="language-javascript">async function request(path, { method = "GET", body, isForm = false } = {}) {
+  const token = readToken();
+  const headers = {};
+  // Setting Content-Type on a FormData body is actively harmful: fetch has to
+  // generate the multipart boundary itself, and a hand-set header omits it.
+  if (!isForm) headers["Content-Type"] = "application/json";
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  let res;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method,
+      headers,
+      body: isForm ? body : body ? JSON.stringify(body) : undefined,</code></pre>
+
+<p>Then the surface is a list of one-liners:</p>
+
+<pre class="language-javascript"><code class="language-javascript">export const httpApi = {
+  /* ---- public ---- */
+  feed: (params) =&gt; request(`/api/feed${qs(params)}`),
+  reelBySlug: (slug) =&gt; request(`/api/reels/${encodeURIComponent(slug)}`),
+  search: (params) =&gt; request(`/api/reels${qs(params)}`),
+  trendingTags: () =&gt; request("/api/tags/trending"),
+  commentsForReel: (reelId) =&gt; request(`/api/reels/${reelId}/comments`),
+  addComment: (reelId, body) =&gt;
+    request(`/api/reels/${reelId}/comments`, { method: "POST", body: { body } }),</code></pre>
+
+<p>Every call site reads as what it does. A component says <code>api.reelBySlug(slug)</code> and knows
+nothing about verbs, headers, base URLs or JSON.</p>
+
+<h2>The details worth stealing</h2>
+
+<h3>fetch does not reject on a 404</h3>
+
+<p>This is the <code>fetch</code> gotcha that catches everyone. It only rejects on a genuine network
+failure — DNS, connection refused, CORS. A 404 or a 500 is a perfectly successful fetch with an
+<code>ok</code> of <code>false</code>.</p>
+
+<pre class="language-javascript"><code class="language-javascript">  } catch (networkError) {
+    // fetch only rejects on a genuine network failure, never on a 4xx/5xx.
+    // Distinguishing the two matters: "the API is down" needs a different
+    // message from "you typed the wrong password".
+    throw new ApiError(0, "Cannot reach the API. Is the backend running on 8087?");
+  }</code></pre>
+
+<p>Distinguishing the two matters to the person using the app: "the API is down" and "you typed the
+wrong password" need different messages, and collapsing them into "something went wrong" makes both
+undebuggable.</p>
+
+<h3>A typed error</h3>
+
+<pre class="language-javascript"><code class="language-javascript">export class ApiError extends Error {
+  constructor(status, message, fieldErrors = []) {
+    super(message);
+    this.status = status;
+    this.fieldErrors = fieldErrors;
+  }
+}</code></pre>
+
+<p>Carrying the status means a caller can branch on it. Carrying <code>fieldErrors</code> is what makes
+lesson 21's server-side validation display possible.</p>
+
+<h3>The 401, handled in exactly one place</h3>
+
+<pre class="language-javascript"><code class="language-javascript">  if (res.status === 401 &amp;&amp; token) {
+    // notify: the auth store listens and clears its refs, which bounces the
+    // router guard back to the login screen.
+    clearSession({ notify: true });
+    throw new ApiError(401, "Your session expired. Please sign in again.");
+  }</code></pre>
+
+<p>Note the condition is not just <code>status === 401</code>. The comment above it in the source
+spells out why, and it is a real bug the application had: a 401 means two different things depending on
+whether a token was sent. With a token, the session expired. Without one, this <em>is</em> the sign-in
+attempt and the credentials were wrong — and treating that as an expiry replaces the server's "Invalid
+email or password" with a nonsensical "Your session expired" on the login form.</p>
+
+<p>Handling it centrally is the point. Thirty components do not each need to know what a 401 means.</p>
+
+<h3>FormData and Content-Type</h3>
+
+<pre class="language-javascript"><code class="language-javascript">// Setting Content-Type on a FormData body is actively harmful: fetch has to
+// generate the multipart boundary itself, and a hand-set header omits it.
+if (!isForm) headers["Content-Type"] = "application/json";</code></pre>
+
+<p>A multipart upload with a hand-set <code>Content-Type</code> fails on the server with a parsing
+error that does not mention boundaries at all. Let <code>fetch</code> set it.</p>
+
+<h2>Loading and error state in a component</h2>
+
+<p>The transport is generic; the state is not. Every view that loads something needs the same three
+things:</p>
+
+<pre class="language-javascript"><code class="language-javascript">async function load() {
+  loading.value = true;
+  try {
+    results.value = await api.search({
+      q: route.query.q ?? "",
+      tag: route.query.tag ?? null,
+      page: Number(route.query.page ?? 1),
+      size: 12,
+    });</code></pre>
+
+<p><code>loading</code> set before, cleared in <code>finally</code>. Errors surfaced to the user rather
+than swallowed. The result assigned in one place.</p>
+
+<p>The <code>finally</code> is the part people leave out, and the failure is nasty: an error leaves the
+spinner turning forever, which reads as "the app hung" rather than "something went wrong".</p>
+
+<p>And the template renders all three states explicitly:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;LoadingSpinner v-if="loading" label="Searching…" /&gt;
+&lt;EmptyState v-else-if="!results.content.length" title="Nothing matched" /&gt;
+&lt;template v-else&gt;
+  &lt;!-- results --&gt;
+&lt;/template&gt;</code></pre>
+
+<p>Loading, empty, and loaded. A component that only handles the third renders a broken-looking page
+for the first two, and "empty" and "still loading" look identical to a user if you do not separate
+them.</p>
+
+<h2>Where to put the call</h2>
+
+<p><strong>Views fetch. Components receive props.</strong></p>
+
+<p>A leaf component that fetches its own data is impossible to reason about — you cannot tell how many
+requests a page makes without reading every component on it, and rendering a list of twenty cards fires
+twenty requests. Keep the calls in routed views and pass the results down.</p>
+
+<p>The exception is a component that genuinely owns a resource, like the comment panel on a reel page.
+That is a judgement call, and the test is whether the component makes sense used twice on one page.</p>
+
+<h2>Streaming</h2>
+
+<p>Not everything is request/response. The admin dashboard's live counters come over server-sent events,
+and the API module hides that too:</p>
+
+<pre class="language-javascript"><code class="language-javascript">  subscribeToStats(onEvent) {
+    const url = `${BASE}/api/admin/stream/stats${qs({ token: readToken() })}`;
+    const es = new EventSource(url);
+    es.addEventListener("stats", (e) =&gt; {
+      try {
+        onEvent(JSON.parse(e.data));
+      } catch {
+        /* a malformed frame should not kill the stream */
+      }
+    });
+    // EventSource reconnects on its own; log once so a persistent failure is
+    // visible in the console rather than silently doing nothing.</code></pre>
+
+<p>It returns an unsubscribe function, which the dashboard calls in <code>onBeforeUnmount</code> — the
+lesson 14 rule, applied to a connection instead of a listener.</p>
+
+<p><code>EventSource</code> cannot send an <code>Authorization</code> header, which is a limitation of
+the browser API rather than an oversight, so the token rides as a query parameter and the endpoint
+accepts it there.</p>
+
+<h2>What about a data-fetching library?</h2>
+
+<p>Everything above is hand-rolled, and for an application this size that is the right call: it is
+maybe 150 lines and has no dependencies.</p>
+
+<p>Once you want caching across components, background refetching, deduplicating simultaneous requests
+for the same resource, or optimistic updates with rollback, stop hand-rolling and use TanStack Query's
+Vue adapter or VueUse's <code>useFetch</code>. The signal you have reached that point is usually your
+third component needing the same data and each fetching it separately.</p>
+
+<p>Next: <a href="/vue/vue-transitions-and-teleport">Transitions and Teleport</a>.</p>

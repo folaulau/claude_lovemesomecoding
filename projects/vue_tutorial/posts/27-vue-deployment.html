@@ -1,0 +1,177 @@
+<p>A Vue application builds to static files. That is worth saying plainly, because it decides everything
+else: there is no Node server to run, no process to keep alive, and hosting is a bucket behind a CDN for
+pennies.</p>
+
+<h2>The build</h2>
+
+<pre class="language-bash"><code class="language-bash">npm run build       # -&gt; dist/
+npm run preview     # serve dist/ locally, on the real built output</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">dist/
+  index.html
+  assets/
+    index-DYUHRy06.js            138.03 kB │ gzip: 46.09 kB
+    DashboardView-BMckYpIh.js    197.49 kB │ gzip: 69.12 kB
+    ExploreView-BO33kbQP.js        3.79 kB │ gzip:  1.88 kB
+    index-BqL3nZ8p.css            ...</code></pre>
+
+<p>Every filename carries a content hash. That is what makes the caching strategy below safe: a file's
+name changes whenever its content does, so a cached copy can never be stale.</p>
+
+<p><strong>Run <code>npm run preview</code> before you deploy.</strong> The dev server and the production
+build differ in ways that matter — environment variables are baked in, minification can expose a
+dependency on function names, and dynamic imports become real network requests. Most "it worked locally"
+deployment failures are visible in <code>preview</code>.</p>
+
+<h2>Environment variables</h2>
+
+<pre class="language-javascript"><code class="language-javascript">const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8087";</code></pre>
+
+<p>Vite exposes variables from <code>.env</code> files on <code>import.meta.env</code>, and
+<strong>only those prefixed <code>VITE_</code></strong>. Files are read in this order, later overriding
+earlier:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">.env                  always
+.env.production       only for `vite build`
+.env.local            always, and gitignored -- your machine only</code></pre>
+
+<p><strong>The prefix is a safety rail, and the rule behind it is absolute: these values are compiled
+into the JavaScript bundle.</strong> Anyone can read them in devtools. A <code>VITE_</code> variable is
+public — an API base URL, a publishable Stripe key, a feature flag. A database password or a secret key
+never gets one, and if it needs one it belongs on a server instead.</p>
+
+<p>They are substituted at <strong>build</strong> time, not run time. One build cannot be promoted from
+staging to production with a different API URL — it is baked in. If you need that, fetch a small
+<code>config.json</code> at startup instead.</p>
+
+<h2>The rewrite rule, and why routes 404 on refresh</h2>
+
+<p>The failure everyone hits once. The app works, you navigate to <code>/explore</code>, you refresh, and
+you get a 404.</p>
+
+<p>The reason: navigating within the app is <code>history.pushState</code> — no request is made. A refresh
+<em>does</em> make a request, for <code>/explore</code>, and there is no such file. Only
+<code>index.html</code> exists.</p>
+
+<p>The fix is to serve <code>index.html</code> for anything that is not a real file, and let the router
+sort it out client-side.</p>
+
+<p><strong>nginx</strong> — this is the whole of it:</p>
+
+<pre class="language-nginx"><code class="language-nginx">location / {
+  try_files $uri $uri/ /index.html;
+}</code></pre>
+
+<p><strong>Netlify</strong> — <code>public/_redirects</code>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">/*    /index.html   200</code></pre>
+
+<p><strong>Vercel</strong> — <code>vercel.json</code>:</p>
+
+<pre class="language-json"><code class="language-json">{ "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }] }</code></pre>
+
+<p><strong>AWS S3 + CloudFront</strong> — set the error document to <code>index.html</code>, or add a
+CloudFront Function that rewrites unmatched paths. Note the S3 static-hosting version returns a 404
+status with the HTML body, which is wrong for SEO; a CloudFront custom error response mapping 404 to
+<code>/index.html</code> with a 200 is the correct form.</p>
+
+<p><strong>Apache</strong> — <code>.htaccess</code> with <code>FallbackResource /index.html</code>.</p>
+
+<p>The status code matters. The rewrite must return <strong>200</strong>, not a redirect — otherwise the
+URL changes and deep links stop working.</p>
+
+<h2>Caching</h2>
+
+<p>Hashed filenames make this simple, and getting it backwards is the second most common deployment
+problem:</p>
+
+<pre class="language-nginx"><code class="language-nginx"># Hashed assets: the name changes when the content does, so cache forever.
+location /assets/ {
+  add_header Cache-Control "public, max-age=31536000, immutable";
+}
+
+# index.html is NOT hashed. It is the file that points at all the others,
+# so a cached copy pins users to the previous deploy.
+location = /index.html {
+  add_header Cache-Control "no-cache";
+}</code></pre>
+
+<p><code>no-cache</code> does not mean "do not cache" — it means "revalidate before using", which is
+exactly right for a small file that must always be current.</p>
+
+<p>Get this the wrong way round and users keep loading an old <code>index.html</code> that references
+chunks you have deleted, which surfaces as a blank page and a <code>MODULE_NOT_FOUND</code> in the
+console.</p>
+
+<h2>Serving it from a container</h2>
+
+<p>Build in one stage, serve from a tiny image in the next:</p>
+
+<pre class="language-docker"><code class="language-docker"># ---- build ----
+FROM node:22-alpine AS build
+WORKDIR /app
+# Copy manifests first so `npm ci` is cached unless dependencies changed.
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# ---- serve ----
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf</code></pre>
+
+<p>The final image contains no Node, no <code>node_modules</code> and no source — just nginx and the
+static files.</p>
+
+<h2>A deploy workflow</h2>
+
+<pre class="language-yaml"><code class="language-yaml">name: deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `npm ci` respects the lockfile exactly. `npm install` may not.
+      - run: npm ci
+      - run: npm run test:unit:run
+      - run: npm run build
+        env:
+          VITE_API_BASE: ${{ secrets.API_BASE }}
+
+      - run: aws s3 sync dist/ s3://my-bucket --delete
+      # Without this, the CDN keeps serving the previous index.html.
+      - run: aws cloudfront create-invalidation --distribution-id ${{ secrets.DIST_ID }} --paths "/*"</code></pre>
+
+<p>Two lines there are the ones people leave out. The <strong>invalidation</strong> — a CDN caches your
+old <code>index.html</code> and will keep serving it for its TTL otherwise. And running the
+<strong>tests before the build</strong>, so a failing suite stops the deploy rather than being noticed
+afterwards.</p>
+
+<h2>Before you call it done</h2>
+
+<p><strong>Check the console on the deployed site.</strong> Not locally — deployed. Mixed content, CORS
+and CSP problems only exist in production.</p>
+
+<p><strong>Refresh on a deep route.</strong> This is the rewrite-rule test, and it is the one thing that
+is fine in development and broken in production.</p>
+
+<p><strong>Set the page title per route</strong> — lesson 20's <code>afterEach</code>. A site where every
+tab says "Vite App" looks unfinished.</p>
+
+<p><strong>Consider what a crawler sees.</strong> A Vue SPA serves an empty <code>&lt;div
+id="app"&gt;</code> and fills it with JavaScript. Google executes JavaScript; many other crawlers and
+most link-preview bots do not. If search or social previews matter, you want Nuxt — server-side
+rendering or static generation — rather than a plain SPA. That is a decision to make before you build,
+not after.</p>
+
+<p>Next: <a href="/vue/vue-interview-questions">Interview Questions</a>.</p>

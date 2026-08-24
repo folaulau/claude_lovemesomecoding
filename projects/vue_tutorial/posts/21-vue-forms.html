@@ -1,0 +1,173 @@
+<p>Lesson 12 covered <code>v-model</code>. This is the rest of a real form: validating it, submitting
+it, and — the part tutorials skip — showing the errors the server sends back.</p>
+
+<h2>One object for the form</h2>
+
+<pre class="language-javascript"><code class="language-javascript">const form = ref({
+  title: "",
+  slug: "",
+  description: "",
+  status: "DRAFT",
+  scheduledFor: null,
+  creatorId: "",
+  tags: [],
+  collectionIds: [],
+  video: { url: null, posterUrl: null, durationSeconds: 0, width: 0, height: 0, sizeBytes: 0 },
+});</code></pre>
+
+<p>One ref holding the whole form, rather than a ref per field. It matches the shape the API expects,
+so submitting is <code>{ ...form.value }</code> instead of assembling an object by hand, and resetting
+is one assignment.</p>
+
+<p>Binding is then <code>v-model="form.title"</code>, <code>v-model="form.status"</code> and so on —
+including onto custom components, which is where <code>&lt;TagInput v-model="form.tags" /&gt;</code>
+and <code>&lt;MediaUpload v-model="form.video" /&gt;</code> come in.</p>
+
+<h2>Submitting</h2>
+
+<pre class="language-markup"><code class="language-markup">&lt;form @submit.prevent="save"&gt;</code></pre>
+
+<p><code>.prevent</code> stops the browser's native submit, which would reload the page. Use a real
+<code>&lt;form&gt;</code> with a <code>submit</code> handler rather than a click handler on the button
+— it gives you Enter-to-submit, native required-field semantics and correct screen-reader behaviour for
+free.</p>
+
+<pre class="language-javascript"><code class="language-javascript">async function save() {
+  if (!validate()) {
+    toast.error("Fix the highlighted fields.");
+    return;
+  }
+  saving.value = true;
+  try {
+    const payload = {
+      ...form.value,
+      scheduledFor: form.value.scheduledFor ? new Date(form.value.scheduledFor).toISOString() : null,
+    };
+    const saved = isNew.value
+      ? await api.createReel(payload)
+      : await api.updateReel(route.params.id, payload);
+    toast.success(isNew.value ? "Reel created." : "Changes saved.");
+    if (isNew.value) router.push({ name: "admin-reel-edit", params: { id: saved.id } });
+    else original.value = saved;
+  } catch (e) {
+    toast.error(e.message);
+  } finally {
+    saving.value = false;
+  }
+}</code></pre>
+
+<p>Four things there are worth copying.</p>
+
+<p><strong>Validate first and bail.</strong> No request goes out for a form that cannot succeed.</p>
+
+<p><strong><code>saving</code> is set before and cleared in <code>finally</code>.</strong> The
+<code>finally</code> is what makes a failed save leave the button usable — set it only in the success
+path and one API error leaves the form permanently disabled.</p>
+
+<p><strong>The payload is built, not sent raw.</strong> <code>scheduledFor</code> is converted to an ISO
+string here, because that is what the API wants and the datetime input gives something else.</p>
+
+<p><strong>Errors become a toast, not a crash.</strong></p>
+
+<p>And in the template, the flag disables the button:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;button class="btn btn-primary" type="submit" :disabled="saving"&gt;
+  {{ saving ? "Saving…" : "Save" }}
+&lt;/button&gt;</code></pre>
+
+<p>That single <code>:disabled</code> is what prevents a double submit. Without it, an impatient
+double-click creates two reels.</p>
+
+<h2>Validation</h2>
+
+<p>An errors object keyed by field name, and a function that fills it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const errors = ref({});
+
+function validate() {
+  const e = {};
+  if (!form.value.title.trim()) e.title = "A title is required.";
+  if (!/^[a-z0-9-]+$/.test(form.value.slug)) e.slug = "Lowercase letters, numbers and hyphens only.";
+  if (form.value.status === "SCHEDULED" &amp;&amp; !form.value.scheduledFor) {
+    e.scheduledFor = "Pick a date, or change the status.";
+  }
+  errors.value = e;
+  return Object.keys(e).length === 0;
+}</code></pre>
+
+<p>The template reads it per field. With Bootstrap that is two bindings:</p>
+
+<pre class="language-markup"><code class="language-markup">              id="title"
+              v-model="form.title"
+              class="form-control"
+              :class="{ 'is-invalid': errors.title }"
+              maxlength="140"
+              placeholder="Fadeaway over two defenders with 1.2 left"
+            /&gt;</code></pre>
+
+<p><code>:class="{ 'is-invalid': errors.title }"</code> turns the field red, and
+<code>.invalid-feedback</code> is only displayed by Bootstrap when a sibling has
+<code>.is-invalid</code> — so the message appears and disappears with the class.</p>
+
+<h3>Validate on submit, not on every keystroke</h3>
+
+<p>Turning a field red while someone is typing their second character is hostile. Validate on submit,
+and then — once a field has an error — clear it as they fix it. That is one watcher, and it is worth
+the ten lines.</p>
+
+<h2>Server errors</h2>
+
+<p>Client-side validation is a convenience. It is not a guarantee, it can be bypassed with devtools, and
+it cannot know things only the server knows — that a slug is already taken, that a creator was deleted
+a moment ago.</p>
+
+<p>The demo application's error class carries field-level errors for exactly this:</p>
+
+<pre class="language-javascript"><code class="language-javascript">export class ApiError extends Error {
+  constructor(status, message, fieldErrors = []) {
+    super(message);
+    this.status = status;
+    this.fieldErrors = fieldErrors;
+  }
+}</code></pre>
+
+<p>The backend's exception handler returns <code>{ message, subErrors[] }</code>, and
+<code>subErrors</code> names the field. Merging those into the same <code>errors</code> object the
+client-side rules use means the display code does not care where an error came from:</p>
+
+<pre class="language-javascript"><code class="language-javascript">catch (e) {
+  // A 400 with field errors renders next to the fields; anything else is a toast.
+  if (e.fieldErrors?.length) {
+    errors.value = Object.fromEntries(e.fieldErrors.map((f) =&gt; [f.field, f.message]));
+  }
+  toast.error(e.message);
+}</code></pre>
+
+<p>This is the part most form tutorials leave out, and it is the part that makes a form usable. A server
+rejection that surfaces as a generic red banner leaves the user hunting for which field was wrong.</p>
+
+<h2>Derived fields</h2>
+
+<p>The reel editor generates a slug from the title, and then stops:</p>
+
+<pre class="language-javascript"><code class="language-javascript">// True once the user edits the slug by hand, after which the title stops
+// driving it - otherwise renaming a published reel would silently change its URL.
+const slugTouched = ref(false);</code></pre>
+
+<p>That comment is the whole design: once the user edits the slug by hand the title stops driving it,
+because renaming a published reel would otherwise silently change its URL.</p>
+
+<p>The general pattern — a derived field that becomes independent the moment it is touched — comes up
+constantly, and a <code>touched</code> flag is the simplest thing that works. Note this cannot be a
+computed: a computed cannot be edited, and the field has to be.</p>
+
+<h2>Libraries</h2>
+
+<p>For a form of this size, hand-rolled validation is about thirty lines and has no dependencies. For
+larger forms — cross-field rules, arrays of sub-forms, a schema shared with the backend — VeeValidate
+and FormKit are the usual answers, and both pair with Zod or Yup for the schema.</p>
+
+<p>Learn the manual version first. The libraries all assume you understand the value-and-event mechanics
+underneath, and half their documentation is about how to plug into it.</p>
+
+<p>Next: <a href="/vue/vue-http">Fetching Data from an API</a>.</p>

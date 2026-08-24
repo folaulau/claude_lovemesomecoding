@@ -1,0 +1,158 @@
+<p>Vue is fast by default, and most performance work on a Vue application turns out not to be about Vue
+at all. Before reaching for anything in this lesson, open the Performance panel and find out what is
+actually slow. The answer is usually an image, a network waterfall, or an algorithm — not the
+framework.</p>
+
+<p>What follows is what to do once you have measured.</p>
+
+<h2>Where re-renders come from</h2>
+
+<p>Vue tracks dependencies per component. When a reactive value changes, only the components whose
+render read that value re-render. There is no cascade down the tree, which is the main structural
+difference from React and the reason there is no <code>useMemo</code>, no
+<code>useCallback</code> and no <code>React.memo</code> equivalent to reach for.</p>
+
+<p>Two practical consequences:</p>
+
+<p><strong>Passing a new object or function as a prop does not cause a re-render</strong> the way it can
+in React. The child re-renders when a value it <em>reads</em> changes.</p>
+
+<p><strong>A big component is one dependency set.</strong> A view that reads twenty refs re-renders when
+any of them changes. Splitting it into smaller components narrows what each one depends on, and that is
+usually the highest-leverage change available — a structural fix rather than a directive.</p>
+
+<h2>Keep work out of the render path</h2>
+
+<p>Lesson 6's rule, stated as a performance point: anything a template reads should be a computed, so it
+is calculated once and cached, not on every render.</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;!-- Runs on every re-render, for every item. --&gt;
+&lt;li v-for="reel in reels.filter(r =&gt; r.published)" :key="reel.id"&gt;</code></pre>
+
+<pre class="language-javascript"><code class="language-javascript">// Runs when `reels` changes. Nothing else invalidates it.
+const published = computed(() =&gt; reels.value.filter((r) =&gt; r.published));</code></pre>
+
+<p>Same rule for anything expensive in an interpolation — date formatting, currency, sorting.</p>
+
+<h2>v-once and v-memo</h2>
+
+<p><code>v-once</code> renders an element one time and never updates it again:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;footer v-once&gt;
+  &lt;p&gt;&amp;copy; 2026 ReelCMS. All rights reserved.&lt;/p&gt;
+&lt;/footer&gt;</code></pre>
+
+<p><code>v-memo</code> skips updating a subtree unless one of the values in its array changes:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;div v-for="reel in reels" :key="reel.id" v-memo="[reel.id, reel.status]"&gt;
+  &lt;!-- Re-renders only if the id or the status changed. A views count ticking
+       up in the background will not touch this row. --&gt;
+  &lt;ReelRow :reel="reel" /&gt;
+&lt;/div&gt;</code></pre>
+
+<p><strong>These are escape hatches, not habits.</strong> <code>v-memo</code> in particular is easy to
+get wrong: omit a value the subtree reads and it silently renders stale data, which is a much worse bug
+than a slow list. Vue's own documentation says to reach for it only on large lists — thousands of rows
+— where you have measured a problem.</p>
+
+<h2>shallowRef</h2>
+
+<p>A <code>ref</code> holding an object is deeply reactive: Vue walks the structure to make every nested
+property observable. For a large object that is real work, done on creation and again on replacement.</p>
+
+<p><code>shallowRef</code> makes only the <code>.value</code> assignment reactive:</p>
+
+<pre class="language-javascript"><code class="language-javascript">import { shallowRef, triggerRef } from "vue";
+
+// A 5,000-row report we replace wholesale and never edit in place.
+const report = shallowRef(null);
+
+report.value = await api.reports();   // reactive -- the whole value changed
+report.value.totals.views = 0;        // NOT reactive -- nothing re-renders
+
+// If you must mutate, tell Vue yourself.
+triggerRef(report);</code></pre>
+
+<p>The condition for using it is precise: <strong>a large object you replace rather than edit</strong>.
+API responses, parsed files, chart datasets. If you mutate nested properties and expect the UI to
+follow, this is the wrong tool and the bug is silent.</p>
+
+<p><code>shallowReactive</code> is the equivalent for <code>reactive</code>.</p>
+
+<h2>Rendering long lists</h2>
+
+<p>Nothing above helps with ten thousand DOM nodes, because the cost is the DOM, not Vue. There are only
+three real answers, in order of preference:</p>
+
+<p><strong>Paginate.</strong> The demo application's search shows twelve results a page.</p>
+
+<p><strong>Load incrementally.</strong> The feed fetches four reels at a time and prefetches the next
+page two slides before the end, so the scroll never stalls.</p>
+
+<p><strong>Virtualise.</strong> Render only the visible rows. <code>vue-virtual-scroller</code> is the
+usual choice. Do this last — it complicates keyboard navigation, find-in-page and accessibility.</p>
+
+<h2>Observers beat scroll listeners</h2>
+
+<p>A pattern worth internalising, and the reason the feed is built the way it is. A
+<code>scroll</code> listener fires on every frame of a flick — dozens of times a second — and each call
+that reads <code>offsetTop</code> or <code>getBoundingClientRect()</code> forces the browser to
+recalculate layout synchronously.</p>
+
+<p>An <code>IntersectionObserver</code> is computed off the main thread and calls you only when an
+element crosses a threshold you named:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const { observe } = useIntersectionObserver(
+  (entries) =&gt; {
+    entries.forEach((entry) =&gt; {
+      // 0.6 rather than 0.5: at exactly half, two slides can both qualify
+      // mid-scroll and the active index flickers between them.
+      if (entry.isIntersecting &amp;&amp; entry.intersectionRatio &gt;= 0.6) {
+        const idx = Number(entry.target.dataset.index);
+        activeIndex.value = idx;
+        // Prefetch a page before hitting the end, so the scroll never stalls.
+        if (idx &gt;= reels.value.length - 2) loadPage();
+      }
+    });
+  },
+  { root: scroller, threshold: [0.6] }
+);</code></pre>
+
+<p>The <code>0.6</code> is a detail worth noting: at exactly half, two slides can both qualify
+mid-scroll and the active index flickers between them.</p>
+
+<p>The same reasoning applies to <code>ResizeObserver</code> over a <code>resize</code> listener.</p>
+
+<h2>Cursor pagination, not offset</h2>
+
+<p>A backend point that decides frontend feel. <code>skip(4000)</code> makes the database walk and
+discard four thousand rows before returning anything, so page 200 of an infinite feed is measurably
+slower than page 2. A cursor turns the same query into "everything published before this timestamp",
+which an index answers by seeking straight to the right place.</p>
+
+<p>The feed sends <code>{ cursor, limit }</code> rather than <code>{ page, size }</code> for exactly
+this reason. In an infinite scroll it is the difference between a feed that stays fast and one that
+degrades the longer someone uses it.</p>
+
+<h2>Bundle size</h2>
+
+<p>Lesson 24 covers code splitting, which is the main lever. Beyond it:</p>
+
+<p><strong>Check what you are importing.</strong> <code>npx vite-bundle-visualizer</code> shows the
+chunks by size. A single date library imported for one <code>format</code> call is a common find.</p>
+
+<p><strong>Import only what you use.</strong> Chart.js is tree-shakeable, which is why the dashboard
+registers each element explicitly rather than importing everything.</p>
+
+<p><strong>Prefer the platform.</strong> <code>Intl.NumberFormat</code> and
+<code>Intl.DateTimeFormat</code> are built into the browser and replace most of what a formatting
+library does.</p>
+
+<h2>Measure with Vue DevTools</h2>
+
+<p>The DevTools extension has a component inspector that shows exactly which component re-rendered and
+why. Use it before and after any change from this lesson — the most common outcome of a performance
+change made on instinct is that it did nothing, and the second most common is a subtle correctness bug
+in exchange for nothing.</p>
+
+<p>Next: <a href="/vue/vue-testing">Testing with Vitest and Vue Test Utils</a>.</p>

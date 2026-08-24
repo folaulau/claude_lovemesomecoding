@@ -50,6 +50,7 @@ from app.services import content as content_service  # noqa: E402
 # SILENTLY -- which is the whole reason this list exists.
 EXPECTED_LANGUAGES = {
     "vue", "javascript", "markup", "css", "scss", "json", "bash", "yaml", "plaintext",
+    "nginx", "docker",
 }
 
 SOURCE_PRE = re.compile(r'<pre\b([^>]*)>(.*?)</pre>', re.S | re.I)
@@ -160,6 +161,28 @@ if content_service.normalize_language("vue") != "vue":
 for entry in manifest.POSTS:
     if len(entry["excerpt"]) > 500:
         failures.append(f"{entry['slug']}: excerpt is {len(entry['excerpt'])} chars, max 500")
+
+# Internal links. The track cross-references itself constantly -- every lesson
+# ends with a "Next:" link and the interview questions link back to all 27 --
+# so one renamed slug silently produces a page of 404s. Code blocks are excluded:
+# a quoted index.html legitimately contains href="/favicon.svg".
+_slugs = {e["slug"] for e in manifest.POSTS}
+_links = 0
+for entry in manifest.POSTS:
+    path = HERE / "posts" / entry["file"]
+    if not path.exists():
+        continue
+    prose = SOURCE_PRE.sub("", path.read_text(encoding="utf-8"))
+    for m in re.finditer(r'href="(/[^"#]*)"', prose):
+        _links += 1
+        href = m.group(1)
+        target = href[len("/vue/"):] if href.startswith("/vue/") else None
+        if target is None:
+            failures.append(f"{entry['slug']}: link to {href} leaves the track")
+        elif target not in _slugs:
+            failures.append(f"{entry['slug']}: link to {href} is not a slug in the manifest")
+
+print(f"\n{_links} internal links checked")
 
 # Lesson 1 carries the index of all 28 lessons, and it is GENERATED from the
 # manifest (gen_index.py). A lesson added or renamed without re-running the

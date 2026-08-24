@@ -1,0 +1,183 @@
+<p>Pinia is Vue's official state library. It replaced Vuex, it is much smaller than Vuex was, and if
+you have read about <code>mutations</code> and <code>commit</code> — those are gone. A Pinia action
+just changes the state.</p>
+
+<h2>Installing it</h2>
+
+<pre class="language-javascript"><code class="language-javascript">createApp(App).use(createPinia()).use(router).mount("#app");</code></pre>
+
+<p>One plugin, and every component can now use every store.</p>
+
+<h2>A store</h2>
+
+<p>There are two ways to write one. <strong>Setup stores</strong> look exactly like
+<code>&lt;script setup&gt;</code>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">export const useToastStore = defineStore("toast", () =&gt; {
+  const items = ref([]);
+
+  function push(message, variant = "success", ms = 3600) {
+    const id = nextId++;
+    items.value.push({ id, message, variant });
+    setTimeout(() =&gt; dismiss(id), ms);
+    return id;
+  }
+
+  const success = (m) =&gt; push(m, "success");
+  // Errors stay up longer - they usually carry something you need to read.
+  const error = (m) =&gt; push(m, "danger", 6000);
+  const info = (m) =&gt; push(m, "info");
+
+  function dismiss(id) {
+    items.value = items.value.filter((t) =&gt; t.id !== id);
+  }
+
+  return { items, push, success, error, info, dismiss };
+});</code></pre>
+
+<p>Refs are state, computeds are getters, functions are actions, and the returned object is the
+store's public surface. There is nothing new to learn — it is the Composition API pointed at a
+singleton.</p>
+
+<p>The alternative is an <strong>option store</strong>, which some people prefer for its structure:</p>
+
+<pre class="language-javascript"><code class="language-javascript">export const useToastStore = defineStore("toast", {
+  state: () =&gt; ({ items: [] }),
+  getters: {
+    count: (state) =&gt; state.items.length,
+  },
+  actions: {
+    dismiss(id) {
+      this.items = this.items.filter((t) =&gt; t.id !== id);
+    },
+  },
+});</code></pre>
+
+<p>Both are fully supported. This track uses setup stores because they need no new syntax, compose
+with other composables, and avoid <code>this</code> entirely.</p>
+
+<h3>The store id</h3>
+
+<p><code>defineStore("toast", ...)</code> — the first argument is a unique id. It is what devtools
+labels the store, and what any persistence plugin keys off. It must be unique across the app.</p>
+
+<h2>Using a store</h2>
+
+<pre class="language-javascript"><code class="language-javascript">const toast = useToastStore();
+
+toast.success("Changes saved.");
+toast.error(e.message);</code></pre>
+
+<p><code>useToastStore()</code> returns the same instance every time. Call it in ten components and
+there is one store.</p>
+
+<p>Note it is a <code>useX</code> function and follows the same rule as any composable: call it at the
+top level of setup, not inside a callback. There is a reason beyond convention — Pinia needs an active
+instance to resolve, which does not exist before <code>app.use(createPinia())</code>. That is also why
+a store must not be called at module scope, in a file that is imported before the app is created.</p>
+
+<h2>storeToRefs, and the bug it prevents</h2>
+
+<p>The store object is reactive. Destructuring it is not:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const toast = useToastStore();
+
+const { items } = toast;   // WRONG -- a plain array, frozen at this moment</code></pre>
+
+<p>Same failure as destructuring a <code>reactive</code> in lesson 5. It renders once, correctly, and
+then never updates — which makes it look like the store is broken rather than the destructure.</p>
+
+<p><code>storeToRefs</code> converts state and getters into refs that keep the connection:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const toast = useToastStore();
+const { items } = storeToRefs(toast);</code></pre>
+
+<p>Note what it does <em>not</em> do: actions are plain functions and are not converted, so you take
+them off the store directly. That is why the toast component keeps both — <code>items</code> through
+<code>storeToRefs</code>, and <code>toast.dismiss</code> called on the store in the template.</p>
+
+<h2>A store that is not just state</h2>
+
+<p>The auth store is the more interesting one, because it shows what a store is for beyond holding
+values:</p>
+
+<pre class="language-javascript"><code class="language-javascript">  const token = ref(readToken());
+  const user = ref(readUser());
+  const loading = ref(false);
+  const error = ref(null);</code></pre>
+
+<p>State is <strong>seeded from storage</strong>, so a refresh does not sign you out. The comment
+above it in the source is the important part: the token is the only thing the server trusts, and the
+cached user exists purely so the sidebar can render a name before any request completes.</p>
+
+<p>Derived state is computed, as in lesson 6, and business rules live with the state they concern:</p>
+
+<pre class="language-javascript"><code class="language-javascript">  function canEdit(reel) {
+    if (isAdmin.value) return true;
+    if (!isCreator.value) return false;
+    return reel?.creator?.id === user.value?.creatorId;
+  }</code></pre>
+
+<p>That rule — a creator may only touch their own reels — is enforced by the server too. Having it in
+the store as well is not duplication for its own sake; it is what lets the UI avoid offering buttons
+that are going to come back 403.</p>
+
+<p>An action wraps the async work and owns the loading and error state that goes with it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">  async function login(email, password) {
+    loading.value = true;
+    error.value = null;
+    try {
+      const res = await api.login(email, password);
+      token.value = res.token;
+      user.value = res.user;
+      writeSession(res.token, res.user);
+      return res.user;
+    } catch (e) {</code></pre>
+
+<p><code>loading</code> and <code>error</code> are set and cleared here rather than in the login
+component, so every caller gets them right. The <code>finally</code> is what makes a failed login
+leave the button usable.</p>
+
+<h2>Reacting to something outside Vue</h2>
+
+<p>One more piece from the same store, worth studying because the problem is common:</p>
+
+<pre class="language-javascript"><code class="language-javascript">  window.addEventListener(SESSION_EXPIRED, () =&gt; {
+    token.value = null;
+    user.value = null;
+  });</code></pre>
+
+<p>The HTTP client discovers an expired session on a 401. It cannot import the auth store to clear it
+— the store imports the client, so that would be a circular import. It dispatches an event instead and
+the store listens.</p>
+
+<p>Decoupling through an event is a normal answer to a circular dependency, and this is a clean example
+of it: one direction of the cycle becomes a message rather than an import.</p>
+
+<h2>Resetting, patching, subscribing</h2>
+
+<pre class="language-javascript"><code class="language-javascript">// Several changes at once, as one devtools entry.
+store.$patch({ loading: false, error: null });
+
+// Back to the initial state. Option stores get this free; a setup store needs
+// its own reset action, because Pinia cannot know what "initial" was.
+store.$reset();
+
+// Every mutation -- how persistence plugins are written.
+store.$subscribe((mutation, state) =&gt; {
+  localStorage.setItem("filters", JSON.stringify(state));
+});</code></pre>
+
+<h2>When you do not need a store</h2>
+
+<p>Most state is not application state. A form's fields belong to the form. A modal's open flag belongs
+to the component that owns the modal. Putting them in a store makes them global, which means anything
+can change them and you have lost the ability to reason about the component on its own.</p>
+
+<p>The demo application has 36 components and <strong>two</strong> stores: the signed-in user, and the
+toast queue. Both are genuinely application-wide. Everything else is local state or props, which is the
+right ratio.</p>
+
+<p>Next: <a href="/vue/vue-options-api">The Options API</a> — the other way to write all of this, and
+why this track does not.</p>

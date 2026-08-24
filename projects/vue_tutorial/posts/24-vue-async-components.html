@@ -1,0 +1,142 @@
+<p>Everything in your <code>src</code> folder ends up in one JavaScript bundle unless you tell the
+build otherwise. This lesson is about telling it otherwise, and about the two components that go with
+that.</p>
+
+<h2>Route-level code splitting</h2>
+
+<p>The highest-value split, and one line per route:</p>
+
+<pre class="language-javascript"><code class="language-javascript">        component: () =&gt; import("../views/public/ExploreView.vue"),</code></pre>
+
+<p>A function returning a dynamic <code>import()</code> instead of the component. Vite sees the
+<code>import()</code>, gives that module its own chunk, and the chunk is fetched the first time someone
+navigates there.</p>
+
+<p>The numbers from the demo application's build make the case:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">dist/assets/FeedView-DYKBp3Im.js          3.20 kB
+dist/assets/ExploreView-BO33kbQP.js       3.79 kB
+dist/assets/ReelListView-BZ8crJCl.js      7.74 kB
+dist/assets/ReelEditView-DLPQMmBp.js     14.38 kB
+dist/assets/DashboardView-BMckYpIh.js   197.49 kB   &lt;- Chart.js lives here
+dist/assets/index-DYUHRy06.js           138.03 kB   &lt;- the shared bundle</code></pre>
+
+<p>The dashboard is bigger than the entire rest of the application, because it pulls in Chart.js. Nobody
+visiting the public feed downloads a byte of it.</p>
+
+<h3>Except the landing route</h3>
+
+<pre class="language-javascript"><code class="language-javascript">// The feed is eager: it is the landing route, and a lazy chunk there just adds
+// a round trip before the first pixel.
+component: FeedView,</code></pre>
+
+<p>The rule is <strong>lazy-load everything except the route people arrive on</strong>. Splitting the
+first screen makes the browser fetch the app shell, parse it, discover it needs another file, and fetch
+that too — a guaranteed extra round trip before anything renders.</p>
+
+<h2>defineAsyncComponent</h2>
+
+<p>The same idea for a component that is not a route:</p>
+
+<pre class="language-javascript"><code class="language-javascript">import { defineAsyncComponent } from "vue";
+
+// The chunk is fetched the first time &lt;ReelAnalytics&gt; actually renders.
+const ReelAnalytics = defineAsyncComponent(() =&gt;
+  import("../components/admin/ReelAnalytics.vue")
+);</code></pre>
+
+<p>Worth it for something heavy behind a condition — a chart panel on a tab, a rich text editor in a
+modal, a map. Not worth it for a 2 kB card component, where the extra request costs more than the bytes
+saved.</p>
+
+<p>The long form takes loading and error states, which is what you want for anything the user waits
+on:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const ReelAnalytics = defineAsyncComponent({
+  loader: () =&gt; import("../components/admin/ReelAnalytics.vue"),
+  loadingComponent: LoadingSpinner,
+  errorComponent: LoadFailed,
+  // Do not flash a spinner for a chunk that arrives in 40ms.
+  delay: 200,
+  timeout: 10000,
+});</code></pre>
+
+<p><code>delay</code> is the detail worth copying. Without it, a fast connection gets a spinner that
+appears and vanishes within one frame, which reads as a flicker rather than as loading.</p>
+
+<p>Also note the <code>errorComponent</code>. A dynamic import <em>fails</em> more often than you would
+think — most commonly when you deploy while someone has the old page open, and the hashed chunk they ask
+for no longer exists. Handle it, and consider reloading the page on that specific failure.</p>
+
+<h2>Suspense</h2>
+
+<p>Still marked <strong>experimental</strong>. The API has changed before and may again, so read this as
+orientation rather than a recommendation.</p>
+
+<p><code>&lt;Suspense&gt;</code> lets a component have an <code>async setup()</code>, and renders a
+fallback until it resolves:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;Suspense&gt;
+  &lt;ReelDetail :slug="slug" /&gt;
+
+  &lt;template #fallback&gt;
+    &lt;LoadingSpinner label="Loading reel…" /&gt;
+  &lt;/template&gt;
+&lt;/Suspense&gt;</code></pre>
+
+<pre class="language-vue"><code class="language-vue">&lt;script setup&gt;
+// Top-level await -- allowed only inside a component under &lt;Suspense&gt;.
+const reel = await api.reelBySlug(props.slug);
+&lt;/script&gt;</code></pre>
+
+<p>The appeal is that a tree of components can await in parallel and produce one coordinated loading
+state, instead of six spinners appearing and vanishing independently.</p>
+
+<p>The catch, beyond the experimental label: an error in that <code>await</code> needs an
+<code>onErrorCaptured</code> in an ancestor, and a component that has already resolved does not go back
+to the fallback when its props change — so re-fetching still needs a watcher.</p>
+
+<p>The demo application uses the explicit <code>loading</code> / error / empty pattern from lesson 22
+instead. It is more code and it is entirely stable.</p>
+
+<h2>KeepAlive</h2>
+
+<p>By default, navigating away from a component destroys it. Come back and it is created from scratch:
+state gone, scroll position lost, data refetched.</p>
+
+<p><code>&lt;KeepAlive&gt;</code> caches the instance instead:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;RouterView v-slot="{ Component }"&gt;
+  &lt;KeepAlive :include="['ExploreView']"&gt;
+    &lt;component :is="Component" /&gt;
+  &lt;/KeepAlive&gt;
+&lt;/RouterView&gt;</code></pre>
+
+<p>Now going from a search result into a reel and back returns to the same results, at the same scroll
+position, with no request — which is exactly the behaviour people expect from a browser back button and
+almost never get from a single-page app.</p>
+
+<p>Cached components get two extra lifecycle hooks, because they are no longer being mounted and
+unmounted:</p>
+
+<pre class="language-javascript"><code class="language-javascript">import { onActivated, onDeactivated } from "vue";
+
+onActivated(() =&gt; {
+  // Entered from the cache. onMounted does NOT run again.
+  refreshIfStale();
+});
+
+onDeactivated(() =&gt; {
+  // Navigated away, but still alive. Pause things here.
+  player.value?.pause();
+});</code></pre>
+
+<p><strong>This is the part that bites.</strong> A cached component's <code>onMounted</code> runs once,
+ever. Any refresh-on-return logic that lives there silently stops happening, and
+<code>onBeforeUnmount</code> never fires — so a timer or a subscription started at mount keeps running
+for the rest of the session, for every cached component.</p>
+
+<p>Use <code>:include</code> or <code>:max</code> to bound it. <code>&lt;KeepAlive&gt;</code> with no
+props caches every component that passes through it, and the memory only goes up.</p>
+
+<p>Next: <a href="/vue/vue-performance">Performance</a>.</p>

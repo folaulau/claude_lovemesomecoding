@@ -24,7 +24,13 @@ POSTS = Path(__file__).resolve().parent / "posts"
 # Kept in step with EXPECTED_LANGUAGES in check_content.py. Asking for a
 # language the backend does not support degrades to plaintext SILENTLY, so a
 # typo here is caught at authoring time instead of in review.
-LANGUAGES = {"vue", "javascript", "markup", "css", "scss", "json", "bash", "yaml", "plaintext"}
+LANGUAGES = {
+    "vue", "javascript", "markup", "css", "scss", "json", "bash", "yaml", "plaintext",
+    # The deployment lesson quotes an nginx rewrite rule and a Dockerfile. Both
+    # grammars are already in the backend's SUPPORTED_LANGUAGES and already
+    # imported by the frontend -- the Docker track added them.
+    "nginx", "docker",
+}
 
 
 def code(lang: str, source: str) -> str:

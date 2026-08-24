@@ -1,0 +1,225 @@
+<p>Two kinds of test, and they are good at different things. Unit tests mount one component in
+isolation and are fast enough to run on every save. End-to-end tests drive a real browser against a real
+backend and catch the things that only break when the pieces are connected.</p>
+
+<p><strong>A note on this lesson's snippets.</strong> The demo application's own suite is Playwright
+end-to-end — it has no unit tests. So the Playwright code below is quoted from it and is real; the
+Vitest and Vue Test Utils examples are written for this lesson. They are correct, but unlike the rest of
+this track they are not lifted from a running codebase, and it is better to say so than to pretend
+otherwise.</p>
+
+<h2>Vitest</h2>
+
+<p>Vitest is the test runner for Vite projects. It reuses your <code>vite.config.js</code>, so aliases,
+plugins and environment variables all work in tests without a second configuration to keep in sync — the
+main reason it displaced Jest in this ecosystem. The API is Jest's, so most Jest knowledge transfers
+directly.</p>
+
+<pre class="language-bash"><code class="language-bash">npm install -D vitest @vue/test-utils jsdom</code></pre>
+
+<pre class="language-javascript"><code class="language-javascript">// vite.config.js
+export default defineConfig({
+  plugins: [vue()],
+  test: {
+    // Components need a DOM. Without this you get "document is not defined".
+    environment: "jsdom",
+    globals: true,
+  },
+});</code></pre>
+
+<pre class="language-json"><code class="language-json">"scripts": {
+  "test:unit": "vitest",
+  "test:unit:run": "vitest run"
+}</code></pre>
+
+<p><code>vitest</code> watches; <code>vitest run</code> runs once and exits, which is what CI
+wants.</p>
+
+<h2>Mounting a component</h2>
+
+<pre class="language-javascript"><code class="language-javascript">import { mount } from "@vue/test-utils";
+import { describe, expect, it } from "vitest";
+import StatusBadge from "../src/components/ui/StatusBadge.vue";
+
+describe("StatusBadge", () =&gt; {
+  it("renders the label and variant for a known status", () =&gt; {
+    const wrapper = mount(StatusBadge, {
+      props: { status: "PUBLISHED" },
+    });
+
+    expect(wrapper.text()).toContain("Published");
+    expect(wrapper.classes()).toContain("text-bg-success");
+  });
+
+  it("falls back to the raw status when it is unrecognised", () =&gt; {
+    const wrapper = mount(StatusBadge, { props: { status: "WEIRD" } });
+
+    expect(wrapper.text()).toContain("WEIRD");
+    expect(wrapper.classes()).toContain("text-bg-secondary");
+  });
+});</code></pre>
+
+<p><strong>Assert on rendered output, not internals.</strong> <code>wrapper.text()</code> and
+<code>wrapper.classes()</code> test what a user sees. Reaching into <code>wrapper.vm.someRef</code> tests
+how it is built, and turns every refactor into a test failure.</p>
+
+<p>The second test is the one worth writing. Anyone can assert the happy path; the fallback branch is
+where the bug will be.</p>
+
+<h2>Props in, events out</h2>
+
+<p>A component's contract is its props and its emits, so that is what to test:</p>
+
+<pre class="language-javascript"><code class="language-javascript">import { mount } from "@vue/test-utils";
+import TagInput from "../src/components/admin/TagInput.vue";
+
+it("slugifies a tag and emits it without mutating the prop", async () =&gt; {
+  const tags = ["dunk"];
+  const wrapper = mount(TagInput, { props: { modelValue: tags } });
+
+  await wrapper.find("input").setValue("Buzzer Beater");
+  await wrapper.find("input").trigger("keydown.enter");
+
+  // The emitted value is a NEW array containing the slugified tag...
+  expect(wrapper.emitted("update:modelValue")[0]).toEqual([["dunk", "buzzer-beater"]]);
+  // ...and the prop the parent owns was not touched.
+  expect(tags).toEqual(["dunk"]);
+});
+
+it("refuses a duplicate", async () =&gt; {
+  const wrapper = mount(TagInput, { props: { modelValue: ["dunk"] } });
+
+  await wrapper.find("input").setValue("dunk");
+  await wrapper.find("input").trigger("keydown.enter");
+
+  expect(wrapper.emitted("update:modelValue")).toBeUndefined();
+});</code></pre>
+
+<p><code>wrapper.emitted()</code> records every event. The double array is the shape that catches people
+out: the outer index is which emission, the inner array is that emission's arguments.</p>
+
+<p>The second assertion in the first test is the valuable one — it pins down the
+props-are-read-only rule from lesson 10 so a later refactor to <code>push()</code> fails
+loudly.</p>
+
+<p><strong><code>await</code> every interaction.</strong> Vue updates the DOM asynchronously, so
+<code>trigger</code> and <code>setValue</code> return promises. Forgetting the <code>await</code> is the
+most common reason a Vue Test Utils assertion fails on a component that plainly works.</p>
+
+<h2>Async, and stubbing the API</h2>
+
+<pre class="language-javascript"><code class="language-javascript">import { flushPromises, mount } from "@vue/test-utils";
+import { vi } from "vitest";
+import * as api from "../src/api";
+
+it("shows the empty state when the search returns nothing", async () =&gt; {
+  vi.spyOn(api.api, "search").mockResolvedValue({ content: [], totalPages: 0 });
+
+  const wrapper = mount(ExploreView, { global: { plugins: [router, createPinia()] } });
+  await flushPromises();   // let the pending promises settle and the DOM update
+
+  expect(wrapper.text()).toContain("Nothing matched");
+});</code></pre>
+
+<p><code>flushPromises()</code> is the async equivalent of <code>await nextTick()</code> — it waits for
+the microtask queue to drain, so both the request and the re-render it caused have finished.</p>
+
+<p>Note that mocking one module is only possible because the whole application imports the API from one
+place (lesson 22). A component calling <code>fetch</code> directly is much harder to test, which is a
+design argument as much as a testing one.</p>
+
+<h2>Testing a store</h2>
+
+<p>Pinia stores are plain functions and need no component at all:</p>
+
+<pre class="language-javascript"><code class="language-javascript">import { createPinia, setActivePinia } from "pinia";
+import { beforeEach, expect, it } from "vitest";
+import { useToastStore } from "../src/stores/toast";
+
+beforeEach(() =&gt; {
+  // A fresh Pinia per test, or state leaks between them.
+  setActivePinia(createPinia());
+});
+
+it("dismisses by id and leaves the others alone", () =&gt; {
+  const toast = useToastStore();
+
+  const a = toast.success("Saved.");
+  const b = toast.error("Nope.");
+  toast.dismiss(a);
+
+  expect(toast.items).toHaveLength(1);
+  expect(toast.items[0].id).toBe(b);
+});</code></pre>
+
+<p>The <code>beforeEach</code> is not optional. Stores are singletons, so without a fresh Pinia the
+second test inherits the first one's state and the failures are order-dependent and baffling.</p>
+
+<h2>End-to-end tests</h2>
+
+<p>These are the demo application's actual tests, and its config states the philosophy plainly:</p>
+
+<pre class="language-javascript"><code class="language-javascript"> * These are TRUE end-to-end tests: they drive a real browser against the real Vue
+ * app talking to the real Spring Boot API and a real MongoDB. Nothing is stubbed,
+ * because the things most worth testing here (cursor paging, the change stream,
+ * role enforcement) only exist once all three are running.
+ *
+ * Both servers must already be up:
+ *   docker compose up -d
+ *   cd reelcms-springboot-backend &amp;&amp; ./mvnw spring-boot:run
+ *   cd reelcms-vue-frontend &amp;&amp; npm run dev</code></pre>
+
+<p>Nothing is stubbed, because the things most worth testing here — cursor paging, the change stream,
+role enforcement — only exist once all three tiers are running.</p>
+
+<pre class="language-javascript"><code class="language-javascript">  test("scrolling the feed loads the next page via the cursor", async ({ page }) =&gt; {
+    await page.goto("/");
+    await page.locator(".reel-stage").first().waitFor();
+
+    const before = await page.locator(".feed-slide").count();
+
+    // Scroll to the bottom of the pager, which trips the IntersectionObserver
+    // prefetch two slides from the end.
+    await page.locator(".feed-scroller").evaluate((el) =&gt; el.scrollTo(0, el.scrollHeight));
+    await page.waitForTimeout(1500);
+
+    const after = await page.locator(".feed-slide").count();
+    expect(after).toBeGreaterThanOrEqual(before);
+  });</code></pre>
+
+<p>That test would be nearly impossible as a unit test. It needs a real scroll, a real
+<code>IntersectionObserver</code>, a real cursor query and a real database — and it is exactly the
+integration that breaks when someone changes the prefetch threshold.</p>
+
+<p>The suite also does something worth copying: it never hard-codes a slug.</p>
+
+<pre class="language-javascript"><code class="language-javascript">/** The first published reel, straight from the API - slugs change on every reseed. */
+export async function firstPublishedReel(request) {
+  const res = await request.get(`${API}/api/feed?limit=1`);
+  const body = await res.json();
+  return body.items[0];
+}</code></pre>
+
+<p>Test data is reseeded and ids change. Asking the API what exists is the difference between a suite
+that survives a reseed and one that needs editing every time.</p>
+
+<h2>What to test, and how much</h2>
+
+<p>Chasing a coverage number produces tests of getters. Aim at these instead:</p>
+
+<p><strong>Branches.</strong> The fallback, the empty state, the error path. The happy path is usually
+covered by the app simply working.</p>
+
+<p><strong>Component contracts.</strong> Props in, events out — the surface other code depends on.</p>
+
+<p><strong>Logic you extracted.</strong> Composables and store actions are plain functions and the
+cheapest things in the codebase to test.</p>
+
+<p><strong>Bugs.</strong> Every fix gets a test that fails without it. This is the highest-value test you
+will ever write, because it is proof the bug was real and a guarantee it stays fixed.</p>
+
+<p>And a few end-to-end tests over the flows that would be catastrophic to break — signing in, checking
+out, publishing. They are slow and they need the whole stack, so keep the list short and make each one
+count.</p>
+
+<p>Next: <a href="/vue/vue-deployment">Building and Deploying to Production</a>.</p>
