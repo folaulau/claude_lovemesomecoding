@@ -110,6 +110,9 @@ solution("112-path-sum.html", "S112")
 solution("114-flatten-binary-tree-to-linked-list.html", "S114")
 solution("118-pascals-triangle.html", "S118")
 solution("119-pascals-triangle-ii.html", "S119")
+solution("122-best-time-to-buy-and-sell-stock-ii.html", "S122")
+solution("124-binary-tree-maximum-path-sum.html", "S124")
+solution("125-valid-palindrome.html", "S125")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -229,6 +232,12 @@ fragment("101-symmetric-tree.html", -1, "S101Iterative")
 
 # LeetCode 112: the two-parallel-stacks variant, presented as a loose method.
 fragment("112-path-sum.html", -1, "S112Iterative")
+
+# LeetCode 122: the two-state DP, presented as a bare method body.
+states = blocks("122-best-time-to-buy-and-sell-stock-ii.html")[-1]
+parts.append("class S122States {\n  int maxProfit(int[] prices) {\n"
+             "    if (prices.length == 0) return 0;\n"
+             + states + "\n  }\n}")
 
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
@@ -517,6 +526,47 @@ public class Main {
         long r = 1;
         for (int i = 1; i <= k; i++) r = r * (n - k + i) / i;
         return (int) r;
+    }
+
+    /** Every downward-path sum starting at n, for the problem 124 model. */
+    static List<Integer> downwardChains(TreeNode n) {
+        List<Integer> out = new ArrayList<>();
+        if (n == null) return out;
+        out.add(n.val);
+        for (TreeNode child : new TreeNode[]{n.left, n.right})
+            for (int c : downwardChains(child)) out.add(n.val + c);
+        return out;
+    }
+
+    /** Best simple-path sum, by enumerating every node as the path's highest point. */
+    static Integer bestPathModel(TreeNode root) {
+        if (root == null) return null;
+        List<TreeNode> nodes = new ArrayList<>();
+        Deque<TreeNode> stack = new ArrayDeque<>();
+        stack.push(root);
+        while (!stack.isEmpty()) {
+            TreeNode n = stack.pop();
+            nodes.add(n);
+            if (n.left != null) stack.push(n.left);
+            if (n.right != null) stack.push(n.right);
+        }
+        int best = Integer.MIN_VALUE;
+        for (TreeNode n : nodes) {
+            List<Integer> left = downwardChains(n.left), right = downwardChains(n.right);
+            best = Math.max(best, n.val);
+            for (int a : left) best = Math.max(best, n.val + a);
+            for (int b : right) best = Math.max(best, n.val + b);
+            for (int a : left) for (int b : right) best = Math.max(best, n.val + a + b);
+        }
+        return best;
+    }
+
+    /** Clean-and-reverse palindrome check, as an independent model. */
+    static boolean cleanPalindrome(String text) {
+        StringBuilder sb = new StringBuilder();
+        for (char c : text.toCharArray())
+            if (Character.isLetterOrDigit(c)) sb.append(Character.toLowerCase(c));
+        return sb.toString().equals(sb.reverse().toString());
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -2332,6 +2382,92 @@ public class Main {
         check("agrees with the last row of problem 118", pascalAgreeBad, 0);
         check("reusable: two calls give the same row",
               s119.getRow(5).equals(s119.getRow(5)) && s119.getRow(5).equals(List.of(1,5,10,10,5,1)), true);
+
+        System.out.println("LeetCode 122 - Best Time to Buy and Sell Stock II");
+        S122 s122 = new S122();
+        S122States s122d = new S122States();
+        check("[7,1,5,3,6,4]", s122.maxProfit(new int[]{7,1,5,3,6,4}), 7);
+        check("[1,2,3,4,5] (hold vs daily trades: same total)", s122.maxProfit(new int[]{1,2,3,4,5}), 4);
+        check("[7,6,4,3,1] (falling market)", s122.maxProfit(new int[]{7,6,4,3,1}), 0);
+        check("[1]", s122.maxProfit(new int[]{1}), 0);
+        check("[] (empty)", s122.maxProfit(new int[]{}), 0);
+        check("[2,2,2] (flat)", s122.maxProfit(new int[]{2,2,2}), 0);
+        check("[1,5,1,5,1,5]", s122.maxProfit(new int[]{1,5,1,5,1,5}), 12);
+        int unlimitedBad = 0, vs121Bad = 0;
+        S121 s121ref = new S121();
+        for (int n = 0; n <= 8; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] prices = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { prices[i] = 1 + mm % 3; mm /= 3; }
+                if (s122.maxProfit(prices.clone()) != s122d.maxProfit(prices.clone())) unlimitedBad++;
+                if (n > 0 && s122.maxProfit(prices.clone()) < s121ref.maxProfit(prices.clone())) vs121Bad++;
+            }
+        }
+        check("greedy agrees with the two-state DP on every series up to length 8", unlimitedBad, 0);
+        check("never worse than the single-transaction answer (problem 121)", vs121Bad, 0);
+
+        System.out.println("LeetCode 124 - Binary Tree Maximum Path Sum");
+        S124 s124 = new S124();
+        check("[1,2,3]", s124.maxPathSum(buildTree(1,2,3)), 6);
+        check("[-10,9,20,null,null,15,7] (best path skips the root)",
+              s124.maxPathSum(buildTree(-10,9,20,null,null,15,7)), 42);
+        check("[-3] (single negative -- must NOT return 0)", s124.maxPathSum(buildTree(-3)), -3);
+        check("[2,-1] (take the node alone)", s124.maxPathSum(buildTree(2,-1)), 2);
+        check("[-2,-1]", s124.maxPathSum(buildTree(-2,-1)), -1);
+        check("all negative", s124.maxPathSum(buildTree(-5,-4,-3,-2,-1)), -1);
+        // The field must be reset, or the second call inherits the first's answer.
+        check("reusable: same object, two calls",
+              s124.maxPathSum(buildTree(1,2,3)) + s124.maxPathSum(buildTree(1,2,3)), 12);
+        int pathSumBad = 0;
+        int[] pathValues = {-3, -1, 2};
+        for (int n = 1; n <= 5; n++) {
+            for (int mask = 0; mask < (1 << (n - 1)); mask++) {
+                int combos = (int) Math.pow(pathValues.length, n);
+                for (int vm = 0; vm < combos; vm++) {
+                    Integer[] xs = new Integer[n];
+                    int vv = vm;
+                    xs[0] = pathValues[vv % pathValues.length]; vv /= pathValues.length;
+                    for (int i = 1; i < n; i++) {
+                        if ((mask >> (i - 1) & 1) == 1) { xs[i] = pathValues[vv % pathValues.length]; vv /= pathValues.length; }
+                        else xs[i] = null;
+                    }
+                    TreeNode t = buildTree(xs);
+                    if (t == null) continue;
+                    if (s124.maxPathSum(buildTree(xs)) != bestPathModel(buildTree(xs))) pathSumBad++;
+                }
+            }
+        }
+        check("matches exhaustive path enumeration on small trees over {-3,-1,2}", pathSumBad, 0);
+
+        System.out.println("LeetCode 125 - Valid Palindrome");
+        S125 s125 = new S125();
+        check("A man, a plan, a canal: Panama",
+              s125.isPalindrome("A man, a plan, a canal: Panama"), true);
+        check("race a car", s125.isPalindrome("race a car"), false);
+        check("single space (empty after filtering)", s125.isPalindrome(" "), true);
+        check("empty string", s125.isPalindrome(""), true);
+        check("0P -- THE trap: 0 and P differ by exactly 32", s125.isPalindrome("0P"), false);
+        check("ab_a (underscore is not alphanumeric)", s125.isPalindrome("ab_a"), true);
+        check("single character", s125.isPalindrome("a"), true);
+        check("pure punctuation", s125.isPalindrome(".,;:!"), true);
+        check("aba (odd length, middle vs itself)", s125.isPalindrome("aba"), true);
+        check("1a1 (digits count)", s125.isPalindrome("1a1"), true);
+        check("1a2", s125.isPalindrome("1a2"), false);
+        char[] palAlphabet = {'a', 'A', '0', 'P', ',', ' '};
+        int palBad = 0;
+        for (int n = 0; n <= 5; n++) {
+            int combos = (int) Math.pow(palAlphabet.length, n);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder sb = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < n; i++) { sb.append(palAlphabet[mm % palAlphabet.length]); mm /= palAlphabet.length; }
+                String text = sb.toString();
+                if (s125.isPalindrome(text) != cleanPalindrome(text)) palBad++;
+            }
+        }
+        check("matches clean-and-reverse on every string up to length 5", palBad, 0);
 
         System.out.println();
         if (failures > 0) {

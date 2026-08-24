@@ -1881,6 +1881,133 @@ check("agrees with the last row of problem 118 for every rowIndex 0..30", bad, [
 check("reusable: two calls give the same row", (s.getRow(5), s.getRow(5)),
       ([1,5,10,10,5,1], [1,5,10,10,5,1]))
 
+print("LeetCode 122 - Best Time to Buy and Sell Stock II")
+s = load("122-best-time-to-buy-and-sell-stock-ii.html")
+check("[7,1,5,3,6,4]", s.maxProfit([7,1,5,3,6,4]), 7)
+check("[1,2,3,4,5] (hold vs daily trades: same total)", s.maxProfit([1,2,3,4,5]), 4)
+check("[7,6,4,3,1] (falling market)", s.maxProfit([7,6,4,3,1]), 0)
+check("[1]", s.maxProfit([1]), 0)
+check("[] (empty)", s.maxProfit([]), 0)
+check("[2,2,2] (flat)", s.maxProfit([2,2,2]), 0)
+check("[1,5,1,5,1,5]", s.maxProfit([1,5,1,5,1,5]), 12)
+# Brute force: every sequence of non-overlapping buy/sell pairs.
+def best_unlimited(prices):
+    n = len(prices)
+    if n < 2:
+        return 0
+    cash, hold = 0, -prices[0]
+    for i in range(1, n):
+        prev = cash
+        cash = max(cash, hold + prices[i])
+        hold = max(hold, prev - prices[i])
+    return cash
+
+bad = []
+for n in range(0, 9):
+    for combo in itertools.product([1, 2, 3], repeat=n):
+        if s.maxProfit(list(combo)) != best_unlimited(list(combo)):
+            bad.append(combo)
+check("matches a two-state DP on every price series up to length 8 over {1,2,3}", bad, [])
+# It must never do worse than the single-transaction answer from problem 121.
+single = load("121-best-time-to-buy-and-sell-stock.html")
+bad = []
+for n in range(1, 9):
+    for combo in itertools.product([1, 4, 2, 7], repeat=n):
+        if s.maxProfit(list(combo)) < single.maxProfit(list(combo)):
+            bad.append(combo)
+check("never worse than the single-transaction answer (problem 121)", bad, [])
+
+print("LeetCode 124 - Binary Tree Maximum Path Sum")
+s = load("124-binary-tree-maximum-path-sum.html", extra=TREE)
+check("[1,2,3]", s.maxPathSum(build([1,2,3])), 6)
+check("[-10,9,20,null,null,15,7] (best path skips the root)",
+      s.maxPathSum(build([-10,9,20,None,None,15,7])), 42)
+check("[-3] (single negative -- must NOT return 0)", s.maxPathSum(build([-3])), -3)
+check("[2,-1] (take the node alone)", s.maxPathSum(build([2,-1])), 2)
+check("[1]", s.maxPathSum(build([1])), 1)
+check("[-2,-1] ", s.maxPathSum(build([-2,-1])), -1)
+check("all negative", s.maxPathSum(build([-5,-4,-3,-2,-1])), -1)
+# Reuse: the field must be reset between calls.
+check("reusable: same object, two calls",
+      (s.maxPathSum(build([1,2,3])), s.maxPathSum(build([1,2,3]))), (6, 6))
+# Brute force: every simple path in the tree, enumerated directly.
+def all_path_sums(root):
+    nodes = []
+    def collect(n):
+        if n:
+            nodes.append(n); collect(n.left); collect(n.right)
+    collect(root)
+    best = None
+    # A simple path in a tree is determined by its highest node and one or two
+    # downward chains from it.
+    def chains(n):
+        """Every downward-path sum starting at n."""
+        if n is None:
+            return []
+        out = [n.val]
+        for child in (n.left, n.right):
+            for c in chains(child):
+                out.append(n.val + c)
+        return out
+    for n in nodes:
+        left = chains(n.left) or []
+        right = chains(n.right) or []
+        cands = [n.val]
+        cands += [n.val + c for c in left]
+        cands += [n.val + c for c in right]
+        cands += [n.val + a + b for a in left for b in right]
+        top = max(cands)
+        best = top if best is None else max(best, top)
+    return best
+
+bad = []
+for n in range(1, 7):
+    for mask in range(1 << (n - 1)):
+        for vals in itertools.product([-3, -1, 2], repeat=n):
+            it = iter(vals)
+            xs, taken = [next(it)], 1
+            for i in range(n - 1):
+                xs.append(next(it) if (mask >> i & 1) else None)
+            xs = [v for v in xs]
+            tree = build(xs)
+            present = [v for v in xs if v is not None]
+            if len(present) == 0:
+                continue
+            got, want = s.maxPathSum(build(xs)), all_path_sums(build(xs))
+            if got != want:
+                bad.append((xs, got, want))
+    if bad:
+        break
+check("matches exhaustive path enumeration on small trees over {-3,-1,2}", bad, [])
+
+print("LeetCode 125 - Valid Palindrome")
+s = load("125-valid-palindrome.html")
+check('"A man, a plan, a canal: Panama"',
+      s.isPalindrome("A man, a plan, a canal: Panama"), True)
+check('"race a car"', s.isPalindrome("race a car"), False)
+check('" " (empty after filtering)', s.isPalindrome(" "), True)
+check('"" (empty)', s.isPalindrome(""), True)
+check('"0P" -- THE trap: 0 and P differ by exactly 32', s.isPalindrome("0P"), False)
+check('"ab_a" (underscore is not alphanumeric)', s.isPalindrome("ab_a"), True)
+check('"a" (single)', s.isPalindrome("a"), True)
+check('".,;:!" (pure punctuation)', s.isPalindrome(".,;:!"), True)
+check('"aba" (odd length, middle vs itself)', s.isPalindrome("aba"), True)
+check('"0p" (genuinely different letters)', s.isPalindrome("0p"), False)
+check('"1a2" ', s.isPalindrome("1a2"), False)
+check('"1a1" (digits count)', s.isPalindrome("1a1"), True)
+# Cross-check against the clean-and-reverse model on generated strings.
+def clean_model(text):
+    cleaned = [c.lower() for c in text if c.isalnum()]
+    return cleaned == cleaned[::-1]
+
+bad = []
+for n in range(0, 6):
+    for combo in itertools.product("aA0P, ", repeat=n):
+        text = "".join(combo)
+        if s.isPalindrome(text) != clean_model(text):
+            bad.append(text)
+check("matches clean-and-reverse on every string up to length 5 over aA0P, and space", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

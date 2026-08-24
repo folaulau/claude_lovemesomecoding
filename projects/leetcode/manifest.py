@@ -1172,6 +1172,54 @@ POSTS = [
         ),
     },
     {
+        "number": 122,
+        "slug": "leetcode-122-best-time-to-buy-and-sell-stock-ii",
+        "algorithm": "Greedy",
+        "title": "LeetCode 122 \u2013 Best Time to Buy and Sell Stock II",
+        "file": "122-best-time-to-buy-and-sell-stock-ii.html",
+        "date": "2024-12-10T18:35:50",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "greedy", "dynamic-programming"],
+        "excerpt": (
+            "A rare case where removing a constraint makes the problem easier. Every profit is a "
+            "sum of consecutive daily deltas, so take every positive one \u2014 and that derivation is "
+            "what turns a greedy that looks like cheating into one that is obviously optimal. Plus "
+            "the two-state form that survives fees, cooldowns and caps."
+        ),
+    },
+    {
+        "number": 124,
+        "slug": "leetcode-124-binary-tree-maximum-path-sum",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 124 \u2013 Binary Tree Maximum Path Sum",
+        "file": "124-binary-tree-maximum-path-sum.html",
+        "date": "2024-12-10T21:45:12",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
+        "excerpt": (
+            "The hardest version of the pattern this track has been building toward since Diameter: "
+            "the recursion returns one quantity and records another. A path that uses both children "
+            "cannot also reach the parent, which is the geometric fact behind the whole solution. "
+            "Twelve lines, and no debugging helps if the two are confused."
+        ),
+    },
+    {
+        "number": 125,
+        "slug": "leetcode-125-valid-palindrome",
+        "algorithm": "Strings",
+        "title": "LeetCode 125 \u2013 Valid Palindrome",
+        "file": "125-valid-palindrome.html",
+        "date": "2024-12-14T17:10:27",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "string", "two-pointers"],
+        "excerpt": (
+            "A two-pointer warm-up with one nasty trap: '0' and 'P' differ by exactly 32, so the "
+            "popular case-insensitive shortcut says they match. The 32 gap is a fact about letters, "
+            "and it stops meaning anything the moment digits are in scope. Also why each skip loop "
+            "needs its own bound."
+        ),
+    },
+    {
         "number": 200,
         "batch": "interview-essentials",
         "slug": "leetcode-200-number-of-islands",
