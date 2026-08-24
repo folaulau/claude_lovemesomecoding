@@ -3,6 +3,7 @@
 The blocks are pulled straight out of the published HTML, so this tests what a
 reader would copy, not a retyped copy of it.
 """
+import collections
 import html
 import math
 import re
@@ -1121,6 +1122,177 @@ def enumerate_ways(n):
     return enumerate_ways(n - 1) + enumerate_ways(n - 2)
 bad = [n for n in range(1, 16) if s.climbStairs(n) != enumerate_ways(n)]
 check("matches brute-force enumeration for n in 1..15", bad, [])
+
+print("LeetCode 71 - Simplify Path")
+s = load("071-simplify-path.html")
+check('"/home/"', s.simplifyPath("/home/"), "/home")
+check('"/home//foo/"', s.simplifyPath("/home//foo/"), "/home/foo")
+check('"/../" (root parent is root)', s.simplifyPath("/../"), "/")
+check('"/a/./b/../../c/"', s.simplifyPath("/a/./b/../../c/"), "/c")
+check('"/..." (three dots is a NAME)', s.simplifyPath("/..."), "/...")
+check('"/"', s.simplifyPath("/"), "/")
+check('"/a//b////c/d//././/.."', s.simplifyPath("/a//b////c/d//././/.."), "/a/b/c")
+check('"/../../../a"', s.simplifyPath("/../../../a"), "/a")
+check('"/a/.."', s.simplifyPath("/a/.."), "/")
+check('"/..hidden"', s.simplifyPath("/..hidden"), "/..hidden")
+check('"/a..b"', s.simplifyPath("/a..b"), "/a..b")
+check('"/.."', s.simplifyPath("/.."), "/")
+# Cross-check against an independent model on generated paths.
+def canonical(path):
+    out = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out:
+                out.pop()
+        else:
+            out.append(part)
+    return "/" + "/".join(out)
+
+bad = []
+for n in range(1, 6):
+    for combo in itertools.product(["a", ".", "..", "", "..."], repeat=n):
+        path = "/" + "/".join(combo)
+        got = s.simplifyPath(path)
+        if got != canonical(path):
+            bad.append((path, got, canonical(path)))
+check("matches an independent model on every path up to 5 components", bad, [])
+# Structural invariants: always absolute, never a trailing slash, no . or .. left.
+bad = []
+for n in range(1, 6):
+    for combo in itertools.product(["a", "bb", ".", "..", ""], repeat=n):
+        got = s.simplifyPath("/" + "/".join(combo))
+        if not got.startswith("/"):
+            bad.append(("not absolute", got))
+        elif got != "/" and got.endswith("/"):
+            bad.append(("trailing slash", got))
+        elif any(p in (".", "..", "") for p in got.split("/")[1:]) and got != "/":
+            bad.append(("unresolved", got))
+check("output is absolute, has no trailing slash, and resolves every . and ..", bad, [])
+
+print("LeetCode 72 - Edit Distance")
+s = load("072-edit-distance.html")
+check('"horse" -> "ros"', s.minDistance("horse", "ros"), 3)
+check('"intention" -> "execution"', s.minDistance("intention", "execution"), 5)
+check('"" -> "abc" (three inserts)', s.minDistance("", "abc"), 3)
+check('"abc" -> "" (three deletes)', s.minDistance("abc", ""), 3)
+check('"" -> ""', s.minDistance("", ""), 0)
+check('"abc" -> "abc"', s.minDistance("abc", "abc"), 0)
+check('"a" -> "b" (one replace)', s.minDistance("a", "b"), 1)
+check('"sunday" -> "saturday"', s.minDistance("sunday", "saturday"), 3)
+# Independent Levenshtein, plus the symmetry the post claims.
+def lev(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(prev[j - 1] if ca == cb else 1 + min(prev[j - 1], prev[j], cur[j - 1]))
+        prev = cur
+    return prev[len(b)]
+
+bad, asym = [], []
+for m in range(0, 5):
+    for n in range(0, 5):
+        for wa in itertools.product("ab", repeat=m):
+            for wb in itertools.product("ab", repeat=n):
+                a, b = "".join(wa), "".join(wb)
+                got = s.minDistance(a, b)
+                if got != lev(a, b):
+                    bad.append((a, b, got))
+                if got != s.minDistance(b, a):
+                    asym.append((a, b))
+check("matches Levenshtein on every pair of a/b strings up to length 4", bad, [])
+check("distance is symmetric", asym, [])
+# The answer is never more than the longer string, nor less than the length difference.
+bad = []
+for a, b in [("abcdef", ""), ("kitten", "sitting"), ("flaw", "lawn"), ("a" * 20, "b" * 20)]:
+    d = s.minDistance(a, b)
+    if not (abs(len(a) - len(b)) <= d <= max(len(a), len(b))):
+        bad.append((a, b, d))
+check("|len(a)-len(b)| <= distance <= max(len(a), len(b))", bad, [])
+
+print("LeetCode 76 - Minimum Window Substring")
+s = load("076-minimum-window-substring.html")
+check('"ADOBECODEBANC", "ABC"', s.minWindow("ADOBECODEBANC", "ABC"), "BANC")
+check('"a", "a"', s.minWindow("a", "a"), "a")
+check('"a", "aa" (duplicates must be counted)', s.minWindow("a", "aa"), "")
+check('"ab", "b"', s.minWindow("ab", "b"), "b")
+check('"ab", "A" (case sensitive)', s.minWindow("ab", "A"), "")
+check('"aa", "aa"', s.minWindow("aa", "aa"), "aa")
+check('"", "a"', s.minWindow("", "a"), "")
+check('"abc", ""', s.minWindow("abc", ""), "")
+check('"bba", "ab"', s.minWindow("bba", "ab"), "ba")
+check('"cabwefgewcwaefgcf", "cae"', s.minWindow("cabwefgewcwaefgcf", "cae"), "cwae")
+# Brute force over every substring, on generated inputs.
+def brute(sv, tv):
+    if not tv:
+        return ""
+    needc = collections.Counter(tv)
+    best = None
+    for i in range(len(sv)):
+        for j in range(i + 1, len(sv) + 1):
+            window = collections.Counter(sv[i:j])
+            if all(window[c] >= k for c, k in needc.items()):
+                if best is None or j - i < len(best):
+                    best = sv[i:j]
+                break            # shortest window starting at i
+    return best or ""
+
+bad = []
+for n in range(0, 7):
+    for sv in itertools.product("abc", repeat=n):
+        for m in range(1, 3):
+            for tv in itertools.product("ab", repeat=m):
+                a, b = "".join(sv), "".join(tv)
+                got, want = s.minWindow(a, b), brute(a, b)
+                # Any window of the right length is acceptable; compare lengths and validity.
+                if len(got) != len(want):
+                    bad.append((a, b, got, want))
+                elif got and not all(collections.Counter(got)[c] >= k
+                                     for c, k in collections.Counter(b).items()):
+                    bad.append(("invalid window", a, b, got))
+check("matches brute force on every s up to length 6 over abc, t up to length 2", bad, [])
+
+print("LeetCode 78 - Subsets")
+s = load("078-subsets.html")
+def sset(r):
+    return sorted(tuple(x) for x in r)
+check("[1,2,3]", sset(s.subsets([1,2,3])),
+      sset([[],[1],[2],[3],[1,2],[1,3],[2,3],[1,2,3]]))
+check("[0]", sset(s.subsets([0])), sset([[], [0]]))
+check("[] returns [[]], not []", s.subsets([]), [[]])
+check("[1,2] ", sset(s.subsets([1,2])), sset([[],[1],[2],[1,2]]))
+check("the empty subset is present", [] in s.subsets([1,2,3]), True)
+# 2^n subsets, all distinct, each a sub-multiset of the input, for every n.
+bad = []
+for n in range(0, 11):
+    nums = list(range(n))
+    got = s.subsets(nums)
+    if len(got) != 2 ** n:
+        bad.append(("count", n, len(got)))
+    elif len({tuple(x) for x in got}) != 2 ** n:
+        bad.append(("duplicates", n))
+    elif any(len(set(x)) != len(x) or not set(x) <= set(nums) for x in got):
+        bad.append(("bad member", n))
+check("2^n distinct subsets of the input for every n in 0..10", bad, [])
+# Against itertools.combinations, which is an independent generator.
+bad = []
+for n in range(0, 7):
+    nums = list(range(n))
+    want = sorted(c for k in range(n + 1) for c in itertools.combinations(nums, k))
+    if sset(s.subsets(nums)) != want:
+        bad.append(n)
+check("matches itertools.combinations over all sizes for n in 0..6", bad, [])
+# Aliasing: the returned lists must be independent objects.
+# If the recursion stored `path` instead of a copy, every entry is the same object
+# and this marker would appear in all 8 of them.
+out = s.subsets([1, 2, 3])
+out[0].append(999)
+check("mutating one returned subset does not touch the others",
+      sum(999 in x for x in out), 1)
+check("...and the other 7 still hold the right sizes",
+      sorted(len(x) for x in out[1:]), [1, 1, 1, 2, 2, 2, 3])
 
 print()
 if fails:

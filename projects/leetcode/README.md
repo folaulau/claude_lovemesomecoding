@@ -55,7 +55,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 5 | 41–50 | 6 — 41, 42, 43, 46, 47, 49 | **live** since 2024-08/09 |
 | 6 | 51–60 | 7 — 51, 52, 53, 55, 56, 57, 58 | **live** since 2024-09 |
 | 7 | 61–70 | 8 — 62, 63, 64, 65, 67, 68, 69, 70 | **live** since 2024-09/10 |
-| 8 | 71–80 | 4 — 71, 72, 76, 78 | not started |
+| 8 | 71–80 | 4 — 71, 72, 76, 78 | **live** since 2024-10/11 |
+| 9 | 81–90 | 3 — 81, 83, 88 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -87,14 +88,14 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 51 posts:
+Current distribution across the 55 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Implementation | 9 |
-| Strings | 9 |
-| Dynamic Programming | 8 |
-| Recursion | 8 |
+| Implementation | 10 |
+| Strings | 10 |
+| Dynamic Programming | 9 |
+| Recursion | 9 |
 | Sorting | 7 |
 | Searching | 5 |
 | Greedy | 2 |
@@ -155,11 +156,14 @@ Round 7 had **no** room left, so LeetCode 121 was moved forward with `--redate`,
 `2024-09-18` to `2024-11-10`. That reopened the two-month gap between it and LeetCode 200
 (`2024-11-19`), and round 7's eight posts are spread across `2024-09-18` to `2024-10-29`.
 
-**That is the move to repeat.** The four interview-essentials posts (121, 200, 347, 543) are the only
-things standing between the numbered rounds and the end of 2024, and their dates are synthetic track
-ordering exactly like every other LeetCode date here — moving one forward is cheap and reversible.
-Round 8 will need the same treatment. Once the numbered rounds pass 121 the constraint disappears
-and later rounds simply take dates after `2024-12-28`.
+**That is the move to repeat when the gap runs out** — but check first rather than doing it by
+reflex. Round 8 needed only four slots and the 12 days left after round 7 were plenty, so nothing
+was moved. Round 9 has three posts and about 4.5 days, which still fits. Round 10 will not.
+
+The four interview-essentials posts (121, 200, 347, 543) are the only things standing between the
+numbered rounds and the end of 2024, and their dates are synthetic track ordering exactly like every
+other LeetCode date here — moving one forward is cheap, idempotent and reversible. Once the numbered
+rounds pass 121 the constraint disappears and later rounds simply take dates after `2024-12-28`.
 
 ### Changing a date after publication
 

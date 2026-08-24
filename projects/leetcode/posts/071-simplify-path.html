@@ -1,0 +1,147 @@
+<p>Simplify Path is a stack problem that arrives disguised as string manipulation, and the reason it
+is worth doing is that the stack is not an optimisation here — it is the only structure that models
+what <code>..</code> actually means. Once you see "go up one level" as "undo the last thing I did",
+the code writes itself.</p>
+
+<h2>The problem</h2>
+
+<p>Given an absolute Unix-style file path, return its canonical form. In the canonical path: a single
+slash separates components, there is no trailing slash, and no component is <code>.</code> or
+<code>..</code>.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">"/home/"            -&gt; "/home"        trailing slash dropped
+"/home//foo/"       -&gt; "/home/foo"    repeated slashes collapse
+"/../"              -&gt; "/"            the root's parent is the root
+"/a/./b/../../c/"   -&gt; "/c"
+"/..."              -&gt; "/..."         three dots is an ORDINARY name
+"/"                 -&gt; "/"
+"/a//b////c/d//././/.." -&gt; "/a/b/c"</code></pre>
+
+<p><code>"/..."</code> is the one that catches people. Only <em>exactly</em> two dots means parent.
+Three dots, or <code>"..a"</code>, or <code>"a.."</code>, are just filenames, and a solution that
+tests <code>startsWith("..")</code> gets them wrong.</p>
+
+<h2>Why a stack</h2>
+
+<p>Walk the components left to right and ask what each one does to the path you have built so far:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">a name   push it
+"."      nothing -- "stay here"
+".."     pop the last one -- "undo the previous push"
+""       nothing -- an artefact of "//" or the leading "/"</code></pre>
+
+<p>"Undo the most recent operation" is the definition of a stack, which is why nothing simpler works.
+You cannot resolve <code>..</code> with a counter, because you need to know <em>which</em> component
+to remove, and you cannot do it with a single backward pass, because <code>..</code> can chain.</p>
+
+<h2>Splitting is doing more work than it looks</h2>
+
+<p>Splitting on <code>"/"</code> handles three of the four cases for free, which is worth noticing
+rather than writing code to handle them:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">"/home//foo/".split("/")  ->  ["", "home", "", "foo"]
+                               ^^         ^^
+                          leading slash   the doubled slash</code></pre>
+
+<p>Both collapse to empty strings, and empty strings are skipped by the same branch that skips
+<code>"."</code>. So repeated slashes, the leading slash and any trailing slash all disappear without
+a dedicated rule. Say that out loud — an interviewer watching you write three special cases for
+things the split already handled is watching you add bugs.</p>
+
+<h2>The pop that must not throw</h2>
+
+<p><code>".."</code> at the root is a no-op, not an error: <code>/..</code> is <code>/</code> on
+every Unix system. So the pop has to tolerate an empty stack. In Java that is the difference between
+two nearly identical methods:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">stack.removeLast()   throws NoSuchElementException when empty
+stack.pollLast()     returns null when empty  <-- the one you want</code></pre>
+
+<p>Picking <code>pollLast</code> deliberately, and being able to say why, reads much better than an
+<code>if (!stack.isEmpty())</code> wrapper — though that is equally correct and clearer in Python,
+which has no such pair.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution {
+    public String simplifyPath(String path) {
+        Deque&lt;String&gt; stack = new ArrayDeque&lt;&gt;();
+
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || part.equals(".")) {
+                continue;                       // "//", the leading "/", and "."
+            } else if (part.equals("..")) {
+                stack.pollLast();               // at the root this is a no-op, not an error
+            } else {
+                stack.addLast(part);            // ".." is EQUALS, so "..." lands here
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        for (String dir : stack) {
+            out.append('/').append(dir);
+        }
+
+        return out.length() == 0 ? "/" : out.toString();
+    }
+}</code></pre>
+
+<p>Use <code>ArrayDeque</code> rather than <code>Stack</code>. <code>Stack</code> extends
+<code>Vector</code>, so every operation is synchronised for no benefit, and — the part that actually
+matters here — iterating a <code>Stack</code> yields elements bottom-to-top while
+<code>stack.pop()</code> takes from the top, so the two disagree about which end is which. Building
+the output by iteration is where that bites.</p>
+
+<p>Appending <code>'/'</code> before each component gives the leading slash for free and no trailing
+one, so the only special case left is the empty stack.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">class Solution:
+    def simplifyPath(self, path: str) -&gt; str:
+        stack: list[str] = []
+
+        for part in path.split("/"):
+            if part == "" or part == ".":
+                continue
+            if part == "..":
+                if stack:                 # the root's parent is the root
+                    stack.pop()
+            else:
+                stack.append(part)
+
+        return "/" + "/".join(stack)</code></pre>
+
+<p>The return is one line and needs no empty check: <code>"/".join([])</code> is <code>""</code>, so
+the result is <code>"/"</code> exactly when the stack is empty. Worth pointing at — it is the kind
+of thing that makes a reviewer trust the rest of the function.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th></th><th>Time</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Split and stack</td><td><code>O(n)</code></td><td><code>O(n)</code></td></tr>
+  </tbody>
+</table>
+
+<p>Each component is pushed at most once and popped at most once, so the total work is linear in the
+length of the path despite the nested-looking structure. The space is genuinely <code>O(n)</code>
+and cannot be improved: <code>"/a/b/c/d/e"</code> has no redundancy to remove, so the output is as
+long as the input.</p>
+
+<p>Splitting allocates the component array up front. Scanning with two indices and slicing lazily
+avoids it, and is worth mentioning if asked about memory — but it trades clear code for a constant
+factor, which is rarely the right call in an interview.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That you reach for a stack because <code>..</code> means undo, not because stacks are handy.</li>
+  <li>That splitting on <code>"/"</code> handles doubled and trailing slashes for free.</li>
+  <li><code>".."</code> compared with equality, so <code>"..."</code> stays a filename.</li>
+  <li>That popping an empty stack is a no-op — <code>/..</code> is <code>/</code>.</li>
+  <li>The root path <code>"/"</code>, and a path that reduces to it.</li>
+  <li>No trailing slash on the output, and always a leading one.</li>
+  <li><code>ArrayDeque</code> over <code>Stack</code>, and why the iteration order matters.</li>
+</ul>

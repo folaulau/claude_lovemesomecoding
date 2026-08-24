@@ -88,6 +88,10 @@ solution("067-add-binary.html", "S67")
 solution("068-text-justification.html", "S68")
 solution("069-sqrtx.html", "S69")
 solution("070-climbing-stairs.html", "S70")
+solution("071-simplify-path.html", "S71")
+solution("072-edit-distance.html", "S72")
+solution("076-minimum-window-substring.html", "S76")
+solution("078-subsets.html", "S78")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -183,6 +187,15 @@ parts.append("class S58Trim {\n  int lengthOfLastWord(String s) {\n" + trimmed +
 
 # LeetCode 67: the XOR/AND adder, presented as a loose method.
 fragment("067-add-binary.html", -1, "S67Bits")
+
+# LeetCode 72: the one-row version with the carried diagonal.
+onerow = blocks("072-edit-distance.html")[-1]
+parts.append("class S72Row {\n  int minDistance(String word1, String word2) {\n"
+             "    int m = word1.length(), n = word2.length();\n"
+             + onerow + "\n    return row[n];\n  }\n}")
+
+# LeetCode 78: the bitmask enumeration, presented as a loose method.
+fragment("078-subsets.html", -1, "S78Bits")
 
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
@@ -318,6 +331,57 @@ public class Main {
         if (r + 1 < m) best = Math.min(best, enumerateBest(g, r + 1, c));
         if (c + 1 < n) best = Math.min(best, enumerateBest(g, r, c + 1));
         return g[r][c] + best;
+    }
+
+    /** Independent path canonicaliser, to check Simplify Path against. */
+    static String canonical(String path) {
+        Deque<String> out = new ArrayDeque<>();
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || part.equals(".")) continue;
+            if (part.equals("..")) out.pollLast();
+            else out.addLast(part);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String d : out) sb.append('/').append(d);
+        return sb.length() == 0 ? "/" : sb.toString();
+    }
+
+    /** Independent Levenshtein distance. */
+    static int lev(String a, String b) {
+        int[] prev = new int[b.length() + 1];
+        for (int j = 0; j <= b.length(); j++) prev[j] = j;
+        for (int i = 1; i <= a.length(); i++) {
+            int[] cur = new int[b.length() + 1];
+            cur[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                cur[j] = a.charAt(i - 1) == b.charAt(j - 1)
+                        ? prev[j - 1]
+                        : 1 + Math.min(prev[j - 1], Math.min(prev[j], cur[j - 1]));
+            }
+            prev = cur;
+        }
+        return prev[b.length()];
+    }
+
+    /** Does `window` contain every character of `t`, with multiplicity? */
+    static boolean covers(String window, String t) {
+        int[] have = new int[128];
+        for (char c : window.toCharArray()) have[c]++;
+        for (char c : t.toCharArray()) if (--have[c] < 0) return false;
+        return true;
+    }
+
+    /** Shortest covering window by brute force. */
+    static String bruteWindow(String s, String t) {
+        if (t.isEmpty()) return "";
+        String best = null;
+        for (int i = 0; i < s.length(); i++)
+            for (int j = i + 1; j <= s.length(); j++)
+                if (covers(s.substring(i, j), t)) {
+                    if (best == null || j - i < best.length()) best = s.substring(i, j);
+                    break;
+                }
+        return best == null ? "" : best;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -1494,6 +1558,135 @@ public class Main {
             int next = fa + fb; fa = fb; fb = next;
         }
         check("matches an independent Fibonacci model for n in 0..40", stairBad, 0);
+
+        System.out.println("LeetCode 71 - Simplify Path");
+        S71 s71 = new S71();
+        check("/home/", s71.simplifyPath("/home/"), "/home");
+        check("/home//foo/", s71.simplifyPath("/home//foo/"), "/home/foo");
+        check("/../ (root parent is root)", s71.simplifyPath("/../"), "/");
+        check("/a/./b/../../c/", s71.simplifyPath("/a/./b/../../c/"), "/c");
+        check("/... (three dots is a NAME)", s71.simplifyPath("/..."), "/...");
+        check("/ (root)", s71.simplifyPath("/"), "/");
+        check("/a//b////c/d//././/..", s71.simplifyPath("/a//b////c/d//././/.."), "/a/b/c");
+        check("/../../../a", s71.simplifyPath("/../../../a"), "/a");
+        check("/a/..", s71.simplifyPath("/a/.."), "/");
+        check("/..hidden", s71.simplifyPath("/..hidden"), "/..hidden");
+        check("/a..b", s71.simplifyPath("/a..b"), "/a..b");
+        String[] pathParts = {"a", ".", "..", "", "..."};
+        int simplifyBad = 0, shapeBad = 0;
+        for (int n = 1; n <= 5; n++) {
+            int combos = (int) Math.pow(pathParts.length, n);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder sb = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < n; i++) { sb.append('/').append(pathParts[mm % pathParts.length]); mm /= pathParts.length; }
+                String path = sb.toString();
+                String got = s71.simplifyPath(path);
+                if (!got.equals(canonical(path))) simplifyBad++;
+                if (!got.startsWith("/")) shapeBad++;
+                else if (!got.equals("/") && got.endsWith("/")) shapeBad++;
+                else if (!got.equals("/")) {
+                    for (String part : got.substring(1).split("/", -1))
+                        if (part.isEmpty() || part.equals(".") || part.equals("..")) shapeBad++;
+                }
+            }
+        }
+        check("matches an independent model on every path up to 5 components", simplifyBad, 0);
+        check("output is absolute, has no trailing slash, and resolves every . and ..", shapeBad, 0);
+
+        System.out.println("LeetCode 72 - Edit Distance");
+        S72 s72 = new S72();
+        S72Row s72r = new S72Row();
+        check("horse -> ros", s72.minDistance("horse", "ros"), 3);
+        check("intention -> execution", s72.minDistance("intention", "execution"), 5);
+        check("empty -> abc (three inserts)", s72.minDistance("", "abc"), 3);
+        check("abc -> empty (three deletes)", s72.minDistance("abc", ""), 3);
+        check("empty -> empty", s72.minDistance("", ""), 0);
+        check("abc -> abc", s72.minDistance("abc", "abc"), 0);
+        check("a -> b (one replace)", s72.minDistance("a", "b"), 1);
+        check("sunday -> saturday", s72.minDistance("sunday", "saturday"), 3);
+        int editBad = 0, editAsym = 0, rowBad = 0;
+        for (int m = 0; m <= 4; m++) {
+            for (int n = 0; n <= 4; n++) {
+                for (int am = 0; am < (1 << m); am++) {
+                    for (int bm = 0; bm < (1 << n); bm++) {
+                        StringBuilder sa = new StringBuilder(), sb2 = new StringBuilder();
+                        for (int i = 0; i < m; i++) sa.append((am >> i & 1) == 1 ? 'a' : 'b');
+                        for (int i = 0; i < n; i++) sb2.append((bm >> i & 1) == 1 ? 'a' : 'b');
+                        String wordA = sa.toString(), wordB = sb2.toString();
+                        int dist = s72.minDistance(wordA, wordB);
+                        if (dist != lev(wordA, wordB)) editBad++;
+                        if (dist != s72.minDistance(wordB, wordA)) editAsym++;
+                        if (s72r.minDistance(wordA, wordB) != dist) rowBad++;
+                    }
+                }
+            }
+        }
+        check("matches Levenshtein on every pair of a/b strings up to length 4", editBad, 0);
+        check("distance is symmetric", editAsym, 0);
+        check("[one-row version] agrees with the table on the same pairs", rowBad, 0);
+
+        System.out.println("LeetCode 76 - Minimum Window Substring");
+        S76 s76 = new S76();
+        check("ADOBECODEBANC / ABC", s76.minWindow("ADOBECODEBANC", "ABC"), "BANC");
+        check("a / a", s76.minWindow("a", "a"), "a");
+        check("a / aa (duplicates must be counted)", s76.minWindow("a", "aa"), "");
+        check("ab / b", s76.minWindow("ab", "b"), "b");
+        check("ab / A (case sensitive)", s76.minWindow("ab", "A"), "");
+        check("empty s", s76.minWindow("", "a"), "");
+        check("empty t", s76.minWindow("abc", ""), "");
+        check("bba / ab", s76.minWindow("bba", "ab"), "ba");
+        check("cabwefgewcwaefgcf / cae", s76.minWindow("cabwefgewcwaefgcf", "cae"), "cwae");
+        int winBad = 0;
+        for (int n = 0; n <= 6; n++) {
+            int sCombos = (int) Math.pow(3, n);
+            for (int sm = 0; sm < sCombos; sm++) {
+                StringBuilder sb = new StringBuilder();
+                int mm = sm;
+                for (int i = 0; i < n; i++) { sb.append((char) ('a' + mm % 3)); mm /= 3; }
+                String sv = sb.toString();
+                for (int m = 1; m <= 2; m++) {
+                    for (int tm = 0; tm < (1 << m); tm++) {
+                        StringBuilder tb = new StringBuilder();
+                        for (int i = 0; i < m; i++) tb.append((tm >> i & 1) == 1 ? 'a' : 'b');
+                        String tv = tb.toString();
+                        String win = s76.minWindow(sv, tv), bruteWin = bruteWindow(sv, tv);
+                        if (win.length() != bruteWin.length()) winBad++;
+                        else if (!win.isEmpty() && !covers(win, tv)) winBad++;
+                    }
+                }
+            }
+        }
+        check("matches brute force on every s up to length 6 over abc, t up to length 2", winBad, 0);
+
+        System.out.println("LeetCode 78 - Subsets");
+        S78 s78 = new S78();
+        S78Bits s78b = new S78Bits();
+        check("[1,2,3]", norm(s78.subsets(new int[]{1,2,3})),
+              norm(List.of(List.of(), List.of(1), List.of(2), List.of(3),
+                           List.of(1,2), List.of(1,3), List.of(2,3), List.of(1,2,3))));
+        check("[0]", s78.subsets(new int[]{0}).size(), 2);
+        check("[] returns [[]], not []", s78.subsets(new int[]{}), List.of(List.of()));
+        check("the empty subset is present", s78.subsets(new int[]{1,2,3}).contains(List.of()), true);
+        int subBad = 0, bitsBad = 0;
+        for (int n = 0; n <= 10; n++) {
+            int[] nums = new int[n];
+            for (int i = 0; i < n; i++) nums[i] = i;
+            List<List<Integer>> got = s78.subsets(nums.clone());
+            if (got.size() != (1 << n)) subBad++;
+            if (new HashSet<>(got).size() != (1 << n)) subBad++;
+            for (List<Integer> sub : got)
+                if (new HashSet<>(sub).size() != sub.size()) subBad++;
+            if (!norm(s78b.subsetsBits(nums.clone())).equals(norm(got))) bitsBad++;
+        }
+        check("2^n distinct subsets of the input for every n in 0..10", subBad, 0);
+        check("[bitmask] agrees with the backtracking version", bitsBad, 0);
+        // Without the defensive copy, all 2^n entries would alias one list.
+        List<List<Integer>> subs = new ArrayList<>(s78.subsets(new int[]{1,2,3}));
+        subs.get(0).add(999);
+        int carrying = 0;
+        for (List<Integer> sub : subs) if (sub.contains(999)) carrying++;
+        check("mutating one returned subset does not touch the others", carrying, 1);
 
         System.out.println();
         if (failures > 0) {

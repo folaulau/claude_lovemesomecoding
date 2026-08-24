@@ -797,6 +797,70 @@ POSTS = [
             "step sizes become arbitrary and it turns into Coin Change."
         ),
     },
+    {
+        "number": 71,
+        "slug": "leetcode-71-simplify-path",
+        "algorithm": "Implementation",
+        "title": "LeetCode 71 \u2013 Simplify Path",
+        "file": "071-simplify-path.html",
+        "date": "2024-10-29T21:06:47",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "string", "stack"],
+        "excerpt": (
+            "A stack problem disguised as string manipulation, and the stack is not an optimisation "
+            "\u2014 it is the only structure that models what .. means. Splitting on / handles doubled "
+            "and trailing slashes for free, popping an empty stack must be a no-op, and \"...\" is an "
+            "ordinary filename."
+        ),
+    },
+    {
+        "number": 72,
+        "slug": "leetcode-72-edit-distance",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 72 \u2013 Edit Distance",
+        "file": "072-edit-distance.html",
+        "date": "2024-11-04T01:56:29",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "string", "dynamic-programming"],
+        "excerpt": (
+            "The two-dimensional DP problem \u2014 if you get one 2-D table fluent, make it this one. "
+            "Why dp[i][j] must be defined over prefix lengths rather than indices, why the extra row "
+            "and column remove every edge case, and how to work out which neighbour is the insert "
+            "instead of guessing."
+        ),
+    },
+    {
+        "number": 76,
+        "slug": "leetcode-76-minimum-window-substring",
+        "algorithm": "Strings",
+        "title": "LeetCode 76 \u2013 Minimum Window Substring",
+        "file": "076-minimum-window-substring.html",
+        "date": "2024-11-04T18:31:10",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "string", "sliding-window", "hash-table"],
+        "excerpt": (
+            "The hardest sliding window on most lists, and the difficulty is not the window \u2014 it is "
+            "knowing when it is valid without recounting. One integer does it, the counts are allowed "
+            "to go negative because the sign carries the surplus, and t = \"aa\" is the case that "
+            "separates working from nearly working."
+        ),
+    },
+    {
+        "number": 78,
+        "slug": "leetcode-78-subsets",
+        "algorithm": "Recursion",
+        "title": "LeetCode 78 \u2013 Subsets",
+        "file": "078-subsets.html",
+        "date": "2024-11-05T15:42:30",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "backtracking", "bit-manipulation", "array"],
+        "excerpt": (
+            "The cleanest backtracking problem there is, with one structural difference worth "
+            "spotting: every node of the recursion tree is an answer, not just the leaves, so the "
+            "base case disappears. Plus the two bugs \u2014 i + 1 rather than start + 1, and the copy "
+            "without which all 2^n entries alias one list."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for
