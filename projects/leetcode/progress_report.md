@@ -3,7 +3,7 @@
 Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.com under
 **Software Engineering → Fundamental Problems**, published in rounds of ten LeetCode numbers.
 
-**Status: rounds 1–8, the interview-essentials batch and three legacy rewrites are all LIVE.**
+**Status: rounds 1–9, the interview-essentials batch and three legacy rewrites are all LIVE.**
 
 ---
 
@@ -21,12 +21,13 @@ Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.
 | Round 6 (LeetCode 51–60) | 7 posts — **live** |
 | Round 7 (LeetCode 61–70) | 8 posts — **live** |
 | Round 8 (LeetCode 71–80) | 4 posts — **live** |
-| Round 9 (LeetCode 81–90) | 3 in the repo — 81, 83, 88. Not started. |
-| Site total | **782 posts** (several tracks publish in parallel; the LeetCode work accounts for 52) |
+| Round 9 (LeetCode 81–90) | 3 posts — **live** |
+| Round 10 (LeetCode 91–100) | 4 in the repo — 91, 94, 98, 100. Not started. |
+| Site total | **785 posts** (several tracks publish in parallel; the LeetCode work accounts for 55) |
 | Category | `fundamental-problem`, already existed — no nav change needed |
 
-Live at https://lovemesomecoding.com/fundamental-problem, which now holds 63 posts: the 52 LeetCode
-ones leading the archive, above the 11 legacy 2019 posts. All 52 return 200, all 52 are in
+Live at https://lovemesomecoding.com/fundamental-problem, which now holds 66 posts: the 55 LeetCode
+ones leading the archive, above the 11 legacy 2019 posts. All 55 return 200, all 55 are in
 `sitemap.xml`, highlighting renders, cross-post links resolve, and the pre-existing URLs in this and
 other categories are unaffected.
 
@@ -149,7 +150,9 @@ between LeetCode 70 and LeetCode 121, and round 8 has only four posts, so ~2.4 d
 line with the rest of the track. Check the gap before reaching for `--redate`; the operation is
 cheap but it is not free, since it moves a live post in the archive.
 
-Round 9 (three posts, ~4.5 days) still fits. Round 10 will not.
+Round 9 (three posts, ~4.5 days) fitted too. **Round 10 does not**: four posts and roughly 29
+hours between LeetCode 88 and LeetCode 121, so `--redate` 121 forward before seeding it. There are
+still nine days of room between 121 and LeetCode 200 to move it into.
 
 ### The source repo has a mislabelled file
 `leetcode/github-2022-9-30/` contains two files named `88. ...`. One is genuinely LeetCode 88
@@ -170,7 +173,7 @@ Everything below was run and passed on 2026-08-12, covering all four published r
 blocks *out of the published HTML* — so they test what a reader would copy, not a retyped copy — and
 exercise them against the LeetCode examples plus the edge cases each post claims to handle:
 overflow, `Integer.MIN_VALUE`, empty strings, duplicate values, even-length palindromes, `""` against
-`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **566 Python assertions and 579 Java
+`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **597 Python assertions and 605 Java
 assertions, all green.** Several of those are worth more than the rest put together: problems 12 and 13
 are inverses, so both suites round-trip every integer from 1 to 3999 through `intToRoman` and back
 through `romanToInt`; problem 22's output is checked against the Catalan numbers up to n = 8 (1430
@@ -195,7 +198,7 @@ for LeetCode 47 ran results through `norm()`, which sorts each inner list — co
 but it collapsed all three permutations of `[1,1,2]` into one and proved nothing about ordering.
 Permutation results now go through an order-preserving `permSet()`.
 
-**`check_content.py`** proves all 252 code blocks round-trip byte-for-byte through the backend
+**`check_content.py`** proves all 267 code blocks round-trip byte-for-byte through the backend
 normaliser, every block comes out in the exact `<pre class="language-X"><code class="language-X">`
 shape the highlighter matches, every heading has an anchor id, and no post links to a slug the track
 does not define. It also checks the manifest for duplicate slugs and non-ascending dates.
@@ -218,8 +221,8 @@ out, rounds 2 through 4 against the live site after:
   return 200.
 - All 33 post URLs return 200 and all 33 appear in `sitemap.xml`.
 
-**`npm run build`** passes, including `verify-build.mjs`: 782/782 posts served, 43/43 category counts
-agree, 95 redirects intact, 996 HTML files emitted.
+**`npm run build`** passes, including `verify-build.mjs`: 785/785 posts served, 43/43 category counts
+agree, 95 redirects intact, 999 HTML files emitted.
 
 **A deploy can fail after printing LIVE.** Round 8's first attempt lost two archive-page uploads to a
 transient botocore error (*"Need to rewind the stream ... but stream is not seekable"*), and the
@@ -268,9 +271,11 @@ this machine. The checks above were done against the rendered HTML instead.
       LeetCode 121 forward with `--redate`.
 - [x] ~~Round 8 seeded to prod and deployed.~~ Done 2026-08-24 (dated 2024-10/11). No `--redate`
       was needed — the gap round 7 left was enough.
-- [ ] Round 9 (LeetCode 81–90 has three: 81 Search in Rotated Sorted Array II, 83 Remove Duplicates
-      from Sorted List, 88 Merge Sorted Array). The ~4.5 days left before LeetCode 121 still fit
-      three posts; round 10 will need `--redate`.
+- [x] ~~Round 9 seeded to prod and deployed.~~ Done 2026-08-24 (dated 2024-11). No `--redate`
+      needed; ~4.5 days was enough for three posts.
+- [ ] Round 10 (LeetCode 91–100 has four: 91 Decode Ways, 94 Binary Tree Inorder Traversal,
+      98 Validate Binary Search Tree, 100 Same Tree). **`--redate` LeetCode 121 forward first** —
+      only ~29 hours remain between LeetCode 88 and 121, and four posts do not fit.
 - [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.
 - [ ] Decide whether the 305 unnumbered LintCode-titled files are ever in scope.
 - [ ] Consider whether `fundamental-problem` should get a landing blurb explaining the track, now

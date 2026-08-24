@@ -861,6 +861,54 @@ POSTS = [
             "without which all 2^n entries alias one list."
         ),
     },
+    {
+        "number": 81,
+        "slug": "leetcode-81-search-in-rotated-sorted-array-ii",
+        "algorithm": "Searching",
+        "title": "LeetCode 81 \u2013 Search in Rotated Sorted Array II",
+        "file": "081-search-in-rotated-sorted-array-ii.html",
+        "date": "2024-11-06T15:13:31",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "binary-search"],
+        "excerpt": (
+            "Problem 33 with duplicates, which looks like a one-line change and is not. Two arrays "
+            "with the pivot in different halves can present identical evidence at every point the "
+            "algorithm may look, so no decision is right for both. The worst case is O(n) \u2014 and "
+            "that bound is on the problem, not on your approach."
+        ),
+    },
+    {
+        "number": 83,
+        "slug": "leetcode-83-remove-duplicates-from-sorted-list",
+        "algorithm": "Implementation",
+        "title": "LeetCode 83 \u2013 Remove Duplicates from Sorted List",
+        "file": "083-remove-duplicates-from-sorted-list.html",
+        "date": "2024-11-08T21:44:36",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "linked-list", "two-pointers"],
+        "excerpt": (
+            "Five lines with one bug in them that nearly everyone writes first: advancing after a "
+            "deletion skips the node that just became the successor, and only three equal values in "
+            "a row exposes it. Also the cleanest place to learn when a linked list needs a dummy "
+            "head \u2014 exactly when the head itself can be removed."
+        ),
+    },
+    {
+        "number": 88,
+        "slug": "leetcode-88-merge-sorted-array",
+        "algorithm": "Sorting",
+        "title": "LeetCode 88 \u2013 Merge Sorted Array",
+        "file": "088-merge-sorted-array.html",
+        "date": "2024-11-09T03:58:42",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "two-pointers", "sorting"],
+        "excerpt": (
+            "Tagged Easy, with one idea worth more than most Mediums: when you write into an array "
+            "you are also reading, go backwards. The trailing zeros are reserved space rather than "
+            "data, forwards clobbers values it has not consumed, and looping on nums2 alone is what "
+            "makes the remainder handle itself."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for

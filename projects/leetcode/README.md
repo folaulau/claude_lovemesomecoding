@@ -56,7 +56,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 6 | 51–60 | 7 — 51, 52, 53, 55, 56, 57, 58 | **live** since 2024-09 |
 | 7 | 61–70 | 8 — 62, 63, 64, 65, 67, 68, 69, 70 | **live** since 2024-09/10 |
 | 8 | 71–80 | 4 — 71, 72, 76, 78 | **live** since 2024-10/11 |
-| 9 | 81–90 | 3 — 81, 83, 88 | not started |
+| 9 | 81–90 | 3 — 81, 83, 88 | **live** since 2024-11 |
+| 10 | 91–100 | 4 — 91, 94, 98, 100 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -88,16 +89,16 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 55 posts:
+Current distribution across the 58 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Implementation | 10 |
+| Implementation | 11 |
 | Strings | 10 |
 | Dynamic Programming | 9 |
 | Recursion | 9 |
-| Sorting | 7 |
-| Searching | 5 |
+| Sorting | 8 |
+| Searching | 6 |
 | Greedy | 2 |
 | Graph Theory | 2 |
 | Bit Manipulation | 1 |
@@ -158,7 +159,8 @@ Round 7 had **no** room left, so LeetCode 121 was moved forward with `--redate`,
 
 **That is the move to repeat when the gap runs out** — but check first rather than doing it by
 reflex. Round 8 needed only four slots and the 12 days left after round 7 were plenty, so nothing
-was moved. Round 9 has three posts and about 4.5 days, which still fits. Round 10 will not.
+was moved. Round 9 had three posts and about 4.5 days, which fitted. **Round 10 does not** — four posts
+with roughly 29 hours between LeetCode 88 and LeetCode 121, so run `--redate` on 121 first.
 
 The four interview-essentials posts (121, 200, 347, 543) are the only things standing between the
 numbered rounds and the end of 2024, and their dates are synthetic track ordering exactly like every

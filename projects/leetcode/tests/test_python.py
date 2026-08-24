@@ -1294,6 +1294,95 @@ check("mutating one returned subset does not touch the others",
 check("...and the other 7 still hold the right sizes",
       sorted(len(x) for x in out[1:]), [1, 1, 1, 2, 2, 2, 3])
 
+print("LeetCode 81 - Search in Rotated Sorted Array II")
+s = load("081-search-in-rotated-sorted-array-ii.html")
+check("[2,5,6,0,0,1,2] t=0", s.search([2,5,6,0,0,1,2], 0), True)
+check("[2,5,6,0,0,1,2] t=3", s.search([2,5,6,0,0,1,2], 3), False)
+check("[1,0,1,1,1] t=0 (the ambiguous case)", s.search([1,0,1,1,1], 0), True)
+check("[1,1,1,0,1] t=0 (pivot on the other side)", s.search([1,1,1,0,1], 0), True)
+check("[1,1,1,1,1] t=2", s.search([1,1,1,1,1], 2), False)
+check("[1] t=1", s.search([1], 1), True)
+check("[1] t=0", s.search([1], 0), False)
+check("[1,1] t=1", s.search([1,1], 1), True)
+check("[3,1] t=1 (rotated pair)", s.search([3,1], 1), True)
+# Every rotation of every sorted array over a small alphabet, against membership.
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product([0, 1, 2], repeat=n):
+        base = sorted(combo)
+        for k in range(n):
+            rotated = base[k:] + base[:k]
+            for target in range(-1, 4):
+                if s.search(list(rotated), target) != (target in rotated):
+                    bad.append((rotated, target))
+check("every rotation of every sorted array up to length 7 over {0,1,2}", bad, [])
+# Arrays that are mostly one value -- the worst case the post describes.
+bad = []
+for n in range(1, 12):
+    for pos in range(n):
+        arr = [1] * n
+        arr[pos] = 0
+        base = sorted(arr)
+        for k in range(n):
+            rotated = base[k:] + base[:k]
+            if s.search(list(rotated), 0) is not True or s.search(list(rotated), 2) is not False:
+                bad.append((rotated,))
+check("single 0 among 1s, every rotation, terminates and is correct", bad, [])
+
+print("LeetCode 83 - Remove Duplicates from Sorted List")
+ns = {}
+exec(compile(LISTNODE, "listnode", "exec"), ns)
+s = load("083-remove-duplicates-from-sorted-list.html", extra=LISTNODE)
+def dedupe(xs):
+    return to_arr83(s.deleteDuplicates(to_list83(xs)))
+to_list83, to_arr83 = ns["to_list"], ns["to_arr"]
+check("1->1->2", dedupe([1,1,2]), [1,2])
+check("1->1->2->3->3", dedupe([1,1,2,3,3]), [1,2,3])
+check("1->1->1 (THREE in a row)", dedupe([1,1,1]), [1])
+check("1->1->1->1 (four in a row)", dedupe([1,1,1,1]), [1])
+check("empty list", dedupe([]), [])
+check("single node", dedupe([1]), [1])
+check("no duplicates at all", dedupe([1,2,3]), [1,2,3])
+check("duplicates at the tail", dedupe([1,2,3,3,3]), [1,2,3])
+check("every value duplicated", dedupe([1,1,2,2,3,3]), [1,2,3])
+bad = []
+for n in range(0, 9):
+    for combo in itertools.product([1, 1, 2, 3], repeat=n):
+        xs = sorted(combo)
+        want = [v for i, v in enumerate(xs) if i == 0 or v != xs[i - 1]]
+        if dedupe(xs) != want:
+            bad.append(xs)
+check("matches sorted-unique on every sorted list up to length 8", bad, [])
+# The head node object itself must be returned, not a rebuilt list.
+node = to_list83([1, 1, 2])
+check("returns the original head object", s.deleteDuplicates(node) is node, True)
+
+print("LeetCode 88 - Merge Sorted Array")
+s = load("088-merge-sorted-array.html")
+def merged(a, m, b, n):
+    a = list(a)
+    s.merge(a, m, list(b), n)
+    return a
+check("[1,2,3,0,0,0] + [2,5,6]", merged([1,2,3,0,0,0], 3, [2,5,6], 3), [1,2,2,3,5,6])
+check("[1] m=1, [] n=0", merged([1], 1, [], 0), [1])
+check("[0] m=0, [1] n=1 (nums1 contributes nothing)", merged([0], 0, [1], 1), [1])
+check("[4,5,6,0,0,0] + [1,2,3] (all of nums2 first)",
+      merged([4,5,6,0,0,0], 3, [1,2,3], 3), [1,2,3,4,5,6])
+check("[] m=0, [] n=0", merged([], 0, [], 0), [])
+check("negatives", merged([-3,-1,0,0], 3, [-2], 1), [-3,-2,-1,0])
+check("all equal", merged([2,2,2,0,0], 3, [2,2], 2), [2,2,2,2,2])
+check("returns None, mutating in place", s.merge([1,0], 1, [2], 1), None)
+# Exhaustive over every pair of small sorted inputs.
+bad = []
+for m in range(0, 5):
+    for n in range(0, 5):
+        for a in itertools.combinations_with_replacement(range(4), m):
+            for b in itertools.combinations_with_replacement(range(4), n):
+                got = merged(list(a) + [0] * n, m, list(b), n)
+                if got != sorted(list(a) + list(b)):
+                    bad.append((a, b, got))
+check("matches sorted(a + b) for every pair of sorted inputs up to length 4", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

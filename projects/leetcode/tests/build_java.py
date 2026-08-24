@@ -92,6 +92,9 @@ solution("071-simplify-path.html", "S71")
 solution("072-edit-distance.html", "S72")
 solution("076-minimum-window-substring.html", "S76")
 solution("078-subsets.html", "S78")
+solution("081-search-in-rotated-sorted-array-ii.html", "S81")
+solution("083-remove-duplicates-from-sorted-list.html", "S83")
+solution("088-merge-sorted-array.html", "S88")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -1687,6 +1690,130 @@ public class Main {
         int carrying = 0;
         for (List<Integer> sub : subs) if (sub.contains(999)) carrying++;
         check("mutating one returned subset does not touch the others", carrying, 1);
+
+        System.out.println("LeetCode 81 - Search in Rotated Sorted Array II");
+        S81 s81 = new S81();
+        check("[2,5,6,0,0,1,2] t=0", s81.search(new int[]{2,5,6,0,0,1,2}, 0), true);
+        check("[2,5,6,0,0,1,2] t=3", s81.search(new int[]{2,5,6,0,0,1,2}, 3), false);
+        check("[1,0,1,1,1] t=0 (the ambiguous case)", s81.search(new int[]{1,0,1,1,1}, 0), true);
+        check("[1,1,1,0,1] t=0 (pivot on the other side)", s81.search(new int[]{1,1,1,0,1}, 0), true);
+        check("[1,1,1,1,1] t=2", s81.search(new int[]{1,1,1,1,1}, 2), false);
+        check("[1] t=1", s81.search(new int[]{1}, 1), true);
+        check("[1] t=0", s81.search(new int[]{1}, 0), false);
+        check("[3,1] t=1 (rotated pair)", s81.search(new int[]{3,1}, 1), true);
+        int rotDupBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] base = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { base[i] = mm % 3; mm /= 3; }
+                Arrays.sort(base);
+                for (int k = 0; k < n; k++) {
+                    int[] rotated = new int[n];
+                    for (int i = 0; i < n; i++) rotated[i] = base[(k + i) % n];
+                    for (int target = -1; target <= 3; target++) {
+                        boolean present = false;
+                        for (int v : rotated) if (v == target) present = true;
+                        if (s81.search(rotated.clone(), target) != present) rotDupBad++;
+                    }
+                }
+            }
+        }
+        check("every rotation of every sorted array up to length 7 over {0,1,2}", rotDupBad, 0);
+        // The worst case: a single 0 hiding among 1s, every rotation.
+        int worstBad = 0;
+        for (int n = 1; n <= 12; n++) {
+            for (int pos = 0; pos < n; pos++) {
+                int[] base = new int[n];
+                Arrays.fill(base, 1);
+                base[0] = 0;                       // sorted form
+                for (int k = 0; k < n; k++) {
+                    int[] rotated = new int[n];
+                    for (int i = 0; i < n; i++) rotated[i] = base[(k + i) % n];
+                    if (!s81.search(rotated.clone(), 0)) worstBad++;
+                    if (s81.search(rotated.clone(), 2)) worstBad++;
+                }
+            }
+        }
+        check("single 0 among 1s, every rotation, terminates and is correct", worstBad, 0);
+
+        System.out.println("LeetCode 83 - Remove Duplicates from Sorted List");
+        S83 s83 = new S83();
+        check("1->1->2", toArr(s83.deleteDuplicates(toList(1,1,2))), new int[]{1,2});
+        check("1->1->2->3->3", toArr(s83.deleteDuplicates(toList(1,1,2,3,3))), new int[]{1,2,3});
+        check("1->1->1 (THREE in a row)", toArr(s83.deleteDuplicates(toList(1,1,1))), new int[]{1});
+        check("1->1->1->1 (four in a row)", toArr(s83.deleteDuplicates(toList(1,1,1,1))), new int[]{1});
+        check("empty list", toArr(s83.deleteDuplicates(null)), new int[]{});
+        check("single node", toArr(s83.deleteDuplicates(toList(1))), new int[]{1});
+        check("no duplicates at all", toArr(s83.deleteDuplicates(toList(1,2,3))), new int[]{1,2,3});
+        check("duplicates at the tail", toArr(s83.deleteDuplicates(toList(1,2,3,3,3))), new int[]{1,2,3});
+        int listBad = 0;
+        int[] listPool = {1, 1, 2, 3};
+        for (int n = 0; n <= 8; n++) {
+            int combos = (int) Math.pow(listPool.length, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] xs = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { xs[i] = listPool[mm % listPool.length]; mm /= listPool.length; }
+                Arrays.sort(xs);
+                List<Integer> uniq = new ArrayList<>();
+                for (int i = 0; i < n; i++) if (i == 0 || xs[i] != xs[i - 1]) uniq.add(xs[i]);
+                int[] wantUniq = uniq.stream().mapToInt(Integer::intValue).toArray();
+                if (!Arrays.equals(toArr(s83.deleteDuplicates(toList(xs))), wantUniq)) listBad++;
+            }
+        }
+        check("matches sorted-unique on every sorted list up to length 8", listBad, 0);
+        // The head is never removed, so the same object must come back.
+        ListNode headNode = toList(1, 1, 2);
+        check("returns the original head object", s83.deleteDuplicates(headNode) == headNode, true);
+
+        System.out.println("LeetCode 88 - Merge Sorted Array");
+        S88 s88 = new S88();
+        int[] mergeTarget = {1,2,3,0,0,0};
+        s88.merge(mergeTarget, 3, new int[]{2,5,6}, 3);
+        check("[1,2,3,0,0,0] + [2,5,6]", mergeTarget, new int[]{1,2,2,3,5,6});
+        int[] onlyOne = {1};
+        s88.merge(onlyOne, 1, new int[]{}, 0);
+        check("[1] m=1, [] n=0", onlyOne, new int[]{1});
+        int[] emptyFirst = {0};
+        s88.merge(emptyFirst, 0, new int[]{1}, 1);
+        check("[0] m=0, [1] n=1 (nums1 contributes nothing)", emptyFirst, new int[]{1});
+        int[] allSecond = {4,5,6,0,0,0};
+        s88.merge(allSecond, 3, new int[]{1,2,3}, 3);
+        check("[4,5,6,0,0,0] + [1,2,3] (all of nums2 first)", allSecond, new int[]{1,2,3,4,5,6});
+        int[] negatives = {-3,-1,0,0};
+        s88.merge(negatives, 3, new int[]{-2}, 1);
+        check("negatives", negatives, new int[]{-3,-2,-1,0});
+        int mergeBad = 0;
+        for (int m = 0; m <= 4; m++) {
+            for (int n = 0; n <= 4; n++) {
+                int aCombos = (int) Math.pow(4, m), bCombos = (int) Math.pow(4, n);
+                for (int am = 0; am < aCombos; am++) {
+                    int[] left = new int[m];
+                    int mm = am;
+                    for (int i = 0; i < m; i++) { left[i] = mm % 4; mm /= 4; }
+                    Arrays.sort(left);
+                    for (int bm = 0; bm < bCombos; bm++) {
+                        int[] right = new int[n];
+                        int nn = bm;
+                        for (int i = 0; i < n; i++) { right[i] = nn % 4; nn /= 4; }
+                        Arrays.sort(right);
+
+                        int[] slot = new int[m + n];
+                        System.arraycopy(left, 0, slot, 0, m);
+                        s88.merge(slot, m, right.clone(), n);
+
+                        int[] wantMerged = new int[m + n];
+                        System.arraycopy(left, 0, wantMerged, 0, m);
+                        System.arraycopy(right, 0, wantMerged, m, n);
+                        Arrays.sort(wantMerged);
+                        if (!Arrays.equals(slot, wantMerged)) mergeBad++;
+                    }
+                }
+            }
+        }
+        check("matches sorted(a + b) for every pair of sorted inputs up to length 4", mergeBad, 0);
 
         System.out.println();
         if (failures > 0) {
