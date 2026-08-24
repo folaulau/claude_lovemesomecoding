@@ -1383,6 +1383,177 @@ for m in range(0, 5):
                     bad.append((a, b, got))
 check("matches sorted(a + b) for every pair of sorted inputs up to length 4", bad, [])
 
+print("LeetCode 91 - Decode Ways")
+s = load("091-decode-ways.html")
+check('"12"', s.numDecodings("12"), 2)
+check('"226"', s.numDecodings("226"), 3)
+check('"06" (leading zero in a pair)', s.numDecodings("06"), 0)
+check('"0"', s.numDecodings("0"), 0)
+check('"10"', s.numDecodings("10"), 1)
+check('"100" (the 0 has no partner)', s.numDecodings("100"), 0)
+check('"2101"', s.numDecodings("2101"), 1)
+check('"27" (27 is not a letter)', s.numDecodings("27"), 1)
+check('"1111"', s.numDecodings("1111"), 5)
+check('"11106"', s.numDecodings("11106"), 2)
+check('"230"', s.numDecodings("230"), 0)
+check('"1201234"', s.numDecodings("1201234"), 3)
+# Brute force by explicit enumeration, over every digit string up to length 8.
+def decodings(text):
+    if not text:
+        return 1
+    total = 0
+    if text[0] != "0":
+        total += decodings(text[1:])
+    if len(text) >= 2 and 10 <= int(text[:2]) <= 26:
+        total += decodings(text[2:])
+    return total
+
+bad = []
+for n in range(1, 9):
+    for combo in itertools.product("0123", repeat=n):
+        text = "".join(combo)
+        if s.numDecodings(text) != decodings(text):
+            bad.append((text, s.numDecodings(text), decodings(text)))
+check("matches enumeration on every string of 0-3 digits up to length 8", bad, [])
+# All-ones is Fibonacci, which is the post's claim about the shape.
+fib = [1, 1]
+while len(fib) < 20:
+    fib.append(fib[-1] + fib[-2])
+bad = [n for n in range(1, 18) if s.numDecodings("1" * n) != fib[n]]
+check("all-ones strings follow Fibonacci", bad, [])
+
+print("LeetCode 94 - Binary Tree Inorder Traversal")
+TREE = """
+class TreeNode:
+    def __init__(self, val=0, left=None, right=None):
+        self.val, self.left, self.right = val, left, right
+
+def build(xs):
+    if not xs or xs[0] is None:
+        return None
+    root = TreeNode(xs[0])
+    queue, i = [root], 1
+    while queue and i < len(xs):
+        node = queue.pop(0)
+        if i < len(xs):
+            v = xs[i]; i += 1
+            if v is not None:
+                node.left = TreeNode(v); queue.append(node.left)
+        if i < len(xs):
+            v = xs[i]; i += 1
+            if v is not None:
+                node.right = TreeNode(v); queue.append(node.right)
+    return root
+"""
+ns94 = {}
+exec(compile(TREE, "tree", "exec"), ns94)
+build = ns94["build"]
+s = load("094-binary-tree-inorder-traversal.html", extra=TREE)
+check("[1,null,2,3]", s.inorderTraversal(build([1, None, 2, 3])), [1, 3, 2])
+check("empty tree", s.inorderTraversal(None), [])
+check("single node", s.inorderTraversal(build([1])), [1])
+check("a BST comes out sorted",
+      s.inorderTraversal(build([4, 2, 6, 1, 3, 5, 7])), [1, 2, 3, 4, 5, 6, 7])
+# A degenerate left chain and right chain, which is where recursion depth bites.
+left_chain = ns94["TreeNode"](1)
+node = left_chain
+for v in range(2, 60):
+    node.left = ns94["TreeNode"](v); node = node.left
+check("left chain of 59 nodes", s.inorderTraversal(left_chain), list(range(59, 0, -1)))
+# Cross-check against an independent recursive traversal on generated trees.
+def inorder_model(node):
+    return inorder_model(node.left) + [node.val] + inorder_model(node.right) if node else []
+
+bad = []
+for n in range(1, 9):
+    for combo in itertools.product([None, 1], repeat=n - 1):
+        xs = [0] + [None if c is None else 1 for c in combo]
+        # give every present node a distinct value so ordering is observable
+        vals = itertools.count(1)
+        xs = [next(vals) if v is not None else None for v in xs]
+        tree = build(xs)
+        if s.inorderTraversal(tree) != inorder_model(tree):
+            bad.append(xs)
+check("matches a recursive model on every small tree shape", bad, [])
+# The Morris variant, if the post shows one, must agree and restore the tree.
+if hasattr(s, "inorderMorris"):
+    bad = []
+    for xs in ([4,2,6,1,3,5,7], [1,None,2,3], [1], [1,2], [1,None,2]):
+        tree = build(xs)
+        got = s.inorderMorris(tree)
+        if got != inorder_model(build(xs)):
+            bad.append((xs, got))
+        elif inorder_model(tree) != got:
+            bad.append(("tree not restored", xs))
+    check("[Morris] agrees and leaves the tree restored", bad, [])
+
+print("LeetCode 98 - Validate Binary Search Tree")
+s = load("098-validate-binary-search-tree.html", extra=TREE)
+check("[2,1,3]", s.isValidBST(build([2, 1, 3])), True)
+check("[5,1,4,null,null,3,6]", s.isValidBST(build([5, 1, 4, None, None, 3, 6])), False)
+check("the naive-check counterexample [5,1,6,null,null,4,7]",
+      s.isValidBST(build([5, 1, 6, None, None, 4, 7])), False)
+check("empty tree", s.isValidBST(None), True)
+check("single node", s.isValidBST(build([1])), True)
+check("duplicates are invalid", s.isValidBST(build([2, 2])), False)
+check("Integer.MIN_VALUE as the only node (sentinel trap)",
+      s.isValidBST(build([-2147483648])), True)
+check("Integer.MAX_VALUE as the only node", s.isValidBST(build([2147483647])), True)
+check("[-2147483648, null, 2147483647]",
+      s.isValidBST(build([-2147483648, None, 2147483647])), True)
+# Independent model: inorder must be strictly increasing.
+bad = []
+for n in range(1, 8):
+    for vals in itertools.product([1, 2, 3], repeat=n):
+        tree = build(list(vals))
+        seq = inorder_model(tree)
+        want = all(seq[i] < seq[i + 1] for i in range(len(seq) - 1))
+        if s.isValidBST(tree) != want:
+            bad.append((vals, s.isValidBST(tree), want))
+check("agrees with strictly-increasing-inorder on every small tree", bad, [])
+if hasattr(s, "isValidBSTInorder"):
+    bad = []
+    for n in range(1, 7):
+        for vals in itertools.product([1, 2, 3], repeat=n):
+            if s.isValidBSTInorder(build(list(vals))) != s.isValidBST(build(list(vals))):
+                bad.append(vals)
+    check("[inorder version] agrees with the bounds version", bad, [])
+
+print("LeetCode 100 - Same Tree")
+s = load("100-same-tree.html", extra=TREE)
+check("identical trees", s.isSameTree(build([1,2,3]), build([1,2,3])), True)
+check("same values, different shape",
+      s.isSameTree(build([1,2]), build([1,None,2])), False)
+check("same shape, different values",
+      s.isSameTree(build([1,2,1]), build([1,1,2])), False)
+check("both empty", s.isSameTree(None, None), True)
+check("one empty", s.isSameTree(None, build([1])), False)
+check("one empty, the other way round", s.isSameTree(build([1]), None), False)
+check("a node valued 0 is not treated as absent",
+      s.isSameTree(build([0]), build([0])), True)
+# Exhaustive over every pair of small trees, against an independent comparison.
+def same_model(a, b):
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return a.val == b.val and same_model(a.left, b.left) and same_model(a.right, b.right)
+
+shapes = []
+for n in range(0, 5):
+    for vals in itertools.product([1, 2, None], repeat=n):
+        xs = list(vals)
+        if xs and xs[0] is None:
+            continue
+        shapes.append(xs)
+bad = []
+for xa in shapes[:60]:
+    for xb in shapes[:60]:
+        ta, tb = build(list(xa)), build(list(xb))
+        if s.isSameTree(ta, tb) != same_model(build(list(xa)), build(list(xb))):
+            bad.append((xa, xb))
+check("matches an independent comparison on every pair of small trees", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

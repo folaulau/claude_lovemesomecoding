@@ -909,6 +909,70 @@ POSTS = [
             "makes the remainder handle itself."
         ),
     },
+    {
+        "number": 91,
+        "slug": "leetcode-91-decode-ways",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 91 \u2013 Decode Ways",
+        "file": "091-decode-ways.html",
+        "date": "2024-11-11T17:55:24",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "string", "dynamic-programming"],
+        "excerpt": (
+            "Climbing Stairs with the steps made conditional, and that one change means most wrong "
+            "answers come from a single character: '0'. The recurrence takes a minute; the zeros "
+            "take the rest of the interview. Why the two-digit gate needs a LOWER bound of 10, and "
+            "why ways(0) must be 1."
+        ),
+    },
+    {
+        "number": 94,
+        "slug": "leetcode-94-binary-tree-inorder-traversal",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 94 \u2013 Binary Tree Inorder Traversal",
+        "file": "094-binary-tree-inorder-traversal.html",
+        "date": "2024-11-12T13:32:53",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "stack", "depth-first-search"],
+        "excerpt": (
+            "Four lines recursively, which is why the statement ends with \"could you do it "
+            "iteratively?\" \u2014 the recursion is the warm-up and the explicit stack is the question. "
+            "Why the loop needs both halves of its condition, why no visited flag is required, and "
+            "Morris traversal for when O(1) space is asked for."
+        ),
+    },
+    {
+        "number": 98,
+        "slug": "leetcode-98-validate-binary-search-tree",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 98 \u2013 Validate Binary Search Tree",
+        "file": "098-validate-binary-search-tree.html",
+        "date": "2024-11-13T05:30:40",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "binary-search-tree", "depth-first-search"],
+        "excerpt": (
+            "The most famous wrong answer on the list: checking each node against its immediate "
+            "children is not the BST property. A node's bounds come from every ancestor and narrow "
+            "on the way down. Plus the Integer.MIN_VALUE sentinel trap, and the inorder alternative "
+            "that generalises to Recover BST."
+        ),
+    },
+    {
+        "number": 100,
+        "slug": "leetcode-100-same-tree",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 100 \u2013 Same Tree",
+        "file": "100-same-tree.html",
+        "date": "2024-11-13T16:15:12",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
+        "excerpt": (
+            "The smallest possible tree recursion, and the template the harder tree problems are "
+            "written against. Three base cases and one recursive step \u2014 and the ORDER of those base "
+            "cases is the only thing that can go wrong, because each one protects the next from a "
+            "null dereference."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for
@@ -920,7 +984,7 @@ POSTS = [
         "algorithm": "Dynamic Programming",
         "title": "LeetCode 121 – Best Time to Buy and Sell Stock",
         "file": "121-best-time-to-buy-and-sell-stock.html",
-        "date": "2024-11-10T09:12:44",
+        "date": "2024-12-08T10:41:05",
         "difficulty": "Easy",
         "tags": ["leetcode", "array", "dynamic-programming"],
         "excerpt": (
@@ -938,7 +1002,7 @@ POSTS = [
         "algorithm": "Graph Theory",
         "title": "LeetCode 200 – Number of Islands",
         "file": "200-number-of-islands.html",
-        "date": "2024-11-19T07:23:20",
+        "date": "2024-12-14T19:03:28",
         "difficulty": "Medium",
         "tags": ["leetcode", "graph", "depth-first-search", "breadth-first-search", "matrix"],
         "excerpt": (
@@ -956,7 +1020,7 @@ POSTS = [
         "algorithm": "Sorting",
         "title": "LeetCode 347 – Top K Frequent Elements",
         "file": "347-top-k-frequent-elements.html",
-        "date": "2024-12-13T21:29:46",
+        "date": "2024-12-21T08:57:11",
         "difficulty": "Medium",
         "tags": ["leetcode", "hash-table", "heap", "sorting"],
         "excerpt": (

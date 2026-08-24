@@ -95,6 +95,10 @@ solution("078-subsets.html", "S78")
 solution("081-search-in-rotated-sorted-array-ii.html", "S81")
 solution("083-remove-duplicates-from-sorted-list.html", "S83")
 solution("088-merge-sorted-array.html", "S88")
+solution("091-decode-ways.html", "S91")
+solution("094-binary-tree-inorder-traversal.html", "S94")
+solution("098-validate-binary-search-tree.html", "S98")
+solution("100-same-tree.html", "S100")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -199,6 +203,15 @@ parts.append("class S72Row {\n  int minDistance(String word1, String word2) {\n"
 
 # LeetCode 78: the bitmask enumeration, presented as a loose method.
 fragment("078-subsets.html", -1, "S78Bits")
+
+# LeetCode 94: the recursive helper, shown before the iterative solution.
+fragment("094-binary-tree-inorder-traversal.html", 0, "S94Recursive",
+         "  List<Integer> inorderTraversal(TreeNode root) {\n"
+         "    List<Integer> out = new ArrayList<>();\n"
+         "    walk(root, out);\n    return out;\n  }")
+
+# LeetCode 100: the queue-of-pairs variant, presented as a loose method.
+fragment("100-same-tree.html", -1, "S100Iterative")
 
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
@@ -385,6 +398,31 @@ public class Main {
                     break;
                 }
         return best == null ? "" : best;
+    }
+
+    /** Count decodings by explicit enumeration. */
+    static int countDecodings(String text) {
+        if (text.isEmpty()) return 1;
+        int total = 0;
+        if (text.charAt(0) != '0') total += countDecodings(text.substring(1));
+        if (text.length() >= 2) {
+            int pair = Integer.parseInt(text.substring(0, 2));
+            if (pair >= 10 && pair <= 26) total += countDecodings(text.substring(2));
+        }
+        return total;
+    }
+
+    static void inorderModel(TreeNode node, List<Integer> out) {
+        if (node == null) return;
+        inorderModel(node.left, out);
+        out.add(node.val);
+        inorderModel(node.right, out);
+    }
+
+    static boolean sameModel(TreeNode a, TreeNode b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.val == b.val && sameModel(a.left, b.left) && sameModel(a.right, b.right);
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -1814,6 +1852,140 @@ public class Main {
             }
         }
         check("matches sorted(a + b) for every pair of sorted inputs up to length 4", mergeBad, 0);
+
+        System.out.println("LeetCode 91 - Decode Ways");
+        S91 s91 = new S91();
+        check("12", s91.numDecodings("12"), 2);
+        check("226", s91.numDecodings("226"), 3);
+        check("06 (leading zero in a pair)", s91.numDecodings("06"), 0);
+        check("0", s91.numDecodings("0"), 0);
+        check("10", s91.numDecodings("10"), 1);
+        check("100 (the 0 has no partner)", s91.numDecodings("100"), 0);
+        check("2101", s91.numDecodings("2101"), 1);
+        check("27 (27 is not a letter)", s91.numDecodings("27"), 1);
+        check("1111", s91.numDecodings("1111"), 5);
+        check("11106", s91.numDecodings("11106"), 2);
+        check("230", s91.numDecodings("230"), 0);
+        check("1201234", s91.numDecodings("1201234"), 3);
+        int decodeBad = 0;
+        for (int n = 1; n <= 8; n++) {
+            int combos = (int) Math.pow(4, n);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder sb = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < n; i++) { sb.append((char) ('0' + mm % 4)); mm /= 4; }
+                String text = sb.toString();
+                if (s91.numDecodings(text) != countDecodings(text)) decodeBad++;
+            }
+        }
+        check("matches enumeration on every string of 0-3 digits up to length 8", decodeBad, 0);
+        int fibBad = 0, fa91 = 1, fb91 = 1;
+        for (int n = 1; n <= 17; n++) {
+            int next = fa91 + fb91; fa91 = fb91; fb91 = next;
+            if (s91.numDecodings("1".repeat(n)) != fa91) fibBad++;
+        }
+        check("all-ones strings follow Fibonacci", fibBad, 0);
+
+        System.out.println("LeetCode 94 - Binary Tree Inorder Traversal");
+        S94 s94 = new S94();
+        S94Recursive s94r = new S94Recursive();
+        check("[1,null,2,3]", s94.inorderTraversal(buildTree(1, null, 2, 3)), List.of(1, 3, 2));
+        check("empty tree", s94.inorderTraversal(null), List.of());
+        check("single node", s94.inorderTraversal(buildTree(1)), List.of(1));
+        check("a BST comes out sorted",
+              s94.inorderTraversal(buildTree(4, 2, 6, 1, 3, 5, 7)), List.of(1,2,3,4,5,6,7));
+        // A degenerate left chain: where the recursive stack depth would bite.
+        TreeNode leftChain = new TreeNode(1), leftChainTail = leftChain;
+        List<Integer> chainWant = new ArrayList<>();
+        for (int v = 2; v < 60; v++) { leftChainTail.left = new TreeNode(v); leftChainTail = leftChainTail.left; }
+        for (int v = 59; v >= 1; v--) chainWant.add(v);
+        check("left chain of 59 nodes", s94.inorderTraversal(leftChain), chainWant);
+        int inorderBad = 0;
+        for (int n = 1; n <= 8; n++) {
+            for (int mask = 0; mask < (1 << (n - 1)); mask++) {
+                Integer[] xs = new Integer[n];
+                int next = 1;
+                xs[0] = next++;
+                for (int i = 1; i < n; i++) xs[i] = (mask >> (i - 1) & 1) == 1 ? next++ : null;
+                TreeNode t = buildTree(xs);
+                List<Integer> model = new ArrayList<>();
+                inorderModel(t, model);
+                if (!s94.inorderTraversal(t).equals(model)) inorderBad++;
+                if (!s94r.inorderTraversal(t).equals(model)) inorderBad++;
+            }
+        }
+        check("iterative and recursive both match a model on every small tree shape", inorderBad, 0);
+
+        System.out.println("LeetCode 98 - Validate Binary Search Tree");
+        S98 s98 = new S98();
+        check("[2,1,3]", s98.isValidBST(buildTree(2, 1, 3)), true);
+        check("[5,1,4,null,null,3,6]", s98.isValidBST(buildTree(5, 1, 4, null, null, 3, 6)), false);
+        check("the naive-check counterexample [5,1,6,null,null,4,7]",
+              s98.isValidBST(buildTree(5, 1, 6, null, null, 4, 7)), false);
+        check("empty tree", s98.isValidBST(null), true);
+        check("single node", s98.isValidBST(buildTree(1)), true);
+        check("duplicates are invalid", s98.isValidBST(buildTree(2, 2)), false);
+        // The sentinel trap: a lone Integer.MIN_VALUE / MAX_VALUE node is valid.
+        check("Integer.MIN_VALUE as the only node", s98.isValidBST(buildTree(Integer.MIN_VALUE)), true);
+        check("Integer.MAX_VALUE as the only node", s98.isValidBST(buildTree(Integer.MAX_VALUE)), true);
+        check("[MIN_VALUE, null, MAX_VALUE]",
+              s98.isValidBST(buildTree(Integer.MIN_VALUE, null, Integer.MAX_VALUE)), true);
+        int bstBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                Integer[] xs = new Integer[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { xs[i] = 1 + mm % 3; mm /= 3; }
+                TreeNode t = buildTree(xs);
+                List<Integer> seq = new ArrayList<>();
+                inorderModel(t, seq);
+                boolean strictlyIncreasing = true;
+                for (int i = 0; i + 1 < seq.size(); i++)
+                    if (seq.get(i) >= seq.get(i + 1)) strictlyIncreasing = false;
+                if (s98.isValidBST(t) != strictlyIncreasing) bstBad++;
+            }
+        }
+        check("agrees with strictly-increasing-inorder on every small tree", bstBad, 0);
+
+        System.out.println("LeetCode 100 - Same Tree");
+        S100 s100 = new S100();
+        S100Iterative s100i = new S100Iterative();
+        check("identical trees", s100.isSameTree(buildTree(1,2,3), buildTree(1,2,3)), true);
+        check("same values, different shape",
+              s100.isSameTree(buildTree(1,2), buildTree(1,null,2)), false);
+        check("same shape, different values",
+              s100.isSameTree(buildTree(1,2,1), buildTree(1,1,2)), false);
+        check("both empty", s100.isSameTree(null, null), true);
+        check("one empty", s100.isSameTree(null, buildTree(1)), false);
+        check("one empty, the other way round", s100.isSameTree(buildTree(1), null), false);
+        check("a node valued 0 is not treated as absent",
+              s100.isSameTree(buildTree(0), buildTree(0)), true);
+        // Exhaustive over pairs of small trees, with the iterative version agreeing.
+        List<Integer[]> treeShapes = new ArrayList<>();
+        for (int n = 1; n <= 4; n++) {
+            int combos = (int) Math.pow(3, n - 1);
+            for (int mask = 0; mask < combos; mask++) {
+                Integer[] xs = new Integer[n];
+                xs[0] = 1;
+                int mm = mask;
+                for (int i = 1; i < n; i++) {
+                    int pick = mm % 3; mm /= 3;
+                    xs[i] = pick == 2 ? null : 1 + pick;
+                }
+                treeShapes.add(xs);
+            }
+        }
+        int sameBad = 0, sameIterBad = 0;
+        for (Integer[] xa : treeShapes) {
+            for (Integer[] xb : treeShapes) {
+                boolean model = sameModel(buildTree(xa), buildTree(xb));
+                if (s100.isSameTree(buildTree(xa), buildTree(xb)) != model) sameBad++;
+                if (s100i.isSameTreeIterative(buildTree(xa), buildTree(xb)) != model) sameIterBad++;
+            }
+        }
+        check("matches an independent comparison on every pair of small trees", sameBad, 0);
+        check("[iterative] agrees on the same pairs", sameIterBad, 0);
 
         System.out.println();
         if (failures > 0) {

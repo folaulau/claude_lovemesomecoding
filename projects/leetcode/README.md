@@ -57,7 +57,9 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 7 | 61–70 | 8 — 62, 63, 64, 65, 67, 68, 69, 70 | **live** since 2024-09/10 |
 | 8 | 71–80 | 4 — 71, 72, 76, 78 | **live** since 2024-10/11 |
 | 9 | 81–90 | 3 — 81, 83, 88 | **live** since 2024-11 |
-| 10 | 91–100 | 4 — 91, 94, 98, 100 | not started |
+| 10 | 91–100 | 4 — 91, 94, 98, 100 | **live** since 2024-11 |
+| 11 | 101–110 | 6 — 101, 102, 103, 104, 105, 110 | not started |
+| 12 | 111–120 | 5 — 111, 112, 114, 118, 119 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -89,18 +91,18 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 58 posts:
+Current distribution across the 62 posts:
 
 | Algorithm | Posts |
 |---|---|
 | Implementation | 11 |
 | Strings | 10 |
-| Dynamic Programming | 9 |
+| Dynamic Programming | 10 |
 | Recursion | 9 |
 | Sorting | 8 |
 | Searching | 6 |
+| Graph Theory | 5 |
 | Greedy | 2 |
-| Graph Theory | 2 |
 | Bit Manipulation | 1 |
 
 Constructive Algorithms, Game Theory and Warmup are in the taxonomy but unused so far —
@@ -159,8 +161,17 @@ Round 7 had **no** room left, so LeetCode 121 was moved forward with `--redate`,
 
 **That is the move to repeat when the gap runs out** — but check first rather than doing it by
 reflex. Round 8 needed only four slots and the 12 days left after round 7 were plenty, so nothing
-was moved. Round 9 had three posts and about 4.5 days, which fitted. **Round 10 does not** — four posts
-with roughly 29 hours between LeetCode 88 and LeetCode 121, so run `--redate` on 121 first.
+was moved. Round 10 was where it finally ran out, and rather than nudge 121 again the **whole
+interview-essentials block moved at once**: 121 to `2024-12-08`, 200 to `2024-12-14`, 347 to
+`2024-12-21`, 543 left at `2024-12-28`. The repo holds 15 posts numbered 91–120 that must sort
+before 121, so one operation buys rounds 10, 11 and 12 instead of three separate ones. Rounds 11 and
+12 have `2024-11-16` to `2024-12-08` to work with.
+
+**The 2022–2024 window is the real constraint and it is nearly spent.** Only 55 of roughly 300
+numbered problems in the repo are published, and the track already spans March 2022 to December 2024.
+Round 13 starts at LeetCode 121, where the numbered rounds catch up with the interview-essentials
+posts and this juggling stops working. That needs a decision — spread the whole track more tightly,
+or extend past 2024 — and it is a decision about the brief, not a technical one.
 
 The four interview-essentials posts (121, 200, 347, 543) are the only things standing between the
 numbered rounds and the end of 2024, and their dates are synthetic track ordering exactly like every
