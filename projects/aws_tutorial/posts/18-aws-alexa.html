@@ -1,0 +1,136 @@
+<p>Short version, because it is the thing most people come here to find out:
+<strong>an Alexa skill is not an AWS service.</strong> There is no <code>aws alexa</code> command,
+nothing called Alexa in the AWS console, and no line for it on your AWS bill.</p>
+
+<p>Alexa is an Amazon product, not an Amazon Web Services product. Those are different
+organisations with different consoles, different accounts and different tooling, and the confusion
+is entirely reasonable given they share a parent company's name.</p>
+
+<p>If you landed here looking for AWS, the <a href="/aws/aws-lambda">Lambda post</a> is almost
+certainly what you want. If you are genuinely building a skill, here is the map.</p>
+
+<h2>Where the pieces actually live</h2>
+
+<table>
+  <thead><tr><th>Piece</th><th>Lives in</th><th>Managed with</th></tr></thead>
+  <tbody>
+    <tr><td>Skill, invocation name, intents, sample utterances</td>
+        <td>Amazon Developer portal</td><td>Alexa developer console, or the ASK CLI</td></tr>
+    <tr><td>Interaction model (the JSON schema of what users can say)</td>
+        <td>Amazon Developer portal</td><td>ASK CLI</td></tr>
+    <tr><td>Certification and publication</td><td>Amazon Developer portal</td><td>Console</td></tr>
+    <tr><td><strong>The code that handles a request</strong></td><td><strong>AWS</strong></td>
+        <td>Lambda, like anything else</td></tr>
+  </tbody>
+</table>
+
+<p>So exactly one row is AWS, and on that row an Alexa skill is an ordinary Lambda function. It has
+a handler, an execution role, CloudWatch logs, and everything else you already know. The only thing
+that makes it "an Alexa skill" is the shape of the JSON event it receives and the shape it must
+return.</p>
+
+<h2>The two accounts</h2>
+
+<p>This is the practical consequence, and the part that costs an afternoon.</p>
+
+<p>You need an <strong>Amazon Developer account</strong> for the skill and an <strong>AWS
+account</strong> for the Lambda. They are separate sign-ups, and they can use the same email
+address, which makes it easy to believe they are one account until something does not work.</p>
+
+<p>The two are joined by a pair of identifiers pointed at each other:</p>
+
+<ul>
+  <li>In the developer console, the skill's <strong>endpoint</strong> is the Lambda's ARN</li>
+  <li>On the Lambda, a <strong>resource policy</strong> allows
+      <code>alexa-appkit.amazon.com</code> to invoke it, restricted to that skill id</li>
+</ul>
+
+<p>That second half is the one people skip, and the symptom is unhelpful: the skill reports that it
+cannot reach its endpoint, with nothing in your Lambda logs — because the invocation never happened.
+Add the permission from the AWS side:</p>
+
+<pre class="language-bash"><code class="language-bash">aws lambda add-permission \
+  --function-name my-skill-handler \
+  --statement-id alexa-skill-invoke \
+  --action lambda:InvokeFunction \
+  --principal alexa-appkit.amazon.com \
+  --event-source-token amzn1.ask.skill.00000000-0000-0000-0000-000000000000</code></pre>
+
+<p><code>--event-source-token</code> is the skill id. Without it, any Alexa skill in the world could
+invoke your function, so it is not optional in anything you publish.</p>
+
+<h2>The ASK CLI is a different tool</h2>
+
+<p>The AWS CLI cannot manage a skill, because a skill is not an AWS resource. The Alexa Skills Kit
+has its own CLI, installed from npm and authenticated against your Amazon Developer account:</p>
+
+<pre class="language-bash"><code class="language-bash">npm install -g ask-cli
+ask configure
+ask deploy</code></pre>
+
+<p>Note that <code>ask deploy</code> can deploy the Lambda as well as the skill, using a
+CloudFormation stack under the hood. That is convenient and it is also a trap for a team that
+already has infrastructure as code: you end up with a function managed by the ASK CLI sitting
+beside functions managed by your own templates, and nobody is sure which tool owns it. Pick one.
+Deploying the Lambda through your normal pipeline and giving the skill only the ARN is the cleaner
+split.</p>
+
+<h2>What a request looks like</h2>
+
+<p>The handler is a normal Lambda handler. What arrives is a JSON envelope describing which intent
+matched and what slots were filled:</p>
+
+<pre class="language-python"><code class="language-python">def lambda_handler(event, context):
+    request = event["request"]
+
+    if request["type"] == "LaunchRequest":
+        return speak("Welcome. What would you like to do?")
+
+    if request["type"] == "IntentRequest":
+        intent = request["intent"]["name"]
+        slots = request["intent"].get("slots", {})
+        return speak(f"You asked for {intent}.")
+
+    return speak("Sorry, I did not understand that.")
+
+
+def speak(text, end=False):
+    return {
+        "version": "1.0",
+        "response": {
+            "outputSpeech": {"type": "PlainText", "text": text},
+            "shouldEndSession": end,
+        },
+    }</code></pre>
+
+<p>The intent names and the slots come from the interaction model you defined in the developer
+console — which is the real work, and none of it is AWS. There are official SDKs
+(<code>ask-sdk-core</code> for Python and Node) that wrap this envelope in something more
+pleasant than dictionary access; use one for anything beyond a demo.</p>
+
+<h2>Testing and logs</h2>
+
+<p>Because the two halves live in different places, so does the debugging, and knowing which half
+is broken saves most of the time.</p>
+
+<p>If Alexa responds with "there was a problem with the requested skill's response", the request
+reached your function and something about the reply was wrong — a malformed envelope, an exception,
+or a timeout. That is an AWS problem and CloudWatch has it:</p>
+
+<pre class="language-bash"><code class="language-bash">aws logs tail /aws/lambda/my-skill-handler --follow --since 10m</code></pre>
+
+<p>If instead nothing appears in the log at all, the invocation never happened, and the problem is
+on the developer-portal side: the endpoint ARN, the region, or the missing resource policy above.</p>
+
+<p>Two constraints worth designing around from the start. A skill must respond in about
+<strong>eight seconds</strong> or Alexa gives up, which is far tighter than a typical API timeout —
+so anything slow needs a progressive response or a queued job. And your Lambda must be in a region
+Alexa supports for that skill's locale; a function in the wrong region is unreachable no matter how
+correct the permission is.</p>
+
+<h2>The one AWS thing worth carrying away</h2>
+
+<p>If you take nothing else from this page: when a skill "cannot reach its endpoint", check the
+Lambda's resource policy before you touch anything else. It is the boundary between the two
+accounts, it is invisible from the developer console, and it is the failure that produces no log
+line to search for.</p>

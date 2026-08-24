@@ -1,0 +1,122 @@
+<p>Most teams who reach for Kinesis want SQS. It is worth starting there, because picking the wrong
+one costs you either money you did not need to spend or a capability you cannot add later.</p>
+
+<h2>Kinesis or SQS</h2>
+
+<p>Both move data between components without coupling them. They differ in what happens to a
+message after it is read.</p>
+
+<table>
+  <thead><tr><th></th><th>SQS</th><th>Kinesis Data Streams</th></tr></thead>
+  <tbody>
+    <tr><td>After a consumer reads</td><td>Deleted</td><td>Stays until retention expires</td></tr>
+    <tr><td>Replay</td><td>No</td><td>Yes — re-read from any point in the window</td></tr>
+    <tr><td>Multiple consumers</td><td>Each message goes to one</td><td>Every consumer sees every
+        record</td></tr>
+    <tr><td>Ordering</td><td>FIFO queues only</td><td>Per partition key, always</td></tr>
+    <tr><td>Scaling</td><td>Automatic, invisible</td><td>You manage shards</td></tr>
+    <tr><td>Idle cost</td><td>Nothing</td><td>Billed per shard-hour, busy or not</td></tr>
+  </tbody>
+</table>
+
+<p>The decision comes down to one question: <strong>does more than one thing need to read the same
+records, or might you need to replay them?</strong> If yes, that is a stream. If no — if you have
+work items and you want them processed once — you want a queue, and a queue costs nothing when
+nothing is happening.</p>
+
+<p>"We might want analytics on it later" is the honest reason most streams get created. That is a
+real reason, but it is a reason to write the events to S3, not necessarily to run a stream.</p>
+
+<h2>Shards, and the partition key that ruins them</h2>
+
+<p>A stream is divided into shards. Each shard takes 1 MB/second or 1,000 records/second in, and
+gives 2 MB/second out. Capacity is shards × those numbers, so throughput is something you provision
+rather than something you get.</p>
+
+<p>Every record carries a partition key. Kinesis hashes it to choose a shard, and that gives you
+the ordering guarantee: records with the same partition key always land on the same shard and are
+read in order.</p>
+
+<pre class="language-bash"><code class="language-bash">aws kinesis create-stream --stream-name bookings --shard-count 2
+
+aws kinesis put-record \
+  --stream-name bookings \
+  --partition-key property-4417 \
+  --data "$(echo -n '{"event":"booking_created","id":9912}' | base64)"</code></pre>
+
+<p>That property id as the partition key is the design decision. Every event for one property is
+ordered; events for different properties spread across shards.</p>
+
+<p>Choose badly and you get a <strong>hot shard</strong>. A partition key of
+<code>"production"</code>, or an event type with three possible values, sends most traffic to one
+shard — which throttles while the stream as a whole looks nowhere near capacity. The symptom is
+<code>ProvisionedThroughputExceededException</code> on a stream that the metrics say is quiet.
+Pick a key with high cardinality that still groups what genuinely must stay ordered.</p>
+
+<p>If you would rather not think about any of this, on-demand mode exists and scales shards for
+you at a higher per-GB price:</p>
+
+<pre class="language-bash"><code class="language-bash">aws kinesis create-stream --stream-name bookings --stream-mode-details StreamMode=ON_DEMAND</code></pre>
+
+<h2>Retention is the replay window</h2>
+
+<p>Records are kept for 24 hours by default, extendable to 365 days for a fee. That window is
+exactly how far back a broken consumer can be rewound, so it is a recovery decision rather than a
+storage one. Twenty-four hours means a bug shipped on Friday afternoon is unrecoverable by Monday.</p>
+
+<pre class="language-bash"><code class="language-bash">aws kinesis increase-stream-retention-period \
+  --stream-name bookings --retention-period-hours 168</code></pre>
+
+<h2>Firehose, when you only wanted the data in S3</h2>
+
+<p>A large share of streams exist to get events into S3 or a warehouse. That does not need a
+stream and a consumer — Firehose does it as a managed pipeline, buffers by size or time, and can
+transform records with a Lambda on the way through.</p>
+
+<p>It is serverless: no shards, and you pay for data ingested rather than for capacity sitting
+idle. For "put my application logs in S3 as Parquet", it is the whole answer.</p>
+
+<h2>Reading a stream</h2>
+
+<p>You almost never write a consumer by hand. Point a Lambda at the stream and AWS polls it for
+you, delivering batches:</p>
+
+<pre class="language-python"><code class="language-python">import base64, json
+
+def lambda_handler(event, context):
+    for record in event["Records"]:
+        payload = json.loads(base64.b64decode(record["kinesis"]["data"]))
+        handle(payload)
+    # Returning normally acknowledges the WHOLE batch. Raising re-delivers the
+    # whole batch — including the records that already succeeded. So either make
+    # handle() idempotent, or use ReportBatchItemFailures to fail one record.</code></pre>
+
+<p>That comment is the part worth remembering. By default an exception anywhere in the batch
+retries the entire batch, so a single poison record can block a shard until the data expires —
+records are read in order, and Kinesis will not move past one that keeps failing. Configure a
+failure destination and <code>ReportBatchItemFailures</code>, or you will meet this at 3am.</p>
+
+<h2>The names changed, and the API did not</h2>
+
+<p>This trips people up when reading anything written before 2024, which is most of what a search
+returns.</p>
+
+<ul>
+  <li><strong>Kinesis Data Firehose</strong> is now <strong>Amazon Data Firehose</strong> — the
+      docs also call the object a "Firehose stream" rather than a "delivery stream"</li>
+  <li><strong>Kinesis Data Analytics</strong> is now <strong>Amazon Managed Service for Apache
+      Flink</strong></li>
+  <li><strong>Kinesis Data Streams</strong> kept its name</li>
+</ul>
+
+<p>The rename was cosmetic and the API was left alone, which produces a genuinely confusing
+result: the service is called Amazon Data Firehose, but the CLI still speaks the old vocabulary,
+and its own service model still says "Amazon Kinesis Firehose" internally.</p>
+
+<pre class="language-bash"><code class="language-bash">aws firehose list-delivery-streams
+aws firehose describe-delivery-stream --delivery-stream-name bookings-to-s3</code></pre>
+
+<p>So do not go looking for <code>aws firehose list-firehose-streams</code>. It does not exist, and
+neither does <code>aws kinesis-firehose</code>. When the documentation and the CLI disagree about a
+name, the CLI is the one your script has to satisfy — check the command exists before you build a
+deploy around it.</p>

@@ -1,0 +1,120 @@
+<p>Elastic Kubernetes Service runs a managed Kubernetes control plane so you do not have to operate
+etcd and the API server yourself. Everything below is worth reading in the order it is written,
+because the first section is the one most readers actually need.</p>
+
+<h2>You probably do not need this yet</h2>
+
+<p>Kubernetes is a distributed system with its own scheduler, its own networking model, its own
+storage abstractions and its own RBAC — on top of the AWS versions of all four. That is a real
+amount to learn and a real amount to operate, and it buys nothing at all if you are running one
+backend, one worker and a database.</p>
+
+<p>For that shape, <strong>ECS on Fargate</strong> does the same job with three concepts instead of
+thirty, no control plane to pay for, and IAM instead of a second permissions system.</p>
+
+<p>The honest cases for choosing EKS:</p>
+
+<ul>
+  <li>You already have Kubernetes manifests, a Helm chart, or operators you depend on</li>
+  <li>Several teams deploy independently and you want namespaces and RBAC to separate them</li>
+  <li>You need to run the same workloads somewhere other than AWS, and can name where</li>
+  <li>You want an ecosystem tool — Argo, Istio, KEDA — that only exists for Kubernetes</li>
+</ul>
+
+<p>"It is what serious companies use" is not on that list. Neither is "we might need it later" —
+moving from ECS to EKS later is a redeploy, not a rewrite, because the container image is the
+thing that carries over.</p>
+
+<h2>What it costs before a single pod runs</h2>
+
+<p>The control plane is <strong>$0.10 per cluster per hour</strong> — about $73 a month, whether
+you run one pod or a thousand. Nodes, load balancers and storage are all extra and priced normally.</p>
+
+<p>Two costs are easy to miss. A cluster left on an old Kubernetes version moves to
+<strong>extended support</strong> after 14 months, and that is <strong>$0.60 per cluster per
+hour</strong> — six times the price, charged for not upgrading. And a non-production cluster per
+developer multiplies the $73, which is the usual reason an EKS bill surprises people.</p>
+
+<h2>Nodes: three ways to get compute</h2>
+
+<table>
+  <thead><tr><th>Option</th><th>What it is</th><th>Suits</th></tr></thead>
+  <tbody>
+    <tr><td>Managed node groups</td><td>EC2 instances EKS provisions and upgrades for you</td>
+        <td>The default; most workloads</td></tr>
+    <tr><td>Fargate profiles</td><td>One micro-VM per pod, no instances to manage</td>
+        <td>Bursty or isolated workloads; no DaemonSets</td></tr>
+    <tr><td>Self-managed nodes</td><td>Your own Auto Scaling group</td>
+        <td>Custom AMIs, GPUs, unusual kernels</td></tr>
+  </tbody>
+</table>
+
+<p>Start with a managed node group. Fargate on EKS sounds like the simple option and is not:
+DaemonSets do not run, pods take longer to start, and per-pod overhead is charged for a full
+micro-VM.</p>
+
+<h2>Connecting to a cluster</h2>
+
+<p>This is the command that confuses people who know the AWS CLI, because it does not call an API
+that changes anything — it writes a local file:</p>
+
+<pre class="language-bash"><code class="language-bash">aws eks update-kubeconfig --name stayhub-prod --region us-west-2
+
+kubectl get nodes</code></pre>
+
+<p>It merges a context into <code>~/.kube/config</code> that tells <code>kubectl</code> how to
+authenticate as you. There is no long-lived Kubernetes credential: the config runs the AWS CLI to
+mint a short-lived token on every call, so your IAM identity is what grants access, and removing
+someone from IAM removes their cluster access.</p>
+
+<p>Which also means <code>kubectl</code> talks to whichever cluster the current context points at.
+Check before you type anything destructive:</p>
+
+<pre class="language-bash"><code class="language-bash">kubectl config current-context</code></pre>
+
+<h2>The two AWS-specific pieces</h2>
+
+<p>Almost everything else about EKS is ordinary Kubernetes. These two are not, and they are what
+you will actually spend time on.</p>
+
+<p><strong>IRSA — IAM Roles for Service Accounts.</strong> A pod that needs to read an S3 bucket
+should not use the node's instance role, because that gives every pod on that node the same access.
+IRSA associates an IAM role with a Kubernetes service account through an OIDC provider, so
+permissions are per-workload:</p>
+
+<pre class="language-bash"><code class="language-bash">aws eks describe-cluster --name stayhub-prod \
+  --query "cluster.identity.oidc.issuer" --output text</code></pre>
+
+<p>That issuer URL has to be registered as an IAM OIDC provider once per cluster, and it is the
+step people skip — after which the role exists, the annotation is right, and the pod still gets
+access denied.</p>
+
+<p><strong>The AWS Load Balancer Controller.</strong> A Kubernetes <code>Service</code> of type
+<code>LoadBalancer</code> gives you a classic ELB by default. The controller is an add-on that
+turns an <code>Ingress</code> into a proper ALB with target groups and path routing, and it is
+effectively mandatory for anything serving HTTP. It is not installed by default.</p>
+
+<h2>Access is two systems, not one</h2>
+
+<p>The single most common "why can I not do anything" moment on a new EKS cluster comes from this:
+IAM decides whether you may <em>reach</em> the Kubernetes API, and Kubernetes RBAC decides what you
+may <em>do</em> once you are there. They are separate, and being an account administrator does not
+make you a cluster administrator.</p>
+
+<p>Historically this mapping lived in a ConfigMap called <code>aws-auth</code>, which was easy to
+break and locked people out permanently. Newer clusters use EKS access entries instead, which are a
+real API:</p>
+
+<pre class="language-bash"><code class="language-bash">aws eks list-access-entries --cluster-name stayhub-prod</code></pre>
+
+<p>Whichever mode a cluster uses, grant a second identity admin access on the day you create it.
+The creator has it implicitly, and a cluster whose only administrator is one person's IAM user is
+one offboarding away from being unmanageable.</p>
+
+<h2>If you do go ahead</h2>
+
+<p>Create the cluster with <code>eksctl</code> or Terraform rather than the console — a cluster
+built by clicking is one nobody can rebuild, and a Kubernetes cluster is exactly the wrong thing to
+have only one of by accident. Then plan the upgrade cadence on day one: Kubernetes releases three
+times a year, standard support lasts 14 months, and the $0.60 per hour is what not planning it
+costs.</p>

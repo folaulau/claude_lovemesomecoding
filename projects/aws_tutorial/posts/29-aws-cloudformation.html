@@ -1,0 +1,157 @@
+<p>Clicking through the console is fine until the day you have to build it again — in another
+region, in another account, or because someone deleted something and nobody remembers what it was
+called. CloudFormation is AWS's answer: describe the resources in a file, hand the file to AWS, and
+let it work out what to create, change or delete.</p>
+
+<p>The examples here are from the stack that runs this site's admin API, because a real template
+shows the parts that matter and a tutorial template does not.</p>
+
+<h2>A template's five sections</h2>
+
+<p>Only <code>Resources</code> is required. The rest earn their place as the stack grows.</p>
+
+<table>
+  <thead><tr><th>Section</th><th>What it is for</th></tr></thead>
+  <tbody>
+    <tr><td><code>Parameters</code></td><td>Values supplied at deploy time — environment name, a
+        certificate ARN, a bucket</td></tr>
+    <tr><td><code>Conditions</code></td><td>Booleans built from parameters, used to include or skip
+        a resource</td></tr>
+    <tr><td><code>Resources</code></td><td>The actual things. Each has a logical id, a
+        <code>Type</code>, and <code>Properties</code></td></tr>
+    <tr><td><code>Outputs</code></td><td>Values to read back afterwards, or export to another
+        stack</td></tr>
+    <tr><td><code>Mappings</code></td><td>Static lookup tables, usually keyed by region</td></tr>
+  </tbody>
+</table>
+
+<pre class="language-yaml"><code class="language-yaml">AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev]
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Regional ACM cert in this stack's region (NOT us-east-1)
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'lovemesomecoding-admin-api-${Env}'
+      Handler: app.main.handler
+      Runtime: python3.12
+      MemorySize: 512
+      Timeout: 30
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint</code></pre>
+
+<p><code>!Ref</code> reads a parameter or another resource's main identifier, <code>!GetAtt</code>
+reads a named attribute of a resource, and <code>!Sub</code> interpolates both into a string. Those
+three cover most templates.</p>
+
+<h2>SAM is shorthand, not a different service</h2>
+
+<p>That <code>Transform: AWS::Serverless-2016-10-31</code> line is what makes
+<code>AWS::Serverless::Function</code> legal. A transform is a macro: CloudFormation expands it
+server-side into ordinary resources — an <code>AWS::Lambda::Function</code>, an execution role,
+a log group — before it deploys anything.</p>
+
+<p>So SAM is not a competing tool. It is CloudFormation with a preprocessor, and a SAM stack is a
+CloudFormation stack you can inspect in the CloudFormation console. That also means anything SAM
+cannot express, you can drop into the same template as a raw resource.</p>
+
+<h2>Change sets: see it before you do it</h2>
+
+<p>The feature that makes CloudFormation safe to run against production. A change set is a diff:
+what would be added, modified, or <em>replaced</em>.</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudformation create-change-set \
+  --stack-name lovemesomecoding-admin-api-prod \
+  --change-set-name review \
+  --template-body file://template.yaml \
+  --capabilities CAPABILITY_IAM
+
+aws cloudformation describe-change-set \
+  --stack-name lovemesomecoding-admin-api-prod \
+  --change-set-name review \
+  --query "Changes[].ResourceChange.[Action,LogicalResourceId,Replacement]" \
+  --output table</code></pre>
+
+<p>The column to read is <code>Replacement</code>. <code>True</code> means CloudFormation will
+delete the resource and create a new one — a new database, a new bucket, a new identifier for
+everything pointing at it. Some properties simply cannot be updated in place, and the change set
+is where you find that out instead of during the deploy.</p>
+
+<h2>The trap: an omitted parameter keeps its old value</h2>
+
+<p>This one has cost real time on this site, so it gets its own heading.</p>
+
+<p><strong>CloudFormation keeps the PREVIOUS value for any parameter an update omits. It does not
+adopt a changed default from your new template.</strong></p>
+
+<p>The consequences are quiet and confusing. You edit a default in <code>template.yaml</code>,
+commit it, deploy, and the stack keeps running the old value — the template in git no longer
+describes what is deployed. There is no warning, because from CloudFormation's point of view you
+asked for no change.</p>
+
+<p>The fix is to pass every parameter explicitly on every deploy, which is what this site's deploy
+script does:</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name lovemesomecoding-admin-api-prod \
+  --capabilities CAPABILITY_IAM \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides Env=prod DataEnv=prod CorsOrigins="$CORS_ORIGINS"</code></pre>
+
+<p>There is a sharper edge on the same rule. An empty string is a real value, not an omission — so
+passing <code>CertificateArn=''</code> flips <code>HasCustomDomain</code> to false, and
+CloudFormation then <em>deletes</em> the custom domain and its DNS record. A missing environment
+variable in a deploy script becomes a silent outage. Guard against it in the script rather than
+trusting yourself to remember.</p>
+
+<h2>Drift: when someone clicks something</h2>
+
+<p>CloudFormation does not stop anyone editing a managed resource in the console, and it will not
+notice on its own. Someone widens a security group by hand to unblock themselves on a Friday, and
+the template quietly stops describing reality — until the next deploy puts it back and breaks
+whatever depended on the manual change.</p>
+
+<p>Drift detection is the check for this, and it is worth running before any deploy you are
+nervous about:</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudformation detect-stack-drift --stack-name lovemesomecoding-admin-api-prod
+
+aws cloudformation describe-stack-resource-drifts \
+  --stack-name lovemesomecoding-admin-api-prod \
+  --stack-resource-drift-status-filters MODIFIED DELETED</code></pre>
+
+<p>Note that the first call starts an asynchronous detection and returns an id; the second reads
+the result once it has finished. Drift that is deliberate belongs in the template. Drift that is
+not is a deploy about to surprise you.</p>
+
+<h2>When an update fails</h2>
+
+<p>CloudFormation rolls back by default: it returns the stack to its last good state, which is
+usually what you want and occasionally maddening, because the error scrolls past during the
+rollback. The stack events are where the real message is — read the <em>oldest</em> failure, not
+the newest, since everything after it is rollback noise.</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudformation describe-stack-events \
+  --stack-name lovemesomecoding-admin-api-prod \
+  --query "StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+  --output table</code></pre>
+
+<p>A stack stuck in <code>ROLLBACK_COMPLETE</code> cannot be updated — it can only be deleted and
+recreated. That is only survivable if the stack really does describe everything, which is the
+argument for not doing half your infrastructure by hand.</p>

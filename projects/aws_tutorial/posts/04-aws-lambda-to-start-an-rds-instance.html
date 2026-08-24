@@ -1,0 +1,142 @@
+<p>This is the other half of the nightly-shutdown pair: bring the development database back before
+anyone needs it. The API call is trivial. The timing is not, and that is what this post is
+actually about.</p>
+
+<h2>Starting is slow, and that changes the schedule</h2>
+
+<p>Stopping an EC2 instance and starting it again are roughly symmetrical operations. RDS is not.
+The user guide's own warning is worth reading twice: <em>starting a DB instance requires instance
+recovery and can take from minutes to hours.</em></p>
+
+<p>RDS has to provision an EC2 instance, attach the storage volumes, start the engine, and — if the
+instance did not shut down cleanly — run recovery before it will accept a connection. On a small
+dev instance that is usually a few minutes. It is never a few seconds.</p>
+
+<p>The practical consequence: schedule the start well before the first person needs it. If the team
+begins at 8am, start the database at 7:30am. A schedule set for 7:55am produces a morning of
+connection errors and a bug report that is really a calendar problem.</p>
+
+<h2>The handler</h2>
+
+<pre class="language-python"><code class="language-python">import boto3
+
+rds = boto3.client("rds")
+
+TAG_KEY = "Schedule"
+TAG_VALUE = "nightly-stop"
+
+
+def lambda_handler(event, context):
+    started = []
+
+    for page in rds.get_paginator("describe_db_instances").paginate():
+        for db in page["DBInstances"]:
+            tags = {t["Key"]: t["Value"] for t in db.get("TagList", [])}
+            if tags.get(TAG_KEY) != TAG_VALUE:
+                continue
+
+            # `stopped` is the ONLY state start_db_instance accepts. An instance
+            # already `starting` raises InvalidDBInstanceState — so without this
+            # check, a schedule that fires twice logs a failure for a database
+            # that is coming up perfectly well.
+            if db["DBInstanceStatus"] != "stopped":
+                continue
+
+            rds.start_db_instance(DBInstanceIdentifier=db["DBInstanceIdentifier"])
+            started.append(db["DBInstanceIdentifier"])
+
+    print(f"started: {started or 'nothing'}")
+    return {"started": started}</code></pre>
+
+<p>The status check matters more here than on the stop side, and for a reason worth spelling out.
+Because starting takes minutes, the window during which the instance is <code>starting</code> is
+long. Any retry, any duplicate schedule, any manual re-run inside that window hits an instance in a
+state the API rejects. Filtering on <code>stopped</code> makes the function safe to invoke as often
+as you like — it becomes a no-op instead of an error.</p>
+
+<p>Note that the same tag drives both functions. One tag, two schedules; nothing to keep in sync.</p>
+
+<h2>The IAM policy</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "FindInstances",
+      "Effect": "Allow",
+      "Action": ["rds:DescribeDBInstances", "rds:ListTagsForResource"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "StartOnlyTaggedInstances",
+      "Effect": "Allow",
+      "Action": "rds:StartDBInstance",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/Schedule": "nightly-stop" }
+      }
+    }
+  ]
+}</code></pre>
+
+<p>Starting a database is far less dangerous than stopping one, so the condition here is about cost
+rather than availability: without it, a bad tag filter starts every stopped instance in the account
+and you find out on the bill.</p>
+
+<h2>The schedule</h2>
+
+<pre class="language-bash"><code class="language-bash">aws scheduler create-schedule \
+  --name rds-morning-start \
+  --schedule-expression "cron(30 7 ? * MON-FRI *)" \
+  --schedule-expression-timezone "America/Denver" \
+  --flexible-time-window "Mode=OFF" \
+  --target '{"Arn":"arn:aws:lambda:us-west-2:111122223333:function:rds-morning-start","RoleArn":"arn:aws:iam::111122223333:role/scheduler-invoke"}'</code></pre>
+
+<p>Two things about that cron expression, because it is not standard cron.</p>
+
+<p>It has <strong>six fields</strong>, not five — minute, hour, day-of-month, month, day-of-week,
+year. And you cannot specify day-of-month and day-of-week in the same expression; one of them must
+be <code>?</code>. That is why a weekday-only schedule reads
+<code>cron(30 7 ? * MON-FRI *)</code> and not <code>cron(30 7 * * MON-FRI)</code>. Getting this
+wrong is the single most common reason a schedule silently never fires.</p>
+
+<p>Weekdays only is also the point: there is no reason to start a dev database on Saturday, and the
+stop function will not fire either, so it stays off all weekend. That is the largest single saving
+in the whole exercise.</p>
+
+<h2>What this actually saves</h2>
+
+<p>Worth doing the arithmetic before building it, because the answer decides whether the pair of
+functions is worth maintaining.</p>
+
+<p>A week is 168 hours. Running 7:30am to 7pm on weekdays only is 11.5 hours × 5 days = 57.5
+hours. So the instance is up for about <strong>34% of the week</strong>, and you stop paying
+instance hours for the other 66%.</p>
+
+<p>That 66% applies only to the instance-hour line. As covered in the companion post, storage,
+backups and any public IPv4 address bill the whole time. So on a db.t4g.medium whose bill is mostly
+compute, this is close to a two-thirds saving. On an instance with a large Provisioned IOPS volume
+attached, it might be a fifth. Look at the cost breakdown in Cost Explorer, grouped by usage type,
+before deciding.</p>
+
+<h2>Waiting for it properly</h2>
+
+<p>If something downstream — a migration, a smoke test — has to run once the database is actually
+up, do not sleep and hope. There is a waiter:</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds wait db-instance-available --db-instance-identifier mydb</code></pre>
+
+<p>That polls until the status is <code>available</code>, which is the difference between "the API
+accepted my request" and "the database will answer a query". In Python it is
+<code>rds.get_waiter("db_instance_available")</code>.</p>
+
+<p>Do not put that waiter inside the starting Lambda. It would block for the entire startup —
+minutes of billed Lambda time doing nothing, and quite possibly a timeout. If you need
+work to happen after the database is up, use a separate scheduled invocation or a Step Functions
+state machine, which is designed to wait.</p>
+
+<p>One last thing that catches people: the endpoint hostname does not change across a stop and
+start, but any application that was holding a connection pool through the night has a pool full of
+dead sockets. Make sure your pool is configured to validate a connection before handing it out —
+in SQLAlchemy that is <code>pool_pre_ping=True</code> — or the first request each morning fails
+even though the database is perfectly healthy.</p>

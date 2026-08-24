@@ -1,7 +1,7 @@
 # Postgres tutorial track — progress report
 
-**Status:** 🟢 **All 18 posts written, verified and seeded to the LOCAL tree.** Not published to
-prod — that is one command away and waiting on Folau.
+**Status:** ✅ **PUBLISHED AND LIVE** — 18 posts on https://lovemesomecoding.com/postgre, all 18
+URLs verified serving at the edge. Build `394b0bd`, deployed 2026-08-23.
 **Started:** 2026-08-22
 **Where it lands:** https://lovemesomecoding.com/postgre
 

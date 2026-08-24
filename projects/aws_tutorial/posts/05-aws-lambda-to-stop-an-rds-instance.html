@@ -1,0 +1,160 @@
+<p>A development database that nobody queries between 7pm and 8am is costing you instance hours for
+about two thirds of its life. RDS lets you stop it, and a Lambda on a schedule is the cheapest way
+to make that happen every night without anyone remembering to.</p>
+
+<p>There is one fact that shapes the whole design, so it goes first.</p>
+
+<h2>RDS restarts a stopped instance after seven days</h2>
+
+<p>From the RDS user guide: if you do not manually start a DB instance after it has been stopped
+for <strong>seven consecutive days</strong>, RDS starts it for you, so that it does not fall behind
+required maintenance.</p>
+
+<p>This is not a bug and there is no setting to turn it off. It is the reason a stop-on-a-schedule
+Lambda is a <em>schedule</em> rather than a one-off click: something has to keep stopping the
+instance, because AWS keeps starting it. A nightly stop resets the seven-day clock every time, so
+you never reach it.</p>
+
+<p>If you want a database off for a month, stopping it is the wrong tool — take a final snapshot
+and delete the instance instead. Stopping is for the instance you want back tomorrow.</p>
+
+<h2>What you still pay for</h2>
+
+<p>Stopping saves the instance hours and nothing else. While it is stopped you are still billed
+for:</p>
+
+<ul>
+  <li>provisioned storage, including any Provisioned IOPS</li>
+  <li>backup storage — manual snapshots and automated backups inside the retention window</li>
+  <li>the public IPv4 address, if the instance is publicly accessible</li>
+</ul>
+
+<p>On a small dev instance the instance hours are most of the bill, so this is still worth doing.
+On a database whose cost is mostly a large provisioned volume, it saves less than you expect.
+Check the split before you build anything.</p>
+
+<h2>The handler</h2>
+
+<pre class="language-python"><code class="language-python">import boto3
+
+rds = boto3.client("rds")
+
+TAG_KEY = "Schedule"
+TAG_VALUE = "nightly-stop"
+
+
+def lambda_handler(event, context):
+    stopped = []
+
+    for page in rds.get_paginator("describe_db_instances").paginate():
+        for db in page["DBInstances"]:
+            tags = {t["Key"]: t["Value"] for t in db.get("TagList", [])}
+            if tags.get(TAG_KEY) != TAG_VALUE:
+                continue
+
+            # stop_db_instance is only valid from `available`. Calling it on an
+            # instance that is already stopping raises InvalidDBInstanceState,
+            # which on a retried schedule turns into a loop of failed invocations.
+            if db["DBInstanceStatus"] != "available":
+                continue
+
+            # An instance with a read replica cannot be stopped, and neither can
+            # a replica itself. Skipping them here is the difference between a
+            # clean run and an alarm every night.
+            if db.get("ReadReplicaDBInstanceIdentifiers") or db.get("ReadReplicaSourceDBInstanceIdentifier"):
+                continue
+
+            rds.stop_db_instance(DBInstanceIdentifier=db["DBInstanceIdentifier"])
+            stopped.append(db["DBInstanceIdentifier"])
+
+    print(f"stopped: {stopped or 'nothing'}")
+    return {"stopped": stopped}</code></pre>
+
+<p>Three details in there are the whole post.</p>
+
+<p><strong>It selects on a tag, not on a name.</strong> Tag the instances you want stopped and the
+Lambda needs no code change when you add another one.</p>
+
+<p><strong>It filters on status before calling.</strong> <code>stop_db_instance</code> on an
+instance that is already <code>stopping</code> or <code>stopped</code> raises
+<code>InvalidDBInstanceState</code>. Without the check, the first night it runs twice you get a
+failed invocation and an alarm for something that is working correctly.</p>
+
+<p><strong>It skips replicas.</strong> You cannot stop an instance that has a read replica, and you
+cannot stop a replica. Both raise errors rather than being ignored.</p>
+
+<p>Multi-AZ deployments <em>can</em> be stopped — the one engine that cannot is RDS for SQL Server.
+Note that the primary and secondary Availability Zones may be swapped when it starts again.</p>
+
+<h2>Aurora is a different call</h2>
+
+<p>If the database is Aurora, none of the above applies, because an Aurora database is a cluster
+with instances in it rather than a single instance. You stop the cluster:</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds stop-db-cluster --db-cluster-identifier my-aurora-cluster</code></pre>
+
+<p>Calling <code>stop-db-instance</code> on a member of an Aurora cluster fails. The seven-day
+limit applies here too, and Aurora Serverless v2 cannot be stopped at all — it scales its capacity
+down instead, which is the equivalent knob.</p>
+
+<p>So if your account has both, the handler needs a second loop over
+<code>describe_db_clusters</code>. The tag filter and the status check work the same way.</p>
+
+<h2>The IAM policy</h2>
+
+<p>The instinct is <code>"rds:*"</code> on <code>"*"</code>. Do not. The describe calls have to be
+account-wide because that is how you find the instances, but the destructive call can be scoped to
+the tag you already select on:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "FindInstances",
+      "Effect": "Allow",
+      "Action": ["rds:DescribeDBInstances", "rds:ListTagsForResource"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "StopOnlyTaggedInstances",
+      "Effect": "Allow",
+      "Action": "rds:StopDBInstance",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/Schedule": "nightly-stop" }
+      }
+    }
+  ]
+}</code></pre>
+
+<p>Now a bug in the tag filter cannot stop production, because the permission does not exist. That
+is the point of writing the condition rather than trusting the code.</p>
+
+<h2>The schedule</h2>
+
+<p>EventBridge Scheduler runs it. One rule, no code:</p>
+
+<pre class="language-bash"><code class="language-bash">aws scheduler create-schedule \
+  --name rds-nightly-stop \
+  --schedule-expression "cron(0 3 * * ? *)" \
+  --schedule-expression-timezone "America/Denver" \
+  --flexible-time-window "Mode=OFF" \
+  --target '{"Arn":"arn:aws:lambda:us-west-2:111122223333:function:rds-nightly-stop","RoleArn":"arn:aws:iam::111122223333:role/scheduler-invoke"}'</code></pre>
+
+<p><code>--schedule-expression-timezone</code> is the flag worth knowing. EventBridge's older rules
+are UTC only, which means a schedule written against local time drifts by an hour twice a year.
+Scheduler takes an IANA timezone and handles daylight saving for you.</p>
+
+<h2>Verifying it</h2>
+
+<pre class="language-bash"><code class="language-bash">aws rds describe-db-instances \
+  --query "DBInstances[].[DBInstanceIdentifier,DBInstanceStatus]" \
+  --output table</code></pre>
+
+<p>Expect <code>stopping</code> for a while before <code>stopped</code>. The docs are blunt that it
+can take several minutes and occasionally up to an hour, because RDS shuts the engine down,
+detaches the volumes and terminates the underlying EC2 instance. Do not write an alarm that fires
+because the status is not <code>stopped</code> ninety seconds later.</p>
+
+<p>The other half of this pair is starting it again in the morning, which has its own timing
+problem — see the companion post.</p>

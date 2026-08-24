@@ -1,0 +1,155 @@
+<p>ECS runs containers for you. If you have a Dockerfile and you want it running in AWS behind a
+load balancer, this is the shortest path that is still a real production setup — and on Fargate
+there is no server to patch, size or log into.</p>
+
+<h2>Three nouns, and that is the whole model</h2>
+
+<table>
+  <thead><tr><th>Noun</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Task definition</strong></td><td>The recipe: which image, how much CPU and
+        memory, which ports, which environment variables, where logs go. Versioned — every edit
+        creates a new revision</td></tr>
+    <tr><td><strong>Task</strong></td><td>One running instance of that recipe. Roughly "a
+        container, running"</td></tr>
+    <tr><td><strong>Service</strong></td><td>Keeps N tasks alive, registers them with a load
+        balancer, and replaces them on deploy or on failure</td></tr>
+  </tbody>
+</table>
+
+<p>A <strong>cluster</strong> is just a namespace those live in. On Fargate it holds no servers, so
+creating one costs nothing and means almost nothing.</p>
+
+<h2>Fargate or EC2</h2>
+
+<p>Launch type decides who owns the machine. On <strong>Fargate</strong>, AWS runs each task on
+capacity you never see; you pick vCPU and memory per task and pay for exactly that while it runs.
+On <strong>EC2</strong>, you run a cluster of instances and ECS packs tasks onto them.</p>
+
+<p>Fargate costs more per vCPU-hour and is almost always the right default, because the price
+difference is smaller than the cost of someone patching AMIs. EC2 wins when you need GPUs, very
+large sustained scale where bin-packing pays, or a daemon on every host.</p>
+
+<h2>A task definition</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "family": "stayhub-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::111122223333:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::111122223333:role/stayhub-api-task",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "111122223333.dkr.ecr.us-west-2.amazonaws.com/stayhub-api:1.4.0",
+      "portMappings": [{ "containerPort": 8000 }],
+      "secrets": [
+        { "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:ssm:us-west-2:111122223333:parameter/stayhub/db-url" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/stayhub-api",
+          "awslogs-region": "us-west-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}</code></pre>
+
+<p>Note <code>cpu</code> and <code>memory</code> are strings, and Fargate only accepts specific
+pairings — 512 CPU units (half a vCPU) allows 1, 2, 3 or 4 GB and nothing else. An arbitrary
+combination is rejected at registration.</p>
+
+<h2>The two roles, which is the thing that bites</h2>
+
+<p>There are two IAM roles in that file and they are not interchangeable. This is the single most
+common reason a task dies on startup with nothing useful in the log.</p>
+
+<ul>
+  <li><strong><code>executionRoleArn</code></strong> — used by the ECS <em>agent</em>, before your
+      container starts, to pull the image from ECR, fetch <code>secrets</code>, and create the log
+      stream. If this is wrong the container never runs, so there is no application log to read.</li>
+  <li><strong><code>taskRoleArn</code></strong> — used by <em>your code</em> at runtime for the AWS
+      calls it makes. This is the one that needs S3 or DynamoDB access.</li>
+</ul>
+
+<p>The tell: a task that goes <code>PROVISIONING</code> → <code>STOPPED</code> with a
+<code>ResourceInitializationError</code> and an empty log group is an execution-role problem every
+time. And the log group must already exist — <code>awslogs</code> does not create it unless you set
+<code>awslogs-create-group</code>.</p>
+
+<h2>Running it</h2>
+
+<pre class="language-bash"><code class="language-bash">aws ecs register-task-definition --cli-input-json file://task-definition.json
+
+aws ecs create-service \
+  --cluster stayhub \
+  --service-name stayhub-api \
+  --task-definition stayhub-api \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-aaa,subnet-bbb],securityGroups=[sg-ccc]}" \
+  --load-balancers "targetGroupArn=arn:aws:elasticloadbalancing:us-west-2:111122223333:targetgroup/stayhub/abc,containerName=api,containerPort=8000"</code></pre>
+
+<p>Two subnets in different Availability Zones, because two tasks in one AZ is not redundancy.</p>
+
+<p><code>networkMode: awsvpc</code> is what makes that block necessary: every task gets its own
+elastic network interface and its own private IP, so it is addressed like a small instance rather
+than sharing a host's ports. That is why the security group goes on the task rather than on a
+machine, and why the load balancer's target type is <code>ip</code> and not
+<code>instance</code>.</p>
+
+<p>Put tasks in <strong>private</strong> subnets with the load balancer in the public ones. A task
+in a public subnet with <code>assignPublicIp=ENABLED</code> works and is the default many tutorials
+reach for, but it puts your container directly on the internet for no benefit.</p>
+
+<h2>Deploying a new version</h2>
+
+<p>A deploy is: push a new image, register a new task-definition revision, tell the service to use
+it. ECS starts new tasks, waits for them to pass the target group's health check, then drains the
+old ones.</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecs update-service --cluster stayhub --service stayhub-api \
+  --task-definition stayhub-api:42
+
+aws ecs wait services-stable --cluster stayhub --services stayhub-api</code></pre>
+
+<p>That waiter is what makes a deploy script honest — without it the command returns immediately
+and your pipeline reports success before anything has actually started.</p>
+
+<p>Turn on the deployment circuit breaker when you create the service. Without it, a revision that
+crashes on startup loops forever, replacing failed tasks until someone notices; with it, ECS gives
+up and rolls back to the last working revision on its own.</p>
+
+<h2>Scaling the service</h2>
+
+<p><code>--desired-count</code> is a fixed number until you attach Application Auto Scaling to it.
+Target tracking is the version worth using: you name a metric and a value, and AWS adds or removes
+tasks to hold it there.</p>
+
+<pre class="language-bash"><code class="language-bash">aws application-autoscaling register-scalable-target \
+  --service-namespace ecs \
+  --resource-id service/stayhub/stayhub-api \
+  --scalable-dimension ecs:service:DesiredCount \
+  --min-capacity 2 --max-capacity 10</code></pre>
+
+<p>Target CPU utilisation around 60–70% is a sane starting point. Scaling on request count per
+target is usually better for an API, because it reacts to load rather than to the symptom of load.</p>
+
+<p>Set <code>--min-capacity</code> to at least 2. One task is not a deployment strategy: during a
+rolling deploy, or an AZ event, one task means zero tasks.</p>
+
+<h2>Reading a failure</h2>
+
+<pre class="language-bash"><code class="language-bash">aws ecs describe-tasks --cluster stayhub --tasks arn:aws:ecs:us-west-2:111122223333:task/stayhub/abc \
+  --query "tasks[].[lastStatus,stopCode,stoppedReason]"</code></pre>
+
+<p><code>stoppedReason</code> is the field that answers the question. <code>OutOfMemory</code>
+means the container exceeded its memory limit and was killed — raise <code>memory</code>, or find
+the leak. <code>Essential container in task exited</code> means your process exited, and the reason
+is in CloudWatch. Anything mentioning <code>ResourceInitialization</code> is the execution role.</p>

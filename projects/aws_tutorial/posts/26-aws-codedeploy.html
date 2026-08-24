@@ -1,0 +1,146 @@
+<p>CodeDeploy is the piece of AWS's CI/CD family that takes a built artifact and puts it on the
+thing that runs it. CodeBuild produces the artifact, CodePipeline sequences the stages, CodeDeploy
+does the last step — and it is the one with an opinion worth having, because it knows how to shift
+traffic gradually and take it back.</p>
+
+<h2>Where it still earns its place in 2026</h2>
+
+<p>Being clear about this first saves you evaluating it for a job it is not good at.</p>
+
+<table>
+  <thead><tr><th>Target</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>EC2 / on-premises</td><td><strong>Yes.</strong> Still the best answer for deploying to
+        instances you own</td></tr>
+    <tr><td>ECS blue/green</td><td><strong>Yes.</strong> ECS's own rolling update cannot shift
+        traffic in weighted steps or roll back on an alarm</td></tr>
+    <tr><td>Lambda</td><td>Sometimes — canary and linear traffic shifting, usually reached through
+        SAM's <code>DeploymentPreference</code> rather than directly</td></tr>
+    <tr><td>Static sites, containers on Fargate via rolling update</td><td><strong>No.</strong>
+        Nothing to gain</td></tr>
+  </tbody>
+</table>
+
+<p>If you deploy by replacing a container image and you are happy with a rolling update, you do not
+need CodeDeploy. If a bad deploy needs to be caught by an alarm and undone in seconds without a
+human, that is exactly what it is for.</p>
+
+<h2>appspec: the file that describes a deployment</h2>
+
+<p>Every deployment is driven by an <code>appspec</code> file that sits in the artifact. On EC2 it
+is YAML, it lists what to copy where, and it names the scripts to run at each stage:</p>
+
+<pre class="language-yaml"><code class="language-yaml">version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /srv/stayhub
+hooks:
+  ApplicationStop:
+    - location: scripts/stop.sh
+      timeout: 60
+      runas: root
+  BeforeInstall:
+    - location: scripts/install-deps.sh
+      timeout: 300
+      runas: root
+  ApplicationStart:
+    - location: scripts/start.sh
+      timeout: 60
+      runas: root
+  ValidateService:
+    - location: scripts/healthcheck.sh
+      timeout: 120
+      runas: root</code></pre>
+
+<p>On ECS and Lambda the appspec is a different, smaller shape — it names the task definition or
+function version rather than files — but the hook idea is the same.</p>
+
+<h2>The hooks, and the order that surprises people</h2>
+
+<p>The lifecycle runs roughly: <code>ApplicationStop</code> → <code>BeforeInstall</code> →
+<code>Install</code> → <code>AfterInstall</code> → <code>ApplicationStart</code> →
+<code>ValidateService</code>.</p>
+
+<p>Two things about that sequence are worth knowing before your first deployment hangs.</p>
+
+<p><strong><code>ApplicationStop</code> runs the script from the PREVIOUS deployment</strong>, not
+the one you are shipping. It has to, because the new files are not on the instance yet. So a broken
+<code>stop.sh</code> keeps breaking every future deployment until you fix it on the instance by
+hand — the fix in your new revision never gets a chance to run.</p>
+
+<p><strong><code>ValidateService</code> is the point of the whole file.</strong> It is the hook
+where you check that the thing you just started actually works — curl the health endpoint, verify
+it returns 200, exit non-zero if not. A deployment with no ValidateService succeeds as long as the
+process launched, which is not the same as working. Blue/green is only safer than in-place if
+something is qualified to say the new version is bad.</p>
+
+<h2>In-place versus blue/green</h2>
+
+<p><strong>In-place</strong> updates the instances you already have, taking them out of the load
+balancer a batch at a time. Cheap, and rollback means deploying the old revision again — which
+takes as long as a deploy.</p>
+
+<p><strong>Blue/green</strong> stands up a replacement set, waits, shifts traffic, and keeps the
+originals for a while. It costs double the instances during the deployment and rollback is a
+traffic shift back, measured in seconds. On ECS the same idea uses two target groups rather than
+two fleets.</p>
+
+<p>Pick blue/green when a bad minute is expensive. Pick in-place when it is not.</p>
+
+<h2>Automatic rollback is the feature</h2>
+
+<p>Manual rollback is just another deploy. The reason to configure CodeDeploy properly is that it
+can watch a CloudWatch alarm and undo itself:</p>
+
+<pre class="language-bash"><code class="language-bash">aws deploy update-deployment-group \
+  --application-name stayhub \
+  --current-deployment-group-name prod \
+  --auto-rollback-configuration "enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM" \
+  --alarm-configuration "enabled=true,alarms=[{name=stayhub-5xx-high}]"</code></pre>
+
+<p>Now a spike in 5xx during a deployment reverses it without anyone being paged. That is the
+capability you are buying, and it is worth more than the deployment mechanics.</p>
+
+<h2>Deployment configurations</h2>
+
+<p>How fast traffic moves is a named, reusable setting rather than something you script. The
+built-in ones cover most needs:</p>
+
+<table>
+  <thead><tr><th>Name</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td><code>AllAtOnce</code></td><td>Everything at once. Fast, and a bad revision is a full
+        outage</td></tr>
+    <tr><td><code>HalfAtATime</code></td><td>50% then 50%. Needs the remaining half to carry the
+        load</td></tr>
+    <tr><td><code>OneAtATime</code></td><td>Safest and slowest; a large fleet takes a long
+        time</td></tr>
+    <tr><td><code>Canary10Percent5Minutes</code></td><td>10% of traffic, wait 5 minutes, then the
+        rest</td></tr>
+    <tr><td><code>Linear10PercentEvery1Minute</code></td><td>10% more each minute</td></tr>
+  </tbody>
+</table>
+
+<p>The canary and linear configurations are the ones that pair with an alarm: the waiting period
+exists so the alarm has time to fire while most traffic is still on the old version. A canary with
+no alarm attached is just a slower deploy — the pause is only useful if something is watching.</p>
+
+<h2>Why a deployment hangs for an hour</h2>
+
+<p>The classic failure: the deployment sits at <code>ApplicationStop</code> or
+<code>BeforeInstall</code> and eventually times out.</p>
+
+<p>Almost always it is the <strong>CodeDeploy agent</strong> — not installed, not running, or the
+instance's role cannot read the artifact from S3. The agent polls for work, so if it is not running
+nothing reports back and the deployment waits for its timeout rather than failing fast. Check the
+agent first:</p>
+
+<pre class="language-bash"><code class="language-bash">aws deploy get-deployment --deployment-id d-EXAMPLE123 \
+  --query "deploymentInfo.[status,errorInformation]"</code></pre>
+
+<p>The agent's own log on the instance, at
+<code>/var/log/aws/codedeploy-agent/codedeploy-agent.log</code>, says more than the console does —
+it is the first place to look, not the last. Hook script output goes to a separate directory,
+<code>/opt/codedeploy-agent/deployment-root/deployment-logs/</code>, which is where you find out
+why <code>healthcheck.sh</code> exited non-zero.</p>
