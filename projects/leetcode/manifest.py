@@ -669,6 +669,134 @@ POSTS = [
             "needs no plus one."
         ),
     },
+    {
+        "number": 62,
+        "slug": "leetcode-62-unique-paths",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 62 \u2013 Unique Paths",
+        "file": "062-unique-paths.html",
+        "date": "2024-09-18T03:52:29",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "dynamic-programming", "math", "combinatorics"],
+        "excerpt": (
+            "The cleanest introduction to grid DP there is, and worth doing carefully because the "
+            "next two problems are this one with a single detail changed. Deriving the recurrence "
+            "from what was the last move, compressing the table to one row and why the sweep "
+            "direction makes that work, and why the combinatorial closed form is a footnote."
+        ),
+    },
+    {
+        "number": 63,
+        "slug": "leetcode-63-unique-paths-ii",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 63 \u2013 Unique Paths II",
+        "file": "063-unique-paths-ii.html",
+        "date": "2024-09-24T12:08:57",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "dynamic-programming", "matrix"],
+        "excerpt": (
+            "Unique Paths with obstacles: the recurrence is unchanged, one guard goes in front of "
+            "it. An obstacle means zero paths, and zeros propagate on their own with no "
+            "unreachable-region detection. The trap is the first row and column, where one "
+            "obstacle cuts off everything after it."
+        ),
+    },
+    {
+        "number": 64,
+        "slug": "leetcode-64-minimum-path-sum",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 64 \u2013 Minimum Path Sum",
+        "file": "064-minimum-path-sum.html",
+        "date": "2024-09-25T01:49:36",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "dynamic-programming", "matrix", "greedy"],
+        "excerpt": (
+            "Same table, one operator changed, and with it the entire class of problem. Building "
+            "the grid where the greedy loses instead of just claiming it does, why a missing "
+            "neighbour is infinity here when it was zero in the counting version, and why "
+            "Integer.MAX_VALUE as the sentinel overflows into a path through the wall."
+        ),
+    },
+    {
+        "number": 65,
+        "slug": "leetcode-65-valid-number",
+        "algorithm": "Implementation",
+        "title": "LeetCode 65 \u2013 Valid Number",
+        "file": "065-valid-number.html",
+        "date": "2024-10-05T11:28:37",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "string", "parsing"],
+        "excerpt": (
+            "Not an algorithms problem at all \u2014 it tests whether you can pin down an ambiguous "
+            "spec with questions and turn it into code that does not sprawl. Three flags and one "
+            "pass beat the finite-state machine, and resetting seenDigit on e is the single line "
+            "that rejects 1e while accepting 3e+7."
+        ),
+    },
+    {
+        "number": 67,
+        "slug": "leetcode-67-add-binary",
+        "algorithm": "Bit Manipulation",
+        "title": "LeetCode 67 \u2013 Add Binary",
+        "file": "067-add-binary.html",
+        "date": "2024-10-06T10:52:23",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "string", "bit-manipulation", "math"],
+        "excerpt": (
+            "Looks like string manipulation, is really about carries \u2014 and the parse-to-integer "
+            "answer everyone writes first is exactly what the 10,000-character constraint rules "
+            "out. Why the carry belongs in the loop condition, why you build and reverse instead of "
+            "prepending, and XOR and AND as sum-without-carry and carry."
+        ),
+    },
+    {
+        "number": 68,
+        "slug": "leetcode-68-text-justification",
+        "algorithm": "Implementation",
+        "title": "LeetCode 68 \u2013 Text Justification",
+        "file": "068-text-justification.html",
+        "date": "2024-10-14T01:30:48",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "string", "simulation", "greedy"],
+        "excerpt": (
+            "No algorithmic difficulty and one of the highest failure rates on the list, because "
+            "the spacing rules have four interacting cases and each is a silent off-by-one. Split "
+            "packing from padding before typing, collapse the four cases into two, and remember the "
+            "single-word line where gaps would be zero."
+        ),
+    },
+    {
+        "number": 69,
+        "slug": "leetcode-69-sqrtx",
+        "algorithm": "Searching",
+        "title": "LeetCode 69 \u2013 Sqrt(x)",
+        "file": "069-sqrtx.html",
+        "date": "2024-10-20T10:33:41",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "binary-search", "math"],
+        "excerpt": (
+            "A binary search problem that never mentions a sorted array \u2014 binary search is for any "
+            "monotonic predicate, and spotting one with no array in sight is the lesson. Plus the "
+            "overflow that is really the point: mid * mid goes negative near MAX_VALUE and the "
+            "search silently walks the wrong way."
+        ),
+    },
+    {
+        "number": 70,
+        "slug": "leetcode-70-climbing-stairs",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 70 \u2013 Climbing Stairs",
+        "file": "070-climbing-stairs.html",
+        "date": "2024-10-29T05:44:23",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "dynamic-programming", "math", "memoization"],
+        "excerpt": (
+            "Fibonacci wearing a hard hat, and the smallest problem where the recursion-to-DP "
+            "conversation happens naturally. Recognising the sequence is nice; being able to say "
+            "why it is Fibonacci is the answer, because the recurrence is what survives when the "
+            "step sizes become arbitrary and it turns into Coin Change."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for
@@ -680,7 +808,7 @@ POSTS = [
         "algorithm": "Dynamic Programming",
         "title": "LeetCode 121 – Best Time to Buy and Sell Stock",
         "file": "121-best-time-to-buy-and-sell-stock.html",
-        "date": "2024-09-18T11:16:35",
+        "date": "2024-11-10T09:12:44",
         "difficulty": "Easy",
         "tags": ["leetcode", "array", "dynamic-programming"],
         "excerpt": (

@@ -4,6 +4,7 @@ The blocks are pulled straight out of the published HTML, so this tests what a
 reader would copy, not a retyped copy of it.
 """
 import html
+import math
 import re
 import sys
 from pathlib import Path
@@ -883,6 +884,243 @@ for n in range(1, 8):
         if one_liner.lengthOfLastWord(text) != len(text.split()[-1]):
             bad.append(("one-liner", text))
 check("both versions agree with split()[-1] on every a/space string up to length 7", bad, [])
+
+print("LeetCode 62 - Unique Paths")
+s = load("062-unique-paths.html")
+check("m=3 n=7", s.uniquePaths(3, 7), 28)
+check("m=3 n=2", s.uniquePaths(3, 2), 3)
+check("m=1 n=1 (already there)", s.uniquePaths(1, 1), 1)
+check("m=1 n=10 (a corridor)", s.uniquePaths(1, 10), 1)
+check("m=10 n=1 (the other corridor)", s.uniquePaths(10, 1), 1)
+check("m=7 n=3 (symmetric)", s.uniquePaths(7, 3), 28)
+# The closed form the post names: C(m+n-2, m-1).
+bad = []
+for m in range(1, 12):
+    for n in range(1, 12):
+        want = math.comb(m + n - 2, m - 1)
+        if s.uniquePaths(m, n) != want:
+            bad.append((m, n))
+check("matches C(m+n-2, m-1) for every grid up to 11x11", bad, [])
+check("reusable: 3x7 twice", (s.uniquePaths(3, 7), s.uniquePaths(3, 7)), (28, 28))
+
+print("LeetCode 63 - Unique Paths II")
+s63 = load("063-unique-paths-ii.html")
+check("blocked centre", s63.uniquePathsWithObstacles([[0,0,0],[0,1,0],[0,0,0]]), 2)
+check("[[0,1],[0,0]]", s63.uniquePathsWithObstacles([[0,1],[0,0]]), 1)
+check("[[1]] (start blocked)", s63.uniquePathsWithObstacles([[1]]), 0)
+check("[[0]] (single free cell)", s63.uniquePathsWithObstacles([[0]]), 1)
+check("[[0,0],[1,1],[0,0]] (a wall across)", s63.uniquePathsWithObstacles([[0,0],[1,1],[0,0]]), 0)
+check("finish blocked", s63.uniquePathsWithObstacles([[0,0],[0,1]]), 0)
+# The first-row trap: everything past an obstacle in row 0 is unreachable.
+check("obstacle in the top row cuts off the rest",
+      s63.uniquePathsWithObstacles([[0,1,0],[0,0,0]]), 1)
+check("obstacle in the left column can be walked around",
+      s63.uniquePathsWithObstacles([[0,0],[1,0],[0,0]]), 1)
+check("...but not in a single-column grid",
+      s63.uniquePathsWithObstacles([[0],[1],[0]]), 0)
+# With no obstacles it must agree with problem 62, on every small grid.
+bad = []
+for m in range(1, 7):
+    for n in range(1, 7):
+        if s63.uniquePathsWithObstacles([[0] * n for _ in range(m)]) != s.uniquePaths(m, n):
+            bad.append((m, n))
+check("obstacle-free grids agree with problem 62", bad, [])
+# Brute-force path enumeration on every small grid with obstacles.
+def count_paths(grid):
+    m, n = len(grid), len(grid[0])
+    if grid[0][0] or grid[m-1][n-1]:
+        return 0
+    seen = {}
+    def go(r, c):
+        if r == m - 1 and c == n - 1:
+            return 1
+        if (r, c) in seen:
+            return seen[(r, c)]
+        total = 0
+        if r + 1 < m and not grid[r+1][c]:
+            total += go(r + 1, c)
+        if c + 1 < n and not grid[r][c+1]:
+            total += go(r, c + 1)
+        seen[(r, c)] = total
+        return total
+    return go(0, 0)
+
+bad = []
+for m in range(1, 4):
+    for n in range(1, 4):
+        for mask in range(1 << (m * n)):
+            grid = [[(mask >> (r * n + c)) & 1 for c in range(n)] for r in range(m)]
+            if s63.uniquePathsWithObstacles([row[:] for row in grid]) != count_paths(grid):
+                bad.append(grid)
+check("matches path enumeration on every obstacle layout up to 3x3", bad, [])
+
+print("LeetCode 64 - Minimum Path Sum")
+s64 = load("064-minimum-path-sum.html")
+check("[[1,3,1],[1,5,1],[4,2,1]]", s64.minPathSum([[1,3,1],[1,5,1],[4,2,1]]), 7)
+check("[[1,2,3],[4,5,6]]", s64.minPathSum([[1,2,3],[4,5,6]]), 12)
+check("[[5]] (start counts)", s64.minPathSum([[5]]), 5)
+check("[[0]]", s64.minPathSum([[0]]), 0)
+check("single row", s64.minPathSum([[1,2,3,4]]), 10)
+check("single column", s64.minPathSum([[1],[2],[3]]), 6)
+# The grid from the post where the greedy loses.
+check("greedy counterexample from the post",
+      s64.minPathSum([[1,2,100],[1,100,100],[1,1,1]]), 5)
+check("returns an int, not a float", isinstance(s64.minPathSum([[1,2],[3,4]]), int), True)
+# Brute force over every monotone path, on every small grid of small values.
+def best_path(grid):
+    m, n = len(grid), len(grid[0])
+    best = [None]
+    def go(r, c, total):
+        total += grid[r][c]
+        if r == m - 1 and c == n - 1:
+            if best[0] is None or total < best[0]:
+                best[0] = total
+            return
+        if r + 1 < m:
+            go(r + 1, c, total)
+        if c + 1 < n:
+            go(r, c + 1, total)
+    go(0, 0, 0)
+    return best[0]
+
+bad = []
+for m in range(1, 4):
+    for n in range(1, 4):
+        for combo in itertools.product([0, 1, 5], repeat=m * n):
+            grid = [list(combo[r * n:(r + 1) * n]) for r in range(m)]
+            if s64.minPathSum([row[:] for row in grid]) != best_path(grid):
+                bad.append(grid)
+check("matches brute-force path enumeration on every grid up to 3x3 over {0,1,5}", bad, [])
+
+print("LeetCode 65 - Valid Number")
+s = load("065-valid-number.html")
+VALID = ["2", "0089", "-0.1", "+3.14", "4.", "-.9", "2e10", "-90E3", "3e+7",
+         "+6e-1", "53.5e93", "-123.456e789", "0", "0.1", ".1", "1.", "+.8", "46e6"]
+INVALID = ["abc", "1a", "1e", "e3", "99e2.5", "--6", "-+3", "95a54e53", ".",
+           "+", "", "4e+", "e", ".e1", "1e2e3", "1..2", "+-", " 1", "1 ", "1e.5",
+           ".-4", "6+1", "infinity", "1e2.5"]
+for t in VALID:
+    check(f"valid: {t!r}", s.isNumber(t), True)
+for t in INVALID:
+    check(f"invalid: {t!r}", s.isNumber(t), False)
+# Cross-check against the grammar the post writes as a regex, over generated strings.
+GRAMMAR = re.compile(r"^[+-]?((\d+\.?\d*)|(\.\d+))([eE][+-]?\d+)?$")
+bad = []
+for n in range(0, 5):
+    for combo in itertools.product("01.eE+-", repeat=n):
+        t = "".join(combo)
+        if s.isNumber(t) != bool(GRAMMAR.match(t)):
+            bad.append(t)
+check("agrees with the grammar on every string up to length 4 over 01.eE+-", bad, [])
+
+print("LeetCode 67 - Add Binary")
+s = load("067-add-binary.html")
+check('"11" + "1"', s.addBinary("11", "1"), "100")
+check('"1010" + "1011"', s.addBinary("1010", "1011"), "10101")
+check('"0" + "0"', s.addBinary("0", "0"), "0")
+check('"1" + "111" (carry all the way out)', s.addBinary("1", "111"), "1000")
+check('"0" + "1"', s.addBinary("0", "1"), "1")
+# Well past what a 64-bit integer could hold -- the constraint the post calls out.
+big = "1" * 200
+check("200 ones + 1", s.addBinary(big, "1"), "1" + "0" * 200)
+check("200 ones + 200 ones",
+      s.addBinary(big, big), bin(int(big, 2) * 2)[2:])
+bad = []
+for x in range(0, 64):
+    for y in range(0, 64):
+        got = s.addBinary(bin(x)[2:], bin(y)[2:])
+        if got != bin(x + y)[2:]:
+            bad.append((x, y, got))
+check("agrees with integer addition for all x,y in 0..63", bad, [])
+# The constraints exclude leading zeros in the input, so the output cannot have
+# any either: adding two such numbers keeps the leading 1 in place.
+bad = [(x, y) for x in range(1, 40) for y in range(1, 40)
+       if s.addBinary(bin(x)[2:], bin(y)[2:]).startswith("0")]
+check("never emits a leading zero on in-spec input", bad, [])
+
+print("LeetCode 68 - Text Justification")
+s = load("068-text-justification.html")
+check("the canonical example",
+      s.fullJustify(["This","is","an","example","of","text","justification."], 16),
+      ["This    is    an", "example  of text", "justification.  "])
+check("single word line is NOT stretched",
+      s.fullJustify(["What","must","be","acknowledgment","shall","be"], 16),
+      ["What   must   be", "acknowledgment  ", "shall be        "])
+check("one word total", s.fullJustify(["a"], 5), ["a    "])
+check("word exactly maxWidth", s.fullJustify(["abcde"], 5), ["abcde"])
+check("a single line is the LAST line, so left-justified",
+      s.fullJustify(["a", "b"], 5), ["a b  "])
+check("two words, spaces divide evenly",
+      s.fullJustify(["a", "b", "cccc"], 5), ["a   b", "cccc "])
+check("extra spaces go to the LEFT gaps",
+      s.fullJustify(["aa", "b", "cc", "ddddd"], 8), ["aa  b cc", "ddddd   "])
+# Structural invariants on generated inputs: every line is exactly maxWidth, words
+# come back in order, and no line has leading spaces.
+bad = []
+for width in range(4, 12):
+    for n in range(1, 7):
+        for combo in itertools.product(["a", "bb", "ccc"], repeat=n):
+            if max(len(w) for w in combo) > width:
+                continue
+            out = s.fullJustify(list(combo), width)
+            if any(len(line) != width for line in out):
+                bad.append(("width", combo, width, out)); continue
+            if [w for line in out for w in line.split()] != list(combo):
+                bad.append(("order", combo, width, out)); continue
+            if any(line.startswith(" ") for line in out):
+                bad.append(("leading space", combo, width, out)); continue
+            # Only the last line, or a line holding one word, may end in a space.
+            for line in out[:-1]:
+                if line.endswith(" ") and len(line.split()) > 1:
+                    bad.append(("not justified", combo, width, out))
+check("every line is exactly maxWidth, words in order, no leading spaces", bad, [])
+
+print("LeetCode 69 - Sqrt(x)")
+s = load("069-sqrtx.html")
+check("x=4", s.mySqrt(4), 2)
+check("x=8 (floor of 2.828)", s.mySqrt(8), 2)
+check("x=0", s.mySqrt(0), 0)
+check("x=1", s.mySqrt(1), 1)
+check("x=2", s.mySqrt(2), 1)
+check("x=2147483647 (the overflow case)", s.mySqrt(2147483647), 46340)
+check("x=2147395600 (46340 squared exactly)", s.mySqrt(2147395600), 46340)
+bad = [x for x in range(0, 5000) if s.mySqrt(x) != math.isqrt(x)]
+check("matches math.isqrt for every x in 0..4999", bad, [])
+bad = [x for x in (10**k for k in range(1, 10)) if s.mySqrt(x) != math.isqrt(x)]
+check("matches math.isqrt on powers of ten up to 10^9", bad, [])
+# Perfect squares and the values either side of them must land correctly.
+bad = []
+for k in range(1, 1000):
+    sq = k * k
+    if (s.mySqrt(sq), s.mySqrt(sq - 1), s.mySqrt(sq + 1)) != (k, k - 1, k):
+        bad.append(k)
+check("k*k, k*k-1 and k*k+1 for every k in 1..999", bad, [])
+
+print("LeetCode 70 - Climbing Stairs")
+s = load("070-climbing-stairs.html")
+check("n=1", s.climbStairs(1), 1)
+check("n=2", s.climbStairs(2), 2)
+check("n=3", s.climbStairs(3), 3)
+check("n=4", s.climbStairs(4), 5)
+check("n=5", s.climbStairs(5), 8)
+check("n=45 (the constraint bound)", s.climbStairs(45), 1836311903)
+# Independent model: count sequences of 1s and 2s summing to n.
+def ways(n):
+    a, b = 1, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+bad = [n for n in range(0, 40) if s.climbStairs(n) != ways(n)]
+check("matches an independent Fibonacci model for n in 0..39", bad, [])
+# And against brute-force enumeration for small n, which is what the problem means.
+def enumerate_ways(n):
+    if n == 0:
+        return 1
+    if n < 0:
+        return 0
+    return enumerate_ways(n - 1) + enumerate_ways(n - 2)
+bad = [n for n in range(1, 16) if s.climbStairs(n) != enumerate_ways(n)]
+check("matches brute-force enumeration for n in 1..15", bad, [])
 
 print()
 if fails:

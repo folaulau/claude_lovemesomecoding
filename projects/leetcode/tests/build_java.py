@@ -80,6 +80,14 @@ solution("055-jump-game.html", "S55")
 solution("056-merge-intervals.html", "S56")
 solution("057-insert-interval.html", "S57")
 solution("058-length-of-last-word.html", "S58")
+solution("062-unique-paths.html", "S62")
+solution("063-unique-paths-ii.html", "S63")
+solution("064-minimum-path-sum.html", "S64")
+solution("065-valid-number.html", "S65")
+solution("067-add-binary.html", "S67")
+solution("068-text-justification.html", "S68")
+solution("069-sqrtx.html", "S69")
+solution("070-climbing-stairs.html", "S70")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -172,6 +180,9 @@ parts.append("class S55Backward {\n  boolean canJump(int[] nums) {\n"
 # LeetCode 58: the trim()/lastIndexOf one-liner is a bare body.
 trimmed = blocks("058-length-of-last-word.html")[-1]
 parts.append("class S58Trim {\n  int lengthOfLastWord(String s) {\n" + trimmed + "\n  }\n}")
+
+# LeetCode 67: the XOR/AND adder, presented as a loose method.
+fragment("067-add-binary.html", -1, "S67Bits")
 
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
@@ -278,6 +289,35 @@ public class Main {
             sb.append(Arrays.toString(xs[i]));
         }
         return sb.append("]").toString();
+    }
+
+    /** Count monotone right/down paths by explicit enumeration, obstacles honoured. */
+    static int enumeratePaths(int[][] g) {
+        int m = g.length, n = g[0].length;
+        if (g[0][0] == 1 || g[m - 1][n - 1] == 1) return 0;
+        int[][] memo = new int[m][n];
+        for (int[] row : memo) Arrays.fill(row, -1);
+        return pathsFrom(g, 0, 0, memo);
+    }
+
+    static int pathsFrom(int[][] g, int r, int c, int[][] memo) {
+        int m = g.length, n = g[0].length;
+        if (r == m - 1 && c == n - 1) return 1;
+        if (memo[r][c] >= 0) return memo[r][c];
+        int total = 0;
+        if (r + 1 < m && g[r + 1][c] == 0) total += pathsFrom(g, r + 1, c, memo);
+        if (c + 1 < n && g[r][c + 1] == 0) total += pathsFrom(g, r, c + 1, memo);
+        return memo[r][c] = total;
+    }
+
+    /** Cheapest monotone path by explicit enumeration, to check the DP against. */
+    static int enumerateBest(int[][] g, int r, int c) {
+        int m = g.length, n = g[0].length;
+        if (r == m - 1 && c == n - 1) return g[r][c];
+        int best = Integer.MAX_VALUE;
+        if (r + 1 < m) best = Math.min(best, enumerateBest(g, r + 1, c));
+        if (c + 1 < n) best = Math.min(best, enumerateBest(g, r, c + 1));
+        return g[r][c] + best;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -1224,6 +1264,236 @@ public class Main {
         }
         check("agrees with split on every a/space string up to length 7", wordBad, 0);
         check("[trim/lastIndexOf] agrees on the same inputs", trimBad, 0);
+
+        System.out.println("LeetCode 62 - Unique Paths");
+        S62 s62 = new S62();
+        check("m=3 n=7", s62.uniquePaths(3, 7), 28);
+        check("m=3 n=2", s62.uniquePaths(3, 2), 3);
+        check("m=1 n=1 (already there)", s62.uniquePaths(1, 1), 1);
+        check("m=1 n=10 (a corridor)", s62.uniquePaths(1, 10), 1);
+        check("m=10 n=1 (the other corridor)", s62.uniquePaths(10, 1), 1);
+        check("m=7 n=3 (symmetric)", s62.uniquePaths(7, 3), 28);
+        // Against the closed form C(m+n-2, m-1), computed without factorials.
+        int pathBad = 0;
+        for (int m = 1; m <= 11; m++) {
+            for (int n = 1; n <= 11; n++) {
+                long binomial = 1;
+                for (int k = 1; k <= m - 1; k++) binomial = binomial * (n - 1 + k) / k;
+                if (s62.uniquePaths(m, n) != binomial) pathBad++;
+            }
+        }
+        check("matches C(m+n-2, m-1) for every grid up to 11x11", pathBad, 0);
+        check("reusable: 3x7 twice", s62.uniquePaths(3, 7) + s62.uniquePaths(3, 7), 56);
+
+        System.out.println("LeetCode 63 - Unique Paths II");
+        S63 s63 = new S63();
+        check("blocked centre",
+              s63.uniquePathsWithObstacles(new int[][]{{0,0,0},{0,1,0},{0,0,0}}), 2);
+        check("[[0,1],[0,0]]", s63.uniquePathsWithObstacles(new int[][]{{0,1},{0,0}}), 1);
+        check("[[1]] (start blocked)", s63.uniquePathsWithObstacles(new int[][]{{1}}), 0);
+        check("[[0]] (single free cell)", s63.uniquePathsWithObstacles(new int[][]{{0}}), 1);
+        check("a wall across", s63.uniquePathsWithObstacles(new int[][]{{0,0},{1,1},{0,0}}), 0);
+        check("finish blocked", s63.uniquePathsWithObstacles(new int[][]{{0,0},{0,1}}), 0);
+        check("obstacle in the top row cuts off the rest",
+              s63.uniquePathsWithObstacles(new int[][]{{0,1,0},{0,0,0}}), 1);
+        check("single-column grid with an obstacle",
+              s63.uniquePathsWithObstacles(new int[][]{{0},{1},{0}}), 0);
+        int obsBad = 0, freeBad = 0;
+        for (int m = 1; m <= 3; m++) {
+            for (int n = 1; n <= 3; n++) {
+                int[][] empty = new int[m][n];
+                if (s63.uniquePathsWithObstacles(empty) != s62.uniquePaths(m, n)) freeBad++;
+                for (int mask = 0; mask < (1 << (m * n)); mask++) {
+                    int[][] g = new int[m][n];
+                    for (int r = 0; r < m; r++)
+                        for (int c = 0; c < n; c++) g[r][c] = (mask >> (r * n + c)) & 1;
+                    int[][] copy = new int[m][];
+                    for (int r = 0; r < m; r++) copy[r] = g[r].clone();
+                    if (s63.uniquePathsWithObstacles(copy) != enumeratePaths(g)) obsBad++;
+                }
+            }
+        }
+        check("obstacle-free grids agree with problem 62", freeBad, 0);
+        check("matches path enumeration on every obstacle layout up to 3x3", obsBad, 0);
+
+        System.out.println("LeetCode 64 - Minimum Path Sum");
+        S64 s64 = new S64();
+        check("[[1,3,1],[1,5,1],[4,2,1]]",
+              s64.minPathSum(new int[][]{{1,3,1},{1,5,1},{4,2,1}}), 7);
+        check("[[1,2,3],[4,5,6]]", s64.minPathSum(new int[][]{{1,2,3},{4,5,6}}), 12);
+        check("[[5]] (start counts)", s64.minPathSum(new int[][]{{5}}), 5);
+        check("[[0]]", s64.minPathSum(new int[][]{{0}}), 0);
+        check("single row", s64.minPathSum(new int[][]{{1,2,3,4}}), 10);
+        check("single column", s64.minPathSum(new int[][]{{1},{2},{3}}), 6);
+        check("greedy counterexample from the post",
+              s64.minPathSum(new int[][]{{1,2,100},{1,100,100},{1,1,1}}), 5);
+        int sumBad = 0;
+        int[] cellValues = {0, 1, 5};
+        for (int m = 1; m <= 3; m++) {
+            for (int n = 1; n <= 3; n++) {
+                int combos = (int) Math.pow(cellValues.length, m * n);
+                for (int mask = 0; mask < combos; mask++) {
+                    int[][] g = new int[m][n];
+                    int mm = mask;
+                    for (int r = 0; r < m; r++)
+                        for (int c = 0; c < n; c++) {
+                            g[r][c] = cellValues[mm % cellValues.length];
+                            mm /= cellValues.length;
+                        }
+                    int[][] copy = new int[m][];
+                    for (int r = 0; r < m; r++) copy[r] = g[r].clone();
+                    if (s64.minPathSum(copy) != enumerateBest(g, 0, 0)) sumBad++;
+                }
+            }
+        }
+        check("matches brute-force enumeration on every grid up to 3x3 over {0,1,5}", sumBad, 0);
+
+        System.out.println("LeetCode 65 - Valid Number");
+        S65 s65 = new S65();
+        String[] validNums = {"2", "0089", "-0.1", "+3.14", "4.", "-.9", "2e10", "-90E3",
+                              "3e+7", "+6e-1", "53.5e93", "-123.456e789", "0", ".1", "1.", "46e6"};
+        String[] invalidNums = {"abc", "1a", "1e", "e3", "99e2.5", "--6", "-+3", "95a54e53",
+                                ".", "+", "", "4e+", "e", ".e1", "1e2e3", "1..2", "+-",
+                                " 1", "1 ", "1e.5", ".-4", "6+1", "1e2.5"};
+        int numBad = 0;
+        for (String t : validNums) if (!s65.isNumber(t)) { numBad++; check("valid: " + t, false, true); }
+        for (String t : invalidNums) if (s65.isNumber(t)) { numBad++; check("invalid: " + t, true, false); }
+        check("all " + (validNums.length + invalidNums.length) + " spec cases classified", numBad, 0);
+        // Against the grammar the post writes out, over generated strings.
+        java.util.regex.Pattern grammar =
+            java.util.regex.Pattern.compile("^[+-]?(([0-9]+[.]?[0-9]*)|([.][0-9]+))([eE][+-]?[0-9]+)?$");
+        char[] numAlphabet = {'0', '1', '.', 'e', 'E', '+', '-'};
+        int grammarBad = 0;
+        for (int len = 0; len <= 4; len++) {
+            int combos = (int) Math.pow(numAlphabet.length, len);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder sb = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < len; i++) { sb.append(numAlphabet[mm % numAlphabet.length]); mm /= numAlphabet.length; }
+                String t = sb.toString();
+                if (s65.isNumber(t) != grammar.matcher(t).matches()) grammarBad++;
+            }
+        }
+        check("agrees with the grammar on every string up to length 4", grammarBad, 0);
+
+        System.out.println("LeetCode 67 - Add Binary");
+        S67 s67 = new S67();
+        S67Bits s67b = new S67Bits();
+        check("11 + 1", s67.addBinary("11", "1"), "100");
+        check("1010 + 1011", s67.addBinary("1010", "1011"), "10101");
+        check("0 + 0", s67.addBinary("0", "0"), "0");
+        check("1 + 111 (carry all the way out)", s67.addBinary("1", "111"), "1000");
+        int addBad = 0, leadingZero = 0;
+        for (int x = 0; x < 64; x++)
+            for (int y = 0; y < 64; y++) {
+                String got = s67.addBinary(Integer.toBinaryString(x), Integer.toBinaryString(y));
+                if (!got.equals(Integer.toBinaryString(x + y))) addBad++;
+                if (got.length() > 1 && got.charAt(0) == '0') leadingZero++;
+            }
+        check("agrees with integer addition for all x,y in 0..63", addBad, 0);
+        check("never emits a leading zero on in-spec input", leadingZero, 0);
+        // Far beyond 64 bits -- the constraint that rules out parsing.
+        String bigOnes = "1".repeat(200);
+        check("200 ones + 1", s67.addBinary(bigOnes, "1"), "1" + "0".repeat(200));
+        check("200 ones + 200 ones", s67.addBinary(bigOnes, bigOnes),
+              new java.math.BigInteger(bigOnes, 2).add(new java.math.BigInteger(bigOnes, 2)).toString(2));
+        // The XOR/AND adder shown as the follow-up, at machine width.
+        int bitAddBad = 0;
+        for (int x = -500; x <= 500; x++)
+            for (int y = -500; y <= 500; y += 7)
+                if (s67b.add(x, y) != x + y) bitAddBad++;
+        check("[XOR/AND adder] agrees with + over a range including negatives", bitAddBad, 0);
+
+        System.out.println("LeetCode 68 - Text Justification");
+        S68 s68 = new S68();
+        check("the canonical example",
+              s68.fullJustify(new String[]{"This","is","an","example","of","text","justification."}, 16),
+              List.of("This    is    an", "example  of text", "justification.  "));
+        check("single word line is NOT stretched",
+              s68.fullJustify(new String[]{"What","must","be","acknowledgment","shall","be"}, 16),
+              List.of("What   must   be", "acknowledgment  ", "shall be        "));
+        check("one word total", s68.fullJustify(new String[]{"a"}, 5), List.of("a    "));
+        check("word exactly maxWidth", s68.fullJustify(new String[]{"abcde"}, 5), List.of("abcde"));
+        check("a single line is the LAST line, so left-justified",
+              s68.fullJustify(new String[]{"a", "b"}, 5), List.of("a b  "));
+        check("two words, spaces divide evenly",
+              s68.fullJustify(new String[]{"a", "b", "cccc"}, 5), List.of("a   b", "cccc "));
+        check("extra spaces go to the LEFT gaps",
+              s68.fullJustify(new String[]{"aa", "b", "cc", "ddddd"}, 8),
+              List.of("aa  b cc", "ddddd   "));
+        // Structural invariants over generated inputs.
+        String[] wordPool = {"a", "bb", "ccc"};
+        int justBad = 0;
+        for (int width = 4; width <= 11; width++) {
+            for (int n = 1; n <= 6; n++) {
+                int combos = (int) Math.pow(wordPool.length, n);
+                for (int mask = 0; mask < combos; mask++) {
+                    String[] ws = new String[n];
+                    int mm = mask;
+                    for (int i = 0; i < n; i++) { ws[i] = wordPool[mm % wordPool.length]; mm /= wordPool.length; }
+                    List<String> out = s68.fullJustify(ws.clone(), width);
+                    StringBuilder seen = new StringBuilder();
+                    for (int li = 0; li < out.size(); li++) {
+                        String line = out.get(li);
+                        if (line.length() != width) justBad++;
+                        if (line.startsWith(" ")) justBad++;
+                        String[] onLine = line.trim().split(" +");
+                        for (String w : onLine) seen.append(w).append(',');
+                        // Only the last line, or a one-word line, may end in a space.
+                        if (li < out.size() - 1 && line.endsWith(" ") && onLine.length > 1) justBad++;
+                    }
+                    StringBuilder expect = new StringBuilder();
+                    for (String w : ws) expect.append(w).append(',');
+                    if (!seen.toString().equals(expect.toString())) justBad++;
+                }
+            }
+        }
+        check("every line is exactly maxWidth, justified, words in order", justBad, 0);
+
+        System.out.println("LeetCode 69 - Sqrt(x)");
+        S69 s69 = new S69();
+        check("x=4", s69.mySqrt(4), 2);
+        check("x=8 (floor of 2.828)", s69.mySqrt(8), 2);
+        check("x=0", s69.mySqrt(0), 0);
+        check("x=1", s69.mySqrt(1), 1);
+        check("x=2", s69.mySqrt(2), 1);
+        check("x=2147483647 (THE overflow case)", s69.mySqrt(2147483647), 46340);
+        check("x=2147395600 (46340 squared exactly)", s69.mySqrt(2147395600), 46340);
+        int sqrtBad = 0;
+        for (int x = 0; x < 5000; x++) {
+            int r = s69.mySqrt(x);
+            if ((long) r * r > x || (long) (r + 1) * (r + 1) <= x) sqrtBad++;
+        }
+        check("r*r <= x < (r+1)*(r+1) for every x in 0..4999", sqrtBad, 0);
+        int edgeBad = 0;
+        for (int k = 1; k < 1000; k++) {
+            int sq = k * k;
+            if (s69.mySqrt(sq) != k || s69.mySqrt(sq - 1) != k - 1 || s69.mySqrt(sq + 1) != k) edgeBad++;
+        }
+        check("k*k, k*k-1 and k*k+1 for every k in 1..999", edgeBad, 0);
+        // The largest values, where mid*mid would overflow.
+        int bigBad = 0;
+        for (int x = Integer.MAX_VALUE; x > Integer.MAX_VALUE - 200; x--) {
+            int r = s69.mySqrt(x);
+            if ((long) r * r > x || (long) (r + 1) * (r + 1) <= x) bigBad++;
+        }
+        check("correct for the 200 largest int values", bigBad, 0);
+
+        System.out.println("LeetCode 70 - Climbing Stairs");
+        S70 s70 = new S70();
+        check("n=1", s70.climbStairs(1), 1);
+        check("n=2", s70.climbStairs(2), 2);
+        check("n=3", s70.climbStairs(3), 3);
+        check("n=4", s70.climbStairs(4), 5);
+        check("n=5", s70.climbStairs(5), 8);
+        check("n=45 (the constraint bound)", s70.climbStairs(45), 1836311903);
+        int stairBad = 0;
+        int fa = 1, fb = 1;
+        for (int n = 0; n <= 40; n++) {
+            if (s70.climbStairs(n) != fa) stairBad++;
+            int next = fa + fb; fa = fb; fb = next;
+        }
+        check("matches an independent Fibonacci model for n in 0..40", stairBad, 0);
 
         System.out.println();
         if (failures > 0) {
