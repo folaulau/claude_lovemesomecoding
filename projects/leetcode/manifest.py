@@ -557,6 +557,118 @@ POSTS = [
             "1 a and 11 b's collides with one that has 11 a's and 1 b."
         ),
     },
+    {
+        "number": 51,
+        "slug": "leetcode-51-n-queens",
+        "algorithm": "Recursion",
+        "title": "LeetCode 51 \u2013 N-Queens",
+        "file": "051-n-queens.html",
+        "date": "2024-09-14T22:22:32",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "backtracking", "recursion", "array"],
+        "excerpt": (
+            "The problem people point at when they say backtracking, and it collapses once you see "
+            "that every row holds exactly one queen \u2014 the board stops being a grid and becomes an "
+            "int[n]. Both diagonals in one test, why no row check is needed, and why this version "
+            "can skip the undo when the next one cannot."
+        ),
+    },
+    {
+        "number": 52,
+        "slug": "leetcode-52-n-queens-ii",
+        "algorithm": "Recursion",
+        "title": "LeetCode 52 \u2013 N-Queens II",
+        "file": "052-n-queens-ii.html",
+        "date": "2024-09-15T07:29:27",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "backtracking", "recursion"],
+        "excerpt": (
+            "The same search asked for a count instead of the boards, and calling problem 51 and "
+            "returning size() is exactly the answer it is designed to catch. Marking row - col and "
+            "row + col makes the legality test O(1), the undo becomes mandatory, and the bitmask "
+            "version is there if you are asked to go faster."
+        ),
+    },
+    {
+        "number": 53,
+        "slug": "leetcode-53-maximum-subarray",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 53 \u2013 Maximum Subarray",
+        "file": "053-maximum-subarray.html",
+        "date": "2024-09-16T15:34:44",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "dynamic-programming", "divide-and-conquer"],
+        "excerpt": (
+            "The smallest problem that is genuinely dynamic programming, and almost everyone gets "
+            "it nearly right then fails on an all-negative array. Deriving Kadane rather than "
+            "recalling it, why best = 0 is the near-miss, keeping best and endingHere distinct, and "
+            "the follow-up that asks where the subarray actually starts."
+        ),
+    },
+    {
+        "number": 55,
+        "slug": "leetcode-55-jump-game",
+        "algorithm": "Greedy",
+        "title": "LeetCode 55 \u2013 Jump Game",
+        "file": "055-jump-game.html",
+        "date": "2024-09-17T03:17:21",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "greedy", "dynamic-programming"],
+        "excerpt": (
+            "A greedy problem that spends most of its time disguised as dynamic programming. "
+            "nums[i] is a maximum, not an exact jump, which makes the reachable set a prefix with "
+            "no holes \u2014 and that is the justification the greedy needs. One variable replaces the "
+            "whole DP table, plus the backward version for when you are asked to flip it."
+        ),
+    },
+    {
+        "number": 56,
+        "slug": "leetcode-56-merge-intervals",
+        "algorithm": "Sorting",
+        "title": "LeetCode 56 \u2013 Merge Intervals",
+        "file": "056-merge-intervals.html",
+        "date": "2024-09-17T11:09:41",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "sorting", "intervals"],
+        "excerpt": (
+            "The gateway to every interval problem, carried almost entirely by one decision: sort "
+            "by start. Why that reduces overlap to a single comparison against the last output, why "
+            "the merged end must be a max, why a[0] - b[0] as a comparator is a production bug, and "
+            "when to sort by end instead."
+        ),
+    },
+    {
+        "number": 57,
+        "slug": "leetcode-57-insert-interval",
+        "algorithm": "Implementation",
+        "title": "LeetCode 57 \u2013 Insert Interval",
+        "file": "057-insert-interval.html",
+        "date": "2024-09-17T11:36:25",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "intervals", "two-pointers"],
+        "excerpt": (
+            "The list arrives sorted and non-overlapping, and re-sorting it throws away the "
+            "precondition the problem went out of its way to give you. Three sequential loops "
+            "sharing one index and no if statements, why absorbing needs a min as well as a max, "
+            "and why the binary-search refinement does not change the complexity."
+        ),
+    },
+    {
+        "number": 58,
+        "slug": "leetcode-58-length-of-last-word",
+        "algorithm": "Strings",
+        "title": "LeetCode 58 \u2013 Length of Last Word",
+        "file": "058-length-of-last-word.html",
+        "date": "2024-09-17T15:43:20",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "string", "two-pointers"],
+        "excerpt": (
+            "A warm-up, and on the list because it is one \u2014 easy problems are where interviewers "
+            "watch how you write rather than whether you can. split()[-1] is correct and allocates "
+            "the whole string to read one word. Scan backwards instead: O(1) space, and end - i "
+            "needs no plus one."
+        ),
+    },
     # Interview essentials - published out of round order, on request, because they
     # cover patterns rounds 1-4 leave out: one-pass scanning, grid BFS/DFS, bucket
     # sort, and the return-one-record-another tree recursion. `batch` groups them for

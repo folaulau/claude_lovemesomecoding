@@ -24,9 +24,12 @@ def load_fn(name, fn):
     return ns[fn]
 
 
-def load(name, extra=""):
+def load(name, extra="", only=None):
+    """`only` picks specific blocks by index, for posts that show more than one
+    complete `class Solution` -- otherwise the later one silently wins."""
     ns = {}
-    src = extra + "\n" + "\n".join(blocks(name))
+    chosen = blocks(name) if only is None else [blocks(name)[i] for i in only]
+    src = extra + "\n" + "\n".join(chosen)
     exec(compile(src, name, "exec"), ns)
     return ns["Solution"]()
 
@@ -694,6 +697,192 @@ for words in (["ab","ba","abc","cab","bca","x"], ["", "", "a"], ["aa","aa","a"])
     if grp(s.groupAnagrams(list(words))) != grp(want.values()):
         bad.append(words)
 check("grouping agrees with sorted-string equivalence", bad, [])
+
+print("LeetCode 51 - N-Queens")
+s = load("051-n-queens.html")
+def legal(board):
+    """Independent validator: re-derive the queen positions and check every pair."""
+    n = len(board)
+    pos = []
+    for r, row in enumerate(board):
+        if len(row) != n or row.count("Q") != 1 or row.count(".") != n - 1:
+            return False
+        pos.append((r, row.index("Q")))
+    for i in range(len(pos)):
+        for j in range(i + 1, len(pos)):
+            (r1, c1), (r2, c2) = pos[i], pos[j]
+            if r1 == r2 or c1 == c2 or abs(r1 - r2) == abs(c1 - c2):
+                return False
+    return True
+
+check("n=1", s.solveNQueens(1), [["Q"]])
+check("n=2 (no solutions, not an error)", s.solveNQueens(2), [])
+check("n=3 (no solutions)", s.solveNQueens(3), [])
+check("n=4 exact boards", sorted(map(tuple, s.solveNQueens(4))),
+      sorted([tuple([".Q..", "...Q", "Q...", "..Q."]),
+              tuple(["..Q.", "Q...", "...Q", ".Q.."])]))
+# The known solution counts for n = 1..9.
+COUNTS = [1, 0, 0, 2, 10, 4, 40, 92, 352]
+for n, want in enumerate(COUNTS, start=1):
+    got = s.solveNQueens(n)
+    check(f"n={n}: {want} solutions", len(got), want)
+    check(f"n={n}: every board is legal", all(legal(b) for b in got), True)
+    check(f"n={n}: all boards distinct", len({tuple(b) for b in got}), want)
+check("reusable: n=6 twice gives the same answer",
+      s.solveNQueens(6) == s.solveNQueens(6), True)
+
+print("LeetCode 52 - N-Queens II")
+s52 = load("052-n-queens-ii.html")
+for n, want in enumerate(COUNTS, start=1):
+    check(f"n={n}", s52.totalNQueens(n), want)
+check("agrees with problem 51 for n=1..8",
+      [s52.totalNQueens(n) for n in range(1, 9)],
+      [len(s.solveNQueens(n)) for n in range(1, 9)])
+# The marks must be undone: a second call on the same object must not see stale state.
+check("reusable: n=8 twice", (s52.totalNQueens(8), s52.totalNQueens(8)), (92, 92))
+
+print("LeetCode 53 - Maximum Subarray")
+s = load("053-maximum-subarray.html")
+check("[-2,1,-3,4,-1,2,1,-5,4]", s.maxSubArray([-2,1,-3,4,-1,2,1,-5,4]), 6)
+check("[1]", s.maxSubArray([1]), 1)
+check("[5,4,-1,7,8]", s.maxSubArray([5,4,-1,7,8]), 23)
+check("[-1] (single negative)", s.maxSubArray([-1]), -1)
+check("[-3,-1,-2] (ALL negative: must not return 0)", s.maxSubArray([-3,-1,-2]), -1)
+check("[-2,-1] (all negative, two elements)", s.maxSubArray([-2,-1]), -1)
+check("[0]", s.maxSubArray([0]), 0)
+check("[5,4,-1,7,8,-100] (run in progress is not the answer)",
+      s.maxSubArray([5,4,-1,7,8,-100]), 23)
+check("[-1,-2,-3,100]", s.maxSubArray([-1,-2,-3,100]), 100)
+# Brute force over every subarray, on every small array over a mixed alphabet.
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product([-2, -1, 0, 1, 3], repeat=n):
+        xs = list(combo)
+        want = max(sum(xs[i:j]) for i in range(n) for j in range(i + 1, n + 1))
+        if s.maxSubArray(list(xs)) != want:
+            bad.append((xs, want))
+check("matches brute force on every array of length 1..7 over {-2,-1,0,1,3}", bad, [])
+
+print("LeetCode 55 - Jump Game")
+s = load("055-jump-game.html")
+check("[2,3,1,1,4]", s.canJump([2,3,1,1,4]), True)
+check("[3,2,1,0,4] (index 3 is a dead end)", s.canJump([3,2,1,0,4]), False)
+check("[0] (already at the last index)", s.canJump([0]), True)
+check("[1,0]", s.canJump([1,0]), True)
+check("[0,1]", s.canJump([0,1]), False)
+check("[2,0,0]", s.canJump([2,0,0]), True)
+check("[1,1,1,1,1]", s.canJump([1,1,1,1,1]), True)
+check("[5,0,0,0,0,0]", s.canJump([5,0,0,0,0,0]), True)
+# Brute force by explicit reachability, on every small array of jump lengths.
+def reachable(xs):
+    seen, stack = {0}, [0]
+    while stack:
+        i = stack.pop()
+        for j in range(i + 1, min(i + xs[i], len(xs) - 1) + 1):
+            if j not in seen:
+                seen.add(j); stack.append(j)
+    return len(xs) - 1 in seen
+
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product([0, 1, 2, 3], repeat=n):
+        xs = list(combo)
+        if s.canJump(list(xs)) != reachable(xs):
+            bad.append(xs)
+check("matches explicit reachability on every array of length 1..7 over {0,1,2,3}", bad, [])
+
+print("LeetCode 56 - Merge Intervals")
+s = load("056-merge-intervals.html")
+def iv(r):
+    return [list(x) for x in r]
+check("[[1,3],[2,6],[8,10],[15,18]]",
+      iv(s.merge([[1,3],[2,6],[8,10],[15,18]])), [[1,6],[8,10],[15,18]])
+check("[[1,4],[4,5]] (touching merges)", iv(s.merge([[1,4],[4,5]])), [[1,5]])
+check("[[1,4],[0,4]] (unsorted input)", iv(s.merge([[1,4],[0,4]])), [[0,4]])
+check("[[1,4],[2,3]] (fully contained -- the max(end) case)",
+      iv(s.merge([[1,4],[2,3]])), [[1,4]])
+check("[[1,10],[2,3],[4,5]] (several contained)",
+      iv(s.merge([[1,10],[2,3],[4,5]])), [[1,10]])
+check("[[1,4],[5,6]] (adjacent but not touching)", iv(s.merge([[1,4],[5,6]])), [[1,4],[5,6]])
+check("[[1,4]] (single)", iv(s.merge([[1,4]])), [[1,4]])
+check("[] (empty)", iv(s.merge([])), [])
+check("[[1,1],[1,1]] (degenerate points)", iv(s.merge([[1,1],[1,1]])), [[1,1]])
+# The caller's input must survive unmutated.
+src = [[1,10],[2,3]]
+s.merge(src)
+check("does not mutate the caller's intervals", src, [[1,10],[2,3]])
+# Cross-check against a set-of-covered-points model on every small interval set.
+bad = []
+for n in range(0, 4):
+    for combo in itertools.product([(0,0),(0,2),(1,1),(1,3),(2,4),(3,3),(4,6)], repeat=n):
+        ivs = [list(x) for x in combo]
+        covered = set()
+        for a, b in combo:
+            covered |= set(range(a, b + 1))
+        got = s.merge([list(x) for x in combo])
+        out = set()
+        ok = True
+        for a, b in got:
+            if a > b or out & set(range(a, b + 1)):
+                ok = False
+            out |= set(range(a, b + 1))
+        # merged output must cover the same points, be disjoint, and not be adjacent
+        starts = [a for a, _ in got]
+        if not ok or out != covered or starts != sorted(starts):
+            bad.append((ivs, got))
+check("output covers the same points, is disjoint and sorted", bad, [])
+
+print("LeetCode 57 - Insert Interval")
+s = load("057-insert-interval.html")
+check("[[1,3],[6,9]] + [2,5]", iv(s.insert([[1,3],[6,9]], [2,5])), [[1,5],[6,9]])
+check("[[1,2],[3,5],[6,7],[8,10],[12,16]] + [4,8]",
+      iv(s.insert([[1,2],[3,5],[6,7],[8,10],[12,16]], [4,8])), [[1,2],[3,10],[12,16]])
+check("[] + [5,7]", iv(s.insert([], [5,7])), [[5,7]])
+check("[[1,5]] + [2,3] (swallowed)", iv(s.insert([[1,5]], [2,3])), [[1,5]])
+check("[[1,5]] + [6,8] (after everything)", iv(s.insert([[1,5]], [6,8])), [[1,5],[6,8]])
+check("[[1,5]] + [0,0] (before everything)", iv(s.insert([[1,5]], [0,0])), [[0,0],[1,5]])
+check("[[1,5]] + [5,7] (touching on the right merges)", iv(s.insert([[1,5]], [5,7])), [[1,7]])
+check("[[3,5]] + [1,3] (touching on the left merges)", iv(s.insert([[3,5]], [1,3])), [[1,5]])
+check("[[3,5]] + [4,8] (min() case: result starts at 3, not 4)",
+      iv(s.insert([[3,5]], [4,8])), [[3,8]])
+check("[[1,2],[3,10]] + [2,4] (running end chains)",
+      iv(s.insert([[1,2],[3,10]], [2,4])), [[1,10]])
+# Must agree with sort-then-merge, which is the correct-but-slower answer.
+merger = load("056-merge-intervals.html")
+bad = []
+for n in range(0, 5):
+    base = [[2*i, 2*i + 1] for i in range(n)]        # sorted, non-overlapping
+    for a in range(-1, 2 * n + 2):
+        for b in range(a, 2 * n + 3):
+            got = iv(s.insert([list(x) for x in base], [a, b]))
+            want = iv(merger.merge([list(x) for x in base] + [[a, b]]))
+            if got != want:
+                bad.append((base, [a, b], got, want))
+check("agrees with sort-then-merge on every insertion into a sorted list", bad, [])
+
+print("LeetCode 58 - Length of Last Word")
+one_liner = load("058-length-of-last-word.html", only=[0])   # the split() version
+s = load("058-length-of-last-word.html", only=[1])           # the backward scan
+check('"Hello World"', s.lengthOfLastWord("Hello World"), 5)
+check('"   fly me   to   the moon  " (trailing + runs of spaces)',
+      s.lengthOfLastWord("   fly me   to   the moon  "), 4)
+check('"luffy is still joyboy"', s.lengthOfLastWord("luffy is still joyboy"), 6)
+check('"a" (no space at all -- the i >= 0 guard)', s.lengthOfLastWord("a"), 1)
+check('"a "', s.lengthOfLastWord("a "), 1)
+check('"day"', s.lengthOfLastWord("day"), 3)
+check('"   day"', s.lengthOfLastWord("   day"), 3)
+check('"day   "', s.lengthOfLastWord("day   "), 3)
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product(["a", " "], repeat=n):
+        text = "".join(combo)
+        if not text.strip():
+            continue                       # the problem guarantees at least one word
+        if s.lengthOfLastWord(text) != len(text.split()[-1]):
+            bad.append(text)
+        if one_liner.lengthOfLastWord(text) != len(text.split()[-1]):
+            bad.append(("one-liner", text))
+check("both versions agree with split()[-1] on every a/space string up to length 7", bad, [])
 
 print()
 if fails:

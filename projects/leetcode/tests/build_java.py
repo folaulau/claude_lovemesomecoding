@@ -73,6 +73,13 @@ solution("043-multiply-strings.html", "S43")
 solution("046-permutations.html", "S46")
 solution("047-permutations-ii.html", "S47")
 solution("049-group-anagrams.html", "S49")
+solution("051-n-queens.html", "S51")
+solution("052-n-queens-ii.html", "S52")
+solution("053-maximum-subarray.html", "S53")
+solution("055-jump-game.html", "S55")
+solution("056-merge-intervals.html", "S56")
+solution("057-insert-interval.html", "S57")
+solution("058-length-of-last-word.html", "S58")
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -143,6 +150,29 @@ parts.append("class S46Swap {\n"
              "  void swap(int[] a, int i, int j) { int t = a[i]; a[i] = a[j]; a[j] = t; }\n"
              + swapvar + "\n}")
 
+# LeetCode 52: the bitmask variant, presented as a loose method.
+fragment("052-n-queens-ii.html", -1, "S52Bits",
+         "  int totalNQueens(int n) { return n == 0 ? 0 : place(n, 0, 0, 0); }")
+
+# LeetCode 53: the index-tracking variant is a bare loop body; wrap it and expose
+# the indices it computes so the test can check them.
+idx = blocks("053-maximum-subarray.html")[-1]
+parts.append("class S53Index {\n"
+             "  int reportedStart, reportedEnd;\n"
+             "  int maxSubArray(int[] nums) {\n"
+             + idx + "\n"
+             "    reportedStart = bestStart; reportedEnd = bestEnd;\n"
+             "    return best;\n  }\n}")
+
+# LeetCode 55: the backward greedy is a bare body.
+backward = blocks("055-jump-game.html")[-1]
+parts.append("class S55Backward {\n  boolean canJump(int[] nums) {\n"
+             + backward + "\n  }\n}")
+
+# LeetCode 58: the trim()/lastIndexOf one-liner is a bare body.
+trimmed = blocks("058-length-of-last-word.html")[-1]
+parts.append("class S58Trim {\n  int lengthOfLastWord(String s) {\n" + trimmed + "\n  }\n}")
+
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
 parts.append("class L2Brute {\n" + two[0] + "\n}")
@@ -209,6 +239,45 @@ public class Main {
         for (List<String> g : gs) { List<String> c = new ArrayList<>(g); Collections.sort(c); out.add(c.toString()); }
         Collections.sort(out);
         return out.toString();
+    }
+
+    /** Independent N-Queens validator: no two queens share a row, column or diagonal. */
+    static boolean legalBoard(List<String> board) {
+        int n = board.size();
+        int[] col = new int[n];
+        for (int r = 0; r < n; r++) {
+            String row = board.get(r);
+            if (row.length() != n || row.chars().filter(c -> c == 'Q').count() != 1) return false;
+            if (row.chars().filter(c -> c == '.').count() != n - 1) return false;
+            col[r] = row.indexOf('Q');
+        }
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+                if (col[i] == col[j] || Math.abs(i - j) == Math.abs(col[i] - col[j])) return false;
+        return true;
+    }
+
+    /** Reachability by explicit search, to check Jump Game's greedy against. */
+    static boolean reachable(int[] nums) {
+        boolean[] seen = new boolean[nums.length];
+        Deque<Integer> stack = new ArrayDeque<>();
+        seen[0] = true; stack.push(0);
+        while (!stack.isEmpty()) {
+            int i = stack.pop();
+            for (int j = i + 1; j <= Math.min(i + nums[i], nums.length - 1); j++)
+                if (!seen[j]) { seen[j] = true; stack.push(j); }
+        }
+        return seen[nums.length - 1];
+    }
+
+    /** Intervals as a comparable string, so results can be compared directly. */
+    static String ivs(int[][] xs) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < xs.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(Arrays.toString(xs[i]));
+        }
+        return sb.append("]").toString();
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -958,6 +1027,203 @@ public class Main {
         check("1a+11b must NOT group with 11a+1b", s49.groupAnagrams(new String[]{w1, w2}).size(), 2);
         check("genuine anagrams still group",
               s49.groupAnagrams(new String[]{w1, new StringBuilder(w1).reverse().toString()}).size(), 1);
+
+        System.out.println("LeetCode 51 - N-Queens");
+        S51 s51 = new S51();
+        check("n=1", s51.solveNQueens(1), List.of(List.of("Q")));
+        check("n=2 (no solutions, not an error)", s51.solveNQueens(2).size(), 0);
+        check("n=3 (no solutions)", s51.solveNQueens(3).size(), 0);
+        check("n=4 exact boards",
+              new TreeSet<>(List.of(s51.solveNQueens(4).get(0).toString(),
+                                    s51.solveNQueens(4).get(1).toString())),
+              new TreeSet<>(List.of(List.of(".Q..", "...Q", "Q...", "..Q.").toString(),
+                                    List.of("..Q.", "Q...", "...Q", ".Q..").toString())));
+        int[] queenCounts = {1, 0, 0, 2, 10, 4, 40, 92, 352};
+        for (int n = 1; n <= 9; n++) {
+            List<List<String>> nq = s51.solveNQueens(n);
+            check("n=" + n + ": " + queenCounts[n - 1] + " solutions", nq.size(), queenCounts[n - 1]);
+            boolean allLegal = true;
+            for (List<String> nqBoard : nq) if (!legalBoard(nqBoard)) allLegal = false;
+            check("n=" + n + ": every board is legal", allLegal, true);
+            check("n=" + n + ": all boards distinct", new HashSet<>(nq).size(), queenCounts[n - 1]);
+        }
+        check("reusable: n=6 twice", s51.solveNQueens(6).equals(s51.solveNQueens(6)), true);
+
+        System.out.println("LeetCode 52 - N-Queens II");
+        S52 s52 = new S52();
+        S52Bits s52b = new S52Bits();
+        for (int n = 1; n <= 9; n++) {
+            check("n=" + n, s52.totalNQueens(n), queenCounts[n - 1]);
+            check("n=" + n + ": [bitmask] agrees", s52b.totalNQueens(n), queenCounts[n - 1]);
+            check("n=" + n + ": agrees with problem 51",
+                  s52.totalNQueens(n), s51.solveNQueens(n).size());
+        }
+        // The marks are shared across branches, so a missing undo shows up here.
+        check("reusable: n=8 twice", s52.totalNQueens(8) + s52.totalNQueens(8), 184);
+
+        System.out.println("LeetCode 53 - Maximum Subarray");
+        S53 s53 = new S53();
+        S53Index s53i = new S53Index();
+        check("[-2,1,-3,4,-1,2,1,-5,4]", s53.maxSubArray(new int[]{-2,1,-3,4,-1,2,1,-5,4}), 6);
+        check("[1]", s53.maxSubArray(new int[]{1}), 1);
+        check("[5,4,-1,7,8]", s53.maxSubArray(new int[]{5,4,-1,7,8}), 23);
+        check("[-1] (single negative)", s53.maxSubArray(new int[]{-1}), -1);
+        check("[-3,-1,-2] (ALL negative: must not return 0)",
+              s53.maxSubArray(new int[]{-3,-1,-2}), -1);
+        check("[0]", s53.maxSubArray(new int[]{0}), 0);
+        check("[5,4,-1,7,8,-100] (run in progress is not the answer)",
+              s53.maxSubArray(new int[]{5,4,-1,7,8,-100}), 23);
+        check("[-1,-2,-3,100]", s53.maxSubArray(new int[]{-1,-2,-3,100}), 100);
+        check("[index variant] [-2,1,-3,4,-1,2,1,-5,4] sum",
+              s53i.maxSubArray(new int[]{-2,1,-3,4,-1,2,1,-5,4}), 6);
+        check("[index variant] ...and reports [3,6]",
+              s53i.reportedStart + "," + s53i.reportedEnd, "3,6");
+        int kadaneBad = 0, idxBad = 0;
+        int[] alphabet = {-2, -1, 0, 1, 3};
+        for (int n = 1; n <= 6; n++) {
+            int combos = (int) Math.pow(alphabet.length, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] xs = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { xs[i] = alphabet[mm % alphabet.length]; mm /= alphabet.length; }
+                int bestSum = Integer.MIN_VALUE;
+                for (int i = 0; i < n; i++) {
+                    int run = 0;
+                    for (int j = i; j < n; j++) { run += xs[j]; bestSum = Math.max(bestSum, run); }
+                }
+                if (s53.maxSubArray(xs.clone()) != bestSum) kadaneBad++;
+                S53Index fresh = new S53Index();
+                int got = fresh.maxSubArray(xs.clone());
+                int slice = 0;
+                for (int k = fresh.reportedStart; k <= fresh.reportedEnd; k++) slice += xs[k];
+                if (got != bestSum || slice != bestSum) idxBad++;   // the reported slice must sum to it
+            }
+        }
+        check("matches brute force on every array of length 1..6 over {-2,-1,0,1,3}", kadaneBad, 0);
+        check("index variant's reported slice actually sums to the answer", idxBad, 0);
+
+        System.out.println("LeetCode 55 - Jump Game");
+        S55 s55 = new S55();
+        S55Backward s55b = new S55Backward();
+        check("[2,3,1,1,4]", s55.canJump(new int[]{2,3,1,1,4}), true);
+        check("[3,2,1,0,4] (index 3 is a dead end)", s55.canJump(new int[]{3,2,1,0,4}), false);
+        check("[0] (already at the last index)", s55.canJump(new int[]{0}), true);
+        check("[1,0]", s55.canJump(new int[]{1,0}), true);
+        check("[0,1]", s55.canJump(new int[]{0,1}), false);
+        check("[2,0,0]", s55.canJump(new int[]{2,0,0}), true);
+        check("[5,0,0,0,0,0]", s55.canJump(new int[]{5,0,0,0,0,0}), true);
+        int jumpBad = 0, jumpBackBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            int combos = (int) Math.pow(4, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] xs = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { xs[i] = mm % 4; mm /= 4; }
+                boolean canReach = reachable(xs.clone());
+                if (s55.canJump(xs.clone()) != canReach) jumpBad++;
+                if (s55b.canJump(xs.clone()) != canReach) jumpBackBad++;
+            }
+        }
+        check("matches explicit reachability on every array of length 1..7 over {0,1,2,3}", jumpBad, 0);
+        check("[backward] agrees on the same inputs", jumpBackBad, 0);
+
+        System.out.println("LeetCode 56 - Merge Intervals");
+        S56 s56 = new S56();
+        check("[[1,3],[2,6],[8,10],[15,18]]",
+              ivs(s56.merge(new int[][]{{1,3},{2,6},{8,10},{15,18}})), "[[1, 6], [8, 10], [15, 18]]");
+        check("[[1,4],[4,5]] (touching merges)",
+              ivs(s56.merge(new int[][]{{1,4},{4,5}})), "[[1, 5]]");
+        check("[[1,4],[0,4]] (unsorted input)",
+              ivs(s56.merge(new int[][]{{1,4},{0,4}})), "[[0, 4]]");
+        check("[[1,4],[2,3]] (fully contained -- the max(end) case)",
+              ivs(s56.merge(new int[][]{{1,4},{2,3}})), "[[1, 4]]");
+        check("[[1,10],[2,3],[4,5]] (several contained)",
+              ivs(s56.merge(new int[][]{{1,10},{2,3},{4,5}})), "[[1, 10]]");
+        check("[[1,4],[5,6]] (adjacent but not touching)",
+              ivs(s56.merge(new int[][]{{1,4},{5,6}})), "[[1, 4], [5, 6]]");
+        check("[[1,4]] (single)", ivs(s56.merge(new int[][]{{1,4}})), "[[1, 4]]");
+        check("[] (empty)", s56.merge(new int[][]{}).length, 0);
+        // The comparator must not overflow, and the caller's arrays must survive.
+        check("extreme bounds do not overflow the comparator",
+              ivs(s56.merge(new int[][]{{Integer.MAX_VALUE - 1, Integer.MAX_VALUE},
+                                        {Integer.MIN_VALUE, Integer.MIN_VALUE + 1}})),
+              "[[" + Integer.MIN_VALUE + ", " + (Integer.MIN_VALUE + 1) + "], ["
+                   + (Integer.MAX_VALUE - 1) + ", " + Integer.MAX_VALUE + "]]");
+        int[][] src = {{1,10},{2,3}};
+        s56.merge(new int[][]{src[0].clone(), src[1].clone()});
+        int[][] src2 = {{1,10},{2,3}};
+        s56.merge(src2);
+        check("does not mutate the caller's intervals", ivs(src2), "[[1, 10], [2, 3]]");
+
+        System.out.println("LeetCode 57 - Insert Interval");
+        S57 s57 = new S57();
+        check("[[1,3],[6,9]] + [2,5]",
+              ivs(s57.insert(new int[][]{{1,3},{6,9}}, new int[]{2,5})), "[[1, 5], [6, 9]]");
+        check("[[1,2],[3,5],[6,7],[8,10],[12,16]] + [4,8]",
+              ivs(s57.insert(new int[][]{{1,2},{3,5},{6,7},{8,10},{12,16}}, new int[]{4,8})),
+              "[[1, 2], [3, 10], [12, 16]]");
+        check("[] + [5,7]", ivs(s57.insert(new int[][]{}, new int[]{5,7})), "[[5, 7]]");
+        check("[[1,5]] + [2,3] (swallowed)",
+              ivs(s57.insert(new int[][]{{1,5}}, new int[]{2,3})), "[[1, 5]]");
+        check("[[1,5]] + [6,8] (after everything)",
+              ivs(s57.insert(new int[][]{{1,5}}, new int[]{6,8})), "[[1, 5], [6, 8]]");
+        check("[[1,5]] + [0,0] (before everything)",
+              ivs(s57.insert(new int[][]{{1,5}}, new int[]{0,0})), "[[0, 0], [1, 5]]");
+        check("[[1,5]] + [5,7] (touching on the right merges)",
+              ivs(s57.insert(new int[][]{{1,5}}, new int[]{5,7})), "[[1, 7]]");
+        check("[[3,5]] + [1,3] (touching on the left merges)",
+              ivs(s57.insert(new int[][]{{3,5}}, new int[]{1,3})), "[[1, 5]]");
+        check("[[3,5]] + [4,8] (min() case: starts at 3, not 4)",
+              ivs(s57.insert(new int[][]{{3,5}}, new int[]{4,8})), "[[3, 8]]");
+        check("[[1,2],[3,10]] + [2,4] (running end chains)",
+              ivs(s57.insert(new int[][]{{1,2},{3,10}}, new int[]{2,4})), "[[1, 10]]");
+        // Must agree with the correct-but-slower append-sort-merge answer.
+        int insBad = 0;
+        for (int n = 0; n <= 4; n++) {
+            int[][] base = new int[n][];
+            for (int i = 0; i < n; i++) base[i] = new int[]{2 * i, 2 * i + 1};
+            for (int lo = -1; lo <= 2 * n + 1; lo++) {
+                for (int hi = lo; hi <= 2 * n + 2; hi++) {
+                    int[][] copy = new int[n][];
+                    for (int i = 0; i < n; i++) copy[i] = base[i].clone();
+                    String got = ivs(s57.insert(copy, new int[]{lo, hi}));
+
+                    int[][] combined = new int[n + 1][];
+                    for (int i = 0; i < n; i++) combined[i] = base[i].clone();
+                    combined[n] = new int[]{lo, hi};
+                    String viaMerge = ivs(s56.merge(combined));
+                    if (!got.equals(viaMerge)) insBad++;
+                }
+            }
+        }
+        check("agrees with sort-then-merge on every insertion into a sorted list", insBad, 0);
+
+        System.out.println("LeetCode 58 - Length of Last Word");
+        S58 s58 = new S58();
+        S58Trim s58t = new S58Trim();
+        check("Hello World", s58.lengthOfLastWord("Hello World"), 5);
+        check("trailing spaces and runs of spaces",
+              s58.lengthOfLastWord("   fly me   to   the moon  "), 4);
+        check("luffy is still joyboy", s58.lengthOfLastWord("luffy is still joyboy"), 6);
+        check("single char, no space at all (the i >= 0 guard)", s58.lengthOfLastWord("a"), 1);
+        check("a with one trailing space", s58.lengthOfLastWord("a "), 1);
+        check("day", s58.lengthOfLastWord("day"), 3);
+        check("leading spaces only", s58.lengthOfLastWord("   day"), 3);
+        int wordBad = 0, trimBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            for (int mask = 0; mask < (1 << n); mask++) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < n; i++) sb.append((mask >> i & 1) == 1 ? 'a' : ' ');
+                String text = sb.toString();
+                if (text.trim().isEmpty()) continue;   // at least one word is guaranteed
+                String[] words = text.trim().split("\\s+");
+                int lastLen = words[words.length - 1].length();
+                if (s58.lengthOfLastWord(text) != lastLen) wordBad++;
+                if (s58t.lengthOfLastWord(text) != lastLen) trimBad++;
+            }
+        }
+        check("agrees with split on every a/space string up to length 7", wordBad, 0);
+        check("[trim/lastIndexOf] agrees on the same inputs", trimBad, 0);
 
         System.out.println();
         if (failures > 0) {

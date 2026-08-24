@@ -53,7 +53,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 3 | 21–30 | 4 — 21, 22, 23, 28 | **live** since 2026-08-13 |
 | 4 | 31–40 | 6 — 31, 33, 34, 36, 39, 40 | **live** since 2026-08-14 |
 | 5 | 41–50 | 6 — 41, 42, 43, 46, 47, 49 | **live** since 2024-08/09 |
-| 6 | 51–60 | 7 — 51, 52, 53, 55, 56, 57, 58 | not started |
+| 6 | 51–60 | 7 — 51, 52, 53, 55, 56, 57, 58 | **live** since 2024-09 |
+| 7 | 61–70 | 8 — 62, 63, 64, 65, 67, 68, 69, 70 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -85,18 +86,18 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 36 posts:
+Current distribution across the 43 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Strings | 8 |
-| Implementation | 6 |
-| Recursion | 6 |
-| Sorting | 6 |
+| Strings | 9 |
+| Recursion | 8 |
+| Implementation | 7 |
+| Sorting | 7 |
 | Searching | 4 |
-| Dynamic Programming | 3 |
+| Dynamic Programming | 4 |
 | Graph Theory | 2 |
-| Greedy | 1 |
+| Greedy | 2 |
 
 Bit Manipulation, Constructive Algorithms, Game Theory and Warmup are in the taxonomy but unused so
 far — nothing published fits them.
@@ -145,8 +146,11 @@ The manifest is ordered by LeetCode number and `check_content.py` enforces that 
 and the dates ascend. A new round therefore has to be slotted into the date gap left by its numeric
 neighbours, not simply appended. Round 5 (numbers 41–49) sits between LeetCode 40
 (`2024-08-09`) and LeetCode 121 (`2024-09-18`), so its dates run `2024-08-11` to `2024-09-14`. Round
-6 (51–58) has the same gap to work with. Once the numbered rounds pass 121 the constraint disappears
-and later rounds simply take dates after `2024-12-28`.
+6 (51–58) had only the 90 hours left in that gap, so its seven dates run `2024-09-14 22:22` to
+`2024-09-17 15:43` — a tighter cluster than the rest of the track, and unavoidable while the
+interview-essentials posts hold the 121+ slots. **Round 7 has no room left at all**: re-date
+LeetCode 121 later with `--redate` before seeding it, or accept sub-hour spacing. Once the numbered
+rounds pass 121 the constraint disappears and later rounds simply take dates after `2024-12-28`.
 
 ### Changing a date after publication
 

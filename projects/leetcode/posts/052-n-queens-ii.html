@@ -1,0 +1,179 @@
+<p><a href="/fundamental-problem/leetcode-51-n-queens">N-Queens</a> asked for the boards. This one
+asks only <em>how many</em> there are. That sounds like a smaller problem — delete the rendering
+code and return a number — and the naive version of that answer is exactly what the question is
+designed to catch.</p>
+
+<h2>The problem</h2>
+
+<p>Given <code>n</code>, return the number of distinct solutions to the n-queens puzzle.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">n = 1  -&gt; 1
+n = 2  -&gt; 0
+n = 3  -&gt; 0
+n = 4  -&gt; 2
+n = 8  -&gt; 92
+n = 9  -&gt; 352</code></pre>
+
+<h2>Do not build what you are going to count</h2>
+
+<p>The tempting move is to call the previous solution and return <code>boards.size()</code>. It is
+correct, and it allocates <code>n</code> strings for every one of those 92 solutions in order to
+throw all of them away. For <code>n = 9</code> that is over three thousand strings whose only
+contribution is to be counted.</p>
+
+<p>The fix is structural, not cosmetic: make the recursion return a <strong>count</strong> rather
+than append to a list. The base case stops being "record this board" and becomes "return 1".</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">place(row) = 1                                if row == n
+           = sum over legal cols of place(row + 1)</code></pre>
+
+<p>That is the whole change, and it is the one the interviewer is looking for. Everything below is
+about making the legality test cheaper.</p>
+
+<h2>From an O(n) check to an O(1) one</h2>
+
+<p>The previous solution rescanned every placed queen to validate a square, so each placement cost
+<code>O(n)</code>. Instead, mark what is already attacked and check the marks in constant time.</p>
+
+<p>Columns are easy — one flag per column. Diagonals need a way to name them, and both have a neat
+one:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">↘ diagonal   row - col   is constant along it
+↙ diagonal   row + col   is constant along it
+
+  r-c:  0 -1 -2 -3        r+c:  0  1  2  3
+        1  0 -1 -2              1  2  3  4
+        2  1  0 -1              2  3  4  5
+        3  2  1  0              3  4  5  6</code></pre>
+
+<p>So a square is safe when its column, its <code>row - col</code> diagonal and its
+<code>row + col</code> diagonal are all unmarked. In Java <code>row - col</code> is negative half
+the time, so shift it by <code>n - 1</code> to index an array. Python skips that entirely — a set
+takes negative keys without complaint.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution {
+    public int totalNQueens(int n) {
+        // Diagonal indices run 0 .. 2n-2 after the shift, so 2n slots is enough
+        // and stays valid for n = 0 (a size 2n-1 array would throw there).
+        return place(n, 0, new boolean[n], new boolean[2 * n], new boolean[2 * n]);
+    }
+
+    private int place(int n, int row, boolean[] col, boolean[] down, boolean[] up) {
+        if (row == n) return 1;          // a full board -- count it, do not build it
+
+        int count = 0;
+        for (int c = 0; c &lt; n; c++) {
+            int d = row - c + n - 1;     // shifted so the index is never negative
+            int u = row + c;
+            if (col[c] || down[d] || up[u]) continue;
+
+            col[c] = down[d] = up[u] = true;
+            count += place(n, row + 1, col, down, up);
+            col[c] = down[d] = up[u] = false;   // the undo is mandatory here
+        }
+        return count;
+    }
+}</code></pre>
+
+<p>The undo that <a href="/fundamental-problem/leetcode-51-n-queens">N-Queens</a> could skip is
+load-bearing now. Those three arrays are shared by every branch of the search, so leaving a mark set
+after a branch returns would make later branches believe a square is attacked when it is not — and
+the symptom is an answer that is too small, with no crash and no obvious culprit.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">class Solution:
+    def totalNQueens(self, n: int) -&gt; int:
+        cols: set[int] = set()
+        down: set[int] = set()      # keyed by row - col
+        up: set[int] = set()        # keyed by row + col
+
+        def place(row: int) -&gt; int:
+            if row == n:
+                return 1
+
+            count = 0
+            for col in range(n):
+                if col in cols or row - col in down or row + col in up:
+                    continue
+
+                cols.add(col); down.add(row - col); up.add(row + col)
+                count += place(row + 1)
+                cols.remove(col); down.remove(row - col); up.remove(row + col)
+
+            return count
+
+        return place(0)</code></pre>
+
+<p>No shift, because a set is keyed by value rather than by offset and <code>-3</code> is a perfectly
+good key. This is the kind of place where reaching for the Python data structure instead of
+transliterating the Java one actually removes a bug source.</p>
+
+<h2>The bitmask version, if you are asked to go faster</h2>
+
+<p>The three boolean arrays are really three bit sets, and Java has integers. Each recursive call
+shifts the diagonal masks by one, because a diagonal that blocks column <code>c</code> on this row
+blocks <code>c ± 1</code> on the next:</p>
+
+<pre class="language-java"><code class="language-java">    private int place(int n, int cols, int down, int up) {
+        int full = (1 &lt;&lt; n) - 1;
+        if (cols == full) return 1;     // n bits set means n queens placed
+
+        int count = 0;
+        int free = ~(cols | down | up) &amp; full;
+        while (free != 0) {
+            int bit = free &amp; -free;     // lowest set bit: the next candidate column
+            free -= bit;
+            count += place(n, cols | bit, ((down | bit) &lt;&lt; 1) &amp; full, (up | bit) &gt;&gt; 1);
+        }
+        return count;
+    }</code></pre>
+
+<p><code>free &amp; -free</code> isolating the lowest set bit is the trick worth knowing; it turns
+"loop over columns and skip the blocked ones" into "loop over exactly the free ones". There is no
+<code>row</code> parameter because <code>cols</code> already encodes the depth.</p>
+
+<p>Offer this only after the readable version works. Leading with it reads as memorised, and if the
+interviewer asks you to explain the <code>&lt;&lt; 1</code> you need to be able to.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th></th><th>Time</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Rescan each placement (51)</td><td><code>O(n! · n)</code></td><td><code>O(n)</code></td></tr>
+    <tr><td>Marked columns and diagonals</td><td><code>O(n!)</code></td><td><code>O(n)</code></td></tr>
+    <tr><td>Bitmask</td><td><code>O(n!)</code></td><td><code>O(n)</code> recursion only</td></tr>
+  </tbody>
+</table>
+
+<p>All three are exponential — the marks remove a linear factor, not the factorial. What actually
+changes between them is the constant, and the constant is the entire reason <code>n = 14</code> is
+reachable and <code>n = 20</code> is not.</p>
+
+<p>The output space is the real win over problem 51: <code>O(n)</code> here against
+<code>O(n² · solutions)</code> there.</p>
+
+<h2>The symmetry you can mention but should not implement</h2>
+
+<p>Every board's mirror image is also a solution, so for <code>n &gt; 1</code> you can search only
+the first half of the columns in row 0 and double the count — with a correction when <code>n</code>
+is odd and the queen sits in the middle column. It roughly halves the work.</p>
+
+<p>Mentioning it shows you are still thinking; writing it under interview pressure invites an
+off-by-one in the odd case that costs more than it saves. Say it, then leave it.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That the recursion returns a count instead of building boards you discard.</li>
+  <li><code>row - col</code> and <code>row + col</code> as the two diagonal identities.</li>
+  <li>That you shift <code>row - col</code> before using it as a Java array index, or use a set.</li>
+  <li>That you undo all three marks — and can explain why this version cannot skip the undo when
+      <a href="/fundamental-problem/leetcode-51-n-queens">problem 51</a> could.</li>
+  <li><code>n = 2</code> and <code>n = 3</code> returning <code>0</code>, which is the answer and not
+      a failure.</li>
+  <li>That you can name a further optimisation without being tempted to write it.</li>
+</ul>
