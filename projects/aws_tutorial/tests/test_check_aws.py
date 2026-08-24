@@ -70,6 +70,10 @@ LINES = [
     ("cat f | aws s3 cp - s3://b/f", 1),
     ("aws sts get-caller-identity && aws s3 ls", 2),
     (r"""aws ec2 describe-instances --query "Reservations[].Instances[?State.Name=='running'].InstanceId" """.strip(), 1),
+    # Regression: a quoted argument containing literal newlines. Reported "No closing quotation"
+    # on a valid `aws route53 change-resource-record-sets` until _join_quoted_lines existed.
+    ("aws route53 change-resource-record-sets \\\n  --hosted-zone-id Z123 \\\n  --change-batch '{\n  \"Changes\": []\n}'", 1),
+    ("aws ec2 authorize-security-group-ingress --group-id sg-a --protocol tcp --port 5432 --source-group sg-b", 1),
 ]
 
 print("=== shell lines that must split correctly ===")

@@ -1,0 +1,177 @@
+<p>By now you know what MongoDB does. This lesson is about where to point it. The honest answer has
+two halves, and the second half is the useful one &mdash; being able to say &ldquo;not this
+one&rdquo; is worth more than another list of strengths.</p>
+
+<p>One framing to carry through: this is a decision per <strong>workload</strong>, not per company.
+Plenty of good systems run a relational database for orders and MongoDB for the content catalogue.
+That is not indecision, it is using each tool for what it is.</p>
+
+<h2>Five shapes that fit well</h2>
+
+<h3>1. Content and catalogues</h3>
+
+<p>Products, listings, articles, media libraries. The defining feature is that <strong>every item
+has a different set of attributes</strong>: a laptop has RAM and a screen size, a t-shirt has a size
+and a colour. Relationally that becomes two hundred nullable columns, an entity-attribute-value
+table nobody can query, or a JSON column &mdash; and if the answer is a JSON column, a document
+store is the honest version of the same idea.</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.products.find({ category: "laptop", "specs.ram_gb": { $gte: 16 } })</code></pre>
+
+<h3>2. User profiles, sessions and preferences</h3>
+
+<p>Anything read as a whole object, keyed by one id. The access pattern is &ldquo;give me
+everything about user X&rdquo;, which is one document and one read rather than a six-way join.
+Preferences and feature flags change shape constantly as a product evolves, and adding a field
+needs no migration. A TTL index expires sessions for free.</p>
+
+<h3>3. Events, telemetry and audit logs</h3>
+
+<p>High write volume, append-only, rarely updated, queried by time range. Time-series collections
+and TTL indexes exist for exactly this, and the aggregation pipeline does the roll-ups.</p>
+
+<p>ReelCMS records one document per playback, and the shape is the giveaway &mdash; everything
+queried alongside the timestamp lives in the metadata:</p>
+
+<pre class="language-java"><code class="language-java">public static class ViewMetadata {
+
+    @Field(targetType = FieldType.OBJECT_ID)
+    private String reelId;
+
+    @Field(targetType = FieldType.OBJECT_ID)
+    private String creatorId;
+
+    private String country;
+    private String device;
+}</code></pre>
+
+<h3>4. Real-time dashboards</h3>
+
+<p>Aggregation is strong, and <strong>change streams</strong> let a dashboard update without
+polling. The pattern that scales is to materialise an expensive result rather than recomputing it
+per request &mdash; <code>$merge</code> writes a pipeline&rsquo;s output into a collection you can
+then read in one query:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.view_events.aggregate([
+  { $match: { ts: { $gte: since } } },
+  { $group: { _id: { $dateTrunc: { date: "$ts", unit: "day" } }, views: { $sum: 1 } } },
+  { $merge: { into: "daily_views", on: "_id", whenMatched: "replace" } }
+])</code></pre>
+
+<p>Run that on a schedule and the dashboard reads <code>daily_views</code> directly. The
+alternative &mdash; aggregating thirty thousand events on every page load &mdash; works fine in
+development and stops working at exactly the moment the product succeeds.</p>
+
+<h3>5. Mobile back ends and early-stage products</h3>
+
+<p>JSON in, JSON out &mdash; no impedance mismatch between the API layer and storage. The schema
+evolves as fast as the requirements do, which matters most in the first six months of a product
+when nobody knows what the questions are yet.</p>
+
+<h2>Four where it is the wrong answer</h2>
+
+<h3>1. Money, ledgers and inventory</h3>
+
+<p>Anything where multi-record correctness is the normal case rather than the exception. MongoDB
+has had transactions since 4.0, but they are a bolt-on with a real cost, not the default mode of
+operation. A relational database was built for this and a decade of your accountants&rsquo;
+questions will be easier to answer there.</p>
+
+<h3>2. Deeply relational data</h3>
+
+<p>If the interesting questions are naturally five joins deep &mdash; which suppliers shipped parts
+used in contracts signed last quarter &mdash; you will hand-write <code>$lookup</code> chains that
+a query planner would do better and faster. Fighting the tool.</p>
+
+<h3>3. Reporting over unknown future queries</h3>
+
+<p>Document modelling rewards knowing your access patterns, because you shape documents around
+them. Ad-hoc analytics, where the next question is genuinely unknown, is where a normalised schema
+and a mature planner pay off.</p>
+
+<h3>4. A schema several teams must agree on</h3>
+
+<p>When the database <em>is</em> the contract between services, having it enforce that contract is
+a feature rather than friction. Schema validation narrows this gap but it is opt-in, per collection,
+and easy to skip.</p>
+
+<h2>A shorter way to decide</h2>
+
+<p>Six questions, and the honest answers usually settle it before you have finished the list:</p>
+
+<table>
+  <thead>
+    <tr><th>Question</th><th>MongoDB</th><th>Relational</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Do records share one fixed shape?</td><td>No &mdash; they vary</td><td>Yes</td></tr>
+    <tr><td>Do you know your top three queries?</td><td>Yes</td><td>Not yet, or all of them</td></tr>
+    <tr><td>Is most reading &ldquo;one whole thing by id&rdquo;?</td><td>Yes</td><td>No &mdash; it joins</td></tr>
+    <tr><td>Must multi-record writes be exact?</td><td>Rarely</td><td>Routinely</td></tr>
+    <tr><td>Who owns the schema contract?</td><td>The application</td><td>Several teams</td></tr>
+    <tr><td>How does it grow?</td><td>Out, across machines</td><td>Up, bigger machine</td></tr>
+  </tbody>
+</table>
+
+<p>Mostly the left column? MongoDB, comfortably. Mostly the right? Use Postgres and be happier.
+Genuinely split down the middle usually means you have two workloads, not one &mdash; which is the
+per-workload answer from the top of this lesson arriving by a different route.</p>
+
+<h2>You are not locked in either way</h2>
+
+<p>One reason this decision feels heavier than it is: people treat it as permanent. It is not, in
+either direction, and knowing the escape routes makes it easier to commit.</p>
+
+<p>Every relational database worth using now has a JSON column type, so &ldquo;we need a flexible
+attribute bag&rdquo; is not on its own a reason to move a whole system. Going the other way, a
+document store can hold normalised data with ids and joins &mdash; badly, but it works while you
+migrate.</p>
+
+<p>What genuinely does not migrate cheaply is a <strong>shard key</strong>, and a schema whose
+denormalization has spread far enough that nobody can say which copy is authoritative. Both are
+worth avoiding until you are sure, and neither is a day-one decision.</p>
+
+<h2>Two signals from your own codebase</h2>
+
+<p>Two things are worth watching once you are running, because they tell you the model has drifted
+from the workload.</p>
+
+<p><strong>You are writing joins on a hot path.</strong> One <code>$lookup</code> in a nightly
+report is fine. A <code>$lookup</code> on every page load means data that belongs together is
+stored apart &mdash; either denormalize, or accept that the shape is relational.</p>
+
+<p><strong>You are reaching for transactions routinely.</strong> An occasional one is normal. If
+most writes need one, the documents are drawn along the wrong boundaries. ReelCMS embeds its
+counters inside the reel for precisely this reason, so incrementing them is atomic without a
+session:</p>
+
+<pre class="language-java"><code class="language-java">public class ReelStats {
+    @Builder.Default
+    private long views = 0;
+    @Builder.Default
+    private long likes = 0;
+    @Builder.Default
+    private long comments = 0;
+    @Builder.Default
+    private long shares = 0;
+}</code></pre>
+
+<p>Both signals point at the schema rather than the database. That is usually where the fix is.</p>
+
+<h2>The test, one more time</h2>
+
+<p>Write down the three queries that will run on every page load. If you can, MongoDB will let you
+shape documents around them and turn your hottest read into a single lookup. If you cannot &mdash;
+if the honest answer is that you do not know yet, or that it is all of them &mdash; normalise now
+and denormalize later, once the questions have shown up.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Good fits: varied catalogues, whole-object reads, event streams, live dashboards, fast-moving
+      early products.</li>
+  <li>Bad fits: money, deeply relational data, ad-hoc reporting, cross-team schema contracts.</li>
+  <li>Choose per workload. Two databases in one system is a normal answer.</li>
+  <li>Joins on a hot path and routine transactions are both schema smells, not database
+      problems.</li>
+</ul>

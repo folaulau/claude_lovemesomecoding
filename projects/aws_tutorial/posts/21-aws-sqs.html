@@ -1,0 +1,144 @@
+<p>A queue is the simplest way to stop a slow or broken dependency from becoming a 500. The request
+handler writes a message and returns; something else does the work later. If the worker is down,
+messages wait instead of being lost.</p>
+
+<h2>Standard or FIFO</h2>
+
+<table>
+  <thead><tr><th></th><th>Standard</th><th>FIFO</th></tr></thead>
+  <tbody>
+    <tr><td>Order</td><td>Best effort</td><td>Strict, per message group</td></tr>
+    <tr><td>Delivery</td><td>At least once — duplicates happen</td><td>Exactly once, within a
+        5-minute dedup window</td></tr>
+    <tr><td>Throughput</td><td>Effectively unlimited</td><td>High, but bounded</td></tr>
+    <tr><td>Name</td><td>Anything</td><td>Must end <code>.fifo</code></td></tr>
+  </tbody>
+</table>
+
+<p>Standard unless you can name why not. FIFO's ordering is per <em>message group id</em>, not
+across the queue — which is the useful part: order per customer, per booking, per whatever, while
+different groups still process in parallel.</p>
+
+<h2>Your consumer must be idempotent</h2>
+
+<p>Standard queues are at-least-once. Not "rarely twice" — <strong>at least once, by design</strong>.
+A duplicate can arrive because the visibility timeout expired, because a delete failed, or because
+of ordinary distributed-systems reality.</p>
+
+<p>So "send the welcome email" must not send two. Give each message a business key and record what
+you have processed:</p>
+
+<pre class="language-python"><code class="language-python">def handle(message):
+    body = json.loads(message["Body"])
+    key = body["booking_id"]
+
+    # A conditional write is the whole idempotency mechanism: the second
+    # attempt fails the condition instead of doing the work again.
+    try:
+        table.put_item(
+            Item={"pk": f"PROCESSED#{key}"},
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return          # already done
+        raise
+
+    send_confirmation(body)</code></pre>
+
+<p>FIFO's exactly-once applies only within a five-minute deduplication window, so it does not
+remove this requirement either — it narrows it.</p>
+
+<h2>Visibility timeout: the setting that duplicates your work</h2>
+
+<p>When a consumer receives a message it is not deleted — it becomes <em>invisible</em> for the
+visibility timeout, default <strong>30 seconds</strong>. The consumer must delete it before that
+expires, or it returns to the queue and another consumer picks it up.</p>
+
+<p>So if your handler takes 45 seconds and the timeout is 30, every message is processed twice,
+forever. The work completes, the delete arrives too late, and the queue looks like it is
+mysteriously growing.</p>
+
+<p>Set the timeout to comfortably more than your slowest run — a common rule is six times the
+expected duration. For genuinely variable work, extend it while running instead:</p>
+
+<pre class="language-bash"><code class="language-bash">aws sqs change-message-visibility \
+  --queue-url https://sqs.us-west-2.amazonaws.com/111122223333/bookings \
+  --receipt-handle "AQEB..." \
+  --visibility-timeout 300</code></pre>
+
+<h2>Long polling</h2>
+
+<p>Short polling returns immediately, often with nothing, and you pay for the request. Long polling
+waits up to 20 seconds for a message to arrive.</p>
+
+<pre class="language-bash"><code class="language-bash">aws sqs set-queue-attributes \
+  --queue-url https://sqs.us-west-2.amazonaws.com/111122223333/bookings \
+  --attributes ReceiveMessageWaitTimeSeconds=20</code></pre>
+
+<p>This is close to free money: fewer empty receives, a much smaller bill on an idle queue, and
+lower latency, because the message is delivered the moment it lands rather than at your next poll.
+Set it to 20 on every queue you create.</p>
+
+<h2>Dead-letter queues</h2>
+
+<p>Without one, a message that always fails is retried until it expires — up to 14 days of a
+consumer crashing on the same input, and then the evidence is deleted.</p>
+
+<p>A redrive policy moves a message aside after N failures:</p>
+
+<pre class="language-bash"><code class="language-bash">aws sqs set-queue-attributes \
+  --queue-url https://sqs.us-west-2.amazonaws.com/111122223333/bookings \
+  --attributes '{"RedrivePolicy":"{\"deadLetterTargetArn\":\"arn:aws:sqs:us-west-2:111122223333:bookings-dlq\",\"maxReceiveCount\":\"5\"}"}'</code></pre>
+
+<p>Note <code>RedrivePolicy</code> is a JSON string <em>inside</em> JSON, which is why the escaping
+looks like that. It is not a mistake.</p>
+
+<p>Alarm on the DLQ's depth. A dead-letter queue nobody looks at is a folder of silent failures —
+the alarm is the point, not the queue.</p>
+
+<h2>Lambda as the consumer</h2>
+
+<p>An event source mapping polls for you and invokes your function in batches, scaling
+automatically. Two settings matter.</p>
+
+<p><strong>The visibility timeout must exceed the function timeout</strong>, and by a margin. AWS
+recommends at least six times. Get this backwards and messages are redelivered while still being
+processed.</p>
+
+<p><strong>Enable <code>ReportBatchItemFailures</code>.</strong> By default, one failure in a batch
+of ten returns all ten to the queue — including the nine that succeeded, which are then processed
+again. Reporting per-item failures returns only the ones that actually failed.</p>
+
+<h2>Delay, and scheduling work</h2>
+
+<p>Two ways to make a message arrive later. A <strong>delay queue</strong> holds every message for
+a fixed period via <code>DelaySeconds</code> on the queue. A <strong>per-message delay</strong>
+sets it on publish, which is more useful — "retry this in five minutes" without a scheduler.</p>
+
+<p>The cap on both is <strong>15 minutes</strong>. For anything longer, use EventBridge Scheduler
+or Step Functions; people routinely try to build a delayed job system on SQS and hit this wall
+after the design is finished.</p>
+
+<h2>What it costs, and why the queue is usually not the expensive part</h2>
+
+<p>SQS is billed per request, with the first million a month free, and a request covers a batch of
+up to ten messages. Batching therefore cuts your SQS bill by up to a factor of ten, and long
+polling removes the empty receives that make an idle queue cost anything at all.</p>
+
+<p>In practice the queue is rarely the line item worth optimising — the consumers are. A queue is
+one of the cheapest pieces of infrastructure AWS sells, which is part of why reaching for one
+before reaching for a stream is usually right.</p>
+
+<h2>Things that are easy to get wrong</h2>
+
+<ul>
+  <li><strong>Maximum message size is 256 KB.</strong> For anything larger, put the payload in S3
+      and send the key — the extended client library does this for you</li>
+  <li><strong>Retention defaults to 4 days</strong>, maximum 14. A consumer down over a long
+      weekend can lose messages</li>
+  <li><strong>Delete after processing, not before.</strong> Deleting on receipt turns a crash into
+      lost work</li>
+  <li><strong>A queue is not a database.</strong> You cannot query it, and reading a message to
+      check something is not free</li>
+</ul>

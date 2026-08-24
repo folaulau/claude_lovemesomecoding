@@ -1,7 +1,7 @@
 # AWS tutorial track — progress report
 
-**Status:** ✅ **STAGE 1 WRITTEN AND VERIFIED ON LOCAL** — 7 blank posts rewritten, 6,397 words
-replacing 0. Seeded to the `local` tree and built clean. **Prod is untouched, awaiting review.**
+**Status:** 🚀 **LIVE.** 34 posts on https://lovemesomecoding.com/aws — the 33 rewrites plus a new
+`aws-ecr`. Published 2026-08-25; edge verified, build `394b0bd`, 709/709 post URLs served.
 **Started:** 2026-08-24
 **Where it lands:** https://lovemesomecoding.com/aws
 
@@ -165,7 +165,7 @@ The four demo apps (`stayhub`, `pizza`, `bank`, `reelcms`) cover the app-side se
 | 2 | Dead-end services | **Rewrite in place as "this is closed — use X".** Both URLs keep serving, no redirect machinery. |
 | 3 | Post length | **Short — 4–6 reading-minutes**, ~800–1,200 words total. |
 | 4 | Scope | **Staged.** The 7 blank posts first, then the remaining 26. |
-| 5 | Dates | **Keep the stored 2018–2019 dates.** Decided here, not asked — see below. |
+| 5 | Dates | ~~Keep the stored 2018–2019 dates~~ → **re-based to 2024-2025.** Reversed on request — see below. |
 
 ### Why botocore, and what it actually proves
 
@@ -197,19 +197,31 @@ analogue of what `check_sql.py` does for the Postgres track.
 - Nothing about the console click-paths, IAM policy semantics, or CloudFormation templates.
   Templates are checked separately by parsing them and asserting required keys.
 
-### Why the dates stay
+### The dates — decided one way, then reversed
 
-All 33 posts carry stored dates from 2018-10 to 2019-09 that already ascend cleanly, and every one
-is an indexed URL. The Postgres track re-based its dates because it was a *new* track being
-authored before publication; this one is a rewrite of a published archive. Re-stamping 33 indexed
-posts buys nothing and moves 33 URLs in the sitemap at once, so `START_DATE` and `--force-dates`
-are deliberately **not** part of this track. `modified` updates on its own through `upsert_post`.
+Recorded in full because the reasoning on both sides is worth keeping.
 
-If that turns out to be wrong, it is one flag on `seed.py` to reverse.
+**Original call (mine):** keep the stored 2018-2019 dates. All 33 already ascended cleanly and
+every one is an indexed URL; re-stamping them moves 33 sitemap entries for no reader benefit. So
+`START_DATE` was omitted and `seed.py` deliberately had no `--force-dates`, with a docstring
+explaining why.
 
-### Stage 1 — the seven blanks
+**Folau asked for 2024-2025**, which is the call that matters — content describing 2026 AWS dated
+2019 reads as stale regardless of what the sitemap thinks. So:
 
-The bug worth fixing first: seven published posts serve an empty page today.
+- `manifest.py` now computes dates from `START_DATE = 2024-01-09`, `STEP_DAYS = 22`, running
+  **2024-01-09 → 2025-12-13** across all 33 posts
+- `seed.py` has `--force-dates` **back**, and it is required, not optional
+
+⚠️ **`--force-dates` is not a one-off.** `upsert_post` never overwrites an existing date and all 33
+posts already have one, so a plain seed moves nothing at all — every post silently keeps its 2019
+date while the manifest claims 2024. Pass it on every seed that changes a date, and again after any
+change to `START_DATE`. This is the same trap the FastAPI track documented, arrived at from the
+opposite direction.
+
+### Stage 1 — the seven blanks (done)
+
+The bug worth fixing first: seven published posts served an empty page.
 
 | slug | becomes |
 |---|---|
@@ -273,18 +285,89 @@ Two bugs in the tooling itself were found by using it, and both now have regress
 
 ---
 
+## Stage 2 — done
+
+The remaining 26 posts, all rewrites of live URLs. Every one clears the 880-word floor, sits at
+4-5 reading-minutes, and carries 6-10 headings.
+
+The headline: **30,445 words replacing 16,481, and 151 headings replacing 2.** Seven posts went
+from blank to ~900 words. Several went the other way and that is the point — `aws-elasticache` is
+2,184 words of AWS marketing copy replaced by 951 words that say something, and `aws-s3` went
+1,584 -> 898.
+
+### The rule that had to be replaced
+
+The Postgres track's "a rewrite must be 4x the stub" was carried over as "2x the original", and it
+is **wrong for this track** — provably so. Eight of the 26 non-blank posts cannot be twice their
+original *and* fit the 4-6 minute cap, because the original is padded marketing copy already over
+the cap. For those the correct rewrite is shorter, and a growth rule forbids the right answer.
+
+So rule 4 was rebuilt as two rules that measure what actually matters:
+
+- **4a — an absolute word floor** (880), applied to every post, blank or not. No growth
+  requirement in either direction.
+- **4b — no long verbatim run shared with the old content.** This is the real test of "did you
+  rewrite it or paste it", and it is what the defect actually looks like.
+
+Rule 4b checks against `originals/prose.json.gz` — a snapshot of all 33 original bodies taken by
+`originals/snapshot.py`, so the check does not depend on someone having run `sync-content`.
+
+Two things about how it is built were arrived at by getting them wrong first:
+
+- **It compares against ALL 33 originals, not just the post's own.** The first version compared
+  same-slug only, which passes the obvious cheat: the original `aws-lambda` marketing paragraph
+  planted into the Kinesis post sailed through, because Kinesis's own original is blank.
+- **It uses hashed 12-word shingles, not `difflib`.** SequenceMatcher across 33 x 33 bodies is
+  hundreds of millions of comparisons; shingling makes it linear and instant, and "12+ consecutive
+  shared words" *is* a shingle match. Overlapping hits merge, so one pasted paragraph is one
+  finding at its real length rather than forty near-duplicates.
+
+Verified both ways: it passes all 33 real posts, and it catches a planted 39-word paste, naming
+the post it came from.
+
+### What the checkers caught in stage 2
+
+| Finding | Reality |
+|---|---|
+| `aws ec2 authorize-security-group-ingress --protocol/--port/--source-group` rejected | The flags are real CLI shorthand. `EXTRA_FLAGS` was incomplete — confirmed against `aws ... help` and added for all four SG rule commands |
+| `aws configure --profile x` rejected | `configure` is a command group valid with no subcommand. Added `BARE_COMMAND_GROUPS` |
+| `aws codebuild update-project --privileged-mode` | **A genuine error in the post.** No such flag: `privilegedMode` nests inside `--environment`, which also replaces the whole block. Post corrected |
+| `aws route53 change-resource-record-sets --change-batch '{...}'` reported "No closing quotation" | Tokenizer bug — a quoted argument spanning newlines. Fixed with `_join_quoted_lines`, regression-tested |
+| `aws-codecommit` "does not say it is closed" | **Rule bug, and the worst kind.** The post says it in its first sentence, but the phrase wraps across a newline and the pattern wanted a literal space — a false negative on a rule whose whole job is catching a missing warning. Now matched against whitespace-collapsed text |
+| Box-drawing characters in the SNS fan-out diagram | Deliberate; added to `ALLOWED_NON_ASCII` |
+
+Total verified: **144 samples across 33 posts** — 111 CLI commands, 13 CLI customizations, 3
+waiters, 12 JSON documents, 5 YAML templates.
+
+---
+
+## Verification, end to end
+
+| Check | Result |
+|---|---|
+| `check_content.py` | all 33 pass |
+| `check_aws.py` | all 33 pass, 144 samples |
+| `tests/test_check_aws.py` | 0 false positives, 0 missed errors, 0 bad splits |
+| Seeded to `local` | 33 updates, 0 creates, archive holds 33, count 33 |
+| Dev server | all 33 URLs 200, headings anchored, Prism highlighting, no WordPress cruft |
+| Archive `/aws` | 200, 33 posts, standfirst present, ordered 2025-12-13 -> 2024-01-09 |
+| Production build | **708/708 post URLs served**, 42/42 categories, index cross-check agrees |
+
+**Prod has not been seeded.** Everything above is the `local` tree.
+
+---
+
 ## Still to do
 
-- [ ] **Stage 2 — the remaining 26 posts.** All are rewrites of live URLs; the tooling is built
-      and the pattern is set. The worst are `aws-api-gateway` (105 words), `aws-codebuild` (110),
-      `aws-cli` (122) and `aws-elasticbeanstalk` (161).
-- [ ] **Seed stage 1 to prod and deploy** — held for review. One command each, below.
-- [ ] **`/aws-table-of-content` is 28 dead WordPress links.** Not a post, so no tooling here
-      touches it. It needs either a rewrite pointing at the real `/aws/...` URLs or a redirect
-      to `/aws`, which the archive already does better. Decide before stage 2 ships.
-- [ ] **12 hotlinked images on the 26 unwritten posts** point at `docs.aws.amazon.com` and
-      `d1.awsstatic.com`. `check_content.py` rule 8 fails any post that keeps one, so this
-      resolves itself as stage 2 proceeds — noted so it is not a surprise.
+- [ ] **Seed to prod and deploy** — held for review:
+      `seed.py --env prod --write --force-dates`, then `npm run deploy` in the frontend.
+      WARNING: `--force-dates` is required or all 33 keep their 2019 dates.
+- [ ] **`/aws-table-of-content` is 28 dead WordPress links** (`/index.php?name=...`). It is a
+      page, not a post, so nothing in this track touches it. Rewrite it against the real `/aws/...`
+      URLs, or redirect it to `/aws`, which the archive already does better.
+- [ ] Consider whether the misspelled slug `aws-kms-and-ecryption` is worth a redirect. It is
+      cosmetic, it is indexed, and fixing it needs `postbuild.mjs` **plus** a CloudFront Function
+      republish. Left alone deliberately.
 
 ---
 
@@ -295,3 +378,18 @@ Two bugs in the tooling itself were found by using it, and both now have regress
   4-6 minutes, staged). Built `manifest.py`, `check_content.py`, `check_aws.py`, `seed.py` and
   `tests/test_check_aws.py`. Wrote all seven stage-1 posts. Seeded `local` only; verified in the
   dev server and through a full production build. Prod untouched.
+- **2026-08-25** — **Published to prod and deployed.** Then added `aws-ecr` — the collection
+  covered ECS and EKS but nothing on the registry both pull from. Two follow-ups from Folau on the
+  ECS post: a worked two-microservice example (two Spring Boot services, separate ports, one ALB)
+  and how they call each other over Service Connect without leaving the cluster. That put the post
+  at 7 minutes, exempted on request via the new `manifest.LENGTH_EXEMPT` table.
+  Also `/aws/aws-eks` now redirects to `/aws/aws-kubernetes-on-aws`: the post is about EKS but
+  carries the old WordPress slug, so it was effectively unfindable — which is how the gap was
+  spotted in the first place.
+  ⚠️ `originals/snapshot.py` now REFUSES to overwrite its snapshot. With the rewrites live, a
+  re-run would capture them as the "originals" and make rule 4b compare every post against itself.
+- **2026-08-24** — Stage 2: wrote the remaining 26 posts. Replaced the growth rule with the
+  word-floor + verbatim-overlap pair after proving 8 posts could not satisfy both it and the
+  length cap. Re-based every date to 2024-2025 on request, which put `--force-dates` back into
+  `seed.py`. Re-seeded all 33 to `local`; dev server and production build both clean. Prod
+  untouched, awaiting review.

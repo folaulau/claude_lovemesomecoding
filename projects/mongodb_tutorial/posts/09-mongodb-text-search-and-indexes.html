@@ -1,0 +1,181 @@
+<p>MongoDB can do full-text search without another piece of infrastructure. For a search box over a
+few hundred thousand documents that is a genuinely good answer, and it takes one index. It also has
+hard limits that you should know before you build on it, because the point where you outgrow it
+arrives sooner than people expect.</p>
+
+<h2>Creating a text index</h2>
+
+<p>A text index can cover several fields, and each field can carry a <strong>weight</strong> that
+decides how much a match there counts:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.createIndex(
+  { title: "text", tags: "text", description: "text" },
+  { weights: { title: 10, tags: 8, description: 5 }, name: "reel_text" }
+)</code></pre>
+
+<p>A hit in the title now counts twice as much as one in the description. Weights are relative and
+the absolute numbers mean nothing on their own &mdash; 10/8/5 and 100/80/50 behave identically.</p>
+
+<p>ReelCMS declares the same thing from Java:</p>
+
+<pre class="language-java"><code class="language-java">reels.createIndex(TextIndexDefinition.builder()
+        .onField("title", 10F)
+        .onField("tags", 8F)
+        .onField("description", 5F)
+        .build());</code></pre>
+
+<h2>The limit to know first</h2>
+
+<p><strong>A collection may have at most one text index.</strong> Not one per field &mdash; one in
+total. It can span as many fields as you like, but you cannot later add a second text index for a
+different field set. Attempting it fails with <code>IndexOptionsConflict</code>.</p>
+
+<p>The practical consequence: decide the full set of searchable fields up front, because changing
+it means dropping the index and rebuilding it, which on a large collection is a maintenance
+window.</p>
+
+<h2>Searching</h2>
+
+<p><code>$text</code> queries the index. It matches whole <strong>words</strong>, after stemming:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ $text: { $search: "buzzer beater" } })     // documents with EITHER word
+db.reels.find({ $text: { $search: "\"buzzer beater\"" } })  // the exact phrase
+db.reels.find({ $text: { $search: "buzzer -beater" } })     // has buzzer, NOT beater</code></pre>
+
+<p>Multiple words are ORed by default, which surprises people who expect a search box to narrow as
+they add terms. Quote a phrase to require the sequence; prefix a word with <code>-</code> to
+exclude it.</p>
+
+<p>To rank results you have to project the score explicitly and sort on it. Both halves are
+required &mdash; sorting on a field you did not project gives you an arbitrary order and no
+error:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find(
+  { $text: { $search: "fadeaway" } },
+  { score: { $meta: "textScore" }, title: 1 }
+).sort({ score: { $meta: "textScore" } })</code></pre>
+
+<h2>Stemming, and what it means for partial words</h2>
+
+<p>Text search is language-aware. With the default English analyser, <code>running</code>,
+<code>runs</code> and <code>ran</code> all reduce to the same stem, and stop words like
+<code>the</code> are dropped entirely. That is why a search for a common word returns nothing
+rather than everything.</p>
+
+<p>The consequence that actually bites: <strong>there is no prefix matching</strong>. Typing
+<code>fade</code> finds nothing at all, because <code>fade</code> is not a word in
+<code>fadeaway</code> &mdash; it is a substring of one. A search-as-you-type box built on
+<code>$text</code> stays empty until the user finishes the word.</p>
+
+<p>This is exactly why ReelCMS uses two different mechanisms. The public search uses the text index
+for relevance ranking. The admin filter, where an editor types into a box and expects the table to
+narrow immediately, uses an escaped regex instead &mdash; accepting a collection scan because an
+admin list is thousands of documents, not millions.</p>
+
+<h2>Seeing it behave</h2>
+
+<p>Those two rules &mdash; whole words only, terms ORed &mdash; are easier to trust once you have
+watched them. Run against ReelCMS&rsquo;s sixteen reels:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.countDocuments({ $text: { $search: "fadeaway" } })          // 1
+db.reels.countDocuments({ $text: { $search: "fade" } })              // 0  ← no prefix matching
+db.reels.countDocuments({ $text: { $search: "buzzer beater" } })     // 2  ← OR, not AND
+db.reels.countDocuments({ $text: { $search: "\"buzzer beater\"" } })  // 0  ← no such phrase</code></pre>
+
+<p>The second line is the one to internalise. <code>fade</code> is four letters of a word that
+exists in the collection, and it matches nothing &mdash; because the index stores stems of whole
+words, not substrings. The fourth shows the phrase form working correctly: two reels contain one of
+those words, none contains that exact sequence.</p>
+
+<p>And the one-index limit is not advisory. Adding a second text index to the same collection is
+refused outright:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.createIndex({ title: "text" })
+// MongoServerError: IndexOptionsConflict</code></pre>
+
+<h2>Language, and per-document overrides</h2>
+
+<p>The analyser is chosen per index, and it decides both the stemming rules and the stop-word
+list:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.createIndex(
+  { title: "text", description: "text" },
+  { default_language: "english", language_override: "lang" }
+)</code></pre>
+
+<p><code>language_override</code> names a <em>field</em> on each document that can specify its own
+language, which is how one collection holds content in several. A document carrying
+<code>lang: "french"</code> is stemmed with French rules; documents without the field fall back to
+the default.</p>
+
+<p>Setting <code>default_language: "none"</code> turns stemming and stop-word removal off
+entirely, so terms match literally. That is occasionally what you want for identifiers, part
+numbers or tags &mdash; and it is worth knowing exists before you conclude the index is broken
+because it will not match a product code.</p>
+
+<h2>The other constraint: sorting</h2>
+
+<p>A <code>$text</code> query cannot be combined with a sort on an unrelated field and still use
+the index efficiently. Text search always wants to sort by relevance; asking it to sort by date
+instead means MongoDB matches on the text index and then sorts the results separately.</p>
+
+<p>That trade shows up plainly in the ReelCMS implementation &mdash; when there is a search term it
+sorts by score, and only when there is not does it sort by date:</p>
+
+<pre class="language-java"><code class="language-java">if (StringUtils.hasText(q)) {
+    query.addCriteria(
+            TextCriteria.forDefaultLanguage().matchingAny(q.trim().split("\\s+")));
+    query.with(Sort.by(Sort.Direction.DESC, "score"));
+    query = query.with(pageable.getSort().isSorted() ? pageable.getSort() : Sort.unsorted());
+} else {
+    query.with(Sort.by(Sort.Direction.DESC, "publishedAt"));
+}</code></pre>
+
+<p>Note <code>matchingAny</code>: that is the OR behaviour above, made explicit in the Java API
+rather than left as a default someone has to remember.</p>
+
+<h2>When to stop and use something else</h2>
+
+<p>Native text search is the right choice while your requirements stay inside its shape. Reach for
+a dedicated search engine &mdash; Atlas Search, which embeds Lucene, or Elasticsearch &mdash; when
+you need any of:</p>
+
+<ul>
+  <li><strong>Typo tolerance.</strong> There is no fuzzy matching. A user who types
+      <code>fadaway</code> gets nothing.</li>
+  <li><strong>Autocomplete</strong> or prefix matching, per the stemming section above.</li>
+  <li><strong>Faceted search</strong> &mdash; counts per category alongside results.</li>
+  <li><strong>Synonyms</strong>, custom analysers, or per-field language settings.</li>
+  <li><strong>More than one searchable field set</strong>, which the one-index limit forbids.</li>
+</ul>
+
+<p>If you are on Atlas, Atlas Search is the natural next step rather than a second system: it runs
+alongside your data with no separate cluster to synchronise, and it removes every limitation on
+this list. Running your own Elasticsearch means keeping two datastores in step, which is a real
+ongoing cost and worth avoiding until something forces it.</p>
+
+<h2>When a search returns nothing</h2>
+
+<p>Four checks, in the order that finds the cause fastest:</p>
+
+<ol>
+  <li><strong>Is the term a whole word?</strong> Nine times out of ten this is it.</li>
+  <li><strong>Is it a stop word?</strong> <code>the</code>, <code>and</code>, <code>is</code> are
+      dropped from the index entirely, so searching for one matches nothing at all.</li>
+  <li><strong>Is the field in the index?</strong> <code>db.reels.getIndexes()</code> shows the
+      <code>weights</code> object, which is the definitive list of what is searchable.</li>
+  <li><strong>Is there a text index at all?</strong> A <code>$text</code> query against a
+      collection with none fails rather than returning nothing &mdash; which is at least a clear
+      signal.</li>
+</ol>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>One text index per collection. Total. Choose the field set carefully.</li>
+  <li>Weights make some fields count more; only their ratio matters.</li>
+  <li>Terms are ORed by default; quote for a phrase, <code>-</code> to exclude.</li>
+  <li>Ranking needs <code>$meta: "textScore"</code> both projected <em>and</em> sorted on.</li>
+  <li>Whole words only, after stemming &mdash; no prefix matching, so no search-as-you-type.</li>
+  <li>No fuzzy matching, no facets, no synonyms. When you need those, move to Atlas Search.</li>
+</ul>

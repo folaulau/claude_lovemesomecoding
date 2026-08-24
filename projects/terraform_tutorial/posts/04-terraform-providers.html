@@ -1,0 +1,172 @@
+<p>Terraform itself knows nothing about AWS. It is a language and a graph engine; everything that
+actually creates a load balancer lives in a <strong>provider</strong> — a separate plugin, versioned
+separately, released on its own schedule. Understanding that split explains most of what is
+otherwise confusing about version constraints.</p>
+
+<h2>Declaring one</h2>
+
+<pre class="language-hcl"><code class="language-hcl">terraform {
+  required_version = "&gt;= 1.10"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 6.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~&gt; 3.6"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-west-2"
+}</code></pre>
+
+<p>Two different things are happening here and they get conflated constantly:</p>
+
+<p><strong><code>required_providers</code></strong> says which plugins this configuration needs and
+which versions are acceptable. The key on the left — <code>aws</code> — is the
+<em>local name</em>, and it is what resource type prefixes bind to.</p>
+
+<p><strong><code>provider "aws"</code></strong> configures an instance of that plugin. Region,
+credentials, default tags.</p>
+
+<p><code>source</code> is a registry address. <code>hashicorp/aws</code> is shorthand for
+<code>registry.terraform.io/hashicorp/aws</code>. Omitting <code>source</code> used to default to
+the <code>hashicorp/</code> namespace, and for anything else it silently looked in the wrong place —
+always write it.</p>
+
+<h2>Version constraints</h2>
+
+<p>The operators, in the order you will reach for them:</p>
+
+<pre class="language-bash"><code class="language-bash">~&gt; 6.0      &gt;= 6.0.0, &lt; 7.0.0     allow minor and patch     <-- for providers
+~&gt; 6.61.0   &gt;= 6.61.0, &lt; 6.62.0   allow patch only
+&gt;= 1.10     any version at or above                          <-- for terraform itself
+= 6.61.0    exactly this and nothing else
+&gt;= 6.0, &lt; 6.50   both, comma-separated</code></pre>
+
+<p>⚠️ <code>~&gt;</code> is the one people misread. <strong>It lets the rightmost component you
+wrote move.</strong> <code>~&gt; 6.0</code> allows 6.61.0 because you named two components, so the
+second one floats. <code>~&gt; 6.61.0</code> allows only 6.61.x because you named three.</p>
+
+<p>The practical advice:</p>
+
+<p><strong>Providers get <code>~&gt; MAJOR.0</code>.</strong> Providers ship breaking changes in
+majors — the AWS provider's v4→v5 split of <code>aws_s3_bucket</code> into a dozen separate
+resources is the famous one, and it broke essentially every S3 example on the internet. Allowing
+7.x would let a routine <code>init -upgrade</code> rewrite what your configuration means.</p>
+
+<p><strong>Terraform itself gets <code>&gt;=</code>.</strong> Pinning the binary to one patch means
+every colleague and every CI runner must match exactly, which is friction with no safety benefit.
+Set the floor at whatever feature you actually depend on. This track says <code>&gt;= 1.10</code>
+because that is the release that added native S3 state locking, which lesson 8 uses — and an older
+Terraform reading that configuration would proceed <em>without locking</em> rather than fail.</p>
+
+<h2>The lock file</h2>
+
+<p><code>terraform init</code> writes <code>.terraform.lock.hcl</code>:</p>
+
+<pre class="language-hcl"><code class="language-hcl">provider "registry.terraform.io/hashicorp/aws" {
+  version     = "6.61.0"
+  constraints = "~&gt; 6.0"
+  hashes = [
+    "h1:hL8hHkNNo2Cnc0ycA9WEfSp8xkPnZbmfjZeVXxLQfR8=",
+    "zh:0f2e6b1e2c...",
+  ]
+}</code></pre>
+
+<p><strong>Commit this file.</strong> It is the difference between "some 6.x" and "the exact bytes we
+tested against". Your constraint says what is <em>allowed</em>; the lock file records what was
+<em>chosen</em>, so your laptop, your colleague's laptop and CI all run the same plugin.</p>
+
+<p>The <code>hashes</code> are checksums, and they are a supply-chain control: if the registry ever
+served different bytes under the same version, <code>init</code> fails instead of running it.</p>
+
+<pre class="language-bash"><code class="language-bash">terraform init                    # respects the lock file
+terraform init -upgrade           # re-resolve within the constraints, rewrite the lock
+
+# ⚠️ Run this when you add the lock file, or CI on Linux will fail.
+terraform providers lock \
+  -platform=darwin_arm64 \
+  -platform=linux_amd64</code></pre>
+
+<p>That last command is a genuine trap. The lock file records hashes <strong>per platform</strong>,
+and by default only for the platform that ran <code>init</code>. Generate it on an Apple Silicon
+Mac, commit it, and CI on Linux fails with <em>"the local package does not match any of the
+checksums recorded in the dependency lock file"</em> — which reads like a corrupted download rather
+than a missing platform.</p>
+
+<h2>Configuring the provider</h2>
+
+<pre class="language-hcl"><code class="language-hcl">provider "aws" {
+  region = "us-west-2"
+
+  # Applied to every resource this provider creates, on top of whatever tags
+  # the resource sets for itself. It is the backstop that makes a teardown
+  # query trustworthy: even a resource where someone forgot to pass tags
+  # still carries these.
+  default_tags {
+    tags = {
+      Project   = "terraform-tutorial"
+      ManagedBy = "terraform"
+    }
+  }
+}</code></pre>
+
+<p>⚠️ <strong>Do not put credentials in here.</strong> <code>access_key</code> and
+<code>secret_key</code> are real arguments and they work, and using them means your keys are in git.
+Leave them out and the provider uses the same chain the AWS CLI does: environment variables, then
+<code>~/.aws/credentials</code>, then an instance or container role. In CI, use OIDC — lesson 14.</p>
+
+<h2>Aliases: two regions at once</h2>
+
+<p>A <code>provider</code> block with an <code>alias</code> is a second configured instance of the
+same plugin:</p>
+
+<pre class="language-hcl"><code class="language-hcl">provider "aws" {
+  region = "us-west-2"
+}
+
+provider "aws" {
+  alias  = "east"
+  region = "us-east-1"
+}
+
+resource "aws_s3_bucket" "west" {
+  bucket = "example-west"
+}
+
+resource "aws_s3_bucket" "east" {
+  provider = aws.east
+  bucket   = "example-east"
+}</code></pre>
+
+<p>The un-aliased block is the default; anything without a <code>provider</code> argument uses it.
+Note the reference is <code>aws.east</code> — bare, not a string.</p>
+
+<p>This is not a nicety. <strong>ACM certificates for CloudFront must be in us-east-1</strong>, no
+matter where the rest of your infrastructure lives, and so must a handful of other global services.
+An alias is how you do that in one configuration.</p>
+
+<h2>Upgrading a provider</h2>
+
+<p>The sequence that will not surprise you:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform init -upgrade      # 1. re-resolve within the constraints
+terraform plan               # 2. READ IT. carefully.</code></pre>
+
+<p>Step 2 is the whole thing. A provider upgrade can change a default, and a changed default shows
+up as a diff on infrastructure you did not touch. Most are harmless; occasionally one is a
+<code>-/+</code> replacement on something you care about. That is why the upgrade is a deliberate
+commit with a plan attached, and not something CI does on its own.</p>
+
+<p>For a <strong>major</strong> upgrade, read the provider's upgrade guide first. They are good, they
+list every breaking change, and they usually ship a migration path.</p>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-resources-and-state">Lesson 5</a> is the state file — what it holds,
+why Terraform cannot work without it, and the commands for when it and reality disagree.</p>

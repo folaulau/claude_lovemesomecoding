@@ -1,0 +1,186 @@
+<p>Four verbs cover almost everything you will do with MongoDB: insert, find, update, delete. The
+syntax is small and you will have it in an afternoon. What takes longer is the habit that separates
+a fast collection from a slow one &mdash; <strong>updating a field rather than rewriting a
+document</strong>. That is most of this lesson.</p>
+
+<h2>Insert</h2>
+
+<p>Two methods, and the plural one is not just a convenience:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.insertOne({ slug: "half-court-heave", title: "Half-court heave", status: "DRAFT" })
+// { acknowledged: true, insertedId: ObjectId('...') }
+
+db.reels.insertMany([
+  { slug: "a", status: "DRAFT" },
+  { slug: "b", status: "DRAFT" }
+])</code></pre>
+
+<p><code>insertMany</code> sends one network round trip instead of many, which is the difference
+between seconds and minutes on a bulk load. By default it is <em>ordered</em>: it stops at the first
+failure and leaves the rest uninserted. Pass <code>{ ordered: false }</code> and it attempts every
+document, reporting the failures at the end &mdash; usually what you want when importing data where
+a few duplicates are expected.</p>
+
+<p>Remember that a collection does not need to exist first. The first insert creates it, which also
+means a typo creates a new empty collection rather than an error.</p>
+
+<h2>Find</h2>
+
+<p>An empty filter matches everything, and a filter document is an implicit AND of its fields:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({})                                     // everything
+db.reels.find({ status: "PUBLISHED" })                // equality
+db.reels.find({ status: "PUBLISHED", tags: "nba" })   // both conditions
+
+db.reels.findOne({ slug: "half-court-heave-to-end-the-third" })   // one document, or null</code></pre>
+
+<p><code>find</code> returns a <strong>cursor</strong>, not an array. The shell prints the first
+batch and offers to fetch more, but in a driver you either iterate it or call
+<code>toArray()</code>. That distinction matters: a cursor streams, so it can walk a collection
+larger than memory, while <code>toArray()</code> pulls everything at once.</p>
+
+<p>The second argument is a <strong>projection</strong> &mdash; which fields to return. Use it. On a
+collection with large documents it is the cheapest performance win available:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ status: "PUBLISHED" }, { title: 1, slug: 1 })       // these fields, plus _id
+db.reels.find({ status: "PUBLISHED" }, { title: 1, _id: 0 })        // exclude _id explicitly
+db.reels.find({}, { "video.posterUrl": 0 })                         // everything except this</code></pre>
+
+<p>You cannot mix inclusion and exclusion in one projection &mdash; the single exception is
+<code>_id</code>, which may always be excluded. Try it and MongoDB rejects the query, which is one
+of the few places it is strict.</p>
+
+<p>Sorting, skipping and limiting chain onto the cursor:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ status: "PUBLISHED" }).sort({ publishedAt: -1 }).limit(10)</code></pre>
+
+<p><code>1</code> is ascending, <code>-1</code> descending. A sort with no supporting index has to
+happen in memory and is capped at 32 MB &mdash; past that the query fails outright rather than
+slowing down. That cap is why the indexes lesson comes before the aggregation ones.</p>
+
+<h2>Update &mdash; and the habit worth forming</h2>
+
+<p>An update takes a filter and a set of <strong>update operators</strong>. The operators are the
+important part:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.updateOne(
+  { slug: "half-court-heave" },
+  { $set: { status: "PUBLISHED", publishedAt: new Date() } }
+)
+
+db.reels.updateMany({ status: "DRAFT" }, { $set: { status: "ARCHIVED" } })</code></pre>
+
+<p>Leave out the operator and you do not get an error &mdash; on <code>replaceOne</code> you get a
+document with every other field gone. That is the classic first-week accident, and the reason
+<code>updateOne</code> now rejects a plain document argument outright.</p>
+
+<p>The operators worth knowing on day one:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $set:   { title: "New title" } }        // set or create a field
+{ $unset: { scheduledFor: "" } }          // remove a field entirely
+{ $inc:   { "stats.views": 1 } }          // add to a number, atomically
+{ $push:  { tags: "clutch" } }            // append to an array
+{ $addToSet: { tags: "clutch" } }         // append only if absent
+{ $pull:  { collectionIds: someId } }     // remove matching array elements
+{ $currentDate: { updatedAt: true } }     // stamp server time</code></pre>
+
+<h3>Why $inc is not just shorthand</h3>
+
+<p>This is the point of the lesson. Counting a view could be written as read, add one, save:</p>
+
+<pre class="language-javascript" data-antipattern="true"><code class="language-javascript">// DON'T. Two operations with a gap in the middle.
+const reel = db.reels.findOne({ _id: id })
+db.reels.replaceOne({ _id: id }, { ...reel, stats: { ...reel.stats, views: reel.stats.views + 1 } })</code></pre>
+
+<p>Two things are wrong with it. It <strong>loses increments</strong>: two requests that read the
+same value both write the same value back, and one view vanishes. And it rewrites the
+<strong>entire document</strong> to change one number &mdash; on a reel carrying a description and a
+tag array, that is a lot of bytes for eight bits of information.</p>
+
+<p><code>$inc</code> has neither problem. It is applied by the server, atomically, to one field:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.updateOne({ _id: id }, { $inc: { "stats.views": 1 } })</code></pre>
+
+<p>Single-document updates are atomic in MongoDB, so no transaction is involved. This is ReelCMS
+doing exactly that from Java &mdash; note that it names one field rather than saving an object:</p>
+
+<pre class="language-java"><code class="language-java">public void incrementStat(String reelId, String statField, long delta) {
+    mongo.updateFirst(
+            Query.query(Criteria.where("_id").is(reelId)),
+            new Update().inc("stats." + statField, delta),
+            Reel.class);
+}</code></pre>
+
+<h3>Upserts</h3>
+
+<p><code>upsert: true</code> means &ldquo;update it, or insert it if it is not there&rdquo;. The
+inserted document is built from the filter plus the update:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.dailyStats.updateOne(
+  { reelId: id, day: "2025-11-05" },
+  { $inc: { views: 1 } },
+  { upsert: true }
+)</code></pre>
+
+<p>First call creates <code>{ reelId, day, views: 1 }</code>; every call after increments. That
+one line replaces a check-then-write that would have had a race in the gap. Give the filter fields
+a unique index, though &mdash; two concurrent upserts can both find nothing and both insert.</p>
+
+<h3>Getting the document back</h3>
+
+<p><code>updateOne</code> returns counts, not the document. When you need the new value &mdash; a
+counter you are about to display, or an id you just allocated &mdash;
+<code>findOneAndUpdate</code> does both in one atomic operation:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.findOneAndUpdate(
+  { _id: id },
+  { $inc: { "stats.views": 1 } },
+  { returnDocument: "after" }        // "before" is the default
+)</code></pre>
+
+<p>The default returning the <em>old</em> document surprises people, and it is the right default:
+that is what makes the method a compare-and-swap primitive. Reading the value back with a separate
+<code>findOne</code> would reintroduce exactly the race that <code>$inc</code> removed.</p>
+
+<h2>Delete</h2>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.deleteOne({ slug: "half-court-heave" })
+db.reels.deleteMany({ status: "ARCHIVED" })
+db.reels.deleteMany({})            // every document, collection survives
+db.reels.drop()                    // collection and its indexes, gone</code></pre>
+
+<p>There is <strong>no cascade</strong>. Deleting a reel does not touch the comments that reference
+it &mdash; MongoDB has no foreign keys, so cleaning up is the application&rsquo;s job. Miss it and
+you accumulate orphans that nothing will ever read and nothing will ever remove.</p>
+
+<p>Many teams never hard-delete at all, setting a <code>deletedAt</code> field instead and
+filtering it out on read. That keeps referential clean-up optional and makes an accidental delete
+recoverable.</p>
+
+<h2>Bulk writes</h2>
+
+<p>When you have a mixed batch, one <code>bulkWrite</code> beats a loop of individual calls by an
+order of magnitude, because it is one round trip:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.bulkWrite([
+  { insertOne: { document: { slug: "new-clip", status: "DRAFT" } } },
+  { updateOne: { filter: { slug: "old-clip" }, update: { $set: { status: "ARCHIVED" } } } },
+  { deleteOne: { filter: { slug: "junk" } } }
+], { ordered: false })</code></pre>
+
+<p>If you ever find yourself writing <code>for (const doc of docs) db.c.updateOne(...)</code>, this
+is what you wanted instead.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li><code>insertMany</code> is one round trip; <code>{ordered: false}</code> keeps going past a
+      failure.</li>
+  <li><code>find</code> returns a cursor. Project the fields you need.</li>
+  <li>Never mix inclusion and exclusion in a projection, except for <code>_id</code>.</li>
+  <li>An in-memory sort is capped at 32 MB and fails rather than slows.</li>
+  <li>Always update with an operator. <code>$inc</code> is atomic and touches one field; read
+      &rarr; modify &rarr; save loses writes and rewrites everything.</li>
+  <li><code>upsert: true</code> removes a race, but wants a unique index behind it.</li>
+  <li>No cascade on delete. Cleaning up references is your job.</li>
+</ul>

@@ -1,0 +1,177 @@
+<p>A computed derives a value. A <strong>watcher</strong> runs a side effect when something changes
+— fetch this, play that, start a timer, write to storage. If you want a computed that <em>does</em>
+something rather than returns something, you want a watcher.</p>
+
+<h2>watch</h2>
+
+<p>The search page is the clearest example in the demo application, because the watcher is the whole
+architecture of the page:</p>
+
+<pre class="language-javascript"><code class="language-javascript">watch(
+  () =&gt; route.query,
+  () =&gt; {
+    term.value = route.query.q ?? "";
+    load();
+  },
+  { immediate: true, deep: true }
+);</code></pre>
+
+<p>Read that with the comment above it in the source: <em>the query lives in the URL rather than in
+component state</em>. Everything that changes a filter pushes a route; the route change triggers the
+fetch. There is exactly one path to loading results, so a search cannot get out of step with the
+address bar — which is what makes a result page shareable and the back button behave.</p>
+
+<h3>The source argument</h3>
+
+<p><code>watch</code> takes what to watch, then what to do. The source can be:</p>
+
+<pre class="language-javascript"><code class="language-javascript">watch(term, (value) =&gt; { /* a ref */ });
+watch(() =&gt; route.query, () =&gt; { /* a getter */ });
+watch(() =&gt; props.active, (isActive) =&gt; { /* a getter over a prop */ });
+watch([term, page], ([t, p]) =&gt; { /* several at once */ });</code></pre>
+
+<p><strong>A getter is required for anything that is not itself a ref.</strong>
+<code>watch(route.query, ...)</code> passes the current value — a plain object — and watches nothing.
+<code>watch(() => route.query, ...)</code> passes a function Vue can re-run to check. This is the most
+common mistake with watchers and it fails silently: the callback simply never fires.</p>
+
+<h3>immediate</h3>
+
+<p>By default a watcher runs on <em>change</em>, not on setup. On a page whose watcher is the only
+thing that loads data, nothing loads until something changes — the page renders empty forever.</p>
+
+<p><code>{ immediate: true }</code> runs the callback once straight away, which is why Explore uses
+it. It is the difference between a watcher that reacts to changes and one that owns a value's whole
+lifecycle.</p>
+
+<h3>deep</h3>
+
+<p><code>{ deep: true }</code> watches nested mutations, not just replacement of the top-level value.
+Explore needs it because <code>route.query</code> is an object whose properties change.</p>
+
+<p>It is not free — a deep watcher traverses the whole structure on every check, so pointing one at a
+large array of objects has a real cost. Prefer a specific getter, <code>() => route.query.q</code>,
+when you only care about one field.</p>
+
+<h2>A watcher owning an element</h2>
+
+<p>The feed's player is the other pattern worth studying: a watcher keeping a piece of the DOM in
+step with a prop.</p>
+
+<pre class="language-javascript"><code class="language-javascript">watch(
+  () =&gt; props.active,
+  (isActive) =&gt; {
+    const el = videoEl.value;
+    if (!el) {
+      // No &lt;video&gt; at all (poster-only reel): the view still counts, because the
+      // user did look at it.
+      if (isActive) countView();
+      return;
+    }
+    if (isActive) {
+      // play() rejects if the browser blocks autoplay. Muted autoplay is allowed
+      // everywhere, which is why `muted` defaults to true - but a user who
+      // unmutes and then scrolls can still hit the block, so swallow it rather
+      // than letting an unhandled rejection surface.
+      el.play().then(() =&gt; (isPlaying.value = true)).catch(() =&gt; (isPlaying.value = false));
+      countView();
+    } else {
+      el.pause();
+      el.currentTime = 0;
+      progress.value = 0;
+      isPlaying.value = false;
+    }
+  },
+  { immediate: true }
+);</code></pre>
+
+<p>Three things there are worth stealing.</p>
+
+<p><strong><code>immediate: true</code> handles the mount case.</strong> A slide already active when
+the component appears has to start playing; without this it would sit still until the prop changed,
+which for the first slide is never.</p>
+
+<p><strong>The null check comes first.</strong> A watcher can fire before the DOM exists, and a
+poster-only reel has no <code>&lt;video&gt;</code> at all.</p>
+
+<p><strong>The rejection is swallowed deliberately, with a comment saying why.</strong>
+<code>play()</code> rejects when the browser blocks autoplay. That is expected rather than
+exceptional, and an unhandled rejection in a watcher is noise in every console.</p>
+
+<h2>watchEffect</h2>
+
+<p>The other form. Rather than declaring what to watch, you use reactive values and Vue works out the
+dependencies — the same tracking a computed uses:</p>
+
+<pre class="language-javascript"><code class="language-javascript">watchEffect(() =&gt; {
+  // Runs immediately, and again whenever `term` or `page` changes. Nothing
+  // was declared: reading them inside registered them.
+  console.log(`searching ${term.value}, page ${page.value}`);
+});</code></pre>
+
+<p>Compared with <code>watch</code>:</p>
+
+<p><strong>It always runs immediately.</strong> There is no <code>immediate</code> option because
+that is the only behaviour.</p>
+
+<p><strong>It does not give you the old value</strong>, because it does not know which dependency
+changed.</p>
+
+<p><strong>Its dependencies are implicit</strong>, which is convenient until it is not — a value read
+inside a conditional branch is only a dependency while that branch runs.</p>
+
+<p>Use <code>watchEffect</code> for a small effect over several values where you do not care which
+changed. Use <code>watch</code> when you need the previous value, want an explicit dependency list, or
+do not want it firing on setup. The demo application uses <code>watch</code> ten times and
+<code>watchEffect</code> never — being explicit ages better in a codebase someone else reads.</p>
+
+<h2>Async, and the stale response problem</h2>
+
+<p>A watcher that fetches has a race in it. Type "buzz", then "buzzer": two requests are in flight,
+and if the first returns second the UI shows results for the wrong query.</p>
+
+<p><code>onCleanup</code>, the third argument to the callback, runs before the next invocation and on
+unmount:</p>
+
+<pre class="language-javascript"><code class="language-javascript">watch(term, async (value, _old, onCleanup) =&gt; {
+  const controller = new AbortController();
+  // Called when `term` changes again, so the previous request is aborted
+  // before this one starts. No stale response can arrive last.
+  onCleanup(() =&gt; controller.abort());
+
+  const res = await fetch(`/api/reels?q=${value}`, { signal: controller.signal });
+  results.value = await res.json();
+});</code></pre>
+
+<p>Remember from lesson 5 that <strong>tracking stops at the first <code>await</code></strong>.
+Anything read after it is not a dependency, so read what you need up front.</p>
+
+<p>Debouncing solves the neighbouring problem — not the race, but the volume. Lesson 15 builds the
+composable the demo application uses for exactly this.</p>
+
+<h2>Stopping a watcher</h2>
+
+<p>A watcher created in <code>setup</code> stops automatically on unmount, which covers almost every
+case. One created asynchronously is not tied to the component and must be stopped by hand —
+<code>watch</code> returns the function that does it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const stop = watch(term, load);
+stop();   // no longer watching</code></pre>
+
+<h2>When not to reach for a watcher</h2>
+
+<p>The most common misuse is syncing one piece of state into another:</p>
+
+<pre class="language-javascript"><code class="language-javascript">// WRONG -- this is a computed wearing a watcher's clothes.
+const fullName = ref("");
+watch([first, last], () =&gt; {
+  fullName.value = `${first.value} ${last.value}`;
+});
+
+// RIGHT
+const fullName = computed(() =&gt; `${first.value} ${last.value}`);</code></pre>
+
+<p>The watcher version is more code, adds a second piece of state that can drift, and does not
+cache. If your watcher's whole body is an assignment, it should be a computed.</p>
+
+<p>Next: <a href="/vue/vue-list-rendering">Conditional and List Rendering</a>.</p>

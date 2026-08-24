@@ -1,0 +1,139 @@
+<p>The AWS CLI is how you check what is actually deployed, script anything repeatable, and answer
+questions the console makes you click through. Version 2 is the current one and the only one worth
+installing.</p>
+
+<h2>Profiles, so you never hit the wrong account</h2>
+
+<p>Credentials live in <code>~/.aws/credentials</code> and settings in <code>~/.aws/config</code>.
+Give every account a named profile and never configure a default:</p>
+
+<pre class="language-bash"><code class="language-bash">aws configure --profile folau
+aws sts get-caller-identity --profile folau</code></pre>
+
+<p>Leaving <code>[default]</code> empty is a deliberate safety measure. With no default, a command
+missing <code>--profile</code> fails asking for credentials instead of quietly running against
+whatever account happened to be configured. That is the difference between an error and an
+incident.</p>
+
+<p><code>get-caller-identity</code> is the first command to run whenever something is denied. It
+answers "who am I actually authenticated as", which is often not what you assumed.</p>
+
+<p>For an organisation, use SSO rather than long-lived keys — the credentials are short-lived and
+there is nothing on disk worth stealing:</p>
+
+<pre class="language-bash"><code class="language-bash">aws configure sso
+aws sso login --profile production</code></pre>
+
+<h2>--query turns JSON into an answer</h2>
+
+<p>Most commands return far more than you want. <code>--query</code> takes a JMESPath expression
+and runs it client-side:</p>
+
+<pre class="language-bash"><code class="language-bash"># just the ids and states, as a table
+aws ec2 describe-instances \
+  --query "Reservations[].Instances[].[InstanceId,InstanceType,State.Name]" \
+  --output table
+
+# filter inside the expression
+aws ec2 describe-instances \
+  --query "Reservations[].Instances[?State.Name=='running'].InstanceId" \
+  --output text</code></pre>
+
+<p><code>[]</code> flattens nested arrays, <code>[?…]</code> filters, and
+<code>--output text</code> gives you something you can pipe into <code>xargs</code>. Note this is
+different from a service-side <code>--filters</code>, which the API applies before sending —
+prefer <code>--filters</code> when it exists, because <code>--query</code> still transfers
+everything first.</p>
+
+<h2>Three flags that have cost this site real time</h2>
+
+<p>These are not theoretical. Each one shipped a bug on lovemesomecoding.com.</p>
+
+<h3>s3 sync skips unchanged files, so metadata never updates</h3>
+
+<p><code>aws s3 sync</code> compares size and timestamp and skips files it thinks match. That
+includes files whose <em>content</em> is identical but whose <em>metadata</em> you have changed —
+so editing <code>Cache-Control</code> in a deploy script does nothing at all to objects already in
+the bucket. The deploy succeeds, the header stays wrong, and nothing indicates a problem.</p>
+
+<p>The fix is to upload those files unconditionally rather than sync them:</p>
+
+<pre class="language-bash"><code class="language-bash">aws s3 cp ./out s3://lovemesomecoding.com --recursive \
+  --exclude "_next/static/*" \
+  --cache-control "public, max-age=0, must-revalidate"</code></pre>
+
+<h3>--exact-timestamps is load-bearing when downloading</h3>
+
+<p>Downloading, <code>sync</code> skips a same-sized object unless the S3 copy is <em>newer</em>
+than the local file. Two things break that. Small derived files change without changing size —
+<code>"count":12</code> to <code>"count":13</code> is byte-identical in length. And S3's
+timestamp is UTC while the local mtime was stamped at download time, so a fresh write can look
+older than the file it should replace.</p>
+
+<p>Together those shipped a page reading "12 tutorials" above a list of 13.</p>
+
+<pre class="language-bash"><code class="language-bash">aws s3 sync s3://my-bucket/prod/ ./content --exact-timestamps</code></pre>
+
+<p>That skips only on an exact timestamp match, so a same-sized change is always re-fetched.</p>
+
+<h3>--metadata-directive REPLACE without --content-type</h3>
+
+<p>Changing metadata on an existing object requires <code>--metadata-directive REPLACE</code>,
+which replaces <strong>all</strong> metadata — including the content type. Omit
+<code>--content-type</code> and every object becomes <code>binary/octet-stream</code>, at which
+point browsers download your HTML instead of rendering it.</p>
+
+<p>Always pass both, and never run it across mixed file types in one command.</p>
+
+<h2>Pagination is not automatic in the way you expect</h2>
+
+<p>The CLI pages through results for you and prints the whole set, which is usually what you want
+and occasionally very slow. <code>--max-items</code> limits the total returned;
+<code>--page-size</code> changes the requests made underneath without changing the result.</p>
+
+<p>If a listing command is timing out against a large account, a smaller
+<code>--page-size</code> is the fix — the default page is too large for the API to build in time.
+Increasing <code>--max-items</code> will not help.</p>
+
+<h2>Small things that pay for themselves</h2>
+
+<pre class="language-bash"><code class="language-bash"># stop the pager opening on every command
+export AWS_PAGER=""
+
+# build a valid request skeleton instead of guessing at nested JSON
+aws ecs register-task-definition --generate-cli-skeleton > task.json
+aws ecs register-task-definition --cli-input-json file://task.json
+
+# dry run: check permissions without doing anything
+aws ec2 stop-instances --instance-ids i-0abc123def456 --dry-run</code></pre>
+
+<p><code>--generate-cli-skeleton</code> is the one people discover late. For any command taking a
+deeply nested structure, it prints the exact shape expected, which beats assembling it from the
+documentation.</p>
+
+<p><code>--dry-run</code> exists on most EC2 mutating calls and reports whether you
+<em>would</em> be permitted, without acting. <code>DryRunOperation</code> means yes;
+<code>UnauthorizedOperation</code> means no.</p>
+
+<h2>Output formats</h2>
+
+<p>Four are available and each has a job. <code>json</code> is the default and the one to pipe into
+<code>jq</code>. <code>table</code> is for reading with your eyes. <code>text</code> is
+tab-separated and the one to pipe into shell tools — though note that a field containing a tab or
+an empty value will misalign your columns, so prefer <code>json</code> plus <code>jq</code> for
+anything you rely on. <code>yaml</code> exists and is rarely the answer.</p>
+
+<pre class="language-bash"><code class="language-bash">aws ec2 describe-instances \
+  --query "Reservations[].Instances[].InstanceId" --output text \
+  | xargs -n1 echo "found:"</code></pre>
+
+<p>Combining <code>--query</code> with <code>--output text</code> is the workhorse: it turns a
+listing into a list of ids you can loop over, without a JSON parser in the pipeline.</p>
+
+<h2>When output looks wrong</h2>
+
+<p>Two habits worth having. Add <code>--debug</code> to see the actual request, signature and
+response — verbose, but it answers "which region did that go to" definitively. And remember that
+<code>--region</code> beats the profile's region, which beats
+<code>AWS_DEFAULT_REGION</code>: a resource that "does not exist" is very often in a region you did
+not mean to query.</p>

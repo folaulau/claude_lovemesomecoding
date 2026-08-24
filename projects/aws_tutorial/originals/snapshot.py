@@ -7,7 +7,15 @@ needs the ORIGINAL text to compare against, so it is captured here rather than r
 content tree at check time — a check that depends on someone having run sync-content is a check
 that silently skips.
 
-Run once (or after the live posts change, which they should not):
+⚠️ RUN THIS ONCE, BEFORE THE REWRITES ARE PUBLISHED. It is now too late to re-take it.
+
+The snapshot is the "before". Once the rewrites are live in the prod tree — which they are — this
+script would read the NEW bodies and store them as the originals. Rule 4b would then compare every
+post against itself, find a 100% overlap, and fail the whole track; or worse, be "fixed" by
+lowering the threshold, at which point the check is measuring nothing.
+
+So it refuses to overwrite an existing snapshot. `--force` exists for the one legitimate case:
+starting a fresh track whose originals have genuinely not been touched yet.
 
     AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python \
         projects/aws_tutorial/originals/snapshot.py
@@ -42,12 +50,24 @@ def prose(html: str) -> str:
 
 out = {}
 for entry in manifest.POSTS:
+    # A NEW post has no "before" to snapshot — there is no live body it replaces. It is still
+    # checked against every other post's original by rule 4b, so nothing is skipped there.
+    if entry["slug"] in manifest.NEW_SLUGS:
+        continue
     path = TREE / f"{entry['slug']}.json"
     if not path.exists():
         raise SystemExit(f"{entry['slug']} is not in the content tree — is it synced to prod?")
     out[entry["slug"]] = prose(json.loads(path.read_text())["contentHtml"])
 
 dest = HERE / "prose.json.gz"
+if dest.exists() and "--force" not in sys.argv:
+    raise SystemExit(
+        f"{dest.name} already exists — refusing to overwrite.\n\n"
+        "This file is the PRE-REWRITE text of the live posts, and the rewrites are already "
+        "published. Re-taking it now would capture the new bodies as the originals, which makes "
+        "rule 4b compare every post against itself.\n\n"
+        "If you genuinely mean to re-baseline, pass --force.")
+
 with gzip.open(dest, "wt", encoding="utf-8") as fh:
     json.dump(out, fh, ensure_ascii=False, indent=0, sort_keys=True)
 

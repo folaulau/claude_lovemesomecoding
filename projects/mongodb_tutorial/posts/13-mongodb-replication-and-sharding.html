@@ -1,0 +1,163 @@
+<p>Two different words for two different problems, and they get confused constantly.
+<strong>Replication</strong> is copies of the same data for durability and availability.
+<strong>Sharding</strong> is splitting different data across machines for capacity. You will almost
+certainly need the first. You very likely do not need the second.</p>
+
+<h2>Replica sets</h2>
+
+<p>A replica set is a group of <code>mongod</code> processes holding the same data. One is the
+<strong>primary</strong> and takes every write; the others are <strong>secondaries</strong> that
+replicate from it. If the primary becomes unreachable, the remaining members hold an election and
+one is promoted, usually within a few seconds.</p>
+
+<p>Three members is the standard minimum, and the reason is arithmetic: an election needs a
+majority. With two members, losing one leaves a single node that cannot form a majority of two, so
+it steps down to a secondary and the set stops accepting writes. Two nodes are less available than
+one.</p>
+
+<pre class="language-javascript"><code class="language-javascript">rs.status()      // members, states, election history
+rs.conf()        // the configuration, including votes and priorities
+rs.hello()       // which member am I talking to, and who is primary</code></pre>
+
+<p>A member can be given <code>priority: 0</code> so it never becomes primary &mdash; useful for a
+node in another region kept for disaster recovery, or an analytics replica you do not want serving
+production traffic.</p>
+
+<h2>Configuring one</h2>
+
+<p>A set is defined once, with <code>rs.initiate()</code>, and adjusted afterwards with
+<code>rs.add()</code> and <code>rs.reconfig()</code>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">rs.initiate({
+  _id: "rs0",
+  members: [
+    { _id: 0, host: "mongo-a:27017", priority: 2 },   // preferred primary
+    { _id: 1, host: "mongo-b:27017", priority: 1 },
+    { _id: 2, host: "mongo-c:27017", priority: 0, hidden: true }   // backups only
+  ]
+})</code></pre>
+
+<p><code>priority</code> influences elections &mdash; higher wins, and <code>0</code> means never
+primary. <code>hidden</code> additionally keeps a member out of client read preference, which is
+how you dedicate a node to backups or analytics without production traffic finding it.</p>
+
+<p>You can watch a failover rather than waiting for one. <code>rs.stepDown()</code> asks the
+current primary to become a secondary and triggers an election:</p>
+
+<pre class="language-javascript"><code class="language-javascript">rs.stepDown(60)     // step down, and do not seek re-election for 60 seconds
+rs.status().members.map(m =&gt; ({ name: m.name, state: m.stateStr }))</code></pre>
+
+<p>Doing that once on a staging cluster, with your application running against it, is the cheapest
+way to find out whether your driver retries properly. Modern drivers have retryable writes on by
+default and handle it; application code that opens its own sessions often does not.</p>
+
+<h2>The oplog</h2>
+
+<p>The <strong>oplog</strong> is a capped collection in the <code>local</code> database recording
+every write in order. Secondaries tail it and apply the same operations, which is the whole
+replication mechanism.</p>
+
+<p>It is worth understanding because three other features are built on it: change streams,
+transactions, and resumable reads after a failover. A standalone server has no oplog, which is why
+none of those work without a replica set &mdash; and why this track has used one since lesson 2.</p>
+
+<pre class="language-javascript"><code class="language-javascript">rs.printReplicationInfo()      // oplog size, and how many hours it covers</code></pre>
+
+<p>That second number is the one to watch. The oplog is capped, so it holds a rolling window of
+history. A secondary offline longer than the window cannot catch up incrementally and needs a full
+resync. If your oplog covers four hours, a two-hour maintenance job on a secondary is fine and a
+six-hour one is a rebuild.</p>
+
+<h2>Reading from secondaries</h2>
+
+<p>By default every read goes to the primary, which is the safe choice. <strong>Read
+preference</strong> can send reads elsewhere:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find().readPref("primary")             // default — always current
+db.reels.find().readPref("secondaryPreferred")  // offload reads
+db.reels.find().readPref("nearest")             // lowest latency</code></pre>
+
+<p>The catch is that replication is <strong>asynchronous</strong>. A secondary is behind the
+primary by some small amount, so a read from one can miss a write you just made. That is the source
+of &ldquo;I saved it and it is not there&rdquo; bugs, and it is not a MongoDB quirk &mdash; it is
+what asynchronous replication means anywhere.</p>
+
+<p>Use secondary reads for work that tolerates staleness: analytics, exports, reports. Keep
+anything a user just wrote on the primary. Reaching for secondary reads to fix a write-throughput
+problem does not work either, because every write still goes to the primary regardless.</p>
+
+<h2>Watching replication lag</h2>
+
+<p>Lag is the number that tells you whether secondary reads are safe and whether a failover would
+lose anything. Two commands report it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">rs.printSecondaryReplicationInfo()    // per member: how far behind, in seconds
+
+db.adminCommand({ replSetGetStatus: 1 }).members.map(m =&gt; ({
+  name: m.name, state: m.stateStr, optime: m.optimeDate
+}))</code></pre>
+
+<p>A healthy set on a quiet network sits at zero to a couple of seconds. Sustained lag that grows
+means the secondary cannot keep up &mdash; usually slower disks than the primary, or an expensive
+index build running on it.</p>
+
+<p>Write concern is how you convert that from a monitoring problem into a guarantee. Asking for
+<code>majority</code> means a write is not acknowledged until enough members hold it, so it cannot
+be lost to a failover:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.insertOne(doc, { writeConcern: { w: "majority", wtimeout: 5000 } })</code></pre>
+
+<p>Always set <code>wtimeout</code> with <code>majority</code>. Without it, a write issued while
+too few members are reachable waits indefinitely rather than failing &mdash; and an indefinite wait
+inside a request handler is how one degraded node takes an application down. Note that a timeout
+does <em>not</em> roll the write back; it only stops waiting for acknowledgement.</p>
+
+<h2>Sharding, and whether you need it</h2>
+
+<p>Sharding partitions a collection across several replica sets by a <strong>shard key</strong>. A
+router process (<code>mongos</code>) sends each query to the shards that can answer it.</p>
+
+<p>You need it when a single machine genuinely cannot hold your working set or absorb your write
+rate. That threshold is much higher than most people assume &mdash; a well-indexed replica set on
+modern hardware handles a very large application. Before sharding, exhaust the cheaper options:
+better indexes, a larger machine, archiving old data, secondary reads for reporting.</p>
+
+<p>The reason for that caution is the shard key.</p>
+
+<h2>The shard key decides everything</h2>
+
+<p>The shard key determines which shard a document lives on, and it is <strong>very hard to change
+later</strong> &mdash; resharding exists in recent versions but is a major operation. A bad key
+produces one of two failures:</p>
+
+<ul>
+  <li><strong>A hotspot.</strong> A monotonically increasing key &mdash; a timestamp, or an
+      ObjectId &mdash; sends every new document to the same shard. You have bought several machines
+      and are writing to one of them.</li>
+  <li><strong>Scatter-gather everywhere.</strong> If your common queries do not include the shard
+      key, every query goes to every shard and the router merges the results. That is slower than
+      one machine would have been, and it gets slower as you add shards.</li>
+</ul>
+
+<p>So the shard key must appear in your frequent queries and must distribute writes evenly. Those
+two requirements often conflict, which is the real difficulty. Hashed sharding distributes
+perfectly and destroys range queries; a compound key is usually the compromise.</p>
+
+<p>For ReelCMS, sharding <code>reels</code> on <code>creator._id</code> would keep a
+creator&rsquo;s reels together and route their profile page to one shard &mdash; but the public
+feed, which filters only on <code>status</code>, would hit every shard. That tension is normal, and
+resolving it takes knowing which query you care about most.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Replication is copies for availability; sharding is partitions for capacity. Different
+      problems.</li>
+  <li>Three members minimum &mdash; elections need a majority, so two is worse than one.</li>
+  <li>The oplog drives replication, and change streams and transactions are built on it.</li>
+  <li>Check how many hours your oplog covers before taking a secondary offline.</li>
+  <li>Secondary reads are stale by design. Never for read-your-own-write.</li>
+  <li>Shard last, after indexes, hardware and archiving.</li>
+  <li>The shard key must be in your hot queries <em>and</em> spread writes. Getting it wrong is
+      expensive to undo.</li>
+</ul>

@@ -1,0 +1,178 @@
+<p><code>find</code> answers &ldquo;which documents match this?&rdquo;. The aggregation pipeline
+answers everything else &mdash; totals, averages, groupings, reshaping, joins. It is where a
+MongoDB application stops being a key-value store and starts being able to report on itself.</p>
+
+<p>The mental model is simple and worth getting right immediately: <strong>documents flow through
+an ordered list of stages, and each stage transforms the stream it receives</strong>. It is a Unix
+pipe, not a SQL query.</p>
+
+<h2>The shape</h2>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.aggregate([
+  { $match: { status: "PUBLISHED" } },            // filter
+  { $group: { _id: "$creator.username",           // group
+              reels: { $sum: 1 },
+              views: { $sum: "$stats.views" } } },
+  { $sort:  { views: -1 } },                      // order
+  { $limit: 5 }                                   // trim
+])</code></pre>
+
+<p>Each stage receives what the previous one produced. After <code>$group</code> the documents no
+longer look like reels at all &mdash; they are the grouped results, and only fields that survived
+the grouping exist. That is the single most common source of confusion: a
+<code>$match</code> after a <code>$group</code> can only see the grouped fields.</p>
+
+<p>Note the <code>$</code> prefix on <code>"$stats.views"</code>. Inside an aggregation, a string
+starting with <code>$</code> means &ldquo;the value of this field&rdquo;; without it, it is a
+literal string. <code>{ $sum: "stats.views" }</code> sums the literal text and returns zero.</p>
+
+<h2>$match &mdash; and why it goes first</h2>
+
+<p><code>$match</code> uses exactly the same syntax as <code>find</code>. Put it at the top of the
+pipeline whenever you can, for two reasons that both matter:</p>
+
+<ol>
+  <li>It can use an <strong>index</strong>, but only while it is still the first stage. Once
+      anything has transformed the stream, there is no index to use.</li>
+  <li>Every later stage does less work, because fewer documents reach it.</li>
+</ol>
+
+<p>The difference is not marginal. A <code>$match</code> that filters ninety percent of a
+collection makes every subsequent stage ten times cheaper &mdash; and moving it below a
+<code>$group</code> turns an index seek into a full scan.</p>
+
+<h2>$group &mdash; the one that does the work</h2>
+
+<p><code>_id</code> is the grouping key and it is required. Set it to <code>null</code> to
+aggregate everything into a single row:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $group: { _id: null, total: { $sum: "$stats.views" } } }          // one row
+{ $group: { _id: "$status", n: { $sum: 1 } } }                      // one row per status
+{ $group: { _id: { creator: "$creator.username", status: "$status" }, n: { $sum: 1 } } }  // compound key</code></pre>
+
+<p>The accumulators you will use:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $sum: 1 }                  // count
+{ $sum: "$stats.views" }     // total
+{ $avg: "$watchSeconds" }    // mean
+{ $min: "$publishedAt" }     // earliest
+{ $max: "$stats.likes" }     // largest
+{ $push: "$title" }          // every value, as an array
+{ $addToSet: "$status" }     // distinct values
+{ $first: "$title" }         // first in the current order</code></pre>
+
+<p><code>$addToSet</code> deserves a note: it is how you count distinct values, because there is no
+<code>$countDistinct</code> accumulator. Collect the set, then take its size with
+<code>$size</code> in a later stage.</p>
+
+<p>One behaviour to remember from lesson 3: <code>$sum</code> silently skips values that are not
+numeric. A single string in a numeric field makes the total quietly wrong rather than raising an
+error.</p>
+
+<h2>$unwind &mdash; grouping over an array</h2>
+
+<p>You cannot group by the elements of an array directly. <code>$unwind</code> makes it possible by
+emitting one document per element &mdash; a reel with three tags becomes three documents that are
+identical except for the tag:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.aggregate([
+  { $match: { status: "PUBLISHED" } },
+  { $unwind: "$tags" },
+  { $group: { _id: "$tags", reels: { $sum: 1 }, views: { $sum: "$stats.views" } } },
+  { $sort: { views: -1 } },
+  { $limit: 10 }
+])</code></pre>
+
+<p>That is ReelCMS&rsquo;s engagement-by-tag report, and it is the same pipeline in Java:</p>
+
+<pre class="language-java"><code class="language-java">var agg = newAggregation(
+        match(Criteria.where("status").is(ReelStatus.PUBLISHED)),
+        unwind("tags"),
+        group("tags")
+                .count()
+                .as("reels")
+                .sum("stats.views")
+                .as("views")
+                .sum("stats.likes")
+                .as("likes"),
+        sort(Sort.Direction.DESC, "views"),
+        limit(limit));</code></pre>
+
+<p>Be careful with sums after an unwind. Total views here is the sum <em>per tag</em>, so a reel
+with three tags contributes its views three times across the whole result. That is correct for
+&ldquo;views by tag&rdquo; and wrong if you read the column as a grand total &mdash; the numbers
+will not add up to the site total, and they should not.</p>
+
+<h2>$project and $addFields</h2>
+
+<p><code>$project</code> chooses fields and computes new ones. <code>$addFields</code> (and its
+identical twin <code>$set</code>) adds without removing anything, which is usually what you
+want:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $addFields: { engagement: { $divide: ["$stats.likes", { $max: ["$stats.views", 1] }] } } }
+{ $project:  { title: 1, engagement: 1, _id: 0 } }</code></pre>
+
+<p><code>$max</code> around the divisor is not decoration. Dividing by zero in an aggregation does
+not throw &mdash; it produces <code>null</code>, which then poisons any <code>$avg</code>
+downstream and gives you an empty result with no explanation. Guard every divisor that could be
+zero.</p>
+
+<h2>Getting the grouping key back</h2>
+
+<p>A detail that catches everyone: <code>$group</code> always puts the grouping key in a field
+called <code>_id</code>, whatever it was called before. Group by <code>tags</code> and the result
+has <code>_id</code>, not <code>tags</code>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $group: { _id: "$tags", views: { $sum: "$stats.views" } } }
+// → { _id: "motorsport", views: Long("5733") }
+
+{ $project: { tag: "$_id", views: 1, _id: 0 } }     // rename it back if you want
+</code></pre>
+
+<p>This matters more than it sounds, because the next stage &mdash; a <code>$lookup</code>, or a
+sort &mdash; has to refer to <code>_id</code> too.</p>
+
+<h2>Two shortcuts worth knowing</h2>
+
+<p>Counting and counting-by-something are common enough to have dedicated stages, and both are
+clearer than the <code>$group</code> they replace:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $count: "total" }             // instead of { $group: { _id: null, total: { $sum: 1 } } }
+{ $sortByCount: "$tags" }       // instead of $group by tag + $sort desc</code></pre>
+
+<p><code>$sortByCount</code> is exactly a <code>$group</code> with <code>{ $sum: 1 }</code>
+followed by a descending <code>$sort</code>, which is such a common pair that it is worth
+recognising when you read one.</p>
+
+<p>It is also worth knowing when <em>not</em> to reach for the pipeline at all.
+<code>countDocuments</code>, <code>distinct</code> and an ordinary <code>find</code> with a sort
+are simpler, and for what they do they are no slower. The pipeline earns its complexity when you
+need to group, join, reshape, or compute across documents &mdash; not when you need a filtered
+list.</p>
+
+<h2>Debugging a pipeline</h2>
+
+<p>When a pipeline returns nothing, the fastest way to find out where is to <strong>truncate
+it</strong>. Run the first stage alone, then the first two, until the results disappear:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.aggregate([{ $match: { status: "PUBLISHED" } }, { $limit: 2 }])          // 2 documents?
+db.reels.aggregate([{ $match: { status: "PUBLISHED" } }, { $unwind: "$tags" }, { $limit: 2 }])</code></pre>
+
+<p>The stage where the count drops to zero is the broken one. Two other tools help:
+<code>explain()</code> works on <code>aggregate</code> as well as <code>find</code>, and
+<code>{ allowDiskUse: true }</code> lifts the 100 MB per-stage memory limit for a genuinely large
+job &mdash; at the cost of spilling to disk, so treat needing it as a signal to add a
+<code>$match</code> rather than a flag to set by default.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Documents flow through stages, in order. Each stage sees only what the last one produced.</li>
+  <li><code>$match</code> first, always &mdash; it is the only stage that can use an index.</li>
+  <li><code>"$field"</code> means the value; <code>"field"</code> is a literal string.</li>
+  <li><code>$group</code> requires <code>_id</code>, and puts the key there whatever it was
+      called.</li>
+  <li><code>$unwind</code> lets you group by array elements, and multiplies rows while doing it.</li>
+  <li>Guard divisors &mdash; division by zero yields null and poisons the rest of the pipeline.</li>
+  <li>Truncate the pipeline to find the stage that empties it.</li>
+</ul>

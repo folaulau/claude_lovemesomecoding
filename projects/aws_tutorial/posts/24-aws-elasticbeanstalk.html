@@ -1,0 +1,139 @@
+<p>Elastic Beanstalk takes an application and gives you a running, load-balanced, auto-scaling
+environment with one command. It is AWS's oldest platform-as-a-service, it still works, and in 2026
+it is worth a clear-eyed look rather than either enthusiasm or dismissal.</p>
+
+<h2>What it actually creates</h2>
+
+<p>The important thing to understand is that Beanstalk is not a runtime. It is an orchestrator over
+ordinary AWS resources, and everything it makes is visible and editable in the console:</p>
+
+<ul>
+  <li>An Auto Scaling group of EC2 instances running your platform</li>
+  <li>An Application Load Balancer, unless you choose a single-instance environment</li>
+  <li>A security group, an instance profile and a service role</li>
+  <li>An S3 bucket for versions, and CloudWatch alarms for scaling</li>
+  <li>Optionally an RDS instance — <strong>do not use this</strong>, see below</li>
+</ul>
+
+<p>That transparency is its real advantage over a closed PaaS: nothing is hidden, and you can drop
+to the underlying resource whenever you need to.</p>
+
+<h2>Deploying</h2>
+
+<pre class="language-bash"><code class="language-bash">eb init --platform "Python 3.12" --region us-west-2
+eb create stayhub-prod --instance-types t3.small --elb-type application
+eb deploy
+eb status</code></pre>
+
+<p>The <code>eb</code> CLI is a separate tool from the AWS CLI, installed from pip. The same
+operations exist under <code>aws elasticbeanstalk</code>, which is what you script against:</p>
+
+<pre class="language-bash"><code class="language-bash">aws elasticbeanstalk describe-environments \
+  --environment-names stayhub-prod \
+  --query "Environments[].[Status,Health,VersionLabel]" --output table</code></pre>
+
+<h2>Deployment policies, and the one that serves two versions</h2>
+
+<table>
+  <thead><tr><th>Policy</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td>All at once</td><td>Fastest, and a brief outage. Fine for dev only</td></tr>
+    <tr><td>Rolling</td><td>A batch at a time. Reduced capacity during deploy</td></tr>
+    <tr><td>Rolling with additional batch</td><td>Adds instances first, so full capacity
+        throughout</td></tr>
+    <tr><td>Immutable</td><td>A whole new set of instances, then a swap. Safest, slowest</td></tr>
+    <tr><td>Blue/green</td><td>A second environment plus a CNAME swap. Manual, and the fastest
+        rollback</td></tr>
+  </tbody>
+</table>
+
+<p>Every policy except "all at once" and blue/green runs <strong>two versions of your application
+at the same time</strong> for part of the deploy. That is not a Beanstalk quirk — it is true of any
+rolling deploy — but it is where people meet it first, and it has a concrete consequence: a
+database migration that removes a column breaks the old version still serving traffic. Migrations
+have to be backwards-compatible, applied in two deploys.</p>
+
+<h2>Do not let Beanstalk create your database</h2>
+
+<p>The single most damaging default in the service. An RDS instance created inside a Beanstalk
+environment has its lifecycle tied to that environment, so <strong>terminating the environment
+deletes the database</strong>.</p>
+
+<p>Environments get terminated for ordinary reasons — a blue/green cutover, a rebuild, a cleanup of
+something that looked like staging. Create the database separately, and pass its endpoint in as an
+environment property. Then the environment is disposable, which is the whole point of it.</p>
+
+<h2>.ebextensions, and where the abstraction leaks</h2>
+
+<p>Configuration files in <code>.ebextensions/</code> run at deploy time — packages, files,
+commands, option settings:</p>
+
+<pre class="language-yaml"><code class="language-yaml">option_settings:
+  aws:elasticbeanstalk:application:environment:
+    DATABASE_URL: "postgresql://..."
+  aws:autoscaling:asg:
+    MinSize: 2
+    MaxSize: 6
+  aws:elasticbeanstalk:environment:process:default:
+    HealthCheckPath: /healthz</code></pre>
+
+<p>This is where Beanstalk stops being simple. The option-setting namespaces are a large,
+sparsely-documented surface, ordering between files is alphabetical, and a syntax error surfaces
+during deploy rather than before. Amazon Linux 2023 platforms also replaced much of the older
+<code>commands</code> mechanism with <code>.platform/</code> hooks, so a lot of the examples you
+will find no longer apply.</p>
+
+<p>A rule that saves time: put environment variables in option settings, keep everything else in
+your application or your container image. When you find yourself writing shell in
+<code>.ebextensions</code>, you have outgrown the tool.</p>
+
+<h2>Health, and why it goes grey</h2>
+
+<p>Beanstalk reports environment health as a colour, and the colours mean something specific.
+<strong>Green</strong> is fine, <strong>yellow</strong> means some requests are failing,
+<strong>red</strong> means the environment is failing, and <strong>grey</strong> means Beanstalk
+does not know — usually an update in progress, or the health agent not reporting.</p>
+
+<p>Grey is the one that confuses people, because an environment can be serving traffic perfectly
+while reporting grey. Enhanced health monitoring, which is the default on current platforms, needs
+its own IAM permissions on the service role; without them, health reporting silently degrades to
+basic and the detail disappears.</p>
+
+<pre class="language-bash"><code class="language-bash">aws elasticbeanstalk describe-environment-health \
+  --environment-name stayhub-prod --attribute-names All \
+  --query "[HealthStatus,Causes]"</code></pre>
+
+<p><code>Causes</code> is the field that actually says what is wrong, and it does not appear in the
+default console view.</p>
+
+<h2>Should you use it in 2026?</h2>
+
+<p><strong>Yes, if</strong> you want the shortest path from a zip file to a URL with a load
+balancer and autoscaling, you are one developer or a small team, and your application is a
+conventional web app on a supported platform. It is genuinely faster to get running than anything
+else AWS offers.</p>
+
+<p><strong>No, if</strong> you already have a Dockerfile. <strong>ECS on Fargate</strong> gives you
+the same outcome with no instances to patch, better tooling, and no platform-version upgrades to
+schedule. <strong>App Runner</strong> is closer still to the Beanstalk experience — point it at an
+image or a repository and it runs, scales and gives you a URL — and it is the more natural
+successor.</p>
+
+<p>Beanstalk is not deprecated and AWS keeps shipping platform updates. But it is a 2011 answer to
+a question that containers changed, and new projects rarely have a reason to choose it. Existing
+ones have no urgent reason to leave.</p>
+
+<h2>Platform versions are the ongoing cost</h2>
+
+<p>If you do stay, the recurring work is platform updates. Beanstalk platforms are versioned and
+retired on a schedule, and an environment on a retired platform stops receiving security patches —
+which is exactly the thing you adopted a managed platform to avoid.</p>
+
+<pre class="language-bash"><code class="language-bash">aws elasticbeanstalk describe-environments \
+  --environment-names stayhub-prod \
+  --query "Environments[].[PlatformArn,Status]" --output text</code></pre>
+
+<p>Managed platform updates apply minor versions automatically during a maintenance window and are
+worth enabling. Major versions are a deliberate migration, and the safe path is a blue/green swap
+into a new environment rather than an in-place update — which is also a good test of whether your
+environment really is disposable.</p>

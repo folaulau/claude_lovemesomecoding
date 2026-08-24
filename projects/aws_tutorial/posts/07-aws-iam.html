@@ -1,0 +1,177 @@
+<p>IAM is the service you get wrong first and the one that matters most. Every other AWS service
+asks IAM whether the caller is allowed to do this, so a misunderstanding here shows up as a
+confusing error somewhere else entirely.</p>
+
+<h2>The four things IAM has</h2>
+
+<table>
+  <thead><tr><th>Thing</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><strong>User</strong></td><td>A person or a long-lived credential. Has a password
+        and/or access keys</td></tr>
+    <tr><td><strong>Group</strong></td><td>A bag of users, so policies attach in one place. Groups
+        cannot be nested and cannot be a principal</td></tr>
+    <tr><td><strong>Role</strong></td><td>A set of permissions something can <em>assume</em>
+        temporarily. No password, no permanent keys</td></tr>
+    <tr><td><strong>Policy</strong></td><td>The JSON document that actually grants or denies</td></tr>
+  </tbody>
+</table>
+
+<p>The one to internalise is <strong>role</strong>. A role issues short-lived credentials that
+rotate automatically, and it is how a Lambda, an EC2 instance, a container or a CI pipeline should
+get access. If your code holds an access key, replace it with a role — that is the single highest
+-value security change most projects can make.</p>
+
+<h2>A policy, part by part</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadContentObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::my-content-bucket/lovemesomecoding/*",
+      "Condition": {
+        "StringEquals": { "aws:PrincipalTag/team": "content" }
+      }
+    }
+  ]
+}</code></pre>
+
+<ul>
+  <li><strong><code>Version</code></strong> — always <code>2012-10-17</code>. It is a policy
+      language version, not a date you chose. The older <code>2008-10-17</code> silently disables
+      policy variables</li>
+  <li><strong><code>Effect</code></strong> — <code>Allow</code> or <code>Deny</code></li>
+  <li><strong><code>Action</code></strong> — service-prefixed operations. Wildcards allowed:
+      <code>s3:Get*</code></li>
+  <li><strong><code>Resource</code></strong> — ARNs. The trailing <code>/*</code> matters
+      enormously; see below</li>
+  <li><strong><code>Condition</code></strong> — where least privilege actually gets expressed</li>
+</ul>
+
+<h2>The bucket-versus-objects trap</h2>
+
+<p>These two ARNs are different resources and neither implies the other:</p>
+
+<ul>
+  <li><code>arn:aws:s3:::my-bucket</code> — the bucket. <code>s3:ListBucket</code> acts on this</li>
+  <li><code>arn:aws:s3:::my-bucket/*</code> — the objects. <code>s3:GetObject</code> acts on
+      these</li>
+</ul>
+
+<p>Grant <code>GetObject</code> on the bucket ARN without the <code>/*</code> and every read is
+denied, with a message that says access denied and not "you named the wrong resource". A policy
+needing both operations needs two statements.</p>
+
+<h2>Identity policies and resource policies</h2>
+
+<p>There are two places a permission can live, and an S3 bucket routinely needs both.</p>
+
+<p>An <strong>identity policy</strong> attaches to a user, group or role: "this principal may do
+X." A <strong>resource policy</strong> attaches to the resource: "these principals may do X to me."
+S3 buckets, SQS queues, SNS topics, KMS keys and Lambda functions all take one.</p>
+
+<p>Within one account, either is usually enough. Across accounts, <strong>both</strong> are
+required — the calling side must allow the call and the owning side must allow the caller. "I gave
+the role the permission and it still fails" is nearly always a missing resource policy.</p>
+
+<p>Here is the real one serving this site. It says exactly one CloudFront distribution may read
+these objects, and nothing else can:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontOAC",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudfront.amazonaws.com" },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::lovemesomecoding.com/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::111122223333:distribution/E30YUPLP37MY9U"
+        }
+      }
+    }
+  ]
+}</code></pre>
+
+<p>Without that <code>SourceArn</code> condition, the policy would say "any CloudFront distribution
+in the world may read this bucket" — which is a real and commonly shipped mistake. The bucket
+itself stays entirely private with Block Public Access on.</p>
+
+<h2>How a request is actually decided</h2>
+
+<p>The order is short and worth memorising:</p>
+
+<ol>
+  <li><strong>An explicit <code>Deny</code> anywhere wins.</strong> Always, immediately, and it
+      cannot be overridden by any allow</li>
+  <li>Otherwise, an explicit <code>Allow</code> permits the request</li>
+  <li>Otherwise it is denied — the default is no access</li>
+</ol>
+
+<p>So permissions are additive across every attached policy, and a single <code>Deny</code> is
+absolute. That is what makes a "deny unless the request came over TLS" guardrail reliable, and it
+is also why adding a policy can never fix a request that some other policy denies.</p>
+
+<h2>Roles and the trust policy</h2>
+
+<p>A role has two policies and people mix them up constantly. The <strong>permission policy</strong>
+says what the role can do. The <strong>trust policy</strong> says <em>who may assume it</em> — and
+a role with no trust policy is unusable no matter how much access it grants.</p>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "lambda.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}</code></pre>
+
+<p>That is the trust policy every Lambda execution role carries. For EC2 it is
+<code>ec2.amazonaws.com</code>, and the role reaches the instance through an instance profile.</p>
+
+<h2>Conditions are where least privilege lives</h2>
+
+<p>Most policies written in a hurry grant an action on <code>"*"</code> because scoping by ARN is
+fiddly. Conditions are usually the easier win, because they scope by something you already have.</p>
+
+<table>
+  <thead><tr><th>Condition key</th><th>Restricts to</th></tr></thead>
+  <tbody>
+    <tr><td><code>aws:ResourceTag/Key</code></td><td>Resources carrying a tag — how a scheduled
+        stop is confined to dev instances</td></tr>
+    <tr><td><code>aws:PrincipalTag/Key</code></td><td>Callers carrying a tag</td></tr>
+    <tr><td><code>aws:SourceArn</code> / <code>aws:SourceAccount</code></td><td>The specific
+        service resource calling on your behalf</td></tr>
+    <tr><td><code>aws:SecureTransport</code></td><td>HTTPS only</td></tr>
+    <tr><td><code>aws:MultiFactorAuthPresent</code></td><td>Sessions that used MFA</td></tr>
+  </tbody>
+</table>
+
+<p>A tag-scoped <code>Allow</code> turns "this Lambda can stop any instance" into "this Lambda can
+stop instances someone deliberately labelled", and the difference is that a bug in the code can no
+longer reach production. Write the condition even when the code already filters — the code is what
+you are protecting against.</p>
+
+<h2>Practical rules</h2>
+
+<pre class="language-bash"><code class="language-bash">aws sts get-caller-identity
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::111122223333:role/my-role \
+  --action-names s3:GetObject \
+  --resource-arns "arn:aws:s3:::my-bucket/file.txt"</code></pre>
+
+<p><code>get-caller-identity</code> answers "who am I right now", which is the first question when
+something is denied unexpectedly. The policy simulator answers "would this be allowed", without
+having to try it.</p>
+
+<p>Start from the managed policy that is close, then tighten. Turn on MFA for anything with a
+console password. And never use the account root user for daily work — it cannot be restricted by
+any policy, which is precisely why it should stay locked away.</p>

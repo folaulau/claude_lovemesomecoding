@@ -1,0 +1,129 @@
+<p>Lambda runs a function in response to an event and bills you per millisecond of execution. No
+servers, no capacity planning, nothing running when nothing is happening. This site's admin API is
+a FastAPI application on Lambda, and it costs under a dollar a month.</p>
+
+<h2>The handler and the execution context</h2>
+
+<pre class="language-python"><code class="language-python">import json
+import boto3
+
+# Module scope. Runs ONCE per container, not once per request.
+s3 = boto3.client("s3")
+CONFIG = load_config()
+
+
+def lambda_handler(event, context):
+    body = json.loads(event.get("body") or "{}")
+    return {
+        "statusCode": 200,
+        "headers": {"content-type": "application/json"},
+        "body": json.dumps({"ok": True}),
+    }</code></pre>
+
+<p>The single most useful fact about Lambda is in that comment. AWS starts a container, imports
+your module, and then calls the handler — and it <strong>reuses that container</strong> for
+subsequent invocations, often for many minutes.</p>
+
+<p>So anything expensive belongs at module scope: SDK clients, configuration, a database
+connection. Creating a boto3 client inside the handler pays that cost on every request for no
+reason.</p>
+
+<p>The corollary is that module-scope state <em>persists between invocations of different users</em>.
+Caching a config value there is a good idea. Caching request-specific data there is a data leak
+waiting to happen, and it is the kind of bug that never reproduces locally.</p>
+
+<h2>Cold starts, measured</h2>
+
+<p>A cold start is the container creation plus your imports. It happens on the first request, when
+scaling out, and after a period of idleness.</p>
+
+<p>Realistically: a small Python or Node function is roughly 100–300ms; a heavy dependency tree can
+be a second or more; a JVM function can be several. The dominant factor is almost always
+<strong>import time</strong>, not AWS's overhead — so the fix is usually to import less. Importing
+all of <code>boto3</code> when you need one client, or a full data-science stack for one function,
+is where the time goes.</p>
+
+<p>If cold starts genuinely matter, <strong>provisioned concurrency</strong> keeps a number of
+containers warm — and bills for them continuously, which gives up the main advantage of Lambda.
+Reach for it only when you have measured a real problem.</p>
+
+<h2>Memory is the CPU dial</h2>
+
+<p>This one is counter-intuitive and worth acting on. You configure memory from 128 MB to 10,240 MB
+— and CPU is allocated <em>in proportion</em>. You do not set CPU separately.</p>
+
+<p>So a CPU-bound function at 128 MB is not just memory-constrained, it is getting a fraction of a
+core. Raising memory to 1,024 MB can make it run four times faster, and since you are billed for
+GB-milliseconds, four times faster at eight times the memory rate can cost roughly the same — or
+less, with a better user experience.</p>
+
+<p>Do not guess. Run the same workload at several settings, plot duration against cost, and pick
+the knee. AWS Lambda Power Tuning automates exactly this.</p>
+
+<h2>Packaging, and the trap that kills a function at import</h2>
+
+<p>Three options: a zip you upload, a Lambda layer for shared dependencies, or a container image up
+to 10 GB.</p>
+
+<p>Here is the trap, and it has cost this site real time. <strong>Compiled dependencies must be
+built for Lambda's platform, not for your laptop.</strong> Packages like
+<code>pydantic-core</code>, <code>bcrypt</code>, <code>numpy</code> and <code>psycopg</code> ship
+platform-specific binary wheels. Run <code>pip install</code> on macOS, zip the result, and you get
+a Lambda that fails at import with an unhelpful error — nothing in your code is wrong.</p>
+
+<p>Force the target platform explicitly:</p>
+
+<pre class="language-bash"><code class="language-bash">pip install -r requirements.txt -t ./package \
+  --platform manylinux2014_x86_64 \
+  --implementation cp --python-version 3.12 --only-binary=:all:</code></pre>
+
+<p>And verify before deploying, rather than after:</p>
+
+<pre class="language-bash"><code class="language-bash">file package/pydantic_core/*.so     # must say ELF ... x86-64, not Mach-O</code></pre>
+
+<p>If you build on Apple Silicon and target <code>arm64</code>, the same rule applies with a
+different wheel — the point is that the platform must be stated, never inferred.</p>
+
+<h2>Timeouts and the two limits behind them</h2>
+
+<p>The default timeout is 3 seconds and the maximum is 15 minutes. Set it deliberately: too low and
+legitimate work fails, too high and a hung request bills for a quarter of an hour.</p>
+
+<p>Note that anything fronted by API Gateway is capped at <strong>29 seconds</strong> by the
+gateway regardless of your Lambda's timeout, so a 15-minute setting behind an API is a 29-second
+setting with a misleading configuration.</p>
+
+<p>Concurrency is the other limit. An account has a regional concurrent-execution quota shared by
+every function, so one function scaling up can throttle the rest. Reserved concurrency both
+guarantees a floor and caps the ceiling — capping a function that talks to a small database is
+often the point, not a limitation.</p>
+
+<h2>Retries are not optional, and they differ by trigger</h2>
+
+<p>How a failed invocation is retried depends entirely on what invoked it, and assuming the wrong
+one produces either lost work or duplicated work.</p>
+
+<ul>
+  <li><strong>Synchronous</strong> (API Gateway, an ALB) — no retry. The caller gets the error and
+      decides</li>
+  <li><strong>Asynchronous</strong> (S3 events, SNS) — retried twice by default, then sent to a
+      dead-letter queue or on-failure destination if you configured one, and dropped if you did
+      not</li>
+  <li><strong>Stream and queue</strong> (SQS, Kinesis, DynamoDB Streams) — retried until the
+      message expires or succeeds, which can block a shard indefinitely</li>
+</ul>
+
+<p>So every asynchronous function needs a failure destination, and every function that can be
+retried has to be safe to run twice. Idempotency is a requirement here, not a refinement.</p>
+
+<h2>Logs and what to watch</h2>
+
+<pre class="language-bash"><code class="language-bash">aws logs tail /aws/lambda/lovemesomecoding-admin-api-prod --follow --since 15m</code></pre>
+
+<p>Every invocation writes a <code>REPORT</code> line with duration, billed duration, memory size
+and max memory used. That last field is how you right-size: a function configured for 1,024 MB and
+peaking at 90 MB is being paid for at eight times what it needs — unless it is CPU-bound, in which
+case see above.</p>
+
+<p>Set a log retention period. Log groups default to never expiring, and they bill for storage
+forever.</p>

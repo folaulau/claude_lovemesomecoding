@@ -1,0 +1,133 @@
+<p>RDS runs a relational database so you do not have to. It handles the machine, the operating
+system, the engine installation, patching, backups and failover. What it does not handle is your
+schema, your queries, or your indexes — the parts that actually make a database slow.</p>
+
+<p>Engines: PostgreSQL, MySQL, MariaDB, Oracle, SQL Server, Db2, plus Aurora, which is different
+enough to deserve its own post.</p>
+
+<h2>Multi-AZ is failover, not a read replica</h2>
+
+<p>This is the most expensive misunderstanding in the service, so it goes first.</p>
+
+<p><strong>Multi-AZ</strong> maintains a standby copy in another Availability Zone. You cannot
+query it, cannot connect to it, and get no extra capacity from it. It exists so that when the
+primary fails, RDS repoints the DNS endpoint at the standby — typically within a couple of minutes
+— and your application reconnects to the same hostname. You pay roughly double for an instance you
+will never talk to.</p>
+
+<p><strong>A read replica</strong> is a separate instance, with its own endpoint, that you
+<em>can</em> query. It replicates asynchronously, so it lags — usually milliseconds, sometimes far
+more under load — and reading from it means accepting slightly stale data.</p>
+
+<table>
+  <thead><tr><th>You want</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>To survive an AZ failure</td><td>Multi-AZ</td></tr>
+    <tr><td>To take read load off the primary</td><td>Read replica</td></tr>
+    <tr><td>Both</td><td>Both. They are not alternatives</td></tr>
+  </tbody>
+</table>
+
+<p>Buying Multi-AZ expecting more throughput is the classic mistake. It buys availability, and
+availability only.</p>
+
+<h2>Why you cannot connect</h2>
+
+<p>Almost always one of three things, in this order:</p>
+
+<ol>
+  <li><strong>The security group.</strong> The database's group must allow your source on the
+      engine port. Reference the application's security group rather than an IP range</li>
+  <li><strong>Public accessibility.</strong> An instance created without it has no public IP, so
+      from outside the VPC there is nothing to reach. That default is correct — connect through a
+      bastion, a VPN, or Session Manager port forwarding rather than turning it on</li>
+  <li><strong>The subnet group.</strong> It determines which subnets the instance can live in, and
+      a subnet group made of public subnets is how a database ends up exposed by accident</li>
+</ol>
+
+<p>A production database belongs in private subnets with public accessibility off. If you can reach
+it from a coffee shop, so can everyone else.</p>
+
+<h2>Parameter groups</h2>
+
+<p>You cannot edit <code>postgresql.conf</code>, because there is no shell. Engine settings live in
+a <strong>parameter group</strong>, and the default group for each engine version is read-only —
+so changing anything means creating your own and attaching it.</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds create-db-parameter-group \
+  --db-parameter-group-name stayhub-pg16 \
+  --db-parameter-group-family postgres16 \
+  --description "StayHub Postgres 16"
+
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name stayhub-pg16 \
+  --parameters "ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=immediate"</code></pre>
+
+<p><code>ApplyMethod</code> is the part to get right. <code>immediate</code> applies at once;
+<code>pending-reboot</code> waits, and some parameters are static and accept nothing else. A
+setting that appears to have no effect is usually static and waiting for a restart nobody
+scheduled.</p>
+
+<h2>Backups, and the number nobody changes</h2>
+
+<p>Automated backups give you point-in-time recovery to any second within the retention window.
+That window <strong>defaults to 7 days</strong>, and the console will happily let you set it to
+0 — which switches automated backups off entirely.</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds modify-db-instance \
+  --db-instance-identifier stayhub-prod \
+  --backup-retention-period 30 \
+  --apply-immediately</code></pre>
+
+<p>The distinction that matters at 2am: <strong>automated backups are deleted when you delete the
+instance</strong>. Manual snapshots are not — they live until you remove them. So take a manual
+snapshot before anything irreversible, and never rely on automated backups to survive the thing
+you are protecting against.</p>
+
+<p>Restoring never overwrites. It creates a <em>new</em> instance with a new endpoint, which is
+safe but means recovery involves repointing your application. Practise it once before you need
+it.</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds restore-db-instance-to-point-in-time \
+  --source-db-instance-identifier stayhub-prod \
+  --target-db-instance-identifier stayhub-recovered \
+  --restore-time 2026-08-24T09:15:00Z</code></pre>
+
+<h2>Connections</h2>
+
+<p>Every RDS instance class has a connection limit derived from its memory, and small instances run
+out embarrassingly early — a db.t4g.micro allows only a few dozen. Serverless applications make
+this worse: every concurrent Lambda opens its own connection, so a burst of 200 invocations tries
+to open 200 connections and most of them fail.</p>
+
+<p>RDS Proxy sits in front and pools on your behalf, which is the intended answer for Lambda. For
+long-running servers, a pool in the application is usually enough — the important thing is that it
+is bounded and that it validates connections before use.</p>
+
+<h2>Monitoring worth turning on</h2>
+
+<p>Three things, in increasing order of usefulness and cost.</p>
+
+<p><strong>CloudWatch metrics</strong> come free. Watch <code>FreeableMemory</code>,
+<code>FreeStorageSpace</code>, <code>DatabaseConnections</code> and <code>CPUUtilization</code>. A
+database that runs out of storage stops accepting writes, which is an outage with a week of
+warning if anyone is looking — enable storage autoscaling and you never meet it.</p>
+
+<p><strong>Performance Insights</strong> is free at 7-day retention and is the fastest way to
+answer "what is the database doing right now". It shows load broken down by wait event and by
+query, which turns "the database is slow" into a specific statement.</p>
+
+<p><strong>Enhanced Monitoring</strong> reports OS-level metrics at up to one-second granularity
+and does cost extra. Turn it on when you need it, not by default.</p>
+
+<h2>Maintenance windows are not optional</h2>
+
+<p>RDS applies patches during your maintenance window, and applying a patch means a restart.
+Multi-AZ makes that a failover of a minute or two rather than several minutes of downtime, but it
+is never zero.</p>
+
+<p>Set the window to a genuinely quiet hour, and note it is specified in <strong>UTC</strong> — a
+window set to 03:00 without converting is the middle of the afternoon somewhere.</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds describe-db-instances --db-instance-identifier stayhub-prod \
+  --query "DBInstances[0].[PreferredMaintenanceWindow,PendingModifiedValues]"</code></pre>

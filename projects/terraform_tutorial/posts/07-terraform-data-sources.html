@@ -1,0 +1,196 @@
+<p>A <code>resource</code> is something Terraform creates and owns. A <code>data</code> source is
+something that already exists, which Terraform reads. One line of difference in the syntax, and a
+completely different relationship: Terraform will never create, modify or destroy a data source.</p>
+
+<h2>The shape</h2>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+output "azs" {
+  # note the `data.` prefix on the address
+  value = data.aws_availability_zones.available.names
+}</code></pre>
+
+<p>Arguments on a data source are <strong>query parameters</strong>, not desired state. You are
+describing what to look for, and the attributes that come back are what was found.</p>
+
+<p>They are read during <code>plan</code>, every time, so their values are current — which is both
+the point and, occasionally, the problem.</p>
+
+<h2>The four you will use constantly</h2>
+
+<pre class="language-hcl"><code class="language-hcl"># Who am I? Account id, for building ARNs.
+data "aws_caller_identity" "current" {}
+
+# Where am I? Whatever the provider block was configured with.
+data "aws_region" "current" {}
+
+# Which AZs can I actually use?
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# The current partition — "aws", or "aws-cn"/"aws-us-gov" in those regions.
+data "aws_partition" "current" {}</code></pre>
+
+<p>These four are how you write a configuration that is not hard-coded to one account or region:</p>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  # Instead of hard-coding "arn:aws:logs:us-west-2:329580012644:..."
+  log_group_arn = "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/pizza-tf"
+}</code></pre>
+
+<p>⚠️ On AWS provider 6.x the region attribute is <code>data.aws_region.current.region</code>. It
+used to be <code>.name</code>, which is deprecated — a small example of exactly the rot this track
+checks every sample against.</p>
+
+<h2>Availability zones, and why not to hard-code them</h2>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+locals {
+  # Take two. An ALB requires subnets in at least two AZs.
+  azs = slice(data.aws_availability_zones.available.names, 0, 2)
+}</code></pre>
+
+<p><code>us-west-2a</code> in your account and <code>us-west-2a</code> in mine are <strong>not
+necessarily the same physical datacentre</strong>. AWS shuffles the letter-to-AZ mapping per
+account, deliberately, so that everyone's "a" is not the same building. Hard-coding the letters
+produces a configuration that is not portable between accounts, and that breaks outright in a region
+that has retired a letter.</p>
+
+<h2>Finding an AMI</h2>
+
+<p>The classic case, and the classic bug it fixes:</p>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}</code></pre>
+
+<p>A hard-coded <code>ami-0abcdef1234567890</code> is wrong three ways: it is region-specific, it
+goes stale the moment a patched image ships, and it eventually stops existing — at which point the
+apply fails with "InvalidAMIID.NotFound" on a configuration nobody changed.</p>
+
+<p>⚠️ But <code>most_recent = true</code> has a cost worth understanding: <strong>the value can
+change between one plan and the next.</strong> AWS publishes a new AMI, and your next plan shows a
+replacement of every instance using it. That is fine for an autoscaling group you intend to roll,
+and startling on a database server. Where you want stability, pin the AMI in a variable and bump it
+deliberately.</p>
+
+<h2>Reading infrastructure you did not create</h2>
+
+<pre class="language-hcl"><code class="language-hcl"># A VPC someone else's Terraform, or a human, created — found by tag.
+data "aws_vpc" "shared" {
+  filter {
+    name   = "tag:Name"
+    values = ["shared-services"]
+  }
+}
+
+data "aws_subnets" "private" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.shared.id]
+  }
+
+  filter {
+    name   = "tag:Tier"
+    values = ["private"]
+  }
+}</code></pre>
+
+<p>Note the dependency: the second data source references the first, so Terraform reads them in
+order. The graph works the same way for data as for resources.</p>
+
+<p>⚠️ A data source that matches <strong>nothing</strong> is an error, and a data source that matches
+<strong>more than one</strong> thing is also an error for the singular ones
+(<code>aws_vpc</code>, <code>aws_subnet</code>). That strictness is a feature — it fails at plan time
+rather than silently picking one.</p>
+
+<h2>Another configuration's outputs</h2>
+
+<p>When a network stack and an application stack have separate state files, this is the seam between
+them:</p>
+
+<pre class="language-hcl"><code class="language-hcl">data "terraform_remote_state" "network" {
+  backend = "s3"
+
+  config = {
+    bucket = "my-terraform-state"
+    key    = "network/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+resource "aws_db_subnet_group" "this" {
+  name = "pizza-tf-db"
+  # only what the network stack chose to OUTPUT is readable
+  subnet_ids = data.terraform_remote_state.network.outputs.private_subnet_ids
+}</code></pre>
+
+<p>Two things to know. It reads the <strong>whole state file</strong>, so whoever runs this needs read
+access to that bucket — and state contains secrets, so that is a real permission to grant. And it
+couples the two configurations: the network stack cannot remove an output without breaking this one.</p>
+
+<p>Where the values are stable, published identifiers, SSM Parameter Store is often the better seam —
+it exposes exactly what you choose, with its own permissions:</p>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_ssm_parameter" "vpc_id" {
+  name = "/shared/network/vpc-id"
+}</code></pre>
+
+<h2>IAM policy documents</h2>
+
+<p>The data source that is not a lookup at all — it renders JSON:</p>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_iam_policy_document" "execution_secrets" {
+  statement {
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      "arn:aws:secretsmanager:us-west-2:329580012644:secret:pizza-tf/jwt-secret-AbCdEf",
+    ]
+  }
+}</code></pre>
+
+<p>It produces the same thing <code>jsonencode()</code> would, with two advantages: the block
+structure is validated (a misspelled <code>statement</code> field is caught), and documents can be
+merged with <code>source_policy_documents</code>. Either approach beats a heredoc full of JSON,
+where a typo is discovered by AWS at apply time.</p>
+
+<h2>data or import?</h2>
+
+<p>The decision people get wrong. Both let you work with something that already exists:</p>
+
+<pre class="language-bash"><code class="language-bash">data    read it. Terraform never changes it. Someone else owns it.
+import  adopt it. Terraform now owns it, and will change or destroy it.</code></pre>
+
+<p>Use <strong>data</strong> for things outside your responsibility — a shared VPC another team runs,
+an AMI, an account id. Use <strong>import</strong> (lesson 5) when the resource is genuinely yours
+and was created by hand, and you want the files to become the source of truth.</p>
+
+<p>The failure mode of getting this wrong is quiet: reference a shared VPC as a
+<code>resource</code> and your first apply proposes to reconfigure it to match your file.</p>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-remote-state">Lesson 8</a> moves state off your laptop — and covers
+why almost every S3 backend tutorial you will find tells you to create a DynamoDB table you no
+longer need.</p>

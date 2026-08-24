@@ -1,0 +1,204 @@
+<p>Local state works perfectly until there are two of you. Then it stops working in a way that is
+hard to notice and expensive to fix: two people apply at once, and the second one's state file
+overwrites the first's, so Terraform now believes it did not create things that exist.</p>
+
+<p>This lesson moves state into S3 and turns on locking. It also corrects the advice you will find
+almost everywhere else, which tells you to create a DynamoDB table that Terraform deprecated.</p>
+
+<h2>What local state cannot do</h2>
+
+<pre class="language-bash"><code class="language-bash">it is on ONE laptop        nobody else can plan, and CI certainly cannot
+it is not backed up        lose the file, lose the mapping to real resources
+it has no locking          two applies at once corrupt it
+it holds secrets           in cleartext, on a laptop, next to a git repo</code></pre>
+
+<p>Losing the state file is worth dwelling on, because it is not "start again". The infrastructure
+still exists and nothing knows it is yours — you either import every resource by hand or delete it
+all through the console.</p>
+
+<h2>The bootstrap problem</h2>
+
+<p>State goes in an S3 bucket. Something has to create the bucket. That something cannot store its
+state in the bucket it is about to create.</p>
+
+<p>Two honest answers. Create it with the CLI, once, and never manage it with Terraform:</p>
+
+<pre class="language-bash"><code class="language-bash">BUCKET=my-terraform-state-329580012644
+
+aws s3api create-bucket --bucket "$BUCKET" \
+  --region us-west-2 --create-bucket-configuration LocationConstraint=us-west-2
+
+# Versioning is the undo button for a corrupted or truncated state file.
+aws s3api put-bucket-versioning --bucket "$BUCKET" \
+  --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption --bucket "$BUCKET" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+aws s3api put-public-access-block --bucket "$BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true</code></pre>
+
+<p>Or write it in Terraform in its own directory, apply with local state, then migrate that directory
+into itself. It works and it is elegant, and for one bucket the CLI is less to explain. Either way
+it is a one-time act per account.</p>
+
+<p>All four settings matter. Versioning is your recovery path. Encryption is table stakes for a file
+holding cleartext credentials. The public access block is because this is the single worst bucket in
+your account to get wrong.</p>
+
+<h2>The backend block</h2>
+
+<pre class="language-hcl"><code class="language-hcl">terraform {
+  required_version = "&gt;= 1.10"
+
+  backend "s3" {
+    bucket = "my-terraform-state-329580012644"
+    key    = "pizza/terraform.tfstate"
+    region = "us-west-2"
+
+    encrypt = true
+
+    # ⚠️ THIS IS THE LINE THAT REPLACED THE DYNAMODB TABLE. See below.
+    use_lockfile = true
+  }
+}</code></pre>
+
+<p><code>key</code> is the path within the bucket, and it is how one bucket holds many stacks. Give
+it real structure — <code>pizza/prod/terraform.tfstate</code>,
+<code>pizza/staging/terraform.tfstate</code> — because you will have more of these than you expect.</p>
+
+<p>⚠️ The backend block <strong>cannot use variables</strong>. Not <code>var.bucket</code>, not a
+local, not an interpolation. It is read before Terraform evaluates anything, so it must be literal.
+That is why per-environment backends use partial configuration:</p>
+
+<pre class="language-bash"><code class="language-bash"># backend.tf has only:  backend "s3" {}
+terraform init -backend-config=prod.s3.tfbackend</code></pre>
+
+<h2>⚠️ You do not need a DynamoDB table</h2>
+
+<p>Every S3 backend tutorial written before 2025 tells you to create one:</p>
+
+<pre class="language-hcl"><code class="language-hcl">terraform {
+  backend "s3" {
+    bucket = "my-terraform-state"
+    key    = "pizza/terraform.tfstate"
+    region = "us-west-2"
+
+    # ⚠️ DEPRECATED. Do not copy this.
+    dynamodb_table = "terraform-locks"
+  }
+}</code></pre>
+
+<p>The history: S3 had no way to conditionally create an object, so Terraform could not implement a
+lock on S3 alone. DynamoDB's conditional writes could, so the backend borrowed one — and every
+tutorial since has carried the extra table, its IAM policy and its cost.</p>
+
+<p>In 2024 S3 gained conditional writes. <strong>Terraform 1.10 added native locking via
+<code>use_lockfile</code>, and 1.11 made it the default and deprecated <code>dynamodb_table</code></strong>,
+which now emits a warning and is slated for removal.</p>
+
+<p>Native locking writes a <code>.tflock</code> object next to the state and relies on S3 refusing a
+conditional put when it already exists. One bucket, one permission set, no second service.</p>
+
+<pre class="language-bash"><code class="language-bash">use_lockfile = true     <-- current. one bucket, nothing else.
+dynamodb_table = "..."  <-- deprecated. delete the table when you remove it.</code></pre>
+
+<p>⚠️ This is why <code>required_version = "&gt;= 1.10"</code> is load-bearing. An older Terraform
+reading <code>use_lockfile</code> does not recognise the argument and <strong>proceeds with no
+locking at all</strong> rather than failing. The version floor is what makes the lock real.</p>
+
+<h2>Migrating existing state</h2>
+
+<p>You have local state and you have just added a backend block:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform init -migrate-state</code></pre>
+
+<pre class="language-bash"><code class="language-bash">Initializing the backend...
+Do you want to copy existing state to the new backend?
+  Pre-existing state was found while migrating the previous "local" backend
+  to the newly configured "s3" backend. No existing state was found in the
+  newly configured "s3" backend. Do you want to copy this state to the new
+  "s3" backend? Enter "yes" to copy and "no" to start with an empty state.
+
+  Enter a value: yes</code></pre>
+
+<p>Say yes. Then confirm before deleting anything local:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform state list          # should list everything it did before
+terraform plan                # should say "No changes"</code></pre>
+
+<p>"No changes" is the proof the migration worked. Only then remove
+<code>terraform.tfstate</code> and its backup — and remember the backup contains the same secrets, so
+delete it rather than leaving it around.</p>
+
+<h2>Locking, in practice</h2>
+
+<p>When someone else is applying:</p>
+
+<pre class="language-bash"><code class="language-bash">Error: Error acquiring the state lock
+
+Lock Info:
+  ID:        4d31c0a8-3b5c-...
+  Path:      my-terraform-state/pizza/terraform.tfstate
+  Operation: OperationTypeApply
+  Who:       folauk@laptop
+  Created:   2026-08-24 20:14:03 UTC</code></pre>
+
+<p>That is the system working. Wait.</p>
+
+<p>Occasionally a lock is left behind — a crashed process, a cancelled CI job:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform force-unlock 4d31c0a8-3b5c-...</code></pre>
+
+<p>⚠️ Only after you have <strong>confirmed nobody is actually applying</strong>. The lock exists to
+prevent two concurrent writes; forcing it while a colleague's apply is running is how you get the
+corruption it was there to stop. Check the <code>Who</code> and ask them.</p>
+
+<h2>Permissions</h2>
+
+<p>The minimum for a state bucket with native locking:</p>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_iam_policy_document" "state_access" {
+  statement {
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::my-terraform-state-329580012644"]
+  }
+
+  statement {
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      # DeleteObject is for releasing the .tflock, not for deleting state.
+      "s3:DeleteObject",
+    ]
+    resources = ["arn:aws:s3:::my-terraform-state-329580012644/pizza/*"]
+  }
+}</code></pre>
+
+<p>Scope the object permissions to the <code>key</code> prefix, not the whole bucket. One team's
+pipeline having read access to every other team's state — passwords included — is a real and common
+over-grant.</p>
+
+<h2>One bucket, many states</h2>
+
+<p>The question this raises: how many state files should there be?</p>
+
+<p>Not one. A single state for an entire account means every plan refreshes every resource, every
+apply locks everything, and one bad <code>destroy</code> reaches production. Split by blast radius
+and by rate of change — networking changes rarely, applications change hourly:</p>
+
+<pre class="language-bash"><code class="language-bash">network/prod/terraform.tfstate       rarely changes, everything depends on it
+pizza/prod/terraform.tfstate         changes constantly
+pizza/staging/terraform.tfstate</code></pre>
+
+<p>The seam between them is outputs, read with the <code>terraform_remote_state</code> data source
+from lesson 7. <a href="/terraform/terraform-environments-and-workspaces">Lesson 11</a> is about
+where to draw those lines.</p>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-loops-and-conditionals">Lesson 9</a> stops you writing three
+near-identical subnet blocks — and explains the specific reason <code>count</code> will destroy and
+recreate half your resources.</p>

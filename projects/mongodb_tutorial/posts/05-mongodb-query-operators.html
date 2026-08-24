@@ -1,0 +1,161 @@
+<p>A MongoDB filter is a document, and the operators inside it are how you say anything more
+interesting than &ldquo;equals&rdquo;. There are a few dozen; you will use about twelve. This lesson
+is those twelve, plus the three behaviours that surprise people &mdash; missing fields, arrays, and
+what happens when a filter accidentally matches everything.</p>
+
+<h2>The shape of a filter</h2>
+
+<p>Every filter is <code>{ field: condition }</code>. When the condition is a plain value it means
+equality; when it is a document whose keys start with <code>$</code>, those are operators:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ status: "PUBLISHED" }                      // equals
+{ "stats.views": { $gt: 1000 } }             // greater than
+{ status: "PUBLISHED", "stats.views": { $gt: 1000 } }   // both — an implicit AND</code></pre>
+
+<p>Multiple fields in one document are ANDed. That covers most queries, and it is why
+<code>$and</code> is rarer than you would expect.</p>
+
+<h2>Comparison</h2>
+
+<pre class="language-javascript"><code class="language-javascript">{ "stats.views": { $gt: 1000 } }          // >
+{ "stats.views": { $gte: 1000 } }         // >=
+{ "video.durationSeconds": { $lt: 30 } }  // <
+{ "video.durationSeconds": { $lte: 30 } } // <=
+{ status: { $ne: "PUBLISHED" } }          // !=
+{ status: { $in: ["DRAFT", "SCHEDULED"] } }     // any of
+{ status: { $nin: ["ARCHIVED"] } }              // none of</code></pre>
+
+<p>Two conditions on the same field go in the same document, which is how you express a range:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ "video.durationSeconds": { $gte: 20, $lte: 40 } })</code></pre>
+
+<p>Comparisons only ever match values of a comparable type. That is the string-versus-number
+problem from lesson 3 again, and it is worth internalising here: <code>{ views: { $gt: 5 } }</code>
+does not match <code>views: "12"</code>, because a string is not a number that happens to look
+like one.</p>
+
+<h2>Missing versus null &mdash; the one that catches everyone</h2>
+
+<p><code>$ne</code> and <code>$nin</code> match documents where the field is <em>absent</em>, and
+<code>{ field: null }</code> matches both explicit nulls and missing fields. These are different
+questions and the syntax hides it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.countDocuments({ scheduledFor: null })                  // 15 — null OR missing
+db.reels.countDocuments({ scheduledFor: { $exists: false } })    // 15 — missing only
+db.reels.countDocuments({ scheduledFor: { $type: "null" } })     // 0  — explicitly null only
+db.reels.countDocuments({ scheduledFor: { $ne: null } })         // 1  — has a real value</code></pre>
+
+<p>Read those four numbers carefully, because they say something you might not expect. Fifteen
+reels match <code>scheduledFor: null</code>, and all fifteen match <code>$exists: false</code>
+&mdash; while <em>none</em> of them is explicitly null. The field is simply not there.</p>
+
+<p>That is not an accident of this dataset. Most object mappers, Spring Data included, omit a null
+field rather than storing it, so &ldquo;the value is null&rdquo; and &ldquo;there is no such
+field&rdquo; end up being the same state on disk. <code>{ field: null }</code> deliberately matches
+both, which is convenient right up until you need to tell them apart &mdash; and then
+<code>$exists</code> and <code>$type</code> are the only things that can.</p>
+
+<p>The same conflation makes <code>$ne</code> wider than it looks.
+<code>{ status: { $ne: "PUBLISHED" } }</code> returns drafts, archived reels <em>and</em> any
+document with no <code>status</code> field at all. In a schemaless store that last group is real.
+When you mean &ldquo;has a value and it is not this&rdquo;, say so:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ status: { $exists: true, $ne: "PUBLISHED" } }</code></pre>
+
+<h2>Logical operators</h2>
+
+<p><code>$or</code> is the one you actually need. It takes an array of complete filter
+documents:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({
+  $or: [
+    { status: "PUBLISHED" },
+    { status: "SCHEDULED", scheduledFor: { $lte: new Date() } }
+  ]
+})</code></pre>
+
+<p><code>$and</code> is only needed when you want two conditions with the same operator on the same
+field, since a document cannot have duplicate keys. <code>$nor</code> exists and is almost always
+clearer rewritten. One performance note worth carrying: an <code>$or</code> can use a different
+index for each branch, but only if every branch has one &mdash; a single unindexed branch drags the
+whole query into a collection scan.</p>
+
+<h2>Arrays</h2>
+
+<p>Array queries are where MongoDB is genuinely different, and the default behaviour is the one you
+usually want: a filter on an array field matches if <strong>any element</strong> matches.</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.countDocuments({ tags: "motorsport" })         // 3 — any element equals
+db.reels.countDocuments({ tags: ["motorsport"] })       // 0 — the WHOLE array, exactly
+db.reels.countDocuments({ tags: { $all: ["motorsport", "overtake"] } })   // 1 — contains both
+db.reels.countDocuments({ tags: { $size: 3 } })         // 16 — exactly three elements</code></pre>
+
+<p>The second line is the trap. Passing an array as the value is an equality test against the
+entire array, order included &mdash; almost never what was meant.</p>
+
+<p><code>$elemMatch</code> matters when the array holds documents and you need several conditions
+to hold <em>for the same element</em>. Without it, the conditions can be satisfied by different
+elements:</p>
+
+<pre class="language-javascript"><code class="language-javascript">// "has a score over 8 AND has a judge named Ada" — possibly two different entries
+db.clips.find({ "scores.value": { $gt: 8 }, "scores.judge": "Ada" })
+
+// "has an entry where Ada scored over 8" — one entry, both conditions
+db.clips.find({ scores: { $elemMatch: { value: { $gt: 8 }, judge: "Ada" } } })</code></pre>
+
+<p>The first query is a real bug that returns plausible results, which is the worst kind.</p>
+
+<h2>Element and evaluation operators</h2>
+
+<pre class="language-javascript"><code class="language-javascript">{ publishedAt: { $exists: true } }             // the field is present
+{ "stats.views": { $type: "long" } }           // BSON type check
+{ title: { $regex: "final", $options: "i" } }  // pattern, case-insensitive
+{ $expr: { $gt: ["$stats.likes", "$stats.comments"] } }   // compare two fields</code></pre>
+
+<p><code>$expr</code> is the one people miss. An ordinary filter compares a field to a
+<em>constant</em>; there is no way to say &ldquo;likes greater than comments&rdquo; without it,
+because the right-hand side has to be a value. <code>$expr</code> lets you use aggregation
+expressions in a plain <code>find</code>, at the cost of not being able to use an index for that
+comparison.</p>
+
+<p><code>$regex</code> is worth a warning. An anchored prefix pattern like <code>/^final/</code> can
+use an index. Anything else &mdash; and especially a leading wildcard such as
+<code>/final/</code> &mdash; scans every document. That is fine on an admin screen over a few
+thousand records and disastrous on a public endpoint. ReelCMS uses exactly that trade deliberately:
+its admin filter uses a regex so it can match as you type, while its public search uses a text
+index. The regex is also escaped before use, because a user typing <code>((</code> into a search
+box should not be able to throw a pattern-syntax error:</p>
+
+<pre class="language-java"><code class="language-java">String safe = java.util.regex.Pattern.quote(q.trim());
+query.addCriteria(new Criteria()
+        .orOperator(
+                Criteria.where("title").regex(safe, "i"),
+                Criteria.where("tags").regex(safe, "i"),
+                Criteria.where("creator.displayName").regex(safe, "i")));</code></pre>
+
+<h2>Checking what a query actually did</h2>
+
+<p>When a filter returns the wrong count, three checks find the cause almost every time:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find(filter).explain("executionStats").executionStats.totalDocsExamined
+db.reels.aggregate([{ $group: { _id: { $type: "$status" }, n: { $sum: 1 } } }])
+db.reels.countDocuments({ status: { $exists: false } })</code></pre>
+
+<p>They answer, in order: did it use an index, is the field the type I think it is, and are there
+documents missing the field entirely. Most &ldquo;the query is wrong&rdquo; bugs are one of those
+three, and none of them announce themselves.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Fields in one filter document are ANDed; <code>$or</code> takes complete filter documents.</li>
+  <li>Two conditions on one field go in one nested document &mdash; that is how ranges work.</li>
+  <li><code>$ne</code> matches missing fields too. Pair it with <code>$exists</code> when that
+      matters.</li>
+  <li><code>{ tags: "x" }</code> matches any element; <code>{ tags: ["x"] }</code> matches the whole
+      array.</li>
+  <li>Use <code>$elemMatch</code> when several conditions must hold for the <em>same</em> array
+      element.</li>
+  <li><code>$expr</code> compares two fields; a normal filter cannot.</li>
+  <li>Only anchored regexes use an index. Escape anything a user typed.</li>
+</ul>

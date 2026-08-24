@@ -14,20 +14,20 @@ posts, and the static build reads only the indexes.
 
 Idempotent: re-running updates the posts in place.
 
-⚠️ THERE IS NO `--force-dates` HERE, AND THAT IS DELIBERATE.
+⚠️ `--force-dates` IS REQUIRED HERE, AND IT IS NOT A ONE-OFF.
 
-The Postgres and FastAPI tracks both need one, because both compute their dates from a START_DATE
-and both had to re-base a whole track onto its real publication day. `upsert_post` never overwrites
-an existing date, so those tracks need a way to override it.
+`upsert_post` never overwrites an existing date. All 33 of these posts were published between
+2018-10 and 2019-09 and therefore already carry one, so a plain seed leaves every one of them in
+2019 while manifest.py says 2024-2025 — the archive order, the pager and the sitemap all disagree
+with the track, silently.
 
-This track is the opposite case. All 33 posts were published between 2018-10 and 2019-09, every
-date already ascends, and every URL is indexed. The dates in manifest.py are TRANSCRIBED from the
-stored posts rather than computed, so `upsert_post` keeping the existing date is precisely the
-behaviour we want: a re-seed cannot reshuffle a published archive even by accident.
+Pass it on the first seed, and again after ANY change to START_DATE or STEP_DAYS. This is the
+correction the FastAPI track's re-base established, and this track initially got it wrong in the
+other direction: an earlier version transcribed the 2019 dates and deliberately omitted the flag.
+Folau asked for 2024-2025, so the flag is back and the dates are computed.
 
-Adding the flag "for symmetry" would add exactly one capability — silently moving 33 indexed posts
-in the sitemap — so it is left out. If a date genuinely has to move, that is a considered change to
-manifest.py plus a flag written on purpose. See progress_report.md.
+It is still not the default, because leaving the archive alone is what you want when only a post
+body changed.
 
 Staging: `--only` seeds a subset, which is how stage 1 (the seven blank posts) goes out before the
 other 26 are written. The frozen-slug guard below still runs against the whole manifest.
@@ -87,6 +87,10 @@ def main() -> int:
     parser.add_argument("--env", choices=("local", "prod"), default="local")
     parser.add_argument("--write", action="store_true",
                         help="actually write. Without it, only report what would happen.")
+    parser.add_argument("--force-dates", action="store_true",
+                        help="stamp the manifest date onto posts that already exist. REQUIRED for "
+                             "this track: every post predates the manifest, and a published date "
+                             "is sticky, so without it a re-run moves nothing.")
     parser.add_argument("--only", default=None,
                         help="comma-separated slugs to seed, instead of the whole track. This "
                              "is how a stage ships. Unlike the other tracks every slug here is "
@@ -182,10 +186,9 @@ def main() -> int:
             state = "update" if existing else "create"
             note = ""
             if existing and existing.get("date") != entry["date"]:
-                # The manifest transcribes the stored dates, so this should never fire. If it
-                # does, manifest.py and the tree disagree and one of them is wrong.
-                note = (f"  ⚠️ manifest says {entry['date'][:10]} but the tree says "
-                        f"{existing.get('date')[:10]}")
+                note = (f"  date {existing.get('date')[:10]} -> {entry['date'][:10]}"
+                        if args.force_dates
+                        else f"  ⚠️ date stays {existing.get('date')[:10]} (needs --force-dates)")
             print(f"  {state:6}  /{manifest.CATEGORY['slug']}/{entry['slug']}"
                   f"  ({len(bodies[entry['slug']]):,} bytes){note}")
         print("\nnothing written. Re-run with --write.")
@@ -195,6 +198,15 @@ def main() -> int:
     print(f"category {category['slug']} -> {category['url']}  name={category['name']!r}")
 
     for entry in posts:
+        if args.force_dates:
+            # upsert_post keeps `existing["date"]`, so the only way to move a published post's
+            # date is to change it on the stored object first. The upsert below then re-sorts
+            # every index that mentions it.
+            existing = post_service.get_post(entry["slug"])
+            if existing and existing.get("date") != entry["date"]:
+                existing["date"] = entry["date"]
+                post_service.repo().put_json(post_service.post_key(entry["slug"]), existing)
+
         record = post_service.upsert_post(
             {
                 "slug": entry["slug"],

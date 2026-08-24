@@ -1,0 +1,125 @@
+<p>Start with the fact that changes what you do next: <strong>AWS closed CodeCommit to new customers
+on 25 July 2024.</strong> If your account does not already have a repository there, you cannot
+create one — the console and the API refuse. There was no announcement, no deprecation notice and
+no blog post; people found out when creating a repository stopped working.</p>
+
+<p>Existing customers can carry on. AWS has said it will keep running the service with security and
+availability updates, but no new features are planned. Nobody should be starting here in 2026, and
+this post is about the two situations you might actually be in.</p>
+
+<h2>If you are already on CodeCommit</h2>
+
+<p>You are not in danger. Your repositories work, you can still create additional ones, and the
+integrations with CodePipeline and CodeBuild are unchanged.</p>
+
+<p>What you have lost is a roadmap. No new features means no improvement to code review, no
+better search, and no reason to expect the gap with GitHub and GitLab to narrow. A service in that
+state is a migration you will do eventually, so it is worth doing it on a calm week rather than a
+forced one.</p>
+
+<p>The good news is that git makes this genuinely easy. A repository is a repository:</p>
+
+<pre class="language-bash"><code class="language-bash">git clone --mirror https://git-codecommit.us-west-2.amazonaws.com/v1/repos/stayhub
+cd stayhub.git
+git remote add github git@github.com:folaulau/stayhub.git
+git push github --mirror</code></pre>
+
+<p><code>--mirror</code> is the flag that matters: it moves every branch, every tag and the full
+history, rather than the single branch a plain clone gives you.</p>
+
+<p>What does not move is everything around the code — pull requests, comments, approval rules and
+triggers. There is no export for those. Plan to leave the CodeCommit repository readable for a
+while so old review discussion stays reachable, rather than expecting to carry it across.</p>
+
+<h2>What to use instead</h2>
+
+<p>AWS's own recommendation is GitHub, GitLab, or a third-party provider.</p>
+
+<table>
+  <thead><tr><th>Option</th><th>Suits</th></tr></thead>
+  <tbody>
+    <tr><td><strong>GitHub</strong></td><td>Nearly everyone. The largest ecosystem, and GitHub
+        Actions is a complete CI system you do not have to assemble</td></tr>
+    <tr><td><strong>GitLab</strong></td><td>Teams wanting one tool for source, CI, registry and
+        issues, or a self-hosted option</td></tr>
+    <tr><td><strong>Bitbucket</strong></td><td>Teams already deep in Atlassian</td></tr>
+  </tbody>
+</table>
+
+<p>This site's frontend is a public GitHub repository deployed by GitHub Actions, which is the
+shape most small projects should copy.</p>
+
+<h2>Connecting GitHub to AWS properly</h2>
+
+<p>If you keep using CodePipeline or CodeBuild with an external repository, connect them through a
+<strong>CodeConnections</strong> connection rather than a personal access token. A token is a
+long-lived credential sitting in your AWS account; a connection is an OAuth-style link you
+authorise once and can revoke from either side.</p>
+
+<pre class="language-bash"><code class="language-bash">aws codeconnections create-connection \
+  --provider-type GitHub --connection-name github-folaulau
+
+aws codeconnections list-connections \
+  --query "Connections[].[ConnectionName,ConnectionStatus,ConnectionArn]" --output table</code></pre>
+
+<p>A new connection is created in <code>PENDING</code> and stays there until someone completes the
+handshake in the console — the CLI cannot finish it, which surprises people scripting this. Nothing
+using the connection works until its status is <code>AVAILABLE</code>.</p>
+
+<h2>Going the other way: AWS credentials in GitHub Actions</h2>
+
+<p>If you move CI to GitHub as well, the same principle applies in reverse. Do not put an access
+key in repository secrets — use OIDC, so GitHub's workflow assumes an IAM role directly and no
+long-lived credential exists anywhere:</p>
+
+<pre class="language-yaml"><code class="language-yaml">permissions:
+  id-token: write
+  contents: read
+
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::111122223333:role/github-actions-deploy
+      aws-region: us-west-2</code></pre>
+
+<p>The role's trust policy names GitHub's OIDC provider and restricts which repository and branch
+may assume it. Scope that condition to a specific repo — a trust policy allowing any repository is
+a role anyone on GitHub can assume.</p>
+
+<h2>Checking what you have</h2>
+
+<p>If you inherited an account and want to know whether CodeCommit is in the picture at all, the
+list is one call per region — and repositories are regional, so a repository in a region you do not
+normally look at is easy to miss:</p>
+
+<pre class="language-bash"><code class="language-bash">aws codecommit list-repositories --region us-west-2 \
+  --query "repositories[].repositoryName" --output text</code></pre>
+
+<p>An empty list in every region means the account never onboarded, and the decision is made for
+you: there is nothing to migrate and nothing you could create.</p>
+
+<p>If repositories do exist, check when each was last written to before planning anything. A large
+share of CodeCommit repositories in long-lived accounts are abandoned experiments, and archiving
+those to S3 is much less work than migrating them:</p>
+
+<pre class="language-bash"><code class="language-bash">aws codecommit get-branch --repository-name stayhub --branch-name main \
+  --query "branch.commitId"</code></pre>
+
+<h2>The wider lesson</h2>
+
+<p>CodeCommit was not the only one. Cloud9 closed the same day, and other services have quietly
+stopped taking new customers since.</p>
+
+<p>The practical takeaway is not "distrust AWS" but a design rule: prefer the services with obvious
+portability for things that are not your differentiator. Source control on git is portable by
+construction, which is why this migration is a <code>git push</code> rather than a project.
+Something built on a proprietary format would not have been.</p>
+
+<p>It is also worth noticing how the closure was communicated, because it tells you what to watch
+for. There was no deprecation notice and no end-of-life date — the service simply stopped accepting
+new customers, and everything already running kept running. That pattern is invisible if you only
+look at your own account, where nothing changed.</p>
+
+<p>The cheap habit that catches it: when you pick a managed service for something central, check
+that it still has recent feature announcements. A service that has shipped nothing in two years is
+telling you something, whether or not anyone has written it down.</p>

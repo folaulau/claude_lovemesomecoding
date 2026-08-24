@@ -1,0 +1,165 @@
+<p>Without an index, answering a query means reading every document in the collection. With the
+right one, MongoDB jumps straight to the answers. The gap between those two is the difference
+between an application that scales and one that falls over at a few hundred thousand documents.</p>
+
+<p>Creating an index is one line. Creating the <em>right</em> one comes down to a rule about field
+order, and to reading one command&rsquo;s output.</p>
+
+<h2>The kinds you will actually use</h2>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.createIndex({ slug: 1 }, { unique: true })          // single field, unique
+db.reels.createIndex({ status: 1, publishedAt: -1 })          // compound
+db.reels.createIndex({ tags: 1 })                             // multikey (tags is an array)
+db.reels.createIndex({ title: "text" })                       // text
+db.view_events.createIndex({ ts: 1 }, { expireAfterSeconds: 7776000 })   // TTL</code></pre>
+
+<p><code>1</code> is ascending, <code>-1</code> descending. On a single-field index the direction
+does not matter &mdash; MongoDB can walk it either way. On a compound index it matters a great
+deal, and that is the next section.</p>
+
+<p>Three of these have a wrinkle worth knowing now. A <strong>multikey</strong> index is not a
+separate type you ask for: index an array field and MongoDB indexes one entry per element
+automatically, which is what makes <code>{ tags: "motorsport" }</code> a seek. A
+<strong>unique</strong> index counts a missing field as <code>null</code>, so a second document
+without that field collides with the first &mdash; use a <em>partial</em> index to allow many.
+And a <strong>TTL</strong> index deletes documents rather than just indexing them, which is either
+exactly what you want or a surprise you will only have once.</p>
+
+<h2>ESR: the rule that decides field order</h2>
+
+<p>A compound index is one ordered structure, not several indexes bolted together. Its usefulness
+depends entirely on the order of its fields, and the rule is <strong>Equality, Sort, Range</strong>:
+fields matched exactly go first, then fields you sort by, then fields matched as a range.</p>
+
+<p>ReelCMS&rsquo;s feed query is the worked example. It filters on an exact status and sorts by
+date:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ status: "PUBLISHED" }).sort({ publishedAt: -1 })</code></pre>
+
+<p>Equality on <code>status</code>, sort on <code>publishedAt</code> &mdash; so the index is
+declared in that order:</p>
+
+<pre class="language-java"><code class="language-java">reels.createIndex(new Index().on("status", Sort.Direction.ASC).on("publishedAt", Sort.Direction.DESC));</code></pre>
+
+<p>Reverse those two fields and MongoDB can still use the index &mdash; but it can no longer supply
+the ordering, so it has to sort the matched documents afterwards, in memory. That path is capped at
+32 MB and <strong>fails the query outright</strong> once the result set exceeds it. An index that
+works in development and errors in production is usually this.</p>
+
+<h2>Reading explain()</h2>
+
+<p><code>explain()</code> is how you stop guessing. The useful mode is
+<code>"executionStats"</code>, which runs the query and reports what it actually did:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ status: "PUBLISHED" }).sort({ publishedAt: -1 }).explain("executionStats")</code></pre>
+
+<p>Run against ReelCMS, the parts that matter come back like this:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "winningPlan":  { "stage": "FETCH", "inputStage": { "stage": "IXSCAN",
+                    "indexName": "status_1_publishedAt_-1" } },
+  "executionStats": { "totalKeysExamined": 12, "totalDocsExamined": 12, "nReturned": 12 }
+}</code></pre>
+
+<p>Three things to check, in order of importance:</p>
+
+<ol>
+  <li><strong>IXSCAN, not COLLSCAN.</strong> <code>COLLSCAN</code> means every document was read.
+      On a small collection it is fine and fast; it is also a time bomb.</li>
+  <li><strong>No SORT stage.</strong> A <code>SORT</code> above the scan means the index did not
+      supply the ordering &mdash; the 32 MB problem above. Here there is none: the plan is
+      <code>FETCH</code> over <code>IXSCAN</code> and nothing else.</li>
+  <li><strong>keysExamined ≈ nReturned.</strong> This is the quality measure, and the one people
+      skip. Twelve keys examined, twelve documents returned: a perfect ratio, nothing read and
+      thrown away. Examine ten thousand keys to return ten documents and the index is being used
+      but is the wrong shape.</li>
+</ol>
+
+<p>That third ratio is the number to watch as data grows. It degrades quietly, long before anything
+times out.</p>
+
+<h2>The prefix rule &mdash; why you need fewer indexes than you think</h2>
+
+<p>A compound index serves any query that uses a <strong>left-hand prefix</strong> of its fields.
+One index on three fields therefore covers three cases:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.createIndex({ "creator._id": 1, status: 1, publishedAt: -1 })
+
+db.reels.find({ "creator._id": id })                                  // ✓ uses it
+db.reels.find({ "creator._id": id, status: "PUBLISHED" })             // ✓ uses it
+db.reels.find({ "creator._id": id, status: "PUBLISHED" }).sort({ publishedAt: -1 })  // ✓ uses it
+
+db.reels.find({ status: "PUBLISHED" })                                // ✗ skips the first field</code></pre>
+
+<p>The last one cannot use it. An index is ordered by its first field, then its second within that,
+and so on &mdash; skipping the leading field is like looking up a surname in a phone book indexed
+by first name. That is why ReelCMS has a <em>separate</em> <code>{status, publishedAt}</code> index
+even though those fields already appear inside the three-field one.</p>
+
+<p>Practically: create indexes for query <em>shapes</em>, not for fields, and check whether a shape
+is already a prefix of something you have before adding another. Two well-ordered compound indexes
+routinely replace five single-field ones.</p>
+
+<h2>Covered queries</h2>
+
+<p>If an index contains every field a query needs, MongoDB can answer from the index alone and skip
+reading documents entirely. The plan shows <code>PROJECTION_COVERED</code> and no
+<code>FETCH</code>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.createIndex({ status: 1, publishedAt: -1, slug: 1 })
+db.reels.find({ status: "PUBLISHED" }, { slug: 1, _id: 0 }).sort({ publishedAt: -1 })
+// totalDocsExamined: 0</code></pre>
+
+<p>Note <code>_id: 0</code>. Without excluding it the query needs a field the index does not carry,
+and the coverage is lost. This is worth reaching for on a hot endpoint that returns a few fields
+from large documents; it is not worth distorting an index to achieve.</p>
+
+<h2>Partial and sparse</h2>
+
+<p>A partial index covers only documents matching a filter. It is smaller, cheaper to maintain, and
+the correct way to make &ldquo;unique when present&rdquo; work:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.createIndex(
+  { publishedAt: -1 },
+  { partialFilterExpression: { status: "PUBLISHED" } }
+)</code></pre>
+
+<p>The catch is that MongoDB will only use it when the query <em>provably</em> stays inside the
+filter &mdash; a query with no <code>status</code> condition cannot use the index above, even if
+every matching document happens to be published. Prefer <code>partialFilterExpression</code> to the
+older <code>sparse</code> option, which is a blunter version of the same idea.</p>
+
+<h2>Building indexes without an outage</h2>
+
+<p>Two practical points about production. Index builds since MongoDB 4.2 do not block reads and
+writes for their duration, but they do consume I/O and memory, so a build on a large collection is
+still a maintenance-window decision. And every index makes writes slower and takes memory
+&mdash; indexes are not free, and an unused one is pure cost:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.aggregate([{ $indexStats: {} }])   // usage count per index, since server start
+db.reels.dropIndex("tags_1_publishedAt_-1")</code></pre>
+
+<p><code>$indexStats</code> is the one to run before a tuning session. An index with an
+<code>accesses.ops</code> of zero after a week of production traffic is a write penalty you are
+paying for nothing.</p>
+
+<p>One last thing about where indexes are declared. ReelCMS puts every one of them in a single
+class rather than scattering <code>@Indexed</code> annotations across its entities, and turns
+Spring Data&rsquo;s auto-index-creation off. The reason is operational: an annotation that
+silently triggers an index build against a live collection is a production incident that starts as
+a one-line diff. Having the whole index strategy in one file is also the only way anyone ever
+reviews it.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Compound index field order follows <strong>Equality, Sort, Range</strong>.</li>
+  <li>Wrong order still uses the index but sorts in memory &mdash; capped at 32 MB, then it
+      fails.</li>
+  <li><code>explain("executionStats")</code>: want IXSCAN, no SORT, and keysExamined close to
+      nReturned.</li>
+  <li>Indexing an array gives you a multikey index automatically.</li>
+  <li>A unique index treats missing as null; use <code>partialFilterExpression</code> for
+      &ldquo;unique when present&rdquo;.</li>
+  <li>Every index slows writes. Check <code>$indexStats</code> and drop the unused ones.</li>
+</ul>

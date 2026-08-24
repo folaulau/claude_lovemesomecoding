@@ -1,0 +1,157 @@
+<p>A development instance that runs nights and weekends is idle for about two thirds of the hours
+you pay for. Shutting it down on a schedule is twenty lines of code, and unlike the equivalent
+trick for RDS there is no seven-day limit to work around — a stopped EC2 instance stays stopped.</p>
+
+<h2>What stopping actually saves</h2>
+
+<p>You stop paying for instance hours immediately. You keep paying for:</p>
+
+<ul>
+  <li><strong>EBS volumes.</strong> The root volume still exists and still bills at the full
+      per-GB rate. This is the bulk of the remaining cost</li>
+  <li><strong>Elastic IPs</strong>, if one is allocated — and an idle Elastic IP is charged
+      whether or not it is attached</li>
+  <li>Snapshots and AMIs you have taken</li>
+</ul>
+
+<p>Anything on an instance store volume is <strong>destroyed</strong> on stop, not preserved. That
+is a property of the storage type, not a bug, and it is worth knowing before you stop something
+with scratch data on it.</p>
+
+<h2>The handler</h2>
+
+<pre class="language-python"><code class="language-python">import boto3
+
+ec2 = boto3.client("ec2")
+
+TAG_KEY = "Schedule"
+TAG_VALUE = "nightly-stop"
+
+
+def lambda_handler(event, context):
+    response = ec2.describe_instances(
+        Filters=[
+            {"Name": f"tag:{TAG_KEY}", "Values": [TAG_VALUE]},
+            {"Name": "instance-state-name", "Values": ["running"]},
+        ]
+    )
+
+    ids = [
+        instance["InstanceId"]
+        for reservation in response["Reservations"]
+        for instance in reservation["Instances"]
+    ]
+
+    if not ids:
+        print("nothing tagged and running")
+        return {"stopped": []}
+
+    ec2.stop_instances(InstanceIds=ids)
+    print(f"stopping: {ids}")
+    return {"stopped": ids}</code></pre>
+
+<p>Filtering server-side rather than fetching everything and matching in Python is the difference
+between one API call and a paginated sweep of the account. The state filter matters too:
+<code>stop_instances</code> on an already-stopped instance is harmless, but including them makes
+the log useless for telling whether the schedule did anything.</p>
+
+<h2>The bug worth being afraid of</h2>
+
+<p><strong>An empty filter list is not a filter that matches nothing. It is no filter at all.</strong></p>
+
+<p>If you build filters conditionally and the tag value ends up unset, you can produce
+<code>describe_instances(Filters=[])</code> — which returns <em>every instance in the region</em>.
+The next line then stops all of them. The code looks correct, the tests pass with a tag present,
+and the failure only appears the first time a config value is missing.</p>
+
+<p>So guard the result, not the input:</p>
+
+<pre class="language-python"><code class="language-python">if not TAG_VALUE:
+    raise RuntimeError("TAG_VALUE is empty — refusing to run an unfiltered stop")</code></pre>
+
+<p>And do the same thing in IAM, where a bug cannot reach at all.</p>
+
+<h2>The IAM policy</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "FindInstances",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeInstances",
+      "Resource": "*"
+    },
+    {
+      "Sid": "StopOnlyTaggedInstances",
+      "Effect": "Allow",
+      "Action": "ec2:StopInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/Schedule": "nightly-stop" }
+      }
+    }
+  ]
+}</code></pre>
+
+<p><code>ec2:DescribeInstances</code> cannot be scoped to a resource — the describe actions do not
+support resource-level permissions, so it is <code>"*"</code> and that is fine, because reading is
+not what you are worried about. <code>ec2:StopInstances</code> does support them, and the condition
+is what makes the unfiltered-stop bug above unable to touch production.</p>
+
+<h2>The schedule</h2>
+
+<pre class="language-bash"><code class="language-bash">aws scheduler create-schedule \
+  --name ec2-nightly-stop \
+  --schedule-expression "cron(0 19 ? * MON-FRI *)" \
+  --schedule-expression-timezone "America/Denver" \
+  --flexible-time-window "Mode=OFF" \
+  --target '{"Arn":"arn:aws:lambda:us-west-2:111122223333:function:ec2-nightly-stop","RoleArn":"arn:aws:iam::111122223333:role/scheduler-invoke"}'</code></pre>
+
+<p>Stopping on weekday evenings only is deliberate: pair it with a weekday-morning start and the
+instance stays down all weekend, which is the largest single saving available.</p>
+
+<h2>Stopping is not killing</h2>
+
+<p><code>stop_instances</code> asks the guest operating system to shut down. Anything running gets
+the usual signals and a chance to finish, which means a long build or a batch job may still be
+mid-flight when the schedule fires — and a database on that instance may be mid-write.</p>
+
+<p>If that is a real risk, the answer is not to skip the schedule, it is to make the instance safe
+to stop at any moment: write work to durable storage rather than to local disk, and run anything
+long under something that can resume. An instance you are afraid to stop is one you cannot patch
+either.</p>
+
+<p>Two escape hatches worth knowing. Tagging is the intended way to opt out, so removing the tag
+takes an instance off the schedule with no code change. And for the case where a stop must never
+happen, EC2 has explicit stop protection:</p>
+
+<pre class="language-bash"><code class="language-bash">aws ec2 modify-instance-attribute --instance-id i-0abc123def456 --disable-api-stop</code></pre>
+
+<p>With that set, the API call fails rather than succeeding quietly, which is the behaviour you
+want for anything that matters.</p>
+
+<h2>Checking it worked</h2>
+
+<pre class="language-bash"><code class="language-bash">aws ec2 describe-instances \
+  --filters "Name=tag:Schedule,Values=nightly-stop" \
+  --query "Reservations[].Instances[].[InstanceId,State.Name]" \
+  --output table</code></pre>
+
+<p>The transition is <code>running</code> → <code>stopping</code> → <code>stopped</code>, and it
+takes a minute or two because the operating system is asked to shut down cleanly first. If an
+instance sits in <code>stopping</code> for a long time, the guest is refusing to halt; a forced
+stop is available and is the equivalent of pulling the power.</p>
+
+<h2>Is it worth it?</h2>
+
+<p>Do the arithmetic before you build it. A week is 168 hours; running 7:45am to 7pm on weekdays
+is 56.25 hours, so the instance is up about a third of the time and you save roughly two thirds of
+the instance-hour line.</p>
+
+<p>How much of the bill that actually is depends on the volume attached. A t3.large with a 30 GB
+gp3 root volume is overwhelmingly compute, so the saving is close to the headline. The same
+instance with a 2 TB volume is mostly storage, and stopping it saves far less than you would
+guess. Group Cost Explorer by usage type and look before you build.</p>
+
+<p>The companion post covers starting them again, which is where the scheduling detail lives.</p>

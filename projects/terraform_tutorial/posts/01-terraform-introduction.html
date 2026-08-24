@@ -1,0 +1,201 @@
+<p>You need a server, a database and a load balancer. You open the AWS console, click through four
+wizards, and twenty minutes later it works. Then someone asks you to build the same thing again for
+staging, and you cannot — because you do not remember which of the forty checkboxes you ticked.</p>
+
+<p>Terraform is the answer to that. You write down what the infrastructure should be, in a file, and
+a tool makes reality match. The file goes in git, so "what changed?" and "who changed it?" become
+questions with answers.</p>
+
+<h2>What infrastructure as code actually buys you</h2>
+
+<p>Not "automation" — you can automate with a shell script. Four specific things:</p>
+
+<p><strong>It is repeatable.</strong> The same file produces the same infrastructure in staging and
+production. The difference between them is a variable, not a memory.</p>
+
+<p><strong>It is reviewable.</strong> "Open port 22 to the world" is a line in a pull request that a
+colleague can object to, rather than something that happened in a console at 11pm.</p>
+
+<p><strong>It is reversible.</strong> The previous version of the file is in git, and applying it
+puts things back.</p>
+
+<p><strong>It tells you what it is about to do.</strong> This is the part people underestimate.
+Terraform shows you the diff — create these six, change this one, <em>destroy that database</em> —
+and waits. Most of the value is in reading that output and saying no.</p>
+
+<h2>The idea, in one loop</h2>
+
+<p>Terraform holds three things and reconciles them:</p>
+
+<pre class="language-bash"><code class="language-bash">your .tf files      what you want
+terraform state     what Terraform believes it built
+the real AWS API    what is actually there
+
+plan  = compare all three, print the difference
+apply = make the difference go away</code></pre>
+
+<p>That is the whole tool. Everything else — modules, variables, backends — is about keeping that
+loop manageable as the amount of infrastructure grows.</p>
+
+<p>It matters that Terraform is <strong>declarative</strong>. You do not write "create a VPC". You
+write "a VPC exists, with this CIDR", and Terraform works out whether that means creating one,
+changing one, or doing nothing. Run it twice and the second run does nothing, which is the property
+a shell script full of <code>aws ec2 create-vpc</code> does not have.</p>
+
+<h2>What it looks like</h2>
+
+<p>Here is a real resource from the stack this track deploys later. You do not need to follow the
+details yet — just the shape:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_ecs_cluster" "this" {
+  name = "pizza-tf"
+
+  tags = {
+    Project = "terraform-tutorial"
+  }
+}</code></pre>
+
+<p>A block type (<code>resource</code>), a resource type (<code>aws_ecs_cluster</code>), a name you
+choose (<code>this</code>), and arguments. Roughly every line of Terraform you will ever write is
+that shape.</p>
+
+<h2>Where Terraform sits next to the alternatives</h2>
+
+<p>These get compared constantly and the comparisons are usually unfair. The honest version:</p>
+
+<p><strong>CloudFormation</strong> is AWS's own, in YAML or JSON. It is free, deeply integrated, and
+AWS supports new services there first. It is also AWS-only, and its error messages and rollback
+behaviour are widely disliked. If you are certain you will never touch a second cloud or a
+non-cloud provider, it is a reasonable choice.</p>
+
+<p><strong>AWS CDK</strong> is CloudFormation with TypeScript or Python in front of it. You get
+loops, types and an IDE. You also get a compile step, and the thing that actually deploys is still
+CloudFormation — so you debug generated templates when it goes wrong.</p>
+
+<p><strong>Pulumi</strong> is the same idea as CDK but multi-cloud and not built on CloudFormation.
+Genuinely good. Much smaller ecosystem, and a real programming language means real programs, which
+means infrastructure code with bugs in its control flow.</p>
+
+<p><strong>Ansible</strong> is a different category and the comparison is a category error.
+Terraform <em>provisions</em> — it creates the server. Ansible <em>configures</em> — it installs
+packages on a server that exists. They are often used together. Ansible can create AWS resources,
+but it has no plan step and no state, so it cannot tell you what it is about to change.</p>
+
+<p>Terraform's actual advantage is the <strong>provider ecosystem</strong>: AWS, GCP, Azure,
+Cloudflare, Datadog, GitHub, Kubernetes and several thousand more, all driven by the same language
+and the same plan/apply loop. Most real systems are not one vendor.</p>
+
+<h2>The licence changed, and there is a fork</h2>
+
+<p>You need to know this because every tutorial written before August 2023 gets it wrong by
+omission.</p>
+
+<p>On 2023-08-10 HashiCorp moved Terraform from the MPL 2.0 open source licence to the
+<strong>Business Source License</strong>. In practice the BSL restricts using Terraform to build a
+competing commercial product; for the overwhelming majority of users — companies managing their own
+infrastructure — nothing changed and it remains free to use.</p>
+
+<p>The reaction was a fork of the last MPL commit, now a Linux Foundation project called
+<strong>OpenTofu</strong>. It is a drop-in replacement for most usage: same HCL, same providers,
+<code>tofu</code> instead of <code>terraform</code>.</p>
+
+<p>This track uses Terraform, and everything in it applies to OpenTofu with the binary renamed. If
+your employer has a policy about the BSL, OpenTofu is the answer; otherwise the choice rarely
+matters day to day. That is the whole of the politics, and it will not come up again.</p>
+
+<h2>The versions this is written against</h2>
+
+<p>Infrastructure content rots faster than almost anything else — arguments get renamed, resources
+move, defaults change. So: exact versions, read off the machine that wrote this, not copied from a
+docs page.</p>
+
+<pre class="language-bash"><code class="language-bash">terraform    1.15.9
+aws provider 6.61.0        (hashicorp/aws)
+aws cli      2.32.24
+region       us-west-2</code></pre>
+
+<p>Two things in particular are worth knowing are recent, because the internet is full of advice
+that predates them:</p>
+
+<ul>
+  <li><strong>State locking no longer needs DynamoDB.</strong> Terraform 1.10 added native locking
+  on S3, and 1.11 made it the default and deprecated the <code>dynamodb_table</code> argument. Every
+  older tutorial tells you to create a lock table. Lesson 8 explains what to do instead.</li>
+  <li><strong>The AWS provider is on major version 6.</strong> Version 4 and 5 examples frequently
+  fail to plan, most visibly around S3 bucket configuration, which was split from one resource into
+  about a dozen.</li>
+</ul>
+
+<h2>The application this deploys</h2>
+
+<p>The AWS lessons are not abstract. They deploy a real Spring Boot application — a pizza ordering
+API with MySQL, Liquibase migrations, JWT auth and Stripe payments — to ECS Fargate behind an
+application load balancer, with a GitHub Actions pipeline in front of it.</p>
+
+<p>Everything quoted in those lessons came from a stack that was <strong>actually applied to a real
+AWS account, checked through the load balancer, and then destroyed.</strong> Where something broke,
+the lesson says what broke and what the error looked like, because the errors are the part worth
+having read before you meet them.</p>
+
+<h2>What you need before lesson 2</h2>
+
+<ul>
+  <li>An AWS account you are allowed to create things in.</li>
+  <li>The AWS CLI, configured — <code>aws sts get-caller-identity</code> should return your
+  account.</li>
+  <li>A willingness to spend a few dollars. The AWS lessons build a load balancer, a NAT gateway
+  and an RDS instance, which together cost about <strong>$0.13/hour</strong> and are outside the
+  free tier. Every lesson that creates something says what it costs and ends by destroying it.</li>
+</ul>
+
+<h2>The track</h2>
+
+<p>Sixteen lessons, in reading order. The first eleven are the language and the tool; the last five
+are a real deployment.</p>
+
+<p><strong>Foundations</strong></p>
+<ol>
+  <li><a href="/terraform/terraform-introduction">Terraform – What It Is and Why It Exists</a>
+  <em>(you are here)</em></li>
+  <li><a href="/terraform/terraform-fundamentals">Install It and Run Your First Apply</a> — the
+  <code>init</code> → <code>plan</code> → <code>apply</code> → <code>destroy</code> loop</li>
+  <li><a href="/terraform/terraform-hcl-syntax">HCL Syntax You Will Actually Use</a> — blocks,
+  types, expressions, functions</li>
+  <li><a href="/terraform/terraform-providers">Providers, Versions and the Lock File</a> — pinning,
+  and why the lock file is committed</li>
+  <li><a href="/terraform/terraform-resources-and-state">Resources and the State File</a> — what
+  state is, and the commands for when it disagrees with reality</li>
+</ol>
+
+<p><strong>Making it reusable</strong></p>
+<ol start="6">
+  <li><a href="/terraform/terraform-variables-and-outputs">Variables, Locals and Outputs</a> —
+  typed inputs, validation, and what <code>sensitive</code> does not do</li>
+  <li><a href="/terraform/terraform-data-sources">Data Sources</a> — reading infrastructure you did
+  not create</li>
+  <li><a href="/terraform/terraform-remote-state">Remote State and Locking on S3</a> — and why the
+  DynamoDB table everyone tells you to create is obsolete</li>
+  <li><a href="/terraform/terraform-loops-and-conditionals">count, for_each and Dynamic Blocks</a>
+  — and the reason <code>count</code> will destroy half your resources</li>
+  <li><a href="/terraform/terraform-modules">Writing and Using Modules</a> — including when not
+  to</li>
+  <li><a href="/terraform/terraform-environments-and-workspaces">Dev, Staging and Prod Without
+  Copy-Paste</a> — why workspaces are a trap for production</li>
+</ol>
+
+<p><strong>A real deployment on AWS</strong></p>
+<ol start="12">
+  <li><a href="/terraform/terraform-with-aws">Building the Network and Database</a> — VPC, subnets,
+  security groups, RDS, and keeping the password out of the state file</li>
+  <li><a href="/terraform/terraform-ecs-fargate-deploy">Deploying a Spring Boot API to ECS
+  Fargate</a> — ECR, task definitions, the load balancer, and the health check that has to be
+  exactly right</li>
+  <li><a href="/terraform/terraform-github-actions-cicd">A CI/CD Pipeline in GitHub Actions</a> —
+  plan on the PR, apply on merge, and no stored AWS keys</li>
+  <li><a href="/terraform/terraform-production-practices">Running It in Production</a> — drift,
+  secrets, <code>prevent_destroy</code>, and reading a plan properly</li>
+  <li><a href="/terraform/terraform-interview-questions">Interview Questions</a></li>
+</ol>
+
+<p>Start with <a href="/terraform/terraform-fundamentals">lesson 2</a>, which installs the thing and
+creates something real in about ten minutes.</p>

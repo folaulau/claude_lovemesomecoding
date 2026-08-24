@@ -1,0 +1,441 @@
+<p>The network and database from <a href="/terraform/terraform-with-aws">lesson 12</a> are up. This
+lesson puts the pizza API on them: a registry, a task definition, a Fargate service and a load
+balancer.</p>
+
+<p>It also covers the two things that went wrong on the real run, because both are the kind of
+failure that wastes an afternoon and neither produces an error message that says what is wrong.</p>
+
+<h2>ECR</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_ecr_repository" "this" {
+  name = var.name_prefix
+
+  # Pushing :abc123 twice becomes an error rather than silently moving the tag.
+  # It is what makes "which image is running?" a question with an answer.
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  # So `terraform destroy` works. Default is false, and ECR refuses to delete a
+  # repository that still has images in it — which it always will by then.
+  force_delete = true
+}
+
+resource "aws_ecr_lifecycle_policy" "this" {
+  repository = aws_ecr_repository.this.name
+
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Expire untagged images after 1 day"
+      selection = {
+        tagStatus   = "untagged"
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        countNumber = 1
+      }
+      action = { type = "expire" }
+    }]
+  })
+}</code></pre>
+
+<p>Untagged layers accumulate on every rebuild and are billed per GB. Without the lifecycle policy a
+busy pipeline quietly grows a storage bill nobody is looking at.</p>
+
+<h2>⚠️ The chicken and egg</h2>
+
+<p>The ECS service references an image, in a repository, that does not exist yet. The first apply
+cannot work in one shot.</p>
+
+<pre class="language-bash"><code class="language-bash"># 1. the registry alone. One of the few legitimate uses of -target, which
+#    Terraform warns about and is right to.
+terraform apply -target=module.service.aws_ecr_repository.this
+
+# 2. build and push
+SHA=$(git rev-parse --short HEAD)
+aws ecr get-login-password --region us-west-2 \
+  | docker login --username AWS --password-stdin 329580012644.dkr.ecr.us-west-2.amazonaws.com
+docker buildx build --platform linux/arm64 \
+  -t 329580012644.dkr.ecr.us-west-2.amazonaws.com/pizza-tf:$SHA --push .
+
+# 3. everything else
+terraform apply -var "image_tag=$SHA"</code></pre>
+
+<h2>⚠️ Architecture: get this wrong and the task dies silently</h2>
+
+<p>Fargate defaults to X86_64. If you build on an Apple Silicon Mac and do not say otherwise, the
+task starts, the kernel refuses the binary, and CloudWatch says:</p>
+
+<pre class="language-bash"><code class="language-bash">exec /usr/bin/java: exec format error</code></pre>
+
+<p>ECS does not check the architecture at deploy time. It finds out when the process will not run. So
+state it explicitly rather than letting it default:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_ecs_task_definition" "this" {
+  family = var.name_prefix
+
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"     # 0.5 vCPU
+  memory                   = "1024"    # valid pairings are fixed: 512 CPU allows 1024-4096
+
+  runtime_platform {
+    cpu_architecture        = "ARM64"
+    operating_system_family = "LINUX"
+  }
+
+  # The full container definition is below; this much is enough to plan.
+  container_definitions = jsonencode([{
+    name      = "api"
+    image     = "example:latest"
+    essential = true
+  }])
+}</code></pre>
+
+<p>This stack uses <strong>ARM64</strong>, for three reasons in order of weight: Fargate on Graviton
+is about 20% cheaper, the build is native on an Apple Silicon machine, and GitHub now offers free
+arm64 runners so CI is native too.</p>
+
+<p>The x86 route was tried first and does not work from a Mac on this Dockerfile:</p>
+
+<pre class="language-bash"><code class="language-bash">$ docker buildx build --platform linux/amd64 ...
+
+tar: apache-maven-3.9.16/lib/asm-9.9.1.jar: Cannot open: Function not implemented
+tar: Exiting with failure status due to previous errors
+ERROR: failed to solve: process "/bin/sh -c ./mvnw -B clean package -DskipTests"
+       did not complete successfully: exit code: 1</code></pre>
+
+<p>That is QEMU's amd64 emulation missing a syscall GNU tar uses, inside the Maven wrapper's own
+bootstrap — nothing to do with the Dockerfile. Cross-building x86 from ARM needs either a
+<code>--platform=$BUILDPLATFORM</code> build stage or a jar built on the host. The native arm64 build
+took <strong>2m23s</strong> including the push.</p>
+
+<h2>Two IAM roles, and why</h2>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_iam_policy_document" "ecs_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "execution" {
+  name               = "${var.name_prefix}-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+resource "aws_iam_role" "task" {
+  name               = "${var.name_prefix}-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}</code></pre>
+
+<pre class="language-bash"><code class="language-bash">execution role   assumed by the ECS AGENT, BEFORE your container starts.
+                 pulls the image, fetches secrets, creates log streams.
+
+task role        assumed by YOUR CODE, once running. what the AWS SDK
+                 inside the application picks up.</code></pre>
+
+<p>Giving the application the execution role is a common shortcut, and it hands your code the ability
+to read every secret the task uses. Here the task role carries <strong>no policies at all</strong> —
+the pizza API does not call AWS — which is the correct amount of permission.</p>
+
+<p>The managed policy covers ECR and logs. Reading secrets is <em>not</em> in it:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_iam_role_policy_attachment" "execution_managed" {
+  role       = aws_iam_role.execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# ⚠️ Its absence is one of the most confusing ECS failures there is: the task
+# stops during provisioning with ResourceInitializationError and the application
+# logs are EMPTY, because the container never started.
+data "aws_iam_policy_document" "execution_secrets" {
+  statement {
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      aws_secretsmanager_secret.jwt.arn,
+      var.db_secret_arn,
+    ]
+  }
+}</code></pre>
+
+<p>Scoped to exactly those two ARNs, not <code>"*"</code>.</p>
+
+<h2>Secrets in the task definition</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "random_password" "jwt" {
+  length = 64
+
+  # No punctuation. The value reaches the app through an environment variable,
+  # and a shell-quoting bug anywhere along the way turns a $ or a ` into a silent
+  # truncation. 64 alphanumeric characters is ~380 bits.
+  special = false
+}
+
+resource "aws_secretsmanager_secret" "jwt" {
+  name = "${var.name_prefix}/jwt-secret"
+
+  # ⚠️ Secrets Manager SCHEDULES deletion, with a 30-day recovery window by
+  # default. A destroy followed by an apply then fails with "already scheduled
+  # for deletion", because the name is still taken. Zero forces it immediately,
+  # which is what a stack that gets torn down and rebuilt needs.
+  recovery_window_in_days = 0
+}</code></pre>
+
+<p>⚠️ Honest caveat, and the counterpart to lesson 12's RDS password: <strong>this value IS in the
+state file.</strong> <code>random_password</code> stores its result by definition — that is how it
+stays stable across applies. The genuinely state-free pattern is the RDS one, where AWS generates and
+owns the value.</p>
+
+<p>The container definition then splits plain configuration from secrets:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  container = [{
+    name      = "api"
+    image     = "${aws_ecr_repository.this.repository_url}:${var.image_tag}"
+    essential = true
+
+    portMappings = [{ containerPort = 8085, protocol = "tcp" }]
+
+    # Visible to anyone who can call DescribeTaskDefinition. Nothing secret here.
+    environment = [
+      # Deliberately NOT "local": application.properties defaults to the `local`
+      # profile, whose properties file is GITIGNORED — so it is present in an
+      # image built on a laptop and absent from one built in CI. That difference
+      # is invisible until the two images behave differently.
+      { name = "SPRING_PROFILES_ACTIVE", value = "aws" },
+      { name = "SERVER_PORT", value = "8085" },
+    ]
+
+    # Resolved by the ECS AGENT before the container starts, using the execution
+    # role, and injected as environment variables. The values never appear in the
+    # task definition, in state, or in the console.
+    #
+    # The `:key::` suffix selects one field out of a JSON secret — RDS stores its
+    # managed password as {"username":…,"password":…}, so without it the app would
+    # receive the whole JSON document as its password. The two trailing colons are
+    # version-stage and version-id, left empty to mean "current", and are required
+    # even when empty.
+    secrets = [
+      { name = "SPRING_DATASOURCE_USERNAME", valueFrom = "${var.db_secret_arn}:username::" },
+      { name = "SPRING_DATASOURCE_PASSWORD", valueFrom = "${var.db_secret_arn}:password::" },
+      { name = "PIZZA_JWT_SECRET", valueFrom = aws_secretsmanager_secret.jwt.arn },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.this.name
+        "awslogs-region"        = data.aws_region.current.region
+        "awslogs-stream-prefix" = "ecs"
+      }
+    }
+  }]
+}</code></pre>
+
+<h2>⚠️ The health check has to be exactly right</h2>
+
+<p>This is where the real deployment first went wrong, and it is worth the space.</p>
+
+<p>An ALB target group polls a URL and <strong>kills the task</strong> if it does not get a 200. The
+obvious choice for a Spring Boot app is <code>/actuator/health</code>. Measured on this app, that
+returns:</p>
+
+<pre class="language-bash"><code class="language-bash">GET /actuator/health  ->  503  {"status":"DOWN"}
+
+  jms            DOWN   jakarta.jms.JMSException: Failed to create session factory
+  elasticsearch  UP     ... only because another container happened to be on :9200
+  diskSpace      UP</code></pre>
+
+<p>Spring Boot auto-configures a health indicator for <em>every optional dependency on the
+classpath</em> and aggregates them into one status. The pizza API has Artemis and Elasticsearch
+starters, neither of which is meant to be running here — so the aggregate is DOWN forever, the ALB
+reads that as unhealthy, and the service cycles tasks with nothing in the logs that mentions health
+checks.</p>
+
+<p>The fix is a health <strong>group</strong>, which is a whitelist rather than a blacklist:</p>
+
+<pre class="language-properties"><code class="language-properties">management.endpoints.web.exposure.include=health
+management.endpoint.health.show-details=never
+
+# `ping` is UP whenever the context is serving — exactly the question a load
+# balancer is asking. Disabling the failing indicators one at a time instead
+# would work today and break the next time somebody adds a starter.
+management.endpoint.health.group.alb.include=ping</code></pre>
+
+<p>And Spring Security has to permit the sub-path. Permitting the exact string
+<code>/actuator/health</code> leaves <code>/actuator/health/alb</code> returning <strong>403</strong>,
+which an ALB also reads as unhealthy:</p>
+
+<pre class="language-java"><code class="language-java">.requestMatchers("/actuator/health", "/actuator/health/**")
+.permitAll()</code></pre>
+
+<p>Then the target group:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_lb_target_group" "this" {
+  name     = var.name_prefix
+  port     = 8085
+  protocol = "HTTP"
+  vpc_id   = var.vpc_id
+
+  # ⚠️ "ip", not "instance". Fargate tasks use awsvpc networking and each gets
+  # its own ENI and private IP — there is no EC2 instance to register. With
+  # "instance" the service fails to register targets at all.
+  target_type = "ip"
+
+  health_check {
+    enabled             = true
+    path                = "/actuator/health/alb"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  # The default is 300s, which makes every deploy five minutes longer than it
+  # needs to be. This is how long the ALB waits for in-flight requests before
+  # removing a draining target.
+  deregistration_delay = 30
+}</code></pre>
+
+<h2>The service</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_ecs_service" "this" {
+  name            = var.name_prefix
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.this.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = var.private_subnet_ids
+    security_groups = [var.app_security_group_id]
+
+    # false, because the tasks are in private subnets and reach the internet
+    # through the NAT gateway. Setting this true in a private subnet does NOT
+    # help — there is no internet gateway route — and it is a common wrong fix
+    # for "cannot pull image", whose real cause is missing routing.
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.this.arn
+    container_name   = "api"
+    container_port   = 8085
+  }
+
+  # How long ECS waits before honouring the ALB health check at all. A Spring
+  # Boot app running Liquibase migrations needs well over the 0-second default,
+  # and without it the service kills each task just before it finishes booting.
+  health_check_grace_period_seconds = 180
+
+  # ⚠️ Without this, apply races IAM. ECS validates that it can assume the
+  # execution role at service-creation time, and IAM is eventually consistent —
+  # a role created moments earlier may not be visible yet. Terraform sees no
+  # dependency because the service references the role only indirectly.
+  depends_on = [
+    aws_lb_listener.http,
+    aws_iam_role_policy_attachment.execution_managed,
+  ]
+}</code></pre>
+
+<h2>⚠️ When the service cycles tasks forever</h2>
+
+<p>The second real failure, and the most valuable debugging lesson here.</p>
+
+<p>After the first apply the target flipped between states indefinitely:</p>
+
+<pre class="language-bash"><code class="language-bash">[1] initial   Elb.RegistrationInProgress
+[2] draining  Target.DeregistrationInProgress
+[3] draining  Target.DeregistrationInProgress
+[4] initial   Elb.RegistrationInProgress
+...</code></pre>
+
+<p>The ECS service events said only "registered 1 targets" and "has started 1 tasks". Nothing was
+wrong with the load balancer, the routing or the security groups.</p>
+
+<p><strong>The ECS console tells you a task stopped. It never tells you why.</strong> The exit code
+is one API call away:</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecs list-tasks --cluster pizza-tf --desired-status STOPPED
+aws ecs describe-tasks --cluster pizza-tf --tasks &lt;arn&gt; \
+  --query 'tasks[0].{stopped:stoppedReason,code:stopCode,exit:containers[0].exitCode}'
+
+{ "stopped": "Essential container in task exited",
+  "code": "EssentialContainerExited",
+  "exit": 1 }</code></pre>
+
+<p>Exit 1 means the container ran and the process failed — not an image, network or permissions
+problem. The cause was only ever in CloudWatch:</p>
+
+<pre class="language-bash"><code class="language-bash">APPLICATION FAILED TO START
+
+Property: pizza.cors.allowedOrigins
+Value: "[]"
+Reason: must not be empty</code></pre>
+
+<p>The module passed an empty string for the CORS origins, and the application declares that property
+<code>@NotEmpty</code>. The fix was to default it to the load balancer's own hostname — non-empty,
+and genuinely correct, since that is the origin the API is served from:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  # Non-empty by construction: fall back to the load balancer's own hostname.
+  cors_origin = var.cors_allowed_origins != "" ? var.cors_allowed_origins : "http://${aws_lb.this.dns_name}"
+}</code></pre>
+
+<p>…and then use <code>local.cors_origin</code> as the value of
+<code>PIZZA_CORS_ALLOWED_ORIGINS</code> in the <code>environment</code> list above.</p>
+
+<p>Referencing the ALB from the task definition is not a cycle — the load balancer does not depend on
+the task definition.</p>
+
+<p>The debugging order worth remembering:</p>
+
+<pre class="language-bash"><code class="language-bash">1. describe-services  -> events. usually unhelpful, but free.
+2. describe-tasks     -> stopCode and exitCode. THIS narrows it:
+                         ResourceInitializationError  = secrets/IAM/networking
+                         CannotPullContainerError     = ECR access or routing
+                         EssentialContainerExited + 1 = your app failed to start
+3. CloudWatch logs    -> the actual reason. always.</code></pre>
+
+<h2>It works</h2>
+
+<pre class="language-bash"><code class="language-bash">$ curl "$(terraform output -raw app_url)/actuator/health/alb"
+{"status":"UP"}
+
+$ curl "$(terraform output -raw app_url)/api/products" | jq 'length'
+14
+
+$ curl -o /dev/null -w '%{http_code}\n' "$(terraform output -raw app_url)/api/admin/users"
+403</code></pre>
+
+<p>Fourteen products proves more than routing: they came out of MySQL on RDS, which means Liquibase
+ran its migrations, which means the task resolved its credentials from Secrets Manager and connected.
+That is the entire secrets path proven by data rather than by a log line. And <code>403</code> on the
+admin endpoint shows security is intact through the load balancer.</p>
+
+<h2>Then destroy it</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform destroy</code></pre>
+
+<p>Then check, by name, rather than trusting the tag index:</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds describe-db-instances --db-instance-identifier pizza-tf-mysql   # NotFound
+aws ec2 describe-nat-gateways --filter Name=state,Values=available --query 'length(NatGateways)'
+aws elbv2 describe-load-balancers --query "length(LoadBalancers[?starts_with(LoadBalancerName,'pizza-tf')])"</code></pre>
+
+<p>⚠️ <strong>The Resource Groups Tagging API lies for a while after a destroy.</strong> It still
+listed the cluster, the service and the NAT gateway several minutes after all of them were gone. It
+is an index, and it lags — useful for <em>finding</em> things, not for proving their absence.</p>
+
+<h2>Next</h2>
+
+<p>Deploying by hand does not scale past one person.
+<a href="/terraform/terraform-github-actions-cicd">Lesson 14</a> puts this in a pipeline: plan on the
+pull request, apply on merge, and no AWS keys stored anywhere.</p>

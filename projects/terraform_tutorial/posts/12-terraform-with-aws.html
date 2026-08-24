@@ -1,0 +1,313 @@
+<p>Everything up to here has been the language. This lesson and the next deploy a real application: the
+<strong>pizza API</strong>, a Spring Boot 4 service with MySQL, Liquibase migrations and JWT auth,
+onto ECS Fargate behind a load balancer.</p>
+
+<p>This half builds what it runs on — a VPC, subnets, security groups and an RDS instance. The next
+half runs the container.</p>
+
+<p>⚠️ Everything here was <strong>applied to a real AWS account, checked through the load balancer,
+and destroyed</strong>. The timings and error messages are what actually happened.</p>
+
+<h2>What it costs</h2>
+
+<p>Say this first, because a lot of ECS tutorials do not:</p>
+
+<pre class="language-bash"><code class="language-bash">NAT gateway                       $0.045/hr    ~$32/month
+Application load balancer         $0.023/hr    ~$17/month
+Fargate 0.5 vCPU / 1 GB (ARM64)   $0.020/hr
+RDS db.t4g.micro                  $0.016/hr
+                                  ─────────
+                                  ~$0.13/hr    ~$92/month if you leave it up</code></pre>
+
+<p>None of it is free tier except the RDS instance in a new account's first year. The full stack for
+this article cost about <strong>$0.11</strong>, because it was destroyed after fifty minutes. End
+every session with <code>terraform destroy</code>.</p>
+
+<h2>The shape</h2>
+
+<pre class="language-bash"><code class="language-bash">                   internet
+                      │
+               ┌──────▼──────┐
+               │     ALB     │   public subnets, 2 AZs, :80
+               └──────┬──────┘
+                      │  :8085
+            ┌─────────▼─────────┐
+            │  ECS Fargate task │   private subnets
+            └─────────┬─────────┘
+                      │  :3306
+               ┌──────▼──────┐
+               │  RDS MySQL  │   private subnets
+               └─────────────┘
+
+  NAT gateway (public subnet) ── outbound only: ECR, Secrets Manager, logs</code></pre>
+
+<p>Nothing in a private subnet has a route from the internet, so nothing on the internet can open a
+connection to it. The tasks still need <em>outbound</em> access to pull their image and write logs,
+which is what the NAT gateway is for.</p>
+
+<h2>The VPC</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_vpc" "this" {
+  cidr_block = var.vpc_cidr
+
+  # Both are required for RDS to be reachable by hostname, and both default to
+  # FALSE on a VPC you create yourself — unlike the default VPC, where they are
+  # already on. RDS hands out a DNS name; without enable_dns_hostnames there is
+  # no name to resolve, and the app fails with an unknown-host error that reads
+  # like a typo in the connection string.
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(var.tags, { Name = var.name_prefix })
+}
+
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+  tags   = merge(var.tags, { Name = "${var.name_prefix}-igw" })
+}</code></pre>
+
+<p>The CIDR is <code>10.20.0.0/16</code> — deliberately <strong>not</strong> the
+<code>172.31.0.0/16</code> that AWS default VPCs use. Overlapping ranges cannot be peered later, and
+picking an unused range costs nothing today.</p>
+
+<h2>Subnets</h2>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+locals {
+  # Exactly two. An ALB REQUIRES subnets in at least two AZs and refuses to
+  # create with one — and the error says "at least two subnets" without
+  # mentioning availability zones, which is a confusing way to learn this.
+  azs = slice(data.aws_availability_zones.available.names, 0, 2)
+
+  public_cidrs  = ["10.20.0.0/24", "10.20.1.0/24"]
+  private_cidrs = ["10.20.10.0/24", "10.20.11.0/24"]
+}
+
+resource "aws_subnet" "public" {
+  count = length(local.azs)
+
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = local.public_cidrs[count.index]
+  availability_zone = local.azs[count.index]
+
+  # This is what makes the subnet "public" in the sense the ALB cares about.
+  # It is NOT what makes it routable — the route table below does that.
+  map_public_ip_on_launch = true
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-public-${local.azs[count.index]}"
+    Tier = "public"
+  })
+}</code></pre>
+
+<p><code>count</code>, not <code>for_each</code> — and this is the case where lesson 9's warning does
+not apply. The subnets are an ordered pair with no identity of their own, indexed by AZ, from a list
+that is derived rather than hand-maintained. Nobody is going to remove the middle element of a
+two-element list.</p>
+
+<h2>The NAT gateway, and what it costs</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  # The EIP is allocated from a pool the internet gateway must already exist
+  # to draw from. Terraform cannot see that dependency in the arguments —
+  # neither resource references the other — so it has to be stated.
+  depends_on = [aws_internet_gateway.this]
+}
+
+resource "aws_nat_gateway" "this" {
+  allocation_id = aws_eip.nat.id
+
+  # ⚠️ In a PUBLIC subnet. A NAT gateway's whole job is to have a route to the
+  # internet gateway; putting it in the private subnet it serves creates a
+  # routing loop that Terraform will happily build for you.
+  subnet_id = aws_subnet.public[0].id
+
+  depends_on = [aws_internet_gateway.this]
+}</code></pre>
+
+<p><strong>One gateway, not one per AZ.</strong> A NAT gateway lives in a single AZ and takes that
+AZ's outbound traffic with it when it fails. Two would be the highly-available answer and would
+double the cost — a deliberate trade for a demo, and one production in two AZs should make
+differently.</p>
+
+<p>The alternatives, honestly:</p>
+
+<pre class="language-bash"><code class="language-bash">public subnets + assign_public_ip   free, but tasks get inbound-capable addresses
+VPC interface endpoints             better at scale — but Fargate needs FIVE of
+                                    them (ECR api, ECR dkr, S3, Logs, Secrets)
+                                    at ~$0.01/hr each. That is MORE than one NAT
+                                    gateway until data volume is high.</code></pre>
+
+<h2>Route tables</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.this.id
+  }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.this.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.this.id
+  }
+}
+
+# ⚠️ A route table does nothing until a subnet is associated with it.
+resource "aws_route_table_association" "private" {
+  count          = length(aws_subnet.private)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}</code></pre>
+
+<p>The association is the step people skip. The symptom is a task that starts, cannot pull its image,
+and times out several minutes later with an error that never mentions routing.</p>
+
+<h2>Security groups that reference security groups</h2>
+
+<p>The single most useful habit in AWS networking:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_security_group" "db" {
+  name        = "${var.name_prefix}-db"
+  description = "MySQL access for the pizza API tasks"
+  vpc_id      = var.vpc_id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "db_from_app" {
+  security_group_id = aws_security_group.db.id
+  description       = "MySQL from the ECS tasks"
+
+  from_port   = 3306
+  to_port     = 3306
+  ip_protocol = "tcp"
+
+  # ⚠️ NO CIDR BLOCK. This allows traffic from anything WEARING that security
+  # group, wherever it is and whatever address it has. Fargate tasks get a new
+  # private IP every time they start, so a CIDR rule here would either be wrong
+  # or so wide it allowed the whole VPC.
+  referenced_security_group_id = var.app_security_group_id
+}</code></pre>
+
+<p>Note there is deliberately <strong>no egress rule</strong> on the database. A security group with
+no egress rules allows nothing out, and a database has no business opening outbound connections.</p>
+
+<p>These are the separate rule resources, not the older inline <code>ingress</code>/<code>egress</code>
+blocks on <code>aws_security_group</code>. Two reasons: each rule is its own addressable resource, so
+a plan shows exactly which rule changed; and the inline form silently retains AWS's default
+allow-all egress, so the absence above would not have meant anything.</p>
+
+<h2>RDS, and keeping the password out of state</h2>
+
+<p>This is the most useful thing in the lesson.</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_db_subnet_group" "this" {
+  name = "${var.name_prefix}-db"
+
+  # At least two subnets in different AZs, EVEN FOR A SINGLE-AZ INSTANCE. AWS
+  # wants somewhere to fail over to before it will let you opt out of failing over.
+  subnet_ids = var.private_subnet_ids
+}
+
+resource "aws_db_instance" "this" {
+  identifier = "${var.name_prefix}-mysql"
+
+  engine         = "mysql"
+  engine_version = "8.4"
+  instance_class = "db.t4g.micro"
+
+  allocated_storage = 20
+  storage_type      = "gp3"
+  storage_encrypted = true
+
+  db_name  = "pizza"
+  username = "pizza"    # NOT "admin" or "root" — both are reserved by RDS
+
+  # ⚠️ THE POINT OF THIS RESOURCE.
+  #
+  # With `password = var.db_password`, the password is in the state file in
+  # PLAINTEXT — forever, in every historical version, readable by anyone who can
+  # read state. Marking the variable `sensitive` only hides it from console
+  # output; it changes nothing about what is written to disk.
+  #
+  # This instead has RDS generate the password, store it in Secrets Manager, and
+  # own its rotation. Terraform never learns it.
+  manage_master_user_password = true
+
+  db_subnet_group_name   = aws_db_subnet_group.this.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+
+  publicly_accessible = false
+  multi_az            = false   # production says true
+
+  # The three arguments that make `terraform destroy` actually work. Every
+  # default here is tuned for a real database and fights a teardown.
+  skip_final_snapshot     = true  # default false: destroy fails asking for a snapshot name
+  deletion_protection     = false # production says true, and destroy then refuses
+  backup_retention_period = 0     # default 1 day: backups bill after the instance is gone
+}</code></pre>
+
+<p>The password reaches the application as an ARN, never as a value:</p>
+
+<pre class="language-hcl"><code class="language-hcl">output "master_user_secret_arn" {
+  description = "ARN of the RDS-managed master password secret."
+  value       = aws_db_instance.this.master_user_secret[0].secret_arn
+}</code></pre>
+
+<h2>Proving the password is not in state</h2>
+
+<p>Do not take that on trust — it is checkable. Pull the live password out of Secrets Manager and
+grep the state file for it:</p>
+
+<pre class="language-bash"><code class="language-bash">SECRET=$(terraform output -raw db_secret_arn)
+PW=$(aws secretsmanager get-secret-value --secret-id "$SECRET" \
+       --query SecretString --output text | jq -r .password)
+
+grep -c "$PW" terraform.tfstate
+# 0</code></pre>
+
+<p>And what the state does hold instead:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "password": null,
+  "manage_master_user_password": true,
+  "master_user_secret": [
+    {
+      "secret_arn": "arn:aws:secretsmanager:us-west-2:329580012644:secret:rds!db-a7221b70-...",
+      "kms_key_id": "arn:aws:kms:us-west-2:329580012644:key/b12f0d01-..."
+    }
+  ]
+}</code></pre>
+
+<p>An ARN and a KMS key id. That is the pattern worth copying wherever a platform will generate and
+hold a secret for you: <strong>let it, and reference the ARN.</strong></p>
+
+<p>⚠️ The honest counterpart, from the next lesson: <code>random_password</code> does <em>not</em>
+have this property. It stores its result in state by definition, because that is how the value stays
+stable across applies.</p>
+
+<h2>How long it takes</h2>
+
+<pre class="language-bash"><code class="language-bash">module.database.aws_db_instance.this: Still creating... [05m10s elapsed]
+module.database.aws_db_instance.this: Creation complete after 5m17s</code></pre>
+
+<p><strong>RDS is the long pole, at 5m17s.</strong> Everything else in the network — VPC, four
+subnets, gateways, route tables, security groups — completes in under a minute, and the NAT gateway
+takes about ninety seconds. Plan your feedback loop around that: developing the ECS half against an
+already-created database is much faster than tearing the whole stack down each time.</p>
+
+<h2>Next</h2>
+
+<p>The network and the database are up. <a href="/terraform/terraform-ecs-fargate-deploy">Lesson
+13</a> puts the application on it — ECR, a task definition, a Fargate service and a load balancer —
+including the health check that has to be exactly right, and the first apply that cycled tasks
+forever.</p>

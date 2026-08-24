@@ -1,0 +1,132 @@
+<p>Getting SES to send an email takes ten minutes. Getting that email into an inbox rather than a
+spam folder is the actual work, and almost all of it happens in DNS before you write any code.</p>
+
+<h2>Verify the domain, not the address</h2>
+
+<p>SES will not send from an identity it has not verified. You can verify a single address, which
+is fine for testing, but verify the <strong>domain</strong> for anything real — then any address on
+it works, and you get DKIM signing.</p>
+
+<pre class="language-bash"><code class="language-bash">aws sesv2 create-email-identity --email-identity lovemesomecoding.com
+
+aws sesv2 get-email-identity --email-identity lovemesomecoding.com \
+  --query "[VerifiedForSendingStatus,DkimAttributes.Status]"</code></pre>
+
+<p>Note <code>sesv2</code>. SES has two API versions and v2 is the current one; a lot of older
+examples use <code>aws ses</code>, which still works but is missing newer features.</p>
+
+<h2>The three DNS records that decide everything</h2>
+
+<p>Deliverability is mostly these. Skip them and mail from your domain looks exactly like mail from
+someone forging your domain, because technically it is indistinguishable.</p>
+
+<table>
+  <thead><tr><th>Record</th><th>Answers</th></tr></thead>
+  <tbody>
+    <tr><td><strong>SPF</strong></td><td>Is this server allowed to send for this domain?</td></tr>
+    <tr><td><strong>DKIM</strong></td><td>Was this message signed by the domain, and unmodified
+        since?</td></tr>
+    <tr><td><strong>DMARC</strong></td><td>What should a receiver do when SPF and DKIM fail — and
+        where do I report it?</td></tr>
+  </tbody>
+</table>
+
+<p>SES gives you three CNAME records for DKIM when you verify a domain. Add all three; DKIM stays
+pending until every one resolves.</p>
+
+<p>SPF is a TXT record on the apex, and the limit that catches people is <strong>ten DNS
+lookups</strong> — each <code>include:</code> costs one, and exceeding ten makes the whole record
+fail rather than partially apply:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">v=spf1 include:amazonses.com -all</code></pre>
+
+<p>DMARC is a TXT record at <code>_dmarc.yourdomain.com</code>. Start permissive and tighten once
+the reports are clean:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">v=DMARC1; p=none; rua=mailto:dmarc-reports@lovemesomecoding.com</code></pre>
+
+<p><code>p=none</code> means "do not act, just report". Move to <code>quarantine</code> and then
+<code>reject</code> once you are confident every legitimate sender is aligned. Going straight to
+<code>reject</code> is how you discover your invoicing system also sends as your domain.</p>
+
+<h2>The sandbox</h2>
+
+<p>Every new account starts in the sandbox, where you can only send <em>to</em> verified addresses
+and are capped at a low daily quota. This is not a bug and it is not something you can code around
+— it exists so spammers cannot sign up and start sending.</p>
+
+<pre class="language-bash"><code class="language-bash">aws sesv2 get-account --query "[ProductionAccessEnabled,SendQuota]"</code></pre>
+
+<p>Leaving it requires a support request describing what you send, to whom, how they opted in, and
+how you handle bounces and unsubscribes. Approval typically takes a day or so. <strong>Request it
+early</strong> — it is a common reason a launch slips, because nobody thought of it until the
+week of.</p>
+
+<h2>Bounces and complaints will get you suspended</h2>
+
+<p>SES watches two rates and enforces them:</p>
+
+<ul>
+  <li><strong>Bounce rate</strong> — keep under 5%. Above it, your account is reviewed and can be
+      paused</li>
+  <li><strong>Complaint rate</strong> — keep under 0.1%. That is one complaint per thousand
+      emails</li>
+</ul>
+
+<p>Those are low, and they are cumulative rather than per-campaign. The way people fail is by
+sending to a list they did not clean: every address that no longer exists is a hard bounce, and a
+few thousand of them is enough.</p>
+
+<p>So you must handle bounces, and the way to do it is to have SES tell you rather than to find out
+from a dashboard:</p>
+
+<pre class="language-bash"><code class="language-bash">aws sesv2 create-configuration-set --configuration-set-name transactional
+
+aws sesv2 create-configuration-set-event-destination \
+  --configuration-set-name transactional \
+  --event-destination-name to-sns \
+  --event-destination '{"Enabled":true,"MatchingEventTypes":["BOUNCE","COMPLAINT","DELIVERY"],"SnsDestination":{"TopicArn":"arn:aws:sns:us-west-2:111122223333:ses-events"}}'</code></pre>
+
+<p>Then a consumer on that topic suppresses the address permanently. A hard bounce means never send
+there again; a complaint means the recipient pressed "spam" and you must stop immediately,
+regardless of what your database says about their preferences.</p>
+
+<p>SES keeps an account-level suppression list that does some of this for you, but your own
+application still needs to know — otherwise it keeps queuing mail that will never be delivered.</p>
+
+<h2>Receiving mail, and the region catch</h2>
+
+<p>SES can also receive: mail arriving at your domain can be written to S3, published to SNS, or
+handed to a Lambda. That is how you build an address that files support requests into a system
+without running a mail server.</p>
+
+<p>Two constraints make this less general than it sounds. Inbound is available in a
+<strong>limited set of regions</strong>, so it may not be where the rest of your stack lives — and
+it needs an MX record pointing at SES, which means the domain cannot also be receiving mail
+somewhere else. For a domain already on Google Workspace, that rules it out unless you use a
+subdomain.</p>
+
+<h2>Sending</h2>
+
+<pre class="language-bash"><code class="language-bash">aws sesv2 send-email \
+  --from-email-address "hello@lovemesomecoding.com" \
+  --destination '{"ToAddresses":["reader@example.com"]}' \
+  --configuration-set-name transactional \
+  --content '{"Simple":{"Subject":{"Data":"Welcome"},"Body":{"Text":{"Data":"Thanks for signing up."}}}}'</code></pre>
+
+<p>Always send through a configuration set — without one, the events above are not emitted and you
+have no delivery data at all.</p>
+
+<h2>Practical details</h2>
+
+<ul>
+  <li><strong>Separate transactional and marketing mail</strong>, ideally onto different
+      subdomains. A marketing complaint rate should not be able to stop your password resets</li>
+  <li><strong>Warm up a new domain gradually.</strong> Sending 100,000 emails on day one from a
+      domain with no history is the strongest spam signal there is</li>
+  <li><strong>Include a working unsubscribe link</strong> in anything non-transactional. It is a
+      legal requirement in most jurisdictions and it converts complaints into unsubscribes</li>
+  <li><strong>The sending rate is per second</strong> and separate from the daily quota. Exceeding
+      it returns a throttling error, so batch senders need to pace themselves rather than firing
+      everything at once</li>
+</ul>

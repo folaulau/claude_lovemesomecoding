@@ -1,0 +1,163 @@
+<p>The other half of the nightly shutdown. Starting an EC2 instance is fast — usually under a minute
+to <code>running</code> — so unlike RDS you can schedule it close to when people arrive. What
+catches people here is the schedule expression itself, and an IP address that does not survive the
+night.</p>
+
+<h2>The handler</h2>
+
+<pre class="language-python"><code class="language-python">import boto3
+
+ec2 = boto3.client("ec2")
+
+
+def lambda_handler(event, context):
+    response = ec2.describe_instances(
+        Filters=[
+            {"Name": "tag:Schedule", "Values": ["nightly-stop"]},
+            {"Name": "instance-state-name", "Values": ["stopped"]},
+        ]
+    )
+
+    ids = [
+        instance["InstanceId"]
+        for reservation in response["Reservations"]
+        for instance in reservation["Instances"]
+    ]
+
+    if not ids:
+        return {"started": []}
+
+    ec2.start_instances(InstanceIds=ids)
+    print(f"starting: {ids}")
+    return {"started": ids}</code></pre>
+
+<p>Same tag as the stop function, so one label controls both ends of the schedule and there is
+nothing to keep in sync. Filtering on <code>stopped</code> makes the function safe to run twice.</p>
+
+<h2>EventBridge cron is not Unix cron</h2>
+
+<p>This is where most broken schedules come from. The expression looks familiar enough that people
+paste a crontab line, and then nothing ever fires — silently, because a schedule that never matches
+is not an error.</p>
+
+<p>There are <strong>six fields</strong>, not five:</p>
+
+<table>
+  <thead><tr><th>Field</th><th>Values</th></tr></thead>
+  <tbody>
+    <tr><td>Minute</td><td>0–59</td></tr>
+    <tr><td>Hour</td><td>0–23</td></tr>
+    <tr><td>Day of month</td><td>1–31, or <code>?</code></td></tr>
+    <tr><td>Month</td><td>1–12 or JAN–DEC</td></tr>
+    <tr><td>Day of week</td><td>1–7 or SUN–SAT, or <code>?</code></td></tr>
+    <tr><td><strong>Year</strong></td><td>1970–2199, usually <code>*</code></td></tr>
+  </tbody>
+</table>
+
+<p>And the rule that breaks the pasted crontab: <strong>you cannot specify day-of-month and
+day-of-week in the same expression.</strong> One of them must be <code>?</code>. So a
+weekday-morning schedule is:</p>
+
+<pre class="language-bash"><code class="language-bash">aws scheduler create-schedule \
+  --name ec2-morning-start \
+  --schedule-expression "cron(45 7 ? * MON-FRI *)" \
+  --schedule-expression-timezone "America/Denver" \
+  --flexible-time-window "Mode=OFF" \
+  --target '{"Arn":"arn:aws:lambda:us-west-2:111122223333:function:ec2-morning-start","RoleArn":"arn:aws:iam::111122223333:role/scheduler-invoke"}'</code></pre>
+
+<p>Not <code>cron(45 7 * * MON-FRI)</code>, which is five fields with both day fields populated and
+is rejected outright.</p>
+
+<p>For anything simpler than a wall-clock time, <code>rate(1 hour)</code> and
+<code>rate(15 minutes)</code> exist and avoid the whole problem.</p>
+
+<h2>Timezones, and the twice-a-year bug</h2>
+
+<p>EventBridge's older rules are <strong>UTC only</strong>. A "start at 7:45am" schedule written as
+UTC is correct for half the year and an hour wrong for the other half, because your clocks move and
+UTC does not. Every spring someone's instance comes up an hour late and nobody connects it to
+daylight saving.</p>
+
+<p>EventBridge Scheduler — the newer service, used above — takes
+<code>--schedule-expression-timezone</code> with an IANA name and handles the transitions. If you
+are on a classic <code>events</code> rule, converting to Scheduler is the fix.</p>
+
+<h2>The IAM policy</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "ec2:DescribeInstances",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ec2:StartInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/Schedule": "nightly-stop" }
+      }
+    }
+  ]
+}</code></pre>
+
+<h2>The public IP changes</h2>
+
+<p>An automatically-assigned public IPv4 address is released when the instance stops and a
+different one is assigned when it starts. So every morning the address in your SSH config, your
+bookmark and any DNS record pointing at it is wrong.</p>
+
+<p>Three ways out, worst to best:</p>
+
+<ul>
+  <li><strong>Elastic IP.</strong> Fixed address that survives a stop. It also bills per hour while
+      the instance is stopped, which quietly eats into the saving you built this for</li>
+  <li><strong>A Route 53 record updated by the same Lambda</strong> after the start call. Works,
+      and is more moving parts than the problem deserves</li>
+  <li><strong>SSM Session Manager.</strong> Connect by instance id instead of by address, so there
+      is no IP to track and no inbound port open at all</li>
+</ul>
+
+<pre class="language-bash"><code class="language-bash">aws ssm start-session --target i-0abc123def456</code></pre>
+
+<p>That needs the SSM agent running and an instance profile with the managed node policy. It is
+worth setting up once — it removes this problem, removes port 22 from your security group, and logs
+who connected.</p>
+
+<h2>When not to write this at all</h2>
+
+<p>If the instances are already in an Auto Scaling group, none of this is necessary — scheduled
+scaling does the same job with no Lambda, no IAM role and no code to maintain:</p>
+
+<pre class="language-bash"><code class="language-bash">aws autoscaling put-scheduled-update-group-action \
+  --auto-scaling-group-name stayhub-workers \
+  --scheduled-action-name weekday-morning \
+  --recurrence "45 13 * * MON-FRI" \
+  --desired-capacity 2</code></pre>
+
+<p>Note the recurrence there IS standard five-field cron, and it is <strong>UTC</strong> unless you
+pass <code>--time-zone</code> — a different syntax and a different default from the Scheduler
+expression above, in the same account, for the same job. Read the field count before you trust a
+schedule.</p>
+
+<p>The Lambda approach earns its place for standalone instances that are not in a group, and for
+selecting across many instances by tag. For a group, use the group.</p>
+
+<h2>Waiting until it is really up</h2>
+
+<pre class="language-bash"><code class="language-bash">aws ec2 wait instance-status-ok --instance-ids i-0abc123def456</code></pre>
+
+<p>Two waiters exist and the difference matters. <code>instance-running</code> returns as soon as
+the hypervisor reports the instance started — the operating system has not booted, sshd is not
+listening, and your application certainly is not up. <code>instance-status-ok</code> waits for both
+the system and instance status checks to pass, which is much closer to "you can connect to it".</p>
+
+<p>Neither one knows anything about your application. If something has to run once the service is
+actually serving traffic, poll its own health endpoint — that is the only check which means what
+you want it to mean.</p>
+
+<p>As with the RDS pair, do not put the waiter inside the starting function. It bills Lambda time
+for doing nothing and risks a timeout. Let the schedule fire, let the instance come up, and give
+anything that depends on it its own trigger.</p>

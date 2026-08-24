@@ -1,0 +1,196 @@
+<p>Two features that both sit on top of the oplog, and both get oversold. <strong>Change
+streams</strong> let your application subscribe to writes as they happen, which removes a whole
+category of polling code. <strong>Time-series collections</strong> are a storage engine for
+append-only measurements &mdash; and their headline benefit turns out to depend entirely on your
+data, in a way the marketing does not mention.</p>
+
+<h2>Change streams</h2>
+
+<p>A change stream is a tailable cursor over the oplog. MongoDB hands you every write as it is
+committed, with no polling and no message broker:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const stream = db.reels.watch([
+  { $match: { operationType: { $in: ["update", "replace"] } } }
+], { fullDocument: "updateLookup" })
+
+while (stream.hasNext()) {
+  const change = stream.next()
+  print(change.operationType, change.documentKey._id, change.fullDocument.stats.views)
+}</code></pre>
+
+<p>Three details in that snippet are the difference between it working and it silently doing
+nothing.</p>
+
+<p><strong>It needs a replica set.</strong> A standalone has no oplog, and the error says so
+without saying what to do about it: <code>The $changeStream stage is only supported on replica
+sets</code>.</p>
+
+<p><strong>An update event carries no document by default.</strong> Change events describe the
+change, not the result &mdash; so an update gives you the changed fields and nothing else.
+<code>fullDocument: "updateLookup"</code> makes MongoDB re-read the document and attach it. Without
+it, <code>change.fullDocument</code> is <code>null</code> on every update, and the cause is not
+obvious.</p>
+
+<p><strong>Filter on the server.</strong> The pipeline passed to <code>watch()</code> runs on the
+server, so an unfiltered stream ships every write in the collection to your process to be discarded
+there.</p>
+
+<h2>What an event looks like</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "operationType": "update",
+  "documentKey": { "_id": "..." },
+  "updateDescription": { "updatedFields": { "stats.views": 4963 }, "removedFields": [] },
+  "fullDocument": { "...": "only present with updateLookup" },
+  "_id": { "_data": "8267..." }
+}</code></pre>
+
+<p>That last <code>_id</code> is the <strong>resume token</strong>, and it is the part that makes
+change streams usable in production. Store it, and after a restart you can resume from exactly
+where you stopped rather than losing everything that happened while you were down:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.watch([], { resumeAfter: savedToken })</code></pre>
+
+<p>The window is bounded by the oplog, so a consumer offline longer than the oplog covers cannot
+resume and must fall back to a full read.</p>
+
+<h2>In Java</h2>
+
+<p>The cursor blocks forever, so it needs its own thread. Spring Data provides a container that
+handles that:</p>
+
+<pre class="language-java"><code class="language-java">var request = ChangeStreamRequest.builder(listener)
+        .collection("reels")
+        .filter(new Document(
+                "$match", new Document("operationType", new Document("$in", List.of("update", "replace")))))
+        .fullDocumentLookup(FullDocument.UPDATE_LOOKUP)
+        .build();</code></pre>
+
+<p>One trap specific to Spring Data, and it cost real time in ReelCMS: there are two
+<code>filter</code> overloads. The one taking an <code>Aggregation</code> maps field names against
+your <em>domain type</em> &mdash; and <code>operationType</code> is a field of the change event, not
+of <code>Reel</code>, so the mapper rewrites it into something that matches nothing. The stream
+opens cleanly and delivers silence. Passing a raw <code>Document</code>, as above, skips the mapping
+and works.</p>
+
+<h2>What they are good for</h2>
+
+<p>Pushing live updates to a browser without polling, invalidating a cache the moment its source
+changes, feeding a search index, or emitting an audit record. In ReelCMS the dashboard&rsquo;s live
+view counter is a change stream forwarded over server-sent events &mdash; the counter ticks as a
+side effect of the <code>$inc</code>, with no publish step anywhere in the application.</p>
+
+<p>What they are <em>not</em> is a message queue. There is no acknowledgement, no dead-letter
+handling, no consumer group. If a message must be processed exactly once, use a queue.</p>
+
+<h2>What you can watch, and for what</h2>
+
+<p><code>watch()</code> exists at three levels, and the wider two are easy to miss:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.watch()      // one collection
+db.watch()            // every collection in the database
+db.getMongo().watch() // the whole deployment</code></pre>
+
+<p>The deployment-wide form is what you want for an audit log or a cache invalidator, because it
+does not need updating every time somebody adds a collection.</p>
+
+<p>The <code>operationType</code> values worth handling:</p>
+
+<ul>
+  <li><code>insert</code>, <code>update</code>, <code>replace</code>, <code>delete</code> &mdash;
+      the ordinary four. Note that <code>update</code> and <code>replace</code> are different
+      events, so a filter that only watches <code>update</code> misses a <code>save()</code> from
+      an object mapper.</li>
+  <li><code>drop</code>, <code>rename</code>, <code>dropDatabase</code> &mdash; structural.</li>
+  <li><code>invalidate</code> &mdash; the stream is finished. This arrives after a drop or rename,
+      and the cursor cannot be resumed from a token past it.</li>
+</ul>
+
+<p>A <code>delete</code> event carries only <code>documentKey</code>, because the document is gone
+&mdash; <code>updateLookup</code> cannot help. If your consumer needs to know <em>what</em> was
+deleted, enable <code>fullDocumentBeforeChange</code>, which requires turning on change-stream
+pre-images for the collection and costs storage.</p>
+
+<h2>Time-series collections</h2>
+
+<p>A time-series collection is a different storage layout for append-only measurements. You declare
+a <code>timeField</code>, usually a <code>metaField</code>, and MongoDB buckets documents that share
+metadata within a time window, storing the measurements column-wise:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.createCollection("view_events", {
+  timeseries: { timeField: "ts", metaField: "metadata", granularity: "seconds" },
+  expireAfterSeconds: 7776000
+})</code></pre>
+
+<p>Two constraints come with it. The collection <strong>must be created with these options
+before anything inserts</strong> &mdash; insert first and MongoDB auto-creates an ordinary
+collection that works fine and quietly costs more. And documents cannot be updated or deleted
+individually; expiry is by TTL on whole buckets. For measurements that is fine, because a
+measurement is a fact.</p>
+
+<h2>The measured result &mdash; and it is not what the pitch says</h2>
+
+<p>The claim is large storage savings. Measured on ReelCMS&rsquo;s actual data &mdash; 30,187 view
+events, after forcing a checkpoint:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">time-series, random insert order : 0.84 MB
+time-series, sorted by timestamp : 0.85 MB
+ordinary collection              : 0.91 MB</code></pre>
+
+<p>A saving of about 1.1&times;. Effectively a wash. Insert order made no measurable difference
+either, which was the first hypothesis and it was wrong.</p>
+
+<p>The reason is bucket density:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">measurements                    : 30,187
+buckets                         : 17,967
+average measurements per bucket :      1.7
+distinct metadata combinations  :     49</code></pre>
+
+<p>Columnar compression pays off in proportion to how many measurements share a bucket. At
+<strong>1.7 per bucket</strong> there is nothing to compress: 49 metadata combinations scattered
+across 30 days of hourly windows produce roughly 35,000 possible buckets for 30,000 events.</p>
+
+<p>So the honest rule is: <strong>time-series collections are not a free win, and the saving is
+proportional to bucket density.</strong> They pay off with few metadata combinations and a high
+event rate &mdash; one sensor emitting every second fills buckets beautifully. They do nothing for
+sparse events spread across many metadata values. Check for yourself before assuming a benefit:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.getCollection("system.buckets.view_events").countDocuments({})   // 17967
+db.view_events.countDocuments({})                                   // 30187</code></pre>
+
+<p>The TTL and the time-range query optimisations are still worth having on their own. The
+compression is a maybe, and it is measurable in ten minutes.</p>
+
+<h2>Running one in production</h2>
+
+<p>Four things separate a demo consumer from one you can leave running:</p>
+
+<ol>
+  <li><strong>Persist the resume token</strong>, and only after the event has been handled. Storing
+      it first turns a crash into silent data loss.</li>
+  <li><strong>Expect duplicates.</strong> Resuming replays from the token, so an event can arrive
+      twice. Make the handler idempotent &mdash; which usually means keying on
+      <code>documentKey._id</code> rather than counting.</li>
+  <li><strong>Run one consumer, not one per instance.</strong> Every instance of your application
+      opening the same stream means every event handled N times. Either elect a leader or accept
+      the duplication deliberately.</li>
+  <li><strong>Handle <code>invalidate</code>.</strong> A dropped or renamed collection ends the
+      stream, and the stored token is no longer usable. The consumer has to start fresh rather
+      than retry forever.</li>
+</ol>
+
+<p>None of that is difficult, and all of it is the sort of thing that gets discovered in production
+rather than designed in.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Change streams need a replica set &mdash; they are the oplog, exposed.</li>
+  <li><code>fullDocument: "updateLookup"</code> or update events carry no document.</li>
+  <li>Filter server-side; store the resume token so a restart does not lose events.</li>
+  <li>Not a message queue: no acks, no redelivery, no consumer groups.</li>
+  <li>Create a time-series collection <em>before</em> the first insert; it cannot be converted.</li>
+  <li>Its storage saving depends on measurements-per-bucket. Measure yours &mdash; ReelCMS got
+      1.1&times;, which is nothing.</li>
+</ul>

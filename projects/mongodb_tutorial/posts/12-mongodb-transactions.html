@@ -1,0 +1,187 @@
+<p>Coming from a relational database, the first question about MongoDB is usually &ldquo;does it have
+transactions?&rdquo; It does, since 4.0. But leading with that question gets the design backwards,
+because the more useful answer is that <strong>a well-modelled MongoDB application needs them far
+less often than you would expect</strong> &mdash; and that is a property of the document model, not
+a limitation you work around.</p>
+
+<h2>Single-document writes are already atomic</h2>
+
+<p>Every write to a single document is atomic, no matter how much of the document it touches. That
+includes nested fields, arrays, and several fields at once:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.updateOne(
+  { _id: id },
+  {
+    $inc:  { "stats.views": 1, "stats.shares": 1 },
+    $set:  { updatedAt: new Date() },
+    $push: { recentViewers: viewerId }
+  }
+)</code></pre>
+
+<p>Four changes across three parts of the document, and no reader ever sees half of them. No
+transaction, no session, no extra cost.</p>
+
+<p>That is why the embedding decision from lesson 6 is also a <em>correctness</em> decision, not
+just a performance one. Counters live inside the reel, so incrementing them is atomic. Put them in
+a separate collection and keeping the two consistent suddenly needs a transaction &mdash; the same
+data, a different schema, and a much harder concurrency problem.</p>
+
+<p><strong>Things that must change together want to live in the same document.</strong> Solve it at
+the schema level and the transaction question mostly disappears.</p>
+
+<h2>The concurrency mistake that has nothing to do with transactions</h2>
+
+<p>Most lost-update bugs in MongoDB are not missing transactions. They are read-modify-write:</p>
+
+<pre class="language-javascript" data-antipattern="true"><code class="language-javascript">// DON'T — two requests can read the same value and both write it back
+const reel = db.reels.findOne({ _id: id })
+db.reels.updateOne({ _id: id }, { $set: { "stats.views": reel.stats.views + 1 } })</code></pre>
+
+<p>A transaction would fix this, expensively. An update operator fixes it for free, because the
+arithmetic happens on the server inside the atomic write:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.updateOne({ _id: id }, { $inc: { "stats.views": 1 } })</code></pre>
+
+<p>Before reaching for a transaction, check whether an operator does the job. <code>$inc</code>,
+<code>$push</code>, <code>$addToSet</code>, <code>$min</code>, <code>$max</code> and
+<code>findOneAndUpdate</code> cover a surprising amount of what people write transactions for.</p>
+
+<h2>When you genuinely need one</h2>
+
+<p>Two or more documents that must change together, where you cannot merge them into one:</p>
+
+<ul>
+  <li>Moving value between two accounts &mdash; the canonical case, and the reason to think hard
+      before choosing MongoDB for a ledger at all.</li>
+  <li>Creating a document and updating a counter in another collection, where a drifting count is
+      not acceptable.</li>
+  <li>Writing to two collections that different services read independently.</li>
+</ul>
+
+<h2>Writing one</h2>
+
+<p>A transaction runs inside a <strong>session</strong>. The convenience API handles retries for
+you, which matters more than it looks:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const session = db.getMongo().startSession()
+
+session.withTransaction(() => {
+  const reels = session.getDatabase("reelcms").reels
+  const audit = session.getDatabase("reelcms").audit
+
+  reels.updateOne({ _id: id }, { $set: { status: "ARCHIVED" } }, { session })
+  audit.insertOne({ action: "archive", reelId: id, at: new Date() }, { session })
+})
+
+session.endSession()</code></pre>
+
+<p>In Java, Spring&rsquo;s <code>@Transactional</code> works once a
+<code>MongoTransactionManager</code> bean exists &mdash; without that bean the annotation is
+silently ignored, which is a particularly unpleasant way to discover the problem.</p>
+
+<p>Every operation must be passed the session. An operation inside the block that does not receive
+it runs <em>outside</em> the transaction, commits independently, and is not rolled back. That is
+easy to do and produces exactly the inconsistency the transaction was meant to prevent.</p>
+
+<h2>What they cost</h2>
+
+<p>Transactions are not free, and the costs are worth naming:</p>
+
+<ul>
+  <li><strong>A replica set is required.</strong> Standalone servers cannot run them &mdash; the
+      reason lesson 2 insisted on a single-node replica set even on a laptop.</li>
+  <li><strong>There is a 60-second default limit.</strong> Past
+      <code>transactionLifetimeLimitSeconds</code> the transaction is aborted. A long batch job
+      inside one transaction will not finish.</li>
+  <li><strong>Conflicts abort, they do not queue.</strong> Two transactions touching the same
+      document produce a <code>TransientTransactionError</code> for one of them; it must be retried
+      whole. <code>withTransaction</code> does this automatically, which is why hand-rolling the
+      session loop is a mistake.</li>
+  <li><strong>They hold resources.</strong> Uncommitted writes pin oplog and cache. Long
+      transactions on a busy cluster degrade everything else.</li>
+</ul>
+
+<p>Design them to be short and to touch few documents. A transaction is a scalpel, not a
+container to put your business logic in.</p>
+
+<h2>The case that is genuinely awkward</h2>
+
+<p>Deleting a reel in ReelCMS touches three collections: the reel itself, its comments, and the
+collections that list it. MongoDB has no cascade, so the application does all three:</p>
+
+<pre class="language-java"><code class="language-java">commentRepository.deleteByReelId(id);
+collectionService.removeReelFromAll(id);
+reelRepository.deleteById(id);</code></pre>
+
+<p>Three writes, no transaction. If the process dies between the first and the third, the reel
+survives while its comments are gone &mdash; an inconsistent state.</p>
+
+<p>That is a real trade and worth naming rather than hiding. It is accepted here because the
+failure is recoverable and harmless: a reel with missing comments is a cosmetic problem, and the
+delete can simply be run again. Wrapping it in a transaction would be correct and would also make
+every delete pay for a session, on an operation that happens a few times a day.</p>
+
+<p>The decision procedure is the useful part: ask what the inconsistent state actually costs. If
+the answer is &ldquo;a wrong number on a dashboard until the next run&rdquo;, skip the transaction.
+If it is &ldquo;money exists in two places or neither&rdquo;, do not.</p>
+
+<h3>Ordering helps more than people expect</h3>
+
+<p>Notice the order above: children first, parent last. If it fails partway, the reel is still
+there and still points at what remains, so retrying is straightforward. Reverse it &mdash; delete
+the reel first &mdash; and a failure leaves orphaned comments with no parent to find them from,
+which needs a sweep to clean up. Careful ordering turns many multi-document writes into something
+that is safely retryable without a transaction at all.</p>
+
+<h2>Write concern and read concern</h2>
+
+<p>Related, and more often the thing you actually needed. <strong>Write concern</strong> says how
+many members must acknowledge a write before it is considered done:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.insertOne(doc, { writeConcern: { w: "majority" } })   // safe from rollback
+db.reels.insertOne(doc, { writeConcern: { w: 1 } })            // primary only — faster
+</code></pre>
+
+<p><code>w: "majority"</code> is the default in recent versions and the right one: a write
+acknowledged only by a primary that then fails can be rolled back and disappear. <code>w: 1</code>
+is a deliberate trade for throughput on data you can afford to lose &mdash; analytics events, for
+instance.</p>
+
+<p><strong>Read concern</strong> is the mirror image. <code>"local"</code> may return writes that
+have not yet replicated; <code>"majority"</code> returns only writes that cannot be rolled back.
+Reading your own recent write from a secondary with <code>"local"</code> is where
+&ldquo;I just saved it and it is not there&rdquo; comes from.</p>
+
+<h2>Sessions without transactions</h2>
+
+<p>A session is useful on its own, without a transaction wrapped around it. Inside one, MongoDB
+guarantees <strong>causal consistency</strong>: a read that follows a write in the same session
+sees that write, even if it is routed to a secondary that has not caught up.</p>
+
+<pre class="language-javascript"><code class="language-javascript">const session = db.getMongo().startSession({ causalConsistency: true })
+const reels = session.getDatabase("reelcms").reels
+
+reels.updateOne({ _id: id }, { $set: { status: "PUBLISHED" } })
+reels.findOne({ _id: id })     // guaranteed to see the update</code></pre>
+
+<p>That is the fix for the read-your-own-write problem from the replication lesson, and it is much
+cheaper than a transaction &mdash; no locks, no abort, no 60-second limit. Reach for it before
+reaching for a transaction; a surprising number of &ldquo;we need a transaction&rdquo; situations
+are really &ldquo;we need this read to see that write&rdquo;.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Single-document writes are atomic &mdash; including several operators at once.</li>
+  <li>Model so that things which change together live together, and the question mostly goes
+      away.</li>
+  <li>Most lost updates are read-modify-write. Use <code>$inc</code>, not a transaction.</li>
+  <li>Transactions need a replica set, abort after 60 seconds, and abort on conflict rather than
+      waiting.</li>
+  <li>Use <code>withTransaction</code> so retries are handled, and pass the session to every
+      operation.</li>
+  <li>Keep them short and narrow.</li>
+  <li>Write and read concern often solve the durability problem people reach for transactions
+      for.</li>
+  <li>A causally consistent session fixes read-your-own-write without a transaction.</li>
+</ul>

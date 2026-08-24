@@ -1,0 +1,125 @@
+<p>A load balancer spreads traffic across several copies of your application so that one of them
+failing is not an outage. AWS has three, and for a web backend the choice is really between two.</p>
+
+<h2>ALB or NLB</h2>
+
+<table>
+  <thead><tr><th></th><th>Application LB</th><th>Network LB</th></tr></thead>
+  <tbody>
+    <tr><td>Layer</td><td>7 — understands HTTP</td><td>4 — TCP/UDP only</td></tr>
+    <tr><td>Routes on</td><td>Path, host, header, method, query</td><td>Port</td></tr>
+    <tr><td>TLS termination</td><td>Yes</td><td>Yes, or pass through</td></tr>
+    <tr><td>Static IP</td><td>No — a DNS name that changes</td><td>Yes, one per AZ</td></tr>
+    <tr><td>Latency</td><td>Milliseconds</td><td>Lower</td></tr>
+    <tr><td>Protocols</td><td>HTTP, HTTPS, gRPC, WebSocket</td><td>Anything over TCP/UDP</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Use an ALB</strong> for HTTP. Use an NLB when you need a fixed IP address someone will
+whitelist, a non-HTTP protocol, or the lowest possible latency. The Classic Load Balancer is the
+previous generation and there is no reason to choose it for something new.</p>
+
+<h2>Target groups are the part that matters</h2>
+
+<p>The load balancer itself is nearly configuration-free. The object that decides whether your
+deploy is a deploy or an outage is the <strong>target group</strong>: a set of destinations plus
+the health check that determines which of them get traffic.</p>
+
+<pre class="language-bash"><code class="language-bash">aws elbv2 create-target-group \
+  --name stayhub-api \
+  --protocol HTTP --port 8000 \
+  --vpc-id vpc-0abc123 \
+  --target-type ip \
+  --health-check-path /healthz \
+  --health-check-interval-seconds 10 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 2</code></pre>
+
+<p><code>--target-type</code> is <code>instance</code> for EC2, <code>ip</code> for Fargate tasks
+and anything with its own network interface, and <code>lambda</code> to put a function behind an
+ALB.</p>
+
+<h2>The health check arithmetic nobody does</h2>
+
+<p>Those numbers are not decoration. Time to notice a dead target is:</p>
+
+<p><code>interval × unhealthy-threshold</code></p>
+
+<p>The defaults on many setups are a 30-second interval and a threshold of 3, which is
+<strong>90 seconds of traffic sent into a dead target</strong> before it is removed. Every request
+in that window fails. At 10 seconds and 2 failures it is 20 seconds — a tenth of the errors, for a
+health check that costs nothing.</p>
+
+<p>The same arithmetic runs the other way. A new target receives no traffic until it passes
+<code>healthy-threshold</code> checks, so a slow-starting application plus a long interval means a
+deploy sits there apparently stuck.</p>
+
+<p>Point the check at a real endpoint. A check on <code>/</code> that returns a static page is
+green while the database is unreachable. A check on <code>/healthz</code> that verifies
+dependencies tells the truth — but keep it cheap, because it runs on every target every interval,
+and do not have it fail on a dependency the instance cannot fix by being replaced.</p>
+
+<h2>Listeners and rules</h2>
+
+<p>A listener watches a port; rules decide where matching requests go. This is where an ALB earns
+its keep — one load balancer in front of several services:</p>
+
+<pre class="language-bash"><code class="language-bash">aws elbv2 create-rule \
+  --listener-arn arn:aws:elasticloadbalancing:us-west-2:111122223333:listener/app/stayhub/abc/def \
+  --priority 10 \
+  --conditions '[{"Field":"path-pattern","PathPatternConfig":{"Values":["/api/*"]}}]' \
+  --actions '[{"Type":"forward","TargetGroupArn":"arn:aws:elasticloadbalancing:us-west-2:111122223333:targetgroup/stayhub-api/abc"}]'</code></pre>
+
+<p>Rules are evaluated by priority, lowest first, and the first match wins — so a broad rule with a
+low number shadows everything after it. The default action catches whatever matches nothing.</p>
+
+<p>Always redirect port 80 to 443 at the listener rather than in your application. It is a
+built-in action, it costs nothing, and it means the unencrypted request never reaches your code.</p>
+
+<h2>Draining, and the deploy that drops requests</h2>
+
+<p>When a target is deregistered it enters <code>draining</code>: no new connections, existing ones
+allowed to finish, for up to <code>deregistration_delay.timeout_seconds</code> — 300 by default.</p>
+
+<p>Too long and every deploy crawls. Too short and in-flight requests are cut off. Match it to your
+slowest normal request and no more; 30 seconds suits most APIs.</p>
+
+<p>Draining alone does not prevent dropped requests, though. The load balancer stops sending new
+work, but your application must also stop accepting and finish what it has — which means handling
+<code>SIGTERM</code> rather than exiting immediately. A container that dies instantly on the signal
+drops every request in flight no matter how the target group is configured.</p>
+
+<h2>Sticky sessions</h2>
+
+<p>Stickiness pins a client to one target with a cookie. It is available, and it is usually a sign
+of a problem rather than a solution: it means your application holds state in memory, so scaling
+out does not distribute load evenly and losing a target loses user sessions.</p>
+
+<p>Put session state in ElastiCache or a database and leave stickiness off. The exception is a
+legacy application you cannot change — then it is the pragmatic answer.</p>
+
+<h2>What it costs</h2>
+
+<p>A load balancer bills two ways: an hourly charge for existing, and a usage charge in
+<strong>LCUs</strong> — Load Balancer Capacity Units — which meter new connections, active
+connections, processed bytes and rule evaluations, billing on whichever is highest.</p>
+
+<p>The practical consequence is that one ALB in front of several services is markedly cheaper than
+one per service, because you pay the hourly charge once. This is the main argument for
+path-based routing even when you do not need it architecturally.</p>
+
+<p>Idle load balancers are a common source of forgotten spend — they bill whether or not any target
+is registered.</p>
+
+<h2>When something is unreachable</h2>
+
+<pre class="language-bash"><code class="language-bash">aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:us-west-2:111122223333:targetgroup/stayhub-api/abc \
+  --query "TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]" \
+  --output table</code></pre>
+
+<p><code>Target.FailedHealthChecks</code> means it is reachable and answering wrongly — check the
+path and the expected status code. <code>Target.Timeout</code> almost always means a security
+group: the target's group must allow the load balancer's group on the target port. And a 503 from
+the load balancer itself with no targets listed means the group is empty, which is a registration
+problem rather than a health one.</p>

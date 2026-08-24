@@ -1,0 +1,218 @@
+<p>HCL is a small language. It has no loops in the usual sense, no functions you can define, and no
+classes. That is deliberate — it is a configuration language, and the constraint is what keeps
+infrastructure readable. This lesson is the part of it you will actually use.</p>
+
+<h2>Everything is a block or an argument</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_ecs_cluster" "this" {
+  name = "pizza-tf"
+}</code></pre>
+
+<pre class="language-bash"><code class="language-bash">resource            block TYPE      — what kind of thing this is
+"aws_ecs_cluster"   block LABEL     — which resource type
+"this"              block LABEL     — the name YOU choose, unique per type
+name = "pizza-tf"   an ARGUMENT     — a name and a value</code></pre>
+
+<p>The second label is yours and it never appears in AWS. It is the address other parts of the
+configuration use to refer to this resource: <code>aws_ecs_cluster.this.id</code>. Name it for its
+role, not its type — <code>"this"</code> is idiomatic when a module makes exactly one of something,
+and <code>"public"</code> / <code>"private"</code> beat <code>"subnet1"</code> / <code>"subnet2"</code>
+every time.</p>
+
+<p>The block types you will meet are few:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform   settings: required versions, backend
+provider    how to talk to a platform
+resource    something Terraform creates and owns
+data        something that already exists, which Terraform reads
+variable    an input
+output      a return value
+locals      named intermediate values
+module      a call to another directory of Terraform</code></pre>
+
+<h2>Types</h2>
+
+<p>HCL has three primitive types and three collection types.</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  # primitives
+  name    = "pizza-tf"     # string
+  port    = 8085           # number  — no separate int/float
+  enabled = true           # bool
+
+  # collections
+  azs = ["us-west-2a", "us-west-2b"]        # list — ordered, same type
+
+  tags = {                                   # map — string keys, same type
+    Project   = "terraform-tutorial"
+    ManagedBy = "terraform"
+  }
+
+  service = {                                # object — fixed keys, MIXED types
+    name = "api"
+    port = 8085
+    tags = ["web", "public"]
+  }
+}</code></pre>
+
+<p>The distinction that matters: a <strong>map</strong> has arbitrary keys and one value type, an
+<strong>object</strong> has known keys and per-key types. They look identical in HCL — the same
+<code>{ }</code> — and Terraform infers which you meant. It only becomes visible when you write a
+type constraint on a variable, which lesson 6 covers.</p>
+
+<p>There is also <code>null</code>, and it is genuinely useful: setting an argument to
+<code>null</code> means "as if I had not written this line", so the provider default applies. That
+is how you conditionally omit an argument.</p>
+
+<h2>Strings and interpolation</h2>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  prefix = "pizza-tf"
+
+  # ${...} interpolates an expression into a string
+  db_name  = "${local.prefix}-mysql"
+  log_group = "/ecs/${local.prefix}"
+
+  # ⚠️ Do NOT do this. It is a string containing one interpolation and
+  # nothing else, so the quotes and ${} do nothing but add noise.
+  bad  = "${local.prefix}"
+  good = local.prefix
+}</code></pre>
+
+<p>That last one is the most common thing <code>terraform fmt</code> and reviewers pick up. If the
+whole string is one expression, write the expression.</p>
+
+<p>For anything multi-line — a policy document, a startup script — use a heredoc:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  # &lt;&lt;-EOT (with the dash) strips the leading indentation, so the block can be
+  # indented to match the code around it without the indentation ending up in
+  # the value. Without the dash, every space is part of the string.
+  startup = &lt;&lt;-EOT
+    #!/bin/bash
+    echo "starting ${local.prefix}"
+    systemctl start docker
+  EOT
+}</code></pre>
+
+<p>⚠️ For JSON — IAM policies especially — <strong>do not use a heredoc.</strong> Use
+<code>jsonencode()</code>:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  # A heredoc full of JSON is a string. A typo in it is discovered at APPLY
+  # time, by AWS, as a parse error. jsonencode takes real HCL values, so a
+  # missing brace is a syntax error in your editor and a trailing comma is
+  # simply allowed.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = ["arn:aws:secretsmanager:us-west-2:123456789012:secret:example"]
+    }]
+  })
+}</code></pre>
+
+<h2>The functions worth knowing</h2>
+
+<p>There are around 100 built-in functions and you cannot define your own. In practice a handful
+cover almost everything:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  base = { Project = "terraform-tutorial" }
+
+  # merge — combine maps, later keys win. The single most-used function
+  # in real configurations, because it is how you add a Name to shared tags.
+  tags = merge(local.base, { Name = "pizza-tf-vpc" })
+
+  # lookup — read a map with a fallback instead of erroring
+  size = lookup(local.base, "InstanceSize", "small")
+
+  # coalesce — first non-null, non-empty value
+  region = coalesce(null, "", "us-west-2")
+
+  # try — first expression that does not error. The polite way to handle
+  # a value that may not exist yet.
+  maybe = try(local.base.Missing, "default")
+
+  # join / split
+  origins = join(",", ["http://a.example", "http://b.example"])
+  parts   = split(",", "a,b,c")
+
+  # slice / length / element — list handling
+  first_two = slice(["a", "b", "c", "d"], 0, 2)
+
+  # cidrsubnet — carve a subnet out of a VPC range without doing the
+  # arithmetic yourself. cidrsubnet("10.20.0.0/16", 8, 1) = "10.20.1.0/24"
+  subnet = cidrsubnet("10.20.0.0/16", 8, 1)
+
+  # file / templatefile — read a file from disk, optionally with variables
+  # NOTE: read at PLAN time, from the machine running Terraform.
+  # user_data = templatefile("${path.module}/init.sh.tftpl", { port = 8085 })
+}</code></pre>
+
+<h2>terraform console</h2>
+
+<p>You do not have to guess what an expression evaluates to. <code>terraform console</code> is a
+REPL over your configuration:</p>
+
+<pre class="language-bash"><code class="language-bash">$ terraform console
+&gt; cidrsubnet("10.20.0.0/16", 8, 1)
+"10.20.1.0/24"
+
+&gt; merge({ a = 1 }, { b = 2 })
+{
+  "a" = 1
+  "b" = 2
+}
+
+&gt; [for s in ["a", "b"] : upper(s)]
+[
+  "A",
+  "B",
+]</code></pre>
+
+<p>It loads state too, so you can inspect real attributes of things you have already built. It is
+the fastest way to answer "what shape is this value actually?", which is most of the confusion when
+an expression will not compile.</p>
+
+<h2>Comments</h2>
+
+<pre class="language-hcl"><code class="language-hcl"># the idiomatic one
+// also works
+/* block comment,
+   rarely used */</code></pre>
+
+<p>Use them. Infrastructure code is read far more often than written, and almost every non-obvious
+line in it is non-obvious because of something AWS does — which is exactly the thing worth writing
+down.</p>
+
+<h2>terraform fmt</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform fmt              # rewrite files in this directory
+terraform fmt -recursive   # and every subdirectory
+terraform fmt -check       # exit non-zero instead of rewriting — for CI</code></pre>
+
+<p>It aligns the <code>=</code> in consecutive arguments, fixes indentation, and removes the
+redundant interpolation shown earlier. Run it before every commit and put
+<code>fmt -check -recursive</code> in CI, and formatting stops being something anyone discusses in a
+review.</p>
+
+<h2>Files and layout</h2>
+
+<p>Terraform reads every <code>.tf</code> file in the directory and concatenates them. The names are
+pure convention, but the convention is near-universal and worth following:</p>
+
+<pre class="language-bash"><code class="language-bash">main.tf        the resources
+variables.tf   the inputs
+outputs.tf     the outputs
+versions.tf    the terraform{} block and provider requirements</code></pre>
+
+<p>Subdirectories are <strong>not</strong> read. A directory is the unit of everything in Terraform
+— one state file, one <code>init</code>, one <code>apply</code>. A subdirectory is a separate
+configuration unless you explicitly call it as a module, which is lesson 10.</p>
+
+<h2>Next</h2>
+
+<p>You can read HCL now. <a href="/terraform/terraform-providers">Lesson 4</a> is about the plugin
+that turns it into AWS API calls — how to pin it, and why the lock file belongs in git.</p>

@@ -7,21 +7,22 @@ a rewrite of a published archive, not a track being authored. `scripts/verify-bu
 fails the frontend build if any URL in `index/posts.json` stops resolving, so a slug that leaves
 this manifest is a 404 on a page Google already has.
 
-⚠️ THE DATES ARE NOT COMPUTED, unlike the Postgres and FastAPI tracks.
+⚠️ THE DATES ARE COMPUTED, and they were not always.
 
-Those two tracks derived every date from a START_DATE because they were authored before they were
-published and the whole track had to be re-based when the publish day arrived. This one is the
-opposite situation: all 33 posts were published between 2018-10 and 2019-09, the stored dates
-already ascend cleanly, and every URL is indexed. Re-stamping them buys nothing and moves 33
-sitemap entries at once.
+The first version of this track transcribed each post's stored 2018-2019 date, on the reasoning
+that re-stamping 33 indexed posts moved 33 sitemap entries for no gain. Folau asked for the track
+to sit in 2024-2025 instead, so the dates are now derived from START_DATE + STEP_DAYS like the
+Postgres and FastAPI tracks.
 
-So the dates below are TRANSCRIBED FROM THE STORED POSTS, and `seed.py` has no `--force-dates`.
-`upsert_post` never overwrites an existing date, which is exactly the behaviour we want here —
-it means a re-seed cannot reshuffle the archive even by accident. `modified` updates on its own.
+That reversal has a consequence worth stating plainly, because it is the trap those tracks
+documented: `upsert_post` NEVER overwrites an existing date, and all 33 of these posts already
+have one. So a plain re-seed moves nothing at all — seeding this track requires
+`seed.py --force-dates`, and requires it again after ANY change to START_DATE. It is not a
+one-off flag. See progress_report.md.
 
-If a date ever does need to move, that is a deliberate change to this file plus a new flag on
-seed.py, and it is worth reading progress_report.md first.
 """
+
+from datetime import datetime, timedelta
 
 CATEGORY = {
     "slug": "aws",
@@ -40,6 +41,30 @@ CATEGORY = {
 # Where the category sits in site navigation, for reference. nav.ts already lists `aws` under the
 # DevOps group with the display name "AWS" — nothing to add there.
 NAV_GROUP = "DevOps"
+
+# ---------------------------------------------------------------------------
+# Dates
+# ---------------------------------------------------------------------------
+# Lesson 1 is stamped START_DATE and each following lesson is STEP_DAYS later, so the archive and
+# the ‹ prev / next › pager agree with the reading order.
+#
+# Folau asked for this track to sit in 2024-2025. With 34 posts, one every 21 days runs
+# 2024-01-09 -> 2025-12-02, which fills the two years without spilling into 2026.
+#
+# ⚠️ The step was 22 when the track held 33 posts. Adding `aws-ecr` pushed the last post to
+# 2026-01-04, outside the range Folau asked for, so the step came down rather than the range going
+# up. That re-dates every post by a few days — cheap here, and the alternative is a manifest where
+# the dates are no longer a single rule.
+#
+# ⚠️ Changing either value here means re-seeding with --force-dates. A published post's date is
+# sticky, so without that flag nothing moves and the manifest quietly disagrees with the site.
+START_DATE = datetime(2024, 1, 9, 9, 0, 0)
+STEP_DAYS = 21
+
+
+def _date(index: int) -> str:
+    return (START_DATE + timedelta(days=STEP_DAYS * index)).strftime("%Y-%m-%dT%H:%M:%S")
+
 
 # ---------------------------------------------------------------------------
 # Versions — READ OFF THIS MACHINE, not chosen
@@ -95,6 +120,20 @@ WORDS_PER_MINUTE = 220
 TARGET_MINUTES = (4, 6)                                  # Folau: "keep posts to the point"
 TOTAL_WORDS_MIN = TARGET_MINUTES[0] * WORDS_PER_MINUTE   # 880
 TOTAL_WORDS_MAX = TARGET_MINUTES[1] * WORDS_PER_MINUTE   # 1,320
+
+# Per-post exemptions from the reading-time CAP, with the reason recorded.
+#
+# The cap exists so "keep posts to the point" is enforced rather than intended, and an exemption
+# that is not written down is the cap being quietly abandoned. So it is a declared table, one line
+# per post, and check_content.py still enforces the FLOOR and the prose share on an exempt post —
+# only the ceiling moves.
+LENGTH_EXEMPT = {
+    # Folau asked for a worked two-microservice example — two Spring Boot services on separate
+    # ports behind one load balancer, plus how they call each other over Service Connect without
+    # leaving the cluster. That is genuinely the most useful thing in the post and it does not fit
+    # in six minutes alongside the basics. Exempted on request, 2026-08-25.
+    "aws-ecs": 8,
+}
 
 # AND a floor on the prose share. JSON is even easier than SQL to fill a word budget with — one
 # pasted IAM policy or CloudFormation template is 400 words of `"Effect": "Allow"` — and the
@@ -164,7 +203,6 @@ _TRACK = [
     {
         "slug": "aws-ecs",
         "title": "AWS – ECS: Running Containers Without Kubernetes",
-        "date": "2018-10-30T18:18:24",
         "tags": ["aws", "ecs", "containers", "fargate"],
         "excerpt": (
             "ECS in the three nouns it actually has — task definition, service, cluster — and why "
@@ -175,9 +213,21 @@ _TRACK = [
         ),
     },
     {
+        "slug": "aws-ecr",
+        "title": "AWS – ECR: The Registry Your Containers Come From",
+        "state": "new",
+        "tags": ["aws", "ecr", "containers", "docker"],
+        "excerpt": (
+            "Every container you run on ECS, EKS or Lambda is pulled from a registry, and on AWS "
+            "that is ECR. Authenticating with a token that expires in twelve hours, the tag "
+            "immutability setting that stops `:latest` meaning two different things, lifecycle "
+            "policies so old images do not bill forever, and the vulnerability scan worth turning "
+            "on. Plus the pull that fails from a private subnet, and why it is a VPC endpoint."
+        ),
+    },
+    {
         "slug": "aws-lambda-to-stop-an-ec2-instance",
         "title": "AWS – Stop an EC2 Instance on a Schedule with Lambda",
-        "date": "2019-04-22T05:00:18",
         "tags": ["aws", "lambda", "ec2", "cost"],
         "excerpt": (
             "A dev instance running nights and weekends is roughly 70% waste. Twenty lines of "
@@ -190,7 +240,6 @@ _TRACK = [
     {
         "slug": "aws-lambda-to-start-an-ec2-instance",
         "title": "AWS – Start an EC2 Instance on a Schedule with Lambda",
-        "date": "2019-04-22T05:00:51",
         "tags": ["aws", "lambda", "ec2", "eventbridge"],
         "excerpt": (
             "The other half of the schedule: bring the instance back before anyone needs it. The "
@@ -203,7 +252,6 @@ _TRACK = [
     {
         "slug": "aws-lambda-to-start-an-rds-instance",
         "title": "AWS – Start an RDS Instance on a Schedule with Lambda",
-        "date": "2019-04-22T05:01:23",
         "tags": ["aws", "lambda", "rds", "cost"],
         "excerpt": (
             "Starting a stopped RDS instance is one API call and a wait measured in minutes, not "
@@ -216,7 +264,6 @@ _TRACK = [
     {
         "slug": "aws-lambda-to-stop-an-rds-instance",
         "title": "AWS – Stop an RDS Instance on a Schedule with Lambda",
-        "date": "2019-04-22T05:01:39",
         "tags": ["aws", "lambda", "rds", "cost"],
         "excerpt": (
             "Stopping RDS saves the instance hours but not the storage, and it does not last: AWS "
@@ -229,7 +276,6 @@ _TRACK = [
     {
         "slug": "aws-iam",
         "title": "AWS – IAM: Policies, Roles and Least Privilege",
-        "date": "2019-08-05T06:37:40",
         "tags": ["aws", "iam", "security"],
         "excerpt": (
             "IAM is the service you get wrong first and it is the one that matters most. The five "
@@ -242,7 +288,6 @@ _TRACK = [
     {
         "slug": "aws-ec2",
         "title": "AWS – EC2: Instances, Storage and What They Cost",
-        "date": "2019-08-05T06:38:12",
         "tags": ["aws", "ec2", "compute"],
         "excerpt": (
             "Reading an instance type instead of guessing — what m7g.large tells you before you "
@@ -255,7 +300,6 @@ _TRACK = [
     {
         "slug": "aws-load-balancer",
         "title": "AWS – Load Balancers: ALB, NLB and Target Groups",
-        "date": "2019-08-05T06:38:30",
         "tags": ["aws", "elb", "alb", "networking"],
         "excerpt": (
             "ALB or NLB, decided in one table instead of three paragraphs. The target group is the "
@@ -268,7 +312,6 @@ _TRACK = [
     {
         "slug": "aws-route-53",
         "title": "AWS – Route 53: DNS, Alias Records and Health Checks",
-        "date": "2019-08-05T06:39:07",
         "tags": ["aws", "route53", "dns"],
         "excerpt": (
             "The one thing Route 53 does that other DNS does not: an ALIAS record, which points a "
@@ -281,7 +324,6 @@ _TRACK = [
     {
         "slug": "aws-cli",
         "title": "AWS – The CLI: Profiles, Queries and the Flags That Bite",
-        "date": "2019-08-05T06:39:30",
         "tags": ["aws", "aws-cli", "tooling"],
         "excerpt": (
             "Named profiles so you never run a command against the wrong account, SSO login, and "
@@ -294,7 +336,6 @@ _TRACK = [
     {
         "slug": "aws-rds",
         "title": "AWS – RDS: Managed Databases and What Managed Means",
-        "date": "2019-08-05T06:39:53",
         "tags": ["aws", "rds", "database"],
         "excerpt": (
             "What RDS takes off your hands and what it very much does not. Multi-AZ is failover "
@@ -307,7 +348,6 @@ _TRACK = [
     {
         "slug": "aws-dynamodb",
         "title": "AWS – DynamoDB: Keys, Indexes and Access Patterns",
-        "date": "2019-08-05T06:40:26",
         "tags": ["aws", "dynamodb", "nosql"],
         "excerpt": (
             "DynamoDB rewards you for knowing your queries before you design your table, and "
@@ -320,7 +360,6 @@ _TRACK = [
     {
         "slug": "aws-elasticache",
         "title": "AWS – ElastiCache: Redis in Front of Your Database",
-        "date": "2019-08-05T06:40:51",
         "tags": ["aws", "elasticache", "redis", "caching"],
         "excerpt": (
             "Cache-aside in fifteen lines, then the four questions that decide whether it helps: "
@@ -333,7 +372,6 @@ _TRACK = [
     {
         "slug": "aws-s3",
         "title": "AWS – S3: Buckets, Policies and Static Sites",
-        "date": "2019-08-05T06:41:20",
         "tags": ["aws", "s3", "storage"],
         "excerpt": (
             "S3 as the service everything else leans on. Storage classes and the lifecycle rule "
@@ -346,7 +384,6 @@ _TRACK = [
     {
         "slug": "aws-cloudfront",
         "title": "AWS – CloudFront: Caching, OAC and Edge Functions",
-        "date": "2019-08-05T06:46:13",
         "tags": ["aws", "cloudfront", "cdn"],
         "excerpt": (
             "A CDN is a cache, and a cache you cannot explain is an outage waiting. Origins and "
@@ -359,7 +396,6 @@ _TRACK = [
     {
         "slug": "aws-lambda",
         "title": "AWS – Lambda: Handlers, Cold Starts and Packaging",
-        "date": "2019-08-05T06:46:44",
         "tags": ["aws", "lambda", "serverless"],
         "excerpt": (
             "The handler signature, what actually lives in the execution context between "
@@ -372,7 +408,6 @@ _TRACK = [
     {
         "slug": "aws-api-gateway",
         "title": "AWS – API Gateway: HTTP APIs, Routes and Custom Domains",
-        "date": "2019-08-05T06:47:04",
         "tags": ["aws", "api-gateway", "serverless"],
         "excerpt": (
             "HTTP API or REST API — one table, and for most backends the answer is the cheaper, "
@@ -385,7 +420,6 @@ _TRACK = [
     {
         "slug": "aws-alexa",
         "title": "AWS – Alexa Skills: Where They Actually Live",
-        "date": "2019-08-05T06:47:32",
         "tags": ["aws", "alexa", "lambda"],
         "closed": True,
         "excerpt": (
@@ -399,7 +433,6 @@ _TRACK = [
     {
         "slug": "aws-kms-and-ecryption",
         "title": "AWS – KMS and Encryption at Rest",
-        "date": "2019-08-05T06:48:17",
         "tags": ["aws", "kms", "encryption", "security"],
         "excerpt": (
             "Encryption at rest is a checkbox until something needs decrypting from another "
@@ -412,7 +445,6 @@ _TRACK = [
     {
         "slug": "aws-sqs",
         "title": "AWS – SQS: Queues, Visibility Timeout and DLQs",
-        "date": "2019-08-05T06:48:40",
         "tags": ["aws", "sqs", "messaging"],
         "excerpt": (
             "A queue is the simplest way to stop a slow dependency from becoming a 500. Standard "
@@ -425,7 +457,6 @@ _TRACK = [
     {
         "slug": "aws-ses",
         "title": "AWS – SES: Sending Email That Arrives",
-        "date": "2019-08-05T06:49:08",
         "tags": ["aws", "ses", "email"],
         "excerpt": (
             "Getting SES to send is easy; getting the mail delivered is the work. Verifying a "
@@ -438,7 +469,6 @@ _TRACK = [
     {
         "slug": "aws-sns",
         "title": "AWS – SNS: Fan-out, Filtering and SQS Subscriptions",
-        "date": "2019-08-05T06:49:27",
         "tags": ["aws", "sns", "messaging"],
         "excerpt": (
             "SNS pushes, SQS pulls, and the useful thing is putting them together: one topic, "
@@ -451,7 +481,6 @@ _TRACK = [
     {
         "slug": "aws-elasticbeanstalk",
         "title": "AWS – Elastic Beanstalk, and Whether to Use It in 2026",
-        "date": "2019-08-05T06:50:10",
         "tags": ["aws", "elastic-beanstalk", "deployment"],
         "excerpt": (
             "Beanstalk still works and still deploys a web app in one command, and it is still "
@@ -464,7 +493,6 @@ _TRACK = [
     {
         "slug": "aws-kinesis",
         "title": "AWS – Kinesis: Streams, Firehose and When to Use SQS Instead",
-        "date": "2019-08-05T06:50:39",
         "tags": ["aws", "kinesis", "streaming"],
         "excerpt": (
             "Most teams reaching for Kinesis want SQS, so this starts with the table that tells "
@@ -477,7 +505,6 @@ _TRACK = [
     {
         "slug": "aws-codecommit",
         "title": "AWS – CodeCommit Is Closed. Here Is What to Use",
-        "date": "2019-08-05T06:51:08",
         "tags": ["aws", "codecommit", "git", "ci-cd"],
         "closed": True,
         "excerpt": (
@@ -491,7 +518,6 @@ _TRACK = [
     {
         "slug": "aws-codedeploy",
         "title": "AWS – CodeDeploy: Blue/Green and Where It Still Fits",
-        "date": "2019-08-05T06:51:35",
         "tags": ["aws", "codedeploy", "ci-cd", "deployment"],
         "excerpt": (
             "CodeDeploy is the piece that takes a built artifact and puts it on the thing that "
@@ -504,7 +530,6 @@ _TRACK = [
     {
         "slug": "aws-codepipeline",
         "title": "AWS – CodePipeline: Stages, Artifacts and Approvals",
-        "date": "2019-08-05T06:52:06",
         "tags": ["aws", "codepipeline", "ci-cd"],
         "excerpt": (
             "A pipeline is stages, and between them an artifact in an S3 bucket — get that one "
@@ -517,7 +542,6 @@ _TRACK = [
     {
         "slug": "aws-codebuild",
         "title": "AWS – CodeBuild: buildspec, Caching and Build Speed",
-        "date": "2019-08-05T06:52:29",
         "tags": ["aws", "codebuild", "ci-cd"],
         "excerpt": (
             "The buildspec file phase by phase, what each one is actually for, and the artifacts "
@@ -530,7 +554,6 @@ _TRACK = [
     {
         "slug": "aws-cloudformation",
         "title": "AWS – CloudFormation: Infrastructure You Can Re-create",
-        "date": "2019-08-05T06:53:07",
         "tags": ["aws", "cloudformation", "iac", "sam"],
         "excerpt": (
             "Click-ops is fine until the day you have to build it again. A template's five "
@@ -543,7 +566,6 @@ _TRACK = [
     {
         "slug": "aws-cloudwatch",
         "title": "AWS – CloudWatch: Logs, Metrics and Alarms Worth Having",
-        "date": "2019-08-05T06:53:52",
         "tags": ["aws", "cloudwatch", "monitoring", "observability"],
         "excerpt": (
             "Log groups, retention that defaults to never expire and quietly bills you forever, "
@@ -556,7 +578,6 @@ _TRACK = [
     {
         "slug": "aws-secrets-manager",
         "title": "AWS – Secrets Manager and Parameter Store",
-        "date": "2019-08-07T03:32:16",
         "tags": ["aws", "secrets-manager", "ssm", "security"],
         "excerpt": (
             "Two services do this job and the right answer is usually the cheaper one. Parameter "
@@ -569,7 +590,6 @@ _TRACK = [
     {
         "slug": "aws-aurora",
         "title": "AWS – Aurora: What It Changes About RDS",
-        "date": "2019-08-21T19:58:25",
         "tags": ["aws", "aurora", "database", "rds"],
         "excerpt": (
             "Aurora is RDS with the storage layer replaced, and every difference that matters "
@@ -582,7 +602,6 @@ _TRACK = [
     {
         "slug": "aws-kubernetes-on-aws",
         "title": "AWS – EKS: Kubernetes, and Whether You Need It",
-        "date": "2019-09-06T21:01:13",
         "tags": ["aws", "eks", "kubernetes", "containers"],
         "excerpt": (
             "The honest version: most teams shipping one backend do not need Kubernetes, and ECS "
@@ -600,21 +619,26 @@ POSTS = [
         "slug": entry["slug"],
         "title": entry["title"],
         "file": f"{i + 1:02d}-{entry['slug']}.html",
-        "date": entry["date"],
+        "date": _date(i),
         "tags": entry["tags"],
         "excerpt": entry["excerpt"],
-        "state": "rewrite",
+        "state": entry.get("state", "rewrite"),
         "closed": entry.get("closed", False),
     }
     for i, entry in enumerate(_TRACK)
 ]
 
-# Every slug in this track is live and indexed. check_content.py fails if one leaves the manifest,
-# and seed.py refuses to write to prod if one is missing from the target tree.
-FROZEN_SLUGS = {e["slug"] for e in _TRACK}
+# Slugs that are live and indexed. check_content.py fails if one leaves the manifest, and seed.py
+# refuses to write to prod if one is missing from the target tree.
+#
+# ⚠️ This is no longer "every post". The track began as a pure rewrite of 33 published URLs;
+# `aws-ecr` is the first genuinely NEW post, added because the collection covered ECS and EKS but
+# had nothing on the registry both pull from. A new slug is not frozen — there is no indexed URL
+# to protect — but it IS subject to the collision check in seed.py, because post slugs are global
+# across categories.
+FROZEN_SLUGS = {e["slug"] for e in _TRACK if e.get("state", "rewrite") == "rewrite"}
 
-# There are no new slugs in this track. Kept so seed.py can stay shaped like the other tracks'.
-NEW_SLUGS: set[str] = set()
+NEW_SLUGS = {e["slug"] for e in _TRACK if e.get("state") == "new"}
 
 # Posts about something a reader cannot adopt today. They must say so above the fold.
 CLOSED_SLUGS = {e["slug"] for e in _TRACK if e.get("closed")}

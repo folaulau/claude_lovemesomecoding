@@ -1,0 +1,140 @@
+<p>DynamoDB is a key-value store that gives you single-digit millisecond reads at any scale, with no
+servers and no connection pool. It buys that by removing the thing you rely on in SQL: the ability
+to ask a question you did not plan for.</p>
+
+<p>So the design process runs backwards. In Postgres you model the data and write queries later. In
+DynamoDB you list the queries first, then build a table that answers them.</p>
+
+<h2>Keys</h2>
+
+<p>Every item is found by its primary key, which is one of two shapes:</p>
+
+<ul>
+  <li><strong>Partition key alone.</strong> A pure lookup — give the key, get one item</li>
+  <li><strong>Partition key plus sort key.</strong> The partition key selects a group; the sort key
+      orders within it. This is what makes range queries possible</li>
+</ul>
+
+<p>The partition key decides which physical partition the item lives on, so it also decides how
+your load spreads. The sort key is what lets you say "the ten most recent bookings for this
+property" in one request.</p>
+
+<h2>Query is the operation. Scan is a bug.</h2>
+
+<p><code>Query</code> takes a partition key and reads only that partition — fast, and priced by
+what it returns. <code>Scan</code> reads the entire table and filters afterwards, so it is priced
+by what it <em>reads</em>, and it gets slower and more expensive every day the table grows.</p>
+
+<pre class="language-bash"><code class="language-bash">aws dynamodb query \
+  --table-name Bookings \
+  --key-condition-expression "PK = :pk AND begins_with(SK, :prefix)" \
+  --expression-attribute-values '{":pk":{"S":"PROPERTY#4417"},":prefix":{"S":"BOOKING#"}}' \
+  --limit 10 --no-scan-index-forward</code></pre>
+
+<p><code>--no-scan-index-forward</code> reverses the sort order, which is how you get "most recent"
+without reading everything first.</p>
+
+<p>The trap worth naming: <code>--filter-expression</code> looks like a WHERE clause and is not.
+It is applied <em>after</em> items are read, so you are billed for every item examined even though
+you receive few. A scan with a filter that returns three items from a million-item table costs the
+million.</p>
+
+<h2>Single-table design, briefly</h2>
+
+<p>DynamoDB has no joins. The usual answer is to put several entity types in one table and shape
+the keys so related items sit next to each other:</p>
+
+<table>
+  <thead><tr><th>PK</th><th>SK</th><th>Item</th></tr></thead>
+  <tbody>
+    <tr><td><code>PROPERTY#4417</code></td><td><code>META</code></td><td>The property</td></tr>
+    <tr><td><code>PROPERTY#4417</code></td><td><code>BOOKING#2026-08-24#9912</code></td><td>A booking</td></tr>
+    <tr><td><code>PROPERTY#4417</code></td><td><code>REVIEW#2026-07-02#331</code></td><td>A review</td></tr>
+  </tbody>
+</table>
+
+<p>One <code>Query</code> on <code>PROPERTY#4417</code> now returns the property and all its
+bookings and reviews together — the equivalent of a join, in one request, at partition speed. Sort
+keys are compared as strings, which is why dates are written <code>YYYY-MM-DD</code>: that is the
+format where lexical order and chronological order agree.</p>
+
+<p>It is a genuinely harder model to read and refactor. Use it when access patterns are settled and
+the request count matters; two simple tables are often the better trade.</p>
+
+<h2>Indexes, and the one you cannot undo</h2>
+
+<table>
+  <thead><tr><th></th><th>GSI</th><th>LSI</th></tr></thead>
+  <tbody>
+    <tr><td>Partition key</td><td>Any attribute</td><td>Same as the table's</td></tr>
+    <tr><td>Created</td><td>Any time</td><td><strong>Only at table creation</strong></td></tr>
+    <tr><td>Consistency</td><td>Eventual only</td><td>Strong available</td></tr>
+    <tr><td>Capacity</td><td>Its own</td><td>Shared with the table</td></tr>
+  </tbody>
+</table>
+
+<p><strong>An LSI cannot be added later.</strong> Not by an update, not by a migration — the table
+must be recreated and the data moved. Given that, and that a GSI can do almost everything an LSI
+can, default to GSIs and treat LSIs as a specialist choice made deliberately on day one.</p>
+
+<p>A GSI also costs writes: every write to the table that touches an indexed attribute is a second
+write to the index, billed separately. Project only the attributes you need.</p>
+
+<h2>On-demand or provisioned</h2>
+
+<p><strong>On-demand</strong> charges per request, scales instantly, and costs nothing when idle.
+<strong>Provisioned</strong> reserves capacity units per second and is roughly six times cheaper
+per request at steady load.</p>
+
+<p>Start on-demand. It is the right answer for anything new, unpredictable, or small, and it
+removes an entire class of throttling problems. Move to provisioned with autoscaling once traffic
+is predictable enough that you can see the saving in a bill.</p>
+
+<h2>The hot partition</h2>
+
+<p>Throughput is spread across partitions, so a partition key with low cardinality concentrates
+traffic on one of them. The symptom is
+<code>ProvisionedThroughputExceededException</code> while the table's own metrics look
+comfortable — you have exhausted one partition, not the table.</p>
+
+<p>A key of <code>"2026-08-24"</code> puts an entire day's writes in one place. A key of
+<code>"ACTIVE"</code> is worse. Choose something with many distinct values — a user id, a property
+id — and if the natural key really is low-cardinality, append a suffix to spread it and query
+across the suffixes.</p>
+
+<h2>Reads, consistency and cost</h2>
+
+<p>Reads are eventually consistent by default, which means a read immediately after a write may
+return the old value. Strongly consistent reads cost twice as much and are not available on a GSI
+at all.</p>
+
+<p>Also worth knowing: writes are billed per KB of item size, and an update to one attribute is
+billed against the <em>whole</em> item. Large items with a frequently-updated counter are an
+expensive shape; split the counter into its own item.</p>
+
+<h2>Streams</h2>
+
+<pre class="language-bash"><code class="language-bash">aws dynamodb update-table --table-name Bookings \
+  --stream-specification "StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES"</code></pre>
+
+<p>A stream emits every change in order, and a Lambda can consume it. This is how you keep a search
+index in sync, publish events, or maintain an aggregate — without your write path knowing about any
+of it. It is the closest thing DynamoDB has to a trigger, and it is the answer to most "but I also
+need to…" requirements.</p>
+
+<p>Records are retained for 24 hours, and ordering is guaranteed per partition key rather than
+across the table. Both matter: a consumer broken for a day loses data, and a design that assumes
+global ordering is assuming something the stream does not offer.</p>
+
+<h2>Deleting data on a schedule</h2>
+
+<p>DynamoDB has a built-in TTL. Name an attribute holding a Unix timestamp and items are removed
+once it passes:</p>
+
+<pre class="language-bash"><code class="language-bash">aws dynamodb update-time-to-live --table-name Sessions \
+  --time-to-live-specification "Enabled=true,AttributeName=expiresAt"</code></pre>
+
+<p>Deletion is free, which makes it much cheaper than scanning for old items and deleting them. It
+is also not prompt — AWS deletes typically within 48 hours of expiry, not at it. So TTL is right
+for housekeeping and wrong for anything where the data must be gone by a deadline, and any query
+that must not see expired items needs to filter on the timestamp itself.</p>

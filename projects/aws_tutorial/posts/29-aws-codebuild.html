@@ -1,0 +1,147 @@
+<p>CodeBuild runs your build in a managed container: it clones the source, runs the commands you
+declare, and uploads whatever you tell it to keep. You pay per build-minute and nothing when idle.</p>
+
+<h2>buildspec.yml, phase by phase</h2>
+
+<pre class="language-yaml"><code class="language-yaml">version: 0.2
+
+env:
+  variables:
+    NODE_ENV: production
+  parameter-store:
+    NPM_TOKEN: /stayhub/prod/npm-token
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - npm ci
+  pre_build:
+    commands:
+      - npm run lint
+      - npm test
+  build:
+    commands:
+      - npm run build
+  post_build:
+    commands:
+      - echo "built $CODEBUILD_RESOLVED_SOURCE_VERSION"
+
+artifacts:
+  files:
+    - '**/*'
+  base-directory: dist
+
+cache:
+  paths:
+    - 'node_modules/**/*'</code></pre>
+
+<p>The phases are conventions rather than rules — nothing stops you running tests in
+<code>build</code> — but keeping to them makes the console's phase timings useful, which is how you
+find out that <code>install</code> is two thirds of your build.</p>
+
+<p>One real difference: <strong><code>post_build</code> runs even when <code>build</code>
+fails.</strong> That is deliberate, so you can publish test reports or clean up, and it is a trap
+if you put "push the image" there — it will push after a failed build unless you check
+<code>$CODEBUILD_BUILD_SUCCEEDING</code>.</p>
+
+<h2>The artifacts block decides what the next stage gets</h2>
+
+<p>CodeBuild uploads only what <code>artifacts</code> declares. Omit the block and the next
+pipeline stage receives an empty zip — and it fails there, not here, which is why this shows up as
+a mysterious deploy failure.</p>
+
+<p><code>base-directory</code> is the other half. Without it, <code>files: '**/*'</code> uploads
+your whole workspace including <code>node_modules</code>, producing an artifact hundreds of
+megabytes larger than it needs to be and a slow upload on every build.</p>
+
+<h2>Caching, which is usually the whole performance story</h2>
+
+<p>By default every build starts from a clean container and downloads every dependency again. On a
+typical Node or Python project that is most of the build time and most of the bill.</p>
+
+<p>Two kinds of cache, and they are not alternatives:</p>
+
+<ul>
+  <li><strong>Local caching</strong> — kept on the build host. Fast, free, and only hits when a
+      build lands on a host that ran a recent build. Modes include
+      <code>DOCKER_LAYER_CACHE</code>, <code>SOURCE_CACHE</code> and
+      <code>CUSTOM_CACHE</code></li>
+  <li><strong>S3 caching</strong> — uploaded and downloaded per build. Reliable, hits every time,
+      and costs the transfer. Better for large dependency trees</li>
+</ul>
+
+<pre class="language-bash"><code class="language-bash">aws codebuild update-project --name stayhub-build \
+  --cache '{"type":"LOCAL","modes":["LOCAL_DOCKER_LAYER_CACHE","LOCAL_SOURCE_CACHE"]}'</code></pre>
+
+<p>Docker layer caching is the biggest single win if you build images, and it requires privileged
+mode — see below. Measure before and after; a cache that never hits is pure overhead.</p>
+
+<h2>Compute type: do not guess</h2>
+
+<p>Sizes run from <code>BUILD_GENERAL1_SMALL</code> upwards, and a larger one costs more per
+minute while finishing sooner. Because you are billed per minute, the bigger instance is sometimes
+<em>cheaper</em> overall, and sometimes not — it depends entirely on whether your build
+parallelises.</p>
+
+<p>A single-threaded build gains almost nothing from more vCPUs and you pay the higher rate for the
+same wall-clock time. A test suite that runs in parallel can halve both. Try two sizes on the same
+commit and compare; it is a ten-minute experiment that settles the question.</p>
+
+<p>Graviton (<code>ARM_CONTAINER</code>) is cheaper per minute again, if your dependencies build
+for arm64.</p>
+
+<h2>Secrets belong in parameter-store, not variables</h2>
+
+<p>Anything under <code>env.variables</code> is plain text in the buildspec, which is in your
+repository, and it is echoed in the build log. The <code>parameter-store</code> and
+<code>secrets-manager</code> blocks fetch at build time and mask the value in the log.</p>
+
+<p>The project's service role needs <code>ssm:GetParameters</code> and <code>kms:Decrypt</code>
+for that to work — and the failure is an unhelpful "parameter not found", which sends people
+looking for a typo rather than a permission.</p>
+
+<h2>Building a container image</h2>
+
+<p>Running <code>docker build</code> inside CodeBuild needs <strong>privileged mode</strong>, which
+is off by default. Without it, the Docker daemon cannot start and the error mentions a socket
+rather than a setting.</p>
+
+<pre class="language-bash"><code class="language-bash">aws codebuild update-project --name stayhub-build \
+  --environment '{"type":"LINUX_CONTAINER","image":"aws/codebuild/standard:7.0","computeType":"BUILD_GENERAL1_SMALL","privilegedMode":true}'
+
+aws ecr get-login-password --region us-west-2 \
+  | docker login --username AWS --password-stdin 111122223333.dkr.ecr.us-west-2.amazonaws.com</code></pre>
+
+<p><code>privilegedMode</code> is nested inside <code>--environment</code> rather than being a flag
+of its own, and <code>--environment</code> replaces the whole block — so you must restate
+<code>type</code>, <code>image</code> and <code>computeType</code> or you will reset them to
+something you did not choose. This is a general property of the <code>update-project</code> call
+and it catches people on <code>--artifacts</code> and <code>--source</code> too.</p>
+
+<p>Note the ECR login is piped rather than passed as an argument, so the token never appears in the
+process list or the build log.</p>
+
+<h2>What a build costs, and the free tier</h2>
+
+<p>Billing is per build-minute at a rate set by compute type, with 100 minutes a month free on the
+smallest Linux size. For a small project that is often the entire CI bill.</p>
+
+<p>The number worth watching is not the rate but the duration, and the duration is usually
+dependencies. A build that spends four minutes on <code>npm ci</code> and forty seconds compiling
+is a caching problem, not a compute-size problem — and buying a larger instance to fix it makes the
+bill worse rather than better.</p>
+
+<h2>Debugging a failing build</h2>
+
+<pre class="language-bash"><code class="language-bash">aws codebuild batch-get-builds --ids stayhub-build:abc-123 \
+  --query "builds[].[buildStatus,phases[?phaseStatus=='FAILED'].[phaseType,contexts[].message]]"</code></pre>
+
+<p>That names the phase that failed, which narrows things immediately: an <code>install</code>
+failure is dependencies, <code>pre_build</code> is your tests, and a <code>DOWNLOAD_SOURCE</code>
+failure is the connection or the service role rather than anything in your code.</p>
+
+<p>For anything you cannot reproduce from logs, CodeBuild can pause a build and let you connect to
+the container with Session Manager — far faster than adding <code>echo</code> statements and
+pushing again.</p>

@@ -1,0 +1,213 @@
+<p>A composable is a function that uses Vue's reactivity and lifecycle APIs, named
+<code>useSomething</code>. It is how you share <em>logic</em> between components, and it is the thing
+the Composition API was actually created for.</p>
+
+<p>Vue 2 shared logic with mixins, which merged properties into a component from a distance. Two
+mixins could silently overwrite each other, nothing told you where a property came from, and the
+component's real surface was unknowable. Composables have none of those problems, because they are
+just function calls with return values.</p>
+
+<h2>A real one</h2>
+
+<p>The demo application's feed needs an <code>IntersectionObserver</code>. That means creating it once
+the DOM exists, registering elements that may not exist yet, and — the part that is easy to forget —
+disconnecting it on unmount. None of that is about reels:</p>
+
+<pre class="language-javascript"><code class="language-javascript">export function useIntersectionObserver(onIntersect, { root = null, threshold = 0 } = {}) {
+  let observer = null;
+
+  // Elements registered before mount. A template ref inside a v-for is not
+  // populated until the DOM exists, but the caller should not have to care about
+  // that ordering, so they are buffered and observed once the observer is built.
+  const pending = new Set();
+
+  const isActive = ref(false);
+
+  onMounted(() =&gt; {
+    observer = new IntersectionObserver(onIntersect, {
+      // unref() so the caller can pass either `scroller` (a ref) or an element.
+      root: unref(root) ?? null,
+      threshold,
+    });
+    isActive.value = true;
+    pending.forEach((el) =&gt; observer.observe(el));
+    pending.clear();
+  });
+
+  /** Watch an element. Safe to call with null, and safe to call twice —
+   *  re-observing an element already under observation is a no-op. */
+  function observe(el) {
+    if (!el) return;
+    if (observer) observer.observe(el);
+    else pending.add(el);
+  }
+
+  function unobserve(el) {
+    if (!el) return;
+    pending.delete(el);
+    observer?.unobserve(el);
+  }
+
+  function stop() {
+    observer?.disconnect();
+    observer = null;
+    pending.clear();
+    isActive.value = false;
+  }
+
+  // The whole point. A component using this cannot leak an observer, because
+  // the composable that created it is the thing that tears it down.
+  onBeforeUnmount(stop);
+
+  return { observe, unobserve, stop, isActive };
+}</code></pre>
+
+<p>And what is left in the component is only the part that <em>is</em> about the feed:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const { observe } = useIntersectionObserver(
+  (entries) =&gt; {
+    entries.forEach((entry) =&gt; {
+      // 0.6 rather than 0.5: at exactly half, two slides can both qualify
+      // mid-scroll and the active index flickers between them.
+      if (entry.isIntersecting &amp;&amp; entry.intersectionRatio &gt;= 0.6) {
+        const idx = Number(entry.target.dataset.index);
+        activeIndex.value = idx;
+        // Prefetch a page before hitting the end, so the scroll never stalls.
+        if (idx &gt;= reels.value.length - 2) loadPage();
+      }
+    });
+  },
+  { root: scroller, threshold: [0.6] }
+);</code></pre>
+
+<p>The component no longer mentions <code>IntersectionObserver</code>, <code>onMounted</code> or
+<code>onBeforeUnmount</code>. It cannot leak the observer, because the thing that creates it is the
+thing that tears it down.</p>
+
+<h2>What makes it a composable</h2>
+
+<p><strong>1. It calls Vue APIs, so it must be called from setup.</strong> <code>onMounted</code> and
+friends attach to whichever component is currently being set up. Call a composable inside a callback,
+a promise, or after an <code>await</code>, and there is no current component — the hooks silently
+attach to nothing, or to the wrong component.</p>
+
+<pre class="language-javascript"><code class="language-javascript">// Correct -- top level of &lt;script setup&gt;
+const { observe } = useIntersectionObserver(onEntry, { root: scroller });
+
+// WRONG -- no current component instance by the time this runs
+onMounted(async () =&gt; {
+  await load();
+  const { observe } = useIntersectionObserver(onEntry);
+});</code></pre>
+
+<p><strong>2. It owns its cleanup.</strong> This is the real payoff. Anything a composable starts, it
+must stop, so the caller cannot get it half right.</p>
+
+<p><strong>3. It returns refs, not values.</strong> Returning <code>count.value</code> hands over a
+number and the caller loses reactivity forever. Return the ref.</p>
+
+<h2>Accepting reactive arguments</h2>
+
+<p>The second composable in the application debounces a value, which is what lets Explore search as you
+type without firing a request per keystroke:</p>
+
+<pre class="language-javascript"><code class="language-javascript">export function useDebounced(source, delay = 300) {
+  const debounced = ref(typeof source === "function" ? source() : unref(source));
+  let timer = null;
+
+  watch(source, (value) =&gt; {
+    clearTimeout(timer);
+    timer = setTimeout(() =&gt; {
+      debounced.value = value;
+    }, delay);
+  });
+
+  // Without this, a timer that fires after the component is gone writes to a ref
+  // nothing is rendering any more. Harmless here; not harmless when the callback
+  // starts a request.
+  onBeforeUnmount(() =&gt; clearTimeout(timer));
+
+  // Returned READONLY by convention: the caller reads it and writes to `source`.
+  // Returning a writable ref invites two sources of truth for the same value.
+  return debounced;
+}</code></pre>
+
+<p>Note what the argument is. Not a string — a <strong>ref or a getter</strong>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const debouncedTerm = useDebounced(term, 350);                   // a ref
+const debouncedQuery = useDebounced(() =&gt; route.query.q, 350);   // a getter</code></pre>
+
+<p>Passing <code>term.value</code> would hand over a plain string. The composable would debounce one
+value, once, and never update again — and nothing would warn you. This is the most common composable
+bug, and it always looks like "the debounce is broken" rather than "the argument was wrong".</p>
+
+<p><code>watch</code> accepts either form directly, which is why the composable needs no branching to
+support both. Design yours the same way.</p>
+
+<p>The caller then reacts to the debounced value:</p>
+
+<pre class="language-javascript"><code class="language-javascript">watch(debouncedTerm, (q) =&gt; {
+  if (q !== (route.query.q ?? "")) setFilter({ q });</code></pre>
+
+<h2>Conventions worth following</h2>
+
+<p><strong>Name it <code>useX</code>.</strong> Not decoration — it is the signal that this function has
+lifecycle side effects and must be called from setup.</p>
+
+<p><strong>One file per composable</strong>, in <code>src/composables/</code>.</p>
+
+<p><strong>Return an object, not an array.</strong> An object lets the caller take only what it needs
+and rename on destructure. <code>const { observe } = useIntersectionObserver(...)</code> ignores the
+other three returns without ceremony.</p>
+
+<p><strong>Return a <code>stop</code> when you start something long-lived</strong>, even though unmount
+handles the usual case. It costs one line and makes the composable usable outside a component.</p>
+
+<h2>Composables are not stores</h2>
+
+<p>An important distinction, and the source of a lot of confused architecture.</p>
+
+<p>Calling a composable twice gives you <strong>two independent instances</strong>. Two components each
+calling <code>useDebounced(term)</code> get their own timer and their own ref. That is usually what you
+want.</p>
+
+<p>State declared at <em>module</em> scope in a composable's file is shared by every caller:</p>
+
+<pre class="language-javascript"><code class="language-javascript">// Module scope -- ONE ref, shared by every component that calls this.
+const user = ref(null);
+
+export function useUser() {
+  return { user };   // a singleton pretending to be a composable
+}</code></pre>
+
+<p>That works, and people do it. But it is a global store with none of a store's tooling — no devtools
+timeline, no obvious home for actions, and no signal in the name that it is shared. If state should be
+shared, use Pinia and say so. That is lesson 17.</p>
+
+<h2>Custom directives, the other half of reusability</h2>
+
+<p>Vue groups composables, custom directives and plugins under one heading, because they answer the same
+question in different places. A composable reuses <em>logic</em>; a directive reuses <em>low-level DOM
+behaviour</em>.</p>
+
+<pre class="language-javascript"><code class="language-javascript">// main.js
+app.directive("autofocus", {
+  // Called once the element is in the DOM.
+  mounted(el) {
+    el.focus();
+  },
+});</code></pre>
+
+<pre class="language-markup"><code class="language-markup">&lt;input v-autofocus class="form-control" type="email" /&gt;</code></pre>
+
+<p>The hooks are <code>created</code>, <code>beforeMount</code>, <code>mounted</code>,
+<code>beforeUpdate</code>, <code>updated</code>, <code>beforeUnmount</code> and
+<code>unmounted</code>, and each receives the element plus a binding object holding the value, argument
+and modifiers — so <code>v-tooltip:top.fast="text"</code> is all available.</p>
+
+<p>Reach for a directive rarely. Vue's own guidance is that a component is almost always the better
+answer, and the demo application does not define a single custom directive. They earn their place for
+behaviour that must attach to <em>any</em> element without wrapping it — focus, click-outside,
+intersection, tooltips.</p>
+
+<p>Next: <a href="/vue/vue-provide-inject">provide and inject</a>.</p>

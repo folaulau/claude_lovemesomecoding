@@ -1,0 +1,183 @@
+<p>You need three things to follow the rest of this track: a MongoDB server, a shell to talk to it,
+and an understanding of one setup choice that trips people up later. That choice is running a
+<strong>replica set</strong> from the very first command, even on your laptop, even with one node.
+This lesson explains why.</p>
+
+<h2>Getting a server</h2>
+
+<p>There are three reasonable ways to get MongoDB, and they suit different situations.</p>
+
+<p><strong>Docker</strong> is the right default for development. Nothing is installed on your
+machine, the version is pinned in a file your colleagues share, and deleting it is one command.
+<strong>Atlas</strong> is MongoDB&rsquo;s hosted service and has a free tier; it is the fastest way
+to get a real cluster and the right answer for production unless you have a reason to run your own.
+A <strong>native install</strong> via Homebrew or apt is fine, but it puts a background service on
+your machine that you will forget about.</p>
+
+<p>The shortest possible Docker run looks like this:</p>
+
+<pre class="language-bash"><code class="language-bash">docker run -d --name mongo -p 27017:27017 mongo:8.0
+docker exec -it mongo mongosh</code></pre>
+
+<p>That works, and for the next four lessons it is enough. It is also the setup that will fail
+confusingly in lesson 12, so it is worth spending a minute now on the alternative.</p>
+
+<h2>Why a replica set, even with one node</h2>
+
+<p>A replica set is a group of servers holding the same data. You would expect to need one only for
+redundancy, in production. In fact three features you will want on your laptop are all built on the
+same mechanism &mdash; the <strong>oplog</strong>, the ordered log of every write that a replica set
+keeps so its members can catch up:</p>
+
+<ul>
+  <li><strong>Transactions</strong> across more than one document.</li>
+  <li><strong>Change streams</strong>, which let your application subscribe to writes as they
+      happen.</li>
+  <li><strong>Resumable reads</strong> after a failover.</li>
+</ul>
+
+<p>A standalone <code>mongod</code> has no oplog at all, so none of them work. The error you get is
+accurate but does not point at your setup:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">MongoServerError: The $changeStream stage is only supported on replica sets</code></pre>
+
+<p>Nothing in that message says &ldquo;your <code>docker run</code> was missing a flag&rdquo;.
+Starting as a single-node replica set from day one avoids the whole detour, and costs nothing.</p>
+
+<h2>A compose file that does it properly</h2>
+
+<p>This is the service definition from ReelCMS, the app this track quotes throughout:</p>
+
+<pre class="language-yaml"><code class="language-yaml">services:
+  mongo:
+    image: mongo:8.0
+    container_name: reelcms-mongo
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all", "--port", "27018"]
+    ports:
+      - "27018:27018"
+    volumes:
+      - reelcms-mongo-data:/data/db</code></pre>
+
+<p>Two details there are not arbitrary.</p>
+
+<p><strong>The port is the same number on both sides.</strong> That looks redundant until you know
+what a replica set does to a client. A replica set does not just serve the connection you opened
+&mdash; it hands back its member list, and the driver then <em>reconnects</em> to whatever address
+that list advertises, discarding the one you dialled. So the advertised <code>host:port</code> has
+to be reachable under that exact spelling from wherever your application runs. Publish
+<code>27018:27017</code> while the set advertises <code>localhost:27017</code>, and the driver
+dials 27018, is told the primary is at 27017, and hangs there until it times out with a server
+selection error that never mentions ports.</p>
+
+<p><strong><code>--replSet</code> alone is not enough.</strong> The set has to be initiated once,
+which is a command you run against the server after it starts:</p>
+
+<pre class="language-javascript"><code class="language-javascript">rs.initiate({
+  _id: "rs0",
+  members: [{ _id: 0, host: "localhost:27018" }]
+})</code></pre>
+
+<p>Until you do, <code>mongod</code> accepts connections happily and then fails every write with
+<code>NotWritablePrimary</code>. &ldquo;The port is open&rdquo; is not the same as &ldquo;the
+database is ready&rdquo;, which is worth remembering when you write a health check.</p>
+
+<p>Compose has no declarative way to say &ldquo;run this once after the server starts&rdquo;, so
+the usual pattern is a throwaway second container that initiates the set and exits. Making it
+tolerate being run twice matters &mdash; you will restart this stack often:</p>
+
+<pre class="language-javascript"><code class="language-javascript">try {
+  rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27018" }] });
+  print("replica set initiated");
+} catch (e) {
+  if (e.codeName === "AlreadyInitialized") { print("already initiated - ok"); }
+  else { throw e; }
+}</code></pre>
+
+<h2>Connecting</h2>
+
+<p><code>mongosh</code> is the shell. It is a full JavaScript environment, which is why every
+example in this track that is not Java looks like JavaScript &mdash; because it is.</p>
+
+<pre class="language-bash"><code class="language-bash">mongosh "mongodb://localhost:27018/reelcms?replicaSet=rs0"</code></pre>
+
+<p>The <code>replicaSet=rs0</code> parameter matters as much as the host. Without it the driver
+connects in single-server mode, which works perfectly for ordinary reads and writes and then fails
+only when something needs the oplog. The application looks healthy and its live features are
+silently dead &mdash; the worst kind of misconfiguration, because nothing complains.</p>
+
+<h2>Connecting to Atlas instead</h2>
+
+<p>A hosted cluster is already a replica set, so none of the above applies. The connection string
+uses the <code>mongodb+srv://</code> scheme, which asks DNS for the member list rather than listing
+hosts:</p>
+
+<pre class="language-bash"><code class="language-bash">mongosh "mongodb+srv://cluster0.abc123.mongodb.net/reelcms" --username folau</code></pre>
+
+<p>Two things catch people out. Atlas blocks every IP by default, so a connection that hangs is
+usually the access list rather than your credentials. And <code>+srv</code> needs working DNS SRV
+lookups, which some corporate networks and VPNs quietly block &mdash; if it fails there but works
+on your phone&rsquo;s hotspot, that is what happened.</p>
+
+<h2>Finding your way around</h2>
+
+<p>Five commands cover almost all navigation:</p>
+
+<pre class="language-javascript"><code class="language-javascript">show dbs                      // every database on the server
+use reelcms                   // switch to one (it need not exist yet)
+show collections              // what is in it
+db.reels.countDocuments({})   // 16
+db.reels.findOne()            // one document, to see the shape</code></pre>
+
+<p><code>use</code> does not create anything. A database and a collection both spring into
+existence on the first write, which is convenient and also means a typo in a collection name gives
+you a brand-new empty collection rather than an error. If a query returns nothing, checking
+<code>show collections</code> for a near-miss spelling is the cheapest first move.</p>
+
+<p>Because the shell is JavaScript, anything you know about JavaScript works &mdash; variables,
+loops, functions, and <code>const</code> to hold a result you want to poke at:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const reel = db.reels.findOne({ status: "PUBLISHED" })
+reel.stats.views                        // e.g. 4962 — a live counter, it moves
+Object.keys(reel)                       // the field names on this document
+
+db.reels.find().limit(3).toArray()      // an array you can map over
+db.reels.distinct("status")             // [ 'ARCHIVED', 'DRAFT', 'PUBLISHED', 'SCHEDULED' ]</code></pre>
+
+<p>Two ergonomics worth knowing now. <code>.pretty()</code> is no longer needed &mdash; modern
+<code>mongosh</code> formats output by default. And for anything scripted, <code>--eval</code>
+runs a snippet without opening an interactive session, which is how the health check above and
+every setup script in this track work:</p>
+
+<pre class="language-bash"><code class="language-bash">mongosh --port 27018 --quiet --eval 'db.getSiblingDB("reelcms").reels.countDocuments({})'</code></pre>
+
+<p><code>getSiblingDB</code> is the scripted equivalent of <code>use</code>: <code>use</code> is a
+shell convenience that does not exist inside a script.</p>
+
+<h2>Getting data in and out</h2>
+
+<p>Two command-line tools ship alongside the shell and are worth knowing before you need them.
+<code>mongoimport</code> loads JSON or CSV into a collection, which is how most sample datasets
+arrive:</p>
+
+<pre class="language-bash"><code class="language-bash">mongoimport --uri "mongodb://localhost:27018/reelcms" \
+  --collection reels --file reels.json --jsonArray</code></pre>
+
+<p><code>mongodump</code> and <code>mongorestore</code> are the pair you want for a real backup:
+they write BSON rather than JSON, so types survive the round trip. <code>mongoexport</code> writes
+JSON and therefore loses them &mdash; an <code>ObjectId</code> comes back as a string, a
+<code>Date</code> as text. Use export for feeding another tool, never for a backup you intend to
+restore.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Docker for development, Atlas for production, native install if you must.</li>
+  <li>Run a <strong>single-node replica set</strong> from the start &mdash; transactions, change
+      streams and resumable reads all need the oplog, and a standalone has none.</li>
+  <li><code>--replSet</code> starts it; <code>rs.initiate()</code> makes it usable.</li>
+  <li>Publish the same port number on both sides, because the set advertises an address the driver
+      will reconnect to.</li>
+  <li>Put <code>replicaSet=</code> in the connection string, or the oplog features fail silently.</li>
+  <li><code>mongosh</code> is JavaScript, and writes create databases and collections on demand.</li>
+</ul>

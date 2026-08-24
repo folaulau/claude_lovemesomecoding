@@ -18,6 +18,7 @@ projects/aws_tutorial/
   manifest.py            category metadata + one entry per post (slug, title, date, tags, excerpt)
   posts/NN-slug.html     the post bodies, plain semantic HTML
   check_content.py       the HTML round-trips, and this track's own length/prose/safety rules
+  originals/             snapshot of the 33 original bodies, so a rewrite can be proved to be one
   check_aws.py           VALIDATES every `aws …` command against the botocore service model
   tests/test_check_aws.py  proves check_aws actually catches things
   seed.py                writes the category and posts into a content tree
@@ -26,7 +27,10 @@ projects/aws_tutorial/
 
 ## The track
 
-33 posts at `/aws/{slug}`, 4–6 reading-minutes each, dated 2018-10-30 → 2019-09-06.
+34 posts at `/aws/{slug}`, 4–6 reading-minutes each, dated **2024-01-09 → 2025-12-02**.
+
+33 are rewrites of live indexed URLs; **`aws-ecr` is the one genuinely new post**, added because
+the collection covered ECS and EKS but nothing on the registry both pull from.
 
 ⚠️ **All 33 slugs are live, indexed URLs.** There are no new posts in this track — it is a rewrite
 of a published archive. `scripts/verify-build.mjs` fails the frontend build if any indexed post URL
@@ -35,22 +39,31 @@ on a page Google already has.
 
 That includes `aws-kms-and-ecryption`, which is misspelled and staying that way.
 
-⚠️ **There is no `--force-dates`, deliberately.** The dates in `manifest.py` are *transcribed* from
-the stored posts rather than computed from a `START_DATE`, and `upsert_post` never overwrites an
-existing date — which is exactly what we want on a published archive. A re-seed cannot reshuffle
-it. This is the opposite of the Postgres and FastAPI tracks; see `progress_report.md`.
+⚠️ **`--force-dates` is REQUIRED, and it is not a one-off.** The dates are computed from
+`START_DATE` + `STEP_DAYS` in `manifest.py`, but all 33 posts were published in 2018-2019 and
+`upsert_post` never overwrites an existing date. So a plain seed moves nothing at all — every post
+silently keeps its 2019 date while the manifest claims 2024. Pass it on any seed that changes a
+date, and again after any change to `START_DATE`.
 
-### Progress
+(An earlier version of this track kept the 2019 dates and deliberately had no such flag. That was
+reversed; `progress_report.md` records both sides.)
 
-| stage | posts | state |
-|---|---|---|
-| 1 | the 7 that served a **blank page** | ✅ written, verified, seeded to `local` |
-| 2 | the other 26 | ⬜ not started |
+### State
 
-Stage 1: `aws-alexa`, `aws-cloudformation`, `aws-codedeploy`, `aws-kinesis`,
-`aws-kubernetes-on-aws`, `aws-lambda-to-start-an-rds-instance`, `aws-lambda-to-stop-an-rds-instance`.
+**All 33 posts are written and verified.** 30,445 words replacing 16,481; 151 headings replacing 2.
 
-**Prod has not been seeded.** Stage 1 is on `local` only, pending review.
+| | before | after |
+|---|---:|---:|
+| posts | 33 | 34 |
+| words | 16,481 | 31,977 |
+| headings | 2 | 168 |
+| blank posts | 7 | 0 |
+| code samples | 72 | 169 |
+
+**Published 2026-08-25.** All 34 live at https://lovemesomecoding.com/aws.
+
+`/aws/aws-eks` redirects to `/aws/aws-kubernetes-on-aws` — the post is about EKS but carries the
+old WordPress slug, so the obvious URL had to resolve.
 
 ## Commands
 
@@ -67,22 +80,26 @@ lovemesomecoding_backend/.venv/bin/python projects/aws_tutorial/check_aws.py --p
 # prove the checker still catches planted errors
 lovemesomecoding_backend/.venv/bin/python projects/aws_tutorial/tests/test_check_aws.py
 
+# re-take the "before" snapshot (only if the live posts change, which they should not)
+AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python \
+  projects/aws_tutorial/originals/snapshot.py
+
 # dry run — reports create/update per post and writes nothing
 AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/aws_tutorial/seed.py --env local
 ```
 
-Seeding a stage (`--only` takes a comma-separated slug list):
+Seeding. `--force-dates` is not optional here — see above:
 
 ```bash
-STAGE1=$(lovemesomecoding_backend/.venv/bin/python -c \
-  "import sys;sys.path.insert(0,'projects/aws_tutorial');import manifest;print(','.join(manifest.STAGE_1))")
+AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/aws_tutorial/seed.py \
+  --env local --write --force-dates
 
 AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/aws_tutorial/seed.py \
-  --env local --only "$STAGE1" --write
-
-AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/aws_tutorial/seed.py \
-  --env prod  --only "$STAGE1" --write
+  --env prod  --write --force-dates
 ```
+
+`--only slug-a,slug-b` seeds a subset. Every slug here is already live, so a partial seed leaves
+no half-built archive — it just updates fewer posts.
 
 Then deploy:
 

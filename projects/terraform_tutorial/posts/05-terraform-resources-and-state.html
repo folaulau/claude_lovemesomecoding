@@ -1,0 +1,213 @@
+<p>State is the part of Terraform people skip, and then get burned by. It is also the thing that makes
+Terraform work at all — every other tool that manages infrastructure declaratively has an equivalent,
+and Terraform's happens to be a JSON file you can look at.</p>
+
+<h2>Why it has to exist</h2>
+
+<p>You write "an S3 bucket named X exists". Terraform needs to answer three questions before it can
+plan:</p>
+
+<pre class="language-bash"><code class="language-bash">1. does it exist?               ask AWS
+2. is it configured correctly?  ask AWS
+3. did *I* create it?           <-- AWS cannot answer this</code></pre>
+
+<p>Question 3 is why state exists. Without it, deleting a resource from your <code>.tf</code> files
+would mean nothing — Terraform would have no record that it was ever responsible for the thing, so
+it could not know to destroy it. And it could not tell "someone renamed this bucket" from "this is a
+different bucket that happens to be here".</p>
+
+<p>State is Terraform's memory: <strong>a map from your resource addresses to real object ids</strong>,
+plus a cached copy of every attribute as of the last read.</p>
+
+<pre class="language-bash"><code class="language-bash">aws_s3_bucket.first        ->  tf-first-bucket-8f3a1c
+module.network.aws_vpc.this ->  vpc-0aefaffec4178776e</code></pre>
+
+<h2>What is actually in the file</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform show                 # human-readable
+terraform state list           # just the addresses
+terraform state show aws_s3_bucket.first</code></pre>
+
+<pre class="language-json"><code class="language-json">{
+  "version": 4,
+  "terraform_version": "1.15.9",
+  "serial": 93,
+  "lineage": "b0d1c3a2-...",
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "aws_s3_bucket",
+      "name": "first",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "attributes": {
+            "id": "tf-first-bucket-8f3a1c",
+            "arn": "arn:aws:s3:::tf-first-bucket-8f3a1c",
+            "tags": { "Environment": "learning" }
+          }
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+<p><code>serial</code> increments on every write and is what makes locking meaningful.
+<code>lineage</code> identifies this state's ancestry — Terraform refuses to overwrite a state with
+a different lineage, which is the guard against pointing a configuration at the wrong backend.</p>
+
+<h2>⚠️ It contains secrets, in cleartext</h2>
+
+<p>This is the single most important fact about state.</p>
+
+<p>Every attribute is cached, including the ones marked sensitive. An RDS password set through
+Terraform is in that file as text. So is a generated <code>random_password</code>. So is the body of
+any secret you created.</p>
+
+<pre class="language-bash"><code class="language-bash"># prove it to yourself
+grep -o '"password":"[^"]*"' terraform.tfstate</code></pre>
+
+<p>Marking a variable <code>sensitive = true</code> redacts it from <em>console output</em>. It
+changes nothing about what is written to disk. There is no encryption of the state file by
+Terraform.</p>
+
+<p>Which gives three rules: state never goes in git, state lives in an encrypted bucket with tight
+access (lesson 8), and where a platform can generate and hold a secret itself, let it — lesson 12
+uses RDS-managed passwords so the value never reaches Terraform at all.</p>
+
+<h2>Dependencies come from references</h2>
+
+<p>Terraform builds a graph and works out the order itself. You almost never state it:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_vpc" "this" {
+  cidr_block = "10.20.0.0/16"
+}
+
+resource "aws_subnet" "public" {
+  # THIS reference is the dependency. Terraform sees aws_vpc.this in the
+  # expression, so it creates the VPC first and waits for its id.
+  vpc_id     = aws_vpc.this.id
+  cidr_block = "10.20.0.0/24"
+}</code></pre>
+
+<p>Independent resources are created <strong>in parallel</strong> — ten by default. That is why an
+apply is much faster than the same thing done by hand, and why the order in your file means
+nothing.</p>
+
+<p><code>depends_on</code> is for the dependencies that are real but invisible — where nothing in the
+arguments references the other resource:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_ecs_service" "this" {
+  name            = "pizza-tf"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.this.arn
+
+  # ECS checks it can assume the execution role when the service is created,
+  # and IAM is eventually consistent. Nothing in the arguments above mentions
+  # the policy attachment, so Terraform would happily create the service first
+  # and fail on a role that "does not exist" — a race that passes on a retry
+  # and looks like flakiness.
+  depends_on = [
+    aws_iam_role_policy_attachment.execution_managed,
+  ]
+}</code></pre>
+
+<p>Use it sparingly. Over-using <code>depends_on</code> serialises the graph and slows every apply;
+each one should have a comment saying what the invisible dependency is.</p>
+
+<h2>lifecycle</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_db_instance" "this" {
+  identifier     = "pizza-tf-mysql"
+  engine         = "mysql"
+  instance_class = "db.t4g.micro"
+
+  lifecycle {
+    # Refuse to destroy this, ever. `terraform destroy` ERRORS rather than
+    # deleting it. The guard is real: removing this block is a deliberate,
+    # reviewable commit, which is exactly the friction you want in front of
+    # a production database.
+    prevent_destroy = true
+
+    # Create the replacement BEFORE destroying the old one. Only useful where
+    # a name collision will not stop it — two things cannot both hold one
+    # unique identifier.
+    create_before_destroy = false
+
+    # Do not plan a change when these drift. `desired_count` is the classic:
+    # if an autoscaler owns it at runtime, Terraform will otherwise fight the
+    # autoscaler on every apply.
+    ignore_changes = [tags["LastModified"]]
+  }
+}</code></pre>
+
+<p><code>ignore_changes</code> is a sharp tool. It makes Terraform stop being the source of truth for
+that attribute, which is right when something else legitimately owns it and wrong the rest of the
+time — a drifted value simply stops being reported.</p>
+
+<h2>When state and reality disagree</h2>
+
+<p>Someone changes something in the console. A resource is deleted out from under you. This happens,
+and these are the commands for it.</p>
+
+<p><strong>Something changed in the console.</strong> Nothing to do — <code>plan</code> refreshes
+from AWS every run, so it will show you the drift and offer to put it back. That is the correct
+outcome: your files are the source of truth.</p>
+
+<p><strong>You renamed a resource in your files.</strong> Terraform sees the old address gone and a
+new one appear, and plans destroy-then-create. Use a <code>moved</code> block instead:</p>
+
+<pre class="language-hcl"><code class="language-hcl">moved {
+  from = aws_s3_bucket.old_name
+  to   = aws_s3_bucket.new_name
+}</code></pre>
+
+<p>This is checked into the code, so it works for everyone including CI. It replaced
+<code>terraform state mv</code>, which did the same thing as a manual, unrepeatable command.</p>
+
+<p><strong>Something exists that Terraform did not create.</strong> Adopt it with an
+<code>import</code> block:</p>
+
+<pre class="language-hcl"><code class="language-hcl">import {
+  to = aws_s3_bucket.existing
+  id = "a-bucket-that-already-exists"
+}
+
+resource "aws_s3_bucket" "existing" {
+  bucket = "a-bucket-that-already-exists"
+}</code></pre>
+
+<p><code>terraform plan</code> then shows what it would adopt and what would change, which is the
+part the old <code>terraform import</code> command could not do. <code>plan -generate-config-out=x.tf</code>
+will even write the resource block for you.</p>
+
+<p><strong>You want a resource rebuilt.</strong></p>
+
+<pre class="language-bash"><code class="language-bash">terraform apply -replace=aws_ecs_service.this</code></pre>
+
+<p>This is the replacement for <code>terraform taint</code>, and it is better because it goes through
+<code>plan</code> — you see the destroy before you agree to it.</p>
+
+<p><strong>You need something out of state without destroying it.</strong></p>
+
+<pre class="language-bash"><code class="language-bash">terraform state rm aws_s3_bucket.first</code></pre>
+
+<p>Terraform forgets it; AWS still has it. Useful when handing a resource to another configuration.
+⚠️ There is no undo, and the resource is now unmanaged and easy to forget about — this is the one
+command here that is genuinely dangerous.</p>
+
+<h2>What not to do</h2>
+
+<p><strong>Do not hand-edit the state file.</strong> Every problem above has a command, and the
+commands maintain <code>serial</code> and <code>lineage</code> correctly. If you truly must, use
+<code>terraform state pull</code> and <code>terraform state push</code>, and take a backup first.</p>
+
+<p><strong>Do not run <code>-refresh=false</code> to make plans faster</strong> unless you know
+exactly why. It plans against a cached picture of the world, and its whole value is that it does
+not.</p>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-variables-and-outputs">Lesson 6</a> makes one configuration serve
+several environments — typed inputs, validation that fails at plan time, and the precedence order
+for when a variable is set four different ways.</p>

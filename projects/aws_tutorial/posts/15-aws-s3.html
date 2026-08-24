@@ -1,0 +1,139 @@
+<p>S3 stores objects and hands them back by key. Almost everything else in AWS leans on it —
+CloudFront serves from it, Athena queries it, CloudTrail and Firehose write into it, and every
+static site ends up there. This site is a few thousand HTML files in a bucket.</p>
+
+<h2>It is not a filesystem</h2>
+
+<p>There are no directories. A key is a single string that happens to contain slashes, and the
+console draws folders by grouping on them. Practical consequences:</p>
+
+<ul>
+  <li>Renaming a "folder" means copying every object and deleting the originals</li>
+  <li>An empty prefix does not exist — nothing to hold it</li>
+  <li>Listing is by prefix, and listing a bucket with millions of keys is paginated and slow</li>
+  <li>There is no partial write. An object is replaced whole, atomically</li>
+</ul>
+
+<p>Reads are strongly consistent: a successful <code>PutObject</code> is immediately visible to the
+next <code>GetObject</code>. That has been true since 2020 and a lot of older advice about
+"eventual consistency" is now obsolete.</p>
+
+<h2>Storage classes</h2>
+
+<table>
+  <thead><tr><th>Class</th><th>For</th><th>Catch</th></tr></thead>
+  <tbody>
+    <tr><td>Standard</td><td>Anything served or accessed often</td><td>—</td></tr>
+    <tr><td>Intelligent-Tiering</td><td>Unknown or changing patterns</td><td>Small monitoring fee
+        per object</td></tr>
+    <tr><td>Standard-IA</td><td>Accessed monthly-ish</td><td>Retrieval fee; 30-day minimum</td></tr>
+    <tr><td>Glacier Instant</td><td>Archives needed immediately, rarely</td><td>90-day minimum</td></tr>
+    <tr><td>Glacier Deep Archive</td><td>Compliance, years</td><td>Hours to restore; 180-day
+        minimum</td></tr>
+  </tbody>
+</table>
+
+<p>Those minimum durations are the part that bites. Move an object to Standard-IA and delete it a
+week later and you are billed for the full 30 days anyway, so a lifecycle rule that transitions
+short-lived objects can cost more than leaving them in Standard. For anything genuinely
+unpredictable, Intelligent-Tiering does this for you and is usually the right default.</p>
+
+<pre class="language-bash"><code class="language-bash">aws s3api put-bucket-lifecycle-configuration --bucket my-logs --lifecycle-configuration '{
+  "Rules": [{
+    "ID": "archive-then-expire",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "logs/" },
+    "Transitions": [{ "Days": 30, "StorageClass": "STANDARD_IA" }],
+    "Expiration": { "Days": 365 }
+  }]
+}'</code></pre>
+
+<h2>Versioning is an undo button with a bill</h2>
+
+<p>With versioning on, overwriting keeps the old version and deleting writes a <em>delete
+marker</em> rather than removing anything. It is the best protection against a bad deploy or a
+mistaken <code>rm</code>, and it is why your storage cost can grow while the object count looks
+flat.</p>
+
+<p>Two things follow. Versioning cannot be switched off once enabled — only suspended, which stops
+new versions and keeps existing ones. And you need a lifecycle rule for
+<code>NoncurrentVersionExpiration</code>, or old versions accumulate forever.</p>
+
+<h2>Block Public Access should stay on</h2>
+
+<p>The old way to host a static site was to make a bucket public and enable website hosting. Do not
+do that. Public buckets are the single most common cause of AWS data exposure, and the modern
+pattern is better in every respect.</p>
+
+<p>Keep Block Public Access enabled and serve through CloudFront with <strong>Origin Access
+Control</strong>. The bucket stays entirely private; CloudFront is the only thing that can read it,
+and you get HTTPS, a real certificate, caching and edge locations as a side effect.</p>
+
+<p>This is the actual policy on the bucket serving this site:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowCloudFrontOAC",
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::lovemesomecoding.com/*",
+    "Condition": {
+      "StringEquals": {
+        "AWS:SourceArn": "arn:aws:cloudfront::111122223333:distribution/E30YUPLP37MY9U"
+      }
+    }
+  }]
+}</code></pre>
+
+<p>Without the <code>SourceArn</code> condition that would read "any CloudFront distribution
+anywhere may read this bucket", which is a mistake people ship regularly.</p>
+
+<h2>Two flags that have cost this site real time</h2>
+
+<p><strong><code>aws s3 sync</code> skips unchanged files, so metadata never updates.</strong>
+Changing <code>Cache-Control</code> in a deploy script does nothing to objects already in the
+bucket — same size, same timestamp, skipped. Non-fingerprinted files have to be uploaded with
+<code>cp --recursive</code> instead.</p>
+
+<p><strong><code>--metadata-directive REPLACE</code> without <code>--content-type</code> rewrites
+every object to <code>binary/octet-stream</code>.</strong> The directive replaces <em>all</em>
+metadata, content type included, and browsers then download your HTML instead of rendering it.</p>
+
+<pre class="language-bash"><code class="language-bash">aws s3 cp ./out s3://lovemesomecoding.com --recursive \
+  --exclude "_next/static/*" \
+  --cache-control "public, max-age=0, must-revalidate" \
+  --content-type "text/html"</code></pre>
+
+<h2>Getting files in and out without a server</h2>
+
+<p>A presigned URL grants time-limited access to one object using your credentials, so a browser
+can upload or download directly. Your application never proxies the bytes:</p>
+
+<pre class="language-bash"><code class="language-bash">aws s3 presign s3://my-bucket/report.pdf --expires-in 3600</code></pre>
+
+<p>For uploads, prefer a presigned POST, which lets you constrain content type and maximum size —
+a presigned PUT accepts whatever the client sends.</p>
+
+<h2>Encryption and access logs</h2>
+
+<p>Every object is encrypted at rest by default with SSE-S3, at no cost and with nothing to
+configure. Switch to SSE-KMS when you need an audit trail of who decrypted what, or a key you can
+revoke — but note KMS charges per request, so a bucket serving millions of objects can run up a
+meaningful KMS bill. S3 Bucket Keys cut that substantially and are worth enabling if you go this
+route.</p>
+
+<p>For "who did what to this bucket", CloudTrail data events are the answer rather than S3 server
+access logs — they are structured, near real-time, and queryable. Both cost money at volume, and
+neither is on by default.</p>
+
+<h2>Costs that surprise people</h2>
+
+<p>Storage is rarely the interesting line. <strong>Data transfer out to the internet</strong>
+usually is, and serving through CloudFront is cheaper than serving from S3 directly as well as
+faster. <strong>Request counts</strong> matter at scale — millions of small GETs add up.</p>
+
+<p>And incomplete multipart uploads are invisible: a failed large upload leaves parts that bill as
+storage and appear in no normal listing. Add a lifecycle rule to abort them after 7 days and forget
+about it.</p>

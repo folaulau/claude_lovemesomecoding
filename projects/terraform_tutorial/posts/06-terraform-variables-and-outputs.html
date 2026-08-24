@@ -1,0 +1,225 @@
+<p>The point of variables is one configuration serving several environments. The point of
+<em>typed</em> variables with <em>validation</em> is that a wrong value fails at plan time, in a
+message that names the problem, instead of failing halfway through an apply and leaving you with
+half a stack.</p>
+
+<h2>Declaring an input</h2>
+
+<pre class="language-hcl"><code class="language-hcl">variable "name_prefix" {
+  type        = string
+  description = "Prefix on every resource name."
+  default     = "pizza-tf"
+}
+
+variable "desired_count" {
+  type        = number
+  description = "How many ECS tasks to run."
+  default     = 1
+}
+
+variable "private_subnet_ids" {
+  type        = list(string)
+  description = "Subnets for the Fargate tasks."
+  # No default — this one is REQUIRED. Terraform prompts if it is missing
+  # interactively, and fails outright with -input=false, which is what CI uses.
+}</code></pre>
+
+<p><strong>Always declare the type.</strong> Without it a variable is <code>any</code>, and a value
+that is the wrong shape produces an error deep inside whichever resource used it — usually phrased
+in terms of the provider's internals rather than your input.</p>
+
+<p><strong>Always write the description.</strong> It is what <code>terraform-docs</code> renders and
+what the person calling your module reads. A module whose inputs are undescribed is a module people
+have to read the source of.</p>
+
+<h2>Type constraints go as deep as you need</h2>
+
+<pre class="language-hcl"><code class="language-hcl">variable "tags" {
+  type    = map(string)
+  default = {}
+}
+
+# An object has known keys with individual types. Terraform checks the SHAPE,
+# so a caller who forgets `port` is told exactly that, at plan time.
+variable "service" {
+  type = object({
+    name = string
+    port = number
+    cpu  = optional(string, "512")   # optional, with a default
+  })
+}
+
+variable "services" {
+  type = map(object({
+    port  = number
+    image = string
+  }))
+  default = {}
+}</code></pre>
+
+<p><code>optional()</code> with a default is the argument that makes big object variables usable —
+before it, every optional field had to be passed as <code>null</code> by every caller.</p>
+
+<h2>validation — fail at plan time</h2>
+
+<p>This is the feature most people never turn on, and it is the one that saves the most time.</p>
+
+<pre class="language-hcl"><code class="language-hcl">variable "name_prefix" {
+  type    = string
+  default = "pizza-tf"
+
+  validation {
+    # AWS resource names have rules, and breaking them fails an apply several
+    # minutes in — after a VPC exists and before the thing that failed does.
+    condition     = can(regex("^[a-z][a-z0-9-]{2,20}$", var.name_prefix))
+    error_message = "name_prefix must be lowercase letters, digits and hyphens, 3-21 chars, starting with a letter."
+  }
+}
+
+variable "cpu_architecture" {
+  type    = string
+  default = "ARM64"
+
+  validation {
+    condition     = contains(["X86_64", "ARM64"], var.cpu_architecture)
+    error_message = "cpu_architecture must be X86_64 or ARM64."
+  }
+}
+
+variable "private_subnet_ids" {
+  type = list(string)
+
+  validation {
+    # RDS requires subnets in two AZs even for a single-AZ instance. Catching
+    # it here beats catching it from RDS eight minutes into an apply.
+    condition     = length(var.private_subnet_ids) &gt;= 2
+    error_message = "RDS needs subnets in at least two availability zones."
+  }
+}</code></pre>
+
+<p><code>can()</code> wraps an expression and returns a bool instead of erroring, which is what makes
+<code>regex()</code> usable in a condition — a non-matching regex is an error, not a
+<code>false</code>.</p>
+
+<p>Write the <code>error_message</code> as an instruction, not a complaint. "must be lowercase
+letters, digits and hyphens" tells the reader what to do; "invalid name_prefix" does not.</p>
+
+<h2>sensitive, and what it does not do</h2>
+
+<pre class="language-hcl"><code class="language-hcl">variable "db_password" {
+  type      = string
+  sensitive = true
+}</code></pre>
+
+<p>⚠️ <strong><code>sensitive</code> redacts console output. It does not encrypt anything.</strong>
+The value is written to the state file in cleartext exactly as it would be without the flag, and it
+propagates: any output derived from a sensitive value must itself be marked sensitive, or Terraform
+refuses to plan.</p>
+
+<p>It is worth setting — it stops a password appearing in CI logs, which is a real leak — but it is
+not a security control for state. The genuine fix is not to pass secrets through Terraform at all.
+Lesson 12 has RDS generate its own password into Secrets Manager, so the value never reaches
+Terraform; the module only ever holds an ARN.</p>
+
+<h2>Setting a variable, and who wins</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform apply -var "desired_count=2"
+terraform apply -var-file="prod.tfvars"
+export TF_VAR_desired_count=2 && terraform apply</code></pre>
+
+<p>Terraform loads several sources, and <strong>later ones win</strong>:</p>
+
+<pre class="language-bash"><code class="language-bash">1. the variable's `default`
+2. TF_VAR_* environment variables
+3. terraform.tfvars           (loaded automatically if present)
+4. terraform.tfvars.json      (ditto)
+5. *.auto.tfvars              (ditto, alphabetically)
+6. -var-file=...              in the order given on the command line
+7. -var "..."                 highest precedence
+</code></pre>
+
+<p>The two automatic ones catch people out. A <code>terraform.tfvars</code> sitting in the directory
+is loaded with no flag, so a value you cannot find in any command is often in there. A
+<code>*.auto.tfvars</code> does the same — handy for CI, surprising in a checkout.</p>
+
+<pre class="language-bash"><code class="language-bash"># prod.tfvars
+name_prefix   = "pizza-prod"
+desired_count = 3
+tags = {
+  Environment = "production"
+}</code></pre>
+
+<p>⚠️ <code>*.tfvars</code> is gitignored in every sensible repository, because it is where real
+values live. Commit <code>terraform.tfvars.example</code> instead.</p>
+
+<h2>locals</h2>
+
+<p>A local is a named expression. It is computed, not passed in, and it cannot be overridden.</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  # The tags every resource gets. This is the archetypal local: written once,
+  # merged everywhere, and the one place to change when a convention changes.
+  tags = merge(var.tags, {
+    Project   = "terraform-tutorial"
+    ManagedBy = "terraform"
+  })
+
+  # Naming, derived rather than repeated.
+  db_identifier = "${var.name_prefix}-mysql"
+  log_group     = "/ecs/${var.name_prefix}"
+}</code></pre>
+
+<p>The rule of thumb: <strong>a variable is an input, a local is a conclusion.</strong> If the caller
+should be able to set it, it is a variable. If it is derived from other values, it is a local. Using
+a variable with a default as a place to compute something is a common smell — it lets a caller
+override a value the module's logic depends on.</p>
+
+<h2>outputs</h2>
+
+<pre class="language-hcl"><code class="language-hcl">output "app_url" {
+  description = "Open this. It is the load balancer's public hostname."
+  value       = "http://example.execute-api.us-west-2.amazonaws.com"
+}
+
+output "db_password" {
+  value     = "example"
+  sensitive = true   # redacted in output; STILL in state
+}</code></pre>
+
+<p>Outputs do three jobs, and it is worth knowing which one you are using:</p>
+
+<p><strong>They tell a human what happened.</strong> Printed at the end of an apply; read back later
+with <code>terraform output</code>.</p>
+
+<p><strong>They are a module's return values.</strong> A parent module can only read what a child
+module outputs — a child's resources are otherwise invisible. This is the important one, and it is
+what lesson 10 is built on.</p>
+
+<p><strong>They are the interface between separate states.</strong> Another configuration can read
+them through a <code>terraform_remote_state</code> data source, which lesson 7 covers.</p>
+
+<pre class="language-bash"><code class="language-bash">terraform output                      # all of them
+terraform output app_url              # one, quoted
+terraform output -raw app_url         # one, unquoted — for shell scripts
+terraform output -json                # everything, machine-readable
+
+curl "$(terraform output -raw app_url)/actuator/health/alb"</code></pre>
+
+<p><code>-raw</code> is the one you want in a script. Without it you get the JSON-quoted form,
+<code>"http://..."</code> with the quotes, and the resulting URL is subtly wrong.</p>
+
+<h2>What to make a variable</h2>
+
+<p>Not everything. A configuration where every value is a variable is harder to read than one with
+sensible constants, and each variable is a decision you have pushed onto the caller.</p>
+
+<p>Good candidates: anything that differs between environments (sizes, counts, names), anything that
+is an identity (account, region, domain), anything a module genuinely cannot know.</p>
+
+<p>Poor candidates: values that must be a specific thing for the configuration to work at all. If
+changing it would break the stack, it is a constant with a comment, not an input.</p>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-data-sources">Lesson 7</a> covers the other half of the inputs
+story — reading values out of infrastructure that already exists rather than passing them in.</p>

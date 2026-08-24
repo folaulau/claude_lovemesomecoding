@@ -1,0 +1,155 @@
+<p>&ldquo;NoSQL&rdquo; is a bad name. It says what these databases are not, which tells you nothing
+about when to reach for one. MongoDB is a <strong>document database</strong>: it stores records
+whose shape can vary, and it optimises for reading a whole record at once. That single sentence
+explains almost every trade it makes &mdash; the good ones and the painful ones.</p>
+
+<p>This lesson is about the decision, not the syntax. By the end you should be able to say why
+MongoDB fits a problem, and be equally comfortable saying it does not.</p>
+
+<h2>A document is not a row</h2>
+
+<p>A relational row is flat. Every column has a declared type, every row has every column, and
+anything nested lives in another table joined back by a key. A MongoDB document is a tree:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{
+  _id: ObjectId("6a8c923d080ed19272d6331e"),
+  slug: "around-the-outside-on-the-final-lap",
+  title: "Around the outside on the final lap",
+  status: "PUBLISHED",
+  video: { url: "/media/videos/lap.mp4", durationSeconds: 34 },
+  creator: { _id: ObjectId("6a8c923d080ed19272d63301"), displayName: "The Last Lap" },
+  tags: ["motorsport", "overtake"],
+  stats: { views: 4962, likes: 447 }
+}</code></pre>
+
+<p>That is one document from ReelCMS, the short-video CMS this track takes its examples from.
+Written relationally, the same information needs five tables:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE reels        (id BIGINT PRIMARY KEY, slug TEXT UNIQUE, title TEXT, status TEXT,
+                           creator_id BIGINT REFERENCES creators(id));
+CREATE TABLE videos       (reel_id BIGINT PRIMARY KEY REFERENCES reels(id), url TEXT, duration_s INT);
+CREATE TABLE creators     (id BIGINT PRIMARY KEY, display_name TEXT);
+CREATE TABLE tags         (id BIGINT PRIMARY KEY, name TEXT UNIQUE);
+CREATE TABLE reel_tags    (reel_id BIGINT, tag_id BIGINT, PRIMARY KEY (reel_id, tag_id));
+CREATE TABLE reel_stats   (reel_id BIGINT PRIMARY KEY, views BIGINT, likes BIGINT);</code></pre>
+
+<p>Rendering one card in a feed joins all of them. The document version is a single read, and the
+shape on disk is already the shape the screen wants. That is the entire pitch, and everything
+below is a consequence of it.</p>
+
+<h2>What that actually buys you</h2>
+
+<p><strong>The read gets cheaper.</strong> Not because MongoDB is faster at any individual
+operation &mdash; it usually is not &mdash; but because a well-modelled document turns a five-way
+join into a single lookup by primary key. The win is in the modelling, not the engine.</p>
+
+<p><strong>Adding a field costs nothing.</strong> No <code>ALTER TABLE</code>, no migration
+window, no lock on a large table. Two documents in the same collection can have different fields,
+so a new attribute appears on new documents and old ones simply do not have it.</p>
+
+<p><strong>Scaling out is a built-in, not a project.</strong> MongoDB shards horizontally on a key
+you choose. Relational databases scale out too, but rarely without an application rewrite.</p>
+
+<h2>What it costs</h2>
+
+<p>Every one of those has a bill attached, and the bill is what the marketing pages leave out.</p>
+
+<p><strong>Joins are possible but not free.</strong> <code>$lookup</code> exists in the
+aggregation pipeline, and it works. It is also strict about types, runs inside a pipeline rather
+than the query planner, and gets expensive when it is the thing you do on every request. If your
+queries are naturally five joins deep, you are fighting the tool.</p>
+
+<p><strong>The flexible schema is only flexible until someone relies on it.</strong> Nothing stops
+a bug writing <code>views: "12"</code> as a string into a collection where every other document
+has a number. Relational databases reject that at the door. MongoDB accepts it, and you find out
+much later:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.insertOne({ slug: "a", stats: { views: 12 } })    // number
+db.reels.insertOne({ slug: "b", stats: { views: "12" } })  // string, from a bug
+
+db.reels.find({ "stats.views": { $gt: 5 } }).count()
+// 1 — the string document is not "greater than 5", it is a different BSON type
+
+db.reels.aggregate([{ $group: { _id: null, total: { $sum: "$stats.views" } } }])
+// [ { _id: null, total: 12 } ] — the string was silently skipped, not added</code></pre>
+
+<p>Neither of those raised an error. A total that is quietly wrong is worse than a query that
+fails, and this is the single most common way a flexible schema turns into a bug. Schema
+validation is available and worth using, but it is opt-in &mdash; nobody turns it on for you.</p>
+
+<p><strong>Atomicity stops at the document boundary by default.</strong> A single-document update
+is atomic, which covers more than people expect &mdash; if the things that must change together
+live in one document, you never need a transaction at all. That is a genuine argument for
+embedding. But anything spanning two documents needs an explicit transaction, those require a
+replica set, and they hold resources for their duration. In a relational database a transaction is
+the water you swim in; here it is a decision with a price.</p>
+
+<h2>The four cases where the answer is a relational database</h2>
+
+<p>Being able to name these is more useful than being able to name the advantages.</p>
+
+<ol>
+  <li><strong>Money and inventory.</strong> Anything where multi-record correctness is the normal
+      case, not the exception. MongoDB has had transactions since 4.0, but they are a bolt-on with
+      a cost, not the default mode of operation. Postgres was built for this.</li>
+  <li><strong>Genuinely relational data.</strong> If the interesting questions are &ldquo;which
+      suppliers shipped parts used in contracts signed last quarter&rdquo;, you want a query
+      planner that has spent forty years learning to answer exactly that.</li>
+  <li><strong>Reporting over unknown future queries.</strong> Document modelling rewards knowing
+      your access patterns. Ad-hoc analytics, where the next question is unknown, is where a
+      normalised schema pays off.</li>
+  <li><strong>A schema several teams must agree on.</strong> When the database <em>is</em> the
+      contract between services, having it enforce that contract is a feature, not friction.</li>
+</ol>
+
+<h2>The test that decides it</h2>
+
+<p>Before choosing, write down the three queries your application will run most often. Not every
+query &mdash; the three that run on every page load. For ReelCMS they are:</p>
+
+<ol>
+  <li>The public feed: the most recently published reels, newest first.</li>
+  <li>One reel by its slug, for a permalink.</li>
+  <li>A creator&rsquo;s own reels, for their profile page.</li>
+</ol>
+
+<p>All three want a reel plus its creator&rsquo;s name and avatar. So the creator&rsquo;s display
+fields get copied onto every reel document, and all three become a single-collection read with no
+join. The schema was designed backwards from the queries, which is the only way document modelling
+works.</p>
+
+<p>Now notice what that costs: renaming a creator means rewriting that copy on every reel they own.
+That is a real write, and ReelCMS does it deliberately in one statement. It is the right trade here
+because a display name changes twice in its life and the feed is read constantly &mdash; but it is
+a trade, and you only see it by writing the three queries down first.</p>
+
+<p>If you cannot write that list &mdash; if the honest answer is &ldquo;we do not know yet&rdquo;
+&mdash; that is real information. It means normalise now and denormalise later, once the questions
+have shown up.</p>
+
+<h2>The honest summary</h2>
+
+<p>Choose MongoDB when you can name your top three queries and shape your documents around them.
+That is the whole test. If you can, the document model turns your hottest read into one lookup and
+gets out of your way. If you cannot &mdash; if you are still discovering what the questions are,
+or the answer is &ldquo;all of them&rdquo; &mdash; then normalising and letting a planner sort it
+out is the safer bet.</p>
+
+<p>One more thing worth saying plainly, because it gets lost in the arguing: this is not a
+permanent choice about your whole system. Plenty of applications run Postgres for orders and
+MongoDB for the content catalogue, and that is a sensible answer rather than a fence-sit. Pick per
+workload, not per company.</p>
+
+<p>The rest of this track assumes you have taken that decision and said yes. Next we get a server
+running and a shell connected to it.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>A document is a tree, and the point is that it can be the shape your screen wants.</li>
+  <li>The performance win comes from modelling away joins, not from a faster engine.</li>
+  <li>Flexible schema means no migration &mdash; and no safety net either.</li>
+  <li>Single-document writes are atomic; anything wider needs a transaction.</li>
+  <li>Money, deeply relational data, ad-hoc reporting, and cross-team schema contracts all still
+      point at a relational database.</li>
+</ul>

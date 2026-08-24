@@ -1,0 +1,127 @@
+<p>Aurora is RDS with the storage layer replaced. That one change is the source of every difference
+that matters, so it is worth understanding the mechanism rather than memorising the feature
+list.</p>
+
+<h2>What actually changed</h2>
+
+<p>A normal database writes to a local disk. RDS attaches an EBS volume and, for Multi-AZ, streams
+changes to a standby that keeps its own copy.</p>
+
+<p>Aurora replaces that with a distributed storage service shared by every instance in the cluster.
+Your data is written as log records to six storage nodes across three Availability Zones, and a
+write is acknowledged once four of the six confirm.</p>
+
+<p>Everything else follows from that:</p>
+
+<ul>
+  <li><strong>Replicas do not copy data.</strong> They read the same storage, so replica lag is
+      typically tens of milliseconds rather than seconds</li>
+  <li><strong>Failover is fast</strong> — usually under 30 seconds — because the new writer does
+      not need to catch up on anything</li>
+  <li><strong>Storage grows automatically</strong> in 10 GB increments up to 128 TiB. There is no
+      volume to size and no disk-full outage</li>
+  <li><strong>Backups are continuous</strong> to S3, with no performance hit from taking one</li>
+  <li><strong>Up to 15 replicas</strong>, against 5 for RDS read replicas</li>
+</ul>
+
+<p>Aurora is wire-compatible with PostgreSQL and MySQL. Your driver, your ORM and your SQL do not
+change.</p>
+
+<h2>Two endpoints, and the bug from using the wrong one</h2>
+
+<p>A cluster gives you several endpoints and the distinction is not cosmetic:</p>
+
+<table>
+  <thead><tr><th>Endpoint</th><th>Points at</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Writer</strong> (cluster endpoint)</td><td>The current writer. Follows
+        failover automatically</td></tr>
+    <tr><td><strong>Reader</strong></td><td>Load-balances across replicas. Read-only</td></tr>
+    <tr><td>Instance</td><td>One specific instance. Avoid in application config</td></tr>
+    <tr><td>Custom</td><td>A named subset you define</td></tr>
+  </tbody>
+</table>
+
+<p>Send a write to the reader endpoint and it fails — in Postgres, <em>cannot execute INSERT in a
+read-only transaction</em>. That error is easy to diagnose. The dangerous version is the reverse:
+pointing everything at the writer, which works perfectly and quietly wastes every replica you are
+paying for.</p>
+
+<p>Note also that the reader endpoint balances per <em>connection</em>, not per query. A pooled
+application that opens ten connections at startup and keeps them gets whatever distribution it got
+at startup, which may be lopsided.</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds describe-db-clusters --db-cluster-identifier stayhub-prod \
+  --query "DBClusters[0].[Endpoint,ReaderEndpoint,Engine,EngineVersion]"</code></pre>
+
+<h2>Serverless v2</h2>
+
+<p>Serverless v2 scales an instance's capacity in place, in half-unit steps of Aurora Capacity
+Units, between a floor and a ceiling you set. Each ACU is roughly 2 GiB of memory with matching
+CPU.</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds modify-db-cluster \
+  --db-cluster-identifier stayhub-prod \
+  --serverless-v2-scaling-configuration "MinCapacity=0.5,MaxCapacity=16"</code></pre>
+
+<p>The name misleads people, so be clear about what it is not. It does not scale to zero on the
+original v2 — a minimum of 0.5 ACU bills continuously, so an idle cluster is not free. It is not
+priced like Lambda. And it responds in seconds, not instantly.</p>
+
+<p>It suits genuinely variable load, and development clusters where the floor is cheap. For steady
+traffic, provisioned instances are cheaper — Serverless charges a premium per ACU for the
+flexibility, and if you never use the flexibility you are simply paying more.</p>
+
+<h2>What it costs</h2>
+
+<p>Aurora bills instances at roughly a 20% premium over the equivalent RDS class, plus storage per
+GB-month, plus <strong>I/O per million requests</strong> — and that last line is the one that
+surprises people. A read-heavy workload with a poor cache hit rate can spend more on I/O than on
+compute.</p>
+
+<p>Aurora I/O-Optimized removes the per-request I/O charge for a higher instance and storage price.
+The crossover is around 25% of your bill being I/O; check an actual bill rather than guessing.</p>
+
+<h2>When plain RDS Postgres is the better answer</h2>
+
+<p>Aurora is not the default choice just because it is newer. Prefer RDS when:</p>
+
+<ul>
+  <li><strong>The workload is small and steady.</strong> A single db.t4g.small serving modest
+      traffic gains nothing from distributed storage and costs less</li>
+  <li><strong>You need a Postgres extension or version Aurora does not offer.</strong> Aurora
+      tracks community Postgres at its own pace and does not support every extension</li>
+  <li><strong>You want portability.</strong> RDS Postgres is Postgres; you can
+      <code>pg_dump</code> it and run it anywhere. Aurora's advantages do not travel</li>
+  <li><strong>The bill is I/O-heavy and you have not modelled it.</strong> Measure before
+      migrating</li>
+</ul>
+
+<p>Aurora earns its price when you need many low-lag replicas, fast failover, storage that grows
+without intervention, or scale a single writer cannot serve. For a first production database behind
+a normal web application, RDS Postgres with Multi-AZ is a completely respectable answer and is
+what most projects should start with.</p>
+
+<h2>Failover, and testing it</h2>
+
+<p>Aurora promotes a replica when the writer fails, choosing by a tier you set per instance — lower
+tier wins, ties broken by size. An instance in tier 0 is the intended successor.</p>
+
+<p>The failover itself is fast, but your application still has to notice. The writer endpoint's DNS
+record is repointed with a short TTL, and a client caching DNS for longer than that keeps talking
+to an instance that is now a reader — which surfaces as read-only transaction errors rather than
+connection failures. JVM applications are particularly prone to this, because the default DNS cache
+policy can be indefinite.</p>
+
+<p>The fix is a driver that understands the cluster topology where one exists, plus a bounded DNS
+cache. And test it deliberately rather than discovering the behaviour during an incident:</p>
+
+<pre class="language-bash"><code class="language-bash">aws rds failover-db-cluster --db-cluster-identifier stayhub-prod</code></pre>
+
+<h2>Stopping a cluster</h2>
+
+<pre class="language-bash"><code class="language-bash">aws rds stop-db-cluster --db-cluster-identifier stayhub-dev</code></pre>
+
+<p>Note it is <code>stop-db-cluster</code>, not <code>stop-db-instance</code> — calling the
+instance form on a cluster member fails. As with RDS, a stopped cluster restarts itself after seven
+days, and Serverless v2 cannot be stopped at all; lower its minimum capacity instead.</p>

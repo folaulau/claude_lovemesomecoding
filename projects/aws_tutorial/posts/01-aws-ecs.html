@@ -26,9 +26,9 @@ creating one costs nothing and means almost nothing.</p>
 capacity you never see; you pick vCPU and memory per task and pay for exactly that while it runs.
 On <strong>EC2</strong>, you run a cluster of instances and ECS packs tasks onto them.</p>
 
-<p>Fargate costs more per vCPU-hour and is almost always the right default, because the price
-difference is smaller than the cost of someone patching AMIs. EC2 wins when you need GPUs, very
-large sustained scale where bin-packing pays, or a daemon on every host.</p>
+<p>Fargate costs more per vCPU-hour and is almost always the right default: the price difference is
+smaller than the cost of someone patching AMIs. EC2 wins for GPUs, very large sustained scale where
+bin-packing pays, or a daemon on every host.</p>
 
 <h2>A task definition</h2>
 
@@ -108,6 +108,109 @@ machine, and why the load balancer's target type is <code>ip</code> and not
 in a public subnet with <code>assignPublicIp=ENABLED</code> works and is the default many tutorials
 reach for, but it puts your container directly on the internet for no benefit.</p>
 
+<h2>Two Spring Boot services, two ports, one cluster</h2>
+
+<p>A cluster is a namespace, so running several microservices in one costs nothing extra and is the
+normal arrangement. Take two Spring Boot apps: <code>stayhub-api</code> on 8080 and
+<code>stayhub-search</code> on 8081.</p>
+
+<p>Each gets its own task definition, its own service, and its own <strong>target group</strong> —
+that last one is the piece people try to share and cannot, because a target group has exactly one
+port and one health check.</p>
+
+<pre class="language-bash"><code class="language-bash">aws elbv2 create-target-group --name stayhub-api \
+  --protocol HTTP --port 8080 --target-type ip --vpc-id vpc-0abc123 \
+  --health-check-path /actuator/health
+
+aws elbv2 create-target-group --name stayhub-search \
+  --protocol HTTP --port 8081 --target-type ip --vpc-id vpc-0abc123 \
+  --health-check-path /actuator/health</code></pre>
+
+<p>Spring Boot Actuator's <code>/actuator/health</code> is the natural health-check path, and it is
+worth restricting the exposed endpoints to <code>health</code> so the load balancer probe cannot
+reach anything else.</p>
+
+<p>One load balancer fronts both, and listener rules decide which service a request reaches —
+matched by priority, lowest first, first match wins:</p>
+
+<pre class="language-bash"><code class="language-bash">aws elbv2 create-rule --listener-arn "$LISTENER" --priority 10 \
+  --conditions '[{"Field":"path-pattern","PathPatternConfig":{"Values":["/search*"]}}]' \
+  --actions '[{"Type":"forward","TargetGroupArn":"'"$SEARCH_TG"'"}]'</code></pre>
+
+<p><code>/search*</code> sits at priority 10 and the API is the listener's default action, so
+anything not matching falls through to it. Reverse those and a broad rule swallows every request
+before the specific one is evaluated.</p>
+
+<h2>How they talk to each other, without leaving the cluster</h2>
+
+<p>The obvious way for the API to call search is its public URL. Do not: the request leaves the
+VPC, crosses the internet, comes back through the load balancer, and you pay for the hop and the
+latency on every internal call.</p>
+
+<p><strong>Service Connect</strong> gives every service a short DNS name inside a namespace.
+Declare the port in the task definition with a <code>name</code>:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "name": "search",
+  "portMappings": [
+    { "name": "search-8081", "containerPort": 8081, "appProtocol": "http" }
+  ]
+}</code></pre>
+
+<p>Then the service publishes it under an alias:</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecs create-service --cluster stayhub --service-name stayhub-search \
+  --task-definition stayhub-search --desired-count 2 --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-aaa,subnet-bbb],securityGroups=[sg-search]}" \
+  --load-balancers "targetGroupArn=$SEARCH_TG,containerName=search,containerPort=8081" \
+  --service-connect-configuration '{
+    "enabled": true,
+    "namespace": "stayhub",
+    "services": [{
+      "portName": "search-8081",
+      "discoveryName": "search",
+      "clientAliases": [{ "dnsName": "search", "port": 8081 }]
+    }]
+  }'</code></pre>
+
+<p>The API service enables Service Connect on the same namespace with no <code>services</code>
+block — it is a client, not a publisher. It can then resolve <code>search</code> directly:</p>
+
+<pre class="language-yaml"><code class="language-yaml">stayhub:
+  search:
+    base-url: http://search:8081</code></pre>
+
+<pre class="language-java"><code class="language-java">@Service
+@RequiredArgsConstructor
+public class SearchClient {
+
+    private final RestClient restClient;
+
+    // http://search:8081 resolves inside the cluster. No load balancer, no
+    // public DNS, no internet egress — and the name does not change when
+    // tasks are replaced.
+    public List&lt;PropertyDto&gt; search(String query) {
+        return restClient.get()
+                .uri("/search?q={q}", query)
+                .retrieve()
+                .body(new ParameterizedTypeReference&lt;&gt;() {});
+    }
+}</code></pre>
+
+<p>Service Connect runs a proxy sidecar in each task, so it also load-balances across the search
+tasks and retries a failed connection — which is why this beats plain DNS service discovery.</p>
+
+<p>Two details decide whether this works or half-works.</p>
+
+<p><strong><code>containerPort</code> must match the task definition</strong>, not the listener
+port — the load balancer listens on 443, the container on 8081, and the target group bridges them.
+And <strong>both services must share a namespace</strong>, or the name will not resolve; in Spring
+that surfaces as a connection failure rather than a configuration error.</p>
+
+<p><strong>Give each service its own security group.</strong> With <code>awsvpc</code> the group
+attaches per task, so search allows 8081 from the API's group and the load balancer's group, and
+nothing else. The API needs no inbound rule from search at all.</p>
+
 <h2>Deploying a new version</h2>
 
 <p>A deploy is: push a new image, register a new task-definition revision, tell the service to use
@@ -128,21 +231,17 @@ up and rolls back to the last working revision on its own.</p>
 
 <h2>Scaling the service</h2>
 
-<p><code>--desired-count</code> is a fixed number until you attach Application Auto Scaling to it.
-Target tracking is the version worth using: you name a metric and a value, and AWS adds or removes
-tasks to hold it there.</p>
+<p><code>--desired-count</code> is a fixed number until you attach Application Auto Scaling. Target
+tracking is the version worth using — name a metric and a value, and AWS adds or removes tasks to
+hold it there.</p>
 
 <pre class="language-bash"><code class="language-bash">aws application-autoscaling register-scalable-target \
-  --service-namespace ecs \
-  --resource-id service/stayhub/stayhub-api \
-  --scalable-dimension ecs:service:DesiredCount \
-  --min-capacity 2 --max-capacity 10</code></pre>
+  --service-namespace ecs --resource-id service/stayhub/stayhub-api \
+  --scalable-dimension ecs:service:DesiredCount --min-capacity 2 --max-capacity 10</code></pre>
 
-<p>Target CPU utilisation around 60–70% is a sane starting point. Scaling on request count per
-target is usually better for an API, because it reacts to load rather than to the symptom of load.</p>
-
-<p>Set <code>--min-capacity</code> to at least 2. One task is not a deployment strategy: during a
-rolling deploy, or an AZ event, one task means zero tasks.</p>
+<p>Target CPU around 60-70% is a sane start; request count per target is usually better for an API,
+because it reacts to load rather than to the symptom of load. Keep <code>--min-capacity</code> at
+2 or more — during a rolling deploy, one task means zero tasks.</p>
 
 <h2>Reading a failure</h2>
 

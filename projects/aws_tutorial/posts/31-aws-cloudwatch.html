@@ -1,0 +1,135 @@
+<p>CloudWatch is where AWS puts logs, metrics and alarms. It is not a pleasant product, but it is
+the one that is already collecting data from every service you run, and the handful of things
+worth configuring take an hour.</p>
+
+<h2>Log retention defaults to forever</h2>
+
+<p>Start here, because it is the setting that quietly bills you for years. A log group created by
+Lambda, ECS or anything else has retention set to <strong>Never expire</strong>, and CloudWatch
+charges for stored log data indefinitely.</p>
+
+<pre class="language-bash"><code class="language-bash">aws logs put-retention-policy \
+  --log-group-name /aws/lambda/lovemesomecoding-admin-api-prod \
+  --retention-in-days 30
+
+# find every group that has no retention set
+aws logs describe-log-groups \
+  --query "logGroups[?!not_null(retentionInDays)].logGroupName" --output text</code></pre>
+
+<p>Thirty days suits most application logs; keep audit logs longer and put them in S3, which is far
+cheaper per GB than CloudWatch. Ingestion is charged per GB too, so the other lever is logging
+less — debug logging left on in production is a real line item.</p>
+
+<h2>Logs Insights beats scrolling</h2>
+
+<p>The console's log viewer is for reading one stream. Insights queries across a whole log group,
+which is what you actually want during an incident:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">fields @timestamp, @message
+| filter @message like /ERROR/
+| sort @timestamp desc
+| limit 50</code></pre>
+
+<p>It parses JSON automatically, which is the argument for structured logging — log an object and
+every field becomes queryable:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">fields @timestamp, requestId, durationMs, path
+| filter durationMs > 1000
+| stats count(), avg(durationMs), max(durationMs) by path
+| sort max(durationMs) desc</code></pre>
+
+<p>Queries are billed per GB scanned, so narrow the time range before running one across a month.</p>
+
+<pre class="language-bash"><code class="language-bash">aws logs tail /aws/lambda/lovemesomecoding-admin-api-prod --follow --since 30m</code></pre>
+
+<p>For live watching, <code>logs tail</code> from the CLI is faster than the console and pipes into
+<code>grep</code>.</p>
+
+<h2>Metrics, and the difference between missing and zero</h2>
+
+<p>AWS services publish metrics free at five-minute granularity, or one minute with detailed
+monitoring enabled. Custom metrics cost per metric per month, and a metric with a
+high-cardinality dimension — a user id, a request id — creates one metric per value, which is how
+people accidentally spend hundreds of dollars.</p>
+
+<p>The subtlety worth knowing: <strong>a missing datapoint is not zero</strong>. If your function
+is never invoked, it publishes no <code>Invocations</code> data at all, rather than publishing 0.
+So an alarm on "errors greater than 5" sees no data rather than a value, and by default that means
+the alarm goes to <code>INSUFFICIENT_DATA</code> instead of firing or clearing.</p>
+
+<p>That is why <code>--treat-missing-data</code> exists, and why choosing it deliberately matters:
+<code>notBreaching</code> for something that is legitimately idle, <code>breaching</code> for a
+heartbeat that must always report.</p>
+
+<h2>Alarms worth creating on day one</h2>
+
+<pre class="language-bash"><code class="language-bash">aws cloudwatch put-metric-alarm \
+  --alarm-name lambda-errors-high \
+  --namespace AWS/Lambda \
+  --metric-name Errors \
+  --dimensions Name=FunctionName,Value=lovemesomecoding-admin-api-prod \
+  --statistic Sum --period 300 --evaluation-periods 2 --threshold 5 \
+  --comparison-operator GreaterThanThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions arn:aws:sns:us-west-2:111122223333:alerts</code></pre>
+
+<p>The short list, whatever you are running:</p>
+
+<ul>
+  <li><strong>Error rate</strong> on your entry point — Lambda <code>Errors</code>, or ALB
+      <code>HTTPCode_Target_5XX_Count</code></li>
+  <li><strong>Latency</strong> at p99, not average. An average hides the tail that users notice</li>
+  <li><strong>Queue depth</strong> on any dead-letter queue, with a threshold of zero</li>
+  <li><strong>Database storage and connections</strong> — both fail hard and both warn slowly</li>
+  <li><strong>A billing alarm</strong>, which catches the mistakes no technical alarm covers</li>
+</ul>
+
+<p>Two evaluation periods rather than one is deliberate: a single bad datapoint pages someone at
+3am for a blip that resolved itself.</p>
+
+<h2>Alarms that page, and alarms that act</h2>
+
+<p>Not every alarm needs a human. An alarm action can be an SNS topic, an Auto Scaling policy, an
+EC2 action, or a CodeDeploy rollback — and an alarm that automatically undoes a bad deploy is worth
+more than one that wakes someone to do it by hand.</p>
+
+<p>Keep the two categories separate. If everything pages, people stop reading the pages, and the
+one that mattered arrives in a folder nobody opens.</p>
+
+<h2>Composite alarms</h2>
+
+<p>An alarm per component means an incident produces twenty notifications. A composite alarm
+combines several into one rule, so you can express "the API is down" as errors high AND healthy
+hosts low, and page on that instead of on each part.</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudwatch put-composite-alarm \
+  --alarm-name api-unhealthy \
+  --alarm-rule "ALARM(lambda-errors-high) AND ALARM(alb-unhealthy-hosts)" \
+  --alarm-actions arn:aws:sns:us-west-2:111122223333:pager</code></pre>
+
+<h2>Dashboards, and the trap of building too many</h2>
+
+<p>A dashboard is JSON describing widgets, which means it belongs in your infrastructure code
+rather than being clicked together and forgotten:</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudwatch list-dashboards --query "DashboardEntries[].DashboardName" --output text</code></pre>
+
+<p>Three dashboards per team is plenty. The failure mode is a wall of graphs nobody reads, because
+a graph only helps if someone knows what normal looks like on it. Build one dashboard that answers
+"is the system healthy" in ten seconds, and let everything else be a query you run when you have a
+specific question.</p>
+
+<h2>What CloudWatch is not</h2>
+
+<p>It is a metrics and logs store, not a tracing system. For "which of these eight services made
+the request slow", you want <strong>X-Ray</strong>, which follows a request across services and
+shows where the time went. Enabling it on Lambda is one setting, and it answers a question
+CloudWatch structurally cannot.</p>
+
+<p>It is also not an audit log. "Who changed this security group" is <strong>CloudTrail</strong>,
+which records API calls across the account and is on by default for the last 90 days of management
+events. The two get confused constantly, and reaching for the wrong one during an incident wastes
+the time you have least of.</p>
+
+<p>The division worth remembering: CloudWatch answers what your system is doing, CloudTrail answers
+what people and services did to it, and X-Ray answers where a single request spent its time.</p>

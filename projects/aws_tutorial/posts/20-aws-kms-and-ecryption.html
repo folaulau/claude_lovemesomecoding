@@ -1,0 +1,142 @@
+<p>Encryption at rest is a checkbox on most AWS services, and it stays a checkbox right up until
+something needs to decrypt from another account, or an auditor asks who read what. KMS is the
+service behind that checkbox.</p>
+
+<h2>Envelope encryption</h2>
+
+<p>KMS never encrypts your data. That sounds wrong and it is the key to the whole design.</p>
+
+<p>A KMS key cannot leave the service and can only encrypt small payloads — up to 4 KB. So AWS
+services use <strong>envelope encryption</strong>:</p>
+
+<ol>
+  <li>The service asks KMS for a new data key. KMS returns it twice: once in plaintext, once
+      encrypted under your KMS key</li>
+  <li>The service encrypts your object with the plaintext data key, then discards it from
+      memory</li>
+  <li>The encrypted data key is stored alongside the ciphertext</li>
+  <li>To read, the service sends the encrypted data key back to KMS, gets the plaintext key, and
+      decrypts</li>
+</ol>
+
+<p>This is why a 5 GB S3 object can be encrypted by a service whose keys handle 4 KB, and why
+revoking access in KMS makes existing ciphertext unreadable without rewriting a single byte of
+it — you are not removing the data, you are removing the ability to unwrap its key.</p>
+
+<h2>Which kind of key</h2>
+
+<table>
+  <thead><tr><th></th><th>AWS managed</th><th>Customer managed</th></tr></thead>
+  <tbody>
+    <tr><td>Monthly cost</td><td>Free</td><td>About $1 per key</td></tr>
+    <tr><td>Key policy</td><td>Fixed</td><td>Yours</td></tr>
+    <tr><td>Cross-account</td><td>No</td><td>Yes</td></tr>
+    <tr><td>Rotation</td><td>Annual, automatic</td><td>Configurable</td></tr>
+    <tr><td>Can be disabled or deleted</td><td>No</td><td>Yes</td></tr>
+  </tbody>
+</table>
+
+<p>AWS managed keys — the ones named <code>aws/s3</code>, <code>aws/rds</code> — are free and
+enough for "encrypted at rest, tick". You cannot change their policy, share them, or revoke them,
+which also means you cannot make a mistake with them.</p>
+
+<p>Create a customer managed key when you need cross-account access, a key you can disable in an
+incident, or an audit trail specific to your data. The dollar a month is not the consideration; the
+API request charges at volume might be.</p>
+
+<h2>The key policy is not overridable by IAM</h2>
+
+<p>This is the part that produces "I am an administrator and I cannot use this key".</p>
+
+<p>Every KMS key has a <strong>key policy</strong>, a resource policy attached to the key. Unlike
+most resource policies, it is authoritative: <strong>IAM permissions alone are not enough</strong>.
+If the key policy does not grant access to a principal, no identity policy anywhere can add it.</p>
+
+<pre class="language-json"><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AdminsManageTheKey",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AppUsesTheKey",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/stayhub-api" },
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+      "Resource": "*"
+    }
+  ]
+}</code></pre>
+
+<p><code>"Resource": "*"</code> inside a key policy means "this key" — the policy is already
+attached to it, so there is nothing else to name.</p>
+
+<p>Note the first statement. A key whose policy does not grant the account root
+<code>kms:*</code> can become <strong>unmanageable</strong>: nobody can change the policy, and
+support cannot fix it. Always include it.</p>
+
+<p>Note also <code>GenerateDataKey</code> in the second. A principal that can only
+<code>Decrypt</code> can read existing data and cannot write new — which is either a useful
+restriction or a confusing bug, depending on whether you meant it.</p>
+
+<h2>Aliases</h2>
+
+<pre class="language-bash"><code class="language-bash">aws kms create-alias --alias-name alias/stayhub-app --target-key-id 1234abcd-12ab-34cd-56ef-1234567890ab
+aws kms describe-key --key-id alias/stayhub-app</code></pre>
+
+<p>Key ids are UUIDs and nobody remembers them. Reference an alias everywhere instead, and you can
+repoint it at a new key without editing every configuration that uses it. Aliases are also how you
+write one template that works in several accounts.</p>
+
+<h2>Rotation</h2>
+
+<p>With automatic rotation enabled, KMS generates new key material each year and keeps the old
+material to decrypt existing data. The key id and alias do not change, nothing needs re-encrypting,
+and it is essentially free to turn on.</p>
+
+<pre class="language-bash"><code class="language-bash">aws kms enable-key-rotation --key-id alias/stayhub-app</code></pre>
+
+<p>What rotation does <em>not</em> do is re-encrypt anything. Old ciphertext stays wrapped under
+old material forever, so rotation limits how much new data shares key material — it does not undo a
+past compromise.</p>
+
+<h2>Encryption in transit is a different problem</h2>
+
+<p>KMS is about data at rest. Data in transit is TLS, and the two get conflated in conversations
+about "is it encrypted".</p>
+
+<p>Inside AWS most service endpoints are HTTPS by default and there is little to do. The gaps worth
+checking are the ones inside your own VPC: a database connection with <code>sslmode=prefer</code>
+silently falls back to plaintext if the server does not offer TLS, and traffic between a load
+balancer and its targets is unencrypted unless you configure it.</p>
+
+<p>A useful guardrail is to deny unencrypted access at the resource, so it cannot happen by
+accident rather than being merely discouraged:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "Sid": "DenyInsecureTransport",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:*",
+  "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"],
+  "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+}</code></pre>
+
+<p>An explicit deny always wins, so that statement cannot be undone by any allow elsewhere.</p>
+
+<h2>Deletion is the only irreversible button</h2>
+
+<p>You cannot delete a KMS key immediately. Scheduling deletion starts a waiting period of 7 to 30
+days, during which the key is unusable but recoverable.</p>
+
+<pre class="language-bash"><code class="language-bash">aws kms schedule-key-deletion --key-id alias/stayhub-app --pending-window-in-days 30</code></pre>
+
+<p>That window exists because deleting a key destroys every piece of data encrypted under it,
+permanently, with no recovery path — the ciphertext remains and is now noise. Take the full 30
+days, and before scheduling, check the key's CloudTrail activity for anything still using it.</p>
+
+<p>Disabling is the reversible alternative and is almost always what you actually want.</p>

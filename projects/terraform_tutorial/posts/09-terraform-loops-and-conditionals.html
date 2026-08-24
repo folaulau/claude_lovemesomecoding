@@ -1,0 +1,247 @@
+<p>Three subnets should not be three copy-pasted blocks. Terraform has two ways to say "one of these
+per item", they behave very differently when the list changes, and picking the wrong one is how
+people destroy resources they meant to keep.</p>
+
+<h2>count</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_subnet" "public" {
+  count = 2
+
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = ["10.20.0.0/24", "10.20.1.0/24"][count.index]
+  availability_zone = ["us-west-2a", "us-west-2b"][count.index]
+}</code></pre>
+
+<p><code>count.index</code> is 0-based. The resources are addressed by position:</p>
+
+<pre class="language-bash"><code class="language-bash">aws_subnet.public[0]
+aws_subnet.public[1]
+
+aws_subnet.public[*].id     # splat — the list of all their ids</code></pre>
+
+<h2>⚠️ Why count will destroy your resources</h2>
+
+<p>This is the single most important thing in this lesson.</p>
+
+<p><strong>count keys state by list position.</strong> Remove an element from the middle, and every
+element after it shifts down — so Terraform sees the resource at each index change identity.</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  # before
+  buckets = ["logs", "uploads", "backups"]
+
+  # after — "uploads" removed
+  # buckets = ["logs", "backups"]
+}</code></pre>
+
+<p>You deleted one bucket. Terraform plans this:</p>
+
+<pre class="language-bash"><code class="language-bash">[0] "logs"     -> "logs"      no change
+[1] "uploads"  -> "backups"   ~ UPDATE IN PLACE, renaming the bucket
+[2] "backups"  -> gone        - DESTROY
+
+Plan: 0 to add, 1 to change, 1 to destroy.</code></pre>
+
+<p>The bucket named <code>backups</code> — which you did not touch — is destroyed, and the one named
+<code>uploads</code> is renamed to <code>backups</code>. On an S3 bucket that means the contents of
+the original <code>backups</code> are gone. On an RDS instance it is worse.</p>
+
+<p><strong>Use <code>count</code> only when the items are genuinely positional and interchangeable,
+or when the count is a number you control.</strong> Two subnets indexed by AZ are fine — the list is
+fixed and derived. A list of named things is not.</p>
+
+<h2>for_each</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_s3_bucket" "this" {
+  for_each = toset(["logs", "uploads", "backups"])
+
+  bucket = "pizza-tf-${each.key}"
+}</code></pre>
+
+<p><strong>for_each keys state by the key, not the position.</strong> Remove <code>"uploads"</code>
+and Terraform plans exactly one thing:</p>
+
+<pre class="language-bash"><code class="language-bash">aws_s3_bucket.this["uploads"] will be destroyed
+
+Plan: 0 to add, 0 to change, 1 to destroy.</code></pre>
+
+<p>The others are not touched, because their keys did not change. That is the whole difference, and
+it is why <strong><code>for_each</code> is the correct default.</strong></p>
+
+<p>It takes a <strong>set of strings</strong> or a <strong>map</strong>. A list must be converted with
+<code>toset()</code> — which also means duplicates are silently collapsed, since a set cannot hold
+them.</p>
+
+<p>With a map you get both halves:</p>
+
+<pre class="language-hcl"><code class="language-hcl">variable "services" {
+  type = map(object({
+    port   = number
+    memory = string
+  }))
+  default = {
+    api    = { port = 8085, memory = "1024" }
+    worker = { port = 8086, memory = "512" }
+  }
+}
+
+resource "aws_cloudwatch_log_group" "service" {
+  for_each = var.services
+
+  name              = "/ecs/${each.key}"
+  retention_in_days = 7
+
+  tags = {
+    Port = tostring(each.value.port)
+  }
+}</code></pre>
+
+<pre class="language-bash"><code class="language-bash">each.key      "api"
+each.value    { port = 8085, memory = "1024" }
+
+aws_cloudwatch_log_group.service["api"]
+aws_cloudwatch_log_group.service["worker"]</code></pre>
+
+<h2>⚠️ The for_each restriction that will catch you</h2>
+
+<p>The <strong>keys</strong> of a <code>for_each</code> must be known at plan time. The values can be
+computed; the keys cannot.</p>
+
+<pre class="language-bash"><code class="language-bash">Error: Invalid for_each argument
+
+The "for_each" map includes keys derived from resource attributes that cannot
+be determined until apply, and so Terraform cannot determine the full set of
+keys that will identify the instances of this resource.</code></pre>
+
+<p>This happens when you feed <code>for_each</code> something derived from a resource that does not
+exist yet — bucket names built from a generated id, subnets keyed by an ARN. Terraform needs the
+keys to build the graph, and it builds the graph before it creates anything.</p>
+
+<p>The fix is to key on something you already know — a variable, a literal, a name you chose — and
+put the computed thing in the value.</p>
+
+<h2>Switching between them</h2>
+
+<p>Changing <code>count</code> to <code>for_each</code> changes every address, so Terraform plans to
+destroy everything and create it again. Use <code>moved</code> blocks:</p>
+
+<pre class="language-hcl"><code class="language-hcl">moved {
+  from = aws_s3_bucket.this[0]
+  to   = aws_s3_bucket.this["logs"]
+}
+
+moved {
+  from = aws_s3_bucket.this[1]
+  to   = aws_s3_bucket.this["uploads"]
+}</code></pre>
+
+<h2>count as a conditional</h2>
+
+<p>There is no <code>if</code> for whether a resource exists. This idiom is how it is done:</p>
+
+<pre class="language-hcl"><code class="language-hcl">variable "enable_monitoring" {
+  type    = bool
+  default = false
+}
+
+resource "aws_cloudwatch_log_group" "optional" {
+  count = var.enable_monitoring ? 1 : 0
+
+  name              = "/ecs/pizza-tf-monitoring"
+  retention_in_days = 7
+}</code></pre>
+
+<p>⚠️ It is now a <strong>list</strong>, even with one element, so every reference needs
+<code>[0]</code> — and that reference errors when the count is 0. The safe form:</p>
+
+<pre class="language-hcl"><code class="language-hcl">output "log_group_name" {
+  # one(...) returns the single element, or null if the list is empty
+  value = one(aws_cloudwatch_log_group.optional[*].name)
+}</code></pre>
+
+<h2>The conditional expression</h2>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  env           = "prod"
+  instance_type = local.env == "prod" ? "db.r6g.large" : "db.t4g.micro"
+  backup_days   = local.env == "prod" ? 30 : 0
+}</code></pre>
+
+<p>Both branches must be the same type. And ⚠️ <strong>both branches are evaluated</strong>, so
+<code>condition ? a[0] : "default"</code> still errors when <code>a</code> is empty.</p>
+
+<h2>for expressions</h2>
+
+<p>Transforming a collection, in the expression rather than in the resource:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  services = {
+    api    = { port = 8085 }
+    worker = { port = 8086 }
+  }
+
+  # list from a map
+  names = [for name, cfg in local.services : name]
+
+  # map from a map — note the => and the surrounding braces
+  ports = { for name, cfg in local.services : name =&gt; cfg.port }
+
+  # with a filter
+  web = { for name, cfg in local.services : name =&gt; cfg if cfg.port == 8085 }
+
+  # building the for_each input for a nested resource
+  rules = [for port in [80, 443] : {
+    from_port = port
+    to_port   = port
+  }]
+}</code></pre>
+
+<h2>dynamic blocks</h2>
+
+<p>For repeating a <em>nested block</em> rather than a resource. Reach for it only when the number of
+blocks is genuinely variable:</p>
+
+<pre class="language-hcl"><code class="language-hcl">variable "ingress_ports" {
+  type    = list(number)
+  default = [80, 443]
+}
+
+resource "aws_security_group" "web" {
+  name   = "pizza-tf-web"
+  vpc_id = "vpc-example"
+
+  dynamic "ingress" {
+    for_each = var.ingress_ports
+
+    content {
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+}</code></pre>
+
+<p>The iterator is named after the block — <code>ingress.value</code> — which reads oddly until you
+have seen it a few times.</p>
+
+<p>⚠️ <code>dynamic</code> is the least readable construct in HCL, and two literal blocks are almost
+always clearer than a <code>dynamic</code> over a two-element list. Use it when the count is driven
+by an input, not to avoid repeating yourself twice.</p>
+
+<p>For security groups specifically, prefer the separate rule resources —
+<code>aws_vpc_security_group_ingress_rule</code> — with <code>for_each</code>. Each rule is then its
+own addressable resource, so a plan shows exactly which rule changed rather than a diff of a nested
+block.</p>
+
+<h2>Which to use</h2>
+
+<pre class="language-bash"><code class="language-bash">for_each   DEFAULT. named things, anything that might be removed from the middle.
+count      a number you control, or the ? 1 : 0 conditional idiom.
+dynamic    a nested block whose repetition is driven by an input.
+for        transforming a collection inside an expression.</code></pre>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-modules">Lesson 10</a> packages a directory of Terraform so it can be
+called more than once — and is honest about when a module is the wrong answer.</p>

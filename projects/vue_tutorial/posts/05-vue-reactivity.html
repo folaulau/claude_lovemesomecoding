@@ -1,0 +1,151 @@
+<p>Reactivity is the part of Vue you have to actually understand. Everything else is syntax around
+it. The idea is simple: you declare state, you use it in a template, and when the state changes the
+template updates — without you telling it to.</p>
+
+<p>The mechanism is dependency tracking. While a component renders, Vue records every reactive value
+that render read. When one of those values changes, Vue re-runs that render and nothing else. There
+is no dependency array to maintain and no equality function to pass, because Vue already knows
+exactly which renders touched which values.</p>
+
+<h2>ref</h2>
+
+<p><code>ref()</code> wraps a value in a reactive container:</p>
+
+<pre class="language-javascript"><code class="language-javascript">import { ref } from "vue";
+
+const loading = ref(true);
+const reels = ref([]);
+const activeIndex = ref(0);</code></pre>
+
+<p>In JavaScript you read and write through <code>.value</code>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">loading.value = false;
+reels.value.push(...res.items);
+if (activeIndex.value === 0) { /* ... */ }</code></pre>
+
+<p>In a template you do not:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;LoadingSpinner v-if="loading" /&gt;
+&lt;p&gt;{{ reels.length }} reels&lt;/p&gt;</code></pre>
+
+<p>That inconsistency is the single most common source of early confusion, so it is worth knowing
+why it exists. <code>.value</code> is the only way to make a plain value reactive in JavaScript —
+assigning to a bare variable is invisible to any library, because there is no hook to intercept it.
+A property access is interceptable, so <code>ref</code> gives the value a property. Templates are
+compiled, so the compiler knows which bindings are refs and unwraps them for you.</p>
+
+<h3>Forgetting .value</h3>
+
+<p>This is the bug you will write in your first week:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const loading = ref(true);
+
+if (loading) { /* ALWAYS true -- an object is truthy */ }
+if (loading.value) { /* correct */ }
+
+loading = false;         // TypeError: assignment to constant
+loading.value = false;   // correct</code></pre>
+
+<p>The <code>const</code> assignment throws, which is loud and easy. The truthiness one is silent
+and will cost you an afternoon. If a condition that should sometimes be false never is, this is
+why.</p>
+
+<h3>ref holds anything</h3>
+
+<p>Not just primitives. A <code>ref</code> containing an object or array is <strong>deeply
+reactive</strong> — mutating something nested triggers updates:</p>
+
+<pre class="language-javascript"><code class="language-javascript">  const items = ref([]);
+
+  function push(message, variant = "success", ms = 3600) {
+    const id = nextId++;
+    items.value.push({ id, message, variant });
+    setTimeout(() =&gt; dismiss(id), ms);
+    return id;
+  }</code></pre>
+
+<p><code>items.value.push(...)</code> mutates the array in place and the toast list re-renders.
+Vue wraps the array in a proxy, so the mutation is observable.</p>
+
+<h2>reactive</h2>
+
+<p>The other way to declare state. <code>reactive()</code> takes an object and returns a reactive
+proxy of it, with no <code>.value</code> anywhere:</p>
+
+<pre class="language-javascript"><code class="language-javascript">import { reactive } from "vue";
+
+const filters = reactive({ status: "", creator: "", q: "" });
+
+filters.status = "PUBLISHED";   // no .value
+console.log(filters.q);</code></pre>
+
+<p>That looks nicer, and it is why people reach for it. Then they hit the limitations.</p>
+
+<h3>Three ways reactive will surprise you</h3>
+
+<p><strong>1. It only works on objects.</strong> <code>reactive(0)</code> and
+<code>reactive("hello")</code> do nothing at all — there is no object to proxy. Primitives need
+<code>ref</code>, so a codebase using <code>reactive</code> ends up using both anyway.</p>
+
+<p><strong>2. Destructuring breaks it.</strong> This is the big one:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const filters = reactive({ status: "", q: "" });
+
+// `status` is now a plain string, disconnected from the proxy. It will never
+// update again, and nothing warns you.
+const { status } = filters;</code></pre>
+
+<p>The same applies to passing <code>filters.status</code> into a function: you hand over a value,
+not a reference to reactive state.</p>
+
+<p><strong>3. Reassignment breaks it.</strong> The reactivity belongs to the proxy object, so
+replacing the object throws it away:</p>
+
+<pre class="language-javascript"><code class="language-javascript">let filters = reactive({ status: "" });
+
+filters = { status: "PUBLISHED" };   // reactivity lost -- this is a plain object now
+
+// With a ref, replacing the whole value is fine and is the normal thing to do:
+const filtersRef = ref({ status: "" });
+filtersRef.value = { status: "PUBLISHED" };   // still reactive</code></pre>
+
+<h2>Which to use</h2>
+
+<p><strong>Use <code>ref</code> for everything unless you have a specific reason not to.</strong>
+That is the rule this track follows and the rule the demo application follows — it contains 78
+<code>ref</code> calls and not a single <code>reactive</code>.</p>
+
+<p>The reasoning: <code>ref</code> works for every type, survives destructuring and reassignment, and
+is what composables return anyway. The price is <code>.value</code>, which is a small, consistent,
+visible tax. <code>reactive</code> removes that tax and replaces it with three failure modes that are
+all silent.</p>
+
+<p>Vue's own documentation now recommends <code>ref</code> as the default for the same reasons.</p>
+
+<h2>Related functions you will see</h2>
+
+<p><code>toRef(obj, 'key')</code> creates a ref that stays linked to one property of a reactive
+object, and <code>toRefs(obj)</code> does it for every property at once — which is how you
+destructure a <code>reactive</code> without breaking it. If you follow the rule above you will rarely
+need either, but you will read them in other people's code.</p>
+
+<p><code>shallowRef</code> makes only the <code>.value</code> assignment reactive, not anything
+nested. It is a performance tool for large objects you replace wholesale rather than edit; lesson 25
+covers when it is worth it.</p>
+
+<p><code>readonly(obj)</code> returns a proxy that warns on any write. It is the right way to hand
+state to a child that should only read it, and it comes up again in lesson 16.</p>
+
+<h2>What reactivity does not do</h2>
+
+<p>It tracks <strong>reads during a render or an effect</strong>. Two consequences:</p>
+
+<p>A value read outside any reactive context — in a plain module-level function, say — is not
+tracked, and changing it updates nothing.</p>
+
+<p>An <code>async</code> function loses tracking after its first <code>await</code>. Anything read
+after the await is not registered as a dependency. This matters for watchers, and lesson 7 comes back
+to it.</p>
+
+<p>Next: <a href="/vue/vue-computed">Computed Properties</a> — derived state that caches
+itself.</p>

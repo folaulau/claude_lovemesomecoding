@@ -1,0 +1,137 @@
+<p>ElastiCache runs Redis or Memcached for you. In practice that means Redis — or Valkey, the
+open-source fork AWS now offers at a lower price and which speaks the same protocol.</p>
+
+<p>A cache sits between your application and something slower, usually a database. Getting one
+working takes fifteen lines. Getting one that does not serve wrong data is the actual work.</p>
+
+<h2>Cache-aside</h2>
+
+<p>The pattern almost everyone uses. The application owns the cache; the cache knows nothing about
+the database.</p>
+
+<pre class="language-python"><code class="language-python">import json
+import redis
+
+cache = redis.Redis(host=ENDPOINT, port=6379, ssl=True, decode_responses=True)
+TTL = 300
+
+
+def get_property(property_id):
+    key = f"property:{property_id}:v2"
+
+    try:
+        hit = cache.get(key)
+        if hit is not None:
+            return json.loads(hit)
+    except redis.RedisError:
+        pass                      # a cache failure must not be a request failure
+
+    row = db.fetch_property(property_id)
+
+    try:
+        cache.setex(key, TTL, json.dumps(row))
+    except redis.RedisError:
+        pass
+
+    return row</code></pre>
+
+<p>Two things in there are the difference between a cache that helps and one that becomes an
+outage.</p>
+
+<p><strong>Every cache call is wrapped.</strong> If Redis is unreachable, the request should be
+slower, not failed. A cache is an optimisation; the moment it becomes a hard dependency you have
+added a component that can take your site down.</p>
+
+<p><strong>The key carries a version.</strong> When the shape of what you store changes, bump
+<code>v2</code> to <code>v3</code> and every old entry is orphaned harmlessly. Without that, a
+deploy that changes the serialised format reads old entries with new code, which fails in ways that
+are hard to trace.</p>
+
+<h2>Invalidation, honestly</h2>
+
+<p>There are three strategies and only one of them is safe by default.</p>
+
+<p><strong>TTL.</strong> Entries expire. Data can be stale for up to the TTL and no longer, and
+nothing can leak forever. Boring, and correct.</p>
+
+<p><strong>Explicit deletion on write.</strong> Delete the key when the underlying row changes.
+Fresher, and it fails silently: any write path that forgets leaves a stale entry with no expiry.</p>
+
+<p><strong>Write-through.</strong> Update the cache as part of the write. Consistent until the two
+writes diverge, which they eventually do.</p>
+
+<p>Use TTL as the floor, always. Add deletion on write for the paths where staleness genuinely
+matters. The TTL is what limits the damage when the deletion is missed.</p>
+
+<h2>The miss storm</h2>
+
+<p>Two failure modes worth designing against before they happen.</p>
+
+<p><strong>Stampede.</strong> A popular key expires and a thousand concurrent requests all miss,
+all query the database, and all write the same value back. The database sees a thousand identical
+queries at once. Guard the recompute with a short lock so one request repopulates and the rest wait
+briefly.</p>
+
+<p><strong>Cold cache.</strong> After a failover or a restart, everything misses at once and the
+full load lands on a database sized for the cached rate. That is when a cache that was hiding an
+undersized database reveals it. Know whether yours can survive its own cache being empty.</p>
+
+<h2>Cluster mode changes your client</h2>
+
+<p>This is the configuration detail that produces the most confusing errors.</p>
+
+<p><strong>Cluster mode disabled</strong> gives you one primary and optional replicas, all holding
+the same data. There is a primary endpoint for writes and a reader endpoint for reads. Simple.</p>
+
+<p><strong>Cluster mode enabled</strong> shards data across several primaries. Each key belongs to
+one shard, and your client must know the topology to route requests — so it needs a
+<em>cluster-aware</em> client and the <strong>configuration endpoint</strong>, not a node address.
+Point an ordinary client at one node in a sharded cluster and every request for a key on another
+shard fails with a MOVED redirect the client does not understand.</p>
+
+<pre class="language-bash"><code class="language-bash">aws elasticache describe-replication-groups \
+  --replication-group-id stayhub-cache \
+  --query "ReplicationGroups[0].[ClusterEnabled,ConfigurationEndpoint,NodeGroups[].PrimaryEndpoint]"</code></pre>
+
+<p>Multi-key operations also stop working across shards unless the keys hash to the same slot,
+which is what hash tags — <code>{property:4417}:reviews</code> — are for.</p>
+
+<h2>What to cache</h2>
+
+<p>Good candidates are read often, change rarely, and are expensive to produce: a rendered page
+fragment, a permissions lookup, an aggregate over many rows, a third-party API response.</p>
+
+<p>Poor candidates are anything read once, anything that must be exactly current, and anything
+cheap to compute. Caching a primary-key lookup that already takes 0.2ms adds a network round trip
+to save nothing.</p>
+
+<p>Session storage is the other big use, and a good one — it is what lets you turn off sticky
+sessions on your load balancer.</p>
+
+<h2>Redis, Valkey or Memcached</h2>
+
+<p>Memcached is the older option: a plain key-value cache, multi-threaded, with no persistence, no
+replication and no data structures. It is genuinely simpler and genuinely faster per core for the
+narrow job of caching opaque blobs.</p>
+
+<p>Redis and Valkey give you sorted sets, lists, hashes, pub/sub, atomic counters, replication and
+optional persistence. That extra surface is why almost everything is built on them — a rate limiter
+or a leaderboard is a few commands rather than a design problem.</p>
+
+<p>Valkey is the fork that followed Redis's licence change; ElastiCache offers it at a lower price
+than Redis OSS, and it is protocol-compatible. For a new cluster it is usually the default worth
+choosing. Pick Memcached only if you are certain you need nothing beyond get and set.</p>
+
+<h2>Sizing and operations</h2>
+
+<p>Watch two metrics. <code>CacheHitRate</code> below roughly 80% means the cache is not earning
+its cost — usually a TTL that is too short or keys that are too specific. And
+<code>Evictions</code> above zero means memory is full and Redis is discarding data to make room;
+that is the signal to grow the node, not something to tune away.</p>
+
+<p>Set <code>maxmemory-policy</code> deliberately. <code>allkeys-lru</code> is right for a pure
+cache. The default, <code>volatile-lru</code>, only evicts keys that have a TTL — so a cluster
+holding keys without one fills up and starts refusing writes instead of evicting.</p>
+
+<p>Enable encryption in transit and at rest at creation time, and note in-transit encryption cannot
+be added later without recreating the cluster.</p>

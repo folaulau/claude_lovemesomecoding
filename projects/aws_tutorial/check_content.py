@@ -12,10 +12,14 @@ interpret. Byte-for-byte is the only check worth running. No AWS access needed.
 
 On top of the round-trip check this enforces the rules specific to the AWS track:
 
-  1. All 33 slugs are still in the manifest. EVERY ONE is a live indexed URL — this track has no
-     `new` posts — and losing one is a 404 on a page Google already has.
-  2. Every post fits the 4-6 reading-minute budget. ⚠️ The pipeline counts PROSE AND CODE
-     together, so a 40-line IAM policy can blow the budget without a single extra sentence.
+  1. All 33 FROZEN slugs are still in the manifest. Each is a live indexed URL, and losing one is
+     a 404 on a page Google already has. `aws-ecr` is the one post that is genuinely new, so it
+     has no indexed URL to protect and is exempt from this rule but not from any other.
+  2. Every post fits the 4-6 reading-minute budget, unless it is in manifest.LENGTH_EXEMPT —
+     a declared table with a reason per entry, so an exemption is a decision on the record rather
+     than the cap being quietly dropped. The FLOOR still applies to an exempt post.
+     ⚠️ The pipeline counts PROSE AND CODE together, so a 40-line IAM policy can blow the budget
+     without a single extra sentence.
   3. Prose is at least 45% of the words. JSON is even easier than SQL to fill a word budget with —
      one pasted policy is 400 words of `"Effect": "Allow"` — and the result is a listing with
      captions rather than a lesson.
@@ -110,9 +114,17 @@ WORDPRESS_CRUFT = {
 FOREIGN_IMAGE = re.compile(r'<img[^>]+src="https?://(?!d2q2snz6diubfd\.cloudfront\.net)([^"/]+)')
 
 # Rule 7. Wording that counts as declaring a service closed.
+#
+# ⚠️ Matched against WHITESPACE-COLLAPSED text, not the raw rendered text. The post bodies are
+# hard-wrapped at about 100 characters, so a phrase like "you cannot\ncreate one" carries a
+# newline in the middle and a pattern expecting a literal space silently misses it. That is a
+# false NEGATIVE on a rule whose whole job is to catch a missing warning — the worst direction for
+# this particular rule to fail in. Caught on aws-codecommit, whose first sentence says exactly the
+# right thing and was reported as saying nothing.
 CLOSED_MARKER = re.compile(
-    r"closed to new customers|no longer accepting new|not an AWS service|"
-    r"stopped onboarding|cannot create (?:a )?(?:new )?(?:repositor|one)", re.I)
+    r"closed \S*\s*to new customers|closed to new customers|no longer accepting new|"
+    r"not an AWS service|stopped onboarding|ceased onboarding|"
+    r"cannot create (?:a |an )?(?:new )?(?:repositor|one|cluster)", re.I)
 
 
 # Rule 4b. The original prose of all 33 live posts, captured by originals/snapshot.py.
@@ -257,7 +269,9 @@ for entry in manifest.POSTS:
 
     # Characters outside the house set — a stray CJK character mid-sentence reads as a normal word
     # at a glance and would otherwise ship.
-    ALLOWED_NON_ASCII = set("—–’‘“”…×→±⚠️✓✗‹›°éíóúñ")
+    # Box-drawing characters are deliberate: several posts draw a small architecture diagram in a
+    # plaintext block, and that is a better fit than an image we would then have to host.
+    ALLOWED_NON_ASCII = set("—–’‘“”…×→±⚠️✓✗‹›°éíóúñ" "─│┌┐└┘├┤┬┴┼")
     stray = sorted({c for c in raw if ord(c) > 127} - ALLOWED_NON_ASCII)
     if stray:
         failures.append(
@@ -284,6 +298,7 @@ for entry in manifest.POSTS:
     # reader sees and it is ROUNDED: 1,378 words is 6.3, published as "6 min".
     minutes = result["readingMinutes"]
     low, high = manifest.TARGET_MINUTES
+    high = manifest.LENGTH_EXEMPT.get(entry["slug"], high)
     if minutes > high:
         failures.append(
             f"{entry['slug']}: {minutes} min ({words} words), over the {high}-minute cap. "
@@ -308,7 +323,9 @@ for entry in manifest.POSTS:
     # would forbid the right answer. The floor is absolute; the cap in rule 2 is the other side.
     if words < manifest.TOTAL_WORDS_MIN:
         blank_note = (" This post is BLANK on the live site, so the floor is the only bar."
-                      if entry["slug"] in manifest.BLANK else "")
+                      if entry["slug"] in manifest.BLANK else
+                      " This post is new, so the floor is the only bar."
+                      if entry["state"] == "new" else "")
         failures.append(
             f"{entry['slug']}: {words} words, under the track floor of "
             f"{manifest.TOTAL_WORDS_MIN}.{blank_note}")
@@ -343,8 +360,7 @@ for entry in manifest.POSTS:
 
     # (7) a closed service has to say so early
     if entry["closed"]:
-        first_section = text.split("\n")[0] if "\n" in text else text
-        head = text[:900]
+        head = " ".join(text.split())[:900]
         if not CLOSED_MARKER.search(head):
             failures.append(
                 f"{entry['slug']}: declared `closed` in the manifest but the first 900 characters "
@@ -357,10 +373,11 @@ for entry in manifest.POSTS:
             f"{entry['slug']}: hotlinks an image from {host}. Host it on the media CDN or drop "
             "it — AWS reorganizes those paths without notice.")
 
-    was = manifest.EXISTING[entry["slug"]]
+    was = manifest.EXISTING.get(entry["slug"])
+    was_col = f"{was[2]:>5}w/{was[3]}m" if was else f"{'new':>9}"
     print(f"{entry['slug']:<40} {prose:>6} {code:>6} {words:>6} "
           f"{result['readingMinutes']:>4} {share:>6.0%}  "
-          f"{len(result['toc']):>3} {len(emitted):>4}   {was[2]:>5}w/{was[3]}m"
+          f"{len(result['toc']):>3} {len(emitted):>4}   {was_col}"
           + (f"  {len(plain)} plaintext" if plain else ""))
 
 # ---------------------------------------------------------------- manifest rules
@@ -378,15 +395,19 @@ for frozen in sorted(manifest.FROZEN_SLUGS):
         failures.append(f"frozen slug {frozen} is no longer in the manifest — that URL is indexed")
 
 if manifest.FROZEN_SLUGS != set(manifest.EXISTING):
-    failures.append("FROZEN_SLUGS and EXISTING disagree — one was edited without the other")
+    failures.append("FROZEN_SLUGS and EXISTING disagree — one was edited without the other. "
+                    "EXISTING holds the measured 'before' for every rewrite; a NEW slug must be "
+                    "in neither.")
 
-if manifest.NEW_SLUGS:
-    failures.append("this track has no new slugs — every post is a rewrite of a live URL")
-
+# A new slug with a baseline means someone added it to EXISTING, which would make it look like a
+# rewrite of something. A frozen slug without one means a live post lost its measured baseline.
 for entry in manifest.POSTS:
-    if entry["state"] != "rewrite":
-        failures.append(f"{entry['slug']}: state is {entry['state']!r}, but every post here is a "
-                        "rewrite of a live URL")
+    if entry["state"] not in ("rewrite", "new"):
+        failures.append(f"{entry['slug']}: state is {entry['state']!r}, expected rewrite or new")
+    if entry["state"] == "new" and entry["slug"] in manifest.EXISTING:
+        failures.append(f"{entry['slug']}: marked new but has an EXISTING baseline")
+    if entry["state"] == "rewrite" and entry["slug"] not in manifest.EXISTING:
+        failures.append(f"{entry['slug']}: marked rewrite but has no EXISTING baseline")
     if len(entry["excerpt"]) > 500:
         failures.append(f"{entry['slug']}: excerpt is {len(entry['excerpt'])} chars, max 500")
     if not entry["tags"]:

@@ -1,0 +1,278 @@
+<p>Everything so far works. This lesson is what changes when the state file describes something people
+depend on — and where the stack built in lessons 12 and 13 is honestly not production-ready yet.</p>
+
+<h2>Read the plan. Properly.</h2>
+
+<p>The single highest-value habit, and the one that erodes fastest once plans get long.</p>
+
+<p>Read the summary line backwards:</p>
+
+<pre class="language-bash"><code class="language-bash">Plan: 3 to add, 1 to change, 2 to destroy.
+                                  ^^^^^^^^^^^ start here</code></pre>
+
+<p><strong>Any non-zero destroy count deserves a sentence of explanation before you approve it.</strong>
+Usually there is a good one. Occasionally there is not, and that is the whole reason to look.</p>
+
+<p>Then search the output for two strings:</p>
+
+<pre class="language-bash"><code class="language-bash">forces replacement       an argument that cannot be changed in place
+must be replaced         the resource summary line for the same thing</code></pre>
+
+<pre class="language-bash"><code class="language-bash">  # aws_db_instance.this must be replaced
+-/+ resource "aws_db_instance" "this" {
+      ~ identifier = "pizza-mysql" -&gt; "pizza-prod-mysql" # forces replacement
+    }</code></pre>
+
+<p>That plan deletes a database and creates an empty one. It is a one-line diff in a pull request and
+it reads like a rename.</p>
+
+<p>In CI, post the plan as a pull request comment (lesson 14) so it is reviewed like code. For a
+change you are nervous about, save it and apply exactly that:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform plan -out=tfplan
+terraform show tfplan          # read it again
+terraform apply tfplan         # applies THAT plan, no re-planning, no prompt</code></pre>
+
+<h2>prevent_destroy on the things you cannot lose</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_db_instance" "this" {
+  identifier     = "pizza-prod-mysql"
+  engine         = "mysql"
+  instance_class = "db.r6g.large"
+
+  # Belt and braces. AWS refuses the delete, and Terraform refuses to plan it.
+  deletion_protection = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}</code></pre>
+
+<p><code>terraform destroy</code> then <strong>errors</strong> rather than deleting:</p>
+
+<pre class="language-bash"><code class="language-bash">Error: Instance cannot be destroyed
+
+  Resource aws_db_instance.this has lifecycle.prevent_destroy set, but the plan
+  calls for this resource to be destroyed.</code></pre>
+
+<p>The guard is real precisely because removing it is a separate, reviewable commit. Put it on
+databases, on state buckets, on anything holding data you cannot regenerate.</p>
+
+<p>⚠️ It does not protect against a <code>-/+</code> replacement triggered by an argument change — it
+protects against <em>destroy</em>. A forced replacement is still blocked, which is the useful part,
+but the error tells you nothing about which argument caused it. Read the plan.</p>
+
+<h2>Drift</h2>
+
+<p>Someone changes something in the console. It happens, including in good teams, usually during an
+incident at 3am.</p>
+
+<pre class="language-bash"><code class="language-bash">terraform plan -refresh-only</code></pre>
+
+<p>This shows what changed in reality without proposing to change anything back — the read-only
+version of the question. A scheduled CI job running it daily and alerting on a non-empty result is
+cheap and catches configuration that has quietly stopped matching the code.</p>
+
+<p>When you find drift you have three choices, and they are all legitimate:</p>
+
+<pre class="language-bash"><code class="language-bash">1. apply           put it back. the code is the source of truth.
+2. update the code the console change was right. codify it.
+3. ignore_changes  something else legitimately owns this attribute now.</code></pre>
+
+<p>Option 3 is the one to use sparingly. It makes Terraform stop reporting that attribute at all,
+which is right when an autoscaler owns <code>desired_count</code> and wrong the rest of the time.</p>
+
+<h2>Refactoring without destroying</h2>
+
+<p>Both of these are code, checked in, so they work for everyone including CI — unlike the
+<code>terraform state mv</code> and <code>terraform import</code> commands they replaced.</p>
+
+<pre class="language-hcl"><code class="language-hcl"># renaming a resource, or moving it into a module
+moved {
+  from = aws_s3_bucket.uploads
+  to   = module.storage.aws_s3_bucket.uploads
+}
+
+# adopting something that already exists
+import {
+  to = aws_s3_bucket.legacy
+  id = "a-bucket-created-by-hand-in-2019"
+}</code></pre>
+
+<p>Terraform 1.7 added <code>removed</code> blocks for the opposite case — dropping a resource from
+Terraform's management without destroying it:</p>
+
+<pre class="language-hcl"><code class="language-hcl">removed {
+  from = aws_s3_bucket.legacy
+
+  lifecycle {
+    destroy = false      # forget it, do not delete it
+  }
+}</code></pre>
+
+<h2>Secrets</h2>
+
+<p>The rules, in order of how much they matter:</p>
+
+<p><strong>1. Let the platform generate and hold it.</strong> Lesson 12's
+<code>manage_master_user_password = true</code> is the model: RDS creates the password into Secrets
+Manager and Terraform only ever sees an ARN. Verifiably absent from state.</p>
+
+<p><strong>2. Where you must generate one, know it is in state.</strong>
+<code>random_password</code> stores its result by definition. That is acceptable in an encrypted,
+access-controlled state bucket, and it is not acceptable in a repository.</p>
+
+<p><strong>3. Reference secrets, do not pass them.</strong> The ECS task definition in lesson 13
+carries ARNs; the ECS agent resolves them at container start. The values never enter the task
+definition, the state or the console.</p>
+
+<p><strong>4. Never <code>-var "password=..."</code>.</strong> It is in your shell history and in the
+CI log.</p>
+
+<pre class="language-hcl"><code class="language-hcl"># Reading an existing secret rather than creating one
+data "aws_ssm_parameter" "db_password" {
+  name = "/pizza/prod/db-password"
+  # with_decryption defaults to true for SecureString
+}</code></pre>
+
+<p>⚠️ Reading a secret through a data source still puts the value in state. There is no way to read a
+secret into Terraform without it landing there. The only true escape is to not read it — pass the
+ARN to whatever needs the value, and let that thing resolve it.</p>
+
+<h2>Least privilege for the pipeline</h2>
+
+<p>The CI role in lesson 14 is scoped by its <code>sub</code> condition, which is the important
+control. Two more worth having:</p>
+
+<p><strong>Separate roles per environment.</strong> The role that can apply staging should not be able
+to touch prod. With a directory per environment (lesson 11) this falls out naturally.</p>
+
+<p><strong>A read-only role for plan.</strong> Pull requests from forks should be able to plan without
+being able to apply. <code>ReadOnlyAccess</code> plus state bucket write is enough for a plan, since
+the lock still has to be taken.</p>
+
+<h2>Keeping the bill visible</h2>
+
+<p>Terraform makes it very easy to spend money quickly, and nothing in the plan tells you what
+anything costs.</p>
+
+<p><strong>Tag everything.</strong> <code>default_tags</code> on the provider means every resource
+carries them even where someone forgot:</p>
+
+<pre class="language-hcl"><code class="language-hcl">provider "aws" {
+  region = "us-west-2"
+
+  default_tags {
+    tags = {
+      Project   = "terraform-tutorial"
+      ManagedBy = "terraform"
+    }
+  }
+}</code></pre>
+
+<p><strong>Know the standing costs.</strong> The three that surprise people, none of which are in the
+free tier and all of which bill whether or not anything uses them:</p>
+
+<pre class="language-bash"><code class="language-bash">NAT gateway      ~$32/month each, plus per-GB
+load balancer    ~$17/month each
+Elastic IP       billed when NOT attached to a running instance</code></pre>
+
+<p><strong>Run <code>infracost</code> in CI.</strong> It reads the plan and comments the monthly
+delta on the pull request. "This adds $64/month" in a review is worth a great deal more than
+discovering it on an invoice.</p>
+
+<h2>Testing</h2>
+
+<p>Cheapest first, and the first two are free:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform fmt -check -recursive
+terraform validate                 # schema. catches renamed arguments.
+tflint                             # provider-aware: bad instance types, deprecations
+tfsec / checkov                    # public buckets, open groups, unencrypted storage
+terraform test                     # real assertions, real resources
+</code></pre>
+
+<p><code>terraform test</code> (1.6+) is the native framework. Files are <code>.tftest.hcl</code>:</p>
+
+<pre class="language-bash"><code class="language-bash"># tests/network.tftest.hcl
+run "vpc_has_dns_enabled" {
+  command = plan
+
+  assert {
+    condition     = aws_vpc.this.enable_dns_hostnames == true
+    error_message = "RDS is unreachable by hostname without enable_dns_hostnames"
+  }
+}</code></pre>
+
+<p><code>command = plan</code> creates nothing and is fast enough for every pull request.
+<code>command = apply</code> creates real infrastructure, asserts against it and destroys it — slow,
+costs money, and the right thing for a module other people depend on.</p>
+
+<h2>Where lessons 12 and 13 are not production-ready</h2>
+
+<p>Stated plainly, because a stack that works is easy to mistake for a stack that is finished.</p>
+
+<p><strong>No HTTPS.</strong> The listener is plain HTTP on port 80. Real TLS needs an ACM
+certificate, which needs a domain — and then a redirect from 80 to 443. This is the first thing to
+add, and it is the largest gap.</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.this.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.this.arn
+  }
+}</code></pre>
+
+<p><strong>Local state.</strong> The root module uses local state so the lessons can be followed
+without first creating a bucket. Moving it is a <code>backend</code> block plus
+<code>terraform init -migrate-state</code> — lesson 8.</p>
+
+<p><strong>One task, one NAT gateway, single-AZ RDS.</strong> Each is a deliberate cost trade for a
+demo, each is commented where it is made, and each is wrong for production.</p>
+
+<p><strong>No autoscaling.</strong> <code>desired_count = 1</code> is fixed. Real load needs
+<code>aws_appautoscaling_target</code> and a policy — and then <code>ignore_changes</code> on
+<code>desired_count</code>, or Terraform and the autoscaler will fight on every apply.</p>
+
+<p><strong>No alarms.</strong> Nothing tells you the service is unhealthy. CloudWatch alarms on
+unhealthy host count and 5xx rate are the minimum.</p>
+
+<p><strong>The pipeline has never run.</strong> Lesson 14's workflow is written to be correct and has
+not been executed, because the demo repository has no remote.</p>
+
+<h2>A checklist</h2>
+
+<pre class="language-bash"><code class="language-bash">state
+  [ ] remote, S3, versioned, encrypted, private
+  [ ] use_lockfile = true, and required_version &gt;= 1.10
+  [ ] split by blast radius, not one state per account
+  [ ] never in git
+
+code
+  [ ] .terraform.lock.hcl committed, with linux_amd64 hashes for CI
+  [ ] providers pinned ~&gt; MAJOR.0
+  [ ] fmt -check and validate in CI
+  [ ] every variable typed and described
+
+safety
+  [ ] prevent_destroy + deletion_protection on data
+  [ ] plan reviewed on the pull request
+  [ ] prod apply behind a human approval
+  [ ] separate roles per environment, OIDC not stored keys
+
+operations
+  [ ] scheduled -refresh-only drift check
+  [ ] default_tags on the provider
+  [ ] cost visible before merge
+  [ ] alarms on the things that page you</code></pre>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-interview-questions">Lesson 16</a> is the questions Terraform
+interviews actually ask, answered the way you would say them out loud.</p>

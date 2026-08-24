@@ -1,0 +1,159 @@
+<p>A pipeline is a sequence of stages, and between every pair of stages an artifact sitting in an S3
+bucket. Understand that one sentence and the rest of CodePipeline is configuration.</p>
+
+<h2>The model</h2>
+
+<ul>
+  <li><strong>Stage</strong> — a named step: Source, Build, Deploy. Stages run in order</li>
+  <li><strong>Action</strong> — the work inside a stage. Actions in a stage can run in parallel or
+      in a declared order</li>
+  <li><strong>Artifact</strong> — a zip file in the pipeline's S3 bucket. Each action declares
+      what it consumes and what it produces</li>
+</ul>
+
+<p>The artifact bucket is the part worth internalising, because most confusing pipeline failures
+are really artifact failures. Nothing is passed in memory: the build stage writes a zip, the deploy
+stage reads it, and if the names do not line up the stage fails with very little explanation.</p>
+
+<h2>Source from GitHub, without a token</h2>
+
+<p>Use a CodeConnections connection rather than a personal access token. A token is a long-lived
+credential in your account that someone must rotate; a connection is authorised once and revocable
+from either side.</p>
+
+<pre class="language-bash"><code class="language-bash">aws codeconnections create-connection \
+  --provider-type GitHub --connection-name github-folaulau</code></pre>
+
+<p>The connection is created <code>PENDING</code> and must be completed in the console — the CLI
+cannot finish the handshake. Nothing using it works until the status is <code>AVAILABLE</code>,
+and a pipeline whose source stage fails immediately after creation is usually this.</p>
+
+<h2>A pipeline, in outline</h2>
+
+<pre class="language-json"><code class="language-json">{
+  "name": "stayhub",
+  "stages": [
+    {
+      "name": "Source",
+      "actions": [{
+        "name": "Checkout",
+        "actionTypeId": {
+          "category": "Source", "owner": "AWS",
+          "provider": "CodeStarSourceConnection", "version": "1"
+        },
+        "outputArtifacts": [{ "name": "SourceOutput" }],
+        "configuration": {
+          "ConnectionArn": "arn:aws:codeconnections:us-west-2:111122223333:connection/abc",
+          "FullRepositoryId": "folaulau/stayhub",
+          "BranchName": "main"
+        }
+      }]
+    },
+    {
+      "name": "Build",
+      "actions": [{
+        "name": "Build",
+        "actionTypeId": {
+          "category": "Build", "owner": "AWS",
+          "provider": "CodeBuild", "version": "1"
+        },
+        "inputArtifacts": [{ "name": "SourceOutput" }],
+        "outputArtifacts": [{ "name": "BuildOutput" }],
+        "configuration": { "ProjectName": "stayhub-build" }
+      }]
+    }
+  ]
+}</code></pre>
+
+<p>Note how <code>SourceOutput</code> is produced by one action and named as an input by the next.
+That string is the whole contract between stages.</p>
+
+<h2>The failure that wastes an afternoon</h2>
+
+<p><strong>An input artifact name that does not match an earlier output.</strong> The pipeline
+fails at the consuming stage with a message about the artifact not being found, and because the
+stage that "failed" is not the one that is wrong, people debug the build.</p>
+
+<p>Two related versions of the same problem:</p>
+
+<ul>
+  <li>An action can consume artifacts only from <em>earlier</em> stages, so reordering stages
+      breaks the chain silently</li>
+  <li>CodeBuild only uploads what its <code>artifacts</code> block declares. A build that produces
+      files and declares nothing hands the next stage an empty zip, which then fails at deploy
+      rather than at build</li>
+</ul>
+
+<pre class="language-bash"><code class="language-bash">aws codepipeline get-pipeline-state --name stayhub \
+  --query "stageStates[].[stageName,latestExecution.status,actionStates[].latestExecution.errorDetails.message]"</code></pre>
+
+<h2>Manual approval</h2>
+
+<p>An approval action pauses the pipeline until a human approves it in the console, and it can post
+to an SNS topic so somebody knows it is waiting.</p>
+
+<p>It is the cheapest way to get a controlled production release, and there are two things worth
+knowing. The approver needs <code>codepipeline:PutApprovalResult</code>, which is not in most
+read-only policies. And an approval times out after <strong>seven days</strong> and the pipeline
+then fails — so an approval requested before a holiday quietly expires.</p>
+
+<h2>CodePipeline or GitHub Actions</h2>
+
+<p>Worth being honest, because for most small projects the answer is not CodePipeline.</p>
+
+<table>
+  <thead><tr><th>Use</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td><strong>GitHub Actions</strong></td><td>Your code is on GitHub, the deploy target is
+        AWS, and you want the pipeline defined in the repository next to the code. Simpler, faster
+        to iterate, and free for public repositories</td></tr>
+    <tr><td><strong>CodePipeline</strong></td><td>You need the pipeline itself governed by IAM and
+        CloudFormation, cross-account deploys with role assumption, or an audit trail in
+        CloudTrail. Common in regulated environments</td></tr>
+  </tbody>
+</table>
+
+<p>This site uses GitHub Actions with OIDC to assume a deploy role, which removes both the stored
+credential and the extra service. CodePipeline earns its place when the release process itself is
+something auditors ask about.</p>
+
+<h2>Variables and passing values between stages</h2>
+
+<p>Actions can export variables that later stages read, which is how a build tells a deploy what
+image tag it just pushed without writing it into a file:</p>
+
+<pre class="language-bash"><code class="language-bash">aws codepipeline get-pipeline-execution \
+  --pipeline-name stayhub --pipeline-execution-id abc-123 \
+  --query "pipelineExecution.artifactRevisions[].[name,revisionId]"</code></pre>
+
+<p>A CodeBuild action exports whatever its buildspec declares under <code>exported-variables</code>,
+and a later stage references it as <code>#{BuildAction.IMAGE_TAG}</code>. The namespace matters —
+each action declares one, and a reference to an action with no namespace set resolves to nothing
+rather than failing loudly.</p>
+
+<h2>Triggering and re-running</h2>
+
+<pre class="language-bash"><code class="language-bash">aws codepipeline start-pipeline-execution --name stayhub
+
+aws codepipeline retry-stage-execution --pipeline-name stayhub \
+  --stage-name Deploy --pipeline-execution-id abc-123 \
+  --retry-mode FAILED_ACTIONS</code></pre>
+
+<p><code>retry-stage-execution</code> re-runs only the failed stage with the artifacts it already
+has, which is much faster than rebuilding from source after a transient deploy failure — and it is
+the command most people do not know exists.</p>
+
+<p>By default a pipeline triggers on every push to the configured branch. That is usually what you
+want for a deploy to staging and rarely what you want for production, which is what the manual
+approval gate above is for. Triggers can also be filtered by branch, tag or changed file path, so a
+monorepo does not run every pipeline on every commit.</p>
+
+<h2>Where the pipeline itself lives</h2>
+
+<p>A pipeline clicked together in the console is a pipeline nobody can recreate, and it is the same
+failure that makes people adopt infrastructure as code everywhere else. Define it in
+CloudFormation or Terraform and the release process becomes reviewable — a change to how production
+is deployed arrives as a pull request rather than as something one person did on a Thursday.</p>
+
+<p>It also gets you the thing CodePipeline is genuinely good at: the pipeline is an AWS resource,
+so IAM governs who may change it and CloudTrail records who did.</p>

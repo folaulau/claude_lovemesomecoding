@@ -1,0 +1,252 @@
+<p>The questions Terraform interviews actually ask, with answers the length you would say out loud. The
+good ones are all really asking the same thing: do you understand state?</p>
+
+<h2>What is Terraform, in one sentence?</h2>
+
+<p>A tool that takes a description of infrastructure, works out the difference between that
+description and reality, shows you the difference, and then makes it go away.</p>
+
+<p>The part worth adding: it is <em>declarative</em>. You do not write "create a VPC" — you write
+"this VPC exists", and running it twice does nothing the second time.</p>
+
+<h2>What is the state file for, and why can't Terraform work without it?</h2>
+
+<p>The question everything else hangs off.</p>
+
+<p>State maps your resource addresses to real object ids. AWS can tell Terraform whether a bucket
+exists and how it is configured, but it cannot answer <strong>"did I create this?"</strong> — and
+without that, deleting a resource from your files would mean nothing, because Terraform would have no
+record that it was ever responsible for it.</p>
+
+<p>It also caches every attribute, which is how <code>plan</code> can show a diff, and how Terraform
+can tell "someone changed this in the console" from "this is how it has always been".</p>
+
+<p><strong>Follow-up you should volunteer:</strong> state contains secrets in cleartext. Passwords,
+generated keys, anything a resource holds. That is why it never goes in git and why it lives in an
+encrypted bucket.</p>
+
+<h2>count versus for_each?</h2>
+
+<p>The one that separates people who have used Terraform from people who have read about it.</p>
+
+<p><code>count</code> keys resources <strong>by list position</strong>. <code>for_each</code> keys them
+<strong>by map key or set value</strong>.</p>
+
+<p>It matters when something is removed from the middle. With <code>count</code>, everything after
+the removed element shifts down an index, so Terraform sees each one change identity — and plans to
+modify and destroy resources you never touched. With <code>for_each</code>, only the removed key is
+affected.</p>
+
+<p><strong>So: <code>for_each</code> by default.</strong> <code>count</code> for a number you control,
+or for the <code>count = var.enabled ? 1 : 0</code> conditional idiom.</p>
+
+<h2>How does locking work?</h2>
+
+<p>Two applies at once would both read state, both write, and the second would overwrite the first —
+so Terraform now believes it did not create things that exist.</p>
+
+<p>With the S3 backend, Terraform takes a lock before any operation that writes. Modern versions use
+<code>use_lockfile = true</code>, which writes a <code>.tflock</code> object next to the state and
+relies on S3's conditional writes to refuse a second one.</p>
+
+<p><strong>Say this next, because it dates you:</strong> historically this needed a DynamoDB table,
+because S3 had no conditional writes. Terraform 1.10 added native S3 locking and 1.11 deprecated
+<code>dynamodb_table</code>. Almost every tutorial still shows the table.</p>
+
+<h2>Terraform versus CloudFormation?</h2>
+
+<p>CloudFormation is AWS-only, free, AWS-supported first for new services, and its state is managed by
+AWS rather than by you. Terraform is multi-provider — the same language for AWS, Cloudflare, Datadog,
+GitHub, Kubernetes — with a much better plan output and a state file you own.</p>
+
+<p>The honest trade: owning the state is Terraform's biggest advantage and its biggest operational
+burden. CloudFormation never loses your state file because you never had one.</p>
+
+<h2>Terraform versus Ansible?</h2>
+
+<p>Different jobs. Terraform <strong>provisions</strong> — it creates the server, the database, the
+load balancer. Ansible <strong>configures</strong> — it installs packages and edits files on a
+machine that already exists. They are frequently used together.</p>
+
+<p>Ansible can create cloud resources, but it has no plan step and no state, so it cannot tell you
+what it is about to change or notice that something drifted.</p>
+
+<h2>What happens if someone changes something in the console?</h2>
+
+<p>Nothing breaks. The next <code>plan</code> refreshes from AWS, sees the difference, and offers to
+put it back — your files are the source of truth.</p>
+
+<p>To look without proposing changes: <code>terraform plan -refresh-only</code>. A scheduled job
+running that and alerting on a non-empty result is a cheap drift detector.</p>
+
+<h2>How do you rename a resource without destroying it?</h2>
+
+<p>A <code>moved</code> block:</p>
+
+<pre class="language-hcl"><code class="language-hcl">moved {
+  from = aws_s3_bucket.old
+  to   = aws_s3_bucket.new
+}</code></pre>
+
+<p>It is code, so it is checked in and works for everyone including CI. It replaced
+<code>terraform state mv</code>, which did the same thing as a manual command each person had to run.</p>
+
+<p>Without it, Terraform sees one address disappear and another appear, and plans destroy-then-create.</p>
+
+<h2>How do you bring existing infrastructure under Terraform?</h2>
+
+<p>An <code>import</code> block plus the matching resource block, then <code>plan</code> to see what
+it would adopt and what it thinks should change. <code>plan -generate-config-out=x.tf</code> will
+write the resource block for you.</p>
+
+<p>The older <code>terraform import</code> command still exists, but the block form is reviewable and
+shows you the diff before you commit to it.</p>
+
+<h2>How would you recover a corrupted or deleted state file?</h2>
+
+<p>They want to hear that you took precautions first.</p>
+
+<p><strong>Prevention:</strong> S3 versioning on the state bucket. Recovery is restoring the previous
+object version, which is why versioning is not optional.</p>
+
+<p><strong>If it is genuinely gone:</strong> the infrastructure still exists and nothing knows it is
+yours. You import every resource back, one at a time — tedious but tractable if the stack is small,
+which is an argument for splitting state by blast radius.</p>
+
+<p><strong>What you do not do</strong> is run <code>apply</code> and let it recreate everything.
+Terraform would try to create resources whose names are already taken and fail halfway.</p>
+
+<h2>What is a provider?</h2>
+
+<p>The plugin that translates HCL into API calls. Terraform core is a language and a graph engine and
+knows nothing about AWS.</p>
+
+<p>Providers are versioned separately and ship breaking changes in major versions, which is why you
+pin <code>~&gt; 6.0</code> and commit <code>.terraform.lock.hcl</code>.</p>
+
+<h2>Why commit the lock file?</h2>
+
+<p>The constraint says what is <em>allowed</em>; the lock file records what was <em>chosen</em>. Without
+it, your laptop and CI can resolve different provider versions and produce different plans from the
+same code. It also holds checksums, so a tampered registry response fails <code>init</code>.</p>
+
+<p><strong>Bonus point:</strong> hashes are per-platform. Generate the lock on a Mac, commit it, and
+Linux CI fails — run <code>terraform providers lock -platform=linux_amd64</code> too.</p>
+
+<h2>How do you handle multiple environments?</h2>
+
+<p>Three ways, and having an opinion matters more than which one.</p>
+
+<p><strong>Workspaces</strong> — one directory, multiple states. Good for ephemeral copies; bad for
+production, because which environment you are in is a property of your shell rather than of anything
+reviewable, and everything shares one backend.</p>
+
+<p><strong>A directory per environment</strong> calling shared modules — explicit, separately
+backed, and a diff to <code>environments/prod/</code> is visibly a production change. This is the
+usual answer.</p>
+
+<p><strong>One directory with per-environment tfvars and partial backend config</strong> — no
+duplication, but the environment is on your command line, so it needs a wrapper.</p>
+
+<h2>What does terraform taint do?</h2>
+
+<p>Slightly a trick question. It marked a resource for recreation, and it is <strong>deprecated</strong>.
+The modern form is:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform apply -replace=aws_ecs_service.this</code></pre>
+
+<p>Better, because it goes through <code>plan</code> — you see the destroy before agreeing to it,
+rather than marking state and finding out later.</p>
+
+<h2>When would you use depends_on?</h2>
+
+<p>Only when a dependency is real but invisible — nothing in the arguments references the other
+resource. Referencing an attribute already creates the dependency, and that covers almost everything.</p>
+
+<p>A concrete example: ECS validates it can assume the task execution role when the service is
+created, and IAM is eventually consistent. The service does not reference the role's policy
+attachment in any argument, so without <code>depends_on</code> the apply races IAM and fails on a
+role that "does not exist" — intermittently, which is worse.</p>
+
+<p>Over-using it serialises the graph and slows every apply.</p>
+
+<h2>What is a module, and when would you not write one?</h2>
+
+<p>A directory of <code>.tf</code> files, called from another. The directory you run
+<code>apply</code> in is already one.</p>
+
+<p>The second half is the interesting half. <strong>Do not</strong> write one for a single resource —
+it adds a layer and buys nothing. <strong>Do not</strong> write one until there is a second caller, or
+you will design the interface from one example and get it wrong. <strong>Do not</strong> write one to
+organise a single stack; multiple files in one directory do that job.</p>
+
+<h2>How do you keep secrets out of Terraform?</h2>
+
+<p>Best answer, and it is a specific technique rather than a principle: <strong>have the platform
+generate and hold the secret, and only ever reference its ARN.</strong></p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_db_instance" "this" {
+  identifier     = "pizza-prod-mysql"
+  engine         = "mysql"
+  instance_class = "db.t4g.micro"
+  username       = "pizza"
+
+  # RDS generates the password into Secrets Manager. Terraform never sees it.
+  manage_master_user_password = true
+}</code></pre>
+
+<p>Then hand the secret's ARN to whatever needs the value — an ECS task definition resolves it at
+container start, so the value never enters the task definition, the state or the console.</p>
+
+<p>And say what does <em>not</em> work: <code>sensitive = true</code> redacts console output and
+changes nothing about what is written to state.</p>
+
+<h2>What is in a plan's output?</h2>
+
+<pre class="language-bash"><code class="language-bash">+    create
+~    update in place
+-    destroy
+-/+  destroy then create   <-- replacement
++/-  create then destroy   <-- replacement, create_before_destroy</code></pre>
+
+<p>The one to talk about is <code>-/+</code>. Some arguments cannot be changed on a live resource, so
+changing them means delete and recreate. Terraform says <code>forces replacement</code> next to the
+attribute responsible. On a database that is data loss from a one-line diff, and reading for it is
+the core discipline of using Terraform safely.</p>
+
+<h2>Is Terraform still open source?</h2>
+
+<p>A current-events question, and worth knowing.</p>
+
+<p>No — HashiCorp moved it from MPL 2.0 to the Business Source License in August 2023. The BSL
+restricts using Terraform to build a competing commercial product; for companies managing their own
+infrastructure nothing changed in practice.</p>
+
+<p>The last MPL commit was forked as <strong>OpenTofu</strong>, now a Linux Foundation project. Same
+HCL, same providers, <code>tofu</code> instead of <code>terraform</code>.</p>
+
+<h2>The three that actually get asked most</h2>
+
+<p>If you prepare only three:</p>
+
+<p><strong>What is state for?</strong> The mapping from your addresses to real ids — and the answer to
+"did I create this?", which the cloud API cannot give you. Mention the secrets.</p>
+
+<p><strong><code>count</code> vs <code>for_each</code>?</strong> Position versus key, and what happens
+when you remove the middle element.</p>
+
+<p><strong>How do you keep secrets out?</strong> Let the platform own the value, pass the ARN. And
+<code>sensitive</code> does not encrypt anything.</p>
+
+<h2>The end of the track</h2>
+
+<p>Sixteen lessons: the plan/apply loop, HCL, providers and state, variables, data sources, remote
+state, loops, modules, environments, and a real Spring Boot application on ECS Fargate behind a load
+balancer with a pipeline in front of it.</p>
+
+<p>The stack in lessons 12 and 13 was applied to a real account, verified through the load balancer,
+and destroyed. What broke is written down where it broke —
+<a href="/terraform/terraform-ecs-fargate-deploy">the health check that cycled tasks forever</a> is
+the one most worth having read before you meet it.</p>
+
+<p>Start again at <a href="/terraform/terraform-introduction">lesson 1</a> if you want the index.</p>

@@ -1,0 +1,213 @@
+<p>Everything so far has been the database. This lesson is the Java side: how Spring Data MongoDB
+maps your classes onto documents, when to use a repository and when to drop to
+<code>MongoTemplate</code>, and the three behaviours that surprise people &mdash; two of which
+fail silently.</p>
+
+<h2>Mapping a document</h2>
+
+<p>A mapped class needs <code>@Document</code> and an <code>@Id</code>. Everything else is
+convention:</p>
+
+<pre class="language-java"><code class="language-java">@Document(collection = "reels")
+public class Reel {
+
+    @Id
+    private String id;
+
+    private String slug;
+
+    private String title;
+    private String description;
+
+    private ReelStatus status;</code></pre>
+
+<p>Nested objects need no annotation at all &mdash; a field whose type is another class becomes a
+sub-document automatically. That is what makes the embedding decisions from lesson 6 almost
+invisible in Java: <code>VideoAsset</code>, <code>CreatorRef</code> and <code>ReelStats</code> are
+plain classes, and they land as nested objects because that is where they are declared.</p>
+
+<p>Enums store as strings by default, which is what you want. <code>Instant</code> maps to a BSON
+date. <code>List&lt;String&gt;</code> maps to an array and gets a multikey index if you index it.</p>
+
+<h2>Repositories</h2>
+
+<p>Extend <code>MongoRepository</code> and Spring derives queries from method names:</p>
+
+<pre class="language-java"><code class="language-java">public interface ReelRepository extends MongoRepository&lt;Reel, String&gt; {
+
+    Optional&lt;Reel&gt; findBySlug(String slug);
+
+    boolean existsBySlug(String slug);
+
+    List&lt;Reel&gt; findByStatusOrderByPublishedAtDesc(ReelStatus status, Pageable pageable);</code></pre>
+
+<p>That third method name is doing real work: filter on status, sort by <code>publishedAt</code>
+descending, page the result. It compiles to exactly the query lesson 8 built by hand, and it uses
+the same <code>{status, publishedAt}</code> index.</p>
+
+<p>Derived queries are excellent until the method name stops being readable. When you find yourself
+writing <code>findByStatusAndCreatorIdAndPublishedAtBetweenOrderBy...</code>, that is the signal to
+move to a template.</p>
+
+<h2>MongoTemplate</h2>
+
+<p><code>MongoTemplate</code> is the escape hatch, and it is not a fallback &mdash; it is the right
+tool for three jobs a repository cannot do well: <strong>dynamic filters</strong>,
+<strong>aggregation pipelines</strong>, and <strong>partial updates</strong>.</p>
+
+<p>The partial-update case is the one that matters most, because a repository&rsquo;s
+<code>save()</code> rewrites the whole document:</p>
+
+<pre class="language-java"><code class="language-java">public void incrementStat(String reelId, String statField, long delta) {
+    mongo.updateFirst(
+            Query.query(Criteria.where("_id").is(reelId)),
+            new Update().inc("stats." + statField, delta),
+            Reel.class);
+}</code></pre>
+
+<p>That is one field, changed atomically on the server. The repository equivalent &mdash; load the
+reel, mutate it, <code>save()</code> &mdash; reads the document, sends all of it back, and loses
+increments under concurrency. The rule from lesson 4 applies here as much as in the shell:
+<strong>counters use <code>$inc</code>, never load-mutate-save</strong>.</p>
+
+<p>ReelCMS keeps both in one place, with a DAO interface and an implementation that reaches for
+whichever fits each method &mdash; the same split the relational demos keep between a repository and
+<code>JdbcTemplate</code>.</p>
+
+<h2>Three things that surprise people</h2>
+
+<h3>1. A nested field called `id` becomes `_id`</h3>
+
+<p>Spring Data maps any field named <code>id</code> to <code>_id</code> &mdash; including inside a
+nested object. <code>CreatorRef</code> declares a field called <code>id</code>, so an index declared
+in Java as <code>creator.id</code> is stored by MongoDB as:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">creator._id_1_status_1_publishedAt_-1</code></pre>
+
+<p>It works &mdash; the mapper applies the same rename to queries, so
+<code>Criteria.where("creator.id")</code> hits that index. But <strong>a hand-written
+<code>mongosh</code> query must say <code>creator._id</code></strong>, and anyone comparing the Java
+config to <code>db.reels.getIndexes()</code> sees two different names for the same index. Worth
+knowing before you spend an hour on it.</p>
+
+<h3>2. Auditing is off until you turn it on</h3>
+
+<p><code>@CreatedDate</code> and <code>@LastModifiedDate</code> do nothing without
+<code>@EnableMongoAuditing</code>. No error, no warning &mdash; the fields simply stay null, usually
+discovered when a sort by <code>createdAt</code> returns an arbitrary order.</p>
+
+<pre class="language-java"><code class="language-java">@Configuration
+@EnableMongoAuditing(dateTimeProviderRef = "millisecondDateTimeProvider")
+public class MongoConfig {</code></pre>
+
+<h3>3. BSON keeps milliseconds; Instant.now() has microseconds</h3>
+
+<p>This one is subtle and produces a bug that looks impossible. Stamp a field with
+<code>Instant.now()</code>, save it, read it back, and the two values are not equal:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">in memory : 2026-08-24T18:53:07.048898Z
+in mongo  : 2026-08-24T18:53:07.048Z</code></pre>
+
+<p>Nothing fails. The document saves and the read succeeds &mdash; until something compares them. A
+POST response and a later GET disagree on a timestamp; a client caching on &ldquo;did
+<code>updatedAt</code> change?&rdquo; re-fetches forever. Truncate at the source and the value
+written is the value read back:</p>
+
+<pre class="language-java"><code class="language-java">public static Instant now() {
+    return Instant.now().truncatedTo(ChronoUnit.MILLIS);
+}</code></pre>
+
+<p>The <code>dateTimeProviderRef</code> in the configuration above routes auditing through the same
+helper, so audit fields get the same treatment.</p>
+
+<h2>Returning less than the whole document</h2>
+
+<p>Two ways to avoid loading fields you will not use. A <strong>projection interface</strong> is
+the declarative one: declare the getters you want and Spring builds the projection. ReelCMS does
+not use this &mdash; it maps to DTOs instead &mdash; but it is worth knowing, and it looks like
+this:</p>
+
+<pre class="language-java" data-generic="true"><code class="language-java">public interface ReelSummary {
+    String getSlug();
+    String getTitle();
+}</code></pre>
+
+<p>A repository method returning <code>List&lt;ReelSummary&gt;</code> then fetches two fields
+instead of the whole document. On records carrying a long description and an array that is a real
+saving on a list endpoint, and it is the Spring Data equivalent of the projections from lesson 4.</p>
+
+<p><code>MongoTemplate</code> does the same imperatively with <code>Query.fields()</code>, which is
+what you want when the field list is decided at runtime:</p>
+
+<pre class="language-javascript"><code class="language-javascript">query.fields().include("slug").include("title").exclude("_id");</code></pre>
+
+<h2>Where indexes belong</h2>
+
+<p>Spring Data can create indexes from <code>@Indexed</code> annotations. Turn that off:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.data.mongodb.auto-index-creation=false</code></pre>
+
+<p>Two reasons. Operationally, an annotation that silently triggers an index build against a live
+multi-gigabyte collection is a production incident that starts as a one-line diff. And an index
+strategy is only reviewable if you can see all of it at once &mdash; scattered across five entity
+classes, nobody ever does. ReelCMS declares every index in a single configuration class instead.</p>
+
+<h2>Testing against a real MongoDB</h2>
+
+<p>There are in-memory and embedded MongoDB substitutes. Do not use them for anything in this
+track.</p>
+
+<p>Almost everything worth testing here is behaviour of the actual server: <code>$inc</code>
+atomicity, <code>$lookup</code> type matching, text-index ranking and weights, time-series inserts,
+change streams, unique-index violations. A substitute either does not implement those or implements
+them differently, so a green test tells you nothing about production.</p>
+
+<p>Point the test context at a real server on a throwaway database instead:</p>
+
+<pre class="language-java"><code class="language-java">@SpringBootTest(
+        properties = {
+            "spring.mongodb.uri=mongodb://localhost:27018/reelcms_test?replicaSet=rs0",
+            "spring.mongodb.database=reelcms_test",
+        })</code></pre>
+
+<p>Setting <strong>both</strong> the URI and the database property is deliberate, and it is a real
+scar. <code>spring.mongodb.database</code> overrides the database named inside the URI &mdash;
+silently. If the main <code>application.properties</code> sets it and the test overrides only the
+URI, every test runs against the application&rsquo;s live database. When those tests clear
+collections in <code>@BeforeEach</code>, as integration tests usually do, the result is exactly what
+it sounds like.</p>
+
+<p>Clean the documents rather than dropping the collections, too. Dropping <code>view_events</code>
+takes its time-series options with it, and the next insert quietly recreates it as an ordinary
+collection.</p>
+
+<h2>One Boot 4 note that will cost you an afternoon</h2>
+
+<p>Spring Boot 4 moved the MongoDB <em>connection</em> properties out of
+<code>spring.data.mongodb</code> into <code>spring.mongodb</code>:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.mongodb.uri=mongodb://localhost:27018/reelcms?replicaSet=rs0</code></pre>
+
+<p>The old names are deprecated at error level, but a properties file is not validated &mdash; so
+<code>spring.data.mongodb.uri</code> is read by nobody, no warning is printed, and the driver falls
+back to its default of <code>mongodb://localhost:27017</code>. The symptom is a connection refused
+against a port that appears nowhere in your configuration.</p>
+
+<p>Note that <code>spring.data.mongodb.auto-index-creation</code> above keeps the old prefix,
+because it is a Spring Data setting rather than a connection one. The two prefixes coexist, which
+is exactly as confusing as it sounds.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li><code>@Document</code> + <code>@Id</code>; nested classes become sub-documents for free.</li>
+  <li>Repositories for derived queries; <code>MongoTemplate</code> for dynamic filters,
+      aggregations and partial updates.</li>
+  <li>Counters use <code>$inc</code> through the template, never <code>save()</code>.</li>
+  <li>A nested field named <code>id</code> is stored as <code>_id</code> &mdash; mind your shell
+      queries.</li>
+  <li><code>@EnableMongoAuditing</code> or your audit dates stay null, silently.</li>
+  <li>Truncate <code>Instant</code> to milliseconds so stored and in-memory values agree.</li>
+  <li>Turn off auto-index-creation and declare indexes in one place.</li>
+  <li>Boot 4: <code>spring.mongodb.uri</code>, not <code>spring.data.mongodb.uri</code>.</li>
+</ul>

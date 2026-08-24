@@ -1,0 +1,144 @@
+<p>SNS pushes a message to every subscriber of a topic. SQS holds a message until one consumer pulls
+it. Those two sentences are the whole difference, and putting them together is what most
+event-driven systems on AWS actually are.</p>
+
+<h2>Topics and subscriptions</h2>
+
+<p>A publisher sends to a topic and knows nothing about who is listening. Subscribers can be an SQS
+queue, a Lambda, an HTTPS endpoint, email, SMS, or a mobile push service.</p>
+
+<pre class="language-bash"><code class="language-bash">aws sns create-topic --name booking-events
+
+aws sns publish \
+  --topic-arn arn:aws:sns:us-west-2:111122223333:booking-events \
+  --message '{"event":"booking_created","bookingId":9912,"propertyId":4417}' \
+  --message-attributes '{"eventType":{"DataType":"String","StringValue":"booking_created"}}'</code></pre>
+
+<p>Delivery is at-least-once and unordered, unless you use a FIFO topic — which can only deliver to
+FIFO SQS queues.</p>
+
+<h2>Fan-out: the pattern worth knowing</h2>
+
+<p>SNS alone has a weakness. If a Lambda subscriber fails, SNS retries a few times and then the
+message is gone — there is nothing holding it.</p>
+
+<p>So the standard architecture is <strong>one topic, several SQS queues</strong>, each with its own
+consumer:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                         ┌─→ queue: email     → email worker
+booking-events (SNS) ────┼─→ queue: analytics → analytics worker
+                         └─→ queue: search    → indexer</code></pre>
+
+<p>Every consumer gets its own copy, at its own pace, with its own retries and its own dead-letter
+queue. A slow indexer does not delay email. A broken analytics worker loses nothing — its messages
+wait in its queue.</p>
+
+<p>The publisher stays unchanged when you add a fourth consumer, which is the actual point.</p>
+
+<h2>Turn on raw message delivery</h2>
+
+<p>The setting people meet as a bug. By default SNS wraps your payload in a JSON envelope, so the
+queue receives:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "Type": "Notification",
+  "MessageId": "...",
+  "TopicArn": "arn:aws:sns:us-west-2:111122223333:booking-events",
+  "Message": "{\"event\":\"booking_created\",\"bookingId\":9912}",
+  "Timestamp": "2026-08-24T09:15:00.000Z"
+}</code></pre>
+
+<p>Your actual message is a <em>string</em> inside <code>Message</code>, so consumers end up
+parsing JSON twice and every consumer needs SNS-specific code.</p>
+
+<pre class="language-bash"><code class="language-bash">aws sns set-subscription-attributes \
+  --subscription-arn arn:aws:sns:us-west-2:111122223333:booking-events:abc-123 \
+  --attribute-name RawMessageDelivery --attribute-value true</code></pre>
+
+<p>Now the queue receives your payload unchanged, and the consumer works identically whether the
+message came via SNS or was written to the queue directly.</p>
+
+<p>The trade-off: message attributes move into SQS message attributes, and the topic ARN is no
+longer in the body. If a consumer subscribes to several topics and needs to tell them apart, put
+that in your own payload.</p>
+
+<h2>Filter policies</h2>
+
+<p>Without filtering, every subscriber receives everything and each one throws away what it does
+not care about — which means paying for deliveries and invocations that do nothing.</p>
+
+<p>A filter policy is evaluated by SNS before delivery:</p>
+
+<pre class="language-bash"><code class="language-bash">aws sns set-subscription-attributes \
+  --subscription-arn arn:aws:sns:us-west-2:111122223333:booking-events:abc-123 \
+  --attribute-name FilterPolicy \
+  --attribute-value '{"eventType":["booking_cancelled","booking_created"]}'</code></pre>
+
+<p>By default the policy matches against <strong>message attributes</strong>, not the body — which
+is why the publish above sets an <code>eventType</code> attribute duplicating what is in the JSON.
+Set <code>FilterPolicyScope</code> to <code>MessageBody</code> to match the payload instead.</p>
+
+<p>A subscriber that stops receiving anything after a policy change is nearly always a filter
+matching an attribute the publisher does not send.</p>
+
+<h2>HTTPS endpoints must confirm</h2>
+
+<p>Subscribing an HTTPS endpoint does not activate it. SNS POSTs a
+<code>SubscriptionConfirmation</code> message containing a token, and your endpoint must call the
+<code>SubscribeURL</code> in it. Until then the subscription is <em>PendingConfirmation</em> and
+receives nothing.</p>
+
+<p>Two things to get right: your endpoint must accept POSTs from an unauthenticated source to do
+this at all, and you should <strong>verify the message signature</strong> before acting on
+anything — otherwise you have an open endpoint that anyone can post events to.</p>
+
+<pre class="language-bash"><code class="language-bash">aws sns list-subscriptions-by-topic \
+  --topic-arn arn:aws:sns:us-west-2:111122223333:booking-events \
+  --query "Subscriptions[].[Protocol,Endpoint,SubscriptionArn]" --output table</code></pre>
+
+<p>A <code>SubscriptionArn</code> of <code>PendingConfirmation</code> is the tell.</p>
+
+<h2>When a message disappears</h2>
+
+<p>SNS is fire-and-forget from the publisher's side: a successful <code>publish</code> means SNS
+accepted the message, not that anyone received it. So a missing message is a delivery question, and
+by default there is no record of it.</p>
+
+<p>Turn on <strong>delivery status logging</strong> for the protocols you care about, and set a
+<strong>delivery retry policy</strong> for HTTP endpoints — the default gives up sooner than most
+people expect. For Lambda and SQS subscribers, a subscription-level dead-letter queue catches what
+could not be delivered:</p>
+
+<pre class="language-bash"><code class="language-bash">aws sns set-subscription-attributes \
+  --subscription-arn arn:aws:sns:us-west-2:111122223333:booking-events:abc-123 \
+  --attribute-name RedrivePolicy \
+  --attribute-value '{"deadLetterTargetArn":"arn:aws:sqs:us-west-2:111122223333:sns-dlq"}'</code></pre>
+
+<p>Note that is on the <em>subscription</em>, not the topic — each subscriber needs its own, and
+the queue must have a policy allowing SNS to write to it.</p>
+
+<h2>SNS or EventBridge</h2>
+
+<p>They overlap, and the short version is: <strong>SNS for simple fan-out at high throughput and
+low cost</strong>; <strong>EventBridge when you need routing rules, schemas, archive and replay, or
+events from AWS services and SaaS partners</strong>.</p>
+
+<p>SNS is cheaper per message and lower latency. EventBridge is a router with content-based rules
+across many targets. For "this happened, tell those three queues", SNS is the right size of tool.</p>
+
+<h2>Email and SMS are not what they look like</h2>
+
+<p>SNS can send to an email address or a phone number, and both are tempting shortcuts that turn
+out badly for anything user-facing.</p>
+
+<p>Email subscriptions send a plain-text message from an AWS address, with an unsubscribe footer
+you cannot remove and no templating, no HTML and no tracking. They are fine for an internal alert
+and wrong for anything a customer sees — that is what SES is for.</p>
+
+<p>SMS is worse as a default. Sending to most countries now requires registering a sender id or
+campaign first, per-message pricing varies enormously by destination, and accounts start in a
+sandbox that only delivers to numbers you have verified. Budget time for the registration, not
+just the code.</p>
+
+<p>The rule of thumb: SNS to a queue or a function is the architecture; SNS direct to a human is a
+convenience worth using only for operational alerts to yourself.</p>

@@ -1,0 +1,132 @@
+<p>EC2 is a virtual machine you rent by the second. Almost everything else in AWS is either built on
+it or exists to save you from managing it, so it is worth understanding even if you end up running
+containers instead.</p>
+
+<h2>Reading an instance type</h2>
+
+<p>Instance types look like a code, and they are — <code>m7g.large</code> decodes without a
+lookup once you know the pattern:</p>
+
+<ul>
+  <li><strong><code>m</code></strong> — family. <code>t</code> burstable, <code>m</code> balanced,
+      <code>c</code> compute-heavy, <code>r</code> memory-heavy, <code>g</code>/<code>p</code> GPU</li>
+  <li><strong><code>7</code></strong> — generation. Higher is newer, faster, and usually
+      <em>cheaper</em> for the same work</li>
+  <li><strong><code>g</code></strong> — extra attributes. <code>g</code> means Graviton, AWS's own
+      ARM processor; <code>i</code> Intel, <code>a</code> AMD, <code>d</code> local NVMe</li>
+  <li><strong><code>large</code></strong> — size, doubling up the scale: large, xlarge, 2xlarge…</li>
+</ul>
+
+<p>Graviton is worth a deliberate look: typically 20% cheaper than the equivalent x86 for better
+performance. The catch is that it is ARM, so container images and any compiled dependency must be
+built for <code>arm64</code>. For interpreted code with no native extensions, switching is usually
+just changing the type.</p>
+
+<p>The <code>t</code> family is different in a way that surprises people. It earns CPU credits
+while idle and spends them under load; run out and the instance is throttled hard. Fine for
+development and bursty sites, dangerous for anything with a sustained floor of work.</p>
+
+<h2>The four ways to pay</h2>
+
+<table>
+  <thead><tr><th>Model</th><th>Saves</th><th>For</th></tr></thead>
+  <tbody>
+    <tr><td>On-Demand</td><td>—</td><td>Anything unpredictable, or short-lived</td></tr>
+    <tr><td>Savings Plans</td><td>up to ~70%</td><td>A committed hourly spend for 1 or 3 years.
+        Flexible across family, size and region</td></tr>
+    <tr><td>Reserved Instances</td><td>up to ~70%</td><td>Older, less flexible version of the
+        same idea. Savings Plans are usually the better tool now</td></tr>
+    <tr><td>Spot</td><td>up to ~90%</td><td>Spare capacity, reclaimed with two minutes' notice.
+        Excellent for batch and CI, wrong for a database</td></tr>
+  </tbody>
+</table>
+
+<p>The cheapest instance is still the one that is switched off. Before committing to a year, check
+whether the workload needs to run at night at all.</p>
+
+<h2>Security groups are stateful; NACLs are not</h2>
+
+<p>This single distinction explains most "why can I not connect" problems.</p>
+
+<p>A <strong>security group</strong> is a stateful firewall on the instance. You allow inbound
+port 443; the response goes back out automatically, because the connection is tracked. Security
+groups have <em>allow</em> rules only — there is no way to write a deny — and a request is
+permitted if any attached group allows it.</p>
+
+<p>A <strong>network ACL</strong> sits on the subnet, is stateless, and has both allow and deny.
+Stateless means return traffic needs its own explicit rule, on the ephemeral port range. Forgetting
+that produces a connection that opens and then hangs.</p>
+
+<p>Use security groups for essentially everything. Reach for a NACL only to block something at the
+subnet edge, which is rare.</p>
+
+<p>The best pattern is to reference groups rather than IP ranges — the database group allows 5432
+from the application group, and neither needs to know an address:</p>
+
+<pre class="language-bash"><code class="language-bash">aws ec2 authorize-security-group-ingress \
+  --group-id sg-database \
+  --protocol tcp --port 5432 --source-group sg-application</code></pre>
+
+<h2>Storage</h2>
+
+<p>EBS is a network-attached volume that survives a stop. Instance store is physically attached,
+faster, and <strong>erased when the instance stops</strong>.</p>
+
+<p>For EBS, use <code>gp3</code>. It replaced <code>gp2</code> and is better in both directions:
+cheaper per GB, and its baseline 3,000 IOPS is independent of volume size. Under
+<code>gp2</code> performance scaled with capacity, so people bought a needlessly large volume to
+get IOPS — with <code>gp3</code> you buy the two separately. Step up to <code>io2</code> only when
+you need sustained IOPS beyond what gp3 offers.</p>
+
+<p>Note the root volume's <em>delete on termination</em> flag defaults to true, and any extra
+volume you attach defaults to false. That asymmetry orphans volumes that quietly bill forever.</p>
+
+<h2>First boot</h2>
+
+<pre class="language-bash"><code class="language-bash">aws ec2 run-instances \
+  --image-id ami-0abcdef1234567890 \
+  --instance-type t3.micro \
+  --security-group-ids sg-application \
+  --subnet-id subnet-private-a \
+  --iam-instance-profile Name=app-instance-profile \
+  --user-data file://bootstrap.sh</code></pre>
+
+<p><code>--user-data</code> runs once on first boot as root, which is how an instance configures
+itself without anyone logging in. Its output lands in
+<code>/var/log/cloud-init-output.log</code> — the first place to look when an instance comes up
+but the application does not.</p>
+
+<p>Note <code>--iam-instance-profile</code>, not an access key in the user data. The instance gets
+rotating credentials from the instance metadata service, and every AWS SDK finds them with no
+configuration at all.</p>
+
+<h2>Stop using SSH</h2>
+
+<pre class="language-bash"><code class="language-bash">aws ssm start-session --target i-0abc123def456</code></pre>
+
+<p>Session Manager gives you a shell with no open inbound port, no key pair to distribute and no
+bastion host — the agent connects outbound to AWS and you attach to it. Access is IAM, so
+offboarding someone actually removes it, and sessions can be logged to S3 or CloudWatch for
+audit.</p>
+
+<p>It needs the SSM agent (present on current Amazon Linux and Ubuntu images) and an instance
+profile with the managed node policy. Once it works, delete the port 22 rule and the key pair.</p>
+
+<h2>Where instances go wrong</h2>
+
+<p>Three failures account for most lost afternoons, and none of them announce themselves clearly.</p>
+
+<p><strong>The instance is in a private subnet with no route out.</strong> Package installs hang
+rather than fail. A private subnet needs a NAT gateway for outbound internet, and a NAT gateway
+costs more than most people expect — both per hour and per GB processed. VPC endpoints for S3 and
+DynamoDB are free by comparison and remove a chunk of that traffic.</p>
+
+<p><strong>The status checks are failing.</strong> A system status check failure is AWS's
+problem — stop and start the instance and it moves to different hardware. An instance status check
+failure is yours: a full disk, a kernel panic, or a misconfigured boot. The distinction tells you
+whether to escalate or debug.</p>
+
+<p><strong>The disk is full.</strong> Growing an EBS volume is online and takes seconds, but it
+only grows the block device — the filesystem does not notice until you extend it with
+<code>growpart</code> and <code>resize2fs</code> or <code>xfs_growfs</code>. People resize the
+volume, see no change, and conclude the resize failed.</p>

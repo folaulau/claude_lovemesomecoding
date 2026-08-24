@@ -1,0 +1,167 @@
+<p>MongoDB stores documents, and a document is a set of field-value pairs where the values are
+typed. That type system is <strong>BSON</strong>, and it is not quite JSON. Knowing where the two
+differ explains a whole family of bugs that otherwise look like the database losing your data.</p>
+
+<h2>BSON is JSON with types that survive</h2>
+
+<p>JSON has six types: string, number, boolean, null, object, array. BSON has around twenty. The
+extra ones exist because JSON&rsquo;s are not enough to round-trip a real record:</p>
+
+<ul>
+  <li><strong>ObjectId</strong> &mdash; a 12-byte identifier, the default for <code>_id</code>.</li>
+  <li><strong>Date</strong> &mdash; a real instant, not a formatted string.</li>
+  <li><strong>Int32 / Int64 / Double / Decimal128</strong> &mdash; JSON has one
+      &ldquo;number&rdquo;; BSON distinguishes them, and <code>Decimal128</code> is the one to use
+      for money.</li>
+  <li><strong>Binary</strong> &mdash; bytes, without base64 in the middle.</li>
+  <li><strong>Timestamp</strong> &mdash; an internal type for the oplog. Not the one you want for
+      your own dates.</li>
+</ul>
+
+<p>You can see the difference in the shell, which prints BSON types explicitly:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.samples.insertOne({ a: 1, b: 1.5, c: NumberLong("9007199254740993"), d: new Date() })
+db.samples.findOne()
+// { _id: ObjectId('...'), a: 1, b: 1.5, c: Long('9007199254740993'), d: ISODate('2025-10-15T...') }</code></pre>
+
+<p><code>a</code> came back as an integer, <code>b</code> as a double, <code>c</code> as a 64-bit
+long that a JavaScript number could not have held precisely, and <code>d</code> as a date you can
+compare and sort. Store that date as the string <code>"2025-10-15"</code> instead and every one of
+those operations becomes a string comparison &mdash; which happens to work for ISO dates and breaks
+the moment anyone writes <code>"15/10/2025"</code>.</p>
+
+<h2>Money is the type that catches people</h2>
+
+<p>Doubles cannot represent most decimal fractions exactly, and that is a property of binary
+floating point rather than anything MongoDB does:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.money.insertOne({ price: 0.1 + 0.2 })
+db.money.findOne().price          // 0.30000000000000004
+
+db.money.insertOne({ price: NumberDecimal("0.1") })
+db.money.aggregate([{ $group: { _id: null, t: { $sum: "$price" } } }])
+// Decimal128("0.1") — exact</code></pre>
+
+<p>Use <code>Decimal128</code> for currency. Or do what many teams do and store integer minor units
+&mdash; cents as an <code>Int64</code> &mdash; which sidesteps the question entirely.</p>
+
+<h2>_id, and why it is an ObjectId</h2>
+
+<p>Every document has an <code>_id</code>. It is unique within the collection, immutable, and
+indexed automatically &mdash; you cannot drop that index. If you do not supply one, the driver
+generates an <code>ObjectId</code>.</p>
+
+<p>An ObjectId is twelve bytes: a 4-byte timestamp, a 5-byte random value per process, and a 3-byte
+counter. Two useful consequences follow. It can be generated on the client without asking the
+server, so inserts need no round trip to allocate a key. And because the timestamp leads, ObjectIds
+sort roughly by creation time:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const id = db.reels.findOne()._id
+id.getTimestamp()                 // ISODate — when the document was created
+
+db.reels.find().sort({ _id: -1 }).limit(5)   // roughly newest-first, no extra index</code></pre>
+
+<p>&ldquo;Roughly&rdquo; is doing work in that sentence. The ordering is only as good as the clocks
+on the machines that generated the ids, so it is fine for a debugging glance and wrong for anything
+a user sees. ReelCMS sorts its feed on an explicit <code>publishedAt</code> field for exactly that
+reason &mdash; and because the date a reel was created is not the date it went live.</p>
+
+<h2>Reaching into a document</h2>
+
+<p>Nested fields are addressed with dots, and the whole path goes in quotes because a dotted name
+is not a valid JavaScript identifier:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ "video.durationSeconds": { $lt: 20 } })
+db.reels.find({ "creator.username": "pitchside" })</code></pre>
+
+<p>Arrays behave in a way that surprises people the first time, and then turns out to be exactly
+what you wanted. A query against an array field matches if <em>any</em> element matches &mdash;
+there is no special syntax for it:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ tags: "motorsport" })     // matches ["motorsport", "overtake"]
+db.reels.find({ tags: ["motorsport"] })   // matches ONLY the exact array ["motorsport"]</code></pre>
+
+<p>The first is what you almost always mean. The second is an equality test against the whole
+array, order included. Dot notation reaches array elements by position too, which is occasionally
+useful and usually a sign the field should have been an object:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.find({ "tags.0": "motorsport" })   // first tag only</code></pre>
+
+<p>Two rules on field names are worth knowing before you design anything. A field name cannot
+contain a dot or start with a dollar sign in older server versions &mdash; modern MongoDB permits
+both, but drivers and aggregation expressions still treat them as special, so a key like
+<code>"user.email"</code> is a problem you are choosing to have. And field names are stored in
+every single document, so short names genuinely save space at scale. That is a real trade, not a
+micro-optimisation: at a billion documents the difference between <code>createdAt</code> and
+<code>ca</code> is gigabytes. At a million it is noise, and readable names win.</p>
+
+<h2>The trap: a string that looks like an ObjectId</h2>
+
+<p>This is the single most expensive type mistake in MongoDB, and it never raises an error.</p>
+
+<p>An <code>ObjectId</code> and its 24-character hex string print almost identically. They are
+different BSON types, and MongoDB compares types strictly &mdash; so a query, or worse a join, that
+mixes them matches nothing at all:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const reel = db.reels.findOne()
+
+db.view_events.countDocuments({ "metadata.reelId": reel._id })             // 1649 for this reel
+db.view_events.countDocuments({ "metadata.reelId": reel._id.toString() })  // 0 — for every reel</code></pre>
+
+<p>Same field, same value, different BSON type. No error, no warning, just zero. In an aggregation the same mismatch is worse: a
+<code>$lookup</code> whose local and foreign fields differ in type joins nothing, the
+<code>$unwind</code> after it drops every row, and your report comes back as an empty array.</p>
+
+<h2>Which is why Java has to say so explicitly</h2>
+
+<p>In Java you naturally declare an id as a <code>String</code>, because that is what your API and
+your URLs use. Spring Data stores a plain <code>String</code> field as a BSON string &mdash; while
+the <code>_id</code> it points at is an <code>ObjectId</code>. That is the mismatch above, arriving
+through the mapping layer.</p>
+
+<p>The fix is to tell the mapper what to store, keeping the Java type convenient and the BSON type
+correct. This is from ReelCMS&rsquo;s view-event metadata, the two fields its reports join on:</p>
+
+<pre class="language-java"><code class="language-java">public static class ViewMetadata {
+
+    @Field(targetType = FieldType.OBJECT_ID)
+    private String reelId;
+
+    @Field(targetType = FieldType.OBJECT_ID)
+    private String creatorId;
+
+    private String country;
+    private String device;
+}</code></pre>
+
+<p>Without those two annotations every aggregation in that application returns an empty array, and
+nothing anywhere explains why. With them, the fields stay <code>String</code> in Java and land as
+<code>ObjectId</code> in BSON, and the joins match.</p>
+
+<h2>Checking types when a query returns nothing</h2>
+
+<p><code>$type</code> queries by BSON type, which makes it the fastest way to confirm a hunch:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.view_events.countDocuments({ "metadata.reelId": { $type: "string" } })    // 0
+db.view_events.countDocuments({ "metadata.reelId": { $type: "objectId" } })  // 30187
+
+db.reels.aggregate([{ $group: { _id: { $type: "$stats.views" }, n: { $sum: 1 } } }])
+// one row per type present — anything but a single row is drift</code></pre>
+
+<p>That last one is worth keeping. Run it against any field you rely on and a second row in the
+output means two different types are living in the collection, which is a bug you would otherwise
+find through a wrong total.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>BSON is JSON plus the types JSON lacks &mdash; dates, several number widths, binary,
+      ObjectId.</li>
+  <li>Store dates as dates and money as <code>Decimal128</code> or integer minor units.</li>
+  <li><code>_id</code> is unique, immutable and always indexed; ObjectIds are client-generated and
+      sort roughly by time.</li>
+  <li>An ObjectId is <strong>not</strong> its hex string. Mixing them matches nothing, silently.</li>
+  <li>In Spring Data, an id field declared <code>String</code> needs
+      <code>@Field(targetType = FieldType.OBJECT_ID)</code> or every join on it fails.</li>
+  <li>Group by <code>$type</code> to find type drift before it becomes a wrong number.</li>
+</ul>

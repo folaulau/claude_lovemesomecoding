@@ -1,0 +1,257 @@
+<p>Terraform has about thirty subcommands and you will use four of them. This lesson installs it,
+points it at AWS, and creates something real — then destroys it, so the lesson costs nothing.</p>
+
+<h2>Install it</h2>
+
+<p>It is a single Go binary with no runtime and no dependencies. Every install method is a way of
+putting that one file on your <code>PATH</code>.</p>
+
+<pre class="language-bash"><code class="language-bash">brew tap hashicorp/tap && brew install hashicorp/tap/terraform   # macOS
+choco install terraform                                          # Windows
+# Linux: add the HashiCorp apt/yum repo, or just download the zip
+
+terraform version</code></pre>
+
+<p>If you would rather not use a package manager — or yours refuses, which happens — download the
+zip from HashiCorp's release site, verify it, and drop the binary somewhere on your
+<code>PATH</code>. The checksum step is worth doing on something that will hold your cloud
+credentials:</p>
+
+<pre class="language-bash"><code class="language-bash">V=1.15.9
+curl -fLO "https://releases.hashicorp.com/terraform/${V}/terraform_${V}_darwin_arm64.zip"
+curl -fLO "https://releases.hashicorp.com/terraform/${V}/terraform_${V}_SHA256SUMS"
+shasum -a 256 -c terraform_${V}_SHA256SUMS --ignore-missing
+
+unzip terraform_${V}_darwin_arm64.zip -d ~/bin</code></pre>
+
+<p>This track is written against <strong>Terraform 1.15.9</strong> and <strong>AWS provider
+6.61.0</strong>.</p>
+
+<h2>Point it at AWS</h2>
+
+<p>Terraform does not have its own credentials. The AWS provider uses exactly the same chain the AWS
+CLI does — environment variables, then <code>~/.aws/credentials</code>, then an instance or
+container role. If the CLI works, Terraform works.</p>
+
+<pre class="language-bash"><code class="language-bash">aws configure          # or: export AWS_PROFILE=your-profile
+aws sts get-caller-identity</code></pre>
+
+<p>If that last command prints your account id, you are ready. If it does not, fix that first —
+every Terraform error you would otherwise get is a worse version of the same message.</p>
+
+<h2>Write something</h2>
+
+<p>Make an empty directory and put this in <code>main.tf</code>. The filename does not matter;
+Terraform reads <em>every</em> <code>.tf</code> file in the directory and treats them as one
+configuration.</p>
+
+<pre class="language-hcl"><code class="language-hcl">terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-west-2"
+}
+
+resource "aws_s3_bucket" "first" {
+  # ⚠️ Change this. S3 bucket names are globally unique across every AWS
+  # account on earth, so "my-bucket" was taken in 2006.
+  bucket = "tf-first-bucket-change-me-8f3a1c"
+}</code></pre>
+
+<p>Three blocks, and they are the three you will see at the top of almost every Terraform project:
+which providers this configuration needs, how to configure one, and a thing that should exist.</p>
+
+<h2>init</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform init</code></pre>
+
+<p><code>init</code> reads <code>required_providers</code>, downloads the AWS provider plugin into
+<code>.terraform/</code>, and writes <code>.terraform.lock.hcl</code> recording the exact versions
+and checksums it chose.</p>
+
+<p>The provider is <strong>large</strong> — the AWS one is several hundred megabytes, because it
+contains a generated client for every AWS service. That is why the first <code>init</code> takes a
+while and every later one is instant. Run it again in a new directory and it downloads again, which
+is what <code>TF_PLUGIN_CACHE_DIR</code> exists to fix.</p>
+
+<p>You run <code>init</code> once per directory, and again whenever you add a provider, change a
+version constraint, or add a module.</p>
+
+<h2>plan</h2>
+
+<p>This is the command that makes Terraform worth using.</p>
+
+<pre class="language-bash"><code class="language-bash">terraform plan</code></pre>
+
+<pre class="language-bash"><code class="language-bash">Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # aws_s3_bucket.first will be created
+  + resource "aws_s3_bucket" "first" {
+      + acceleration_status         = (known after apply)
+      + acl                         = (known after apply)
+      + arn                         = (known after apply)
+      + bucket                      = "tf-first-bucket-change-me-8f3a1c"
+      + bucket_domain_name          = (known after apply)
+      + bucket_namespace            = (known after apply)
+      + bucket_prefix               = (known after apply)
+      + bucket_region               = (known after apply)
+      + bucket_regional_domain_name = (known after apply)
+      + force_destroy               = false
+      + hosted_zone_id              = (known after apply)
+      + id                          = (known after apply)
+      + object_lock_enabled         = (known after apply)
+      ... plus tags_all and nine nested blocks, all (known after apply)
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.</code></pre>
+
+<p>Nothing has happened yet. <code>plan</code> reads your files, reads the state, calls AWS to see
+what is actually there, and prints the difference.</p>
+
+<p>Note that you wrote one argument and Terraform is tracking about twenty. Everything you did not
+set has a default or is assigned by AWS, and Terraform records all of it — which is what lets it
+tell you later that something changed underneath you.</p>
+
+<p>Learn to read the symbols now, because one of them is the reason this command exists:</p>
+
+<pre class="language-bash"><code class="language-bash">+   create
+~   update in place
+-   destroy
+-/+ destroy and then create      <-- REPLACEMENT. read this one carefully.
++/- create and then destroy      <-- replacement, with create_before_destroy</code></pre>
+
+<p><strong><code>-/+</code> on a database is how people lose data.</strong> Some arguments cannot be
+changed on a live resource, so changing them means AWS deletes the old one and makes a new one.
+Terraform tells you, in the plan, and says why — <code>forces replacement</code> appears next to the
+offending attribute. The whole discipline of using Terraform safely is reading that output before
+typing yes.</p>
+
+<p><code>(known after apply)</code> just means AWS assigns it — an ARN cannot be known before the
+thing exists.</p>
+
+<h2>apply</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform apply</code></pre>
+
+<p>It prints the plan again and waits for you to type <code>yes</code>. Nothing is created before
+that.</p>
+
+<pre class="language-bash"><code class="language-bash">aws_s3_bucket.first: Creating...
+aws_s3_bucket.first: Creation complete after 1s [id=tf-first-bucket-change-me-8f3a1c]
+
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.</code></pre>
+
+<p>The bucket exists. There is now also a <code>terraform.tfstate</code> file in the directory —
+Terraform's record of what it built and what every attribute came out as. Lesson 5 is about that
+file; for now, know that it is important and that it does not belong in git.</p>
+
+<h2>Change something</h2>
+
+<p>This is the loop you will actually live in. Add tags to the bucket:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_s3_bucket" "first" {
+  bucket = "tf-first-bucket-change-me-8f3a1c"
+
+  tags = {
+    Environment = "learning"
+  }
+}</code></pre>
+
+<pre class="language-bash"><code class="language-bash">terraform plan</code></pre>
+
+<pre class="language-bash"><code class="language-bash">  # aws_s3_bucket.first will be updated in-place
+  ~ resource "aws_s3_bucket" "first" {
+        id                          = "tf-first-bucket-change-me-8f3a1c"
+      ~ tags                        = {
+          + "Environment" = "learning"
+        }
+      ~ tags_all                    = {
+          + "Environment" = "learning"
+        }
+        # (14 unchanged attributes hidden)
+
+        # (3 unchanged blocks hidden)
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.</code></pre>
+
+<p><code>tags</code> is what you wrote; <code>tags_all</code> is what the resource ends up with once
+any provider-level default tags are merged in. Lesson 12 uses that feature; for now it is enough to
+know why the same change appears twice.</p>
+
+<p><code>~</code> and "updated in-place" — it will modify the existing bucket, not replace it.
+Apply that, then run <code>terraform plan</code> a third time:</p>
+
+<pre class="language-bash"><code class="language-bash">No changes. Your infrastructure matches the configuration.</code></pre>
+
+<p>That is the property that makes this a tool rather than a script. Terraform is not "run the
+commands"; it is "make reality match the file", and when it already does, it does nothing. You can
+run <code>apply</code> as many times as you like.</p>
+
+<h2>destroy</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform destroy</code></pre>
+
+<p>It prints everything it is about to delete and asks for <code>yes</code>. Do it now — an empty
+S3 bucket costs nothing, but the habit is the point, and every AWS lesson in this track ends the
+same way.</p>
+
+<pre class="language-bash"><code class="language-bash">aws_s3_bucket.first: Destroying... [id=tf-first-bucket-change-me-8f3a1c]
+aws_s3_bucket.first: Destruction complete after 0s
+
+Destroy complete! Resources: 1 destroyed.</code></pre>
+
+<p>⚠️ <code>destroy</code> deletes everything in the state file, not just the thing you were last
+looking at. In a directory holding your production VPC, that is exactly as bad as it sounds. Lesson
+15 covers <code>prevent_destroy</code>, and lesson 11 covers keeping production in a directory of
+its own so a careless <code>destroy</code> cannot reach it.</p>
+
+<h2>The four commands</h2>
+
+<pre class="language-bash"><code class="language-bash">terraform init      download providers, prepare the directory   (once, and after adding one)
+terraform plan      show me the difference, change nothing      (constantly)
+terraform apply     make it so, after showing me and asking     (deliberately)
+terraform destroy   delete everything in this state             (carefully)</code></pre>
+
+<p>Two more you will want on day one:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform fmt       rewrite files in canonical style
+terraform validate  check syntax and provider schema, no AWS calls needed</code></pre>
+
+<p><code>validate</code> is the fast one. It catches a misspelled argument or a resource type that
+does not exist without touching AWS at all, because the provider ships a schema of everything it
+supports. It is what every example in this track is checked with before it is published.</p>
+
+<h2>What not to commit</h2>
+
+<p>Before you put any of this in git:</p>
+
+<pre class="language-bash"><code class="language-bash">.terraform/          # the downloaded providers. Hundreds of MB, regenerable.
+terraform.tfstate    # ⚠️ SECRETS. see below.
+terraform.tfstate.*
+*.tfvars             # real values for variables
+*.tfplan             # a saved plan contains every value the apply would write</code></pre>
+
+<p><strong>State files contain secrets in cleartext.</strong> Not hashed, not encrypted — if a
+resource has a password attribute, the password is in that file as text. This is the single most
+common way infrastructure credentials end up in a public repository. Lesson 8 moves state somewhere
+it belongs; until then, keep it local and keep it out of git.</p>
+
+<p><code>.terraform.lock.hcl</code> is the exception — that one <strong>is</strong> committed, and
+lesson 4 explains why.</p>
+
+<h2>Next</h2>
+
+<p>You now have the loop. <a href="/terraform/terraform-hcl-syntax">Lesson 3</a> covers the language
+itself — the block types, the type system, and the handful of functions worth knowing — so that the
+configurations from here on read as obvious rather than as magic.</p>

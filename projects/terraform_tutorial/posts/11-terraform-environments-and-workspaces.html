@@ -1,0 +1,206 @@
+<p>You have a stack that works. Now you need it three times — dev, staging, prod — differing in
+instance sizes, counts, and not much else. There are three ways to do this and one of them is a trap
+for production.</p>
+
+<h2>Option 1: workspaces</h2>
+
+<p>Terraform's built-in answer. One directory, multiple state files.</p>
+
+<pre class="language-bash"><code class="language-bash">terraform workspace new staging
+terraform workspace new prod
+terraform workspace list
+
+  default
+  staging
+* prod
+
+terraform workspace select staging
+terraform apply</code></pre>
+
+<p>The state key gets a prefix per workspace, so <code>prod</code> and <code>staging</code> hold
+separate state from the same code. Inside the configuration:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  instance_class = terraform.workspace == "prod" ? "db.r6g.large" : "db.t4g.micro"
+  desired_count  = terraform.workspace == "prod" ? 3 : 1
+  name_prefix    = "pizza-${terraform.workspace}"
+}</code></pre>
+
+<h2>⚠️ Why workspaces are wrong for production</h2>
+
+<p>They work. The problem is not correctness, it is that <strong>the environment is ambient
+state</strong> — a property of your shell, not of anything you can see, review or version.</p>
+
+<p><strong>Which workspace are you in right now?</strong> Nothing in the code says. Nothing in a pull
+request says. You find out by running a command, and if you forget, <code>terraform apply</code>
+applies to whichever one you last selected. The failure mode is running a staging change against
+production and only noticing at the confirmation prompt — if then.</p>
+
+<p><strong>The configuration is identical, so it cannot diverge.</strong> Which sounds like a feature
+until prod needs a read replica that staging does not, and you start writing
+<code>count = terraform.workspace == "prod" ? 1 : 0</code> through the codebase. A few of those and
+the configuration is a pile of conditionals that no single environment reads cleanly.</p>
+
+<p><strong>One backend.</strong> Every workspace lives in the same bucket, so anyone who can plan
+staging can read prod's state — which contains prod's secrets. Separate AWS accounts per environment
+is a common and good practice, and workspaces cannot express it.</p>
+
+<p><strong>The blast radius is shared.</strong> One directory, one set of files. There is no
+structural barrier between a careless <code>destroy</code> and production.</p>
+
+<p>Workspaces are genuinely good for <strong>short-lived, throwaway copies</strong>: a per-developer
+sandbox, an ephemeral environment per pull request, a scratch stack you will destroy this afternoon.
+Same code, different name, no divergence wanted, low stakes.</p>
+
+<h2>Option 2: a directory per environment</h2>
+
+<pre class="language-bash"><code class="language-bash">infra/
+  modules/
+    network/
+    database/
+    service/
+  environments/
+    dev/
+      main.tf          calls the modules with dev's values
+      backend.tf       its OWN backend, its OWN state
+      terraform.tfvars
+    staging/
+    prod/</code></pre>
+
+<pre class="language-hcl"><code class="language-hcl"># environments/prod/main.tf
+terraform {
+  backend "s3" {
+    bucket       = "my-terraform-state-329580012644"
+    key          = "pizza/prod/terraform.tfstate"
+    region       = "us-west-2"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+
+module "network" {
+  source = "../../modules/network"
+
+  name_prefix = "pizza-prod"
+  vpc_cidr    = "10.30.0.0/16"
+}
+
+module "database" {
+  source = "../../modules/database"
+
+  name_prefix    = "pizza-prod"
+  instance_class = "db.r6g.large"
+  multi_az       = true
+}</code></pre>
+
+<p>Everything the workspace approach makes implicit is now explicit and reviewable:</p>
+
+<p><strong>You can see which environment you are in</strong> — it is the directory you are standing
+in, and it is in the path of every command you run.</p>
+
+<p><strong>Environments can differ</strong> without conditionals. Prod's <code>main.tf</code> says
+<code>multi_az = true</code>; dev's does not mention it. Each file reads as a description of one
+environment.</p>
+
+<p><strong>Separate backends, separate permissions, separate accounts if you want them.</strong></p>
+
+<p><strong>A diff to <code>environments/prod/</code> is visibly a production change</strong> in a pull
+request, and can require a different reviewer.</p>
+
+<p>The cost is duplication. Three <code>main.tf</code> files that are 80% identical, and a change to
+the module interface touches all three. In practice that duplication is small — the modules hold the
+logic, and the environment files are a list of values — and it is duplication that <em>you can see</em>,
+which is the good kind.</p>
+
+<p><strong>This is the layout to reach for.</strong> It is what the stack in this track would become
+on the way to production.</p>
+
+<h2>Option 3: one directory, tfvars and partial backends</h2>
+
+<p>The middle path. One configuration, per-environment values and backend config passed in:</p>
+
+<pre class="language-bash"><code class="language-bash">infra/
+  main.tf
+  variables.tf
+  backend.tf              contains only:  terraform { backend "s3" {} }
+  env/
+    prod.tfvars
+    prod.s3.tfbackend
+    staging.tfvars
+    staging.s3.tfbackend</code></pre>
+
+<pre class="language-bash"><code class="language-bash"># env/prod.s3.tfbackend
+bucket       = "my-terraform-state-329580012644"
+key          = "pizza/prod/terraform.tfstate"
+region       = "us-west-2"
+encrypt      = true
+use_lockfile = true</code></pre>
+
+<pre class="language-bash"><code class="language-bash">terraform init -backend-config=env/prod.s3.tfbackend -reconfigure
+terraform apply -var-file=env/prod.tfvars</code></pre>
+
+<p>This exists because <strong>the backend block cannot take variables</strong> — it is read before
+Terraform evaluates anything, so partial configuration is the only way to parameterise it.</p>
+
+<p>No duplication, and environments still cannot diverge structurally. But it brings back the worst
+property of workspaces: <strong>the environment is in your command line</strong>. Forget
+<code>-var-file</code> and you apply defaults to prod's state. Forget <code>-reconfigure</code> after
+switching and you apply prod's values to staging's state.</p>
+
+<p>If you use this, wrap it — a Makefile or a script that takes the environment name once and derives
+both flags, so the two can never disagree:</p>
+
+<pre class="language-bash"><code class="language-bash">make plan ENV=prod</code></pre>
+
+<h2>Choosing</h2>
+
+<pre class="language-bash"><code class="language-bash">workspaces          ephemeral copies: per-developer, per-PR, throwaway
+directory per env   real environments, especially production   <-- default
+tfvars + backend    real environments, when the duplication genuinely hurts,
+                    and only behind a wrapper that sets both flags together</code></pre>
+
+<h2>Naming, whichever you pick</h2>
+
+<p>Every resource name and every tag must carry the environment. It is what makes the console
+readable, the bill attributable, and a teardown provably complete:</p>
+
+<pre class="language-hcl"><code class="language-hcl">locals {
+  name_prefix = "pizza-${var.environment}"
+
+  tags = {
+    Environment = var.environment
+    Project     = "terraform-tutorial"
+    ManagedBy   = "terraform"
+  }
+}</code></pre>
+
+<p>⚠️ Globally-unique names — S3 buckets especially — need the account id too, since
+<code>pizza-prod-uploads</code> is taken across every AWS account on earth. Use
+<code>data.aws_caller_identity.current.account_id</code> from lesson 7 rather than hard-coding it.</p>
+
+<h2>Protecting production</h2>
+
+<p>Whichever layout you choose, two guards are worth having:</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_db_instance" "this" {
+  identifier     = "pizza-prod-mysql"
+  engine         = "mysql"
+  instance_class = "db.r6g.large"
+
+  # In prod, both of these are true. terraform destroy then ERRORS rather
+  # than deleting the database, and removing the block is a reviewable commit.
+  deletion_protection = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}</code></pre>
+
+<p>And in CI, prod's apply should require an approval that dev's does not — lesson 14 wires that up
+with a GitHub environment.</p>
+
+<h2>Next</h2>
+
+<p>The language is done. <a href="/terraform/terraform-with-aws">Lesson 12</a> starts the real
+deployment: a VPC, subnets, security groups and an RDS instance for the pizza API, with the database
+password kept out of both the code and the state file.</p>

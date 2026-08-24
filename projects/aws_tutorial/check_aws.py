@@ -163,10 +163,23 @@ CUSTOM_COMMANDS = {
 # Both entries here were found by the self-test in tests/ rather than by reading the source — a
 # validator this strict produces false positives, and the false positives are the interesting
 # output. Add to this table only when the real CLI genuinely accepts the flag.
+_SG_SHORTHAND = {"--protocol", "--port", "--cidr", "--source-group"}
+
 EXTRA_FLAGS = {
     ("cloudfront", "create-invalidation"): {"--paths"},
     ("cloudfront", "create-distribution"): {"--origin-domain-name", "--default-root-object"},
+    # The security-group rule commands take a nested --ip-permissions structure in the API, and
+    # the CLI adds a flat shorthand for the common single-rule case. Verified against
+    # `aws ec2 authorize-security-group-ingress help` on aws-cli/2.32.24 — all four commands
+    # accept the same four flags.
+    ("ec2", "authorize-security-group-ingress"): _SG_SHORTHAND,
+    ("ec2", "authorize-security-group-egress"): _SG_SHORTHAND,
+    ("ec2", "revoke-security-group-ingress"): _SG_SHORTHAND,
+    ("ec2", "revoke-security-group-egress"): _SG_SHORTHAND,
 }
+
+# CLI command groups that are valid with no subcommand at all, only flags.
+BARE_COMMAND_GROUPS = {"configure", "help"}
 
 # Commands whose second token is a CLI verb rather than an operation.
 #   aws ec2 wait instance-running --instance-ids i-abc
@@ -279,6 +292,54 @@ def split_top_level(line):
     return parts
 
 
+def _unclosed_quote(line, quote):
+    """The quote character still open at the end of `line`, given one open at the start."""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and quote is None and (i == 0 or line[i - 1].isspace()):
+            break  # a comment cannot open a quote
+        i += 1
+    return quote
+
+
+def _join_quoted_lines(lines):
+    """Re-join lines that are inside a quoted argument spanning newlines.
+
+    ⚠️ A shell argument may contain literal newlines, and `aws` commands taking inline JSON
+    routinely do:
+
+        aws route53 change-resource-record-sets --change-batch '{
+          "Changes": [...]
+        }'
+
+    Splitting that on newlines hands shlex a fragment ending in an unterminated quote, reported as
+    "No closing quotation" on a perfectly valid sample. Backslash continuations were already
+    handled; this is the other way a command spans lines.
+    """
+    out, buf, quote = [], [], None
+    for line in lines:
+        if quote:
+            buf.append(line)
+        else:
+            buf = [line]
+        quote = _unclosed_quote(line, quote)
+        if not quote:
+            out.append("\n".join(buf))
+            buf = []
+    if buf:
+        out.append("\n".join(buf))
+    return out
+
+
 def shell_commands(block):
     """Yield each `aws …` invocation in a shell block, line continuations joined.
 
@@ -286,7 +347,7 @@ def shell_commands(block):
     a URL fragment or a JMESPath expression is not a comment.
     """
     text = re.sub(r"\\\n\s*", " ", block)
-    for line in text.splitlines():
+    for line in _join_quoted_lines(text.splitlines()):
         line = re.sub(r"(^|\s)#.*$", "", line).strip()
         if not line:
             continue
@@ -316,6 +377,12 @@ def check_command(command, models, findings, where):
 
     if cli_service in {"help", "--version", "--help"}:
         return "ok"
+
+    # `aws configure` is a CLI command group with no service behind it, and unlike `aws s3` its
+    # BARE form is valid — `aws configure --profile x` runs the interactive prompt. So it cannot
+    # be matched by the (service, subcommand) table below, which needs a subcommand to key on.
+    if cli_service in BARE_COMMAND_GROUPS and (not rest or rest[0].startswith("-")):
+        return "custom"
 
     # `aws s3 cp` and friends: a CLI customization, checked against the declared table.
     if rest and (cli_service, rest[0]) in CUSTOM_COMMANDS:

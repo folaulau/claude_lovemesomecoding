@@ -1,0 +1,148 @@
+<p>A component is created, rendered into the DOM, updated some number of times, and eventually
+removed. Lifecycle hooks let you run code at each of those moments.</p>
+
+<h2>The hooks</h2>
+
+<pre class="language-javascript"><code class="language-javascript">import { onMounted, onBeforeUnmount, onUpdated } from "vue";
+
+onBeforeMount(() =&gt; {});    // after setup, before the first render
+onMounted(() =&gt; {});        // the DOM exists -- this is the one you will use
+onBeforeUpdate(() =&gt; {});   // data changed, DOM not yet patched
+onUpdated(() =&gt; {});        // DOM patched
+onBeforeUnmount(() =&gt; {});  // still attached -- clean up here
+onUnmounted(() =&gt; {});      // gone</code></pre>
+
+<p>Register them at the <strong>top level of <code>setup</code></strong>. They work by associating
+themselves with whichever component is currently being set up, so registering one inside a callback,
+a promise or an <code>if</code> either fails or attaches to the wrong component.</p>
+
+<p>The code in <code>&lt;script setup&gt;</code> that is not in a hook is itself the "before created"
+moment — it runs first, every time, and is where you declare state.</p>
+
+<h2>onMounted</h2>
+
+<p>Use it for anything that needs the real DOM, or that should start once the component is on
+screen.</p>
+
+<pre class="language-javascript"><code class="language-javascript">onMounted(loadPage);</code></pre>
+
+<p>That is the whole of the feed's mounted hook after its observer moved into a composable
+(lesson 15). Before that it also constructed an <code>IntersectionObserver</code> here — because
+<code>new IntersectionObserver({ root: scroller.value })</code> needs <code>scroller.value</code> to
+be a real element, which it is not until mounted.</p>
+
+<p><code>onMounted</code> does <strong>not</strong> run on the server. Anything touching
+<code>window</code>, <code>document</code> or <code>localStorage</code> belongs here for that reason
+alone.</p>
+
+<h3>Fetching in onMounted, or not</h3>
+
+<p>You can start a request in <code>onMounted</code>, and plenty of code does. You can also just start
+it in the setup body — nothing about a <code>fetch</code> needs the DOM:</p>
+
+<pre class="language-javascript"><code class="language-javascript">api.trendingTags().then((t) =&gt; (tags.value = t)).catch(() =&gt; {});</code></pre>
+
+<p>That fires as the component is created, one tick earlier. The demo application does both, choosing
+per case: the tag list is fire-and-forget, while the feed's first page is in <code>onMounted</code>
+because the observer must exist before slides can be registered.</p>
+
+<h2>onBeforeUnmount: the one that matters</h2>
+
+<p><strong>Every hook that starts something needs a hook that stops it.</strong> Intervals, event
+listeners on <code>window</code>, observers, EventSource connections, and any subscription you opened
+will otherwise keep running after the component is gone — holding a reference to it, so the whole
+component tree stays in memory.</p>
+
+<pre class="language-javascript"><code class="language-javascript">onBeforeUnmount(() =&gt; videoEl.value?.pause());</code></pre>
+
+<p>One line, and without it every reel you scroll past keeps playing audio.</p>
+
+<p>The pattern for a listener:</p>
+
+<pre class="language-javascript"><code class="language-javascript">function onResize() { width.value = window.innerWidth; }
+
+onMounted(() =&gt; window.addEventListener("resize", onResize));
+onBeforeUnmount(() =&gt; window.removeEventListener("resize", onResize));</code></pre>
+
+<p>Note the <em>named</em> function. <code>removeEventListener</code> matches by identity, so an
+inline arrow function in both places removes nothing at all — the listener stays, silently, forever.
+This is the single most common memory leak in component code.</p>
+
+<p>Lesson 15 shows the better answer: put the pair inside a composable, so the caller cannot forget
+half of it.</p>
+
+<h3>onBeforeUnmount versus onUnmounted</h3>
+
+<p><code>onBeforeUnmount</code> still has the DOM, so it is where you pause a video or read a final
+scroll position. <code>onUnmounted</code> is after removal, for anything that does not need the
+element. When in doubt use <code>onBeforeUnmount</code>.</p>
+
+<h2>Template refs</h2>
+
+<p>Sometimes you need the actual element — to call <code>play()</code>, to focus an input, to measure
+something. Declare a ref with the same name as the <code>ref</code> attribute:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;video ref="videoEl" ...&gt;&lt;/video&gt;</code></pre>
+
+<pre class="language-javascript"><code class="language-javascript">const videoEl = ref(null);
+
+// null until mounted, so every use is guarded.
+function togglePlay() {
+  const el = videoEl.value;
+  if (!el) return;
+  if (el.paused) el.play().catch(() =&gt; {});
+  else el.pause();
+}</code></pre>
+
+<p>The binding is populated just before <code>onMounted</code> and set back to <code>null</code> on
+unmount. Reading it in the setup body always gives <code>null</code> — that is not a bug, the element
+does not exist yet.</p>
+
+<h3>Refs inside v-for</h3>
+
+<p>A static <code>ref="x"</code> inside a loop cannot work — every iteration would claim the same name.
+Bind a function instead, and Vue calls it with each element:</p>
+
+<pre class="language-markup"><code class="language-markup">      :ref="(el) =&gt; (slideEls[i] = el)"</code></pre>
+
+<pre class="language-javascript"><code class="language-javascript">const slideEls = ref([]);</code></pre>
+
+<p>which gives an array indexed the same way as the list, so
+<code>slideEls.value[3]</code> is the fourth slide's element.</p>
+
+<h3>A ref on a component</h3>
+
+<p><code>ref</code> on a child component gives you the component instance rather than an element. With
+<code>&lt;script setup&gt;</code> a component is <strong>closed by default</strong> — the parent sees
+nothing — and the child opts in to exposing specific things:</p>
+
+<pre class="language-javascript"><code class="language-javascript">// in the child
+defineExpose({ focus, reset });</code></pre>
+
+<p>That default is deliberate and worth respecting. Reaching into a child to call its methods couples
+the two together in a way props and events do not. Use it for genuinely imperative things — focus,
+scroll, play — and nothing else.</p>
+
+<h2>nextTick</h2>
+
+<p>Changing reactive data does not update the DOM immediately. Vue batches changes and applies them on
+the next tick, which is why this reads the old value:</p>
+
+<pre class="language-javascript"><code class="language-javascript">reels.value.push(...res.items);
+console.log(slideEls.value.length);   // the OLD length -- not rendered yet</code></pre>
+
+<p><code>await nextTick()</code> waits for the DOM to catch up:</p>
+
+<pre class="language-javascript"><code class="language-javascript">    await nextTick();
+    observeSlides();</code></pre>
+
+<p>The feed appends a page of reels and then has to observe the new slide elements — which cannot
+happen until they exist. Without the <code>nextTick</code>, <code>observeSlides()</code> would run over
+the previous page's elements and the pager would stop advancing at the end of page one.</p>
+
+<p>That is the whole use of <code>nextTick</code>: <em>I changed data, and now I need the DOM that
+resulted from it.</em> Measuring a newly rendered element, focusing an input that just appeared,
+scrolling to a row that was just added.</p>
+
+<p>Next: <a href="/vue/vue-composables">Composables</a> — packaging all of this up so it can be
+reused.</p>

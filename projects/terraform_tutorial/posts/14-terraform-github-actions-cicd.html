@@ -1,0 +1,386 @@
+<p>Applying from a laptop does not survive a second person. You need a plan on every pull request, an
+apply on merge, and no AWS credentials stored anywhere.</p>
+
+<p>⚠️ <strong>Honesty first.</strong> Everything else in lessons 12 and 13 was applied to a real
+account and verified. This workflow was not — the demo repository has no GitHub remote, so it has
+never run. It is written to be correct rather than proven, the IAM and Terraform in it are validated
+against the real provider schema, and that distinction is stated here rather than left for you to
+discover.</p>
+
+<h2>Do not store AWS keys</h2>
+
+<p>The pattern almost every tutorial shows:</p>
+
+<pre class="language-yaml"><code class="language-yaml"># ⚠️ Do not do this.
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}</code></pre>
+
+<p>Those are long-lived credentials for a user with permission to build your infrastructure. They do
+not expire, they are copied into every fork's settings discussion, and rotating them means touching
+every repository that has them.</p>
+
+<p><strong>OIDC replaces them.</strong> GitHub mints a short-lived signed token describing the
+workflow — which repository, which branch, which environment — and AWS is configured to trust it and
+hand back temporary credentials. Nothing is stored. Nothing can leak, because nothing persists.</p>
+
+<h2>Trusting GitHub, once per account</h2>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
+
+  client_id_list = ["sts.amazonaws.com"]
+
+  # ⚠️ NO thumbprint_list, deliberately.
+  #
+  # Nearly every OIDC tutorial you will find pastes a 40-character CA thumbprint
+  # here, and that advice is out of date twice over. AWS no longer verifies
+  # thumbprints for well-known IdPs including GitHub's, and the argument is
+  # OPTIONAL on AWS provider 6.x — `terraform validate` accepts this resource
+  # without it.
+  #
+  # The thumbprints in those tutorials are also frequently the OLD ones, from
+  # before GitHub rotated its certificate authority. Copying a stale one gives
+  # you a resource that looks configured and pins nothing.
+}</code></pre>
+
+<h2>The role, and the condition that matters</h2>
+
+<pre class="language-hcl"><code class="language-hcl">data "aws_iam_policy_document" "github_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # ⚠️ THE LINE THAT MAKES THIS SAFE.
+    #
+    # Without a `sub` condition, ANY GitHub Actions workflow in ANY repository
+    # on GitHub can assume this role. Not a theoretical risk — it is the single
+    # most common OIDC misconfiguration.
+    #
+    # StringLike, not StringEquals, because of the wildcard. Scope it as
+    # narrowly as you can: a specific repo, and specific refs.
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values = [
+        "repo:folaulau/lovemesomecoding_demo_project:ref:refs/heads/main",
+        "repo:folaulau/lovemesomecoding_demo_project:pull_request",
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions" {
+  name               = "pizza-tf-github-actions"
+  assume_role_policy = data.aws_iam_policy_document.github_assume.json
+}</code></pre>
+
+<p>⚠️ <code>repo:owner/name:*</code> is tempting and wrong — it matches every branch, including one a
+contributor opens a pull request from. Name the refs.</p>
+
+<p>The permissions the role needs are genuinely broad, because Terraform creates VPCs, load balancers
+and databases. Two things make that acceptable: it is scoped by the <code>sub</code> condition above,
+and it is a separate role from anything a human uses.</p>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_iam_role_policy" "state_access" {
+  name = "terraform-state"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = "arn:aws:s3:::my-terraform-state-329580012644"
+      },
+      {
+        Effect = "Allow"
+        # DeleteObject is for releasing the .tflock, not for deleting state.
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "arn:aws:s3:::my-terraform-state-329580012644/pizza/*"
+      },
+    ]
+  })
+}</code></pre>
+
+<h2>Plan on the pull request</h2>
+
+<pre class="language-yaml"><code class="language-yaml">name: terraform
+
+on:
+  pull_request:
+    paths: ['infra/**']
+  push:
+    branches: [main]
+    paths: ['infra/**']
+
+# ⚠️ Two applies at once fight over the state lock, and the loser fails after
+# doing part of its work. This queues them instead.
+#
+# cancel-in-progress is FALSE deliberately: cancelling an apply half way
+# through leaves infrastructure created and state not yet written.
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write        # <- REQUIRED for OIDC. without it, no token is minted.
+  pull-requests: write   # <- to post the plan as a comment
+
+env:
+  TF_VERSION: '1.15.9'
+  AWS_REGION: us-west-2
+  ROLE: arn:aws:iam::329580012644:role/pizza-tf-github-actions
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Formatting and validation first: they need no AWS access and they fail
+      # in seconds, so a badly formatted PR does not wait on a plan.
+      - run: terraform fmt -check -recursive
+      - run: terraform init -input=false
+      - run: terraform validate
+
+      - name: Plan
+        id: plan
+        run: terraform plan -input=false -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Comment the plan
+        uses: actions/github-script@v7
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+        with:
+          script: |
+            const body = `#### Terraform plan \`${{ steps.plan.outcome }}\`
+            <details><summary>Show plan</summary>
+
+            \`\`\`terraform
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body.slice(0, 65000),
+            })
+
+      # continue-on-error above let the comment post even for a failed plan.
+      # This makes the job red anyway, so the failure cannot be merged past.
+      - if: steps.plan.outcome == 'failure'
+        run: exit 1</code></pre>
+
+<p>Three details that are easy to get wrong:</p>
+
+<p><strong><code>id-token: write</code></strong> is what allows GitHub to mint the OIDC token. Without
+it the credentials step fails with an error about the token, not about permissions, and it is
+unobvious.</p>
+
+<p><strong><code>continue-on-error</code> plus an explicit <code>exit 1</code></strong> is what posts
+the plan output even when the plan fails — which is when you most want to read it — while still
+failing the check.</p>
+
+<p><strong>Truncate the comment.</strong> GitHub rejects comments over 65,536 characters, and a plan
+touching thirty resources gets there easily. A workflow that fails on a large plan is worse than one
+that truncates.</p>
+
+<h2>Apply on merge</h2>
+
+<pre class="language-yaml"><code class="language-yaml">  apply:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # A GitHub environment can require a human approval before the job starts.
+    # For production, turn that on — it is the last gate before a real change.
+    environment: production
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - run: terraform init -input=false
+
+      # ⚠️ -auto-approve, and this is the one place it is correct: the plan was
+      # reviewed on the pull request and a human approved the environment. There
+      # is no terminal here to type "yes" into.
+      - run: terraform apply -input=false -auto-approve</code></pre>
+
+<p>⚠️ A subtlety worth knowing: this re-plans at apply time rather than applying the plan file from
+the pull request. That is simpler, and it means the applied change is not <em>exactly</em> the
+reviewed one if <code>main</code> moved underneath it. The rigorous alternative is to upload
+<code>tfplan</code> as an artifact and apply that file — at the cost that a stale plan is rejected
+outright and has to be regenerated. Pick deliberately; most teams take the re-plan.</p>
+
+<h2>Building and shipping the image</h2>
+
+<p>The application changes far more often than the infrastructure, so the image pipeline is a
+separate workflow on a separate path filter.</p>
+
+<pre class="language-yaml"><code class="language-yaml">name: deploy-api
+
+on:
+  push:
+    branches: [main]
+    paths: ['pizza/pizza-springboot-backend/**']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    # Tests in their OWN job, before any image is built. The Dockerfile uses
+    # -DskipTests deliberately: a build that also tests makes every image build
+    # pay for the suite and reports a test failure as a build failure.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - run: ./mvnw -B test
+        working-directory: pizza/pizza-springboot-backend
+
+  build-and-deploy:
+    needs: test
+    # ⚠️ An ARM runner, because the task definition says ARM64 and the two MUST
+    # match. Building amd64 here and running ARM64 there gives you
+    # `exec format error` at runtime with nothing failing at build time.
+    # These runners are free for public repositories.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::329580012644:role/pizza-tf-github-actions
+          aws-region: us-west-2
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: pizza/pizza-springboot-backend
+          platforms: linux/arm64
+          push: true
+          # ⚠️ Tagged with the commit SHA, never :latest. The ECR repository is
+          # IMMUTABLE, so :latest would fail the push anyway — but the real
+          # reason is that ":latest is running" is not an answer to "what is
+          # running?", and it makes a rollback impossible to name.
+          tags: ${{ steps.ecr.outputs.registry }}/pizza-tf:${{ github.sha }}
+          # A CI runner starts with an empty layer cache. Without this every
+          # build re-downloads the whole Maven dependency tree.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Roll the service onto the new image
+        run: |
+          aws ecs update-service \
+            --cluster pizza-tf --service pizza-tf \
+            --force-new-deployment
+
+          # ⚠️ Without this the job goes green the moment the API call returns,
+          # which is BEFORE the new task is healthy. A deploy that fails its
+          # health check would report success.
+          aws ecs wait services-stable \
+            --cluster pizza-tf --services pizza-tf</code></pre>
+
+<h2>⚠️ Where this pipeline is dishonest, and how to fix it</h2>
+
+<p><code>update-service --force-new-deployment</code> re-pulls the tag the task definition already
+names. If the task definition says <code>:abc123</code> and you push <code>:def456</code>, forcing a
+deployment redeploys <strong>abc123</strong>.</p>
+
+<p>It appears to work in tutorials because they use <code>:latest</code>, where the tag does move —
+and that is exactly the setup where you cannot tell what is running.</p>
+
+<p>Two honest options. Either have Terraform own the image tag, and make the application pipeline
+trigger a Terraform run:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform apply -var "image_tag=${{ github.sha }}"</code></pre>
+
+<p>Or have the pipeline register a new task definition revision and update the service to it:</p>
+
+<pre class="language-yaml"><code class="language-yaml">      - uses: aws-actions/amazon-ecs-render-task-definition@v1
+        id: taskdef
+        with:
+          task-definition: taskdef.json
+          container-name: api
+          image: ${{ steps.ecr.outputs.registry }}/pizza-tf:${{ github.sha }}
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.taskdef.outputs.task-definition }}
+          service: pizza-tf
+          cluster: pizza-tf
+          wait-for-service-stability: true</code></pre>
+
+<p>⚠️ The second creates task definition revisions <em>outside</em> Terraform, so the next
+<code>terraform apply</code> sees drift and proposes to set the image back. Add
+<code>ignore_changes = [task_definition]</code> on the service and accept that Terraform no longer
+owns which image runs — a real trade, and one to make deliberately rather than discover.</p>
+
+<p>The first option keeps one source of truth and is what this stack does.</p>
+
+<h2>What CI should run on every pull request</h2>
+
+<p>Even before any AWS access:</p>
+
+<pre class="language-bash"><code class="language-bash">terraform fmt -check -recursive    # formatting, seconds, no credentials
+terraform validate                 # schema, no credentials
+tflint                             # provider-aware lint: bad instance types, etc.
+tfsec / checkov                     # security: public buckets, open groups, no encryption</code></pre>
+
+<p>The first two are free and catch a surprising amount. This track's own posts are checked with
+<code>terraform validate</code> against the pinned provider before publishing, which is how a renamed
+argument gets caught rather than shipped.</p>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-production-practices">Lesson 15</a> is what changes when the state
+file matters — drift, secrets, <code>prevent_destroy</code>, and how to read a plan properly.</p>

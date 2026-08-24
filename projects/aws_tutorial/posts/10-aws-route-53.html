@@ -1,0 +1,129 @@
+<p>Route 53 is DNS with an AWS-shaped advantage. Most of it is ordinary — zones, records, TTLs — but
+one record type does something other DNS providers cannot, and it is the reason this site uses it.</p>
+
+<h2>Alias records</h2>
+
+<p>DNS has a rule: the apex of a domain — <code>example.com</code> with no subdomain — cannot be a
+CNAME. That is a protocol constraint, not a provider limitation. So pointing a bare domain at a
+CloudFront distribution or a load balancer, both of which give you a hostname rather than an IP,
+is normally impossible.</p>
+
+<p>Route 53's <strong>ALIAS</strong> is an AWS-specific record that resolves to the target's
+current addresses at query time and returns them as if they were A records. It works at the apex,
+it tracks the target's IPs as they change, and <strong>queries against it are free</strong>.</p>
+
+<pre class="language-bash"><code class="language-bash">aws route53 change-resource-record-sets \
+  --hosted-zone-id Z000531818AC6P1IJ8LJL \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "lovemesomecoding.com",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "Z2FDTNDATAQYW2",
+          "DNSName": "d32j0xfm775hkk.cloudfront.net",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }]
+  }'</code></pre>
+
+<p>Note the record <code>Type</code> is <code>A</code>, not some special alias type — an alias is
+an A record with a target instead of a value. And that
+<code>HostedZoneId: Z2FDTNDATAQYW2</code> is not a typo or an account-specific value: it is the
+fixed, global zone id for CloudFront, the same in every account. Load balancers have a different
+one per region.</p>
+
+<h2>Hosted zones and delegation</h2>
+
+<p>A hosted zone holds the records for one domain. Creating one gives you four name servers, and
+nothing takes effect until the registrar points at them.</p>
+
+<p>That is the step that catches people. If the domain is registered elsewhere, the zone can be
+perfect and completely ignored — the internet is still asking the old provider. And deleting and
+recreating a zone gives you <em>different</em> name servers, so a zone recreated without updating
+the registrar takes the domain offline.</p>
+
+<pre class="language-bash"><code class="language-bash">aws route53 get-hosted-zone --id Z000531818AC6P1IJ8LJL \
+  --query "DelegationSet.NameServers"</code></pre>
+
+<p>Compare that against what the registrar publishes. If they differ, nothing else you do to the
+zone matters.</p>
+
+<h2>The records worth knowing</h2>
+
+<table>
+  <thead><tr><th>Type</th><th>Holds</th></tr></thead>
+  <tbody>
+    <tr><td>A / AAAA</td><td>An IPv4 / IPv6 address</td></tr>
+    <tr><td>ALIAS</td><td>An AWS target. Works at the apex; free to query</td></tr>
+    <tr><td>CNAME</td><td>Another name. Never at the apex, and never alongside other records</td></tr>
+    <tr><td>MX</td><td>Mail servers, with priorities</td></tr>
+    <tr><td>TXT</td><td>Arbitrary text — SPF, DKIM, DMARC, domain verification</td></tr>
+    <tr><td>NS</td><td>Delegation for the zone or a subdomain</td></tr>
+    <tr><td>CAA</td><td>Which authorities may issue certificates for this domain</td></tr>
+  </tbody>
+</table>
+
+<h2>Routing policies</h2>
+
+<p>A name can have several records with different policies, and Route 53 picks between them:</p>
+
+<ul>
+  <li><strong>Simple</strong> — one answer. The default and usually right</li>
+  <li><strong>Weighted</strong> — split traffic by ratio. This is how you do a gradual migration
+      or a canary between two stacks</li>
+  <li><strong>Failover</strong> — primary, and a secondary used when a health check says the
+      primary is down</li>
+  <li><strong>Latency</strong> — send each client to the region that answers fastest for them</li>
+  <li><strong>Geolocation</strong> — route by where the query came from, for compliance or
+      language</li>
+</ul>
+
+<p>Weighted and failover both depend on health checks to be useful, and a health check is billed
+per check — cheap, but not free, and easy to accumulate.</p>
+
+<h2>TTL is a rollback lever</h2>
+
+<p>TTL controls how long resolvers cache an answer, and it is the one setting people get wrong in
+both directions. A long TTL is efficient and means a change takes that long to reach everyone. A
+short TTL costs more queries and lets you move fast.</p>
+
+<p>The practical rule: <strong>lower the TTL before a change, not during one.</strong> Drop it to
+60 seconds a day ahead of a migration, do the cutover, confirm, then raise it again. Lowering it
+during an incident does nothing for the caches that already hold the old value at the old TTL.</p>
+
+<p>This site's apex records sit at a 60-second TTL for exactly that reason — the documented
+rollback for the CloudFront cutover is to point them back at the old server, and that only works if
+the world stops asking for the current answer within a minute.</p>
+
+<h2>Health checks and failover</h2>
+
+<p>Route 53 health checks run from several AWS locations and mark an endpoint healthy or not. Wired
+to a failover pair, they move traffic to a standby when the primary stops answering.</p>
+
+<p>Two things about them are worth knowing before you rely on it. They check from outside your
+VPC, so the endpoint has to be publicly reachable — a private ALB cannot be checked directly, and
+the usual workaround is a CloudWatch alarm as the health-check source instead. And DNS failover is
+bounded by TTL: clients holding a cached answer keep using it regardless of health, so a five
+-minute TTL means five minutes of failover latency in the worst case.</p>
+
+<p>That makes DNS failover the right tool for regional or whole-stack outages, and the wrong tool
+for individual unhealthy instances — that is the load balancer's job, and it acts in seconds.</p>
+
+<h2>Checking a change, properly</h2>
+
+<pre class="language-bash"><code class="language-bash">dig +short A lovemesomecoding.com @8.8.8.8
+dig +short NS lovemesomecoding.com @8.8.8.8</code></pre>
+
+<p>Query a public resolver explicitly. <code>curl</code> and a plain <code>dig</code> both use your
+machine's resolver, which may be holding the old answer — so a change that has propagated perfectly
+looks broken, and a change that has not looks fine because you are hitting a cache that agrees with
+you. Ask an external resolver directly and you get the real answer.</p>
+
+<pre class="language-bash"><code class="language-bash">aws route53 get-change --id /change/C1234567890ABC</code></pre>
+
+<p>That reports <code>PENDING</code> or <code>INSYNC</code> — whether Route 53 has pushed the change
+to all its own name servers. It says nothing about resolver caches elsewhere, which is what TTL
+governs.</p>

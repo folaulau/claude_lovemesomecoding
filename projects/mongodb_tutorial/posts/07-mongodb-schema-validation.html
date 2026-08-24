@@ -1,0 +1,199 @@
+<p>MongoDB will accept any document you send it. That flexibility is the point &mdash; it is what
+lets you add a field without a migration window. It is also why a single bug can put
+<code>views: "12"</code> into a collection where every other document has a number, and nothing
+tells you until a total comes back wrong.</p>
+
+<p>Schema validation is how you keep the flexibility where you want it and close the door where you
+do not. It is opt-in, nobody turns it on for you, and it takes about ten minutes to add.</p>
+
+<h2>What goes wrong without it</h2>
+
+<p>The failure is never an error. It is a number that is quietly incorrect:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.demo.insertOne({ slug: "a", stats: { views: 12 } })     // number
+db.demo.insertOne({ slug: "b", stats: { views: "12" } })   // string, from a bug
+
+db.demo.aggregate([{ $group: { _id: null, total: { $sum: "$stats.views" } } }])
+// [ { _id: null, total: 12 } ]   ← the string was skipped, not added</code></pre>
+
+<p>Twelve, not twenty-four. <code>$sum</code> ignores values that are not numeric, and it does so
+silently. A report that is wrong by an unknown amount is worse than one that fails.</p>
+
+<h2>Adding a validator</h2>
+
+<p>Validation is a property of the collection, expressed with <code>$jsonSchema</code>. On an
+existing collection use <code>collMod</code>; on a new one, pass it to
+<code>createCollection</code>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.runCommand({
+  collMod: "reels",
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["slug", "title", "status"],
+      properties: {
+        slug:   { bsonType: "string", pattern: "^[a-z0-9-]+$" },
+        title:  { bsonType: "string", maxLength: 140 },
+        status: { enum: ["DRAFT", "SCHEDULED", "PUBLISHED", "ARCHIVED"] },
+        stats: {
+          bsonType: "object",
+          properties: {
+            views: { bsonType: ["long", "int"], minimum: 0 }
+          }
+        }
+      }
+    }
+  },
+  validationLevel: "moderate",
+  validationAction: "error"
+})</code></pre>
+
+<p>Note <code>bsonType</code> rather than JSON Schema&rsquo;s <code>type</code>. The difference
+matters: <code>type: "number"</code> cannot tell an <code>int</code> from a <code>long</code> from a
+<code>double</code>, and those are genuinely different BSON types. Listing both
+<code>"long"</code> and <code>"int"</code> above is deliberate &mdash; a driver may send either for
+a small whole number, and a validator that accepts only one will reject perfectly good writes.</p>
+
+<p>With that in place, the bad document is refused:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.insertOne({ slug: "c", title: "x", status: "PUBLISHED", stats: { views: "12" } })
+// MongoServerError: Document failed validation</code></pre>
+
+<h2>The two dials</h2>
+
+<p><code>validationLevel</code> decides <em>which</em> documents are checked:</p>
+
+<ul>
+  <li><code>strict</code> &mdash; every insert and every update. The default.</li>
+  <li><code>moderate</code> &mdash; inserts, and updates to documents that <em>already</em> pass.
+      Documents that were invalid before you added the rule are left alone.</li>
+  <li><code>off</code> &mdash; nothing.</li>
+</ul>
+
+<p><code>validationAction</code> decides what happens when a document fails:</p>
+
+<ul>
+  <li><code>error</code> &mdash; reject the write. The default.</li>
+  <li><code>warn</code> &mdash; accept it, and log to the server log.</li>
+</ul>
+
+<p>That pairing is what makes this usable on a collection that already has data. Turning on
+<code>strict</code> + <code>error</code> against a live collection full of historical documents
+breaks every update to any of them. The path that works is
+<code>moderate</code>&nbsp;+&nbsp;<code>warn</code> first, watch the logs, fix the stragglers, then
+tighten.</p>
+
+<h2>Finding what would fail, before you turn it on</h2>
+
+<p>You do not have to guess. <code>$jsonSchema</code> works as a query operator too, so you can ask
+the collection directly:</p>
+
+<pre class="language-javascript"><code class="language-javascript">const schema = { bsonType: "object", required: ["slug", "status"],
+                 properties: { status: { enum: ["DRAFT", "SCHEDULED", "PUBLISHED", "ARCHIVED"] } } }
+
+db.reels.countDocuments({ $jsonSchema: schema })              // documents that WOULD pass
+db.reels.countDocuments({ $nor: [{ $jsonSchema: schema }] })  // documents that would FAIL</code></pre>
+
+<p>There is no &ldquo;does not match&rdquo; operator, which is why the second line wraps the schema
+in <code>$nor</code> &mdash; the negation of a one-element list. Run it before enabling
+anything. If it returns zero you can go straight to
+<code>strict</code>; if it does not, you now have the list to clean up rather than a production
+incident to diagnose.</p>
+
+<p><code>validate()</code> is a different thing despite the name &mdash; it checks the
+collection&rsquo;s internal structure for corruption, not your documents against your rules. It is
+not what you want here.</p>
+
+<h2>Reading the failure</h2>
+
+<p>&ldquo;Document failed validation&rdquo; on its own would be useless. The detail is in
+<code>errInfo</code>, which the shell hides unless you ask for it &mdash; and it names the rule,
+the field and the offending value:</p>
+
+<pre class="language-javascript"><code class="language-javascript">try { db.t.insertOne({ status: "WEIRD" }) }
+catch (e) { printjson(e.errInfo.details) }</code></pre>
+
+<pre class="language-json"><code class="language-json">{
+  "operatorName": "$jsonSchema",
+  "schemaRulesNotSatisfied": [
+    { "operatorName": "properties",
+      "propertiesNotSatisfied": [
+        { "propertyName": "status",
+          "details": [ { "operatorName": "enum",
+                         "reason": "value was not found in enum",
+                         "consideredValue": "WEIRD" } ] } ] },
+    { "operatorName": "required", "missingProperties": [ "slug" ] }
+  ]
+}</code></pre>
+
+<p>Note that it reports <em>every</em> broken rule, not just the first &mdash; both the bad enum
+value and the missing required field. Any driver exposes the same structure, so this is the thing
+to log when a write is rejected in production. Logging only the message throws away the one piece
+of information you need.</p>
+
+<h2>Evolving a schema that is already live</h2>
+
+<p>Adding a required field to a collection with a million existing documents is the case that
+actually comes up. The sequence that works has four steps, and the order matters:</p>
+
+<ol>
+  <li><strong>Write the field first.</strong> Deploy application code that sets it on every new and
+      updated document, while the validator still ignores it.</li>
+  <li><strong>Backfill.</strong> One <code>updateMany</code> for the historical documents.</li>
+  <li><strong>Verify.</strong> The <code>$nor</code> query above should return zero.</li>
+  <li><strong>Then require it.</strong> Only now add the field to <code>required</code>.</li>
+</ol>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.updateMany(
+  { publishedAt: { $exists: false } },
+  { $set: { publishedAt: null } }
+)</code></pre>
+
+<p>Doing it the other way round &mdash; tightening the validator first and backfilling after
+&mdash; means every write to an un-backfilled document is rejected in the window between the two,
+which on a busy collection is an outage rather than a migration.</p>
+
+<h2>Where validation should not do the work</h2>
+
+<p>A database validator is a <strong>backstop</strong>, not your application&rsquo;s input
+handling. It runs after the request has travelled all the way to the database, and its error
+message names a schema rather than a form field. ReelCMS validates at the API boundary with bean
+validation, where the message can be useful to a human:</p>
+
+<pre class="language-java"><code class="language-java">public record ReelRequest(
+        @NotBlank @Size(max = 140) String title,
+        @Size(max = 90) String slug,
+        @Size(max = 800) String description,
+        ReelStatus status,
+        Instant scheduledFor,
+        String creatorId,
+        List&lt;String&gt; tags,
+        List&lt;String&gt; collectionIds,
+        VideoDto video) {}</code></pre>
+
+<p>The two layers answer different questions. The DTO asks &ldquo;is this request
+well-formed?&rdquo; and can say exactly which field is wrong. The collection validator asks
+&ldquo;could this document have come from a code path I forgot about?&rdquo; &mdash; a migration
+script, an admin console, a colleague in <code>mongosh</code>. You want both, and you want the
+application layer to be the one users actually hit.</p>
+
+<h2>What it cannot do</h2>
+
+<p>Validation is per-document and per-write. It cannot express a rule that spans documents
+&mdash; &ldquo;this slug is unique&rdquo; is a <em>unique index</em>, not a validator, and
+&ldquo;this creatorId exists&rdquo; is not expressible at all, because MongoDB has no foreign keys.
+Referential integrity remains the application&rsquo;s job no matter how good your schema is.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Flexible by default means wrong types get in silently, and aggregations skip them.</li>
+  <li>Use <code>$jsonSchema</code> with <code>bsonType</code>, not JSON Schema&rsquo;s
+      <code>type</code>.</li>
+  <li>Accept both <code>"int"</code> and <code>"long"</code> for whole numbers.</li>
+  <li>On existing data: <code>moderate</code> + <code>warn</code>, then tighten.</li>
+  <li>Query with <code>{ $nor: [{ $jsonSchema }] }</code> to list what would fail first.</li>
+  <li>Validate in the application for the message; validate in the database for the paths you
+      forgot.</li>
+  <li>Uniqueness is an index. Foreign keys do not exist.</li>
+</ul>

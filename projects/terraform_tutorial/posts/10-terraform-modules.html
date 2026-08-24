@@ -1,0 +1,234 @@
+<p>A module is a directory containing <code>.tf</code> files. That is the entire definition — the
+directory you have been working in is already one, the root module. Calling another directory from
+it makes that directory a child module.</p>
+
+<h2>The shape</h2>
+
+<pre class="language-bash"><code class="language-bash">infra/
+  main.tf              <- the root module
+  variables.tf
+  outputs.tf
+  versions.tf
+  modules/
+    network/           <- a child module
+      main.tf
+      variables.tf     its inputs
+      outputs.tf       its outputs — the ONLY things a caller can read
+    database/
+    service/</code></pre>
+
+<p>Three files, and the split matters more in a module than in a root: <code>variables.tf</code> and
+<code>outputs.tf</code> are the module's public API, and <code>main.tf</code> is the part callers
+should never need to read.</p>
+
+<h2>Calling one</h2>
+
+<pre class="language-hcl"><code class="language-hcl">module "network" {
+  source = "./modules/network"
+
+  name_prefix = "pizza-tf"
+  vpc_cidr    = "10.20.0.0/16"
+  tags        = { Project = "terraform-tutorial" }
+}
+
+module "database" {
+  source = "./modules/database"
+
+  name_prefix        = "pizza-tf"
+  vpc_id             = module.network.vpc_id
+  private_subnet_ids = module.network.private_subnet_ids
+}</code></pre>
+
+<p><code>module.network.vpc_id</code> is the reference form, and it works only because the network
+module declares <code>output "vpc_id"</code>. <strong>A module's resources are otherwise completely
+invisible to its caller</strong> — there is no reaching inside for
+<code>module.network.aws_vpc.this.id</code>.</p>
+
+<p>That opacity is the point. The outputs are a contract, and anything not in them can be
+restructured without breaking callers.</p>
+
+<p>⚠️ After adding or changing a <code>source</code>, run <code>terraform init</code> again. Terraform
+records module sources during init, and a new module is otherwise reported as not installed.</p>
+
+<h2>Writing one</h2>
+
+<p>The network module from the stack this track deploys, cut down to its skeleton:</p>
+
+<pre class="language-hcl"><code class="language-hcl">variable "name_prefix" {
+  type        = string
+  description = "Prefix for every resource name, so a destroy is provably complete."
+}
+
+variable "vpc_cidr" {
+  type        = string
+  default     = "10.20.0.0/16"
+  description = "CIDR block for the VPC."
+
+  validation {
+    condition     = can(cidrnetmask(var.vpc_cidr))
+    error_message = "vpc_cidr must be a valid CIDR block."
+  }
+}
+
+variable "tags" {
+  type        = map(string)
+  default     = {}
+  description = "Tags applied to every resource in this module."
+}</code></pre>
+
+<pre class="language-hcl"><code class="language-hcl">resource "aws_vpc" "this" {
+  cidr_block = var.vpc_cidr
+
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(var.tags, { Name = var.name_prefix })
+}</code></pre>
+
+<pre class="language-hcl"><code class="language-hcl">output "vpc_id" {
+  description = "Id of the VPC."
+  value       = aws_vpc.this.id
+}
+
+output "vpc_cidr" {
+  description = "CIDR of the VPC, for rules that allow VPC-internal traffic."
+  value       = aws_vpc.this.cidr_block
+}</code></pre>
+
+<p>Three conventions worth adopting from this:</p>
+
+<p><strong>Take a <code>name_prefix</code> and a <code>tags</code> map.</strong> A module that
+hard-codes names can only be called once — the second call collides on every name. Prefixing and
+merging tags makes it reusable and makes teardown verifiable.</p>
+
+<p><strong>Name the single instance <code>"this"</code>.</strong> The module is already called
+<code>network</code>; naming its VPC <code>aws_vpc.network</code> stutters into
+<code>module.network.aws_vpc.network</code>.</p>
+
+<p><strong>Do not put a <code>provider</code> block in a child module.</strong> Providers are
+configured by the root and inherited. A module that configures its own cannot be used in a
+configuration that needs a different region, and it cannot be removed cleanly — Terraform needs the
+provider to exist in order to destroy what it made.</p>
+
+<h2>Module sources</h2>
+
+<pre class="language-hcl"><code class="language-hcl">module "local_example" {
+  source = "./modules/network"
+}
+
+module "registry_example" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~&gt; 5.0"        # only registry sources take `version`
+  name    = "example"
+}
+
+module "git_example" {
+  # pinned to a tag. a branch name is not a version.
+  source = "git::https://github.com/example/terraform-modules.git//network?ref=v1.4.0"
+}</code></pre>
+
+<p>⚠️ <strong>Pin git sources to a tag or commit, never a branch.</strong> An unpinned source means
+your infrastructure changes when someone else pushes, and the change arrives on whichever
+<code>init</code> happens to re-fetch. The <code>//</code> in the git URL separates the repository
+from a subdirectory within it.</p>
+
+<h2>count and for_each on modules</h2>
+
+<pre class="language-hcl"><code class="language-hcl">module "service" {
+  source   = "./modules/service"
+  for_each = toset(["api", "worker"])
+
+  name_prefix = "pizza-tf-${each.key}"
+}</code></pre>
+
+<p>Same semantics as on a resource, including the reason to prefer <code>for_each</code> — and the
+consequences are larger, because a shifted index destroys and recreates everything the module
+contains.</p>
+
+<h2>The dependency cycle you will hit</h2>
+
+<p>This one is worth recognising by shape, because the error message names two modules and neither
+looks wrong.</p>
+
+<p>In the stack this track deploys: the <strong>database</strong> module needs the application's
+security group, to write "allow MySQL from this group". The <strong>service</strong> module needs the
+database's endpoint, for the JDBC URL. Put the security group in either module and they reference
+each other:</p>
+
+<pre class="language-bash"><code class="language-bash">Error: Cycle: module.database..., module.service...</code></pre>
+
+<p>The fix is to hoist the shared value to whoever calls them both:</p>
+
+<pre class="language-hcl"><code class="language-hcl"># in the ROOT module, not in either child
+resource "aws_security_group" "app" {
+  name   = "pizza-tf-app"
+  vpc_id = module.network.vpc_id
+}
+
+module "database" {
+  source                = "./modules/database"
+  app_security_group_id = aws_security_group.app.id
+}
+
+module "service" {
+  source                = "./modules/service"
+  app_security_group_id = aws_security_group.app.id
+  db_address            = module.database.address
+}</code></pre>
+
+<p><strong>A cycle between two modules is nearly always a value that belongs to their caller.</strong>
+Recognising that saves a lot of time.</p>
+
+<h2>⚠️ When not to write a module</h2>
+
+<p>The part most module advice leaves out.</p>
+
+<p><strong>Do not write one for a single resource.</strong> A module wrapping
+<code>aws_s3_bucket</code> that passes six arguments straight through adds a layer, a version and an
+indirection, and buys nothing. The resource was already the abstraction.</p>
+
+<p><strong>Do not write one until you have the second caller.</strong> A module designed from one use
+case gets its interface wrong, because you cannot see which parts are general. Duplicate it once,
+compare the two, and then extract — the differences tell you what the variables are.</p>
+
+<p><strong>Do not write one to organise a single stack.</strong> Splitting one root module into six
+child modules that are each called once makes it harder to read, not easier. Multiple
+<code>.tf</code> files in one directory are free and do the organising job perfectly.</p>
+
+<p>The test: <em>is this called more than once, or by more than one configuration?</em> If not, it is
+a file, not a module.</p>
+
+<p>The counterweight, honestly stated: the stack in this track has three modules, each called once.
+They earn their place because they are the boundaries the lessons are organised around — network,
+database, service — and because they are the units someone would plausibly replace. That is a
+teaching decision, and in a codebase you were only shipping, three files would be defensible.</p>
+
+<h2>Registry modules</h2>
+
+<p>The community VPC module handles IPv6, flow logs, VPN gateways and a dozen other things this
+track's does not, and it is battle-tested:</p>
+
+<pre class="language-hcl"><code class="language-hcl">module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~&gt; 5.0"
+
+  name = "pizza-tf"
+  cidr = "10.20.0.0/16"
+
+  azs             = ["us-west-2a", "us-west-2b"]
+  private_subnets = ["10.20.10.0/24", "10.20.11.0/24"]
+  public_subnets  = ["10.20.0.0/24", "10.20.1.0/24"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true
+}</code></pre>
+
+<p>Use them in production. The trade is that a general-purpose module has a large surface — the VPC
+module has well over a hundred inputs — and when something is wrong you are debugging someone
+else's abstraction. This track writes its own because reading the whole thing is the lesson.</p>
+
+<h2>Next</h2>
+
+<p><a href="/terraform/terraform-environments-and-workspaces">Lesson 11</a> uses these modules to run
+dev, staging and prod off one codebase — and explains why workspaces are the wrong tool for
+production.</p>

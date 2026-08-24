@@ -1,0 +1,185 @@
+<p>MongoDB can join. <code>$lookup</code> pulls documents from another collection into the pipeline,
+and it works well &mdash; within limits that are worth knowing before you build a report on it.
+This lesson covers the join, the stages that usually accompany it, and the one mistake that makes a
+join return absolutely nothing without any error at all.</p>
+
+<h2>$lookup</h2>
+
+<p>Four fields, and the names are unfortunately easy to mix up:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.comments.aggregate([
+  { $lookup: {
+      from:         "reels",     // the OTHER collection
+      localField:   "reelId",    // field on the document flowing through
+      foreignField: "_id",       // field on the other collection
+      as:           "reel"       // where to put the result
+  } }
+])</code></pre>
+
+<p><code>as</code> is always an <strong>array</strong>, even when exactly one document matches
+&mdash; because <code>$lookup</code> is a left outer join and cannot know there will only be one.
+A non-match produces an empty array rather than dropping the row.</p>
+
+<h2>The trap: types must match exactly</h2>
+
+<p><code>$lookup</code> compares <code>localField</code> to <code>foreignField</code> with
+<strong>strict type equality</strong>. A BSON string never equals an ObjectId, even when they print
+identically. When they differ, every row gets an empty array, the <code>$unwind</code> after it
+drops all of them, and your report is <code>[]</code>:</p>
+
+<pre class="language-javascript"><code class="language-javascript">// metadata.reelId stored as a STRING, reels._id is an ObjectId
+db.view_events.aggregate([
+  { $lookup: { from: "reels", localField: "metadata.reelId", foreignField: "_id", as: "reel" } },
+  { $match: { "reel.0": { $exists: true } } },
+  { $count: "matched" }
+])
+// []   ← nothing matched, and nothing said so</code></pre>
+
+<p>This is not hypothetical. It is the single most common way a MongoDB aggregation silently fails,
+and it usually arrives through an object mapper: you declare a Java field as <code>String</code>
+because your API uses strings, and it lands in BSON as a string while the <code>_id</code> it
+points at is an ObjectId.</p>
+
+<p>Two fixes. Store the right type in the first place &mdash; which is what ReelCMS does with
+<code>@Field(targetType = FieldType.OBJECT_ID)</code>, from lesson 3. Or convert inside the
+pipeline, which works but pays the cost on every query rather than once at write time:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $addFields: { reelOid: { $toObjectId: "$metadata.reelId" } } }</code></pre>
+
+<p>When a join returns nothing, check the types before you check the logic:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.view_events.findOne().metadata.reelId    // ObjectId('...') or '...' ?
+db.reels.findOne()._id                      // compare</code></pre>
+
+<h2>$unwind after a join</h2>
+
+<p>Because <code>as</code> is an array, most joins are followed by an <code>$unwind</code> to
+flatten it back to an object:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{ $unwind: "$reel" }                                                   // drops non-matches
+{ $unwind: { path: "$reel", preserveNullAndEmptyArrays: true } }       // keeps them</code></pre>
+
+<p>The default <strong>discards</strong> documents whose array is empty, which turns your left
+outer join into an inner join. That is often what you want &mdash; a view event whose reel was
+deleted has nothing useful to report &mdash; but it should be a decision, not a surprise. It is
+also why a type mismatch produces zero rows rather than rows full of nulls.</p>
+
+<h2>Order matters more than anything else</h2>
+
+<p>A join is the most expensive stage in most pipelines, so the rule is: <strong>reduce the stream
+before you join, never after</strong>.</p>
+
+<p>ReelCMS&rsquo;s top-reels report aggregates thirty thousand view events down to eight rows, and
+only then joins:</p>
+
+<pre class="language-java"><code class="language-java">var agg = newAggregation(
+        match(Criteria.where("ts").gte(Date.from(from))),
+        group("metadata.reelId").count().as("views").avg("watchSeconds").as("avgWatch"),
+        sort(Sort.Direction.DESC, "views"),
+        limit(limit),
+        lookup("reels", "_id", "_id", "reel"),
+        unwind("reel", false));</code></pre>
+
+<p>Read the stage order: <code>$match</code> narrows by date and can use an index,
+<code>$group</code> collapses thirty thousand events into one row per reel, <code>$limit</code>
+cuts that to eight, and <em>then</em> eight lookups run. Move the <code>$lookup</code> to the top
+and it joins every event ever recorded before throwing almost all of it away.</p>
+
+<p>Notice the <code>localField</code> in that call is <code>_id</code>, not
+<code>metadata.reelId</code>. After a <code>$group</code>, the grouping key lives in
+<code>_id</code> &mdash; the original field name is gone.</p>
+
+<h2>The sub-pipeline form</h2>
+
+<p>The four-field <code>$lookup</code> can only express &ldquo;this field equals that field&rdquo;.
+For anything else &mdash; a join with an extra condition, or one that pre-filters the other
+collection &mdash; there is a second form that takes a whole pipeline:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.aggregate([
+  { $lookup: {
+      from: "comments",
+      let:  { reelId: "$_id" },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$reelId", "$$reelId"] } } },
+        { $match: { likes: { $gt: 10 } } },
+        { $sort:  { createdAt: -1 } },
+        { $limit: 3 }
+      ],
+      as: "topComments"
+  } }
+])</code></pre>
+
+<p>Three pieces of syntax there. <code>let</code> declares variables from the outer document;
+inside the sub-pipeline they are referenced with <strong>two</strong> dollar signs
+(<code>$$reelId</code>) to distinguish them from the inner collection&rsquo;s own fields. And the
+join condition has to go inside <code>$expr</code>, because comparing two fields is not something an
+ordinary filter can do.</p>
+
+<p>This form is how you fetch &ldquo;the three most-liked comments per reel&rdquo; in one query
+rather than one query per reel. It is more expensive than the simple form &mdash; the sub-pipeline
+runs once per input document &mdash; so the advice about reducing the stream first applies twice
+over.</p>
+
+<h2>$facet &mdash; several pipelines, one pass</h2>
+
+<p>A dashboard usually needs four unrelated figures at once. <code>$facet</code> runs several
+pipelines over the same input and returns all their results in a single document, which means one
+round trip instead of four:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.aggregate([
+  { $match: { status: "PUBLISHED" } },
+  { $facet: {
+      totals:     [ { $group: { _id: null, views: { $sum: "$stats.views" } } } ],
+      byStatus:   [ { $sortByCount: "$status" } ],
+      topByLikes: [ { $sort: { "stats.likes": -1 } }, { $limit: 5 },
+                    { $project: { title: 1, "stats.likes": 1 } } ]
+  } }
+])</code></pre>
+
+<p>Each sub-pipeline sees the same documents the <code>$facet</code> received, and they do not
+affect one another. The catch: only the stages <em>before</em> the <code>$facet</code> can use an
+index, so put your <code>$match</code> above it and keep the input small.</p>
+
+<h2>$dateTrunc &mdash; grouping by day</h2>
+
+<p>Time-series reports group by a truncated date. The older idiom formats the date into a string
+with <code>$dateToString</code> and groups on that, which works but produces a <em>string</em> key
+&mdash; so the following sort is lexicographic and anything downstream has to re-parse it.
+<code>$dateTrunc</code> keeps it a real date:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.view_events.aggregate([
+  { $match: { ts: { $gte: from } } },
+  { $group: { _id: { $dateTrunc: { date: "$ts", unit: "day" } }, views: { $sum: 1 } } },
+  { $sort: { _id: 1 } }
+])</code></pre>
+
+<p><code>unit</code> takes <code>"hour"</code>, <code>"day"</code>, <code>"week"</code>,
+<code>"month"</code> and more, and <code>binSize</code> lets you bucket by, say, fifteen minutes.
+Add <code>timezone</code> if &ldquo;a day&rdquo; means a day where your users are rather than in
+UTC &mdash; a report that shifts by a few hours is usually this.</p>
+
+<h2>When a join means you modelled it wrong</h2>
+
+<p>One <code>$lookup</code> in a reporting pipeline is fine. A <code>$lookup</code> on your hottest
+read path is a signal. If every feed request has to join creators to reels, the creator&rsquo;s
+display fields probably belong <em>on</em> the reel &mdash; which is exactly the denormalization
+from lesson 6.</p>
+
+<p>The rule of thumb: joins belong in reports, which run occasionally and tolerate latency. On the
+path that serves every page view, model the join away instead.</p>
+
+<h2>The short version</h2>
+
+<ul>
+  <li><code>as</code> is always an array; <code>$unwind</code> flattens it and drops non-matches by
+      default.</li>
+  <li><strong>Types must match exactly.</strong> String versus ObjectId is the classic silent
+      failure.</li>
+  <li>Reduce before you join. <code>$match</code>, <code>$group</code>, <code>$limit</code>, then
+      <code>$lookup</code>.</li>
+  <li>After <code>$group</code>, the key is in <code>_id</code> &mdash; join on that.</li>
+  <li><code>$facet</code> gives a whole dashboard in one round trip; index use stops at its
+      boundary.</li>
+  <li><code>$dateTrunc</code> beats <code>$dateToString</code> because it keeps a real date.</li>
+  <li>A join on a hot path is usually a modelling decision waiting to be made.</li>
+</ul>

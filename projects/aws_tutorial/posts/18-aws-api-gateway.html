@@ -1,0 +1,143 @@
+<p>API Gateway puts an HTTP endpoint in front of a Lambda, and handles TLS, custom domains,
+throttling and authentication on the way. This site's admin API is a FastAPI application behind
+one.</p>
+
+<h2>HTTP API or REST API</h2>
+
+<p>Confusingly, both are REST APIs in the ordinary sense. These are two products.</p>
+
+<table>
+  <thead><tr><th></th><th>HTTP API</th><th>REST API</th></tr></thead>
+  <tbody>
+    <tr><td>Price</td><td>About 30% of REST</td><td>Higher</td></tr>
+    <tr><td>Latency</td><td>Lower</td><td>Higher</td></tr>
+    <tr><td>JWT authorizer</td><td>Built in</td><td>Lambda authorizer needed</td></tr>
+    <tr><td>Request/response transformation</td><td>No</td><td>Yes, VTL templates</td></tr>
+    <tr><td>Request validation</td><td>No</td><td>Yes</td></tr>
+    <tr><td>API keys and usage plans</td><td>No</td><td>Yes</td></tr>
+    <tr><td>Private endpoints, WAF</td><td>Limited</td><td>Yes</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Use an HTTP API</strong> unless you need something only REST has. For a backend where
+the Lambda does its own routing and validation — any web framework — the extra features are things
+you would not use, at three times the price.</p>
+
+<p>Pick REST when you need API keys with usage plans for third-party consumers, request validation
+at the edge, or VTL transformation to talk to a legacy client.</p>
+
+<h2>Proxy integration and the event shape</h2>
+
+<p>The useful default is <em>proxy</em> integration: API Gateway forwards the whole request as JSON
+and returns whatever your function produces, with no mapping in between.</p>
+
+<pre class="language-json"><code class="language-json">{
+  "version": "2.0",
+  "routeKey": "GET /posts/{slug}",
+  "rawPath": "/posts/aws-lambda",
+  "headers": { "authorization": "Bearer ..." },
+  "queryStringParameters": { "draft": "true" },
+  "pathParameters": { "slug": "aws-lambda" },
+  "body": null,
+  "isBase64Encoded": false,
+  "requestContext": { "http": { "method": "GET", "sourceIp": "203.0.113.7" } }
+}</code></pre>
+
+<p>That is payload format <strong>2.0</strong>, used by HTTP APIs. REST APIs use 1.0, which puts
+the method at <code>httpMethod</code> and headers in a different shape. Handler code written for
+one silently reads <code>None</code> from the other — a common source of "it worked in the tutorial"
+confusion. Adapters like Mangum and Serverless Express handle both, which is why running a normal
+web framework on Lambda works at all.</p>
+
+<p>Your response must be the right shape too — <code>statusCode</code>, optional
+<code>headers</code>, and a <strong>string</strong> body. Returning a dict as
+<code>body</code> produces a 502, because API Gateway cannot interpret it.</p>
+
+<h2>The stage trap that 404s one of your two URLs</h2>
+
+<p>This one costs an afternoon and the error message never mentions it.</p>
+
+<p>Every API is deployed to a <strong>stage</strong>, and the default execute-api URL includes the
+stage name in the path:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">https://abc123.execute-api.us-west-2.amazonaws.com/prod/posts
+                                                   ^^^^^ the stage</code></pre>
+
+<p>A <strong>custom domain</strong> does not. It maps to a stage, so the stage name is not in the
+path:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">https://api.lovemesomecoding.com/posts</code></pre>
+
+<p>So a route registered as <code>/prod/posts</code> works on one URL and 404s on the other, and
+whichever you tested is the one that works.</p>
+
+<p>The fix is the <strong><code>$default</code> stage</strong>, which has no name and therefore
+adds no prefix. Both URLs then serve identical paths. This site's API uses it, and the deploy
+script asserts it.</p>
+
+<pre class="language-bash"><code class="language-bash">aws apigatewayv2 get-stages --api-id abc123 \
+  --query "Items[].[StageName,AutoDeploy]" --output table</code></pre>
+
+<h2>Routes</h2>
+
+<p>A route is a method and a path. For a framework doing its own routing, one catch-all is all you
+need:</p>
+
+<pre class="language-bash"><code class="language-bash">aws apigatewayv2 create-route --api-id abc123 \
+  --route-key '$default' \
+  --target integrations/xyz789</code></pre>
+
+<p>Everything reaches the function and FastAPI, Express or Flask decides what to do. The
+alternative — a route per endpoint — gives you per-route authorizers and throttling, at the cost of
+keeping the gateway and your application in sync. Pick one; splitting routing across both is how
+you end up with a 404 nobody can locate.</p>
+
+<h2>CORS: configure it in one place</h2>
+
+<p>Both API Gateway and your application can answer preflight requests, and if both do they will
+eventually disagree — the gateway allows an origin the app rejects, or the preflight succeeds and
+the real request fails.</p>
+
+<p>Pick one owner. This site lets FastAPI handle CORS entirely, so preflight and real requests
+cannot diverge, and the gateway does nothing. If you let the gateway own it, turn the framework's
+CORS middleware off.</p>
+
+<h2>Authorizers</h2>
+
+<p>Three ways to decide whether a request is allowed, before your function runs.</p>
+
+<p><strong>JWT authorizer</strong> (HTTP APIs) — you give it an issuer and audience, it validates
+the token's signature, expiry and claims, and rejects anything invalid at the gateway. Your
+function never sees a bad token and never needs the validation code. This is the reason most
+teams pick an HTTP API.</p>
+
+<p><strong>Lambda authorizer</strong> — your own function returns an allow or deny. Necessary for
+anything unusual, and note the result is cached by identity source for a configurable TTL, so a
+revoked token keeps working until the cache expires.</p>
+
+<p><strong>IAM authorization</strong> — callers sign requests with SigV4. Right for
+service-to-service inside AWS, wrong for browsers.</p>
+
+<h2>Throttling and timeouts</h2>
+
+<p>The hard limit worth knowing: <strong>29 seconds</strong>. Integration timeout is capped there,
+so a Lambda configured for 15 minutes behind an API Gateway still gets 29 seconds. Anything longer
+needs a different shape — return 202, do the work asynchronously, and let the client poll.</p>
+
+<p>Throttling is on by default at the account level and configurable per stage or route. Setting a
+sane rate limit is worth doing early: it is what stops one misbehaving client from exhausting your
+Lambda concurrency and taking the whole API down with it.</p>
+
+<h2>When you get a 502 or a 403</h2>
+
+<p>Two status codes account for most confusion, and neither means what it appears to.</p>
+
+<p>A <strong>502 Bad Gateway</strong> is almost never a network problem. It means your function
+returned something API Gateway could not turn into an HTTP response — a dict where a string was
+expected, a missing <code>statusCode</code>, or an unhandled exception. The Lambda log has the real
+error; the gateway only knows the shape was wrong.</p>
+
+<p>A <strong>403 Forbidden</strong> with <code>Missing Authentication Token</code> is the most
+misleading message in the service. It usually has nothing to do with authentication: it is what you
+get when no route matches the path or method you requested. Check the route key before you check
+your token.</p>

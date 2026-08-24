@@ -1,0 +1,165 @@
+<p>Every MongoDB schema comes down to one question asked over and over: does this data live
+<strong>inside</strong> the document, or does it live somewhere else and get pointed at? Get it
+right and your hottest query is a single read. Get it wrong and you either drag megabytes around to
+render a card, or you rebuild joins by hand in application code.</p>
+
+<p>There is a rule that decides most cases, and it fits in six words: <strong>embed what is
+bounded, reference what grows.</strong></p>
+
+<h2>Start from the queries, not the entities</h2>
+
+<p>Relational modelling starts with entities and normalises. Document modelling starts with the
+queries and shapes documents to serve them. That inversion is the whole discipline &mdash; if you
+model MongoDB the relational way and then wonder why everything needs a
+<code>$lookup</code>, this is why.</p>
+
+<p>So before drawing anything, write down the queries that run on every page load. ReelCMS, the
+short-video CMS this track quotes, has three: the public feed newest-first, one reel by slug, and a
+creator&rsquo;s own reels. All three want a reel plus enough of its creator to render a byline.
+That single sentence determines most of what follows.</p>
+
+<h2>The four cases, worked</h2>
+
+<p>Here is the reel document those queries produced, with the decision marked on each field:</p>
+
+<pre class="language-javascript"><code class="language-javascript">{
+  _id:    ObjectId("..."),
+  slug:   "around-the-outside-on-the-final-lap",
+  status: "PUBLISHED",
+  video:  { url: "...", posterUrl: "...", durationSeconds: 34 },   // EMBEDDED
+  creator: { _id: ObjectId("..."), username: "thelastlap",         // REFERENCED + copied
+             displayName: "The Last Lap", avatarUrl: "..." },
+  tags:   ["motorsport", "overtake"],                              // EMBEDDED
+  collectionIds: [ObjectId("...")],                                // REFERENCED
+  stats:  { views: 4962, likes: 447, comments: 12, shares: 31 }    // EMBEDDED
+}
+// comments live in their own collection — NOT here
+</code></pre>
+
+<h3>1. video &mdash; embedded, because it is 1:1</h3>
+
+<p>A video belongs to exactly one reel and no query ever wants one without the other. Splitting it
+into its own collection would buy a join and nothing else. This is the easy case: <strong>1:1 data
+that is always read together is embedded</strong>, always.</p>
+
+<h3>2. tags &mdash; embedded, because it is bounded</h3>
+
+<p>A reel has a handful of tags, and it will still have a handful in five years. They are always
+displayed and often queried, and an array field gets a <em>multikey</em> index automatically, so
+<code>{ tags: "motorsport" }</code> is an index seek rather than a scan. Bounded, small, queried:
+embed.</p>
+
+<h3>3. stats &mdash; embedded, because atomicity is free there</h3>
+
+<p>Four counters that change constantly. Embedding them means an update is a single-document
+operation, and single-document writes in MongoDB are atomic without a transaction:</p>
+
+<pre class="language-javascript"><code class="language-javascript">db.reels.updateOne({ _id: id }, { $inc: { "stats.views": 1 } })</code></pre>
+
+<p>Put those counters in a separate collection and you need a transaction to keep them consistent
+with the reel, or you accept drift. <strong>Things that must change together want to be in the same
+document</strong> &mdash; that is one of the strongest arguments for embedding, and it is about
+correctness rather than speed.</p>
+
+<h3>4. comments &mdash; referenced, and this is the one that matters</h3>
+
+<p>The instinct is to embed them. For a small blog that is right. Here it is wrong, and it fails in
+three different ways at three different scales:</p>
+
+<ol>
+  <li><strong>Unbounded growth.</strong> A document is capped at <strong>16 MB</strong>. A reel that
+      goes viral collects hundreds of thousands of comments and eventually cannot accept another
+      one &mdash; a write failure on your single most successful piece of content.</li>
+  <li><strong>Read amplification.</strong> Every feed query would pull the whole thread off disk to
+      render a card that shows none of it. Projection hides it from the response; the document is
+      still read.</li>
+  <li><strong>Write contention.</strong> Appending to an array rewrites the document, while
+      <code>stats</code> is being <code>$inc</code>&rsquo;d on the same document by every view.</li>
+</ol>
+
+<p>So comments get their own collection with a <code>reelId</code> pointing back, and an index on
+<code>{ reelId: 1, createdAt: -1 }</code> to fetch a thread. The test is not &ldquo;is this a list?
+&rdquo; &mdash; tags are a list. The test is <strong>&ldquo;can this list grow without limit?
+&rdquo;</strong></p>
+
+<h2>The interesting case: referenced and embedded at once</h2>
+
+<p><code>creator</code> is both, and it is the decision worth understanding properly.</p>
+
+<p>The <code>_id</code> is a genuine reference &mdash; <code>creators</code> owns the profile. But
+three display fields are <em>copied</em> onto every reel, so the feed renders a byline without
+joining anything. In Java that copy is its own small type:</p>
+
+<pre class="language-java"><code class="language-java">public class CreatorRef {
+    private String id;
+    private String username;
+    private String displayName;
+    private String avatarUrl;
+}</code></pre>
+
+<p>What that buys is the hottest query in the system staying a single-collection index scan. What
+it costs arrives the first time somebody renames themselves: the copy is now stale on every reel
+they own, and the application &mdash; not the database &mdash; has to fix it.</p>
+
+<pre class="language-java"><code class="language-java">public long refreshCreatorSnapshot(String creatorId, String username, String displayName, String avatarUrl) {
+    var result = mongo.updateMulti(
+            Query.query(Criteria.where("creator.id").is(creatorId)),
+            new Update()
+                    .set("creator.username", username)
+                    .set("creator.displayName", displayName)
+                    .set("creator.avatarUrl", avatarUrl),
+            Reel.class);
+    return result.getModifiedCount();
+}</code></pre>
+
+<p>One statement, not a loop &mdash; which is what keeps the migration path open when a creator has
+a million reels and this becomes a background job.</p>
+
+<p>The rule for deciding what to copy is narrow: <strong>denormalize fields that are read
+constantly and change rarely.</strong> A display name qualifies; it changes twice in its life
+against millions of reads. A follower count does not &mdash; it moves every minute, so ReelCMS
+deliberately leaves it out of the snapshot and reads it from <code>creators</code> on the profile
+page, where one extra query is affordable.</p>
+
+<p>Notice that the trade is only visible because someone wrote the read-to-write ratio down. If it
+were reversed &mdash; a field that changes constantly and is read rarely &mdash; the same design
+would be obviously wrong.</p>
+
+<h2>Many-to-many</h2>
+
+<p>A reel belongs to several collections, and a collection holds several reels. ReelCMS stores ids
+on <strong>both</strong> sides: <code>collectionIds</code> on the reel,
+<code>reelIds</code> on the collection.</p>
+
+<p>That is deliberate duplication, and it is justified by both directions being queried &mdash;
+&ldquo;what is in this collection&rdquo; for the public page, &ldquo;which collections is this reel
+in&rdquo; for the editor. Storing one side only means one of those questions needs a scan of the
+other collection. The price is that the application keeps the two in step, which is a real
+maintenance burden and the reason you should not do this by reflex. With one hot direction, store
+one side.</p>
+
+<h2>When embedding is simply wrong</h2>
+
+<p>Three signals, any one of which means reference:</p>
+
+<ul>
+  <li>The nested thing is <strong>queried on its own</strong> &mdash; if you ever want &ldquo;all
+      comments by this person, across reels&rdquo;, comments are an entity, not a field.</li>
+  <li>The nested thing is <strong>shared</strong>. Embedding a creator profile in every reel is not
+      a snapshot, it is four hundred copies of a record with no owner.</li>
+  <li>The array has <strong>no natural ceiling</strong>. If you cannot name the maximum, there is
+      not one.</li>
+</ul>
+
+<h2>The short version</h2>
+
+<ul>
+  <li>Model from your queries, not your entities. Write the top three down first.</li>
+  <li><strong>Embed what is bounded, reference what grows.</strong></li>
+  <li>1:1 data read together is always embedded.</li>
+  <li>Things that must change together belong in one document &mdash; that buys atomicity for
+      free.</li>
+  <li>The 16 MB cap is a real ceiling, and it bites hardest on your most popular content.</li>
+  <li>Copy fields that are read constantly and change rarely; be ready to fan the update out.</li>
+  <li>Duplicate a many-to-many on both sides only when both directions are genuinely hot.</li>
+</ul>

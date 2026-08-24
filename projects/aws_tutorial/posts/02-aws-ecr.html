@@ -1,0 +1,153 @@
+<p>Every container you run on ECS, EKS, App Runner or Lambda is pulled from a registry. On AWS that
+registry is ECR, and it is the piece people skip past on the way to the interesting services —
+right up until a deploy fails because an image cannot be pulled.</p>
+
+<h2>Private and public</h2>
+
+<p>ECR has two halves. <strong>Private</strong> registries are the default: one per account per
+region, IAM-controlled, and what you push your own images to. <strong>Public</strong> ECR is the
+gallery at <code>public.ecr.aws</code>, which is where AWS's own base images live and a useful
+alternative to Docker Hub's rate limits.</p>
+
+<p>A private repository holds one image's tags — <code>stayhub-api</code> holds
+<code>1.4.0</code>, <code>1.4.1</code> and so on. You create a repository per image, not per
+project.</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecr create-repository \
+  --repository-name stayhub-api \
+  --image-tag-mutability IMMUTABLE \
+  --image-scanning-configuration scanOnPush=true</code></pre>
+
+<p>Both of those flags matter, and both default the other way. They are covered below.</p>
+
+<h2>Logging in, and the token that expires</h2>
+
+<p>ECR does not take a password. You exchange your AWS credentials for a token that is valid for
+<strong>twelve hours</strong>, and hand that to Docker:</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecr get-login-password --region us-west-2 \
+  | docker login --username AWS --password-stdin 111122223333.dkr.ecr.us-west-2.amazonaws.com</code></pre>
+
+<p>The username is literally <code>AWS</code> for every account. Note the pipe: passing the token
+as <code>--password</code> would put it in your shell history and in the process list, and Docker
+warns about exactly that.</p>
+
+<p>The twelve-hour expiry is the practical consequence. A developer laptop needs a fresh login
+about once a day, and any build script that runs longer than that — or a long-lived agent — has to
+re-authenticate rather than assume a login persists. In CI it is simply the first step of every
+build.</p>
+
+<h2>Pushing</h2>
+
+<pre class="language-bash"><code class="language-bash">REGISTRY=111122223333.dkr.ecr.us-west-2.amazonaws.com
+
+docker build -t stayhub-api:1.4.0 .
+docker tag stayhub-api:1.4.0 $REGISTRY/stayhub-api:1.4.0
+docker push $REGISTRY/stayhub-api:1.4.0</code></pre>
+
+<p>The registry hostname is part of the tag — that is how Docker knows where to push. A
+<code>docker push</code> that tries to contact Docker Hub is a tag missing its registry prefix.</p>
+
+<p>Build for the architecture you will run on. An image built on an Apple Silicon laptop is
+<code>arm64</code>, and deploying it to an x86 ECS task fails at runtime with an exec format error
+rather than at push. Pass <code>--platform linux/amd64</code>, or match your compute to your
+laptop and run Graviton.</p>
+
+<h2>Immutable tags</h2>
+
+<p>The single most valuable setting here, and it is off by default.</p>
+
+<p>With mutable tags — the default — pushing <code>1.4.0</code> twice overwrites the first image.
+Two deploys of "the same version" then run different code, and nothing anywhere records that. It is
+the same failure as <code>:latest</code>, just wearing a version number.</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecr put-image-tag-mutability \
+  --repository-name stayhub-api --image-tag-mutability IMMUTABLE</code></pre>
+
+<p>With <code>IMMUTABLE</code>, a second push to an existing tag is rejected. A tag then means
+exactly one image forever, which is what makes "roll back to 1.3.9" a meaningful instruction.</p>
+
+<p>Tag with the git commit as well as the version. The commit is the one identifier that is
+unambiguous, and it turns "what is running in production" into a question with an answer.</p>
+
+<h2>Lifecycle policies, or you pay for 2019 forever</h2>
+
+<p>ECR charges per GB-month of storage, and nothing is ever deleted on its own. A repository built
+by CI accumulates an image per commit, indefinitely, and the bill grows quietly because no single
+image is large.</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecr put-lifecycle-policy --repository-name stayhub-api --lifecycle-policy-text '{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "keep the last 10 released images",
+      "selection": {
+        "tagStatus": "tagged",
+        "tagPrefixList": ["v"],
+        "countType": "imageCountMoreThan",
+        "countNumber": 10
+      },
+      "action": { "type": "expire" }
+    },
+    {
+      "rulePriority": 2,
+      "description": "untagged images are build debris",
+      "selection": {
+        "tagStatus": "untagged",
+        "countType": "sinceImagePushed",
+        "countUnit": "days",
+        "countNumber": 7
+      },
+      "action": { "type": "expire" }
+    }
+  ]
+}'</code></pre>
+
+<p>Rules are evaluated by priority, and <strong>the first matching rule wins</strong> — so a broad
+rule with a low priority number shadows every specific rule after it. Put the narrow rules first.</p>
+
+<p>Untagged images are the ones people forget. Every time you push a tag that already existed under
+mutable tags, the previous image loses its tag and becomes untagged — still stored, still billed,
+and invisible in the console's default view.</p>
+
+<p>Test a policy before it deletes anything:</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecr start-lifecycle-policy-preview --repository-name stayhub-api
+aws ecr get-lifecycle-policy-preview --repository-name stayhub-api \
+  --query "previewResults[].[imageTags[0],action.type]" --output table</code></pre>
+
+<h2>Scanning</h2>
+
+<p>Basic scanning checks your image against the CVE database on push, at no cost. Enhanced
+scanning uses Amazon Inspector, continuously rescans images already in the registry, and looks
+inside application dependencies as well as OS packages — for a per-image charge.</p>
+
+<pre class="language-bash"><code class="language-bash">aws ecr describe-image-scan-findings \
+  --repository-name stayhub-api --image-id imageTag=1.4.0 \
+  --query "imageScanFindings.findingSeverityCounts"</code></pre>
+
+<p>Turn basic scanning on for everything; it is free and occasionally tells you something urgent.
+The thing worth understanding is that a finding is usually in your <em>base image</em> rather than
+your code, so the fix is normally rebuilding on a current base rather than changing anything you
+wrote.</p>
+
+<h2>The pull that fails from a private subnet</h2>
+
+<p>The failure that costs an afternoon. A task in a private subnet cannot pull its image, and the
+error mentions a timeout rather than networking.</p>
+
+<p>ECR is a public API endpoint, so a private subnet needs a route to it. There are two options and
+the second is usually right:</p>
+
+<ul>
+  <li>A <strong>NAT gateway</strong> — works, and charges per hour plus per GB. Container images
+      are large and pulled often, so this line item is real</li>
+  <li><strong>VPC endpoints</strong> — traffic stays on the AWS network, and it is cheaper</li>
+</ul>
+
+<p>The catch is that ECR needs <strong>three</strong> endpoints, not one, and missing the third is
+the usual cause of a half-working setup: interface endpoints for <code>ecr.api</code> and
+<code>ecr.dkr</code>, plus an <strong>S3 gateway endpoint</strong> — because the image layers
+themselves are stored in S3 and are fetched separately from the registry metadata.</p>
+
+<p>Add CloudWatch Logs to that list if your tasks log anywhere, for the same reason.</p>

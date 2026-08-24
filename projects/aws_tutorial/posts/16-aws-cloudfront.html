@@ -1,0 +1,121 @@
+<p>CloudFront is a cache in front of your origin, spread across hundreds of edge locations. It makes
+things faster, cheaper and more secure — and if you cannot explain what it is caching and for how
+long, it will eventually serve someone the wrong page.</p>
+
+<p>This site runs entirely on it: a private S3 bucket, a distribution, and a small function at the
+edge doing URL rewriting.</p>
+
+<h2>The pieces</h2>
+
+<ul>
+  <li><strong>Origin</strong> — where the real content is. S3, an ALB, an API Gateway, or any
+      public HTTP server</li>
+  <li><strong>Behaviour</strong> — a path pattern and the rules for it. Behaviours are matched in
+      order; the default catches everything else</li>
+  <li><strong>Cache policy</strong> — the TTLs, and which parts of the request form the cache
+      key</li>
+  <li><strong>Origin request policy</strong> — what gets forwarded to the origin, which is a
+      separate question</li>
+</ul>
+
+<p>That split trips people up. A header can be forwarded to the origin without being part of the
+cache key, which is usually what you want for something like <code>User-Agent</code> — the origin
+may want it, but caching separately per user agent would shatter your hit rate.</p>
+
+<h2>The cache key is the whole game</h2>
+
+<p>CloudFront caches per unique cache key. Anything you add to the key multiplies the number of
+stored copies and divides your hit rate.</p>
+
+<p>The default is the URL only. Add a query string that varies per user — a tracking parameter, a
+cache-buster — and every visitor gets their own copy, so your cache does nothing while costing
+money. The fix is to include only the query strings that genuinely change the response:</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudfront get-cache-policy-config --id 4135ea2d-6df8-44a3-9df3-4b5a84be39ad</code></pre>
+
+<p>Use the managed policies where they fit. <code>CachingOptimized</code> is the sensible default
+for static assets; <code>CachingDisabled</code> is right for an API behaviour you are only routing,
+not caching.</p>
+
+<h2>Origin Access Control</h2>
+
+<p>OAC lets CloudFront read a private S3 bucket by signing its requests. The bucket keeps Block
+Public Access on and grants access to the distribution alone — see the S3 post for the policy.</p>
+
+<p>It replaces Origin Access Identity, which still works and should not be used for anything new:
+OAC supports SSE-KMS encrypted objects and all regions, OAI does not.</p>
+
+<h2>Invalidation, and why you should rarely need it</h2>
+
+<pre class="language-bash"><code class="language-bash">aws cloudfront create-invalidation \
+  --distribution-id E30YUPLP37MY9U --paths "/*"</code></pre>
+
+<p>That clears the cache. It is also asynchronous — usually a minute or two, not instant — and the
+first 1,000 paths a month are free, after which each path is billed. A deploy pipeline that
+invalidates <code>/*</code> on every push is treating a cache as if it were a filesystem.</p>
+
+<p>The better answer is <strong>fingerprinted filenames</strong>. If a bundle is
+<code>app.9f2c1a.js</code>, a new build produces a new name, which cannot be stale — so those files
+get a one-year TTL and are never invalidated. Only the HTML that references them needs a short TTL,
+and there is far less of it.</p>
+
+<p>That is the split this site uses: fingerprinted assets under <code>_next/static/</code> cached
+for a year, HTML with <code>must-revalidate</code>.</p>
+
+<h2>The certificate must be in us-east-1</h2>
+
+<p>CloudFront only reads ACM certificates from <strong>us-east-1</strong>, regardless of where your
+origin, your bucket or you are. A certificate issued in your working region is simply not offered
+in the distribution's dropdown, with no explanation.</p>
+
+<p>This catches everyone once. Note it applies to CloudFront only — an ALB or an API Gateway custom
+domain wants a certificate in its <em>own</em> region, so a stack with both needs two certificates
+for the same names.</p>
+
+<h2>Functions at the edge</h2>
+
+<p>Two options, and the cheap one is usually right.</p>
+
+<p><strong>CloudFront Functions</strong> are JavaScript, run in under a millisecond at the edge
+location, and can only touch request and response headers and the URL. No network, no filesystem.
+Ideal for rewriting URLs, adding security headers, or a redirect map.</p>
+
+<p><strong>Lambda@Edge</strong> is a real Lambda at the regional edge — slower, more expensive,
+and able to make network calls. Use it only when you need that.</p>
+
+<p>This site uses a CloudFront Function to map clean URLs onto the static files behind them and to
+serve a set of legacy redirects.</p>
+
+<h3>Republish it on every deploy</h3>
+
+<p>The redirect map is compiled <em>into</em> the function. Adding a redirect in the build changes
+the source, and nothing at all happens at the edge until the function is republished to the LIVE
+stage. The deploy succeeds, the file is updated, and the redirect does not exist.</p>
+
+<pre class="language-bash"><code class="language-bash">aws cloudfront describe-function --name lovemesomecoding-router --stage LIVE \
+  --query "FunctionSummary.FunctionMetadata.LastModifiedTime"</code></pre>
+
+<p>If that timestamp is older than your last deploy, the edge is running old code.</p>
+
+<h2>Error pages and single-page apps</h2>
+
+<p>A static export serves real files, so a missing path returns S3's 403 or 404 straight to the
+visitor as XML. Custom error responses fix that, and they are also how a single-page application
+works at all — map 403 and 404 to <code>/index.html</code> with a 200 so the client-side router
+sees the path.</p>
+
+<p>Be careful applying that pattern to a multi-page static site: mapping every 404 to a 200 means
+genuinely missing pages return success, which search engines index as duplicate content. Map to a
+real 404 page with a 404 status instead, and let the router pattern apply only where there is
+actually a single-page app.</p>
+
+<h2>Debugging a wrong response</h2>
+
+<p>Check the response headers first:</p>
+
+<pre class="language-bash"><code class="language-bash">curl -sSI https://lovemesomecoding.com/aws | grep -i "x-cache\|age\|cache-control"</code></pre>
+
+<p><code>X-Cache: Hit from cloudfront</code> means you are seeing cached content, and
+<code>Age</code> tells you how long it has been there — so a stale page with a large
+<code>Age</code> is a TTL question, not an origin bug. <code>Miss from cloudfront</code> means the
+request reached your origin and the problem is behind CloudFront, not in front of it.</p>
