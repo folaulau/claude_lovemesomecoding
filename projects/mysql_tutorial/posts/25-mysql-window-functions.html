@@ -1,0 +1,183 @@
+<p>An aggregate collapses a group into one row. A <strong>window function</strong> computes across a
+group of rows and <strong>keeps every row</strong>. That one difference is what lets a query show
+each order alongside a running total, or each item alongside its rank within its product — things
+that are genuinely awkward without them and three lines with them.</p>
+
+<p>They arrived in <strong>MySQL 8.0</strong>.</p>
+
+<h2>The OVER clause</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total,
+       SUM(total) OVER (ORDER BY id) AS running_total
+FROM   customer_order WHERE status = 'COMPLETED' ORDER BY id LIMIT 5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------+---------------+
+| id | total | running_total |
++----+-------+---------------+
+|  1 | 28.91 |         28.91 |
+|  2 | 18.43 |         47.34 |
+|  3 | 32.18 |         79.52 |
+|  4 | 32.18 |        111.70 |
+|  6 | 24.93 |        136.63 |
++----+-------+---------------+</code></pre>
+
+<p><code>SUM(total)</code> with a <code>GROUP BY</code> would give one row. <code>OVER</code> turns
+the same aggregate into a window function: every row survives, and each carries the sum of
+everything up to and including itself.</p>
+
+<p><code>OVER</code> takes two optional pieces:</p>
+
+<ul>
+  <li><strong><code>PARTITION BY</code></strong> — split the rows into independent groups. Like
+      <code>GROUP BY</code>, except the rows are not collapsed.</li>
+  <li><strong><code>ORDER BY</code></strong> — order the rows <em>within</em> each partition. This
+      is separate from the query's own <code>ORDER BY</code>.</li>
+</ul>
+
+<p><code>OVER ()</code>, empty, means "the whole result set" — useful for putting a grand total
+next to every row.</p>
+
+<h2>PARTITION BY</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT product_name, size, line_total,
+       ROW_NUMBER() OVER (PARTITION BY product_name ORDER BY line_total DESC, id) AS rn
+FROM   order_item WHERE product_name IN ('Pepperoni Pizza','Pepsi') ORDER BY product_name, rn;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+--------+------------+----+
+| product_name    | size   | line_total | rn |
++-----------------+--------+------------+----+
+| Pepperoni Pizza | LARGE  |      33.98 |  1 |
+| Pepperoni Pizza | LARGE  |      21.24 |  2 |
+| Pepperoni Pizza | LARGE  |      16.99 |  3 |
+| Pepperoni Pizza | MEDIUM |      15.49 |  4 |
+| Pepperoni Pizza | SMALL  |      10.99 |  5 |
+| Pepsi           | LARGE  |       8.97 |  1 |
+| Pepsi           | LARGE  |       5.98 |  2 |
+| Pepsi           | MEDIUM |       2.49 |  3 |
++-----------------+--------+------------+----+</code></pre>
+
+<p>The numbering restarts at 1 for each product. Note the <code>, id</code> tiebreaker in the
+window's <code>ORDER BY</code> — without it, rows with equal <code>line_total</code> could be
+numbered either way round, and the query would return different answers on different runs. The same
+rule as <a href="/sql/sql-limit">pagination</a>.</p>
+
+<h2>RANK, DENSE_RANK and ROW_NUMBER</h2>
+
+<p>Three ways to number rows, differing only in what they do with ties:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT product_name, ROUND(SUM(line_total),2) AS revenue,
+       RANK()       OVER (ORDER BY SUM(line_total) DESC) AS rnk,
+       DENSE_RANK() OVER (ORDER BY SUM(line_total) DESC) AS dense,
+       ROW_NUMBER() OVER (ORDER BY SUM(line_total) DESC, product_name) AS rn
+FROM   order_item GROUP BY product_name ORDER BY revenue DESC, product_name LIMIT 6;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------------+---------+-----+-------+----+
+| product_name        | revenue | rnk | dense | rn |
++---------------------+---------+-----+-------+----+
+| Pepperoni Pizza     |   98.69 |   1 |     1 |  1 |
+| Meat Lovers Pizza   |   64.47 |   2 |     2 |  2 |
+| Supreme Pizza       |   55.72 |   3 |     3 |  3 |
+| BBQ Chicken Pizza   |   36.98 |   4 |     4 |  4 |
+| Veggie Lovers Pizza |   36.98 |   4 |     4 |  5 |
+| Cheese Pizza        |   35.97 |   6 |     5 |  6 |
++---------------------+---------+-----+-------+----+</code></pre>
+
+<p>Two products tie at 36.98. Watch what happens on the row after:</p>
+
+<ul>
+  <li><code>RANK</code> gives both 4 and then <strong>skips to 6</strong> — Olympic-style.</li>
+  <li><code>DENSE_RANK</code> gives both 4 and continues at <strong>5</strong> — no gaps.</li>
+  <li><code>ROW_NUMBER</code> refuses to tie, giving 4 and 5 arbitrarily unless you break the tie
+      yourself.</li>
+</ul>
+
+<p>Pick deliberately. "Top 3 by revenue" with <code>RANK</code> can return four rows; with
+<code>ROW_NUMBER</code> it returns exactly three but drops one of a genuine tie.</p>
+
+<p>Also note the window functions here operate on <code>SUM(line_total)</code> — window functions
+run <strong>after</strong> <code>GROUP BY</code>, so they can rank aggregates.</p>
+
+<h2>LAG and LEAD</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total,
+       LAG(total)  OVER (ORDER BY id) AS previous,
+       total - LAG(total) OVER (ORDER BY id) AS change_from_previous
+FROM   customer_order WHERE status = 'COMPLETED' ORDER BY id LIMIT 5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------+----------+----------------------+
+| id | total | previous | change_from_previous |
++----+-------+----------+----------------------+
+|  1 | 28.91 |     NULL |                 NULL |
+|  2 | 18.43 |    28.91 |               -10.48 |
+|  3 | 32.18 |    18.43 |                13.75 |
+|  4 | 32.18 |    32.18 |                 0.00 |
+|  6 | 24.93 |    32.18 |                -7.25 |
++----+-------+----------+----------------------+</code></pre>
+
+<p><code>LAG</code> reaches backwards, <code>LEAD</code> forwards. The first row has nothing before
+it, so <code>LAG</code> is NULL — supply a third argument for a default,
+<code>LAG(total, 1, 0)</code>. This is how you compute month-over-month growth, time between
+events, or "did this value change from the previous row".</p>
+
+<h2>Top N per group</h2>
+
+<p>This is the problem window functions are most often reached for. It cannot be written with
+<code>GROUP BY</code>, because you need whole rows rather than aggregates:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH ranked AS (
+    SELECT product_name, size, line_total,
+           ROW_NUMBER() OVER (PARTITION BY product_name ORDER BY line_total DESC, id) AS rn
+    FROM   order_item
+)
+SELECT product_name, size, line_total
+FROM   ranked WHERE rn = 1
+ORDER  BY line_total DESC, product_name
+LIMIT  5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+--------+------------+
+| product_name          | size   | line_total |
++-----------------------+--------+------------+
+| Pepperoni Pizza       | LARGE  |      33.98 |
+| Cheese Pizza          | MEDIUM |      25.98 |
+| Meat Lovers Pizza     | LARGE  |      23.49 |
+| BBQ Chicken Pizza     | LARGE  |      19.99 |
+| Buffalo Chicken Pizza | LARGE  |      19.99 |
++-----------------------+--------+------------+</code></pre>
+
+<p><code>rn &lt;= 3</code> instead of <code>= 1</code> gives the top three of each. The
+<a href="/sql/mysql-cte">CTE</a> is not decoration: <strong>a window function cannot appear in
+<code>WHERE</code></strong>, because <code>WHERE</code> runs before the window is computed. Compute
+it in a CTE (or derived table) and filter outside. That error — <em>"Window function is allowed
+only in SELECT and ORDER BY"</em> — is the one everybody hits first.</p>
+
+<h2>Frames</h2>
+
+<p>Inside a partition, the <em>frame</em> decides which rows the function sees. Adding
+<code>ORDER BY</code> to <code>OVER</code> silently sets the default frame to "from the start of the
+partition to the current row", which is why the first example produced a running total rather than
+a repeated grand total.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total,
+       SUM(total) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running,
+       SUM(total) OVER ()                                                             AS grand_total,
+       AVG(total) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)         AS moving_avg_3
+FROM   customer_order WHERE status = 'COMPLETED' ORDER BY id LIMIT 5;</code></pre>
+
+<p>The first is the default written out. The second, with no <code>ORDER BY</code>, sees the whole
+partition. The third is a three-row moving average.</p>
+
+<p>One subtlety worth knowing: <code>ROWS</code> counts physical rows, <code>RANGE</code> groups
+tied values together. With duplicates in the ordering column they give different answers, and
+<code>RANGE</code> is the default — so if a running total looks wrong at a tie, that is why.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Window functions keep every row; aggregates collapse them.</li>
+  <li><code>PARTITION BY</code> restarts the calculation per group; <code>ORDER BY</code> orders
+      within it.</li>
+  <li><code>RANK</code> skips after a tie, <code>DENSE_RANK</code> does not,
+      <code>ROW_NUMBER</code> never ties.</li>
+  <li>Always give the window's <code>ORDER BY</code> a unique tiebreaker.</li>
+  <li>You cannot filter on one in <code>WHERE</code> — wrap it in a CTE.</li>
+</ul>

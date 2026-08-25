@@ -1,0 +1,168 @@
+<p>A common table expression names a query so the rest of the statement can use it by that name. It
+was added in <strong>MySQL 8.0</strong>, and it is the single biggest improvement to the
+readability of complicated SQL — a nested query has to be read inside-out, a CTE reads top-down.</p>
+
+<h2>The shape</h2>
+
+<pre class="language-sql"><code class="language-sql">WITH completed AS (
+    SELECT id, order_type, total FROM customer_order WHERE status = 'COMPLETED'
+)
+SELECT order_type, COUNT(*) AS orders, ROUND(SUM(total), 2) AS revenue
+FROM   completed GROUP BY order_type ORDER BY order_type;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+--------+---------+
+| order_type | orders | revenue |
++------------+--------+---------+
+| CARRYOUT   |      5 |   96.49 |
+| DELIVERY   |      8 |  260.91 |
++------------+--------+---------+</code></pre>
+
+<p><code>WITH name AS ( … )</code>, then a query that treats <code>name</code> as a table. The CTE
+exists only for the duration of the statement.</p>
+
+<h2>CTE, derived table or view?</h2>
+
+<table>
+  <tr><th></th><th>Lives for</th><th>Reusable in one query</th></tr>
+  <tr><td><strong>Derived table</strong> (subquery in <code>FROM</code>)</td>
+      <td>the statement</td><td>no — you would repeat it</td></tr>
+  <tr><td><strong>CTE</strong></td><td>the statement</td><td><strong>yes</strong>, by name</td></tr>
+  <tr><td><strong><a href="/sql/mysql-view">View</a></strong></td><td>until dropped</td>
+      <td>yes, in any query</td></tr>
+</table>
+
+<p>A CTE and a derived table do the same work; the CTE is named, appears before the query that uses
+it, and can be referenced twice. Use a view when the definition is worth keeping for other queries
+too — a CTE when it matters only here.</p>
+
+<h2>Chaining</h2>
+
+<p>Several CTEs, comma-separated, each able to see the ones before it. This is where the readability
+argument is won — each step gets a name and a line:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH item_revenue AS (
+    SELECT product_name, SUM(line_total) AS revenue FROM order_item GROUP BY product_name
+), ranked AS (
+    SELECT product_name, revenue, RANK() OVER (ORDER BY revenue DESC) AS rnk FROM item_revenue
+)
+SELECT rnk, product_name, ROUND(revenue, 2) AS revenue FROM ranked WHERE rnk &lt;= 4 ORDER BY rnk;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----+---------------------+---------+
+| rnk | product_name        | revenue |
++-----+---------------------+---------+
+|   1 | Pepperoni Pizza     |   98.69 |
+|   2 | Meat Lovers Pizza   |   64.47 |
+|   3 | Supreme Pizza       |   55.72 |
+|   4 | BBQ Chicken Pizza   |   36.98 |
+|   4 | Veggie Lovers Pizza |   36.98 |
++-----+---------------------+---------+</code></pre>
+
+<p>Two products tie on revenue and both get rank 4 — see
+<a href="/sql/mysql-window-functions">window functions</a> for what <code>RANK</code> does next.
+Note also that this filters on <code>rnk</code>, which a plain query cannot do: window functions
+are not allowed in <code>WHERE</code>, so wrapping the ranking in a CTE and filtering outside is
+the standard way round it.</p>
+
+<h2>RECURSIVE</h2>
+
+<p>A recursive CTE refers to itself. It has two halves joined by <code>UNION ALL</code>: an
+<strong>anchor</strong> that produces the starting rows, and a <strong>recursive step</strong> that
+produces more from the rows already generated, until it produces none.</p>
+
+<h3>Generating a series</h3>
+
+<pre class="language-sql"><code class="language-sql">WITH RECURSIVE days AS (
+    SELECT DATE('2024-06-01') AS d
+    UNION ALL
+    SELECT d + INTERVAL 1 DAY FROM days WHERE d &lt; '2024-06-05'
+)
+SELECT d FROM days;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+
+| d          |
++------------+
+| 2024-06-01 |
+| 2024-06-02 |
+| 2024-06-03 |
+| 2024-06-04 |
+| 2024-06-05 |
++------------+</code></pre>
+
+<p>This solves a problem every reporting query eventually hits: <strong>a day with no orders
+produces no row</strong>, so a chart drawn from <code>GROUP BY date</code> silently skips it and
+the line joins across the gap. Generate the dates, then <code>LEFT JOIN</code> the totals onto
+them and the empty days appear as zeros.</p>
+
+<h3>Walking a tree</h3>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE staff (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(80) NOT NULL,
+    role       VARCHAR(40) NOT NULL,
+    manager_id BIGINT      NULL,
+    CONSTRAINT fk_staff_manager FOREIGN KEY (manager_id) REFERENCES staff (id)
+);
+
+INSERT INTO staff (id, name, role, manager_id) VALUES
+    (1, 'Dana Whitfield', 'General Manager', NULL),
+    (2, 'Alex Rivera',    'Shift Lead',      1),
+    (3, 'Priya Nair',     'Shift Lead',      1),
+    (4, 'Sam Chen',       'Driver',          2),
+    (5, 'Casey Lindgren', 'Cook',            3);</code></pre>
+
+<pre class="language-sql"><code class="language-sql">WITH RECURSIVE chain AS (
+    SELECT id, name, manager_id, 0 AS depth
+    FROM   staff WHERE manager_id IS NULL
+    UNION ALL
+    SELECT s.id, s.name, s.manager_id, c.depth + 1
+    FROM   staff s JOIN chain c ON s.manager_id = c.id
+)
+SELECT depth, name FROM chain ORDER BY depth, name;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------+----------------+
+| depth | name           |
++-------+----------------+
+|     0 | Dana Whitfield |
+|     1 | Alex Rivera    |
+|     1 | Priya Nair     |
+|     2 | Casey Lindgren |
+|     2 | Sam Chen       |
++-------+----------------+</code></pre>
+
+<p>This is the query that a <a href="/sql/sql-self-join">self join</a> cannot write, because a self
+join walks exactly one level and you do not know the depth in advance. Before MySQL 8 the answers
+were a loop in application code, or a <a href="/sql/mysql-closure-table">closure table</a> — which
+is still the right answer when subtree reads have to be fast.</p>
+
+<h2>Two things that will bite</h2>
+
+<p><strong>Runaway recursion.</strong> A recursive step whose termination condition never fires runs
+until it hits <code>cte_max_recursion_depth</code>, which defaults to <strong>1000</strong>, and
+then errors. That limit is a safety net, not a target: if you legitimately need more, raise it for
+the session, and if you did not, the error just saved you. Cycles in the data — a manager who
+reports to their own subordinate — will do this, and are worth guarding against by tracking the
+path.</p>
+
+<p><strong><code>UNION ALL</code> versus <code>UNION</code>.</strong> <code>UNION</code>
+deduplicates each round, which is occasionally the thing that stops a cycle and is usually just
+slower. Use <code>UNION ALL</code> unless you know why you want the other.</p>
+
+<h2>Performance</h2>
+
+<p>A CTE is not automatically materialised in MySQL 8 — the optimizer may merge it into the outer
+query exactly as it would a derived table, so writing one is usually free. But a CTE referenced
+<em>twice</em> may be evaluated twice; if the CTE is expensive and reused, check with
+<a href="/sql/sql-explain">EXPLAIN</a> rather than assuming.</p>
+
+<p>Unlike some databases, MySQL has no hint to force materialisation. If it matters, a temporary
+table is the explicit answer.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>WITH name AS (…)</code> — MySQL 8 and later only.</li>
+  <li>Chain CTEs to give each step of a complicated query a name.</li>
+  <li>A CTE can be referenced twice; a derived table cannot.</li>
+  <li>Filter on a window function by computing it in a CTE and filtering outside.</li>
+  <li><code>RECURSIVE</code> for trees and generated series; mind the 1000-row default depth.</li>
+</ul>

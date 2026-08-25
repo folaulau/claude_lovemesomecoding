@@ -1,0 +1,157 @@
+<p><code>GROUP BY</code> collapses many rows into one per group, and the aggregate functions decide
+what that one row says. It is how you turn a table of orders into a report.</p>
+
+<h2>The aggregates</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT status, COUNT(*) AS orders, ROUND(SUM(total), 2) AS revenue, ROUND(AVG(total), 2) AS avg_order
+FROM   customer_order GROUP BY status ORDER BY orders DESC, status;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+--------+---------+-----------+
+| status          | orders | revenue | avg_order |
++-----------------+--------+---------+-----------+
+| COMPLETED       |     13 |  357.40 |     27.49 |
+| CANCELLED       |      2 |   39.23 |     19.62 |
+| PAID            |      1 |   27.02 |     27.02 |
+| PENDING_PAYMENT |      1 |   11.92 |     11.92 |
+| PREPARING       |      1 |   40.86 |     40.86 |
++-----------------+--------+---------+-----------+</code></pre>
+
+<p><code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code> — plus
+<code>GROUP_CONCAT</code>, which joins a group's values into one string. Note the
+<code>ORDER BY</code>: <strong>MySQL 8 does not sort groups implicitly</strong>. Without it the
+order is undefined, however sorted it happens to look.</p>
+
+<h2>COUNT(*) versus COUNT(column)</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS rows_, COUNT(user_id) AS with_account, COUNT(DISTINCT user_id) AS distinct_accounts
+FROM   customer_order;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------+--------------+-------------------+
+| rows_ | with_account | distinct_accounts |
++-------+--------------+-------------------+
+|    18 |            8 |                 1 |
++-------+--------------+-------------------+</code></pre>
+
+<p>Three different questions:</p>
+
+<ul>
+  <li><code>COUNT(*)</code> counts <strong>rows</strong>.</li>
+  <li><code>COUNT(column)</code> counts <strong>non-NULL values</strong> — ten orders are guest
+      orders with a NULL <code>user_id</code>.</li>
+  <li><code>COUNT(DISTINCT column)</code> counts <strong>distinct</strong> non-NULL values.</li>
+</ul>
+
+<p>Every aggregate ignores NULLs, and for <code>AVG</code> that changes the answer: the denominator
+is the count of non-NULL values, not the row count. An aggregate over <em>zero</em> rows returns
+NULL rather than 0, which is why <code>COALESCE(SUM(x), 0)</code> is a sensible habit. See
+<a href="/sql/sql-isnull">NULL and IS NULL</a>.</p>
+
+<h2>HAVING versus WHERE</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT i.product_name, SUM(i.quantity) AS units, ROUND(SUM(i.line_total), 2) AS revenue
+FROM   order_item i
+GROUP  BY i.product_name
+HAVING SUM(i.quantity) &gt;= 3
+ORDER  BY units DESC, i.product_name;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------------------+-------+---------+
+| product_name      | units | revenue |
++-------------------+-------+---------+
+| Pepperoni Pizza   |     6 |   98.69 |
+| Pepsi             |     6 |   17.44 |
+| Cheese Pizza      |     3 |   35.97 |
+| Meat Lovers Pizza |     3 |   64.47 |
+| Supreme Pizza     |     3 |   55.72 |
++-------------------+-------+---------+</code></pre>
+
+<p>They are not interchangeable, and the difference falls out of when each one runs:</p>
+
+<ul>
+  <li><strong><code>WHERE</code> filters rows before grouping.</strong> It cannot see an aggregate,
+      because none has been computed yet.</li>
+  <li><strong><code>HAVING</code> filters groups after.</strong> It can see aggregates.</li>
+</ul>
+
+<p>When a condition could go in either — one on a plain column — <strong>put it in
+<code>WHERE</code></strong>. Filtering before grouping means fewer rows to group and lets an index
+help; filtering after means doing the work and then discarding it.</p>
+
+<p>MySQL lets <code>HAVING</code> reference a select-list alias (<code>HAVING units &gt;= 3</code>
+works), because <code>HAVING</code> runs after <code>SELECT</code> is evaluated.
+<code>WHERE</code> cannot — see <a href="/sql/sql-select">SELECT</a>.</p>
+
+<h2>ONLY_FULL_GROUP_BY</h2>
+
+<p>This is the MySQL 8 change that breaks more upgrades than any other:</p>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and
+-- contains nonaggregated column 'customer_name' which is not functionally dependent
+-- on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+SELECT status, customer_name, COUNT(*) FROM customer_order GROUP BY status;</code></pre>
+
+<p>The query is genuinely meaningless: thirteen orders are COMPLETED with different customer names,
+so there is no single <code>customer_name</code> for that group. MySQL 5.7 and earlier picked one
+arbitrarily and said nothing, which is how wrong numbers ended up in reports for years.</p>
+
+<p>MySQL 8 turns <code>ONLY_FULL_GROUP_BY</code> on by default and rejects it. The fixes, in order
+of preference:</p>
+
+<ul>
+  <li>Add the column to <code>GROUP BY</code> — if you meant to group by both.</li>
+  <li>Aggregate it: <code>MAX(customer_name)</code>, or <code>GROUP_CONCAT</code> to see them
+      all.</li>
+  <li>Use <code>ANY_VALUE(customer_name)</code> to say explicitly "any one will do" — which
+      documents that you knew.</li>
+</ul>
+
+<p>Do not turn the mode off. It is catching a real ambiguity, and the errors are a list of queries
+that were already returning arbitrary answers.</p>
+
+<p>There is one legitimate exception the server understands: grouping by a primary key.
+<code>GROUP BY o.id</code> lets you select any column of <code>o</code>, because the key
+functionally determines them — one row per group, no ambiguity.</p>
+
+<h2>Grouping by several columns, and WITH ROLLUP</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT COALESCE(order_type, 'ALL') AS order_type, COUNT(*) AS orders
+FROM   customer_order GROUP BY order_type WITH ROLLUP;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+--------+
+| order_type | orders |
++------------+--------+
+| CARRYOUT   |      7 |
+| DELIVERY   |     11 |
+| ALL        |     18 |
++------------+--------+</code></pre>
+
+<p><code>WITH ROLLUP</code> adds subtotal rows. It marks them by putting NULL in the grouped
+column, which is why the <code>COALESCE</code> is there — and also why it is ambiguous if the
+column can genuinely be NULL. <code>GROUPING(order_type)</code> distinguishes the two properly.</p>
+
+<p><code>WITH ROLLUP</code> cannot be combined with <code>ORDER BY</code>, since the subtotal rows
+have to stay attached to the groups they summarise.</p>
+
+<h2>Watch the join</h2>
+
+<p>The trap that produces wrong totals: aggregate a column from the "one" side across a join to the
+"many" side, and every value is counted once per matching row.</p>
+
+<pre class="language-sql"><code class="language-sql">-- WRONG: an order's total is counted once per line item it has
+SELECT ROUND(SUM(o.total), 2) FROM customer_order o JOIN order_item i ON i.order_id = o.id;
+
+-- right: aggregate the detail table, or aggregate before joining
+SELECT ROUND(SUM(i.line_total), 2) FROM order_item i;</code></pre>
+
+<p>Nothing warns you — the number is simply too big. It is the same fan-out problem described in
+<a href="/sql/sql-join-or-inner-join">INNER JOIN</a>, and the general fix is to aggregate in a
+subquery or <a href="/sql/mysql-cte">CTE</a> and join to the result.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Add <code>ORDER BY</code> — grouped output has no guaranteed order.</li>
+  <li><code>COUNT(*)</code> counts rows; <code>COUNT(col)</code> counts non-NULL values.</li>
+  <li><code>WHERE</code> before grouping, <code>HAVING</code> after. Prefer <code>WHERE</code>.</li>
+  <li><code>ONLY_FULL_GROUP_BY</code> is on by default and is right. Fix the query.</li>
+  <li>Do not <code>SUM</code> the "one" side across a join to the "many" side.</li>
+</ul>

@@ -1,0 +1,166 @@
+<p>SQL has no <code>if</code> statement in a query — but it has conditional
+<strong>expressions</strong>, which is what you actually need. They compute a value per row, so
+they can appear anywhere a column can: in the select list, in <code>WHERE</code>, in
+<code>ORDER BY</code>, and — most usefully — inside an aggregate.</p>
+
+<h2>IF()</h2>
+
+<p><code>IF(condition, when_true, when_false)</code>, and that is the whole function:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_name, total, IF(total &gt; 30, 'large', 'standard') AS bucket
+FROM   customer_order ORDER BY id LIMIT 5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------+-------+----------+
+| customer_name | total | bucket   |
++---------------+-------+----------+
+| Demo Customer | 28.91 | standard |
+| Alex Rivera   | 18.43 | standard |
+| Demo Customer | 32.18 | large    |
+| Sam Chen      | 32.18 | large    |
+| Jordan Blake  | 11.92 | standard |
++---------------+-------+----------+</code></pre>
+
+<p><code>IF()</code> is MySQL-specific. <code>CASE</code> is standard SQL and does everything
+<code>IF()</code> does, so if your query might ever move to another database, prefer
+<code>CASE</code>.</p>
+
+<p>Do not confuse this with the <code>IF</code> <em>statement</em>, which is a different thing that
+only exists inside <a href="/sql/mysql-stored-procedure">stored procedures</a>.</p>
+
+<h2>CASE</h2>
+
+<p>Two forms. The simple form compares one expression against values:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT status,
+       CASE status
+           WHEN 'COMPLETED'       THEN 'done'
+           WHEN 'CANCELLED'       THEN 'dead'
+           WHEN 'PENDING_PAYMENT' THEN 'waiting on the customer'
+           ELSE                        'in progress'
+       END AS plain_english,
+       COUNT(*) AS orders
+FROM   customer_order GROUP BY status ORDER BY orders DESC;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+-------------------------+--------+
+| status          | plain_english           | orders |
++-----------------+-------------------------+--------+
+| COMPLETED       | done                    |     13 |
+| CANCELLED       | dead                    |      2 |
+| PAID            | in progress             |      1 |
+| PENDING_PAYMENT | waiting on the customer |      1 |
+| PREPARING       | in progress             |      1 |
++-----------------+-------------------------+--------+</code></pre>
+
+<p>The searched form takes a full condition per branch, so it can compare ranges and combine
+columns:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT CASE
+           WHEN total &gt;= 40 THEN 'large'
+           WHEN total &gt;= 25 THEN 'medium'
+           ELSE                  'small'
+       END AS size_band,
+       COUNT(*) AS orders
+FROM   customer_order
+GROUP  BY size_band
+ORDER  BY orders DESC;</code></pre>
+
+<p><strong>Branches are evaluated in order and the first match wins</strong>, which is why the
+bands above do not need an upper bound each — by the time <code>&gt;= 25</code> is tested, anything
+40 or over has already been taken. Reordering those two lines silently changes the answer.</p>
+
+<p>Omit <code>ELSE</code> and unmatched rows get NULL rather than an error. That is the most common
+<code>CASE</code> bug: a value nobody thought of turns into a NULL that then vanishes from a
+<code>SUM</code>. Write the <code>ELSE</code>.</p>
+
+<h2>NULL-handling shorthands</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, COALESCE(guest_email, 'account holder') AS contact,
+       IFNULL(address_line1, 'carryout') AS delivery_to
+FROM   customer_order ORDER BY id LIMIT 4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+--------------------+-------------+
+| id | contact            | delivery_to |
++----+--------------------+-------------+
+|  1 | account holder     | 123 Main St |
+|  2 | guest1@example.com | carryout    |
+|  3 | account holder     | 123 Main St |
+|  4 | guest2@example.com | 88 Oak Ave  |
++----+--------------------+-------------+</code></pre>
+
+<table>
+  <tr><th>Function</th><th>Returns</th></tr>
+  <tr><td><code>COALESCE(a, b, c, …)</code></td><td>the first non-NULL argument. Standard SQL, any
+      number of arguments.</td></tr>
+  <tr><td><code>IFNULL(a, b)</code></td><td><code>b</code> if <code>a</code> is NULL. MySQL-specific,
+      exactly two arguments.</td></tr>
+  <tr><td><code>NULLIF(a, b)</code></td><td>NULL when the two are equal — used to turn a zero
+      denominator into a NULL instead of an error.</td></tr>
+</table>
+
+<p><code>COALESCE</code> covers both jobs, so there is little reason to reach for
+<code>IFNULL</code>. More on all of this in <a href="/sql/sql-isnull">NULL and IS NULL</a>.</p>
+
+<h2>Conditional aggregation — the reason this lesson matters</h2>
+
+<p>This is the technique worth taking away. Putting a condition <em>inside</em> an aggregate lets
+one pass over the table answer several questions at once:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS orders,
+       SUM(status = 'COMPLETED')                    AS completed,
+       SUM(status = 'CANCELLED')                    AS cancelled,
+       SUM(CASE WHEN order_type = 'DELIVERY' THEN 1 ELSE 0 END) AS delivery,
+       SUM(CASE WHEN status = 'COMPLETED' THEN total ELSE 0 END) AS completed_revenue
+FROM   customer_order;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------+-----------+-----------+----------+-------------------+
+| orders | completed | cancelled | delivery | completed_revenue |
++--------+-----------+-----------+----------+-------------------+
+|     18 |        13 |         2 |       11 |            357.40 |
++--------+-----------+-----------+----------+-------------------+</code></pre>
+
+<p>Five numbers, one scan. The alternatives are five separate queries, or a
+<a href="/sql/mysql-union">UNION</a> of five — both of which read the table five times and give you
+a column of rows where a report wants a row of columns.</p>
+
+<p>Two spellings, and the difference is worth knowing.
+<code>SUM(status = 'COMPLETED')</code> works because a MySQL comparison evaluates to 1 or 0, so
+summing it counts the matches. It is compact and MySQL-specific.
+<code>SUM(CASE WHEN … THEN 1 ELSE 0 END)</code> is the portable form and reads more clearly to
+someone who has not seen the trick.</p>
+
+<p>Use <code>SUM</code>, not <code>COUNT</code>. <code>COUNT(CASE WHEN … THEN 1 END)</code> also
+works — because <code>COUNT</code> ignores NULLs and the missing <code>ELSE</code> yields NULL —
+but <code>COUNT(CASE WHEN … THEN 1 ELSE 0 END)</code> counts <em>every</em> row, since 0 is not
+NULL. That one silently returns the table's row count and looks entirely plausible.</p>
+
+<p>Add a <code>GROUP BY</code> and the same shape becomes a pivot table — one row per group, one
+column per category. That is the standard answer to "turn these rows into columns", and it is in
+<a href="/sql/mysql-interview-advanced-queries">advanced queries</a>.</p>
+
+<h2>Elsewhere in a query</h2>
+
+<pre class="language-sql"><code class="language-sql">-- sort by a computed priority, not by a stored one
+SELECT id, status FROM customer_order
+ORDER  BY CASE status
+              WHEN 'PREPARING'       THEN 1
+              WHEN 'PAID'            THEN 2
+              WHEN 'PENDING_PAYMENT' THEN 3
+              ELSE                        4
+          END, id
+LIMIT  5;</code></pre>
+
+<p><code>CASE</code> works in <code>ORDER BY</code>, in <code>WHERE</code>, in
+<code>GROUP BY</code> and in an <code>UPDATE</code>'s <code>SET</code>. Note that sorting by an
+expression cannot use an index — fine on 18 rows, and something to check on a large table. See
+<a href="/sql/sql-order-by">ORDER BY</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>IF()</code> for two outcomes, <code>CASE</code> for more — and <code>CASE</code> is the
+      portable one.</li>
+  <li>Branches are tested in order; the first match wins.</li>
+  <li>Always write <code>ELSE</code>, or unmatched rows become NULL.</li>
+  <li><code>SUM(CASE …)</code> answers several questions in one scan. Use <code>SUM</code>, not
+      <code>COUNT</code> with an <code>ELSE 0</code>.</li>
+</ul>

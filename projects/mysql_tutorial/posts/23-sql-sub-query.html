@@ -1,0 +1,158 @@
+<p>A subquery is a <code>SELECT</code> inside another statement. It lets one query answer a question
+that depends on the answer to another, and it goes in four places: the select list, the
+<code>WHERE</code> clause, the <code>FROM</code> clause, and — as of MySQL 8 — a
+<a href="/sql/mysql-cte">CTE</a>, which is usually the more readable version of the same idea.</p>
+
+<h2>In the select list: scalar subqueries</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT name, (SELECT COUNT(*) FROM product_size ps WHERE ps.product_id = p.id) AS sizes
+FROM   product p WHERE p.type = 'PIZZA' ORDER BY p.id LIMIT 3;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+-------+
+| name            | sizes |
++-----------------+-------+
+| Pepperoni Pizza |     3 |
+| Cheese Pizza    |     3 |
+| Supreme Pizza   |     3 |
++-----------------+-------+</code></pre>
+
+<p>A subquery here must return <strong>one row and one column</strong> — more than one row is an
+error, and no rows gives NULL. This one is <em>correlated</em>: it mentions <code>p.id</code> from
+the outer query, so conceptually it runs once per outer row. A <code>LEFT JOIN</code> with
+<code>GROUP BY</code> usually does the same job with one pass; see the note on performance
+below.</p>
+
+<h2>In WHERE: IN, EXISTS and comparisons</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, customer_name, total FROM customer_order
+WHERE  id IN (SELECT order_id FROM order_item WHERE product_name = 'Pepsi')
+ORDER  BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------+-------+
+| id | customer_name | total |
++----+---------------+-------+
+|  1 | Demo Customer | 28.91 |
+| 11 | Demo Customer | 58.19 |
+| 18 | Demo Customer | 27.02 |
++----+---------------+-------+</code></pre>
+
+<p><code>IN</code> takes a list of values. <code>EXISTS</code> takes a correlated subquery and asks
+only whether it produced anything — which is why <code>SELECT 1</code> is the convention inside
+one; the columns are never read.</p>
+
+<p>Comparison operators work too, and this is the neat way to ask "above average" — a question you
+cannot write with <code>WHERE total &gt; AVG(total)</code>, because <code>WHERE</code> runs before
+aggregates exist:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total FROM customer_order
+WHERE  total &gt; (SELECT AVG(total) FROM customer_order)
+ORDER  BY total DESC LIMIT 3;</code></pre>
+
+<p><code>ANY</code> and <code>ALL</code> extend that to multi-row subqueries —
+<code>&gt; ALL (…)</code> means greater than every value.</p>
+
+<h2>The NOT IN trap</h2>
+
+<p>This one is worth real attention, because it returns a wrong answer rather than an error. Two
+conditions set it up, both of which happen naturally in a real database — a product nobody has
+ordered yet, and a NULL in the column the subquery selects (<code>order_item.product_id</code> is
+nullable, and goes NULL when a product is deleted):</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO product (id, name, description, type, active, display_order,
+                     created_at, updated_at, public_id, deleted)
+VALUES (99, 'Garlic Knots', 'On the menu, never ordered', 'PIZZA', TRUE, 99,
+        '2026-01-01', '2026-01-01', 'aaaaaaaa-0000-4000-8000-000000000099', FALSE);
+
+UPDATE order_item SET product_id = NULL WHERE id = 1;</code></pre>
+
+<p>Now ask "which products have never been ordered?" three ways. The answer is one — Garlic
+Knots:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT
+    (SELECT COUNT(*) FROM product p WHERE NOT EXISTS (SELECT 1 FROM order_item i WHERE i.product_id = p.id))      AS not_exists,
+    (SELECT COUNT(*) FROM product p WHERE p.id NOT IN (SELECT i.product_id FROM order_item i))                    AS not_in,
+    (SELECT COUNT(*) FROM product p WHERE p.id NOT IN (SELECT i.product_id FROM order_item i
+                                                        WHERE i.product_id IS NOT NULL))                          AS not_in_guarded;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+--------+----------------+
+| not_exists | not_in | not_in_guarded |
++------------+--------+----------------+
+|          1 |      0 |              1 |
++------------+--------+----------------+</code></pre>
+
+<p>The correct answer is 1. <code>NOT IN</code> says <strong>0</strong>.</p>
+
+<p>The reason is NULL logic. <code>x NOT IN (1, 2, NULL)</code> expands to
+<code>x &lt;&gt; 1 AND x &lt;&gt; 2 AND x &lt;&gt; NULL</code>, and that last comparison is never
+true — it is <em>unknown</em>. Unknown ANDed with anything is at best unknown, and
+<code>WHERE</code> keeps only true. So <strong>a single NULL anywhere in the subquery makes
+<code>NOT IN</code> return no rows at all</strong>, silently.</p>
+
+<p>Two fixes: add <code>WHERE col IS NOT NULL</code> to the subquery, or — better — use
+<code>NOT EXISTS</code>, which is immune because it asks about row existence rather than value
+equality. <strong>Prefer <code>NOT EXISTS</code>.</strong> Plain <code>IN</code> is unaffected;
+only the negation is.</p>
+
+<h2>In FROM: derived tables</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT t.order_type, ROUND(AVG(t.order_total), 2) AS avg_order
+FROM   (SELECT o.order_type, o.total AS order_total FROM customer_order o WHERE o.status = 'COMPLETED') t
+GROUP  BY t.order_type ORDER BY t.order_type;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+-----------+
+| order_type | avg_order |
++------------+-----------+
+| CARRYOUT   |     19.30 |
+| DELIVERY   |     32.61 |
++------------+-----------+</code></pre>
+
+<p>A subquery in <code>FROM</code> is a table for the duration of the query and
+<strong>must have an alias</strong> — <code>t</code> here. Leaving it off is
+<em>"Every derived table must have its own alias"</em>, which is one of the more common MySQL
+errors.</p>
+
+<p>Derived tables are the standard way to aggregate twice: group once inside, then group or filter
+the result. They are also how you work around the alias-not-visible-in-<code>WHERE</code> rule from
+<a href="/sql/sql-select">SELECT</a>.</p>
+
+<h2>Correlated or not, and what it costs</h2>
+
+<p>An <strong>uncorrelated</strong> subquery does not mention the outer query. MySQL can run it once
+and reuse the result. A <strong>correlated</strong> one depends on the current outer row, so
+conceptually it runs per row — which on a large table is the difference between one scan and a
+million lookups.</p>
+
+<p>MySQL 8's optimizer is good at rewriting these, frequently turning <code>IN</code> subqueries
+into semi-joins and materialising derived tables. Do not assume either way:
+<a href="/sql/sql-explain">EXPLAIN</a> tells you what it actually chose.</p>
+
+<p>As a rule of thumb, when a subquery and a join express the same thing, the join is easier for the
+optimizer and usually easier to read. The exceptions worth keeping are
+<code>EXISTS</code>/<code>NOT EXISTS</code>, which say what they mean and cannot duplicate rows the
+way a join to a "many" table can.</p>
+
+<h2>When to reach for a CTE instead</h2>
+
+<p>Anything more than one level of nesting gets hard to read, because you have to read a query
+inside-out. A <a href="/sql/mysql-cte">common table expression</a> gives each step a name and lets
+you read top-down:</p>
+
+<pre class="language-sql"><code class="language-sql">WITH completed AS (
+    SELECT order_type, total FROM customer_order WHERE status = 'COMPLETED'
+)
+SELECT order_type, ROUND(AVG(total), 2) AS avg_order
+FROM   completed GROUP BY order_type ORDER BY order_type;</code></pre>
+
+<p>Same result as the derived table above, and a CTE can also be referenced more than once, which a
+derived table cannot.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>A scalar subquery must return one row and one column.</li>
+  <li><strong><code>NOT IN</code> with a NULL in the subquery returns nothing.</strong> Use
+      <code>NOT EXISTS</code>.</li>
+  <li>Derived tables need an alias.</li>
+  <li>Correlated subqueries run per outer row — check with <code>EXPLAIN</code> before assuming.</li>
+  <li>Past one level of nesting, use a CTE.</li>
+</ul>
