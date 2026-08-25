@@ -284,7 +284,7 @@ projects/springboot_tutorial/
 | Tree | State |
 |---|---|
 | `local` | 36 posts, dates 2026-06-11 … 2026-08-18 |
-| `prod` | **36 posts written**, 871 posts total. ⚠️ Lesson 15 is in the content DB but the site has NOT been rebuilt — see "GraphQL" below. |
+| `prod` | **36 posts live**, 871 posts total |
 | backup | `.../backups/prod-2026-08-18-pre-springboot/` and `.../backups/prod-2026-08-25-pre-graphql/` (973 objects) |
 
 Verified after deploy: `verify-build` 573/573 posts, 44/44 category counts agree, 746 HTML files,
@@ -360,14 +360,23 @@ from `@Valid` has no mapping, so validation failures were opaque `INTERNAL_ERROR
 - Anonymous mutation → `UNAUTHORIZED`, customer token → `FORBIDDEN`, admin token → passes the gate
   (checked with a nonexistent id so nothing was actually mutated). All read off the running app.
 
-### State: saved, NOT published
+### State: LIVE (deployed 2026-08-25)
 
-The prod content DB has the post; **the site has not been rebuilt**, so nothing is live yet. The
-build was run locally and passes — `verify-build` 871/871 posts, 42/42 category counts, 1102 HTML
-files, and `out/spring-boot/spring-boot-graphql.html` renders with 929 Prism spans and the right
-prev/next neighbours.
+`verify-build` 871/871 posts, 42/42 category counts agree, 1102 HTML files, 2235 files uploaded,
+CloudFront Function republished (104 redirects, 6.8 KB of the 10 KB limit), invalidation completed
+and the edge confirmed serving build `42a2593`.
 
-⚠️ **Deploying needs a decision first.** `lovemesomecoding_frontend` has four uncommitted files
-(`nav.ts`, `pages.ts`, `postbuild.mjs`, `cloudfront-function.js`) from the 2026-08-24 brainteaser
-retirement. `npm run deploy` would ship those too. They look complete and match the current content
-DB, but they are not mine to publish.
+Verified against the live site, not the build output:
+
+- **All 36 track URLs return 200**, and `/spring-boot` lists 36.
+- `/spring-boot/spring-boot-graphql` renders with 929 Prism spans across
+  `graphql`/`java`/`json`/`markup`/`plaintext`, and the track sidebar puts it between the springdoc
+  lesson and Thymeleaf with `class="active"`.
+- It is in `sitemap.xml`.
+
+⚠️ **This deploy also shipped four uncommitted frontend files** — `nav.ts`, `pages.ts`,
+`postbuild.mjs`, `cloudfront-function.js` — left over from the 2026-08-24 brainteaser retirement.
+Flagged before deploying and approved. Live behaviour matches what their comments describe:
+`/brainteaser` and `/brainteaser/brain-teaser` both 301 to `/`, and `/algorithm-interview` still
+returns 200 (it was only pulled from the nav dropdown, not retired). **They are still uncommitted in
+`lovemesomecoding_frontend`, so the repo no longer matches what is deployed.**
