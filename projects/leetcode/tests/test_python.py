@@ -2809,6 +2809,162 @@ for trial in range(40):
             real.add(number); model.append(number)
 check("matches a brute-force pair scan over 40 random operation sequences", bad, [])
 
+print("LeetCode 173 - Binary Search Tree Iterator")
+ns173 = {}
+exec(compile(TREE + "\n" + "\n".join(blocks("173-binary-search-tree-iterator.html")),
+             "bstiter", "exec"), ns173)
+BSTIterator = ns173["BSTIterator"]
+def drain(xs):
+    it = BSTIterator(build(xs))
+    out = []
+    while it.hasNext():
+        out.append(it.next())
+    return out, it.hasNext()
+
+check("[7,3,15,null,null,9,20]", drain([7,3,15,None,None,9,20]), ([3,7,9,15,20], False))
+check("empty tree", drain([]), ([], False))
+check("single node", drain([1]), ([1], False))
+check("hasNext is false before any next on an empty tree",
+      BSTIterator(build([])).hasNext(), False)
+# Interleaved calls, matching the problem statement's sequence.
+it = BSTIterator(build([7,3,15,None,None,9,20]))
+check("interleaved next/hasNext",
+      [it.next(), it.next(), it.hasNext(), it.next(), it.next(), it.hasNext(), it.next(), it.hasNext()],
+      [3, 7, True, 9, 15, True, 20, False])
+# Must equal inorder, which for a BST is sorted, on every small BST.
+def build_bst(values):
+    Node = ns94["TreeNode"]
+    root = None
+    for v in values:
+        if root is None:
+            root = Node(v); continue
+        node = root
+        while True:
+            if v < node.val:
+                if node.left is None:
+                    node.left = Node(v); break
+                node = node.left
+            else:
+                if node.right is None:
+                    node.right = Node(v); break
+                node = node.right
+    return root
+
+bad = []
+for n in range(1, 8):
+    for perm in itertools.islice(itertools.permutations(range(n)), 40):
+        root = build_bst(list(perm))
+        it = BSTIterator(root)
+        out = []
+        while it.hasNext():
+            out.append(it.next())
+        if out != sorted(perm):
+            bad.append(perm)
+check("yields ascending order for every small BST insertion order", bad, [])
+# A left chain: the shape where the constructor pushes everything at once.
+chain = ns94["TreeNode"](50)
+node = chain
+for v in range(49, 0, -1):
+    node.left = ns94["TreeNode"](v); node = node.left
+it = BSTIterator(chain)
+out = []
+while it.hasNext():
+    out.append(it.next())
+check("left chain of 50 nodes", out, list(range(1, 51)))
+
+print("LeetCode 189 - Rotate Array")
+s = load("189-rotate-array.html")
+def rotated(nums, k):
+    a = list(nums)
+    s.rotate(a, k)
+    return a
+check("[1,2,3,4,5,6,7] k=3", rotated([1,2,3,4,5,6,7], 3), [5,6,7,1,2,3,4])
+check("[-1,-100,3,99] k=2", rotated([-1,-100,3,99], 2), [3,99,-1,-100])
+check("[1,2] k=3 (k EXCEEDS the length)", rotated([1,2], 3), [2,1])
+check("[1] k=0", rotated([1], 0), [1])
+check("[1,2,3] k=3 (full rotation is a no-op)", rotated([1,2,3], 3), [1,2,3])
+check("[1,2,3] k=0", rotated([1,2,3], 0), [1,2,3])
+check("[1,2,3] k=6 (two full rotations)", rotated([1,2,3], 6), [1,2,3])
+check("returns None, mutating in place", s.rotate([1,2], 1), None)
+bad = []
+for n in range(1, 9):
+    nums = list(range(n))
+    for k in range(0, 3 * n + 2):
+        shift = k % n
+        want = nums[-shift:] + nums[:-shift] if shift else list(nums)
+        if rotated(nums, k) != want:
+            bad.append((n, k))
+check("every array length 1..8 crossed with k in 0..3n+1", bad, [])
+
+print("LeetCode 198 - House Robber")
+s = load("198-house-robber.html")
+check("[1,2,3,1]", s.rob([1,2,3,1]), 4)
+check("[2,7,9,3,1]", s.rob([2,7,9,3,1]), 12)
+check("[2,1,1,2] (the answer skips TWO in a row)", s.rob([2,1,1,2]), 4)
+check("[5] (single house)", s.rob([5]), 5)
+check("[2,1]", s.rob([2,1]), 2)
+check("[] (empty)", s.rob([]), 0)
+check("[0,0,0]", s.rob([0,0,0]), 0)
+# The alternating greedy the post disproves must genuinely be worse somewhere.
+def alternating_greedy(nums):
+    return max(sum(nums[0::2]), sum(nums[1::2])) if nums else 0
+check("alternating greedy loses on [2,1,1,2]",
+      (alternating_greedy([2,1,1,2]), s.rob([2,1,1,2])), (3, 4))
+# Brute force over every valid (non-adjacent) subset.
+def brute_rob(nums):
+    best = 0
+    for mask in range(1 << len(nums)):
+        if mask & (mask << 1):
+            continue                     # two adjacent bits set
+        total = sum(nums[i] for i in range(len(nums)) if mask >> i & 1)
+        best = max(best, total)
+    return best
+
+bad = []
+for n in range(0, 12):
+    for combo in itertools.product([0, 1, 4], repeat=n):
+        if s.rob(list(combo)) != brute_rob(list(combo)):
+            bad.append(combo)
+check("matches brute force over non-adjacent subsets, arrays up to length 11", bad, [])
+
+print("LeetCode 199 - Binary Tree Right Side View")
+s = load("199-binary-tree-right-side-view.html", extra=TREE)
+check("[1,2,3,null,5,null,4]", s.rightSideView(build([1,2,3,None,5,None,4])), [1,3,4])
+check("visible node is a LEFT child", s.rightSideView(build([1,2,3,4])), [1,3,4])
+check("empty tree", s.rightSideView(None), [])
+check("single node", s.rightSideView(build([1])), [1])
+check("left-only chain", s.rightSideView(build([1,2,None,3])), [1,2,3])
+check("right-only chain", s.rightSideView(build([1,None,2,None,3])), [1,2,3])
+# Independent model: last value at each depth, by a left-to-right walk.
+def right_view_model(node, depth=0, acc=None):
+    acc = {} if acc is None else acc
+    if node is None:
+        return acc
+    acc[depth] = node.val               # later (more rightward) writes win
+    right_view_model(node.left, depth + 1, acc)
+    right_view_model(node.right, depth + 1, acc)
+    return acc
+
+bad = []
+for n in range(1, 10):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        model = right_view_model(build(xs))
+        want = [model[d] for d in sorted(model)]
+        if s.rightSideView(build(xs)) != want:
+            bad.append(xs)
+check("matches a depth-indexed model on every small tree shape", bad, [])
+if hasattr(s, "rightSideViewBfs"):
+    bad = []
+    for n in range(1, 9):
+        for mask in range(1 << (n - 1)):
+            nxt = itertools.count(1)
+            xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+            if s.rightSideViewBfs(build(xs)) != s.rightSideView(build(xs)):
+                bad.append(xs)
+    check("[BFS version] agrees with the DFS version", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

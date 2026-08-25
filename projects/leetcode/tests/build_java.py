@@ -133,6 +133,15 @@ solution("159-longest-substring-with-at-most-two-distinct-characters.html", "S15
 solution("160-intersection-of-two-linked-lists.html", "S160")
 solution("168-excel-sheet-column-title.html", "S168")
 solution("169-majority-element.html", "S169")
+solution("189-rotate-array.html", "S189")
+solution("198-house-robber.html", "S198")
+solution("199-binary-tree-right-side-view.html", "S199")
+
+# LeetCode 173 defines `class BSTIterator`, not `class Solution`.
+for block in blocks("173-binary-search-tree-iterator.html"):
+    if re.search(r'\bclass\s+BSTIterator\b', block):
+        parts.append(block)
+        break
 
 # LeetCode 170 defines `class TwoSum`, not `class Solution`.
 for block in blocks("170-two-sum-iii-data-structure-design.html"):
@@ -835,6 +844,45 @@ public class Main {
         int total = 0;
         for (char c : title.toCharArray()) total = total * 26 + (c - 'A' + 1);
         return total;
+    }
+
+    /** Insert values into a BST in the given order. */
+    static TreeNode buildBst(int[] values) {
+        TreeNode root = null;
+        for (int v : values) {
+            if (root == null) { root = new TreeNode(v); continue; }
+            TreeNode node = root;
+            while (true) {
+                if (v < node.val) {
+                    if (node.left == null) { node.left = new TreeNode(v); break; }
+                    node = node.left;
+                } else {
+                    if (node.right == null) { node.right = new TreeNode(v); break; }
+                    node = node.right;
+                }
+            }
+        }
+        return root;
+    }
+
+    /** Best non-adjacent subset sum, by enumerating every valid mask. */
+    static int bruteRob(int[] nums) {
+        int best = 0;
+        for (int mask = 0; mask < (1 << nums.length); mask++) {
+            if ((mask & (mask << 1)) != 0) continue;      // two adjacent bits set
+            int total = 0;
+            for (int i = 0; i < nums.length; i++) if ((mask >> i & 1) == 1) total += nums[i];
+            best = Math.max(best, total);
+        }
+        return best;
+    }
+
+    /** Last value seen at each depth by a left-to-right walk = the right side view. */
+    static void rightViewModel(TreeNode node, int depth, Map<Integer, Integer> acc) {
+        if (node == null) return;
+        acc.put(depth, node.val);                        // rightward writes win
+        rightViewModel(node.left, depth + 1, acc);
+        rightViewModel(node.right, depth + 1, acc);
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -3319,6 +3367,128 @@ public class Main {
             }
         }
         check("matches a brute-force pair scan over 40 random operation sequences", twoSumBad, 0);
+
+        System.out.println("LeetCode 173 - Binary Search Tree Iterator");
+        BSTIterator iter = new BSTIterator(buildTree(7, 3, 15, null, null, 9, 20));
+        List<Integer> drained = new ArrayList<>();
+        while (iter.hasNext()) drained.add(iter.next());
+        check("[7,3,15,null,null,9,20]", drained, List.of(3, 7, 9, 15, 20));
+        check("exhausted", new BSTIterator(buildTree(7, 3, 15, null, null, 9, 20)) != null, true);
+        check("empty tree has nothing", new BSTIterator(null).hasNext(), false);
+        BSTIterator loneNode = new BSTIterator(buildTree(1));
+        check("single node", loneNode.next() + "," + loneNode.hasNext(), "1,false");
+        // Interleaved calls, matching the problem statement's sequence.
+        BSTIterator mixed = new BSTIterator(buildTree(7, 3, 15, null, null, 9, 20));
+        check("interleaved next/hasNext",
+              mixed.next() + "," + mixed.next() + "," + mixed.hasNext() + ","
+                  + mixed.next() + "," + mixed.next() + "," + mixed.hasNext() + ","
+                  + mixed.next() + "," + mixed.hasNext(),
+              "3,7,true,9,15,true,20,false");
+        int iterBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            int[] values = new int[n];
+            for (int i = 0; i < n; i++) values[i] = i;
+            // A handful of insertion orders, so the tree shape varies.
+            for (int seed = 0; seed < 40; seed++) {
+                List<Integer> order = new ArrayList<>();
+                for (int v : values) order.add(v);
+                Collections.shuffle(order, new Random(seed));
+                int[] shuffled = order.stream().mapToInt(Integer::intValue).toArray();
+                BSTIterator it = new BSTIterator(buildBst(shuffled));
+                List<Integer> got = new ArrayList<>();
+                while (it.hasNext()) got.add(it.next());
+                List<Integer> ascending = new ArrayList<>(order);
+                Collections.sort(ascending);
+                if (!got.equals(ascending)) iterBad++;
+            }
+        }
+        check("yields ascending order for every small BST insertion order", iterBad, 0);
+        // A left chain: the shape where the constructor pushes everything at once.
+        TreeNode bstChain = new TreeNode(50);
+        TreeNode chainTail = bstChain;
+        for (int v = 49; v >= 1; v--) { chainTail.left = new TreeNode(v); chainTail = chainTail.left; }
+        BSTIterator chainIter = new BSTIterator(bstChain);
+        List<Integer> chainOut = new ArrayList<>();
+        while (chainIter.hasNext()) chainOut.add(chainIter.next());
+        List<Integer> chainExpect = new ArrayList<>();
+        for (int v = 1; v <= 50; v++) chainExpect.add(v);
+        check("left chain of 50 nodes", chainOut, chainExpect);
+
+        System.out.println("LeetCode 189 - Rotate Array");
+        S189 s189 = new S189();
+        int[] rot = {1,2,3,4,5,6,7};
+        s189.rotate(rot, 3);
+        check("[1,2,3,4,5,6,7] k=3", rot, new int[]{5,6,7,1,2,3,4});
+        int[] rot2 = {-1,-100,3,99};
+        s189.rotate(rot2, 2);
+        check("[-1,-100,3,99] k=2", rot2, new int[]{3,99,-1,-100});
+        int[] rot3 = {1,2};
+        s189.rotate(rot3, 3);
+        check("[1,2] k=3 (k EXCEEDS the length)", rot3, new int[]{2,1});
+        int[] rot4 = {1,2,3};
+        s189.rotate(rot4, 3);
+        check("[1,2,3] k=3 (full rotation is a no-op)", rot4, new int[]{1,2,3});
+        int[] rot5 = {1,2,3};
+        s189.rotate(rot5, 0);
+        check("[1,2,3] k=0", rot5, new int[]{1,2,3});
+        int rotateBad = 0;
+        for (int n = 1; n <= 8; n++) {
+            for (int k = 0; k <= 3 * n + 1; k++) {
+                int[] nums = new int[n];
+                for (int i = 0; i < n; i++) nums[i] = i;
+                s189.rotate(nums, k);
+                int shift = k % n;
+                int[] rotatedWant = new int[n];
+                for (int i = 0; i < n; i++) rotatedWant[(i + shift) % n] = i;
+                if (!Arrays.equals(nums, rotatedWant)) rotateBad++;
+            }
+        }
+        check("every array length 1..8 crossed with k in 0..3n+1", rotateBad, 0);
+
+        System.out.println("LeetCode 198 - House Robber");
+        S198 s198 = new S198();
+        check("[1,2,3,1]", s198.rob(new int[]{1,2,3,1}), 4);
+        check("[2,7,9,3,1]", s198.rob(new int[]{2,7,9,3,1}), 12);
+        check("[2,1,1,2] (the answer skips TWO in a row)", s198.rob(new int[]{2,1,1,2}), 4);
+        check("[5] (single house)", s198.rob(new int[]{5}), 5);
+        check("[2,1]", s198.rob(new int[]{2,1}), 2);
+        check("[] (empty)", s198.rob(new int[]{}), 0);
+        // The alternating greedy the post disproves must genuinely lose here.
+        check("alternating greedy would give 3, the answer is 4",
+              Math.max(2 + 1, 1 + 2) + "," + s198.rob(new int[]{2,1,1,2}), "3,4");
+        int robBad = 0;
+        int[] robValues = {0, 1, 4};
+        for (int n = 0; n <= 11; n++) {
+            int combos = (int) Math.pow(robValues.length, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] nums = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { nums[i] = robValues[mm % robValues.length]; mm /= robValues.length; }
+                if (s198.rob(nums.clone()) != bruteRob(nums)) robBad++;
+            }
+        }
+        check("matches brute force over non-adjacent subsets, arrays up to length 11", robBad, 0);
+
+        System.out.println("LeetCode 199 - Binary Tree Right Side View");
+        S199 s199 = new S199();
+        check("[1,2,3,null,5,null,4]",
+              s199.rightSideView(buildTree(1,2,3,null,5,null,4)), List.of(1,3,4));
+        check("visible node is a LEFT child",
+              s199.rightSideView(buildTree(1,2,3,4)), List.of(1,3,4));
+        check("empty tree", s199.rightSideView(null), List.of());
+        check("single node", s199.rightSideView(buildTree(1)), List.of(1));
+        check("left-only chain", s199.rightSideView(buildTree(1,2,null,3)), List.of(1,2,3));
+        check("right-only chain", s199.rightSideView(buildTree(1,null,2,null,3)), List.of(1,2,3));
+        int viewBad = 0;
+        for (int n = 1; n <= 9; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                Map<Integer, Integer> model = new TreeMap<>();
+                rightViewModel(buildTree(xs), 0, model);
+                if (!s199.rightSideView(buildTree(xs)).equals(new ArrayList<>(model.values())))
+                    viewBad++;
+            }
+        }
+        check("matches a depth-indexed model on every small tree shape", viewBad, 0);
 
         System.out.println();
         if (failures > 0) {

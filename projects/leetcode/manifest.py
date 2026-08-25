@@ -1574,6 +1574,69 @@ POSTS = [
         ),
     },
     {
+        "number": 173,
+        "slug": "leetcode-173-binary-search-tree-iterator",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 173 \u2013 Binary Search Tree Iterator",
+        "file": "173-binary-search-tree-iterator.html",
+        "date": "2025-01-30T13:48:01",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "stack", "design", "binary-search-tree"],
+        "excerpt": (
+            "Inorder traversal split across two methods, and that is the whole insight \u2014 the "
+            "descend-left loop becomes the advance step and the stack becomes the object's state. "
+            "Plus the amortised argument that makes next() O(1) on average when a single call can "
+            "clearly do O(h) work."
+        ),
+    },
+    {
+        "number": 189,
+        "slug": "leetcode-189-rotate-array",
+        "algorithm": "Implementation",
+        "title": "LeetCode 189 \u2013 Rotate Array",
+        "file": "189-rotate-array.html",
+        "date": "2025-02-04T02:27:36",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "two-pointers", "math"],
+        "excerpt": (
+            "The array version of Reverse Words in a String, using the identical three-reversal "
+            "trick. It is also where forgetting k %= n turns a correct algorithm into an exception, "
+            "and where the Python one-liner rebinds a local name so the caller sees nothing at all."
+        ),
+    },
+    {
+        "number": 198,
+        "slug": "leetcode-198-house-robber",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 198 \u2013 House Robber",
+        "file": "198-house-robber.html",
+        "date": "2025-02-11T19:13:59",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "dynamic-programming"],
+        "excerpt": (
+            "The DP that introduces a choice: Climbing Stairs counted branches and added them, this "
+            "picks the better of two. Same dependencies, different combiner. And the alternating "
+            "greedy everyone proposes fails on [2,1,1,2], where the best answer skips two houses in "
+            "a row."
+        ),
+    },
+    {
+        "number": 199,
+        "slug": "leetcode-199-binary-tree-right-side-view",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 199 \u2013 Binary Tree Right Side View",
+        "file": "199-binary-tree-right-side-view.html",
+        "date": "2025-02-14T22:51:44",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "breadth-first-search", "depth-first-search"],
+        "excerpt": (
+            "The clearest illustration that how you traverse and what you record are independent: "
+            "level order with one line changed. The visible node may be a LEFT child \u2014 rightmost at "
+            "its depth, not on the right spine \u2014 which is what any walk-down-the-right-side answer "
+            "gets wrong."
+        ),
+    },
+    {
         "number": 200,
         "batch": "interview-essentials",
         "slug": "leetcode-200-number-of-islands",

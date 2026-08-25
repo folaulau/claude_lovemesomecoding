@@ -44,7 +44,10 @@ different constraints. Every post here is written fresh and every solution rewri
 
 ## The rounds
 
-A round is ten LeetCode numbers, holding however many of them the source repo actually has.
+A round is ten LeetCode numbers, holding however many of them the source repo actually has. That
+mostly maps one-to-one onto a writing session, but not always — the last four below LeetCode 200
+span three numeric rounds (171–180, 181–190, 191–200) and were written and seeded together, so
+`seed.py` was run three times for one batch of work.
 
 | Round | Numbers | Posts | Status |
 |---|---|---|---|
@@ -65,7 +68,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 15 | 141–150 | 6 — 141, 142, 144, 145, 146, 149 | **live** since 2024-12/2025-01 |
 | 16 | 151–160 | 6 — 151, 152, 156, 157, 158, 159 | **live** since 2025-01 |
 | 17 | 161–170 | 4 — 160 (see note), 168, 169, 170 | **live** since 2025-01 |
-| 18 | 171–200 | 4 — 173, 189, 198, 199 | not started |
+| 18–20 | 171–200 | 4 — 173, 189, 198, 199 | **live** since 2025-01/02 |
+| 21 | 201–210 | 8 — 202, 203, 204, 205, 206, 207, 208, 210 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -97,14 +101,14 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 98 posts:
+Current distribution across the 102 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Implementation | 21 |
-| Graph Theory | 19 |
+| Implementation | 22 |
+| Graph Theory | 21 |
+| Dynamic Programming | 15 |
 | Strings | 14 |
-| Dynamic Programming | 14 |
 | Recursion | 10 |
 | Sorting | 8 |
 | Searching | 6 |
