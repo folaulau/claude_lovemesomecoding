@@ -1,0 +1,149 @@
+<p><code>DELETE</code> removes rows. Everything interesting about it is what goes with them, and what
+you do instead when the answer is "nothing should ever really be removed".</p>
+
+<h2>The basic form, and its foot-gun</h2>
+
+<pre class="language-sql"><code class="language-sql">DELETE FROM cart_item WHERE cart_id = 42;   -- deletes matching rows
+DELETE FROM cart_item;                      -- deletes EVERY row</code></pre>
+
+<p>There is no confirmation. The same advice as
+<a href="/sql/sql-update">UPDATE</a> applies and applies harder: <strong>run it as a
+<code>SELECT</code> first</strong>, keep <code>sql_safe_updates</code> on, and wrap anything
+consequential in a <a href="/sql/mysql-transaction">transaction</a> you can roll back.</p>
+
+<h2>What goes with it: ON DELETE CASCADE</h2>
+
+<p>The pizza schema declares <code>order_item</code> → <code>customer_order</code> and
+<code>order_item_topping</code> → <code>order_item</code> as <code>ON DELETE CASCADE</code>. So
+deleting one order reaches two levels down:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT
+    (SELECT COUNT(*) FROM customer_order)      AS orders,
+    (SELECT COUNT(*) FROM order_item)          AS items,
+    (SELECT COUNT(*) FROM order_item_topping)  AS toppings;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------+-------+----------+
+| orders | items | toppings |
++--------+-------+----------+
+|     18 |    27 |        9 |
++--------+-------+----------+</code></pre>
+
+<pre class="language-sql"><code class="language-sql">DELETE FROM customer_order WHERE id = 8;
+
+SELECT
+    (SELECT COUNT(*) FROM customer_order)      AS orders,
+    (SELECT COUNT(*) FROM order_item)          AS items,
+    (SELECT COUNT(*) FROM order_item_topping)  AS toppings;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------+-------+----------+
+| orders | items | toppings |
++--------+-------+----------+
+|     17 |    25 |        7 |
++--------+-------+----------+</code></pre>
+
+<p>One statement, one order gone, and with it two line items and two toppings. Cascade is a real
+feature and worth respecting: the blast radius of a <code>DELETE</code> is not visible in the
+statement. Before deleting from a parent table on anything that matters, check what references it —
+<a href="/sql/mysql-information-schema">INFORMATION_SCHEMA</a> will tell you.</p>
+
+<h2>The other direction: ON DELETE SET NULL</h2>
+
+<p><code>order_item.product_id</code> → <code>product</code> is declared <code>SET NULL</code>
+instead, and the difference is deliberate:</p>
+
+<pre class="language-sql"><code class="language-sql">DELETE FROM product WHERE id = 1;
+
+SELECT COUNT(*) AS items_with_null_product FROM order_item WHERE product_id IS NULL;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------------------------+
+| items_with_null_product |
++-------------------------+
+|                       4 |
++-------------------------+</code></pre>
+
+<p>Four line items lost their product reference and <strong>survived</strong>. That is the whole
+point: they snapshotted <code>product_name</code> and <code>unit_price</code> at purchase time, so
+the historical order is still complete and still shows what the customer bought and paid. Cascading
+here would have deleted parts of real orders because someone tidied the menu. See
+<a href="/sql/mysql-normalization">normalization</a>.</p>
+
+<h2>DELETE with a JOIN</h2>
+
+<pre class="language-sql"><code class="language-sql">-- delete the line items of cancelled orders, keeping the orders
+DELETE i
+FROM   order_item i
+JOIN   customer_order o ON o.id = i.order_id
+WHERE  o.status = 'CANCELLED';</code></pre>
+
+<p>Name the table (or tables) to delete from between <code>DELETE</code> and <code>FROM</code> —
+<code>DELETE i</code>. Omit it and MySQL does not know which side you meant. You can name several:
+<code>DELETE i, o FROM …</code>.</p>
+
+<h2>DELETE, TRUNCATE and DROP</h2>
+
+<table>
+  <tr><th></th><th>Removes</th><th>Transactional</th><th>AUTO_INCREMENT</th></tr>
+  <tr><td><code>DELETE</code></td><td>rows matching <code>WHERE</code></td><td>yes — can be rolled
+      back</td><td>keeps counting</td></tr>
+  <tr><td><code>TRUNCATE</code></td><td>all rows</td><td><strong>no</strong> — implicit
+      commit</td><td><strong>resets to 1</strong></td></tr>
+  <tr><td><code>DROP</code></td><td>the table itself</td><td>no</td><td>n/a</td></tr>
+</table>
+
+<p><code>TRUNCATE</code> is far faster on a large table because it drops and recreates it rather
+than deleting row by row. The trade-offs are the ones in the table, plus two more:
+<strong>it does not fire triggers</strong>, and it refuses to run at all if another table has a
+foreign key pointing at this one. That refusal is a feature — it is telling you a
+<code>DELETE</code> would have cascaded.</p>
+
+<p>It is the right tool for emptying a staging or test table. It is the wrong tool for anything you
+might want back, because there is no rollback and it is not written to the binary log as row
+events, so <a href="/sql/mysql-binlog">point-in-time recovery</a> replays it as a truncate.</p>
+
+<h2>Deleting in batches</h2>
+
+<pre class="language-sql"><code class="language-sql">-- repeat until it reports 0 rows
+DELETE FROM customer_order
+WHERE  status = 'CANCELLED' AND created_at &lt; '2023-01-01'
+ORDER  BY id
+LIMIT  1000;</code></pre>
+
+<p>A single <code>DELETE</code> of a million rows holds locks for its whole duration, builds a huge
+undo log, and stalls replication. Batches keep each transaction short. Unlike
+<code>UPDATE ... JOIN</code>, a simple <code>DELETE</code> does accept <code>ORDER BY</code> and
+<code>LIMIT</code>.</p>
+
+<p>Note that deleting rows does not return the disk space to the operating system — InnoDB keeps it
+for reuse in that table. <code>OPTIMIZE TABLE</code> reclaims it, and rebuilds the table to do so.</p>
+
+<h2>Soft delete</h2>
+
+<p>The pizza schema mostly does not delete at all. Every table carries a <code>deleted</code>
+boolean, and rows are flagged rather than removed:</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE product SET deleted = TRUE WHERE id = 3;
+
+SELECT COUNT(*) AS visible FROM product WHERE deleted = FALSE;</code></pre>
+
+<p>Note that <code>deleted</code> and <code>active</code> are two different things in that schema,
+and both are kept: <code>active</code> means temporarily off the menu but still visible in the admin
+screen, <code>deleted</code> means gone for good. Conflating them loses a distinction the business
+actually has.</p>
+
+<p>Soft delete buys you recoverability and keeps historical references intact. It costs you
+something real: <strong>every query must remember the filter</strong>, and the one that forgets
+shows deleted rows to a customer. Push it into a mechanism rather than discipline — the pizza
+schema uses Hibernate's <code>@SQLRestriction</code> on the entity; a
+<a href="/sql/mysql-view">view</a> is the database-side equivalent. Unique constraints also
+interact badly: a soft-deleted row still occupies its unique name, so the name cannot be reused.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>SELECT</code> first, <code>sql_safe_updates</code> on, transaction around anything
+      real.</li>
+  <li><code>ON DELETE CASCADE</code> means one statement can remove far more than it names.</li>
+  <li><code>DELETE i FROM … JOIN …</code> — name the table to delete from.</li>
+  <li><code>TRUNCATE</code> is fast, non-transactional, resets the counter and skips triggers.</li>
+  <li>Batch large deletes; consider soft delete, and then enforce the filter mechanically.</li>
+</ul>

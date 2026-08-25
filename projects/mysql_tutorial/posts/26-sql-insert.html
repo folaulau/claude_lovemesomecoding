@@ -1,0 +1,159 @@
+<p><code>INSERT</code> adds rows. The basic form takes ten seconds to learn; the parts worth knowing
+are the multi-row form, what to do when the row might already exist, and which columns you are
+allowed to leave out.</p>
+
+<h2>The basic form, and the multi-row one</h2>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO crust (name, price_delta, active, display_order, public_id, created_at, updated_at, deleted) VALUES
+    ('Gluten Free', 3.00, TRUE, 5, 'cccccccc-0000-4000-8000-000000000005', '2026-01-01', '2026-01-01', FALSE),
+    ('Cauliflower', 3.50, TRUE, 6, 'cccccccc-0000-4000-8000-000000000006', '2026-01-01', '2026-01-01', FALSE);</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, name, price_delta, display_order FROM crust ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+----------------+-------------+---------------+
+| id | name           | price_delta | display_order |
++----+----------------+-------------+---------------+
+|  1 | Original Pan   |        0.00 |             1 |
+|  2 | Hand Tossed    |        0.00 |             2 |
+|  3 | Thin 'N Crispy |        0.00 |             3 |
+|  4 | Stuffed Crust  |        2.50 |             4 |
+|  5 | Gluten Free    |        3.00 |             5 |
+|  6 | Cauliflower    |        3.50 |             6 |
++----+----------------+-------------+---------------+</code></pre>
+
+<p><strong>Always list the columns.</strong> <code>INSERT INTO crust VALUES (…)</code> is legal and
+depends on column order, so the day someone adds a column your insert starts putting values in the
+wrong places — or fails, if you are lucky.</p>
+
+<p>The multi-row form is not just tidier, it is <strong>dramatically faster</strong>. One statement
+means one round trip, one parse, and one transaction; a thousand separate inserts mean a thousand
+of each. Batching in the low hundreds to low thousands is the usual sweet spot — past that the
+statement gets large enough to bump into <code>max_allowed_packet</code>.</p>
+
+<h2>Which columns you can omit</h2>
+
+<p>A column can be left out if it has a <code>DEFAULT</code>, is <code>AUTO_INCREMENT</code>, or is
+nullable. Everything else must be supplied — which is why the insert above lists
+<code>public_id</code>, <code>created_at</code> and <code>updated_at</code> even though they look
+like bookkeeping.</p>
+
+<p>That is worth pausing on, because it is a real consequence of a schema decision. The pizza
+schema declares those <code>NOT NULL</code> with no default and fills them from JPA lifecycle
+callbacks in the application. The benefit is one mechanism, visible in the Java, that behaves the
+same on any database. The cost is exactly this: <strong>anything writing outside the application —
+a migration, a fix at the <code>mysql&gt;</code> prompt — has to supply them by hand.</strong>
+Database-side <code>DEFAULT CURRENT_TIMESTAMP</code> would trade that the other way. See
+<a href="/sql/sql-date-types">date and time types</a>.</p>
+
+<h2>INSERT ... SELECT</h2>
+
+<p>Insert the result of a query rather than literals — the standard way to copy rows, populate a
+summary table, or backfill:</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO topping (name, price, category, active, public_id, created_at, updated_at, deleted)
+SELECT CONCAT('Extra ', name), price * 1.5, category, TRUE,
+       CONCAT('bbbbbbbb-0000-4000-8000-', LPAD(id + 100, 12, '0')), '2026-01-01', '2026-01-01', FALSE
+FROM   topping
+WHERE  category = 'CHEESE';</code></pre>
+
+<p>No <code>VALUES</code> keyword. The select list has to line up with the column list positionally,
+so read them together.</p>
+
+<h2>When the row might already exist</h2>
+
+<p><code>crust.name</code> is <code>UNIQUE</code>, so inserting a duplicate is an error. Three ways
+to handle that, and they are not interchangeable:</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO crust (name, price_delta, active, display_order, public_id, created_at, updated_at, deleted)
+VALUES ('Gluten Free', 4.25, TRUE, 5, 'cccccccc-0000-4000-8000-000000000005', '2026-01-01', '2026-01-01', FALSE)
+ON DUPLICATE KEY UPDATE price_delta = VALUES(price_delta);</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, name, price_delta FROM crust WHERE name = 'Gluten Free';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+-------------+
+| id | name        | price_delta |
++----+-------------+-------------+
+|  5 | Gluten Free |        4.25 |
++----+-------------+-------------+</code></pre>
+
+<table>
+  <tr><th></th><th>On a duplicate key</th></tr>
+  <tr><td><code>ON DUPLICATE KEY UPDATE</code></td>
+      <td>updates the existing row. A real upsert, and the one you usually want.</td></tr>
+  <tr><td><code>INSERT IGNORE</code></td>
+      <td>skips the row silently — <strong>and downgrades other errors to warnings too</strong>,
+          including truncated data and failed foreign keys. Too blunt; prefer the explicit
+          form.</td></tr>
+  <tr><td><code>REPLACE</code></td>
+      <td><strong>deletes</strong> the old row and inserts a new one. It gets a new
+          <code>AUTO_INCREMENT</code> id, and any child row with <code>ON DELETE CASCADE</code>
+          goes with it. Rarely what anyone means.</td></tr>
+</table>
+
+<p>MySQL 8.0.20 deprecates <code>VALUES(col)</code> in favour of a row alias:</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO crust (name, price_delta, active, display_order, public_id, created_at, updated_at, deleted)
+VALUES ('Cauliflower', 3.75, TRUE, 6, 'cccccccc-0000-4000-8000-000000000006', '2026-01-01', '2026-01-01', FALSE) AS new
+ON DUPLICATE KEY UPDATE price_delta = new.price_delta;</code></pre>
+
+<h2>AUTO_INCREMENT leaves gaps</h2>
+
+<p>Insert one more crust and look at the id it gets:</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO crust (name, price_delta, active, display_order, public_id, created_at, updated_at, deleted)
+VALUES ('Sourdough', 2.00, TRUE, 7, 'cccccccc-0000-4000-8000-000000000007', '2026-01-01', '2026-01-01', FALSE);
+
+SELECT id, name FROM crust ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+----------------+
+| id | name           |
++----+----------------+
+|  1 | Original Pan   |
+|  2 | Hand Tossed    |
+|  3 | Thin 'N Crispy |
+|  4 | Stuffed Crust  |
+|  5 | Gluten Free    |
+|  6 | Cauliflower    |
+|  9 | Sourdough      |
++----+----------------+</code></pre>
+
+<p>Seven rows, and the last id is <strong>9</strong>. Ids 7 and 8 do not exist and never will: the
+two <code>ON DUPLICATE KEY UPDATE</code> statements above each allocated one before discovering the
+row already existed, and MySQL does not give them back. A rolled-back transaction does the same.</p>
+
+<p>This is normal and by design — reusing ids would mean locking the counter across concurrent
+inserts. The lesson is that <strong>an <code>AUTO_INCREMENT</code> id is an identifier, not a
+count</strong>. "How many crusts are there" is <code>COUNT(*)</code>, never <code>MAX(id)</code>.
+It also means an <code>INT</code> key runs out sooner than the row count suggests, which is the
+argument for <code>BIGINT</code> in <a href="/sql/mysql-data-types">data types</a>.</p>
+
+<h2>Getting the id back</h2>
+
+<p>Inserting an order and then its line items needs the order's new id.
+<code>LAST_INSERT_ID()</code> is per-connection, so it is safe under concurrency — see
+<a href="/sql/sql-last_insert_id">LAST_INSERT_ID</a>.</p>
+
+<h2>Bulk loading</h2>
+
+<pre class="language-sql"><code class="language-sql">LOAD DATA LOCAL INFILE '/tmp/toppings.csv'
+INTO TABLE topping
+FIELDS TERMINATED BY ',' ENCLOSED BY '"'
+LINES  TERMINATED BY '\n'
+IGNORE 1 LINES
+(name, price, category);</code></pre>
+
+<p>Far faster than <code>INSERT</code> for a large file, because it skips per-statement parsing.
+<code>LOCAL</code> reads the file on the <em>client</em>; without it the server reads it, which
+needs <code>FILE</code> privilege and the file to be on the server. Both the server
+(<code>local_infile</code>) and the client have to enable <code>LOCAL</code> — it is off by default
+because a malicious server could otherwise ask your client for arbitrary files.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>List your columns.</li>
+  <li>One multi-row <code>INSERT</code> beats many single-row ones by a wide margin.</li>
+  <li><code>ON DUPLICATE KEY UPDATE</code> for an upsert; avoid <code>INSERT IGNORE</code> and
+      <code>REPLACE</code>.</li>
+  <li><code>AUTO_INCREMENT</code> gaps are normal. Ids are identifiers, not counts.</li>
+</ul>

@@ -1,0 +1,134 @@
+<p><code>UPDATE</code> changes rows that already exist. It is the statement most likely to cause an
+incident, because the difference between correct and catastrophic is one clause you can forget to
+type.</p>
+
+<h2>The basic form</h2>
+
+<pre class="language-sql"><code class="language-sql">UPDATE product_size SET price = price * 1.10 WHERE product_id = 2;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.name, ps.size, ps.price FROM product_size ps JOIN product p ON p.id=ps.product_id WHERE p.id = 2 ORDER BY ps.price;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+--------+-------+
+| name         | size   | price |
++--------------+--------+-------+
+| Cheese Pizza | SMALL  | 10.99 |
+| Cheese Pizza | MEDIUM | 14.29 |
+| Cheese Pizza | LARGE  | 17.04 |
++--------------+--------+-------+</code></pre>
+
+<p><code>SET</code> takes several assignments separated by commas, and the right-hand side can
+reference the current value or other columns of the same row. Small prices are unchanged by
+rounding here because <code>price</code> is <code>DECIMAL(10,2)</code> — the arithmetic is exact,
+which is the point of <a href="/sql/mysql-data-types">using DECIMAL for money</a>.</p>
+
+<h2>The habit that saves you</h2>
+
+<p><strong>Run it as a <code>SELECT</code> first.</strong> Same <code>FROM</code>, same
+<code>WHERE</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">-- 1. look
+SELECT id, price FROM product_size WHERE product_id = 2;
+
+-- 2. then change exactly those rows
+UPDATE product_size SET price = price * 1.10 WHERE product_id = 2;</code></pre>
+
+<p>It costs seconds and it catches the two mistakes that matter: a <code>WHERE</code> that matches
+more rows than you expected, and one that matches none because of a typo. In a
+<a href="/sql/mysql-transaction">transaction</a> you get a second safety net —
+<code>UPDATE</code>, check the row count, then <code>COMMIT</code> or <code>ROLLBACK</code>.</p>
+
+<h2>sql_safe_updates</h2>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1175 (HY000): You are using safe update mode and you tried to update a
+-- table without a WHERE that uses a KEY column.
+SET sql_safe_updates = 1;
+UPDATE product SET active = FALSE;</code></pre>
+
+<p>With <code>sql_safe_updates</code> on, MySQL refuses an <code>UPDATE</code> or
+<code>DELETE</code> whose <code>WHERE</code> does not use a key — which is exactly the shape of the
+statement that empties a table by accident. MySQL Workbench turns it on by default; the command
+line does not.</p>
+
+<p><strong>Turn it on in your own session on any server that matters.</strong> When you genuinely
+mean to update every row, add <code>LIMIT</code> (or switch it off deliberately for that one
+statement) — and having to think about it is the entire benefit.</p>
+
+<h2>UPDATE with a JOIN</h2>
+
+<p>The standard shape for a backfill: compute a value from another table and write it back.</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE customer_order o
+JOIN   (SELECT order_id, SUM(line_total) AS s FROM order_item GROUP BY order_id) t
+       ON t.order_id = o.id
+SET    o.subtotal = t.s;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, subtotal, total FROM customer_order ORDER BY id LIMIT 4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+----------+-------+
+| id | subtotal | total |
++----+----------+-------+
+|  1 |    22.97 | 28.91 |
+|  2 |    16.99 | 18.43 |
+|  3 |    25.98 | 32.18 |
+|  4 |    25.98 | 32.18 |
++----+----------+-------+</code></pre>
+
+<p>The syntax puts the join before <code>SET</code>, which reads oddly the first time. Note that
+<code>UPDATE ... JOIN</code> does <strong>not</strong> accept <code>ORDER BY</code> or
+<code>LIMIT</code> — which matters for the batching section below.</p>
+
+<p>MySQL also forbids updating a table while selecting from it in a subquery
+(<em>"You can't specify target table for update in FROM clause"</em>). The workaround is to wrap
+the subquery in another derived table, which forces MySQL to materialise it first — or, more
+readably, use the join form above.</p>
+
+<h2>Updating from a correlated subquery</h2>
+
+<pre class="language-sql"><code class="language-sql">UPDATE customer_order o
+SET    o.subtotal = (SELECT COALESCE(SUM(i.line_total), 0) FROM order_item i WHERE i.order_id = o.id)
+WHERE  o.status = 'COMPLETED';</code></pre>
+
+<p>Equivalent to the join for this case, and it has one important difference: a correlated subquery
+runs for <em>every</em> row the <code>WHERE</code> selects, including rows with no matching items —
+which is why the <code>COALESCE</code> is there, since <code>SUM</code> over nothing is NULL rather
+than 0. The join form simply skips unmatched rows. Choose based on whether "no matching rows" should
+mean zero or mean leave-it-alone.</p>
+
+<h2>Updating in batches</h2>
+
+<p>One <code>UPDATE</code> touching a million rows holds locks and builds an enormous undo log for
+its whole duration, which on a live system means blocked writers and replication lag. Work through
+it instead:</p>
+
+<pre class="language-sql"><code class="language-sql">-- repeat until it reports 0 rows changed
+UPDATE customer_order
+SET    status = 'ARCHIVED'
+WHERE  status = 'COMPLETED' AND created_at &lt; '2024-01-01'
+ORDER  BY id
+LIMIT  1000;</code></pre>
+
+<p><code>ORDER BY</code> with <code>LIMIT</code> makes each batch deterministic — without it you get
+"any 1,000 rows". The <code>WHERE</code> has to exclude rows already done, or the loop never
+terminates; here the status change does that naturally. See
+<a href="/sql/mysql-run-query-in-production">running queries in production</a>.</p>
+
+<h2>Two smaller things</h2>
+
+<p><strong>Rows matched versus rows changed.</strong> MySQL reports both, and they differ when a
+value is set to what it already was. Setting a column to its current value counts as matched but
+not changed — useful when checking whether an update actually did anything.</p>
+
+<p><strong>Assignments are evaluated left to right</strong> within one <code>SET</code>, so
+<code>SET a = b, b = a</code> does not swap them: by the time <code>b</code> is assigned,
+<code>a</code> already holds the old <code>b</code>. Swap via a third column, or use the fact that
+MySQL evaluates the whole right-hand side of each assignment before assigning it.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Run the <code>SELECT</code> first. Every time.</li>
+  <li>Turn on <code>sql_safe_updates</code> anywhere that matters.</li>
+  <li><code>UPDATE ... JOIN</code> for backfills; it takes no <code>LIMIT</code>.</li>
+  <li>Batch large updates with <code>ORDER BY … LIMIT</code> and a <code>WHERE</code> that
+      shrinks.</li>
+</ul>

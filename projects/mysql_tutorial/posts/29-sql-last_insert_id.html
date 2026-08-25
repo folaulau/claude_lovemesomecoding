@@ -1,0 +1,124 @@
+<p>Saving an order means inserting one row into <code>customer_order</code> and then several into
+<code>order_item</code> — and the line items need the order's id, which the database only chose a
+moment ago. <code>LAST_INSERT_ID()</code> is how you get it back.</p>
+
+<h2>The pattern</h2>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO customer_order
+    (guest_email, customer_name, phone, order_type, status, subtotal, tax, delivery_fee, total,
+     created_at, updated_at, public_id, deleted)
+VALUES ('new@example.com', 'Robin Alvarez', '801-555-0199', 'CARRYOUT', 'PENDING_PAYMENT',
+        0, 0, 0, 0, '2026-02-01', '2026-02-01', 'eeeeeeee-0000-4000-8000-000000000019', FALSE);
+
+SET @order_id = LAST_INSERT_ID();
+
+INSERT INTO order_item
+    (order_id, product_id, product_name, size, quantity, unit_price, line_total,
+     created_at, updated_at, public_id, deleted)
+VALUES (@order_id,  2, 'Cheese Pizza', 'LARGE',  1, 15.49, 15.49,
+        '2026-02-01', '2026-02-01', 'ffffffff-0000-4000-8000-000000000101', FALSE),
+       (@order_id, 20, 'Pepsi',        'MEDIUM', 2,  2.49,  4.98,
+        '2026-02-01', '2026-02-01', 'ffffffff-0000-4000-8000-000000000102', FALSE);</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT o.id AS order_id, o.customer_name, i.product_name, i.line_total
+FROM   customer_order o JOIN order_item i ON i.order_id = o.id
+WHERE  o.customer_name = 'Robin Alvarez'
+ORDER  BY i.id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+---------------+--------------+------------+
+| order_id | customer_name | product_name | line_total |
++----------+---------------+--------------+------------+
+|       19 | Robin Alvarez | Cheese Pizza |      15.49 |
+|       19 | Robin Alvarez | Pepsi        |       4.98 |
++----------+---------------+--------------+------------+</code></pre>
+
+<p>Note the <code>SET @order_id = LAST_INSERT_ID()</code>. Capturing it into a variable immediately
+is the safe habit, because the value <strong>changes with every subsequent insert</strong> —
+including the insert into <code>order_item</code>. Reading it again afterwards gives you something
+else entirely.</p>
+
+<h2>Why it is safe under concurrency</h2>
+
+<p>The obvious worry is that two people ordering at the same moment would get each other's ids. They
+do not: <strong><code>LAST_INSERT_ID()</code> is per-connection.</strong> It reports the last value
+generated on <em>your</em> session, and nothing another connection does can change it. No locking,
+no race.</p>
+
+<p>That is also why <code>SELECT MAX(id) FROM customer_order</code> is <strong>not</strong> a
+substitute. It reads whatever is committed globally, so under any concurrency it will eventually
+hand you somebody else's order — and the line items get attached to the wrong order. This is a
+genuine bug that appears only under load, which is the worst kind.</p>
+
+<h2>After a multi-row insert</h2>
+
+<p>The second insert above created two rows, which got ids 28 and 29.
+<code>LAST_INSERT_ID()</code> returns the <strong>first</strong> id of the batch, not the last. The
+rest are guaranteed consecutive from there — provided <code>innodb_autoinc_lock_mode</code> is not
+set to fully interleaved, which is a rare configuration.</p>
+
+<p>So to get all of them, take the first and count forward. There is no way to ask MySQL for the
+whole list.</p>
+
+<h2>Three things that surprise people</h2>
+
+<ul>
+  <li><strong>It does not see a trigger's inserts.</strong> If an <code>AFTER INSERT</code>
+      <a href="/sql/mysql-trigger">trigger</a> writes to an audit table with its own
+      <code>AUTO_INCREMENT</code>, your <code>LAST_INSERT_ID()</code> still reports your row.
+      Usually what you want, and worth knowing either way.</li>
+  <li><strong>It survives a rollback.</strong> The value is session state, not table state. Roll
+      back the transaction and the row is gone while <code>LAST_INSERT_ID()</code> still returns
+      its id — which is the same reason
+      <a href="/sql/sql-insert"><code>AUTO_INCREMENT</code> leaves gaps</a>.</li>
+  <li><strong>It returns 0 if the statement generated no id</strong> — an insert that supplied the
+      id explicitly, or one that updated an existing row via
+      <code>ON DUPLICATE KEY UPDATE</code>. Check for 0 rather than assuming.</li>
+</ul>
+
+<h2>From an application</h2>
+
+<p>You rarely call it directly. JDBC exposes the same value through generated keys:</p>
+
+<pre class="language-java"><code class="language-java">try (PreparedStatement ps = conn.prepareStatement(
+         "INSERT INTO customer_order (customer_name, order_type, status, ...) VALUES (?, ?, ?, ...)",
+         Statement.RETURN_GENERATED_KEYS)) {
+    ps.setString(1, "Robin Alvarez");
+    ps.setString(2, "CARRYOUT");
+    ps.setString(3, "PENDING_PAYMENT");
+    ps.executeUpdate();
+
+    long orderId;
+    try (ResultSet keys = ps.getGeneratedKeys()) {
+        if (!keys.next()) throw new IllegalStateException("no generated key");
+        orderId = keys.getLong(1);
+    }
+    // ... insert the line items with orderId
+}</code></pre>
+
+<p><code>RETURN_GENERATED_KEYS</code> is required — without it <code>getGeneratedKeys()</code>
+returns an empty result set. JPA and Hibernate do the same thing for you: after
+<code>persist()</code>, the entity's id field is populated.</p>
+
+<p>Wrap the whole thing in <strong>one transaction</strong>. An order whose line items failed to
+insert is worse than no order at all — see <a href="/sql/mysql-transaction">transactions</a>.</p>
+
+<h2>The alternative: generate the id yourself</h2>
+
+<p>The pizza schema also gives every row a <code>public_id CHAR(36)</code> UUID, and the
+application generates that <em>before</em> inserting. That sidesteps the round trip entirely: you
+know the identifier without asking the database, so you can build the whole object graph and insert
+it in one go.</p>
+
+<p>It is not a reason to drop the <code>AUTO_INCREMENT</code> key — a random UUID makes a poor
+clustered primary key, for the reasons in
+<a href="/sql/mysql-create-table">CREATE TABLE</a>. Both, each doing the job it is good at.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Capture it into a variable immediately; the next insert overwrites it.</li>
+  <li>It is per-connection, so it is safe under concurrency. <code>MAX(id)</code> is not.</li>
+  <li>After a multi-row insert it returns the <strong>first</strong> id.</li>
+  <li>It returns 0 when no id was generated.</li>
+  <li>From Java, use <code>RETURN_GENERATED_KEYS</code> and one transaction.</li>
+</ul>

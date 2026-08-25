@@ -102,11 +102,23 @@ STATEMENT_START = re.compile(
     re.I)
 
 # Output that cannot be stable, so it is run but not compared.
+#
+# ⚠️ INFORMATION_SCHEMA is deliberately NOT in this list, though it used to be. Blanket-
+# skipping it meant `SELECT AUTO_INCREMENT FROM information_schema.TABLES` was never
+# compared — and sql-insert shipped a quoted "8" where the real answer is 9, because two
+# ON DUPLICATE KEY statements each consumed an id. A catalogue query is deterministic
+# given a deterministic database, and those are exactly the facts worth verifying.
+#
+# What genuinely varies there is the statistics columns, which are estimates that move
+# when the optimizer resamples. Those are named below instead.
 NONDETERMINISTIC = re.compile(
     r"\b(NOW|CURDATE|CURTIME|CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP|SYSDATE|"
     r"UNIX_TIMESTAMP|RAND|UUID|UUID_SHORT|CONNECTION_ID|LAST_INSERT_ID|BENCHMARK|SLEEP|"
     r"VERSION|DATABASE|USER|CURRENT_USER|SHOW\s+PROCESSLIST|SHOW\s+ENGINE|"
-    r"INFORMATION_SCHEMA|PERFORMANCE_SCHEMA|@@)\b", re.I)
+    r"PERFORMANCE_SCHEMA|@@|"
+    # information_schema columns that are estimates or wall-clock, not facts
+    r"TABLE_ROWS|AVG_ROW_LENGTH|DATA_LENGTH|INDEX_LENGTH|DATA_FREE|"
+    r"CREATE_TIME|UPDATE_TIME|CHECK_TIME)\b", re.I)
 
 MARK_ERROR = re.compile(r"^\s*--\s*ERROR\b", re.I | re.M)
 MARK_SESSION2 = re.compile(r"^\s*--\s*session\s*2\b", re.I | re.M)
@@ -214,29 +226,37 @@ def split_chunks(out: str) -> dict[int, str]:
 
 # ---------------------------------------------------------------- scratch databases
 def clone_pizza(scratch: str) -> None:
-    """A full copy of the demo database. Small enough that this is cheap.
+    """A full copy of the demo database, via mysqldump.
 
-    ⚠️ The Liquibase bookkeeping tables are copied too, and deliberately. They are not
-    interesting, but a post may quote `SHOW TABLES` — and if the clone's table list
-    differs from `pizza`'s, output captured while authoring against `pizza` will not
-    match what the checker sees. The clone has to be faithful, not tidy.
+    ⚠️ NOT `CREATE TABLE ... LIKE`. That copies columns and indexes but **silently drops
+    FOREIGN KEYS**, so a clone built with it has no referential integrity at all — every
+    ON DELETE CASCADE in the pizza schema quietly becomes a no-op. A post demonstrating
+    that deleting an order removes its line items would then show the counts unchanged,
+    and the failure looks like the post being wrong rather than the harness.
+
+    mysqldump reproduces the schema exactly, including constraints, triggers on the
+    tables, and the Liquibase bookkeeping tables — which are copied deliberately, since a
+    post may quote `SHOW TABLES` and the list has to match what authoring saw.
+
+    `pizza` is only ever READ here.
     """
-    tables = ["DATABASECHANGELOG", "DATABASECHANGELOGLOCK",
-              "crust", "topping", "product", "product_size", "app_user",
-              "customer_order", "order_item", "order_item_topping",
-              "cart", "cart_item", "cart_item_topping",
-              "user_address", "user_payment_method"]
-    stmt = [f"DROP DATABASE IF EXISTS {scratch};",
-            f"CREATE DATABASE {scratch} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
-            f"USE {scratch};", "SET FOREIGN_KEY_CHECKS=0;"]
-    for t in tables:
-        stmt.append(f"CREATE TABLE {t} LIKE pizza.{t};")
-    for t in tables:
-        stmt.append(f"INSERT INTO {t} SELECT * FROM pizza.{t};")
-    stmt.append("SET FOREIGN_KEY_CHECKS=1;")
-    rc, out = my(["-e", "\n".join(stmt)])
+    dump = subprocess.run(
+        [MYSQL.replace("mysql", "mysqldump"), "-h", DB["host"], "-P", str(DB["port"]),
+         "-u", DB["user"], "--single-transaction", "--routines", "--events",
+         "--set-gtid-purged=OFF", "pizza"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if dump.returncode != 0:
+        raise SystemExit(f"mysqldump of `pizza` failed:\n{dump.stderr}")
+
+    rc, out = my(["-e", f"DROP DATABASE IF EXISTS {scratch}; "
+                        f"CREATE DATABASE {scratch} "
+                        f"CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"])
     if rc != 0:
         raise SystemExit(f"could not create scratch database {scratch}:\n{out}")
+
+    rc, out = my([scratch], stdin=dump.stdout)
+    if rc != 0:
+        raise SystemExit(f"could not load the dump into {scratch}:\n{out}")
 
 
 def drop_db(name: str) -> None:
