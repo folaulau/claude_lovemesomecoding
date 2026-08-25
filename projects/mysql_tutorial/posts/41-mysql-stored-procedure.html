@@ -1,0 +1,222 @@
+<p>A stored procedure is code that lives in the database and runs there. MySQL gives you variables,
+conditionals, loops, cursors and error handlers — a small procedural language wrapped around SQL.
+This lesson covers the syntax and then the question that matters more: whether logic belongs here
+at all.</p>
+
+<h2>DELIMITER, and why you need it</h2>
+
+<p>A procedure body contains semicolons. The client uses a semicolon to decide where a statement
+ends, so without help it sends the first line of your procedure and reports a syntax error. Change
+the delimiter first, then change it back:</p>
+
+<pre class="language-sql"><code class="language-sql">DELIMITER $$
+
+CREATE PROCEDURE recalc_order_total(IN p_order_id BIGINT, OUT p_total DECIMAL(10,2))
+BEGIN
+    DECLARE v_goods DECIMAL(10,2) DEFAULT 0.00;
+    DECLARE v_fee   DECIMAL(10,2) DEFAULT 0.00;
+
+    SELECT COALESCE(SUM(line_total), 0.00) INTO v_goods FROM order_item      WHERE order_id = p_order_id;
+    SELECT delivery_fee                    INTO v_fee   FROM customer_order  WHERE id       = p_order_id;
+
+    SET p_total = v_goods + ROUND(v_goods * 0.0725, 2) + v_fee;
+
+    UPDATE customer_order
+       SET subtotal = v_goods, tax = ROUND(v_goods * 0.0725, 2), total = p_total
+     WHERE id = p_order_id;
+END$$
+
+DELIMITER ;</code></pre>
+
+<p><code>DELIMITER</code> is a <strong>client</strong> command, not SQL — it never reaches the
+server. That is also why it does not appear in scripts run through some drivers, which have their
+own way of handling this.</p>
+
+<h2>Calling it</h2>
+
+<pre class="language-sql"><code class="language-sql">CALL recalc_order_total(1, @t);
+
+SELECT @t AS recalculated_total;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------------+
+| recalculated_total |
++--------------------+
+|              28.63 |
++--------------------+</code></pre>
+
+<p>Three parameter modes: <code>IN</code> (the default, passed in), <code>OUT</code> (written back),
+and <code>INOUT</code> (both). <code>@t</code> is a session variable, which is how an
+<code>OUT</code> value gets back to you.</p>
+
+<p><code>DECLARE</code> declares local variables and must come <strong>first</strong> in the block,
+before any other statement. <code>SELECT ... INTO var</code> assigns from a query — and note it
+errors if the query returns more than one row.</p>
+
+<h2>Naming, and the shadowing trap</h2>
+
+<p>The <code>p_</code> and <code>v_</code> prefixes are not decoration. A parameter or variable with
+the same name as a column <strong>shadows the column</strong>, silently:</p>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: an excerpt from inside the procedure body above, not a standalone statement.
+-- if the parameter were called `order_id`, this would read:
+--     WHERE order_id = order_id     -- always true. Every row.
+SELECT COALESCE(SUM(line_total), 0.00) INTO v_goods FROM order_item WHERE order_id = p_order_id;</code></pre>
+
+<p>No error, no warning, and an <code>UPDATE</code> written that way changes the whole table. Prefix
+parameters and locals, always.</p>
+
+<h2>Control flow</h2>
+
+<pre class="language-sql"><code class="language-sql">DELIMITER $$
+
+CREATE PROCEDURE describe_order(IN p_order_id BIGINT, OUT p_note VARCHAR(60))
+BEGIN
+    DECLARE v_status VARCHAR(30);
+    DECLARE v_items  INT DEFAULT 0;
+
+    SELECT status INTO v_status FROM customer_order WHERE id = p_order_id;
+    SELECT COUNT(*) INTO v_items FROM order_item WHERE order_id = p_order_id;
+
+    IF v_status = 'CANCELLED' THEN
+        SET p_note = 'cancelled';
+    ELSEIF v_items = 0 THEN
+        SET p_note = 'empty order';
+    ELSE
+        SET p_note = CONCAT(v_items, ' item(s), ', LOWER(v_status));
+    END IF;
+END$$
+
+DELIMITER ;</code></pre>
+
+<p><code>CASE</code> works as a statement too, and there are three loops —
+<code>WHILE ... DO ... END WHILE</code>, <code>REPEAT ... UNTIL ... END REPEAT</code>, and a bare
+<code>LOOP</code> you exit with <code>LEAVE</code>.</p>
+
+<h2>Stored functions</h2>
+
+<pre class="language-sql"><code class="language-sql">DELIMITER $$
+
+CREATE FUNCTION order_item_count(p_order_id BIGINT) RETURNS INT DETERMINISTIC READS SQL DATA
+BEGIN
+    DECLARE v INT;
+    SELECT COUNT(*) INTO v FROM order_item WHERE order_id = p_order_id;
+    RETURN v;
+END$$
+
+DELIMITER ;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, customer_name, order_item_count(id) AS items FROM customer_order ORDER BY id LIMIT 4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------+-------+
+| id | customer_name | items |
++----+---------------+-------+
+|  1 | Demo Customer |     2 |
+|  2 | Alex Rivera   |     1 |
+|  3 | Demo Customer |     2 |
+|  4 | Sam Chen      |     1 |
++----+---------------+-------+</code></pre>
+
+<p>A function returns one value and can be used inside a query; a procedure cannot. That
+convenience has a sharp edge: <strong>the function runs once per row</strong>, so on a large table
+that is a query per row. The equivalent <code>LEFT JOIN … GROUP BY</code> does it in one pass. Use
+functions for cheap scalar work, not for hiding a query.</p>
+
+<p>The trailing characteristics are required. <code>DETERMINISTIC</code> promises the same inputs
+give the same output; <code>READS SQL DATA</code> says it reads but does not write. Without one of
+these MySQL refuses to create the function when binary logging is on, because it cannot decide
+whether the function is safe to replicate.</p>
+
+<h2>Error handling</h2>
+
+<pre class="language-sql"><code class="language-sql">DELIMITER $$
+
+CREATE PROCEDURE safe_add_crust(IN p_name VARCHAR(80), IN p_delta DECIMAL(10,2), OUT p_result VARCHAR(40))
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_result = 'failed, rolled back';
+    END;
+
+    START TRANSACTION;
+    INSERT INTO crust (name, price_delta, active, display_order, public_id, created_at, updated_at, deleted)
+    VALUES (p_name, p_delta, TRUE, 99, CONCAT('cccccccc-0000-4000-8000-', LPAD(FLOOR(RAND()*1e9), 12, '0')),
+            '2026-01-01', '2026-01-01', FALSE);
+    COMMIT;
+    SET p_result = 'inserted';
+END$$
+
+DELIMITER ;</code></pre>
+
+<p><code>DECLARE ... HANDLER</code> is MySQL's try/catch. <code>EXIT</code> leaves the block,
+<code>CONTINUE</code> carries on. You can catch a specific error
+(<code>FOR 1062</code>), a SQLSTATE class, or the shorthands <code>SQLEXCEPTION</code>,
+<code>SQLWARNING</code> and <code>NOT FOUND</code>.</p>
+
+<p><code>NOT FOUND</code> is what stops a cursor loop, and forgetting it is the classic way to write
+an infinite one:</p>
+
+<pre class="language-sql"><code class="language-sql">DECLARE done INT DEFAULT 0;
+DECLARE cur CURSOR FOR SELECT id FROM customer_order WHERE status = 'PAID';
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+OPEN cur;
+read_loop: LOOP
+    FETCH cur INTO v_id;
+    IF done = 1 THEN LEAVE read_loop; END IF;
+    -- ... work on v_id ...
+END LOOP;
+CLOSE cur;</code></pre>
+
+<p>And a note on cursors generally: a cursor loop is row-by-row processing, which is what SQL is
+specifically good at avoiding. If you find yourself writing one, check first whether a single
+<code>UPDATE ... JOIN</code> would do it.</p>
+
+<h2>Should the logic live here?</h2>
+
+<p>An honest assessment, because this is a genuine architectural choice and the answer has moved
+over the years.</p>
+
+<table>
+  <tr><th>In favour</th><th>Against</th></tr>
+  <tr><td>One round trip instead of many — a real win for a loop over thousands of rows</td>
+      <td><strong>Version control.</strong> Procedures live in the database, not in your repository,
+          unless you deliberately keep them in migrations</td></tr>
+  <tr><td>The rule applies to every client, including someone at the prompt</td>
+      <td><strong>Testing.</strong> No unit test framework anyone enjoys</td></tr>
+  <tr><td>Grant <code>EXECUTE</code> without granting table access</td>
+      <td><strong>Debugging.</strong> No debugger, no stack trace, poor observability</td></tr>
+  <tr><td>Heavy set-based work stays next to the data</td>
+      <td><strong>Scaling.</strong> Application servers are easy to add; the database is not</td></tr>
+</table>
+
+<p>The pizza application puts its pricing logic in a Java <code>PricingService</code>, and that is
+the right default for most teams today: it is testable, reviewable, and it scales horizontally.</p>
+
+<p>Procedures earn their place for <strong>bulk data work</strong> — a nightly aggregation, a
+migration over millions of rows, an archival job — where moving the data to the application and back
+is the expensive part. Use them for that, keep the definitions in migration files so they are
+version-controlled, and do not put business rules there by default.</p>
+
+<h2>Managing them</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW PROCEDURE STATUS WHERE Db = DATABASE();
+SHOW CREATE PROCEDURE recalc_order_total;
+DROP PROCEDURE IF EXISTS recalc_order_total;
+DROP FUNCTION  IF EXISTS order_item_count;</code></pre>
+
+<p>There is no <code>CREATE OR REPLACE</code> for routines, so changing one means
+<code>DROP</code> then <code>CREATE</code> — which is a moment where the procedure does not exist.
+Note also that <code>mysqldump</code> does <strong>not</strong> include routines unless you pass
+<code>--routines</code>; see <a href="/sql/mysql-dump">backup and restore</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>DELIMITER</code> is a client command, and you need it to define a body.</li>
+  <li>Prefix parameters and locals — a name matching a column shadows it silently.</li>
+  <li>A stored function runs once per row. Do not hide a query in one.</li>
+  <li><code>DECLARE ... HANDLER</code> is try/catch; <code>NOT FOUND</code> ends a cursor loop.</li>
+  <li>Default to logic in the application; use procedures for bulk work, and keep them in
+      migrations.</li>
+</ul>

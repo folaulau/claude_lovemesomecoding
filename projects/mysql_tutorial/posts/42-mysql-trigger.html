@@ -1,0 +1,144 @@
+<p>A trigger is a block of SQL that runs automatically when a row is inserted, updated or deleted. It
+cannot be called and it cannot be skipped, which is both the appeal and the problem.</p>
+
+<h2>An audit trail</h2>
+
+<p>Recording every status change on an order is the case triggers are genuinely good at — it must
+happen for every writer, and no application code has to remember it:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE order_status_audit (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    order_id   BIGINT      NOT NULL,
+    old_status VARCHAR(30),
+    new_status VARCHAR(30) NOT NULL,
+    changed_at DATETIME(6) NOT NULL
+);
+
+DELIMITER $$
+
+CREATE TRIGGER trg_order_status_audit
+AFTER UPDATE ON customer_order FOR EACH ROW
+BEGIN
+    IF NEW.status &lt;&gt; OLD.status THEN
+        INSERT INTO order_status_audit (order_id, old_status, new_status, changed_at)
+        VALUES (NEW.id, OLD.status, NEW.status, NOW(6));
+    END IF;
+END$$
+
+DELIMITER ;</code></pre>
+
+<p>Now change some rows — including one update that does not touch the status:</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE customer_order SET status = 'PREPARING'  WHERE id = 1;
+UPDATE customer_order SET phone  = '555'        WHERE id = 1;   -- not a status change
+UPDATE customer_order SET status = 'COMPLETED'  WHERE id = 1;
+
+SELECT order_id, old_status, new_status FROM order_status_audit ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+------------+------------+
+| order_id | old_status | new_status |
++----------+------------+------------+
+|        1 | COMPLETED  | PREPARING  |
+|        1 | PREPARING  | COMPLETED  |
++----------+------------+------------+</code></pre>
+
+<p>Two rows, not three. <strong>The trigger fires for every updated row regardless</strong> — the
+<code>IF</code> is what keeps the phone change out of the audit. Without it you would log every
+update as a status change from a value to itself.</p>
+
+<h2>NEW and OLD</h2>
+
+<table>
+  <tr><th></th><th><code>OLD</code></th><th><code>NEW</code></th></tr>
+  <tr><td><code>INSERT</code></td><td>—</td><td>the row being inserted</td></tr>
+  <tr><td><code>UPDATE</code></td><td>the row before</td><td>the row after</td></tr>
+  <tr><td><code>DELETE</code></td><td>the row being deleted</td><td>—</td></tr>
+</table>
+
+<p>In a <code>BEFORE</code> trigger, <code>NEW</code> columns are <strong>writable</strong> — that is
+how you normalise or default a value on the way in:</p>
+
+<pre class="language-sql"><code class="language-sql">DELIMITER $$
+
+CREATE TRIGGER trg_normalise_email
+BEFORE INSERT ON app_user FOR EACH ROW
+BEGIN
+    SET NEW.email = LOWER(TRIM(NEW.email));
+END$$
+
+DELIMITER ;</code></pre>
+
+<p><code>BEFORE</code> for validating or adjusting the row; <code>AFTER</code> for reacting to a
+change that has already happened. Six combinations in total, and MySQL 5.7 onwards allows more than
+one trigger for the same event — ordered with <code>FOLLOWS</code> / <code>PRECEDES</code>.</p>
+
+<h2>⚠️ A trigger cannot touch its own table</h2>
+
+<p>This one creates cleanly and fails when it runs, which is the worst time to find out:</p>
+
+<pre class="language-sql"><code class="language-sql">DELIMITER $$
+
+CREATE TRIGGER trg_bad AFTER UPDATE ON customer_order FOR EACH ROW
+BEGIN
+    UPDATE customer_order SET updated_at = NOW(6) WHERE id = NEW.id;
+END$$
+
+DELIMITER ;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1442 (HY000): Can't update table 'customer_order' in stored function/trigger
+-- because it is already used by statement which invoked this stored function/trigger.
+UPDATE customer_order SET phone = '777' WHERE id = 2;</code></pre>
+
+<p><code>CREATE TRIGGER</code> succeeded. The error arrives on the first update to the table —
+possibly in production, possibly weeks later. MySQL forbids it to avoid infinite recursion.</p>
+
+<p>To modify the row being written, use a <code>BEFORE</code> trigger and assign to
+<code>NEW</code>, which needs no <code>UPDATE</code> at all.</p>
+
+<h2>The other limitations</h2>
+
+<ul>
+  <li><strong><code>TRUNCATE</code> does not fire triggers.</strong> It is not a row-by-row delete.
+      Neither are changes made by foreign key <code>ON DELETE CASCADE</code> — the cascade removes
+      child rows without firing their delete triggers.</li>
+  <li>A trigger runs <strong>inside the calling statement's transaction</strong>. If it fails, the
+      whole statement is rolled back. It cannot <code>COMMIT</code> or <code>ROLLBACK</code>.</li>
+  <li>It runs <strong>once per row</strong>, so an update touching 100,000 rows runs it 100,000
+      times. The audit table above doubles the write cost of a bulk status change.</li>
+  <li><code>SHOW TRIGGERS</code> lists them; <code>information_schema.TRIGGERS</code> is
+      queryable. There is no <code>CREATE OR REPLACE</code>, so changing one means
+      <code>DROP</code> then <code>CREATE</code>.</li>
+</ul>
+
+<h2>The real argument against them</h2>
+
+<p>A trigger is <strong>invisible</strong>. Someone debugging why a row appeared in
+<code>order_status_audit</code> will read the application code, find nothing that writes to it, and
+have no reason to suspect the database is doing it. The same applies to a value that mysteriously
+differs from what was inserted.</p>
+
+<p>That cost is worth paying when the rule must hold for <em>every</em> writer and cannot be
+enforced any other way — audit trails and immutable history are the standard examples. It is not
+worth paying for business logic, which belongs where it can be read, tested and version-controlled.
+The pizza schema uses none.</p>
+
+<p>If you do use them: keep them small, name them so the table and event are obvious
+(<code>trg_order_status_audit</code>), keep the definitions in migration files, and
+<strong>document them where an application developer will actually look</strong> — a comment in the
+entity class beats a comment in the trigger.</p>
+
+<p>The common alternatives are worth knowing. Application-level hooks (the pizza schema's JPA
+<code>@PrePersist</code>) are visible and testable but only cover writers going through that code.
+<code>DEFAULT CURRENT_TIMESTAMP ON UPDATE</code> handles timestamps declaratively without a trigger
+at all. And change data capture reading the
+<a href="/sql/mysql-binlog">binary log</a> gives you an audit trail without touching the write path.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>BEFORE</code> to adjust <code>NEW</code>; <code>AFTER</code> to react.</li>
+  <li>It fires per row for every update — test the column you care about.</li>
+  <li>A trigger cannot modify its own table, and that error appears at <em>run</em> time.</li>
+  <li><code>TRUNCATE</code> and FK cascades do not fire triggers.</li>
+  <li>Audit trails yes; business logic no. Invisible behaviour is expensive to debug.</li>
+</ul>

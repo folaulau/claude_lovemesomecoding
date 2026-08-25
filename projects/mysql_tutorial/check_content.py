@@ -294,12 +294,20 @@ for entry in manifest.POSTS:
     # a sentence is discussing a concept, not asserting a result. Searching the whole body
     # failed `sql-order-by` for a prose mention, which is the rule crying wolf — and a rule
     # that cries wolf is one that gets switched off.
+    # ⚠️ NOT "no plans outside LAB_POSTS". check_sql.py re-runs every post and re-derives
+    # every quoted plan, wherever it lives — mysql-view legitimately shows a plan to prove a
+    # view was merged rather than materialised, on 14 rows of the demo database.
+    #
+    # What must not happen is a NON-lab post quoting a LAB-SIZED plan, since it cannot have
+    # come from the small demo database and therefore was not produced by running the post.
     quoted_output = "\n".join(b for lang, b in pairs if lang == "plaintext")
     if SHOWS_A_PLAN.search(quoted_output) and entry["slug"] not in manifest.LAB_POSTS:
-        failures.append(
-            f"{entry['slug']}: shows a query plan but is not in LAB_POSTS, so check_sql.py "
-            "never re-runs it. An unverified EXPLAIN is the most authoritative-looking thing "
-            "you can invent.")
+        big = [int(n) for n in re.findall(r"\|\s*(\d{4,})\s*\|", quoted_output)]
+        if any(n > 1000 for n in big):
+            failures.append(
+                f"{entry['slug']}: quotes a query plan with lab-sized row counts "
+                f"({max(big):,}) but is not in LAB_POSTS. The demo database has 18 orders, so "
+                "that plan cannot have come from running this post.")
 
     print(f"{entry['slug']:<38} {was:>5} {prose:>6} {code:>6} {words:>6} "
           f"{minutes:>4} {share:>6.0%}  {len(result['toc']):>3} {len(emitted):>4}"

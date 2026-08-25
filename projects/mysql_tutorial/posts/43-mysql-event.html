@@ -1,0 +1,143 @@
+<p>An event is a scheduled job that runs inside MySQL. It is cron, without cron — the server keeps
+the schedule and executes the SQL itself.</p>
+
+<h2>Check the scheduler first</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT @@event_scheduler AS event_scheduler;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+
+| event_scheduler |
++-----------------+
+| ON              |
++-----------------+</code></pre>
+
+<p>It is <strong>ON by default in MySQL 8</strong>. A great deal of advice says otherwise — "your
+event never ran because the scheduler is off" — and that was true of MySQL 5.x, where the default
+was <code>OFF</code>. Check rather than assume, in both directions: a managed database may well
+have turned it off again.</p>
+
+<pre class="language-sql"><code class="language-sql">SET GLOBAL event_scheduler = ON;    -- until restart
+SET PERSIST event_scheduler = ON;   -- and afterwards (MySQL 8)</code></pre>
+
+<p>With it <code>OFF</code>, events are stored and simply never fire. No error, no warning.</p>
+
+<h2>A recurring event</h2>
+
+<p>The pizza schema keeps server-side carts, which accumulate: someone builds an order, wanders off,
+and the rows stay forever. A nightly clean-up:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE EVENT ev_purge_abandoned_carts
+ON SCHEDULE EVERY 1 DAY
+STARTS '2026-01-01 03:00:00'
+ON COMPLETION PRESERVE
+COMMENT 'Delete carts untouched for 30 days'
+DO
+    DELETE FROM cart WHERE updated_at &lt; NOW() - INTERVAL 30 DAY;</code></pre>
+
+<p><code>ON COMPLETION PRESERVE</code> matters more than it looks. The default is
+<code>NOT PRESERVE</code>, which <strong>drops the event once it can no longer run</strong> — fine
+for a one-off, and for a recurring event with an <code>ENDS</code> clause it means the definition
+disappears when it finishes.</p>
+
+<p><code>STARTS</code> pins the first run. Without it, "every 1 day" means every 24 hours counted
+from whenever you created it, so the job drifts to whatever time you happened to deploy.</p>
+
+<h2>A one-off</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE EVENT ev_one_off_cleanup
+ON SCHEDULE AT '2026-03-01 02:00:00'
+DO
+    DELETE FROM order_status_audit WHERE changed_at &lt; '2025-01-01';</code></pre>
+
+<p>Useful for scheduling a heavy migration for a quiet hour. It deletes itself afterwards, which for
+a one-off is what you want.</p>
+
+<h2>Several statements</h2>
+
+<pre class="language-sql"><code class="language-sql">DELIMITER $$
+
+CREATE EVENT ev_nightly_rollup
+ON SCHEDULE EVERY 1 DAY
+STARTS '2026-01-01 04:00:00'
+ON COMPLETION PRESERVE
+DO
+BEGIN
+    DELETE FROM cart WHERE updated_at &lt; NOW() - INTERVAL 30 DAY;
+    DELETE FROM order_status_audit WHERE changed_at &lt; NOW() - INTERVAL 1 YEAR;
+END$$
+
+DELIMITER ;</code></pre>
+
+<p>Same <code>DELIMITER</code> requirement as a
+<a href="/sql/mysql-stored-procedure">stored procedure</a>, for the same reason. A neater pattern is
+to put the work in a procedure and have the event just <code>CALL</code> it — the logic then lives
+somewhere you can test and run by hand.</p>
+
+<h2>Managing them</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW EVENTS;
+SELECT EVENT_NAME, STATUS, INTERVAL_VALUE, INTERVAL_FIELD, LAST_EXECUTED
+FROM   information_schema.EVENTS WHERE EVENT_SCHEMA = 'pizza';
+
+ALTER EVENT ev_purge_abandoned_carts DISABLE;
+ALTER EVENT ev_purge_abandoned_carts ENABLE;
+DROP EVENT IF EXISTS ev_purge_abandoned_carts;</code></pre>
+
+<p><code>LAST_EXECUTED</code> is the field to check when someone asks whether the job is running.
+<code>DISABLE</code> is better than dropping when you want it back.</p>
+
+<h2>Where the errors go</h2>
+
+<p>This is the operational weak point. An event that fails writes to the <strong>server error
+log</strong> and nowhere else — nothing tells your application, your monitoring, or you. A nightly
+clean-up can fail every night for a month in complete silence.</p>
+
+<p>If you use events, have the job record its own outcome:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE job_run (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    job_name VARCHAR(60) NOT NULL,
+    ran_at   DATETIME(6) NOT NULL,
+    rows_affected INT
+);</code></pre>
+
+<p>Then alert on the absence of a recent row. "The job did not run" is otherwise invisible, and it
+is the failure that actually happens.</p>
+
+<h2>On a replica</h2>
+
+<p>Events do <strong>not</strong> execute on a replica — the scheduler is disabled there, and the
+work arrives through replication instead, which is correct. But it means an event's status is
+<code>SLAVESIDE_DISABLED</code> on the replica, and after a failover you must remember to enable the
+scheduler on the promoted server. Otherwise every scheduled job silently stops, and nothing reports
+it. See <a href="/sql/mysql-replication">replication</a>.</p>
+
+<h2>Should this be an event?</h2>
+
+<table>
+  <tr><th>An event is reasonable</th><th>Use your scheduler instead</th></tr>
+  <tr><td>Pure SQL clean-up, close to the data</td><td>The job calls an API or writes a file</td></tr>
+  <tr><td>You have no other scheduler</td><td>You already run cron, Kubernetes CronJobs or
+      Quartz</td></tr>
+  <tr><td>The work must follow the database on failover</td><td>You need alerting, retries and
+      logs</td></tr>
+</table>
+
+<p>The honest summary: events are convenient and operationally weak. Most teams already have a
+scheduler with logging, alerting, retries and version control, and a job defined <em>there</em>
+calling a stored procedure gets the best of both — the SQL stays next to the data, and the
+scheduling stays somewhere you can see it.</p>
+
+<p>The one thing an event genuinely gives you is that it travels with the database. If the database
+is the only piece of infrastructure you can rely on, that counts for something.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>event_scheduler</code> is <strong>ON by default in MySQL 8</strong>, unlike 5.x. Check
+      it.</li>
+  <li><code>ON COMPLETION PRESERVE</code>, or the definition disappears when it finishes.</li>
+  <li><code>STARTS</code>, or the schedule drifts to whenever you deployed.</li>
+  <li>Errors go to the server error log only. Record your own outcomes and alert on absence.</li>
+  <li>Disabled on replicas — re-enable the scheduler after a failover.</li>
+</ul>

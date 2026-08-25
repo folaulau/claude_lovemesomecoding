@@ -1,0 +1,143 @@
+<p>A view is a stored <code>SELECT</code> that behaves like a table. It stores no data — the query
+runs when you read the view — so it is a naming and access-control tool rather than a performance
+one.</p>
+
+<h2>Creating one</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE VIEW order_summary AS
+SELECT o.id, o.customer_name, o.status, COUNT(i.id) AS items, ROUND(SUM(i.line_total), 2) AS goods_total
+FROM   customer_order o LEFT JOIN order_item i ON i.order_id = o.id
+GROUP  BY o.id, o.customer_name, o.status;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT * FROM order_summary WHERE status = 'COMPLETED' ORDER BY id LIMIT 4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------+-----------+-------+-------------+
+| id | customer_name | status    | items | goods_total |
++----+---------------+-----------+-------+-------------+
+|  1 | Demo Customer | COMPLETED |     2 |       22.97 |
+|  2 | Alex Rivera   | COMPLETED |     1 |       16.99 |
+|  3 | Demo Customer | COMPLETED |     2 |       25.98 |
+|  4 | Sam Chen      | COMPLETED |     1 |       25.98 |
++----+---------------+-----------+-------+-------------+</code></pre>
+
+<p>The join and the aggregation are written once and used by name after that.
+<code>CREATE OR REPLACE VIEW</code> redefines an existing one; <code>DROP VIEW</code> removes it.
+Note that the column names come from the <code>SELECT</code>, so aliasing every expression is worth
+doing — an unaliased <code>COUNT(i.id)</code> becomes a column literally called
+<code>COUNT(i.id)</code>.</p>
+
+<h2>MERGE or TEMPTABLE — and why it matters</h2>
+
+<p>MySQL processes a view one of two ways, and the difference is the whole performance story.</p>
+
+<p><strong>MERGE</strong> rewrites your query to use the underlying tables directly, so your
+<code>WHERE</code> reaches them and their indexes apply:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE VIEW active_menu AS
+SELECT id, name, type, active FROM product WHERE active = TRUE AND deleted = FALSE WITH CHECK OPTION;
+
+EXPLAIN SELECT id, name FROM active_menu WHERE id = 5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+---------+------------+-------+-----------------------------+---------+---------+-------+------+----------+-------+
+| id | select_type | table   | partitions | type  | possible_keys               | key     | key_len | ref   | rows | filtered | Extra |
++----+-------------+---------+------------+-------+-----------------------------+---------+---------+-------+------+----------+-------+
+|  1 | SIMPLE      | product | NULL       | const | PRIMARY,idx_product_deleted | PRIMARY | 8       | const |    1 |   100.00 | NULL  |
++----+-------------+---------+------------+-------+-----------------------------+---------+---------+-------+------+----------+-------+</code></pre>
+
+<p>The plan names <code>product</code>, not a derived table, and uses the primary key. The view
+cost nothing.</p>
+
+<p><strong>TEMPTABLE</strong> is the other path: MySQL materialises the view's whole result into a
+temporary table and then applies your query to that. It is forced by anything MySQL cannot merge
+through — <code>GROUP BY</code>, <code>DISTINCT</code>, aggregates, <code>UNION</code>, a window
+function, <code>LIMIT</code>.</p>
+
+<p><code>order_summary</code> above has a <code>GROUP BY</code>, so it is a TEMPTABLE view. That
+means <code>SELECT * FROM order_summary WHERE id = 5</code> <strong>aggregates every order first
+and then keeps one row</strong> — the filter cannot reach the base table, and no index helps. On 18
+orders that is invisible; on 400,000 it is the difference between instant and unusable.</p>
+
+<p>This is the single most important thing to know about views: <strong>a view that aggregates
+does not filter cheaply.</strong> Check with <code>EXPLAIN</code> rather than assuming.</p>
+
+<h2>Updatable views</h2>
+
+<p>A simple enough view can be written through:</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE active_menu SET name = 'Pepperoni Pizza ' WHERE id = 1;</code></pre>
+
+<p>A view with aggregation cannot be:</p>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1288 (HY000): The target table order_summary of the UPDATE is not updatable
+UPDATE order_summary SET status = 'PAID' WHERE id = 1;</code></pre>
+
+<p>The rule is roughly: one base table, no <code>GROUP BY</code>, no <code>DISTINCT</code>, no
+aggregates, no <code>UNION</code>, and every selected column a plain column rather than an
+expression.</p>
+
+<h3>WITH CHECK OPTION</h3>
+
+<p>Without it, an update through a view can push a row <em>out</em> of that view — you change a
+value, the row stops matching the view's <code>WHERE</code>, and it vanishes. That is almost never
+intended:</p>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1369 (HY000): CHECK OPTION failed 'active_menu'
+UPDATE active_menu SET active = FALSE WHERE id = 1;</code></pre>
+
+<p><code>WITH CHECK OPTION</code> refuses any write whose result would not be visible through the
+view. If a view is writable at all, it usually wants this.</p>
+
+<h2>What views are genuinely good for</h2>
+
+<ul>
+  <li><strong>Naming a complicated query</strong> so it is written and reviewed once.</li>
+  <li><strong>A permission boundary.</strong> Grant <code>SELECT</code> on a view instead of the
+      table and a reporting account sees the columns you chose and no others — no salary column,
+      no card details. See <a href="/sql/mysql-users-and-privileges">users and privileges</a>.</li>
+  <li><strong>Enforcing a filter mechanically.</strong> The pizza schema soft-deletes with a
+      <code>deleted</code> flag, and every query has to remember it. A view that bakes in
+      <code>WHERE deleted = FALSE</code> is the database-side answer to that — the application uses
+      Hibernate's <code>@SQLRestriction</code> for the same reason. See
+      <a href="/sql/sql-delete">DELETE</a>.</li>
+  <li><strong>A stable interface</strong> over a schema you intend to change.</li>
+</ul>
+
+<h2>What they are not</h2>
+
+<p><strong>MySQL has no materialised views.</strong> Postgres and Oracle can store a view's result
+and refresh it; MySQL cannot. A view is always the query, run again.</p>
+
+<p>The usual substitutes, in order of how often they are the right answer:</p>
+
+<ol>
+  <li>A real <strong>summary table</strong>, refreshed by a scheduled job or on write. Explicit,
+      indexable, and you control the staleness.</li>
+  <li>A <a href="/sql/mysql-event">scheduled event</a> that rebuilds it inside the database.</li>
+  <li>Caching the result in the application.</li>
+</ol>
+
+<p>Two more limits worth knowing: a view cannot have an index of its own — only the base tables can
+— and <strong>nesting views is where performance goes to die</strong>. A view over a view over a
+view materialises repeatedly and the plan becomes very hard to read. One level is usually plenty.</p>
+
+<h2>Seeing what is there</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW FULL TABLES WHERE Table_type = 'VIEW';
+SHOW CREATE VIEW order_summary;</code></pre>
+
+<p>Views also have a <strong>definer</strong> and a security model:
+<code>SQL SECURITY DEFINER</code> (the default) runs the view with its creator's privileges, which
+is what makes the permission-boundary use work; <code>SQL SECURITY INVOKER</code> runs it with the
+caller's. Be deliberate about which — a <code>DEFINER</code> view created by <code>root</code>
+grants its caller root's reach over the tables it names.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>A view stores no data; the query runs each time.</li>
+  <li>MERGE keeps your filters on the base tables; <code>GROUP BY</code> forces TEMPTABLE and loses
+      that.</li>
+  <li>Simple views are updatable — add <code>WITH CHECK OPTION</code>.</li>
+  <li>No materialised views in MySQL. Use a summary table.</li>
+  <li><code>DEFINER</code> versus <code>INVOKER</code> is a security decision, not a detail.</li>
+</ul>
