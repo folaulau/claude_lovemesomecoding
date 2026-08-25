@@ -2965,6 +2965,204 @@ if hasattr(s, "rightSideViewBfs"):
                 bad.append(xs)
     check("[BFS version] agrees with the DFS version", bad, [])
 
+print("LeetCode 202 - Happy Number")
+s = load("202-happy-number.html")
+def happy_model(n):
+    seen = set()
+    while n != 1 and n not in seen:
+        seen.add(n)
+        n = sum(int(c) ** 2 for c in str(n))
+    return n == 1
+check("19 (happy)", s.isHappy(19), True)
+check("2 (unhappy)", s.isHappy(2), False)
+check("1", s.isHappy(1), True)
+check("7 (the other small happy number)", s.isHappy(7), True)
+check("4 (in the unhappy cycle)", s.isHappy(4), False)
+bad = [n for n in range(1, 5000) if s.isHappy(n) != happy_model(n)]
+check("matches a hash-set model for every n in 1..4999", bad, [])
+check("Integer.MAX_VALUE terminates", s.isHappy(2147483647), happy_model(2147483647))
+
+print("LeetCode 203 - Remove Linked List Elements")
+s = load("203-remove-linked-list-elements.html", extra=LISTNODE)
+def removed(xs, val):
+    return to_arr83(s.removeElements(to_list83(xs), val))
+check("1,2,6,3,4,5,6 val=6", removed([1,2,6,3,4,5,6], 6), [1,2,3,4,5])
+check("empty list", removed([], 1), [])
+check("7,7,7,7 val=7 (everything goes)", removed([7,7,7,7], 7), [])
+check("1,2,2,1 val=2", removed([1,2,2,1], 2), [1,1])
+check("6,1,6 val=6 (head AND tail removed)", removed([6,1,6], 6), [1])
+check("no matches", removed([1,2,3], 9), [1,2,3])
+check("single node removed", removed([1], 1), [])
+bad = []
+for n in range(0, 9):
+    for combo in itertools.product([1, 2], repeat=n):
+        for val in (1, 2, 3):
+            if removed(list(combo), val) != [x for x in combo if x != val]:
+                bad.append((combo, val))
+check("matches a filter on every 1/2 list up to length 8", bad, [])
+if hasattr(s, "removeElementsRecursive"):
+    bad = []
+    for n in range(0, 8):
+        for combo in itertools.product([1, 2], repeat=n):
+            got = to_arr83(s.removeElementsRecursive(to_list83(list(combo)), 2))
+            if got != [x for x in combo if x != 2]:
+                bad.append(combo)
+    check("[recursive version] agrees", bad, [])
+
+print("LeetCode 204 - Count Primes")
+s = load("204-count-primes.html")
+def count_primes_model(n):
+    if n < 3:
+        return 0
+    sieve = [True] * n
+    sieve[0] = sieve[1] = False
+    for p in range(2, int(n ** 0.5) + 1):
+        if sieve[p]:
+            for m in range(p * p, n, p):
+                sieve[m] = False
+    return sum(sieve)
+check("n=10", s.countPrimes(10), 4)
+check("n=0", s.countPrimes(0), 0)
+check("n=1", s.countPrimes(1), 0)
+check("n=2 (strictly less than)", s.countPrimes(2), 0)
+check("n=3", s.countPrimes(3), 1)
+check("n=100", s.countPrimes(100), 25)
+check("n=1000", s.countPrimes(1000), 168)
+bad = [n for n in range(0, 2000) if s.countPrimes(n) != count_primes_model(n)]
+check("matches an independent sieve for every n in 0..1999", bad, [])
+
+print("LeetCode 205 - Isomorphic Strings")
+s = load("205-isomorphic-strings.html")
+check('"egg" / "add"', s.isIsomorphic("egg", "add"), True)
+check('"foo" / "bar"', s.isIsomorphic("foo", "bar"), False)
+check('"paper" / "title"', s.isIsomorphic("paper", "title"), True)
+check('"badc" / "baba" -- THE two-map case', s.isIsomorphic("badc", "baba"), False)
+check('"" / ""', s.isIsomorphic("", ""), True)
+check('"a" / "a" (maps to itself)', s.isIsomorphic("a", "a"), True)
+check('different lengths', s.isIsomorphic("ab", "a"), False)
+# Independent model: the first-occurrence pattern must match.
+def pattern(text):
+    return [text.index(c) for c in text]
+bad = []
+for n in range(0, 6):
+    for a in itertools.product("abc", repeat=n):
+        for b in itertools.product("abc", repeat=n):
+            sa, sb = "".join(a), "".join(b)
+            if s.isIsomorphic(sa, sb) != (pattern(sa) == pattern(sb)):
+                bad.append((sa, sb))
+check("matches the first-occurrence pattern on every abc pair up to length 5", bad, [])
+
+print("LeetCode 206 - Reverse Linked List")
+s = load("206-reverse-linked-list.html", extra=LISTNODE)
+def reversed_list(xs):
+    return to_arr83(s.reverseList(to_list83(xs)))
+check("1,2,3,4,5", reversed_list([1,2,3,4,5]), [5,4,3,2,1])
+check("1,2", reversed_list([1,2]), [2,1])
+check("empty list", reversed_list([]), [])
+check("single node", reversed_list([1]), [1])
+bad = [n for n in range(0, 40) if reversed_list(list(range(n))) != list(range(n - 1, -1, -1))]
+check("reverses every list length 0..39", bad, [])
+if hasattr(s, "reverseListRecursive"):
+    bad = [n for n in range(0, 30)
+           if to_arr83(s.reverseListRecursive(to_list83(list(range(n))))) != list(range(n - 1, -1, -1))]
+    check("[recursive version] agrees", bad, [])
+
+print("LeetCode 207 - Course Schedule")
+s = load("207-course-schedule.html")
+check("2, [[1,0]]", s.canFinish(2, [[1,0]]), True)
+check("2, [[1,0],[0,1]] (a cycle)", s.canFinish(2, [[1,0],[0,1]]), False)
+check("3, [[1,0],[2,1]]", s.canFinish(3, [[1,0],[2,1]]), True)
+check("2, [] (no prerequisites)", s.canFinish(2, []), True)
+check("1, [[0,0]] (self loop)", s.canFinish(1, [[0,0]]), False)
+check("diamond (NOT a cycle -- the three-state case)",
+      s.canFinish(4, [[1,0],[2,0],[3,1],[3,2]]), True)
+def acyclic_model(n, edges):
+    graph = collections.defaultdict(list)
+    for course, prereq in edges:
+        graph[prereq].append(course)
+    state = [0] * n
+    def dfs(u):
+        if state[u] == 1:
+            return False
+        if state[u] == 2:
+            return True
+        state[u] = 1
+        for v in graph[u]:
+            if not dfs(v):
+                return False
+        state[u] = 2
+        return True
+    return all(dfs(u) for u in range(n))
+bad = []
+for n in range(1, 5):
+    possible = [(a, b) for a in range(n) for b in range(n)]
+    for count in range(0, 4):
+        for edges in itertools.combinations(possible, count):
+            if s.canFinish(n, [list(e) for e in edges]) != acyclic_model(n, edges):
+                bad.append((n, edges))
+check("matches three-state DFS on every small graph with up to 3 edges", bad, [])
+
+print("LeetCode 208 - Implement Trie (Prefix Tree)")
+ns208 = {}
+exec(compile("\n".join(blocks("208-implement-trie-prefix-tree.html")), "trie", "exec"), ns208)
+Trie = ns208["Trie"]
+trie = Trie()
+trie.insert("apple")
+check('search("apple")', trie.search("apple"), True)
+check('search("app") -- inserted as a PREFIX only', trie.search("app"), False)
+check('startsWith("app")', trie.startsWith("app"), True)
+trie.insert("app")
+check('search("app") after inserting it', trie.search("app"), True)
+check('search("appl") still a prefix only', trie.search("appl"), False)
+check('startsWith("b")', trie.startsWith("b"), False)
+check('search("") on a non-empty trie', trie.search(""), False)
+check('startsWith("") matches everything', trie.startsWith(""), True)
+dup = Trie(); dup.insert("cat"); dup.insert("cat")
+check("inserting the same word twice", (dup.search("cat"), dup.startsWith("ca")), (True, True))
+# Against a plain set of words plus a prefix scan.
+rng = random.Random(20260906)
+words = ["".join(rng.choice("abc") for _ in range(rng.randrange(1, 6))) for _ in range(60)]
+real, model = Trie(), set()
+for w in words:
+    real.insert(w); model.add(w)
+bad = []
+for n in range(0, 5):
+    for combo in itertools.product("abc", repeat=n):
+        q = "".join(combo)
+        if real.search(q) != (q in model):
+            bad.append(("search", q))
+        if real.startsWith(q) != any(w.startswith(q) for w in model):
+            bad.append(("startsWith", q))
+check("matches a set of 60 words on every abc query up to length 4", bad, [])
+
+print("LeetCode 210 - Course Schedule II")
+s = load("210-course-schedule-ii.html")
+def valid_order(n, edges, order):
+    if sorted(order) != list(range(n)):
+        return False
+    position = {c: i for i, c in enumerate(order)}
+    return all(position[prereq] < position[course] for course, prereq in edges)
+check("2, [[1,0]]", list(s.findOrder(2, [[1,0]])), [0,1])
+check("2, [[1,0],[0,1]] (a cycle)", list(s.findOrder(2, [[1,0],[0,1]])), [])
+check("1, []", list(s.findOrder(1, [])), [0])
+got = list(s.findOrder(4, [[1,0],[2,0],[3,1],[3,2]]))
+check("4-course diamond is a valid order", valid_order(4, [[1,0],[2,0],[3,1],[3,2]], got), True)
+canFinish = load("207-course-schedule.html")
+bad = []
+for n in range(1, 5):
+    possible = [(a, b) for a in range(n) for b in range(n)]
+    for count in range(0, 4):
+        for edges in itertools.combinations(possible, count):
+            pairs = [list(e) for e in edges]
+            order = list(s.findOrder(n, [list(e) for e in edges]))
+            feasible = canFinish.canFinish(n, [list(e) for e in edges])
+            if feasible:
+                if not valid_order(n, edges, order):
+                    bad.append(("bad order", n, edges, order))
+            elif order != []:
+                bad.append(("should be empty", n, edges, order))
+check("returns a valid order exactly when 207 says one exists", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

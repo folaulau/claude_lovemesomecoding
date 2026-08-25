@@ -1655,6 +1655,110 @@ POSTS = [
         ),
     },
     {
+        "number": 202,
+        "slug": "leetcode-202-happy-number",
+        "algorithm": "Implementation",
+        "title": "LeetCode 202 \u2013 Happy Number",
+        "file": "202-happy-number.html",
+        "date": "2025-02-16T12:36:16",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "hash-table", "math", "two-pointers"],
+        "excerpt": (
+            "Linked List Cycle with the list replaced by a function. No nodes, no next pointer, and Floyd's algorithm works anyway \u2014 which is the point: cycle detection needs a successor function, not a data structure. Plus why the sequence must terminate at all."
+        ),
+    },
+    {
+        "number": 203,
+        "slug": "leetcode-203-remove-linked-list-elements",
+        "algorithm": "Implementation",
+        "title": "LeetCode 203 \u2013 Remove Linked List Elements",
+        "file": "203-remove-linked-list-elements.html",
+        "date": "2025-02-17T22:45:12",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "linked-list", "recursion"],
+        "excerpt": (
+            "The problem that proves the dummy-head rule problem 83 stated. Here the head CAN be removed, repeatedly, so the dummy stops being a preference and becomes what makes the code short. And you must return dummy.next, never head."
+        ),
+    },
+    {
+        "number": 204,
+        "slug": "leetcode-204-count-primes",
+        "algorithm": "Implementation",
+        "title": "LeetCode 204 \u2013 Count Primes",
+        "file": "204-count-primes.html",
+        "date": "2025-02-23T00:09:04",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "math", "enumeration"],
+        "excerpt": (
+            "A problem about knowing an algorithm rather than deriving one. What is actually tested is the two optimisations that make the sieve fast \u2014 stop at sqrt(n), start the inner loop at p*p \u2014 and whether you can say why both follow from one fact."
+        ),
+    },
+    {
+        "number": 205,
+        "slug": "leetcode-205-isomorphic-strings",
+        "algorithm": "Strings",
+        "title": "LeetCode 205 \u2013 Isomorphic Strings",
+        "file": "205-isomorphic-strings.html",
+        "date": "2025-02-24T16:11:54",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "string", "hash-table"],
+        "excerpt": (
+            "A one-map solution that is wrong and a two-map solution that is right, separated by a single word in the problem statement. The pair badc / baba passes every consistency check and is still not isomorphic, because b and d both map to b."
+        ),
+    },
+    {
+        "number": 206,
+        "slug": "leetcode-206-reverse-linked-list",
+        "algorithm": "Implementation",
+        "title": "LeetCode 206 \u2013 Reverse Linked List",
+        "file": "206-reverse-linked-list.html",
+        "date": "2025-02-26T15:06:16",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "linked-list", "recursion"],
+        "excerpt": (
+            "The most-asked list question there is, and it is asked because four assignments in the wrong order lose the rest of the list. Save the successor before overwriting the link, return previous rather than current \u2014 and it is a building block for half the harder list problems."
+        ),
+    },
+    {
+        "number": 207,
+        "slug": "leetcode-207-course-schedule",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 207 \u2013 Course Schedule",
+        "file": "207-course-schedule.html",
+        "date": "2025-02-27T18:15:50",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "graph", "topological-sort", "breadth-first-search"],
+        "excerpt": (
+            "Cycle detection in a directed graph wearing a scheduling problem's clothes. Kahn's algorithm never looks for the cycle \u2014 it notices what is left over. And the DFS version needs THREE node states, because already-finished and currently-above-me are different facts."
+        ),
+    },
+    {
+        "number": 208,
+        "slug": "leetcode-208-implement-trie-prefix-tree",
+        "algorithm": "Implementation",
+        "title": "LeetCode 208 \u2013 Implement Trie (Prefix Tree)",
+        "file": "208-implement-trie-prefix-tree.html",
+        "date": "2025-03-01T18:24:08",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "design", "trie", "string"],
+        "excerpt": (
+            "A build-the-structure question where the interview is really two things: why a trie beats a hash set for prefix queries, and the one boolean separating a word from a prefix. Every operation is independent of how many words are stored."
+        ),
+    },
+    {
+        "number": 210,
+        "slug": "leetcode-210-course-schedule-ii",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 210 \u2013 Course Schedule II",
+        "file": "210-course-schedule-ii.html",
+        "date": "2025-03-01T20:26:03",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "graph", "topological-sort", "breadth-first-search"],
+        "excerpt": (
+            "Problem 207 asked whether an ordering exists; this wants the ordering, which Kahn's algorithm already had and threw away. The list IS the count. Plus why the DFS version comes out backwards, and the heap that gives the lexicographically smallest order."
+        ),
+    },
+    {
         "number": 347,
         "batch": "interview-essentials",
         "slug": "leetcode-347-top-k-frequent-elements",

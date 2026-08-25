@@ -136,6 +136,19 @@ solution("169-majority-element.html", "S169")
 solution("189-rotate-array.html", "S189")
 solution("198-house-robber.html", "S198")
 solution("199-binary-tree-right-side-view.html", "S199")
+solution("202-happy-number.html", "S202")
+solution("203-remove-linked-list-elements.html", "S203")
+solution("204-count-primes.html", "S204")
+solution("205-isomorphic-strings.html", "S205")
+solution("206-reverse-linked-list.html", "S206")
+solution("207-course-schedule.html", "S207")
+solution("210-course-schedule-ii.html", "S210")
+
+# LeetCode 208 defines `class Trie`, not `class Solution`.
+for block in blocks("208-implement-trie-prefix-tree.html"):
+    if re.search(r'\bclass\s+Trie\b', block):
+        parts.append(block)
+        break
 
 # LeetCode 173 defines `class BSTIterator`, not `class Solution`.
 for block in blocks("173-binary-search-tree-iterator.html"):
@@ -883,6 +896,74 @@ public class Main {
         acc.put(depth, node.val);                        // rightward writes win
         rightViewModel(node.left, depth + 1, acc);
         rightViewModel(node.right, depth + 1, acc);
+    }
+
+    static boolean happyModel(int n) {
+        Set<Integer> seen = new HashSet<>();
+        while (n != 1 && seen.add(n)) {
+            int sum = 0;
+            for (int x = n; x > 0; x /= 10) { int d = x % 10; sum += d * d; }
+            n = sum;
+        }
+        return n == 1;
+    }
+
+    static int countPrimesModel(int n) {
+        if (n < 3) return 0;
+        boolean[] sieve = new boolean[n];
+        int count = 0;
+        for (int p = 2; p < n; p++) {
+            if (sieve[p]) continue;
+            count++;
+            for (long m = (long) p * p; m < n; m += p) sieve[(int) m] = true;
+        }
+        return count;
+    }
+
+    /** First-occurrence pattern: two strings are isomorphic iff these match. */
+    static String firstOccurrencePattern(String text) {
+        StringBuilder sb = new StringBuilder();
+        for (char c : text.toCharArray()) sb.append(text.indexOf(c)).append(',');
+        return sb.toString();
+    }
+
+    /** Three-state DFS acyclicity check, as an independent model for 207. */
+    static boolean acyclicModel(int n, int[][] edges) {
+        List<List<Integer>> graph = new ArrayList<>();
+        for (int i = 0; i < n; i++) graph.add(new ArrayList<>());
+        for (int[] e : edges) graph.get(e[1]).add(e[0]);
+        int[] state = new int[n];
+        for (int u = 0; u < n; u++) if (!acyclicDfs(u, graph, state)) return false;
+        return true;
+    }
+
+    static boolean acyclicDfs(int u, List<List<Integer>> graph, int[] state) {
+        if (state[u] == 1) return false;
+        if (state[u] == 2) return true;
+        state[u] = 1;
+        for (int v : graph.get(u)) if (!acyclicDfs(v, graph, state)) return false;
+        state[u] = 2;
+        return true;
+    }
+
+    /** Is `order` a permutation of 0..n-1 respecting every edge? */
+    static boolean validOrder(int n, int[][] edges, int[] order) {
+        if (order.length != n) return false;
+        int[] position = new int[n];
+        boolean[] seen = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            if (order[i] < 0 || order[i] >= n || seen[order[i]]) return false;
+            seen[order[i]] = true;
+            position[order[i]] = i;
+        }
+        for (int[] e : edges) if (position[e[1]] >= position[e[0]]) return false;
+        return true;
+    }
+
+    static int[][] deepCopy(int[][] xs) {
+        int[][] out = new int[xs.length][];
+        for (int i = 0; i < xs.length; i++) out[i] = xs[i].clone();
+        return out;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -3489,6 +3570,196 @@ public class Main {
             }
         }
         check("matches a depth-indexed model on every small tree shape", viewBad, 0);
+
+        System.out.println("LeetCode 202 - Happy Number");
+        S202 s202 = new S202();
+        check("19 (happy)", s202.isHappy(19), true);
+        check("2 (unhappy)", s202.isHappy(2), false);
+        check("1", s202.isHappy(1), true);
+        check("7", s202.isHappy(7), true);
+        check("4 (in the unhappy cycle)", s202.isHappy(4), false);
+        int happyBad = 0;
+        for (int n = 1; n < 5000; n++) if (s202.isHappy(n) != happyModel(n)) happyBad++;
+        check("matches a hash-set model for every n in 1..4999", happyBad, 0);
+        check("Integer.MAX_VALUE terminates",
+              s202.isHappy(Integer.MAX_VALUE), happyModel(Integer.MAX_VALUE));
+
+        System.out.println("LeetCode 203 - Remove Linked List Elements");
+        S203 s203 = new S203();
+        check("1,2,6,3,4,5,6 val=6",
+              toArr(s203.removeElements(toList(1,2,6,3,4,5,6), 6)), new int[]{1,2,3,4,5});
+        check("empty list", toArr(s203.removeElements(null, 1)), new int[]{});
+        check("7,7,7,7 val=7 (everything goes)",
+              toArr(s203.removeElements(toList(7,7,7,7), 7)), new int[]{});
+        check("1,2,2,1 val=2", toArr(s203.removeElements(toList(1,2,2,1), 2)), new int[]{1,1});
+        check("6,1,6 val=6 (head AND tail removed)",
+              toArr(s203.removeElements(toList(6,1,6), 6)), new int[]{1});
+        check("no matches", toArr(s203.removeElements(toList(1,2,3), 9)), new int[]{1,2,3});
+        int removeBad = 0;
+        for (int n = 0; n <= 8; n++) {
+            for (int mask = 0; mask < (1 << n); mask++) {
+                int[] xs = new int[n];
+                for (int i = 0; i < n; i++) xs[i] = (mask >> i & 1) == 1 ? 2 : 1;
+                for (int val = 1; val <= 3; val++) {
+                    List<Integer> kept = new ArrayList<>();
+                    for (int x : xs) if (x != val) kept.add(x);
+                    int[] wantArr = kept.stream().mapToInt(Integer::intValue).toArray();
+                    if (!Arrays.equals(toArr(s203.removeElements(toList(xs), val)), wantArr)) removeBad++;
+                }
+            }
+        }
+        check("matches a filter on every 1/2 list up to length 8", removeBad, 0);
+
+        System.out.println("LeetCode 204 - Count Primes");
+        S204 s204 = new S204();
+        check("n=10", s204.countPrimes(10), 4);
+        check("n=0", s204.countPrimes(0), 0);
+        check("n=1", s204.countPrimes(1), 0);
+        check("n=2 (strictly less than)", s204.countPrimes(2), 0);
+        check("n=3", s204.countPrimes(3), 1);
+        check("n=100", s204.countPrimes(100), 25);
+        check("n=1000", s204.countPrimes(1000), 168);
+        int primeBad = 0;
+        for (int n = 0; n < 2000; n++) if (s204.countPrimes(n) != countPrimesModel(n)) primeBad++;
+        check("matches an independent sieve for every n in 0..1999", primeBad, 0);
+        check("n=1000000 (the scale the sieve exists for)", s204.countPrimes(1000000), 78498);
+
+        System.out.println("LeetCode 205 - Isomorphic Strings");
+        S205 s205 = new S205();
+        check("egg / add", s205.isIsomorphic("egg", "add"), true);
+        check("foo / bar", s205.isIsomorphic("foo", "bar"), false);
+        check("paper / title", s205.isIsomorphic("paper", "title"), true);
+        check("badc / baba -- THE two-map case", s205.isIsomorphic("badc", "baba"), false);
+        check("empty strings", s205.isIsomorphic("", ""), true);
+        check("a / a (maps to itself)", s205.isIsomorphic("a", "a"), true);
+        check("different lengths", s205.isIsomorphic("ab", "a"), false);
+        int isoBad = 0;
+        for (int n = 0; n <= 5; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int am = 0; am < combos; am++) {
+                StringBuilder sa = new StringBuilder();
+                int aa = am;
+                for (int i = 0; i < n; i++) { sa.append((char) ('a' + aa % 3)); aa /= 3; }
+                for (int bm = 0; bm < combos; bm++) {
+                    StringBuilder sb2 = new StringBuilder();
+                    int bb = bm;
+                    for (int i = 0; i < n; i++) { sb2.append((char) ('a' + bb % 3)); bb /= 3; }
+                    String x = sa.toString(), y = sb2.toString();
+                    boolean model = firstOccurrencePattern(x).equals(firstOccurrencePattern(y));
+                    if (s205.isIsomorphic(x, y) != model) isoBad++;
+                }
+            }
+        }
+        check("matches the first-occurrence pattern on every abc pair up to length 5", isoBad, 0);
+
+        System.out.println("LeetCode 206 - Reverse Linked List");
+        S206 s206 = new S206();
+        check("1,2,3,4,5", toArr(s206.reverseList(toList(1,2,3,4,5))), new int[]{5,4,3,2,1});
+        check("1,2", toArr(s206.reverseList(toList(1,2))), new int[]{2,1});
+        check("empty list", toArr(s206.reverseList(null)), new int[]{});
+        check("single node", toArr(s206.reverseList(toList(1))), new int[]{1});
+        int reverseBad = 0;
+        for (int n = 0; n < 40; n++) {
+            int[] xs = new int[n];
+            for (int i = 0; i < n; i++) xs[i] = i;
+            int[] descending = new int[n];
+            for (int i = 0; i < n; i++) descending[i] = n - 1 - i;
+            if (!Arrays.equals(toArr(s206.reverseList(toList(xs))), descending)) reverseBad++;
+        }
+        check("reverses every list length 0..39", reverseBad, 0);
+
+        System.out.println("LeetCode 207 - Course Schedule");
+        S207 s207 = new S207();
+        check("2, [[1,0]]", s207.canFinish(2, new int[][]{{1,0}}), true);
+        check("2, [[1,0],[0,1]] (a cycle)", s207.canFinish(2, new int[][]{{1,0},{0,1}}), false);
+        check("3, [[1,0],[2,1]]", s207.canFinish(3, new int[][]{{1,0},{2,1}}), true);
+        check("2, [] (no prerequisites)", s207.canFinish(2, new int[][]{}), true);
+        check("1, [[0,0]] (self loop)", s207.canFinish(1, new int[][]{{0,0}}), false);
+        check("diamond (NOT a cycle -- the three-state case)",
+              s207.canFinish(4, new int[][]{{1,0},{2,0},{3,1},{3,2}}), true);
+
+        System.out.println("LeetCode 210 - Course Schedule II");
+        S210 s210 = new S210();
+        check("2, [[1,0]]", s210.findOrder(2, new int[][]{{1,0}}), new int[]{0,1});
+        check("2, [[1,0],[0,1]] (a cycle)", s210.findOrder(2, new int[][]{{1,0},{0,1}}), new int[]{});
+        check("1, []", s210.findOrder(1, new int[][]{}), new int[]{0});
+        check("4-course diamond is a valid order",
+              validOrder(4, new int[][]{{1,0},{2,0},{3,1},{3,2}},
+                         s210.findOrder(4, new int[][]{{1,0},{2,0},{3,1},{3,2}})), true);
+        // Exhaustive over every small graph: 207 and 210 must agree, and the order must be valid.
+        int scheduleBad = 0, topoOrderBad = 0;
+        for (int n = 1; n <= 4; n++) {
+            List<int[]> possible = new ArrayList<>();
+            for (int course = 0; course < n; course++)
+                for (int prereq = 0; prereq < n; prereq++) possible.add(new int[]{course, prereq});
+            int total = possible.size();
+            for (int count = 0; count <= 3; count++) {
+                int[] idx = new int[count];
+                for (int i = 0; i < count; i++) idx[i] = i;
+                while (count == 0 || idx[0] <= total - count) {
+                    int[][] edges = new int[count][];
+                    for (int i = 0; i < count; i++) edges[i] = possible.get(idx[i]).clone();
+
+                    boolean feasible = s207.canFinish(n, deepCopy(edges));
+                    if (feasible != acyclicModel(n, deepCopy(edges))) scheduleBad++;
+
+                    int[] order = s210.findOrder(n, deepCopy(edges));
+                    if (feasible) {
+                        if (!validOrder(n, deepCopy(edges), order)) topoOrderBad++;
+                    } else if (order.length != 0) topoOrderBad++;
+
+                    if (count == 0) break;
+                    int k = count - 1;
+                    while (k >= 0 && idx[k] == total - count + k) k--;
+                    if (k < 0) break;
+                    idx[k]++;
+                    for (int i = k + 1; i < count; i++) idx[i] = idx[i - 1] + 1;
+                }
+            }
+        }
+        check("207 matches three-state DFS on every small graph with up to 3 edges", scheduleBad, 0);
+        check("210 returns a valid order exactly when 207 says one exists", topoOrderBad, 0);
+
+        System.out.println("LeetCode 208 - Implement Trie (Prefix Tree)");
+        Trie trie = new Trie();
+        trie.insert("apple");
+        check("search(apple)", trie.search("apple"), true);
+        check("search(app) -- inserted as a PREFIX only", trie.search("app"), false);
+        check("startsWith(app)", trie.startsWith("app"), true);
+        trie.insert("app");
+        check("search(app) after inserting it", trie.search("app"), true);
+        check("search(appl) still a prefix only", trie.search("appl"), false);
+        check("startsWith(b)", trie.startsWith("b"), false);
+        check("startsWith(empty) matches everything", trie.startsWith(""), true);
+        Trie twice = new Trie(); twice.insert("cat"); twice.insert("cat");
+        check("inserting the same word twice",
+              twice.search("cat") + "," + twice.startsWith("ca"), "true,true");
+        // Against a plain set of words plus a prefix scan.
+        Trie real = new Trie();
+        Set<String> model = new HashSet<>();
+        Random trieRng = new Random(20260906);
+        for (int i = 0; i < 60; i++) {
+            StringBuilder w = new StringBuilder();
+            int len = 1 + trieRng.nextInt(5);
+            for (int j = 0; j < len; j++) w.append((char) ('a' + trieRng.nextInt(3)));
+            real.insert(w.toString());
+            model.add(w.toString());
+        }
+        int trieBad = 0;
+        for (int n = 0; n <= 4; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder q = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < n; i++) { q.append((char) ('a' + mm % 3)); mm /= 3; }
+                String query = q.toString();
+                if (real.search(query) != model.contains(query)) trieBad++;
+                boolean anyPrefix = false;
+                for (String w : model) if (w.startsWith(query)) anyPrefix = true;
+                if (real.startsWith(query) != anyPrefix) trieBad++;
+            }
+        }
+        check("matches a set of 60 words on every abc query up to length 4", trieBad, 0);
 
         System.out.println();
         if (failures > 0) {

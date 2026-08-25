@@ -69,7 +69,8 @@ span three numeric rounds (171–180, 181–190, 191–200) and were written and
 | 16 | 151–160 | 6 — 151, 152, 156, 157, 158, 159 | **live** since 2025-01 |
 | 17 | 161–170 | 4 — 160 (see note), 168, 169, 170 | **live** since 2025-01 |
 | 18–20 | 171–200 | 4 — 173, 189, 198, 199 | **live** since 2025-01/02 |
-| 21 | 201–210 | 8 — 202, 203, 204, 205, 206, 207, 208, 210 | not started |
+| 21 | 201–210 | 8 — 202, 203, 204, 205, 206, 207, 208, 210 | **live** since 2025-02/03 |
+| 22 | 211–220 | 4 — 211, 215, 217, 218, 219 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -101,14 +102,14 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 102 posts:
+Current distribution across the 110 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Implementation | 22 |
-| Graph Theory | 21 |
+| Implementation | 27 |
+| Graph Theory | 23 |
+| Strings | 15 |
 | Dynamic Programming | 15 |
-| Strings | 14 |
 | Recursion | 10 |
 | Sorting | 8 |
 | Searching | 6 |
