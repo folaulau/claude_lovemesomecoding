@@ -402,10 +402,81 @@ rollback should also remove them from it by rebuilding after the restore.
   The widest ASCII diagram line in the track is 95 characters, so wide diagrams scroll inside their
   own block rather than breaking the page. Decision 2 holds in light and dark.
 
+## Re-dated to 2022-2025 (2026-08-24)
+
+The track shipped stamped `2026-08-24` + 2 days per lesson, which put all eighteen posts in the
+future and clustered them inside five weeks. Re-based to **one lesson roughly every eleven weeks
+across 2022-2025**: `START_DATE = 2022-01-18`, `STEP_DAYS = 82`, first post 2022-01-18, last
+2025-11-12.
+
+Two reasons beyond the ask. Future dates are not cosmetic here — archives and the sitemap sort
+newest-first, so the whole track pinned itself to the top of the site and shipped `<lastmod>`
+values that postdated the crawl. And seven of these URLs have genuinely been live since
+2018/2019/2023, so a block of 2026 dates contradicted the pages' own history.
+
+`manifest.DATE_RANGE` now asserts at import that the computed dates stay inside the window, so
+moving `START_DATE` without meaning to leave it fails before it can be seeded.
+
+### Dates inside the posts had to move too
+
+Five posts quoted 2026 dates in code blocks, which a post dated 2023 cannot do. All were
+illustrative or captured output, none were verbatim source quotes, and `check_snippets.py` still
+reports no drift:
+
+| post | was | now | why |
+|---|---|---|---|
+| database-scaling | `bookings_2026_q1/q2` | `bookings_2023_q1/q2` | post is 2023-03-04; the `DROP TABLE bookings_2019_q1` line still reads as old data |
+| message-queues | `20260822T190807…` | `20230815T190807…` | terminal output from the duplicate-delivery run, dated to the post |
+| notification-system | `20260822T190807…` | `20230815T190807…` | **same** timestamps deliberately — post 14 recalls the event from post 08, so they must match, and they belong to the earlier post's date |
+| rate-limiting | `user:42:2026-08-22T14:31` | `user:42:2024-01-26T14:31` | fixed-window key example |
+| delta-airlines | flight `2026-11-04` | `2025-11-04` | post is 2025-08-22; 15 months out is past the real booking window |
+
+### ⚠️ `_reindex` lost six index updates, silently
+
+Worth recording because nothing downstream would have caught it. The first re-seed wrote all
+eighteen post objects correctly, but `index/posts.json` came back with **six entries still
+carrying their old date** (`system-design-back-of-envelope-estimation`, `concurrency-and-locking`,
+`airbnb`, `amazon`, `delta-airlines`, `interview-questions`) — their `modified` field was still the
+2026-08-22 publish. `index/by-category/system-design.json` was completely correct.
+
+`_reindex` is a read-modify-write of one file holding every published post (778 of them now), run
+once per post in the loop. Re-running the seed converged it; the cause was not pinned down.
+
+The dangerous part is that the drift is invisible to every existing guard. The category index was
+right, so the category count still agreed, every URL still resolved, and `verify-build.mjs` passed
+clean — including check 6, which cross-checks the indexes against each other. The only symptom
+would have been six posts sorted to the wrong place in the site-wide archive and the sitemap, and
+nothing looks at that.
+
+`seed.py` now ends with `verify_indexes()`: re-read both indexes from S3, compare every date
+against the post objects, repair once by re-upserting the drifted slugs, verify again, and exit
+non-zero rather than let a build run on a bad index.
+
+### `seed.py --republish`
+
+The `new`-slug collision guard is a pre-publish guard and it expires the moment the track ships —
+once the eleven new posts are live they exist on every subsequent run, so it fires on a correct
+re-seed. `--republish` acknowledges they are ours now. It is deliberately not the default: the day
+that guard is genuinely right is the day a typo'd slug would silently eat an unrelated post.
+
+### Verified live
+
+Post pages render "January 18, 2022" … "November 12, 2025"; the archive lists lesson order
+(the category template sorts oldest-first, which is what a course wants); prev/next still walks
+notification-system → airbnb → amazon; no `2026` remains in any post body — the only 2026 left on
+a page is `dateModified` / "Updated 8/24/2026" / the footer copyright, all correct.
+
+Deployed: 2013 files, 95 redirects, invalidation complete, edge serving build `394b0bd`.
+
+**Unrelated but noticed:** the `vue` track is dated to 2026-11-21 and holds the site-wide newest
+slots. If future-dating is not intentional there, it has the same sitemap `<lastmod>` problem this
+change just fixed here.
+
 ## Still to do
 
 1. **Submit the sitemap to Search Console** if the eleven new URLs should be indexed promptly.
-   (The root `CLAUDE.md` already lists sitemap submission as an open task.)
+   (The root `CLAUDE.md` already lists sitemap submission as an open task.) Note the re-dating
+   changed only `date`, not the URLs, so nothing needs re-submitting on account of it.
 2. **Commit.** Three repos, three separate commits:
    - `claude_lovemesomecoding` — `projects/system_design/` (this track)
    - `lovemesomecoding_demo_project` — the StayHub cache/rate-limit/outbox work

@@ -1,0 +1,133 @@
+<p><code>fetch</code> exists and works exactly as it does in a browser. Then reality arrives: the
+server is not where you think it is, the network is unreliable in ways a desktop's is not, and
+every screen owes the user three states instead of one.</p>
+
+<h2>localhost means three different things</h2>
+
+<p>This is the first wall everybody hits, and it is not a bug in your code.</p>
+
+<p>On the <strong>iOS simulator</strong>, <code>localhost</code> is your Mac — it shares the host's
+network stack. On the <strong>Android emulator</strong>, <code>localhost</code> is the emulator
+itself, a virtual machine with nothing listening; the host is reachable at the special address
+<code>10.0.2.2</code>. On a <strong>real phone</strong>, neither works: it is a different device on
+the Wi-Fi and needs your machine's LAN address, which changes with the network and so cannot be
+written down in advance.</p>
+
+<p>So the API host has to be resolved, not hard-coded:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  const hostUri = Constants.expoConfig?.hostUri;
+  const devHost = hostUri?.split(':')[0];
+
+  if (devHost &amp;&amp; devHost !== 'localhost' &amp;&amp; devHost !== '127.0.0.1') {
+    return `http://${devHost}:${API_PORT}`;
+  }
+
+  if (Platform.OS === 'android') {
+    return `http://10.0.2.2:${API_PORT}`;
+  }
+
+  return `http://localhost:${API_PORT}`;
+}</code></pre>
+
+<p>The physical-device case is solved by asking Expo. While the dev server is running,
+<code>hostUri</code> holds the address the phone used to <em>download</em> this bundle — which is,
+by definition, a route back to your machine. Swap Metro's port for the API's and you have the
+answer, on any network, without configuration.</p>
+
+<p>A release build has no dev server to ask, so it throws instead of guessing. Failing loudly beats
+shipping a binary that silently talks to <code>localhost</code>.</p>
+
+<h3>One more iOS detail</h3>
+
+<p>App Transport Security blocks plain HTTP. A development backend on
+<code>http://localhost:8085</code> needs <code>NSAllowsLocalNetworking</code> in the Expo config —
+which opens local addresses only, rather than <code>NSAllowsArbitraryLoads</code>, which disables
+HTTPS enforcement for the entire app.</p>
+
+<h2>One place that calls fetch</h2>
+
+<pre class="language-tsx"><code class="language-tsx">async function request&lt;T&gt;(path: string, options: RequestOptions = {}): Promise&lt;T&gt; {
+  const { method = 'GET', body, auth = false, signal, timeoutMs = DEFAULT_TIMEOUT_MS } = options;
+
+  const headers: Record&lt;string, string&gt; = { Accept: 'application/json' };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+
+  if (auth) {
+    const token = await tokenStore.get();
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const timeout = withTimeout(timeoutMs, signal);</code></pre>
+
+<p>Everything goes through one function, so there is exactly one implementation of where the API
+lives, how the token is attached, how a timeout is enforced and how an error response becomes a
+thrown error. Calling <code>fetch</code> from a screen scatters all four.</p>
+
+<p>Note <code>await tokenStore.get()</code>. On the web the token came out of
+<code>localStorage</code> synchronously; here it is in the keychain, so reading it is asynchronous.
+That single difference ripples through the whole app — lesson 16.</p>
+
+<h2>Give every request a deadline</h2>
+
+<p>A phone on a weak signal does not fail fast. It hangs — <code>fetch</code> will happily wait for
+minutes while your spinner spins and the user decides the app is broken.</p>
+
+<p>There is no timeout option, so you build one from <code>AbortController</code>: a timer that
+aborts the request, cleared when the response arrives. The demo app uses fifteen seconds, long
+enough for a cold server start and short enough that a dead network is obvious.</p>
+
+<p>⚠️ <code>AbortSignal.any</code> would combine the caller's signal with the timeout in one line,
+and Hermes does not ship it. Wiring the two together by hand is a small thing that is easy to
+copy from the browser and find missing.</p>
+
+<h2>Distinguish a failure from a cancellation</h2>
+
+<p>When a screen unmounts mid-request, the abort is <em>not</em> an error — it is the correct
+outcome, and showing "something went wrong" for it is wrong. The client rethrows a caller-initiated
+abort untouched so <code>error.name === 'AbortError'</code> still identifies it, and only converts
+genuine network failures into its own error type.</p>
+
+<p>Two error types are worth having: one for "the server answered and said no", carrying the status
+and the response body, and one for "the request never arrived". They lead to different messages —
+and on a phone the second usually means a lost signal rather than a backend that is down.</p>
+
+<h2>Fetching in a screen, properly</h2>
+
+<p>Three details, all of which are easy to get wrong:</p>
+
+<p><strong>Cancel on unmount.</strong> An <code>AbortController</code> created in the effect and
+aborted in its cleanup. Without it, a slow first response can land after a fast retry and overwrite
+fresher data — and in development StrictMode runs every effect twice, so the race is not
+hypothetical.</p>
+
+<p><strong>Independent requests go in parallel.</strong> <code>Promise.all</code>, not three
+sequential <code>await</code>s. On a phone that is the difference between a menu that opens and one
+that appears to hang.</p>
+
+<p><strong>An abort is not a failure.</strong> Check the signal before setting an error state, or
+navigating away paints an error on the way out.</p>
+
+<h3>A counter, not a boolean, for retry</h3>
+
+<p>The reload trigger in the demo app is a number that increments. A boolean flag has to be reset,
+and the reset races with the request it triggered; a counter works for the second retry as well as
+the first.</p>
+
+<h2>Loading, empty, error</h2>
+
+<p>Every data screen has three states besides success, and the one that gets forgotten is the error
+branch — which is how you end up with a spinner that spins forever when the backend is down.
+Building them as components rather than repeating the pattern is the cheapest way to stop forgetting
+one.</p>
+
+<h2>When to reach for a data library</h2>
+
+<p>Everything above is what TanStack Query gives you for free, plus caching, deduplication,
+background refetching and stale-while-revalidate. Doing it by hand once is worth it — the loading
+flag, the cancellation and the error branch are exactly what the library is doing — and then reach
+for the library on anything with real caching needs.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-storage">Storing Data on the Device</a> — and why there is no
+<code>localStorage</code>.</p>

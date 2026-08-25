@@ -31,15 +31,17 @@ projects/vue_tutorial/
   progress_report.md status, decisions and the full topic table — read this first
 ```
 
-## Status: foundation done, authoring in progress
+## Status: ✅ published
 
-The 28-post topic table, the manifest and all four tools are done, and the content pipeline has been
-extended to support Vue and **verified end to end**. **2 of 28 post bodies written**
-(`vue-get-started`, `vue-sfc`), both seeded to the local tree.
+All 28 posts are **live at https://lovemesomecoding.com/vue**. The content pipeline was extended to
+support Vue and verified end to end, the backend Lambda and the frontend are both deployed, and every
+one of the 28 URLs returns 200 and appears in the sitemap.
 
-The demo app exists and runs, but has real gaps — no composables, no Teleport, no unit tests, only a
-bare default slot. `progress_report.md` lists them with the cheapest honest fix for each and needs a
-decision on which to close.
+Two gaps in the demo app were closed to serve the track — composables (`useIntersectionObserver`,
+`useDebounced`) and a `<Teleport>`'d confirm modal — and both are improvements to the app on their own
+terms. A Vitest unit suite, a custom directive and named slots were deliberately **not** added; the
+lessons that would have used them say so plainly and use generic examples instead.
+`progress_report.md` holds the gap table, the decision and the full publish log.
 
 Lesson 1's lesson index is **generated from `manifest.POSTS`**, so adding or reordering a lesson
 means re-running `gen_index.py` rather than hand-editing a list that will drift.
@@ -104,15 +106,18 @@ It does not make the track publishable — a full `--env prod` run still needs a
 
 ### `--force-dates`
 
-**Not needed for the first publish.** Every slug in this track is new, and `upsert_post` applies the
-manifest date when it creates a post — it only refuses to overwrite one that already exists. The
-flag is kept for the day the track is deliberately reordered *after* publishing, which is the only
-time it is the right answer.
+Not needed for a *first* publish — `upsert_post` applies the manifest date when it creates a post,
+and only refuses to overwrite one that already exists. It **is** needed to re-date a track that is
+already published, which is what happened here on 2026-08-24 when the whole track was re-based out of
+2026 and into 2025.
 
 ### Re-dating the track
 
-Dates are computed, not hard-coded. Edit `START_DATE` (and `STEP_DAYS`) in `manifest.py` and the
-whole track re-bases in order.
+Dates are computed, not hard-coded. Edit `START_DATE` (and `STEP_DAYS`) in `manifest.py`, then seed
+with `--force-dates`, then redeploy the frontend.
+
+⚠️ **Post dates must fall between 2023 and 2025, and never in the future.** `check_content.py`
+enforces both. The track currently runs **2025-10-09 .. 2025-12-29**.
 
 ## Adding or updating a post
 
@@ -132,15 +137,27 @@ whole track re-bases in order.
   `Prism.languages.vue = Prism.languages.markup` (`lovemesomecoding_frontend/src/lib/content.ts`).
   `check_content.py` asserts the backend half directly, so trimming that list fails a check instead
   of turning 28 posts grey.
-- ⚠️ **The backend Lambda still has the old language list.** Seeding runs the local service layer,
-  so what is in S3 is correct — but editing one of these posts through `/admin` before
-  `lovemesomecoding_backend/scripts/deploy.sh` runs would normalise every `vue` block down to
-  `plaintext` and silently lose the highlighting.
+- ✅ **The backend Lambda was deployed with the new language list on 2026-08-24**, so editing a Vue
+  post through `/admin` keeps its highlighting. This is the hazard the React track hit with `tsx`:
+  seeding runs the *local* service layer, so S3 is correct either way — but an `/admin` save against
+  a Lambda whose `SUPPORTED_LANGUAGES` lacks `vue` normalises every block down to `plaintext` and
+  loses the highlighting silently. Redeploy the backend before editing these posts in the admin if
+  its code is ever rolled back.
 - **Never hand-escape an SFC inside a `<pre>`.** Vue is the worst case this pipeline has faced: a
   snippet contains a literal `<template>`, `<script setup>` and often `<style scoped>`, and one
   missed `&lt;` opens a real element and swallows everything after it. Use `authoring.py` —
   `code()` escapes once, correctly, and `from_app()` reads the file out of the demo app instead of
   retyping it, which is what makes `check_snippets.py` meaningful.
+- **A seed can leave a post out of the derived indexes, and nothing else catches it.** On the first
+  prod publish, two posts were written correctly but were missing from `index/posts.json` and the
+  category indexes. The static build reads *only* the indexes, so those lessons would have been
+  silently absent — and `verify-build.mjs` would have passed, because it cross-checks the indexes
+  against each other and all of them were missing the same two. Re-running the seed repairs it.
+  `seed.py` now verifies every seeded slug landed in both indexes and exits non-zero if not.
+- **`scripts/deploy.sh` in the backend needs `API_DOMAIN`, `API_CERT_ARN` and `HOSTED_ZONE_ID`**, or
+  it passes an empty `DomainName` and `sam` refuses — which is the only thing preventing
+  CloudFormation from tearing down `api.lovemesomecoding.com`. The working invocation is in
+  `progress_report.md`.
 - **An unsupported language normalises to `plaintext` silently — it is never rejected.** The code is
   all still there, just grey, which is easy to miss in review. `check_content.py` treats an authored
   `language-X` that comes out as `plaintext` as a hard failure.

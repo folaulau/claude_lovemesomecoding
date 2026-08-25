@@ -1,0 +1,135 @@
+<p>Two questions decide a testing strategy: what is worth testing, and what can you reach. In React
+Native the second is unusual — a lot of what you want to exercise is native code that does not exist
+in Node.</p>
+
+<h2>The setup</h2>
+
+<p><code>jest-expo</code> is the preset. It configures the transform, the module mapping and the
+environment, and it handles the fact that React Native ships untranspiled ES modules — which is what
+<code>transformIgnorePatterns</code> in the Jest config is for.</p>
+
+<p>React Native Testing Library renders components and queries them the way a user would find them.</p>
+
+<h2>Start with the pure parts</h2>
+
+<pre class="language-tsx"><code class="language-tsx">    it('bumps the quantity of a matching line instead of adding a second one', () =&gt; {
+      const state: CartState = { items: [line({ quantity: 2 })], orderType: 'DELIVERY' };
+
+      const next = cartReducer(state, {
+        type: 'ADD_ITEM',
+        payload: line({ lineId: 'line-2', quantity: 3 }),
+      });
+
+      expect(next.items).toHaveLength(1);
+      expect(next.items[0]?.quantity).toBe(5);
+      expect(next.items[0]?.lineId).toBe('line-1');
+    });</code></pre>
+
+<p>No rendering, no mocks, no async — a function, an input and an output. The cart reducer and the
+money arithmetic are the highest-value tests in the demo app precisely because they are the rules
+that would cost real money to get wrong, and they run in milliseconds.</p>
+
+<p>This is the argument for keeping business logic out of components. Anything you have to render to
+test is harder to test.</p>
+
+<h2>Mocking the native modules</h2>
+
+<p>The keychain, the crypto source and Stripe's SDK do not exist in Node. Mock them once, centrally:</p>
+
+<pre class="language-tsx"><code class="language-tsx">jest.mock('expo-secure-store', () =&gt; {
+  const store = new Map&lt;string, string&gt;();
+  return {
+    getItemAsync: jest.fn(async (key: string) =&gt; store.get(key) ?? null),
+    setItemAsync: jest.fn(async (key: string, value: string) =&gt; {
+      store.set(key, value);
+    }),
+    deleteItemAsync: jest.fn(async (key: string) =&gt; {
+      store.delete(key);
+    }),
+    __store: store,
+  };
+});</code></pre>
+
+<p>A <code>Map</code> is enough to prove that a token written is a token read back. Doing it in
+<code>jest.setup.ts</code> means no individual test has to know, and the mock is shared behaviour
+rather than twenty copies.</p>
+
+<p>Mock the id generator as a <strong>counter</strong>, not a random value: a test asserting "these
+two cart lines are different" needs ids that differ, and a snapshot needs them reproducible. A
+counter gives both.</p>
+
+<p>⚠️ <strong><code>jest.mock</code> factories are hoisted above the imports.</strong> They cannot
+close over an ordinary <code>const</code> — Jest refuses to compile it. Either prefix the variable
+with <code>mock</code>, which is Jest's explicit escape hatch, or <code>require</code> inside the
+factory.</p>
+
+<h2>Rendering components</h2>
+
+<pre class="language-tsx"><code class="language-tsx">  it('renders its title and fires onPress', async () =&gt; {
+    const onPress = jest.fn();
+    await render(&lt;Button title="Add to cart" onPress={onPress} /&gt;);
+
+    await fireEvent.press(screen.getByText('Add to cart'));
+
+    expect(onPress).toHaveBeenCalledTimes(1);
+  });</code></pre>
+
+<p>⚠️ <strong>Note the awaits.</strong> React Native Testing Library 14 made <code>render</code> and
+<code>fireEvent</code> asynchronous, because React 19 can render concurrently and the tree is not
+guaranteed committed when the call returns. Forgetting one produces
+"<code>render</code> function has not been called" from <code>screen</code> — which sounds like
+exactly the opposite problem, and costs you a while.</p>
+
+<h3>Query the way a user finds things</h3>
+
+<p>Prefer <code>getByText</code> and <code>getByLabelText</code> over <code>testID</code>. Querying
+by accessibility label means your tests exercise the same information a screen reader gets, so a
+missing label breaks a test rather than only a person. Keep <code>testID</code> for things with no
+accessible name — a container, a specific row in a list of identical rows.</p>
+
+<h2>Testing a provider</h2>
+
+<p>The highest-value component test in the demo app renders the cart provider with a tiny harness and
+asserts the behaviour around the reducer: that it never writes an empty cart over a saved one, that
+three quick taps are one network write rather than three, that a saved cart the server has forgotten
+is dropped rather than retried forever.</p>
+
+<p>Two traps found while writing it, both worth stealing:</p>
+
+<p><strong>Fake timers deadlock.</strong> Faking timers also fakes the ones AsyncStorage's mock and
+React's scheduler use, and the test then waits forever for a promise only a real tick resolves. Half
+a second of real waiting is the cheaper trade.</p>
+
+<p><strong>A careless mock can hang the suite.</strong> A mocked <code>useMenu</code> returning a
+fresh object each call gives an effect a new dependency every render — so it re-runs, dispatches,
+re-renders, forever. The real provider memoises; the mock has to as well.</p>
+
+<h2>What unit tests cannot reach</h2>
+
+<p>Navigation across several screens, the real keychain, <code>AppState</code>, the payment sheet.
+For those you need the app running.</p>
+
+<p><strong>Maestro</strong> and <strong>Detox</strong> drive a real build on a simulator or device.
+Maestro is YAML and far easier to start with; Detox is faster and more precise once a suite gets
+large.</p>
+
+<p>The demo app takes a third route: it drives the <strong>web</strong> target with Playwright.
+Expo builds the same components through react-native-web, and <code>testID</code> becomes
+<code>data-testid</code>, so 31 tests exercise browse, cart, checkout, auth and profile against the
+real backend. It is cheap and it runs in CI without a simulator.</p>
+
+<p>Be honest about what that cannot cover: the payment sheet has no web build, <code>Alert</code> is
+a no-op there, and <code>accessibilityState</code> is never mapped to <code>aria-*</code>. Those
+gaps are the reason the web suite is a complement to a device run, not a replacement for one.</p>
+
+<h2>What to actually aim for</h2>
+
+<p>Cover the logic thoroughly — reducers, pricing, validation, the API client — because it is cheap
+and it is where the expensive bugs live. Cover the components that encode a rule. Cover the flows
+end to end. Do not chase a coverage number over screens whose only job is layout; a snapshot test of
+a view tree mostly asserts that nobody changed the view tree.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-internals">Internals: Hermes, JSI and the New
+Architecture</a> — how the thing actually works.</p>

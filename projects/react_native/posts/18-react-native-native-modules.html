@@ -1,0 +1,130 @@
+<p>Sooner or later JavaScript is not enough. A payment SDK, Bluetooth, a camera with real controls,
+a vendor's analytics library — all of it is Swift and Kotlin, and a native module is the bridge to
+it.</p>
+
+<h2>Why Expo Go stops working</h2>
+
+<p>Expo Go is a pre-built app. It contains a fixed set of native modules that Expo compiled into it,
+and it cannot load anything else — there is no mechanism for shipping new native code to an already
+built binary.</p>
+
+<p>A <strong>development build</strong> is your own binary, containing exactly the native code your
+project declares:</p>
+
+<pre class="language-bash"><code class="language-bash">npx expo run:ios</code></pre>
+
+<p>That is the whole difference, and it is where "Expo cannot use native modules" comes from. The
+statement was true of Expo Go and has never been true of a development build.</p>
+
+<h2>prebuild, and treating native projects as output</h2>
+
+<pre class="language-bash"><code class="language-bash">npx expo prebuild
+npx expo prebuild --clean</code></pre>
+
+<p><code>prebuild</code> generates <code>ios/</code> and <code>android/</code> from
+<code>app.config.ts</code> and your dependencies. <code>run:ios</code> calls it for you.</p>
+
+<p>The mental shift worth making: those folders are <strong>build output, not source</strong>. Do
+not edit them and do not commit them — the demo app gitignores both. Any change you make by hand is
+silently discarded the next time <code>--clean</code> runs, which is a bad way to lose an
+afternoon.</p>
+
+<p>Everything you would have edited there is expressed in the config instead. That is what makes an
+Expo upgrade a version bump rather than a merge conflict in files nobody understands.</p>
+
+<h2>Config plugins</h2>
+
+<p>A config plugin is a function that edits the generated native projects — adding an entitlement, a
+permission string, a manifest entry. Libraries ship their own, and you list them:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  plugins: [
+    'expo-router',
+    'expo-secure-store',
+    'expo-font',
+    'expo-web-browser',
+    [
+      'expo-splash-screen',
+      {
+        image: './assets/splash-icon.png',
+        resizeMode: 'contain',
+        backgroundColor: PIZZA_CREAM,
+      },
+    ],</code></pre>
+
+<p>A bare string is a plugin with no options; an array is a plugin with options. Adding one and
+re-running <code>prebuild</code> is the entire installation procedure for most native libraries.</p>
+
+<p>⚠️ Plugins can have <em>required</em> options, and the failure is not graceful. Adding Stripe
+without <code>merchantIdentifier</code> — which it demands even with Apple Pay switched off — makes
+<code>expo install</code> crash with <code>Cannot read properties of undefined (reading
+'merchantIdentifier')</code>, which does not obviously mean "you forgot a config option".</p>
+
+<h2>Check the peers</h2>
+
+<pre class="language-bash"><code class="language-bash">npx expo-doctor</code></pre>
+
+<p>Worth running after adding anything native. A missing native peer dependency typically builds
+fine and then crashes at launch — <code>expo-doctor</code> catches it before the build does not.</p>
+
+<h2>Quarantining a native dependency</h2>
+
+<p>This is the architectural part, and it is the most reusable idea in the lesson.</p>
+
+<p>A native module cannot run everywhere. Stripe's SDK has no web build at all, so merely importing
+it breaks the web bundle — and it makes anything that imports it awkward to test, because there is
+nothing to import in Node either.</p>
+
+<p>So it lives in exactly one folder, behind an interface:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export type PaymentOutcome =
+  | { status: 'succeeded' }
+  | { status: 'cancelled' }
+  | { status: 'failed'; message: string };</code></pre>
+
+<p>The contract is written in terms of the <em>domain</em> — an order was paid, or the customer
+changed their mind, or it failed — not in terms of Stripe. Nothing outside the folder knows which
+provider is behind it.</p>
+
+<pre class="language-tsx"><code class="language-tsx">export { StripeProvider, usePaymentGateway } from './paymentGateway';
+export type {
+  PaymentGateway,
+  PaymentOutcome,
+  CardSetupOutcome,
+  PaymentSheetRequest,
+} from './types';</code></pre>
+
+<p>One import path for the rest of the app. Metro resolves <code>./paymentGateway</code> to
+<code>paymentGateway.web.tsx</code> on web and <code>paymentGateway.tsx</code> everywhere else —
+platform extensions again, doing the work a conditional import would do badly.</p>
+
+<h3>The web implementation is honest, not fake</h3>
+
+<pre class="language-tsx"><code class="language-tsx">export function usePaymentGateway(): PaymentGateway {
+  return useMemo(
+    () =&gt; ({
+      payForOrder: async (): Promise&lt;PaymentOutcome&gt; =&gt; ({
+        status: 'failed',
+        message: UNAVAILABLE,
+      }),</code></pre>
+
+<p>It reports failure with an explanation rather than throwing or pretending to succeed. And it sets
+<code>isReady: false</code>, so the checkout screen renders its "payment unavailable" branch — which
+is the <em>same</em> branch a missing Stripe key produces on a real device. One code path, testable
+in a browser, that also covers a real misconfiguration.</p>
+
+<p>Three things fall out of this: the web preview keeps working, the checkout screen is testable
+without a payment provider, and swapping Stripe for something else is one file.</p>
+
+<h2>Writing your own</h2>
+
+<p>If no library exists, Expo Modules API is the modern way — you write a Swift class and a Kotlin
+class, declare the functions in a small DSL, and Expo generates the JavaScript side and the typings.
+It is dramatically less ceremony than the old bridge-based approach.</p>
+
+<p>Before you do: check whether the thing you need is already a config plugin over an existing SDK.
+Most "we need a native module" conversations end there.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-payments">Taking Payments with Stripe</a> — the worked
+example of everything above.</p>

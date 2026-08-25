@@ -1,0 +1,112 @@
+<p>There are two threads. Your JavaScript runs on one of them, and the screen is drawn on the other.
+Every animation decision in React Native comes back to that fact.</p>
+
+<h2>Animated, in three parts</h2>
+
+<p>You create a value, you animate it, and you bind it to a style on an
+<code>Animated</code> component.</p>
+
+<pre class="language-tsx"><code class="language-tsx">  const [enter] = useState(() =&gt; new Animated.Value(0));</code></pre>
+
+<p>An <code>Animated.Value</code> is a mutable number that lives outside React's state. It is
+created once and never replaced, which is why it goes in a lazy <code>useState</code>
+initialiser — the function runs on the first render only.</p>
+
+<p>⚠️ Most React Native code writes <code>useRef(new Animated.Value(0)).current</code>, and it
+works. It also reads <code>ref.current</code> during render, which React 19's
+<code>react-hooks/refs</code> rule now rejects — a ref is not meant to be part of rendering, and the
+React Compiler is entitled to assume it is not. <code>useState</code> with a lazy initialiser gives
+the same guarantee without lying about what it is.</p>
+
+<h2>Start it in an effect</h2>
+
+<pre class="language-tsx"><code class="language-tsx">  useEffect(() =&gt; {
+    const animation = Animated.timing(enter, {
+      toValue: 1,
+      duration: 180,
+      useNativeDriver: true,
+    });
+    animation.start();
+
+    return () =&gt; animation.stop();
+  }, [enter]);</code></pre>
+
+<p>Not in the render body. Render must be side-effect free — React may render a component twice, and
+StrictMode does exactly that in development, so starting an animation from render starts it twice.</p>
+
+<p>The cleanup matters as much. Stopping the animation on unmount is what stops it writing to a node
+that is no longer there, and on a screen that mounts and unmounts rows quickly that adds up.</p>
+
+<h2>useNativeDriver, and what it costs you</h2>
+
+<p>This is the flag that decides whether an animation is smooth.</p>
+
+<p>With <code>useNativeDriver: true</code>, the whole animation is serialised and handed to the
+platform's own animation system before it starts. It then runs on the UI thread, untouched by
+JavaScript — so it stays at 60fps while your code is busy parsing a menu response or re-rendering a
+list.</p>
+
+<p>Without it, every frame is computed in JavaScript and sent across. If the JavaScript thread is
+busy, the animation stutters, and it will be busy at exactly the moments animations matter: during
+a navigation, while data loads.</p>
+
+<p><strong>The catch: only <code>transform</code> and <code>opacity</code> can be driven
+natively.</strong> Not <code>height</code>, not <code>backgroundColor</code>, not
+<code>width</code>, not layout properties at all — those require a layout pass, which only the
+JavaScript side can trigger.</p>
+
+<p>That constraint shapes how you animate. Collapsing a panel by animating its height is the
+obvious approach and the slow one; scaling or translating it is the fast one. When you find yourself
+wanting to animate a layout property, look for a transform that produces the same impression.</p>
+
+<h2>interpolate</h2>
+
+<p>One driving value can produce several effects, which keeps them in lockstep:</p>
+
+<pre class="language-tsx"><code class="language-tsx">        {
+          opacity: enter,
+          transform: [
+            { translateY: enter.interpolate({ inputRange: [0, 1], outputRange: [-8, 0] }) },
+          ],
+        },</code></pre>
+
+<p><code>opacity</code> takes the 0→1 value directly. <code>translateY</code> maps that same value
+onto -8→0, so the toast slides down as it fades in. One animation, two visible effects, and they
+cannot drift apart because there is only one source.</p>
+
+<p><code>interpolate</code> handles more than two stops, and can map to strings — which is how you
+animate a rotation: <code>outputRange: ['0deg', '360deg']</code>.</p>
+
+<h2>Animated components</h2>
+
+<p>Only <code>Animated.View</code>, <code>Animated.Text</code>, <code>Animated.Image</code> and
+<code>Animated.ScrollView</code> can take animated values. Passing one to a plain
+<code>View</code> does nothing useful. <code>Animated.createAnimatedComponent</code> wraps your own
+component if it needs to participate.</p>
+
+<h2>The other animation APIs</h2>
+
+<p><strong><code>LayoutAnimation</code></strong> animates the <em>next</em> layout change
+automatically — one call before a state update and every affected view eases into its new position.
+It is remarkably little code for adding and removing list rows, and correspondingly hard to control
+precisely.</p>
+
+<p><strong><code>Animated.spring</code></strong> instead of <code>timing</code> gives physical
+motion, which usually feels better for anything the user dragged.</p>
+
+<p><strong>Reanimated</strong> is the serious option, and worth knowing where it fits. It runs your
+animation logic itself on the UI thread — not just the interpolation — so a gesture can drive an
+animation with no JavaScript round trip at all. That is what you need for a draggable sheet or a
+swipe-to-delete row. It costs a native dependency and a mental model built on worklets, so it earns
+its place when gestures drive animation and not before.</p>
+
+<h2>Respecting the user</h2>
+
+<p><code>AccessibilityInfo.isReduceMotionEnabled()</code> reports whether the OS setting is on. The
+web has <code>prefers-reduced-motion</code>; this is the same courtesy, and it is one
+<code>if</code> around the decorative animations.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-navigation">Navigation</a> — a stack of native screens, and
+a router where the folder structure is the graph.</p>

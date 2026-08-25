@@ -1,0 +1,120 @@
+<p>On the web, a crashed page has a reload button. On a phone it is a blank screen the user cannot
+refresh away — they force-quit the app and, often, do not come back. Failure states matter more
+here than they do in a browser.</p>
+
+<h2>Error boundaries, and what they do not catch</h2>
+
+<p>An error boundary catches an error thrown while <em>rendering</em> a subtree and shows a fallback
+instead of unmounting everything.</p>
+
+<p>Expo Router looks for an exported <code>ErrorBoundary</code> in a layout file and wraps that
+layout's screens in it:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function ErrorBoundary({ error, retry }: { error: Error; retry: () =&gt; Promise&lt;void&gt; }) {</code></pre>
+
+<p>Exporting it from the root layout means any screen that throws shows this instead of a red box in
+development or a blank white app in production. It is a plain function rather than a class, because
+the router supplies the caught error and a retry function as props — the
+<code>componentDidCatch</code> machinery lives in the router.</p>
+
+<p>⚠️ <strong>What an error boundary does not catch</strong>, and this is most of the code that
+fails: errors thrown in an <strong>event handler</strong>, in a <strong>timeout</strong>, in an
+<strong>async function</strong>, or during <strong>server rendering</strong>. None of those are part
+of rendering.</p>
+
+<p>So a failed API call inside <code>onPress</code> sails straight past. Boundaries are the last
+resort for "something we did not anticipate", not the error handling strategy — which is why every
+API call in the demo app has its own <code>try</code>/<code>catch</code> and its own error state.</p>
+
+<h2>Give the fallback something useful</h2>
+
+<p>A fallback that says "Something went wrong" and nothing else is only marginally better than the
+blank screen. Show the message, and offer the retry the router already handed you. In production,
+report it — Sentry or Bugsnag both have React Native SDKs and both capture native crashes as well as
+JavaScript ones, which matters because a native crash never reaches a boundary at all.</p>
+
+<h2>Typed errors</h2>
+
+<p>Distinguishing failures is what lets the UI say something true:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export class ApiError extends Error {
+  readonly status: number;
+  readonly body: ApiErrorBody | null;</code></pre>
+
+<p>One type for "the server answered and said no", carrying the status and the parsed body, and
+another for "the request never arrived". They lead to different messages — and on a phone the second
+usually means a lost signal rather than a backend that is down, which is a much more useful thing to
+tell someone.</p>
+
+<pre class="language-tsx"><code class="language-tsx">    Object.setPrototypeOf(this, ApiError.prototype);
+  }</code></pre>
+
+<p>⚠️ That line is not ceremony. Subclassing a built-in like <code>Error</code> breaks
+<code>instanceof</code> when the code is transpiled down to ES5, which Metro still does for some
+targets. Every branch that distinguishes an API failure from a network failure depends on that
+check, so it silently stops working without it.</p>
+
+<h2>One place that decides what the user reads</h2>
+
+<pre class="language-tsx"><code class="language-tsx">export function toUserMessage(error: unknown, fallback = 'Something went wrong.'): string {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof NetworkError) return error.message;
+  if (error instanceof Error) return error.message || fallback;
+  return fallback;
+}</code></pre>
+
+<p>Note the last line. <code>catch</code> gives you <code>unknown</code>, and JavaScript lets you
+throw anything — a string, an object, <code>undefined</code>. Assuming an <code>Error</code> is how
+you get "cannot read property message of undefined" inside your error handler, which is a
+particularly bleak failure.</p>
+
+<p>Centralising this means no screen repeats the <code>instanceof</code> ladder, and the wording
+changes in one place.</p>
+
+<h2>Cancellation is not failure</h2>
+
+<p>Worth restating because it produces such confusing bugs. When a screen unmounts mid-request the
+abort is the <em>correct</em> outcome, not an error. Check the signal before setting an error state,
+or navigating away paints an error on the way out — and the user sees a red message about a screen
+they already left.</p>
+
+<p>The same applies to a dismissed payment sheet, which Stripe reports as an error with code
+<code>Canceled</code>. Lesson 19 covers it.</p>
+
+<h2>Three states, and the one that gets forgotten</h2>
+
+<p>Every data screen owes the user loading, empty and error. The error branch is the one that gets
+skipped, and the result is a spinner that spins forever when the backend is down — which reads as a
+frozen app.</p>
+
+<p>Building them as components rather than reimplementing the pattern per screen is the cheapest way
+to stop forgetting one. The demo app keeps <code>LoadingState</code>, <code>EmptyState</code> and
+<code>ErrorState</code> together in one file precisely because they are one decision, not three.</p>
+
+<p>An empty state is worth as much care as an error. A list that renders as blank space reads as
+broken; a sentence explaining why, and a button that does something about it, reads as working.</p>
+
+<h2>Failures that should not surface at all</h2>
+
+<p>Not every error deserves a message. The demo app's cart save fails silently: the cart still works
+in this session, it just will not survive a relaunch, and a toast on every tap would be worse than
+the failure. Storage reads fail silently for the same reason.</p>
+
+<p>The test is whether the user can do anything about it. If not, log it and carry on.</p>
+
+<h2>Development-only tools</h2>
+
+<p><strong>LogBox</strong> shows warnings and errors in-app. Resist the urge to silence a warning
+you do not understand — the "each child in a list should have a unique key" one in particular is
+telling you about a real recycling bug.</p>
+
+<p>The <strong>red screen</strong> is development only. In production a JavaScript error that is not
+caught takes the app to a blank screen instead, which is exactly why the root boundary matters.</p>
+
+<p>Shake the device — or press <code>d</code> in the terminal — for the dev menu, which is where the
+performance monitor and the element inspector live.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-testing">Testing</a> — what to test, and the current version's
+one sharp edge.</p>

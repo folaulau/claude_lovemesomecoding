@@ -82,6 +82,10 @@ def main() -> int:
     parser.add_argument("--force-dates", action="store_true",
                         help="stamp the manifest date onto posts that already exist. "
                              "Needed once, to reorder the seven rewritten legacy posts.")
+    parser.add_argument("--republish", action="store_true",
+                        help="the track is ALREADY live in this tree, so `new` slugs existing is "
+                             "expected rather than a collision. Only for re-seeding a published "
+                             "track — see the guard below.")
     parser.add_argument("--only", default=None,
                         help="comma-separated slugs to seed, instead of the whole track. "
                              "For previewing a post while the rest are still unwritten — the "
@@ -132,12 +136,22 @@ def main() -> int:
 
         # ⚠️ And the reverse: a NEW slug that already exists is not a new post, it is an
         # accidental overwrite of somebody else's page. Post slugs are global across categories.
+        #
+        # ⚠️ That guard is a PRE-PUBLISH one, and it expires the moment the track ships: once the
+        # eleven new posts are live, they exist in the tree on every subsequent run and the guard
+        # fires on a correct re-seed. --republish is the acknowledgement that they are ours now.
+        # It is not the default, because the day the guard is genuinely right is the day a typo'd
+        # slug would silently eat an unrelated post, and that has to stay loud.
         collisions = [slug for slug in sorted(manifest.NEW_SLUGS)
                       if post_service.get_post(slug)]
-        if collisions:
+        if collisions and not args.republish:
             raise SystemExit(
                 "slugs marked `new` already exist in this tree: " + ", ".join(collisions) +
-                "\nSeeding would overwrite them. Either they are not new, or the slug is wrong.")
+                "\nSeeding would overwrite them. Either they are not new, or the slug is wrong."
+                "\nIf this track is already published and you are re-seeding it, pass "
+                "--republish.")
+        if collisions and args.republish:
+            print(f"--republish: {len(collisions)} `new` slug(s) already live, updating in place")
 
     # Fail early rather than half-seeding: every file must exist and no slug may already belong to
     # a different category.
@@ -210,6 +224,63 @@ def main() -> int:
     if len(archive) != len(manifest.POSTS) and not args.only:
         print(f"\n⚠️  archive holds {len(archive)} but the manifest has "
               f"{len(manifest.POSTS)} — something else is in this category.")
+
+    return verify_indexes(post_service, posts)
+
+
+def verify_indexes(post_service, posts: list[dict]) -> int:
+    """Re-read the indexes from S3 and confirm they agree with the post objects.
+
+    ⚠️ This is not paranoia, it caught a live bug. `_reindex` is a read-modify-write of ONE file
+    holding every published post — 778 of them — repeated once per post in the loop. On the run
+    that re-dated this track, six of the eighteen index entries came back carrying their previous
+    date while the post objects themselves were all correct. Re-running converged it.
+
+    The reason it needs an explicit check is that the drift is invisible to everything downstream.
+    The category index was right, so the category count still agreed, every URL still resolved,
+    and `verify-build.mjs` passed — the only symptom would have been six posts sorted to the wrong
+    place in the site-wide archive and the sitemap, which no automated check looks at.
+
+    So: verify, repair once, verify again, and fail loudly rather than build on a bad index.
+    """
+    wanted = {entry["slug"]: entry["date"] for entry in posts}
+    category = manifest.CATEGORY["slug"]
+
+    def drifted() -> list[tuple[str, str, str, str]]:
+        main = {p["slug"]: p.get("date") for p in post_service.list_posts()}
+        cat = {p["slug"]: p.get("date") for p in post_service.list_posts(category=category)}
+        out = []
+        for slug, date in wanted.items():
+            for name, index in (("index/posts.json", main), (f"by-category/{category}", cat)):
+                if index.get(slug) != date:
+                    out.append((slug, name, index.get(slug) or "ABSENT", date))
+        return out
+
+    bad = drifted()
+    if not bad:
+        print(f"\nindexes verified: all {len(wanted)} posts agree with index/posts.json and "
+              f"index/by-category/{category}.json")
+        return 0
+
+    print(f"\n⚠️  {len(bad)} index entr(ies) disagree with the post objects — repairing:")
+    for slug, name, got, want in bad:
+        print(f"     {slug}  {name}  has {got[:10]}, expected {want[:10]}")
+
+    for slug in sorted({slug for slug, _, _, _ in bad}):
+        record = post_service.get_post(slug)
+        if record:
+            post_service.upsert_post({**record, "contentHtml": record["contentHtml"]},
+                                     author=record.get("updatedBy", "seed"))
+
+    still = drifted()
+    if still:
+        print(f"\n❌ {len(still)} entr(ies) STILL wrong after a repair pass. Do not build on "
+              "this — the site-wide archive and the sitemap would sort these posts wrongly.")
+        for slug, name, got, want in still:
+            print(f"     {slug}  {name}  has {got[:10]}, expected {want[:10]}")
+        return 1
+
+    print("repaired — indexes now agree with the post objects")
     return 0
 
 

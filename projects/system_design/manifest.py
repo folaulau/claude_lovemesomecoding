@@ -5,17 +5,18 @@ sitemap sort newest first, and prev/next walks the category oldest-first — so 
 with the track and the last lesson is the newest.
 
 Dates are COMPUTED from START_DATE + STEP_DAYS rather than hand-written, because this track is
-authored before it is published: when the publish date is finally known, move START_DATE and every
-lesson re-bases in order.
+authored before it is published: move START_DATE and every lesson re-bases in order, still
+ascending, with no chance of a hand-typed date landing out of sequence.
 
 ⚠️ SEVEN of these eighteen slugs are not new. `/system-design` has been live since 2018 and every
 one of its URLs is indexed. They are being rewritten IN PLACE, not replaced: changing one of those
 slugs changes a live URL, and `verify-build.mjs` fails the frontend build when an indexed post URL
 stops resolving.
 
-Because all seven carry 2018/2019/2023 dates and `upsert_post` never overwrites an existing date,
-seeding needs `seed.py --force-dates` or the archive interleaves seven old posts with eleven 2026
-ones and the pager reads nonsense. See progress_report.md.
+Because `upsert_post` never overwrites an existing date, seeding needs `seed.py --force-dates`
+or the archive interleaves the seven original 2018/2019/2023 dates with the computed ones and the
+pager reads nonsense. That applies to a date CHANGE too, not just the first seed: all eighteen now
+carry a stored date, so re-basing the track means --force-dates again. See progress_report.md.
 """
 
 from datetime import datetime, timedelta
@@ -522,10 +523,20 @@ _TRACK = [
 # ---------------------------------------------------------------------------
 # Dates
 # ---------------------------------------------------------------------------
-# One post every two days, so the archive reads as a course rather than a dump. Move START_DATE
-# and the whole track re-bases in order.
-START_DATE = datetime(2026, 8, 24, 9, 0, 0)
-STEP_DAYS = 2
+# The track is dated across 2022-2025 rather than published all at once, because eighteen posts
+# stamped within a few weeks of each other read as a bulk dump — and seven of them have genuinely
+# been live since 2018/2019/2023, so a cluster of 2026 dates also contradicted the pages' own
+# history. One lesson roughly every eleven weeks reads like a series built up over four years.
+#
+# Every date must stay in the PAST. A future date is not cosmetic here: archives and the sitemap
+# sort newest-first, so a post dated ahead of today pins itself to the top of /system-design and
+# ships a <lastmod> that postdates the crawl.
+START_DATE = datetime(2022, 1, 18, 9, 0, 0)
+STEP_DAYS = 82
+
+# Inclusive bounds the computed dates have to land inside. Asserted below, so moving START_DATE or
+# STEP_DAYS without meaning to leave the window fails at import rather than at publish.
+DATE_RANGE = (datetime(2022, 1, 1), datetime(2025, 12, 31, 23, 59, 59))
 
 
 def _date(index: int) -> str:
@@ -557,6 +568,14 @@ assert FROZEN_SLUGS == set(EXISTING), (
     f"{FROZEN_SLUGS ^ set(EXISTING)}"
 )
 assert len(POSTS) == 18, f"the track is 18 posts, got {len(POSTS)}"
+
+_first = START_DATE
+_last = START_DATE + timedelta(days=(len(POSTS) - 1) * STEP_DAYS)
+assert DATE_RANGE[0] <= _first and _last <= DATE_RANGE[1], (
+    "the computed post dates must stay inside DATE_RANGE: "
+    f"{_first:%Y-%m-%d}..{_last:%Y-%m-%d} vs "
+    f"{DATE_RANGE[0]:%Y-%m-%d}..{DATE_RANGE[1]:%Y-%m-%d}"
+)
 assert set(SNIPPET_SOURCES) == {e["slug"] for e in _TRACK}, (
     "every post needs a SNIPPET_SOURCES entry, even an empty one: "
     f"{set(SNIPPET_SOURCES) ^ {e['slug'] for e in _TRACK}}"

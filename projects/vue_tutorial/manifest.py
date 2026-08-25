@@ -70,7 +70,14 @@ SNIPPET_LANGUAGE = "javascript"
 # Lesson 1 is stamped START_DATE and each following lesson is STEP_DAYS later,
 # so the pager reads lesson 1 -> lesson 28. Re-base the whole track by editing
 # these two values; nothing else needs to change.
-START_DATE = datetime(2026, 9, 1, 9, 0, 0)
+#
+# 28 lessons x 3 days = an 81-day span, ending 2025-12-29.
+#
+# ⚠️ POST DATES MUST FALL BETWEEN 2023 AND 2025. The first publish of this track
+# used 2026-09-01, which was both outside that range and — since it was published
+# on 2026-08-24 — dated in the FUTURE. Re-basing needs `seed.py --force-dates`,
+# because `upsert_post` never overwrites the date of a post that already exists.
+START_DATE = datetime(2025, 10, 9, 9, 0, 0)
 STEP_DAYS = 3
 
 

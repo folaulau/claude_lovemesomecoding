@@ -1,0 +1,115 @@
+<p>There is no <code>localStorage</code>. That turns out to be an improvement, because it forces a
+decision the web lets you skip: <em>how</em> secret is this?</p>
+
+<h2>Two stores, two purposes</h2>
+
+<p><strong><code>AsyncStorage</code></strong> is the direct equivalent of <code>localStorage</code>
+— a plain key/value store, unencrypted, readable by anyone with access to the device's filesystem or
+a backup of it. It is for things that are inconvenient to lose and harmless to leak.</p>
+
+<p><strong><code>expo-secure-store</code></strong> writes to the iOS <strong>Keychain</strong> and
+Android's <strong>EncryptedSharedPreferences</strong>, both backed by the OS keystore. Another app
+cannot read it. It is for anything an attacker could use.</p>
+
+<p>The web app this one mirrors keeps its JWT in <code>localStorage</code>, with a comment
+apologising that a single XSS bug leaks it. On a phone there is a better answer, so the token goes
+in the keychain:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export const secureStorage = {
+  async get(key: string): Promise&lt;string | null&gt; {
+    if (isWeb) return AsyncStorage.getItem(key);
+    return SecureStore.getItemAsync(key);
+  },
+
+  async set(key: string, value: string): Promise&lt;void&gt; {
+    if (isWeb) return AsyncStorage.setItem(key, value);
+    return SecureStore.setItemAsync(key, value);
+  },</code></pre>
+
+<p>The web branch exists because <code>expo-secure-store</code> has no web implementation and throws
+if called there — and the app runs on web as a development preview. It degrades to
+<code>AsyncStorage</code>, which on web is <code>localStorage</code>: exactly the web app's
+trade-off, made explicitly rather than by accident.</p>
+
+<h3>Limits worth knowing</h3>
+
+<p>Secure storage has a size limit — around 2 KB on Android. Fine for a token, wrong for anything
+bulky. And on iOS, keychain items can outlive an uninstall unless you say otherwise, which
+occasionally surprises people testing a "fresh install".</p>
+
+<h2>Everything is asynchronous, and that changes the app</h2>
+
+<p><code>localStorage.getItem</code> returns a string. Both of these return a Promise. That single
+difference shapes the whole startup sequence.</p>
+
+<p>On the web, the first render already knows whether anyone is signed in. Here it does not — for a
+few frames the app genuinely cannot tell. Render the signed-out UI during that gap and the app
+flashes "Sign in" and then swaps; worse, a route guard bounces a signed-in user to the login
+screen.</p>
+
+<p>So an auth provider needs a third state — not "signed in" or "signed out" but
+<strong>"still finding out"</strong> — and the splash screen stays up until it resolves. That is
+what <code>SplashScreen.preventAutoHideAsync()</code> is for, and it has to be called at module
+level: by the time a component mounts it is too late to prevent the first frame.</p>
+
+<h2>Name the keys once</h2>
+
+<pre class="language-tsx"><code class="language-tsx">export const tokenStore = {
+  get: () =&gt; secureStorage.get(StorageKey.AUTH_TOKEN),
+  set: (token: string) =&gt; secureStorage.set(StorageKey.AUTH_TOKEN, token),
+  clear: () =&gt; secureStorage.remove(StorageKey.AUTH_TOKEN),
+};</code></pre>
+
+<p>A typo in a storage key fails <em>silently</em> — the read returns null and the app behaves as if
+the user had never signed in. Declaring the keys in one object removes that whole class of bug, and
+it also makes it obvious at a glance what the app leaves on the device.</p>
+
+<p>Wrapping each key in a small named store is worth the four lines. Screens never see a key at all,
+and swapping the implementation later touches one file.</p>
+
+<h2>Storage can fail</h2>
+
+<pre class="language-tsx"><code class="language-tsx">export const deviceStorage = {
+  async get(key: string): Promise&lt;string | null&gt; {
+    try {
+      return await AsyncStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },</code></pre>
+
+<p>On a device this is not theoretical: no space left, a corrupted store, a permissions oddity. A
+cart id that cannot be read should mean "start with an empty cart", not an unhandled rejection that
+takes down a screen. Decide per store whether a failure is fatal — for a token it might be, for a
+convenience value it is not.</p>
+
+<h2>What belongs on the device at all</h2>
+
+<p>Less than you would think. The demo app stores exactly two things: the JWT, and a UUID naming
+which server-side cart belongs to this device.</p>
+
+<p>Note what it does <em>not</em> store — the cart's contents. Those live in the database, which is
+the point: force-quitting the app, or opening it a week later, recovers the same basket, re-priced
+against today's menu. Storing the items locally would mean a cart that quietly honours last month's
+prices.</p>
+
+<p>That is a useful general test. If the data is authoritative, it belongs on the server and the
+device holds a pointer. If it is a preference, the device is fine.</p>
+
+<h2>The other options</h2>
+
+<p><strong>MMKV</strong> is a synchronous, much faster key/value store. Synchronous is the
+interesting part — it removes the "still finding out" state entirely. It is a native module, so it
+needs a development build.</p>
+
+<p><strong>SQLite</strong> (<code>expo-sqlite</code>) when you have real relational data or want
+offline-first with queries. <strong>WatermelonDB</strong> or <strong>Realm</strong> when you need
+sync as well.</p>
+
+<p><strong><code>expo-file-system</code></strong> for actual files — images, downloads, caches.
+Do not base64 a photo into <code>AsyncStorage</code>; it will be slow and it will hit limits.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-platform-apis">Platform APIs and Device Differences</a> —
+including the one that can end your process without asking.</p>

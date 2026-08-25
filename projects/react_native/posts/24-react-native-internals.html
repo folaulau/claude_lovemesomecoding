@@ -1,0 +1,109 @@
+<p>You can ship a React Native app without knowing any of this. You cannot debug a strange
+performance problem without it, and the vocabulary turns up in every release note and every
+interview.</p>
+
+<h2>The shape of it</h2>
+
+<p>Three things are running.</p>
+
+<p><strong>A JavaScript engine</strong> executes your code — your components, your state, your
+effects. It is <strong>Hermes</strong>, built by Meta for this job.</p>
+
+<p><strong>The native side</strong> owns the actual UI. Real <code>UIView</code>s on iOS, real
+<code>View</code>s on Android, laid out and drawn by the platform.</p>
+
+<p><strong>A layout engine</strong>, <strong>Yoga</strong>, computes flexbox. It is written in C++
+and shared by both platforms, which is why your layout behaves identically on each — and why the
+flexbox defaults differ from the web's: Yoga is not a browser and made its own choices.</p>
+
+<p>React reconciles as it always does. What changes is the renderer: instead of producing DOM
+mutations it produces instructions for native views.</p>
+
+<h2>The old bridge, and why it was replaced</h2>
+
+<p>Originally the two sides communicated over an asynchronous <strong>bridge</strong>. Every call was
+serialised to JSON, queued, and delivered in a batch. JavaScript could not call a native function
+and get an answer — it sent a message and something happened later.</p>
+
+<p>That design was the source of the era's characteristic problems. Serialising everything is
+expensive at volume, which is why a scroll handler driven from JavaScript stuttered. Nothing was
+synchronous, so measuring a view meant a round trip. And startup was slow because every native
+module was initialised whether you used it or not.</p>
+
+<h2>JSI</h2>
+
+<p>The <strong>JavaScript Interface</strong> replaced it, and it is the foundation of everything
+else. JSI is a lightweight C++ layer that lets JavaScript hold a reference to a C++ object and call
+its methods <em>directly</em> — synchronously, with no serialisation.</p>
+
+<p>Two consequences worth understanding. Calls can be synchronous when they need to be. And the
+engine is now swappable: because the interface is C++ rather than baked into one runtime, Hermes
+replaced JavaScriptCore without rewriting the world.</p>
+
+<h2>The New Architecture</h2>
+
+<p>Three pieces on top of JSI, all enabled by default now.</p>
+
+<p><strong>Fabric</strong> is the new renderer. It keeps an immutable C++ tree of your UI shared by
+both sides, so layout can be computed on any thread and a view's dimensions can be read
+synchronously. In practice: fewer frames where a view is briefly the wrong size, and no round trip to
+measure something.</p>
+
+<p><strong>TurboModules</strong> are lazily initialised native modules. Under the old system every
+module loaded at startup; now a module loads the first time you touch it, which is most of the
+startup win.</p>
+
+<p><strong>Codegen</strong> generates the C++ glue between your TypeScript types and the native
+interfaces at build time, so a mismatch is a compile error instead of an undefined at runtime.</p>
+
+<p>What this means for ordinary code is: almost nothing. You write the same components. It matters
+when you write a native module, when you read a library's changelog, and when you wonder why an
+app feels faster than it used to.</p>
+
+<h2>Hermes</h2>
+
+<p>Hermes is optimised for the thing a mobile app actually does — start quickly on a device with a
+cold cache — rather than for peak throughput on a long-running benchmark.</p>
+
+<p>The main trick is <strong>ahead-of-time bytecode</strong>. Your JavaScript is compiled to Hermes
+bytecode during the build, so the app starts by loading bytecode rather than parsing source. On a
+large bundle that is a large fraction of startup time.</p>
+
+<p>It also uses less memory and produces a smaller download than shipping JavaScriptCore.</p>
+
+<p>The practical consequences show up in ordinary code. Hermes ships a full ICU-backed
+<code>Intl</code>, so date and currency formatting work as they do in a browser — but that was not
+always true, which is why careful code still guards it. Some very new language features arrive later
+than in V8. And there is no Web Crypto: <code>crypto.randomUUID()</code> is simply undefined, which
+is why the demo app uses <code>expo-crypto</code> rather than reaching for
+<code>Math.random()</code>.</p>
+
+<h2>Two threads, and where your code is</h2>
+
+<p>This is the practical model to keep in your head.</p>
+
+<p>The <strong>JavaScript thread</strong> runs your components, effects and handlers. The <strong>UI
+thread</strong> lays out and draws. If the JavaScript thread is busy, the app is not necessarily
+janky — a scroll driven natively stays smooth — but anything waiting on your code is stalled.</p>
+
+<p>That single fact explains several rules from earlier lessons. <code>useNativeDriver: true</code>
+hands an animation to the UI thread so a busy JavaScript thread cannot stutter it. Reanimated goes
+further and runs your animation <em>logic</em> there. And the dev menu's performance monitor shows
+both frame rates separately for exactly this reason: which one is dropping tells you where to
+look.</p>
+
+<h2>How your code gets to the device</h2>
+
+<p><strong>Metro</strong> is the bundler. It resolves modules — including the
+<code>.ios.tsx</code>/<code>.android.tsx</code>/<code>.web.tsx</code> platform extensions — transforms
+them with Babel, and produces one bundle per platform. In development it serves that bundle over
+HTTP, which is what makes fast refresh work and why a physical device needs to reach your machine
+over the network.</p>
+
+<p>In a release build the bundle is compiled to bytecode and embedded in the binary. That is why a
+production build behaves differently enough that profiling a debug build tells you very little.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-build-deploy">Building and Releasing to the App Stores</a> —
+the last mile, and the part web developers underestimate.</p>

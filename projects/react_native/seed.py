@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""Write the Vue category and its posts into a content tree.
+"""Write the React Native category and its posts into a content tree.
 
 Runs the backend's own service layer rather than touching S3 directly, so the
 post objects, the post index, the category archive, the category counts and the
 search index are all maintained by the same code the admin API uses. Anything
-else would risk the derived indexes drifting from the posts, and the static
-build reads only the indexes.
+else would risk the derived indexes drifting from the posts, and the static build
+reads only the indexes.
 
     # dry run against the local tree (default)
-    python projects/vue_tutorial/seed.py
+    python projects/react_native/seed.py
 
-    python projects/vue_tutorial/seed.py --env local --write
-    python projects/vue_tutorial/seed.py --env prod  --write
+    python projects/react_native/seed.py --env local --write
+    python projects/react_native/seed.py --env prod  --write
 
 Idempotent: re-running updates the posts in place. `date` is only applied when a
 post is new, so a re-run never reshuffles the archive.
 
-Every slug in this track is NEW -- /vue does not exist on the live site -- so the
-first publish needs no `--force-dates`: `upsert_post` applies the manifest date
-when it creates a post, and only refuses to overwrite one that already exists.
-The flag is kept for the day the track is deliberately reordered AFTER it has
-been published, which is the only time it is the right answer.
+⚠️ This track does NOT reuse the five 2018 slugs. `rea-native-introduction` and
+friends had an indexed URL, an empty body and a typo in the slug; the replacement
+lessons are new slugs under a new category, and the old ones are removed by
+`retire_old.py` once these are live. Seeding here does not touch them — running
+this on prod leaves both sets present until you retire the originals, which is
+the safe order.
 """
 
 import argparse
@@ -66,8 +67,8 @@ def read_post_html(entry: dict) -> str:
     if not path.exists():
         raise SystemExit(
             f"missing content file: {path}\n"
-            "Post bodies quote reelcms-vue-frontend. Use --only to seed a subset while "
-            "the rest of the track is still being written — see progress_report.md."
+            "Post bodies are written from pizza-react-native-mobile. Use --only to seed a "
+            "subset while the rest of the track is unwritten — see progress_report.md."
         )
     return path.read_text(encoding="utf-8")
 
@@ -79,8 +80,7 @@ def main() -> int:
                         help="actually write. Without it, only report what would happen.")
     parser.add_argument("--force-dates", action="store_true",
                         help="stamp the manifest date onto posts that already exist. "
-                             "NOT needed for the first publish -- every slug here is new. "
-                             "Only for deliberately reordering an already-published track.")
+                             "Needed after re-basing START_DATE.")
     parser.add_argument("--only", default=None,
                         help="comma-separated slugs to seed, instead of the whole track. "
                              "For previewing a post while the rest are still unwritten — the "
@@ -139,7 +139,6 @@ def main() -> int:
         if args.force_dates:
             # upsert_post keeps `existing["date"]`, so the only way to move a
             # published post's date is to change it on the stored object first.
-            # The upsert below then re-sorts every index that mentions it.
             existing = post_service.get_post(entry["slug"])
             if existing and existing.get("date") != entry["date"]:
                 existing["date"] = entry["date"]
@@ -158,44 +157,9 @@ def main() -> int:
             },
             author=args.author,
         )
-        print(f"  {record['url']:52} {record['date']}  "
+        print(f"  {record['url']:56} {record['date']}  "
               f"{record['wordCount']:>5} words  {record['readingMinutes']} min  "
               f"{len(record['toc'])} headings")
-
-    # VERIFY THE DERIVED INDEXES ACTUALLY CONTAIN WHAT WE JUST WROTE.
-    #
-    # `upsert_post` -> `_reindex` rewrites the whole index per post: read it,
-    # drop this slug, append, sort, write. A seed of 28 posts does that 28 times
-    # in a row. On the first prod run of this track TWO posts (vue-watchers and
-    # vue-list-rendering) ended up with a correct post object and NO entry in
-    # index/posts.json, index/categories.json or index/by-category/vue.json.
-    #
-    # That failure is invisible everywhere else. The static build reads only the
-    # indexes, so the posts simply do not exist -- no 404, no error, just two
-    # lessons silently missing from a 28-lesson track. And `verify-build.mjs`
-    # cross-checks the indexes against EACH OTHER, which all agreed, because all
-    # three were missing the same two posts.
-    #
-    # Re-running the seed repairs it. So the only thing needed is to notice.
-    missing = []
-    index_slugs = {p["slug"] for p in post_service.list_posts()}
-    category_slugs = {p["slug"] for p in post_service.list_posts(category=manifest.CATEGORY["slug"])}
-    for entry in posts:
-        if entry["slug"] not in index_slugs:
-            missing.append(f"{entry['slug']} is not in index/posts.json")
-        elif entry["slug"] not in category_slugs:
-            missing.append(f"{entry['slug']} is not in index/by-category/"
-                           f"{manifest.CATEGORY['slug']}.json")
-
-    if missing:
-        print("\nDERIVED INDEX IS INCOMPLETE — the post objects were written but the "
-              "indexes do not list them:")
-        for m in missing:
-            print(f"  x {m}")
-        print("\nThe static build reads ONLY the indexes, so these posts would be "
-              "silently absent from the site.\nRe-run this exact command — the seed is "
-              "idempotent and rewriting the indexes fixes it.")
-        return 1
 
     # Report the state the static build will actually see.
     archive = post_service.list_posts(category=manifest.CATEGORY["slug"])
@@ -205,6 +169,11 @@ def main() -> int:
           f"newest first: {archive[0]['slug']}")
     print(f"category count recorded: {counts.get(manifest.CATEGORY['slug'])}")
     print(f"published posts in this tree now: {total} (was {index_before})")
+
+    stale = counts.get(manifest.OLD_CATEGORY_SLUG)
+    if stale:
+        print(f"\n⚠️  /{manifest.OLD_CATEGORY_SLUG} still holds {stale} post(s). "
+              f"Run retire_old.py to remove them once these are reviewed.")
     return 0
 
 

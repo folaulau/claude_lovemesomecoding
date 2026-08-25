@@ -1,0 +1,143 @@
+<p>Payments are the best worked example of a native module, and the one where getting the
+architecture wrong has consequences beyond a bug. This lesson is Stripe on React Native, and the
+rules that apply whatever provider you use.</p>
+
+<h2>Use the provider's sheet</h2>
+
+<p>Stripe's <strong>PaymentSheet</strong> is a native view rendered by Stripe's own SDK. You hand it
+a client secret and it collects the card, handles 3D Secure, and comes back with a result.</p>
+
+<p>The tempting alternative is <code>CardField</code> — Stripe's input component — with your own
+layout around it. Resist it. The sheet handles saved cards, Apple Pay and Google Pay, bank
+redirects and every regional authentication flow, and none of that is work you want. More
+importantly, the card number never touches your JavaScript, which is what keeps your app out of PCI
+scope.</p>
+
+<p>The equivalent on the web is <code>PaymentElement</code>, for the same reasons.</p>
+
+<h2>Two steps, and why they cannot be one</h2>
+
+<p><strong>Step one:</strong> the app POSTs the order — identifiers and quantities, no prices. The
+server prices the cart from its own database, saves the order as <code>PENDING_PAYMENT</code>, opens
+a Stripe PaymentIntent and returns its client secret.</p>
+
+<p><strong>Step two:</strong> the app hands that secret to the sheet.</p>
+
+<p>The order has to exist before the sheet can open, because the PaymentIntent is what the sheet
+confirms. That ordering is why checkout is two steps rather than one submit — and it is also why the
+customer sees the server's total before they pay, not the app's estimate.</p>
+
+<h2>Opening the sheet</h2>
+
+<pre class="language-tsx"><code class="language-tsx">      const { error: initError } = await initPaymentSheet({
+        merchantDisplayName: 'StayHub Pizza',
+        paymentIntentClientSecret: request.clientSecret,
+        returnURL: 'pizzaapp://stripe-redirect',
+        defaultBillingDetails: {
+          name: request.customerName,
+          email: request.customerEmail,
+        },
+        allowsDelayedPaymentMethods: false,
+      });
+
+      if (initError) {
+        return { status: 'failed', message: initError.message };
+      }</code></pre>
+
+<p>Initialise, then present. Splitting them lets you fail fast: there is no point opening a sheet
+that cannot work.</p>
+
+<p><code>returnURL</code> is the deep link from lesson 12, and it matters here. When a card needs 3D
+Secure the customer leaves for their bank; this is what brings them back. Get it wrong and the app
+is simply never reopened, leaving a paid order the customer never sees confirmed.</p>
+
+<h2>Cancelled is not failed</h2>
+
+<pre class="language-tsx"><code class="language-tsx">      const { error: presentError } = await presentPaymentSheet();
+
+      if (presentError) {
+        if (presentError.code === 'Canceled') return { status: 'cancelled' };
+        return { status: 'failed', message: presentError.message };
+      }
+
+      return { status: 'succeeded' };
+    },</code></pre>
+
+<p>⚠️ <strong>A dismissed sheet reports as an error</strong>, with code <code>'Canceled'</code>.
+Treat that as a failure and you show "your payment failed" to somebody who simply changed their
+mind — and they will believe you.</p>
+
+<p>This is why the gateway returns a three-way outcome rather than a boolean or a thrown error. The
+distinction between "it did not work" and "they decided not to" has to survive as far as the UI.</p>
+
+<h2>What the screen does with it</h2>
+
+<pre class="language-tsx"><code class="language-tsx">    if (outcome.status === 'cancelled') {
+      return;
+    }
+    if (outcome.status === 'failed') {
+      setError(outcome.message);
+      return;
+    }</code></pre>
+
+<p>Cancelled does nothing at all — no message, no state change. The order is still reserved and
+they can try again, which is exactly what a customer who backed out expects.</p>
+
+<pre class="language-tsx"><code class="language-tsx">    clear();
+    showToast('Payment accepted');
+    router.replace(`/order/${created.order.id}`);
+  }</code></pre>
+
+<p><code>replace</code>, not <code>push</code> — the back gesture must not return to a checkout for
+an order that has already been paid.</p>
+
+<h2>The rule that outranks everything else</h2>
+
+<p><strong>The device is never the authority on whether a payment succeeded.</strong></p>
+
+<p>"Stripe accepted the card" is a fact about the customer's phone. Your order is still
+<code>PENDING_PAYMENT</code> until your <em>backend</em> knows, and the backend learns it from
+Stripe's webhook — a signed server-to-server call — not from your app saying so. Anyone can call
+your API and claim anything; only the webhook signature proves it.</p>
+
+<p>So the confirmation screen does not mark the order paid. It asks the server what the server
+believes, and keeps asking until it settles:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  paymentStatus: (orderId: UUID, signal?: AbortSignal) =&gt;
+    apiClient.get&lt;Order&gt;(`/api/orders/${orderId}/payment-status`, { signal }),</code></pre>
+
+<p>Polling exists because a webhook does not reach a laptop unless <code>stripe listen</code> is
+running, and even in production it can arrive seconds after the customer does. The endpoint asks
+Stripe directly, so the screen is correct either way. Ten attempts, two seconds apart, then a
+message telling them to check their email — a poll without a limit is a battery bug.</p>
+
+<h2>Prices come from the server</h2>
+
+<p>The order request carries product ids, sizes, crust ids, topping ids and quantities. No money at
+all. A patched app sending <code>total: 0.01</code> changes nothing, because the server never reads
+it.</p>
+
+<p>The app's arithmetic exists so the customer sees a number before they commit, and the moment the
+order exists the screen switches to the server's figures. The demo app has an end-to-end test
+asserting the request body contains no price field — worth writing, because this is the kind of rule
+that erodes quietly.</p>
+
+<h2>Keys</h2>
+
+<p>The <strong>publishable</strong> key goes in the app. It is public by design: it identifies the
+account and can only create intents, never charge one. The <strong>secret</strong> key lives on the
+server and nowhere else. If a key starting <code>sk_</code> ever appears in a mobile bundle, treat
+it as compromised and roll it — a bundle is downloadable and inspectable.</p>
+
+<h2>Saving a card</h2>
+
+<p>Same sheet, a SetupIntent instead of a PaymentIntent — it collects a card without charging it.
+The sheet does not hand back the payment method, so the SetupIntent is read afterwards to find it,
+and only the opaque <code>pm_…</code> token is sent to your server. Never the number, never the CVC,
+never the cardholder name. Brand, last four and expiry are display metadata and are all you should
+store.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-accessibility">Accessibility</a> — because a
+<code>View</code> announces nothing.</p>

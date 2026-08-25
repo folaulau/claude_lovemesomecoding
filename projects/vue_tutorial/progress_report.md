@@ -1,6 +1,6 @@
 # Vue tutorial track — progress report
 
-**Status:** FOUNDATION DONE — tooling, topic table and pipeline verified. 2 of 28 posts written.
+**Status:** ✅ **PUBLISHED.** All 28 posts live at https://lovemesomecoding.com/vue.
 **Started:** 2026-08-24
 **Where it lands:** https://lovemesomecoding.com/vue
 
@@ -25,8 +25,10 @@ from `lovemesomecoding_demo_project/reelcms/reelcms-vue-frontend`.
 | `seed.py` / `check_content.py` / `check_snippets.py` / `gen_index.py` | ✅ all four run clean |
 | Content pipeline | ✅ `vue` language support added **and verified end to end** (see below) |
 | Site nav | ✅ `vue` added to the JavaScript group in `nav.ts` |
-| Demo app | ✅ exists and runs — but has real gaps, see *Gaps* below |
-| Post bodies | 🚧 **2 of 28** (`vue-get-started`, `vue-sfc`), seeded to the local tree |
+| Demo app | ✅ two gaps closed (composables, Teleport), tests pass |
+| Post bodies | ✅ **28 of 28**, 233 code blocks, 82 verified verbatim against the app |
+| Internal links | ✅ 72 checked, all resolve |
+| Prod | ✅ seeded, frontend deployed, all 28 URLs return 200 and are in the sitemap |
 
 ## The demo app
 
@@ -133,7 +135,7 @@ the small points generically, and never pretend an invented snippet came from th
 | API style | **Composition API only**, `<script setup>` | What vuejs.org leads with. One lesson (18) covers the Options API so legacy code is readable, then never uses it again — mirroring how the React track chose hooks over class components. |
 | Snippet language | JavaScript + `.vue` SFCs | Read off the app. See the warning above. |
 | Code block language | `vue` | Not `markup`. The class stays honestly `language-vue`; the frontend maps it to the markup grammar. |
-| Dates | **Computed** from `START_DATE` + `STEP_DAYS` | The track is authored well before it publishes, so re-basing is a one-line edit. Same as Angular. |
+| Dates | **Computed** from `START_DATE` + `STEP_DAYS`, **2025-10-09 .. 2025-12-29** | Post dates must fall between 2023 and 2025. Computing them made the re-base a one-line edit when the first publish got this wrong. |
 | Lesson index | **Generated** by `gen_index.py` | A hand-written index of 28 links drifts the first time a lesson moves. `check_content.py` fails if it is stale. |
 | Custom directives | Folded into lesson 15 | vuejs.org groups Composables, Custom Directives and Plugins under one "Reusability" heading. Vue developers write directives far less often than Angular developers do. |
 | Seeding | Backend service layer, as React and Angular do | The static build reads only the derived indexes; reusing the admin API's own code is the only way to be sure indexes and posts agree. |
@@ -249,3 +251,115 @@ AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/vue_tutoria
   retyping it — which is what makes `check_snippets.py` meaningful.
 - **`reelcms-vue-frontend` uses Pinia 4 and Vite 8**, both ahead of what most tutorials show. Read
   versions off `package.json`, never from memory.
+
+
+---
+
+## Publish log — 2026-08-24
+
+| Step | Result |
+|---|---|
+| `check_content.py` | 28/28 written, 233 code blocks, every one round-trips byte-for-byte, 72 internal links resolve |
+| `check_snippets.py` | 82 blocks verbatim from the demo app, 131 illustrative, no drift |
+| Backend tests | 90 passed |
+| Backend deploy | `lovemesomecoding-admin-api-prod` updated — `vue` now in the Lambda's `SUPPORTED_LANGUAGES` |
+| Prod seed | 28 created, category count 28 |
+| Frontend deploy | build 394b0bd, `verify-build` 778/778 posts and 43/43 categories, CloudFront invalidated |
+| Live check | 28/28 URLs 200, 28 sitemap entries, `vue-sfc` renders 5 `language-vue` blocks with 306 Prism tokens |
+
+### ⚠️ The backend deploy needs three env vars that nothing documents
+
+`scripts/deploy.sh` passes `DomainName`, `CertificateArn` and `HostedZoneId` **explicitly on every
+deploy**, reading them from `API_DOMAIN`, `API_CERT_ARN` and `HOSTED_ZONE_ID`. With none of them set
+it passes `DomainName=` and `sam deploy` refuses the empty value — which is lucky, because that is
+the one thing standing between a bare `./scripts/deploy.sh` and CloudFormation tearing down
+`api.lovemesomecoding.com`. The script's own guard only covers the case where `API_DOMAIN` is set and
+the cert is not.
+
+The values are on the live stack, and this is the command that works:
+
+```bash
+AWS_PROFILE=folau \
+API_DOMAIN="api.lovemesomecoding.com" \
+API_CERT_ARN="arn:aws:acm:us-west-2:329580012644:certificate/4a17f02e-5d4e-42b1-86fd-31e7068cb347" \
+HOSTED_ZONE_ID="Z000531818AC6P1IJ8LJL" \
+./scripts/deploy.sh
+```
+
+Verified afterwards: `api.lovemesomecoding.com/health` → 200, and the parameters the script does
+*not* pass (`MediaCdn`, `GithubRepo`, `StorageBucket`, `DbBucket`) kept their values, as
+CloudFormation's omitted-parameter behaviour promises. **Worth fixing in `deploy.sh`** — it should
+read the current values off the stack rather than requiring three undocumented variables.
+
+### ⚠️ NEW GOTCHA: the first prod seed silently left two posts out of the indexes
+
+On the first `seed.py --env prod --write`, `vue-watchers` and `vue-list-rendering` were written as
+correct post objects but were **absent from `index/posts.json`, `index/categories.json` and
+`index/by-category/vue.json`**. The archive said 28; the category count said 26.
+
+This is the most dangerous shape of bug this content pipeline has, because nothing catches it:
+
+- **The static build reads only the indexes**, so the two lessons would simply not exist on the
+  site. No 404, no error — a 28-lesson track quietly serving 26.
+- **`verify-build.mjs` would have passed.** Its index cross-check compares the derived indexes
+  against *each other*, and all three agreed, because all three were missing the same two posts.
+  Nothing anywhere compares the indexes against the actual post objects in `posts/`.
+
+`upsert_post` → `_reindex` rewrites the entire index per post — read, drop the slug, append, sort,
+write — and a seed of 28 posts does that 28 times in a row. Re-running the seed repaired it
+completely, so the write path recovers; the problem was purely that nothing noticed.
+
+**`seed.py` now checks.** After writing, it asserts every seeded slug is present in both
+`index/posts.json` and the category index, prints exactly what is missing, and exits non-zero telling
+you to re-run. The check was verified by reproducing the drift against the local tree: it reported
+precisely `vue-watchers` and `vue-list-rendering`.
+
+Final prod state audited object-by-object: **778 post objects, 778 index entries, vue count 28,
+`by-category/vue.json` 28 entries.** The 750 pre-existing posts were consistent throughout, and
+nothing in the index lacked an object.
+
+
+---
+
+## Date correction — 2026-08-24
+
+**Post dates must be between 2023 and 2025.** The first publish used `START_DATE = 2026-09-01`,
+putting the track at 2026-09-01 .. 2026-11-21 — outside that range, and (since it shipped on
+2026-08-24) **dated in the future**. A future-dated post sorts to the top of every archive and the
+sitemap while claiming a publish day that has not happened.
+
+Fixed by re-basing `START_DATE` to **2025-10-09**, which puts the 81-day span at
+**2025-10-09 .. 2025-12-29**. That is exactly the one-line edit the computed-dates design exists for.
+
+Republishing needed **`--force-dates`**: `upsert_post` never overwrites the date of a post that
+already exists, so without it all 28 would have kept their 2026 timestamps. This is the case the flag
+was kept for.
+
+```bash
+AWS_PROFILE=folau .../seed.py --env local --write --force-dates
+AWS_PROFILE=folau .../seed.py --env prod  --write --force-dates
+cd lovemesomecoding_frontend && AWS_PROFILE=folau npm run deploy
+```
+
+`check_content.py` now **enforces the range**: every post's date must fall within 2023-01-01 ..
+2025-12-31 and must not be in the future. Verified by re-basing to 2026 and confirming it produced 56
+failures (28 out of range + 28 future-dated), then restoring.
+
+Live afterwards: lesson 1 renders "October 9, 2025", lesson 28 "December 29, 2025", 28/28 URLs 200,
+28 sitemap entries, and no 2026 date anywhere in the track.
+
+### ⚠️ Other tracks are still dated 2026
+
+This rule was applied to `/vue` only, because that is what was being published. **`/react`
+(2026-06-03 .. 2026-08-20) and `/angular` (2026-05-28 .. 2026-08-17) both violate it**, and 340 posts
+across the whole site carry a 2026 date. Both tracks compute or hard-code their dates the same way,
+so re-basing either is the same one-line edit plus a `--force-dates` seed — but it reshuffles the
+archive, so it is a decision rather than a cleanup. Not done.
+
+### Note on the concurrent publish
+
+Prod grew from 778 to 782 posts during this work — four posts published from elsewhere while the
+re-seed was running. Nothing was clobbered: the seed only touches its own 28 slugs, and the synced
+content (782) matches prod (782) exactly. One deploy also hit four transient
+`Need to rewind the stream` upload failures; re-running the deploy fixed them, and all four URLs
+return 200.

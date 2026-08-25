@@ -27,6 +27,7 @@ plain pass/fail.
     python projects/vue_tutorial/check_content.py
 """
 
+import datetime
 import html
 import os
 import re
@@ -143,6 +144,27 @@ if len(set(slugs)) != len(slugs):
 dates = [e["date"] for e in manifest.POSTS]
 if dates != sorted(dates):
     failures.append("manifest dates do not ascend — the prev/next pager would read out of order")
+
+# Post dates must fall between 2023 and 2025, and must never be in the future.
+#
+# The first publish of this track was stamped 2026-09-01..2026-11-21: outside the
+# range AND dated after the day it shipped. A future-dated post sorts to the top
+# of every archive and the sitemap while claiming to have been written on a day
+# that has not happened. Nothing else in the pipeline checks this.
+#
+# Re-basing is one edit to START_DATE in manifest.py — but a post that already
+# exists keeps its stored date, so republishing after a re-base needs
+# `seed.py --force-dates`.
+DATE_MIN, DATE_MAX = "2023-01-01", "2025-12-31"
+_today = datetime.date.today().isoformat()
+for entry in manifest.POSTS:
+    day = entry["date"][:10]
+    if not (DATE_MIN <= day <= DATE_MAX):
+        failures.append(
+            f"{entry['slug']}: date {day} is outside {DATE_MIN}..{DATE_MAX}. "
+            "Re-base START_DATE in manifest.py, then seed with --force-dates.")
+    if day > _today:
+        failures.append(f"{entry['slug']}: date {day} is in the future (today is {_today})")
 
 for frozen in manifest.FROZEN_SLUGS:
     if frozen not in slugs:

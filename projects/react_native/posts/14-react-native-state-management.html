@@ -1,0 +1,126 @@
+<p>State in React Native is the React you already know. What changes is the environment it runs in:
+a phone can suspend your process at any moment, and a screen can be dropped from memory and rebuilt.
+Those two facts decide where state lives.</p>
+
+<h2>Four places, in order of preference</h2>
+
+<p><strong><code>useState</code> in the component</strong> for anything only that component cares
+about — which modal is open, what is typed into a field, whether an input is focused. Most state is
+this, and moving it upward is the most common way to make an app slower and harder to read.</p>
+
+<p><strong>A custom hook</strong> when one screen owns some state and the fetching around it. The
+demo app's profile screen loads addresses and saved cards through <code>useProfileData</code> rather
+than a provider — nothing else needs them, so putting them in context would keep them in memory for
+the whole session and re-render unrelated screens when they change.</p>
+
+<p><strong>Context</strong> for what genuinely spans the tree: who is signed in, what is in the cart,
+the menu, toasts.</p>
+
+<p><strong>A store</strong> — Redux, Zustand, Jotai — when context stops being enough. The demo app
+does not use one, and that is a real decision rather than an omission: its web sibling uses Redux
+for the admin section, and the mobile app has no admin section.</p>
+
+<h2>useReducer for rules</h2>
+
+<p>Reach for a reducer when updates depend on previous state and form a small closed set of
+operations. A cart is the canonical example:</p>
+
+<pre class="language-tsx"><code class="language-tsx">    case 'ADD_ITEM': {
+      const existing = state.items.find((item) =&gt; isSameConfiguration(item, action.payload));
+
+      if (existing) {
+        return {
+          ...state,
+          items: state.items.map((item) =&gt;
+            item.lineId === existing.lineId
+              ? { ...item, quantity: item.quantity + action.payload.quantity }
+              : item,
+          ),
+        };
+      }
+
+      return { ...state, items: [...state.items, action.payload] };
+    }</code></pre>
+
+<p>Adding a pizza that is already in the cart bumps a quantity; adding a differently-topped one adds
+a line. That rule lives in one testable function instead of being spread across event handlers.</p>
+
+<p>Note that every branch builds a <strong>new</strong> array with <code>map</code> or a spread.
+React compares by reference to decide whether to re-render, so mutating in place updates the data
+without updating the screen — the classic silent bug. There is no Immer here; the reducer is plain
+and the immutability is yours to keep.</p>
+
+<h3>Type the actions as a union</h3>
+
+<p>A discriminated union makes the reducer's <code>switch</code> exhaustively checked: TypeScript
+narrows <code>action.payload</code> from <code>action.type</code>, so adding a case and forgetting to
+handle it fails the build rather than being silently ignored.</p>
+
+<h3>Keep the reducer out of the provider</h3>
+
+<p>The reducer file imports nothing from React. That is what lets it be unit-tested in
+milliseconds — the demo app has eighteen tests over it, covering merge rules, removal, and the
+promise that it never mutates its input. The provider next door owns the effects; the reducer owns
+the rules.</p>
+
+<h2>Context, and the cost of it</h2>
+
+<p>A context value that changes re-renders every consumer. Two habits keep that bearable.</p>
+
+<p><strong>Split contexts by how often they change.</strong> Auth changes twice a session; the cart
+changes constantly. One combined context would re-render everything that only cares about the
+signed-in user every time somebody taps "+".</p>
+
+<p><strong>Memoise the value.</strong> An object literal in the provider's render is a new object
+every time, so every consumer re-renders on every render of the provider — even when nothing
+changed. Wrap it in <code>useMemo</code>, and wrap the functions you hand out in
+<code>useCallback</code>, or the memo achieves nothing because its dependencies are new each time.</p>
+
+<h2>The ordering problem</h2>
+
+<p>This one has no web equivalent in the docs and bites the first time you rehydrate anything:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  return (
+    &lt;SafeAreaProvider&gt;
+      &lt;StripeProvider&gt;
+        &lt;AuthProvider&gt;
+          &lt;MenuProvider&gt;
+            &lt;CartProvider&gt;
+              &lt;ToastProvider&gt;{children}&lt;/ToastProvider&gt;
+            &lt;/CartProvider&gt;
+          &lt;/MenuProvider&gt;
+        &lt;/AuthProvider&gt;
+      &lt;/StripeProvider&gt;
+    &lt;/SafeAreaProvider&gt;
+  );</code></pre>
+
+<p>⚠️ <strong>That nesting order is load-bearing.</strong> <code>MenuProvider</code> must sit above
+<code>CartProvider</code>, because restoring a saved cart calls <code>useMenu()</code> — a stored
+cart line holds only identifiers, so the prices come from the catalogue. Swap the two and the app
+crashes with "useMenu must be used inside a MenuProvider", but only on a launch where a saved cart
+exists. That is a bug that passes every test on a fresh install.</p>
+
+<p>Composing the providers in one named component instead of nesting five of them in the root layout
+is what gives the constraint somewhere to be written down next to the code that depends on it.</p>
+
+<h2>A guard worth writing every time</h2>
+
+<p>Every consumer hook in the demo app checks for <code>undefined</code> and throws a sentence
+naming the missing provider. Without it, a component rendered outside its provider gets
+<code>undefined</code> and fails somewhere else entirely, with a message about a property of
+undefined.</p>
+
+<p>React 19's <code>use()</code> replaces <code>useContext()</code> and reads the same value; unlike
+<code>useContext</code> it may be called conditionally. Not needed here, but it is the API going
+forward.</p>
+
+<h2>State that must survive the app dying</h2>
+
+<p>The mobile-specific part, and the reason the cart is not simply a context. The OS can suspend or
+kill your process without warning, so in-memory state is not durable. Anything the user would be
+upset to lose belongs on the device or on the server — lessons 15 and 16.</p>
+
+<h2>What is next</h2>
+
+<p><a href="/react-native/react-native-data-fetching">Talking to an API</a> — starting with the fact
+that <code>localhost</code> means three different things.</p>
