@@ -3,7 +3,7 @@
 Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.com under
 **Software Engineering → Fundamental Problems**, published in rounds of ten LeetCode numbers.
 
-**Status: rounds 1–15, the interview-essentials batch and three legacy rewrites are all LIVE.**
+**Status: rounds 1–16, the interview-essentials batch and three legacy rewrites are all LIVE.**
 
 ---
 
@@ -28,14 +28,15 @@ Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.
 | Round 13 (LeetCode 121–130) | 3 posts — **live** |
 | Round 14 (LeetCode 131–140) | 6 posts — **live** |
 | Round 15 (LeetCode 141–150) | 6 posts — **live** |
-| Round 16 (LeetCode 151–160) | 6 in the repo — 151, 152, 156, 157, 158, 159. Not started. |
-| Site total | **835 posts** (several tracks publish in parallel; the LeetCode work accounts for 85) |
+| Round 16 (LeetCode 151–160) | 6 posts — **live** |
+| Round 17 (LeetCode 161–170) | 4 in the repo — 160, 168, 169, 170. Not started. |
+| Site total | **842 posts** (several tracks publish in parallel; the LeetCode work accounts for 91) |
 | Category | `fundamental-problem`, already existed — no nav change needed |
 
-Live at https://lovemesomecoding.com/fundamental-problem, which now holds 96 posts: the 85 LeetCode
-ones leading the archive, above the 11 legacy 2019 posts. All 85 return 200, all 85 are in
+Live at https://lovemesomecoding.com/fundamental-problem, which now holds 102 posts: the 91 LeetCode
+ones leading the archive, above the 11 legacy 2019 posts. All 91 return 200, all 91 are in
 `sitemap.xml`, highlighting renders, cross-post links resolve, and the pre-existing URLs in this and
-other categories are unaffected. The pager reads 146 → 149 → 200 → 347 → 543.
+other categories are unaffected. The pager reads 158 → 159 → 200 → 347 → 543.
 
 ### `deploy.sh` cannot verify a content-only deploy
 
@@ -197,6 +198,13 @@ above LeetCode 543 there is no ceiling at all.
 
 The ascending-dates invariant is unchanged and still enforced.
 
+### Round 16 needed a stateful harness for the first time
+Problems 157 and 158 are written against a `read4` primitive that does not exist outside LeetCode, so
+the harness supplies one: a `Reader4` class in Java with a settable source, and a module-level
+`read4` in Python driven through `sol.read.__globals__`. Problem 158 additionally keeps state
+*between* calls, so each test case constructs a fresh solution — reusing one would carry the previous
+file's leftovers into the next assertion, which is the exact bug the problem is about.
+
 ### Slugs are frozen once published
 `leetcode-{n}-{title}`. Changing one changes a live URL.
 
@@ -210,7 +218,7 @@ Everything below was run and passed on 2026-08-12, covering all four published r
 blocks *out of the published HTML* — so they test what a reader would copy, not a retyped copy — and
 exercise them against the LeetCode examples plus the edge cases each post claims to handle:
 overflow, `Integer.MIN_VALUE`, empty strings, duplicate values, even-length palindromes, `""` against
-`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **854 Python assertions and 851 Java
+`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **897 Python assertions and 885 Java
 assertions, all green.** Several of those are worth more than the rest put together: problems 12 and 13
 are inverses, so both suites round-trip every integer from 1 to 3999 through `intToRoman` and back
 through `romanToInt`; problem 22's output is checked against the Catalan numbers up to n = 8 (1430
@@ -235,7 +243,7 @@ for LeetCode 47 ran results through `norm()`, which sorts each inner list — co
 but it collapsed all three permutations of `[1,1,2]` into one and proved nothing about ordering.
 Permutation results now go through an order-preserving `permSet()`.
 
-**`check_content.py`** proves all 435 code blocks round-trip byte-for-byte through the backend
+**`check_content.py`** proves all 468 code blocks round-trip byte-for-byte through the backend
 normaliser, every block comes out in the exact `<pre class="language-X"><code class="language-X">`
 shape the highlighter matches, every heading has an anchor id, and no post links to a slug the track
 does not define. It also checks the manifest for duplicate slugs and non-ascending dates.
@@ -258,8 +266,8 @@ out, rounds 2 through 4 against the live site after:
   return 200.
 - All 33 post URLs return 200 and all 33 appear in `sitemap.xml`.
 
-**`npm run build`** passes, including `verify-build.mjs`: 835/835 posts served, 43/43 category counts
-agree, 101 redirects intact, 1059 HTML files emitted.
+**`npm run build`** passes, including `verify-build.mjs`: 842/842 posts served, 43/43 category counts
+agree, 101 redirects intact, 1066 HTML files emitted.
 
 **Round 15's harness caught a real bug in a published solution before it shipped.** The exhaustive
 collinearity check on LeetCode 149 failed on `[[0,0],[0,0],[0,1]]` — the code returned 2 where the
@@ -329,10 +337,11 @@ this machine. The checks above were done against the rendered HTML instead.
 - [x] ~~Round 15 seeded to prod and deployed.~~ Done 2026-08-24 (dated 2024-12/2025-01).
 - [x] ~~Decide what happens when the 2022–2024 window runs out.~~ Resolved: later rounds run past
       2024. See "The 2022–2024 window was retired at round 15".
-- [ ] Round 16 (LeetCode 151–160 has six: 151 Reverse Words in a String, 152 Maximum Product
-      Subarray, 156 Binary Tree Upside Down, 157 Read N Characters Given Read4, 158 Read N
-      Characters Given Read4 II, 159 Longest Substring with At Most Two Distinct Characters).
-      Dates: `2025-01-03` to `2025-02-15`, no shuffling needed.
+- [x] ~~Round 16 seeded to prod and deployed.~~ Done 2026-08-24 (dated 2025-01). No shuffling
+      needed — the first round to sit entirely in the reopened window.
+- [ ] Round 17 (LeetCode 161–170 has four in the repo, though 160 Intersection of Two Linked Lists
+      belongs to round 16's numeric block and was left over: 160, 168 Excel Sheet Column Title,
+      169 Majority Element, 170 Two Sum III). Dates: `2025-01-20` to `2025-02-15`.
 - [ ] **Decide what happens after LeetCode 120.** Round 13 starts at 121, where the numbered rounds
       meet the interview-essentials posts and the 2022–2024 window has nothing left to give.
 - [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.

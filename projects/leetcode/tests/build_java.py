@@ -124,6 +124,12 @@ solution("142-linked-list-cycle-ii.html", "S142")
 solution("144-binary-tree-preorder-traversal.html", "S144")
 solution("145-binary-tree-postorder-traversal.html", "S145")
 solution("149-max-points-on-a-line.html", "S149")
+solution("151-reverse-words-in-a-string.html", "S151")
+solution("152-maximum-product-subarray.html", "S152")
+solution("156-binary-tree-upside-down.html", "S156")
+solution("157-read-n-characters-given-read4.html", "S157")
+solution("158-read-n-characters-given-read4-ii-call-multiple-times.html", "S158")
+solution("159-longest-substring-with-at-most-two-distinct-characters.html", "S159")
 
 # LeetCode 146 defines `class LRUCache`, not `class Solution`, so it is taken verbatim.
 for block in blocks("146-lru-cache.html"):
@@ -323,6 +329,20 @@ class Node {
 class RNode {
     int val; RNode next, random;
     RNode(int val) { this.val = val; }
+}
+
+/** The primitive problems 157 and 158 are written against. */
+class Reader4 {
+    private String source = "";
+    private int pos = 0;
+
+    void setSource(String text) { source = text; pos = 0; }
+
+    int read4(char[] buf4) {
+        int count = 0;
+        while (count < 4 && pos < source.length()) buf4[count++] = source.charAt(pos++);
+        return count;
+    }
 }
 """
 
@@ -754,6 +774,37 @@ public class Main {
             }
         }
         return best;
+    }
+
+    /** Brute-force maximum subarray product, for problem 152. */
+    static int bruteProduct(int[] nums) {
+        Integer best = null;
+        for (int i = 0; i < nums.length; i++) {
+            int run = 1;
+            for (int j = i; j < nums.length; j++) {
+                run *= nums[j];
+                best = best == null ? run : Math.max(best, run);
+            }
+        }
+        return best;
+    }
+
+    /** Longest substring with at most two distinct characters, by brute force. */
+    static int bruteTwoDistinct(String text) {
+        int best = 0;
+        for (int i = 0; i < text.length(); i++)
+            for (int j = i; j < text.length(); j++) {
+                Set<Character> seen = new HashSet<>();
+                for (int k = i; k <= j; k++) seen.add(text.charAt(k));
+                if (seen.size() <= 2) best = Math.max(best, j - i + 1);
+            }
+        return best;
+    }
+
+    /** Structural rendering for problem 156. */
+    static String shapeOf(TreeNode node) {
+        if (node == null) return ".";
+        return "(" + node.val + " " + shapeOf(node.left) + " " + shapeOf(node.right) + ")";
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -2967,6 +3018,158 @@ public class Main {
             }
         }
         check("matches exact-collinearity brute force on every point set up to size 4", pointsBad, 0);
+
+        System.out.println("LeetCode 151 - Reverse Words in a String");
+        S151 s151 = new S151();
+        check("the sky is blue", s151.reverseWords("the sky is blue"), "blue is sky the");
+        check("leading and trailing spaces", s151.reverseWords("  hello world  "), "world hello");
+        check("runs collapsed", s151.reverseWords("a good   example"), "example good a");
+        check("whitespace only", s151.reverseWords("  "), "");
+        check("single word", s151.reverseWords("single"), "single");
+        check("empty string", s151.reverseWords(""), "");
+        check("spelling is NOT reversed", s151.reverseWords("abc def"), "def abc");
+        int wordsBad = 0, spacingBad = 0;
+        char[] wordAlphabet = {'a', 'b', ' '};
+        for (int n = 0; n <= 7; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder sb = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < n; i++) { sb.append(wordAlphabet[mm % 3]); mm /= 3; }
+                String text = sb.toString();
+
+                String[] words = text.trim().isEmpty() ? new String[0] : text.trim().split(" +");
+                StringBuilder reversedWords = new StringBuilder();
+                for (int i = words.length - 1; i >= 0; i--) {
+                    if (reversedWords.length() > 0) reversedWords.append(' ');
+                    reversedWords.append(words[i]);
+                }
+                String got = s151.reverseWords(text);
+                if (!got.equals(reversedWords.toString())) wordsBad++;
+                if (!got.equals(got.trim()) || got.contains("  ")) spacingBad++;
+            }
+        }
+        check("matches split/reverse/join on every a/b/space string up to length 7", wordsBad, 0);
+        check("output is trimmed and single-spaced", spacingBad, 0);
+
+        System.out.println("LeetCode 152 - Maximum Product Subarray");
+        S152 s152 = new S152();
+        check("[2,3,-2,4]", s152.maxProduct(new int[]{2,3,-2,4}), 6);
+        check("[-2,0,-1]", s152.maxProduct(new int[]{-2,0,-1}), 0);
+        check("[-2,3,-4] (two negatives cancel)", s152.maxProduct(new int[]{-2,3,-4}), 24);
+        check("[-2] (single negative)", s152.maxProduct(new int[]{-2}), -2);
+        check("[2,-5,-2,-4,3]", s152.maxProduct(new int[]{2,-5,-2,-4,3}), 24);
+        check("[-1,-2,-3]", s152.maxProduct(new int[]{-1,-2,-3}), 6);
+        check("[0]", s152.maxProduct(new int[]{0}), 0);
+        int productBad = 0;
+        int[] productValues = {-2, -1, 0, 1, 3};
+        for (int n = 1; n <= 7; n++) {
+            int combos = (int) Math.pow(productValues.length, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] nums = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { nums[i] = productValues[mm % productValues.length]; mm /= productValues.length; }
+                if (s152.maxProduct(nums.clone()) != bruteProduct(nums)) productBad++;
+            }
+        }
+        check("matches brute force on every array of length 1..7 over {-2,-1,0,1,3}", productBad, 0);
+
+        System.out.println("LeetCode 156 - Binary Tree Upside Down");
+        S156 s156 = new S156();
+        check("[1,2,3,4,5]", shapeOf(s156.upsideDownBinaryTree(buildTree(1,2,3,4,5))),
+              "(4 (5 . .) (2 (3 . .) (1 . .)))");
+        check("single node", shapeOf(s156.upsideDownBinaryTree(buildTree(1))), "(1 . .)");
+        check("empty tree", s156.upsideDownBinaryTree(null), null);
+        check("[1,2,3]", shapeOf(s156.upsideDownBinaryTree(buildTree(1,2,3))),
+              "(2 (3 . .) (1 . .))");
+        // The old root must become a genuine leaf: 4 -> right is 2 -> right is 1.
+        TreeNode flipped = s156.upsideDownBinaryTree(buildTree(1,2,3,4,5));
+        TreeNode oldRoot = flipped.right.right;
+        check("the old root is now a leaf",
+              oldRoot.val + "," + (oldRoot.left == null) + "," + (oldRoot.right == null),
+              "1,true,true");
+
+        System.out.println("LeetCode 157 - Read N Characters Given Read4");
+        int readBad = 0;
+        for (int length = 0; length <= 12; length++) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < length; i++) sb.append((char) ('a' + i % 26));
+            String text = sb.toString();
+            for (int n = 0; n <= 13; n++) {
+                S157 reader = new S157();       // fresh: read() is called once
+                reader.setSource(text);
+                char[] buf = new char[Math.max(n, 1)];
+                int got = reader.read(buf, n);
+                String delivered = new String(buf, 0, got);
+                if (got != Math.min(n, length) || !delivered.equals(text.substring(0, Math.min(n, length))))
+                    readBad++;
+            }
+        }
+        check("every file length 0..12 crossed with every n 0..13", readBad, 0);
+        S157 spot = new S157();
+        spot.setSource("leetcode");
+        char[] spotBuf = new char[5];
+        check("file leetcode, n=5 (n smaller than the file)",
+              spot.read(spotBuf, 5) + ":" + new String(spotBuf, 0, 5), "5:leetc");
+
+        System.out.println("LeetCode 158 - Read N Characters Given Read4 II");
+        // THE case: the first call consumes a whole chunk but delivers one character.
+        S158 multi = new S158();
+        multi.setSource("abcdefg");
+        char[] mbuf = new char[8];
+        int m1 = multi.read(mbuf, 1); String d1 = new String(mbuf, 0, m1);
+        int m2 = multi.read(mbuf, 3); String d2 = new String(mbuf, 0, m2);
+        int m3 = multi.read(mbuf, 5); String d3 = new String(mbuf, 0, m3);
+        check("leftovers survive between calls",
+              d1 + "|" + d2 + "|" + d3, "a|bcd|efg");
+        int[][] callPatterns = {{1,1,1,1,1,1,1,1,1,1,1,1}, {2,3,1,4,2}, {5,5,5}, {1,7,1}, {4,4,4}, {12}};
+        int multiBad = 0;
+        for (int length = 0; length <= 11; length++) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < length; i++) sb.append((char) ('a' + i % 26));
+            String text = sb.toString();
+            for (int[] sizes : callPatterns) {
+                S158 reader = new S158();
+                reader.setSource(text);
+                StringBuilder out = new StringBuilder();
+                char[] buf = new char[16];
+                int asked = 0;
+                for (int size : sizes) {
+                    asked += size;
+                    int got = reader.read(buf, size);
+                    out.append(buf, 0, got);
+                    if (got < size) break;
+                }
+                String expected = text.substring(0, Math.min(asked, length));
+                if (!out.toString().equals(expected)) multiBad++;
+            }
+        }
+        check("every call-size pattern delivers the file in order, with no gaps", multiBad, 0);
+
+        System.out.println("LeetCode 159 - Longest Substring with At Most Two Distinct Characters");
+        S159 s159 = new S159();
+        check("eceba", s159.lengthOfLongestSubstringTwoDistinct("eceba"), 3);
+        check("ccaabbb", s159.lengthOfLongestSubstringTwoDistinct("ccaabbb"), 5);
+        check("a", s159.lengthOfLongestSubstringTwoDistinct("a"), 1);
+        check("empty string", s159.lengthOfLongestSubstringTwoDistinct(""), 0);
+        check("abcabcabc", s159.lengthOfLongestSubstringTwoDistinct("abcabcabc"), 2);
+        check("aaaa (ONE distinct is at most two)",
+              s159.lengthOfLongestSubstringTwoDistinct("aaaa"), 4);
+        check("aabbc (needs both a's removed)",
+              s159.lengthOfLongestSubstringTwoDistinct("aabbc"), 4);
+        int distinctBad = 0;
+        for (int n = 0; n <= 9; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder sb = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < n; i++) { sb.append((char) ('a' + mm % 3)); mm /= 3; }
+                String text = sb.toString();
+                if (s159.lengthOfLongestSubstringTwoDistinct(text) != bruteTwoDistinct(text))
+                    distinctBad++;
+            }
+        }
+        check("matches brute force on every abc string up to length 9", distinctBad, 0);
 
         System.out.println();
         if (failures > 0) {

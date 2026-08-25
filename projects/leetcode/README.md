@@ -63,7 +63,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 13 | 121–130 | 3 — 122, 124, 125 (121 was already live) | **live** since 2024-12 |
 | 14 | 131–140 | 6 — 131, 133, 134, 136, 138, 139 | **live** since 2024-12 |
 | 15 | 141–150 | 6 — 141, 142, 144, 145, 146, 149 | **live** since 2024-12/2025-01 |
-| 16 | 151–160 | 6 — 151, 152, 156, 157, 158, 159 | not started |
+| 16 | 151–160 | 6 — 151, 152, 156, 157, 158, 159 | **live** since 2025-01 |
+| 17 | 161–170 | 4 — 160 (see note), 168, 169, 170 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -95,14 +96,14 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 88 posts:
+Current distribution across the 94 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Graph Theory | 18 |
-| Implementation | 16 |
-| Dynamic Programming | 13 |
-| Strings | 11 |
+| Graph Theory | 19 |
+| Implementation | 18 |
+| Dynamic Programming | 14 |
+| Strings | 13 |
 | Recursion | 10 |
 | Sorting | 8 |
 | Searching | 6 |
@@ -175,7 +176,7 @@ exhausted the reservation.
 
 The track originally targeted 2022–2024. That window was exhausted at round 15, and the decision was
 to **let later rounds run past 2024** rather than compress the whole archive. Round 15 is the first
-to cross: LeetCode 146 and 149 are dated January 2025.
+to cross: LeetCode 146 and 149 are dated January 2025, and round 16 sits entirely in 2025.
 
 The three interview-essentials posts moved with it, once, to sizes matched to what the repo actually
 holds — so no further shuffling should ever be needed:

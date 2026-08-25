@@ -2464,6 +2464,211 @@ for n in range(1, 5):
             bad.append((pts, got, want))
 check("matches exact-collinearity brute force on every point set up to size 4", bad, [])
 
+print("LeetCode 151 - Reverse Words in a String")
+s = load("151-reverse-words-in-a-string.html")
+check('"the sky is blue"', s.reverseWords("the sky is blue"), "blue is sky the")
+check('"  hello world  " (trimmed)', s.reverseWords("  hello world  "), "world hello")
+check('"a good   example" (runs collapsed)', s.reverseWords("a good   example"), "example good a")
+check('"  " (whitespace only)', s.reverseWords("  "), "")
+check('"single"', s.reverseWords("single"), "single")
+check('"" (empty)', s.reverseWords(""), "")
+check('spelling is NOT reversed', s.reverseWords("abc def"), "def abc")
+bad = []
+for n in range(0, 8):
+    for combo in itertools.product("ab ", repeat=n):
+        text = "".join(combo)
+        if s.reverseWords(text) != " ".join(reversed(text.split())):
+            bad.append(text)
+check("matches split/reverse/join on every a/b/space string up to length 7", bad, [])
+# Structural: no leading, trailing or doubled spaces in the output.
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product("ab ", repeat=n):
+        out = s.reverseWords("".join(combo))
+        if out != out.strip() or "  " in out:
+            bad.append((combo, out))
+check("output is trimmed and single-spaced", bad, [])
+
+print("LeetCode 152 - Maximum Product Subarray")
+s = load("152-maximum-product-subarray.html")
+check("[2,3,-2,4]", s.maxProduct([2,3,-2,4]), 6)
+check("[-2,0,-1]", s.maxProduct([-2,0,-1]), 0)
+check("[-2,3,-4] (two negatives cancel)", s.maxProduct([-2,3,-4]), 24)
+check("[-2] (single negative)", s.maxProduct([-2]), -2)
+check("[0,2]", s.maxProduct([0,2]), 2)
+check("[2,-5,-2,-4,3]", s.maxProduct([2,-5,-2,-4,3]), 24)
+check("[-1,-2,-3] (odd count of negatives)", s.maxProduct([-1,-2,-3]), 6)
+check("[0]", s.maxProduct([0]), 0)
+# Brute force over every subarray.
+def brute_product(nums):
+    best = None
+    for i in range(len(nums)):
+        run = 1
+        for j in range(i, len(nums)):
+            run *= nums[j]
+            best = run if best is None else max(best, run)
+    return best
+
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product([-2, -1, 0, 1, 3], repeat=n):
+        if s.maxProduct(list(combo)) != brute_product(list(combo)):
+            bad.append(combo)
+check("matches brute force on every array of length 1..7 over {-2,-1,0,1,3}", bad, [])
+
+print("LeetCode 156 - Binary Tree Upside Down")
+s = load("156-binary-tree-upside-down.html", extra=TREE)
+def shape156(node):
+    return None if node is None else (node.val, shape156(node.left), shape156(node.right))
+def left_leaning(depth, next_val):
+    """Build the guaranteed shape: a left spine where every right child is a leaf."""
+    if depth == 0:
+        return None, next_val
+    root = ns94["TreeNode"](next_val); next_val += 1
+    root.left, next_val = left_leaning(depth - 1, next_val)
+    if root.left is not None:
+        root.right = ns94["TreeNode"](next_val); next_val += 1
+    return root, next_val
+
+check("[1,2,3,4,5]", shape156(s.upsideDownBinaryTree(build([1,2,3,4,5]))),
+      (4, (5, None, None), (2, (3, None, None), (1, None, None))))
+check("single node", shape156(s.upsideDownBinaryTree(build([1]))), (1, None, None))
+check("empty tree", s.upsideDownBinaryTree(None), None)
+check("[1,2,3]", shape156(s.upsideDownBinaryTree(build([1,2,3]))),
+      (2, (3, None, None), (1, None, None)))
+# Independent model: the left spine reversed, with right children hung on the left.
+def upside_down_model(root):
+    spine, node = [], root
+    while node:
+        spine.append(node); node = node.left
+    for i in range(len(spine) - 1, 0, -1):
+        parent = spine[i - 1]
+        spine[i].left = parent.right
+        spine[i].right = parent
+        parent.left = None
+        parent.right = None
+    return spine[-1] if spine else None
+
+bad = []
+for depth in range(1, 7):
+    got = shape156(s.upsideDownBinaryTree(left_leaning(depth, 1)[0]))
+    want = shape156(upside_down_model(left_leaning(depth, 1)[0]))
+    if got != want:
+        bad.append((depth, got, want))
+check("matches an independent model on left-leaning trees of depth 1..6", bad, [])
+# The old root must become a genuine leaf.
+result = s.upsideDownBinaryTree(build([1,2,3,4,5]))
+old_root = result.right.right     # 4 -> right is 2 -> right is the old root 1
+check("the old root is now a leaf", (old_root.val, old_root.left, old_root.right), (1, None, None))
+
+print("LeetCode 157 - Read N Characters Given Read4")
+READ4 = """
+_source = {"text": "", "pos": 0}
+
+def set_source(text):
+    _source["text"] = text
+    _source["pos"] = 0
+
+def read4(buf4):
+    text, pos = _source["text"], _source["pos"]
+    count = 0
+    while count < 4 and pos < len(text):
+        buf4[count] = text[pos]
+        count += 1
+        pos += 1
+    _source["pos"] = pos
+    return count
+"""
+ns157 = {}
+exec(compile(READ4, "read4", "exec"), ns157)
+# Each call gets a fresh module namespace, so the file position starts clean.
+# `sol.read.__globals__` is that namespace -- Solution defines no __init__.
+def read_once(text, n):
+    sol = load("157-read-n-characters-given-read4.html", extra=READ4)
+    sol.read.__globals__["set_source"](text)
+    buf = [""] * max(n, 1)
+    got = sol.read(buf, n)
+    return got, "".join(buf[:got])
+
+check('file "abc", n=4 (file shorter than n)', read_once("abc", 4), (3, "abc"))
+check('file "abcde", n=5', read_once("abcde", 5), (5, "abcde"))
+check('file "abcdABCD1234", n=12', read_once("abcdABCD1234", 12), (12, "abcdABCD1234"))
+check('file "leetcode", n=5 (n smaller than the file)', read_once("leetcode", 5), (5, "leetc"))
+check('empty file', read_once("", 1), (0, ""))
+check('n=0', read_once("abc", 0), (0, ""))
+check('n=1 from a 4-char file', read_once("abcd", 1), (1, "a"))
+bad = []
+for length in range(0, 13):
+    text = "".join(chr(ord("a") + i % 26) for i in range(length))
+    for n in range(0, 14):
+        want = (min(n, length), text[:min(n, length)])
+        if read_once(text, n) != want:
+            bad.append((length, n))
+check("every file length 0..12 crossed with every n 0..13", bad, [])
+
+print("LeetCode 158 - Read N Characters Given Read4 II")
+def make158(text):
+    sol = load("158-read-n-characters-given-read4-ii-call-multiple-times.html", extra=READ4)
+    sol.read.__globals__["set_source"](text)
+    return sol
+
+sol = make158("abc")
+buf = [""] * 4
+check("read(1) then read(2) then read(1) on \"abc\"",
+      [(sol.read(buf, 1), buf[0]), (sol.read(buf, 2), "".join(buf[:2])), sol.read(buf, 1)],
+      [(1, "a"), (2, "bc"), 0])
+# THE case: the first call consumes a whole chunk but delivers one character.
+sol = make158("abcdefg")
+buf = [""] * 8
+r1 = sol.read(buf, 1); c1 = "".join(buf[:r1])
+r2 = sol.read(buf, 3); c2 = "".join(buf[:r2])
+r3 = sol.read(buf, 5); c3 = "".join(buf[:r3])
+check("leftovers survive between calls", [(r1, c1), (r2, c2), (r3, c3)],
+      [(1, "a"), (3, "bcd"), (3, "efg")])
+# Any sequence of call sizes must reconstruct the file exactly.
+bad = []
+for length in range(0, 12):
+    text = "".join(chr(ord("a") + i % 26) for i in range(length))
+    for sizes in ((1,1,1,1,1,1,1,1,1,1,1,1), (2,3,1,4,2), (5,5,5), (1,7,1), (4,4,4), (12,)):
+        sol = make158(text)
+        out, buf = [], [""] * 16
+        for size in sizes:
+            got = sol.read(buf, size)
+            out.append("".join(buf[:got]))
+            if got < size:
+                break
+        # The calls only ask for sum(sizes) characters, so the expected output is
+        # the file truncated to whichever is smaller.
+        want = text[:min(sum(sizes), len(text))]
+        if "".join(out) != want:
+            bad.append((text, sizes, "".join(out), want))
+check("every call-size pattern delivers the file in order, with no gaps", bad, [])
+
+print("LeetCode 159 - Longest Substring with At Most Two Distinct Characters")
+s = load("159-longest-substring-with-at-most-two-distinct-characters.html")
+check('"eceba"', s.lengthOfLongestSubstringTwoDistinct("eceba"), 3)
+check('"ccaabbb"', s.lengthOfLongestSubstringTwoDistinct("ccaabbb"), 5)
+check('"a"', s.lengthOfLongestSubstringTwoDistinct("a"), 1)
+check('"" (empty)', s.lengthOfLongestSubstringTwoDistinct(""), 0)
+check('"abcabcabc"', s.lengthOfLongestSubstringTwoDistinct("abcabcabc"), 2)
+check('"aaaa" (ONE distinct is at most two)', s.lengthOfLongestSubstringTwoDistinct("aaaa"), 4)
+check('"aabbc" (needs both a\'s removed)', s.lengthOfLongestSubstringTwoDistinct("aabbc"), 4)
+def brute_two_distinct(text):
+    best = 0
+    for i in range(len(text)):
+        for j in range(i, len(text)):
+            if len(set(text[i:j + 1])) <= 2:
+                best = max(best, j - i + 1)
+    return best
+
+bad = []
+for n in range(0, 10):
+    for combo in itertools.product("abc", repeat=n):
+        text = "".join(combo)
+        if s.lengthOfLongestSubstringTwoDistinct(text) != brute_two_distinct(text):
+            bad.append(text)
+check("matches brute force on every abc string up to length 9", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

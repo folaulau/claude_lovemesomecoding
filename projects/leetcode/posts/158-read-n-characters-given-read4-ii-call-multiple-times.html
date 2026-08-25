@@ -1,0 +1,158 @@
+<p>The same API as
+<a href="/fundamental-problem/leetcode-157-read-n-characters-given-read4">problem 157</a>, with one
+sentence changed: <code>read</code> may be called <strong>multiple times</strong>. That sentence
+turns a loop into a small piece of state management, and it is one of the cleanest examples on the
+list of a requirement that changes the design rather than the code.</p>
+
+<h2>The problem</h2>
+
+<p>Implement <code>read(buf, n)</code> using <code>read4</code>, where <code>read</code> is called
+repeatedly and must continue from where the previous call stopped.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">file = "abc"
+read(buf, 1)  -&gt; 1, buf = "a"
+read(buf, 2)  -&gt; 2, buf = "bc"
+read(buf, 1)  -&gt; 0            file exhausted
+
+file = "abcdefg"
+read(buf, 1)  -&gt; 1, buf = "a"      read4 fetched "abcd" -- b, c, d must survive
+read(buf, 3)  -&gt; 3, buf = "bcd"    served entirely from the leftover
+read(buf, 5)  -&gt; 3, buf = "efg"</code></pre>
+
+<p>That second example is the whole problem. The first call wants one character, but the only
+primitive available fetches four — and the other three are gone from the file forever.</p>
+
+<h2>What breaks</h2>
+
+<p>Problem 157's solution consumes up to four characters per <code>read4</code> and copies out only
+as many as the caller wanted. In a single call the surplus is harmlessly discarded. Called twice, the
+discarded characters are <strong>lost data</strong>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">read(buf, 1) with 157's code:
+  read4 -&gt; "abcd"     copies 'a', discards "bcd"
+
+read(buf, 3):
+  read4 -&gt; "efg"      returns "efg"
+
+   the caller gets "a" then "efg" -- "bcd" vanished.</code></pre>
+
+<p>Naming that failure before writing anything is the answer. The fix follows immediately: the
+surplus has to live somewhere that survives between calls.</p>
+
+<h2>Three fields</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">buf4        the 4-character scratch buffer, now instance state
+bufCount    how many characters read4 actually put in it
+bufPointer  how many of those have been handed to callers</code></pre>
+
+<p>The invariant: <code>buf4[bufPointer .. bufCount)</code> is data that has been read from the file
+and not yet delivered. When the pointer catches the count, the buffer is spent and it is time to
+fetch again.</p>
+
+<p>That single comparison replaces problem 157's nested loops. There is no inner copy loop at all —
+one character moves per iteration, and refilling is just another branch.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution extends Reader4 {
+    // buf4[bufPointer .. bufCount) is read from the file but not yet delivered.
+    private final char[] buf4 = new char[4];
+    private int bufPointer = 0;
+    private int bufCount = 0;
+
+    public int read(char[] buf, int n) {
+        int total = 0;
+
+        while (total &lt; n) {
+            if (bufPointer == bufCount) {     // leftovers exhausted -- refill
+                bufCount = read4(buf4);
+                bufPointer = 0;
+
+                if (bufCount == 0) break;     // end of file
+            }
+
+            buf[total++] = buf4[bufPointer++];
+        }
+
+        return total;
+    }
+}</code></pre>
+
+<p>Resetting <code>bufPointer = 0</code> immediately after the refill matters. Doing it before the
+<code>read4</code>, or forgetting it, leaves the pointer past the end of a fresh chunk and the
+solution silently skips characters.</p>
+
+<p>The end-of-file check must come <em>after</em> the assignment to <code>bufCount</code>, because
+<code>bufCount == 0</code> is what identifies it. Checking a stale value is the natural mistake.</p>
+
+<p>One character copied per iteration looks wasteful next to 157's block copy, and it is
+<code>O(1)</code> either way. Clarity wins; if the interviewer asks, a bulk <code>arraycopy</code> of
+<code>min(bufCount - bufPointer, n - total)</code> is the optimisation, and it is worth naming
+rather than writing.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">class Solution:
+    def __init__(self):
+        # buf4[pointer:count] is read from the file but not yet delivered.
+        self.buf4 = [""] * 4
+        self.pointer = 0
+        self.count = 0
+
+    def read(self, buf: list, n: int) -&gt; int:
+        total = 0
+
+        while total &lt; n:
+            if self.pointer == self.count:        # leftovers exhausted -- refill
+                self.count = read4(self.buf4)
+                self.pointer = 0
+
+                if self.count == 0:               # end of file
+                    break
+
+            buf[total] = self.buf4[self.pointer]
+            total += 1
+            self.pointer += 1
+
+        return total</code></pre>
+
+<p>The state lives on the instance, so it persists across calls — which is exactly what the problem
+asks for and exactly what makes this object <strong>not safe to share between files or threads</strong>.
+Saying that unprompted is the difference between solving the exercise and understanding it.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th></th><th>Time per call</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Buffered read</td><td><code>O(n)</code></td><td><code>O(1)</code> — four characters, forever</td></tr>
+  </tbody>
+</table>
+
+<p>Across a whole file the total work is linear in its size, and <code>read4</code> is called
+<code>⌈size/4⌉</code> times — no character is ever read from the file twice, which is the property
+that failed in the naive version.</p>
+
+<h2>What this is really about</h2>
+
+<p>This is a buffered reader. <code>BufferedInputStream</code>, <code>BufferedReader</code> and every
+socket-reading loop you have ever written hold exactly these three fields, usually with a buffer of
+8192 rather than 4. The reason they exist is the reason this problem exists: the underlying source
+delivers on its own terms, and something has to reconcile that with what the caller asked for.</p>
+
+<p>The follow-ups worth having ready: <strong>thread safety</strong> — this is not safe, and a lock
+around <code>read</code> is the honest fix; <strong>a larger buffer</strong> — the same three fields
+with a bigger array, which is the only change needed; and <strong>peeking or pushback</strong>, which
+is why the pointer is separate from the count rather than the buffer being shifted.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That you identify the lost-leftover bug before writing code.</li>
+  <li>Three pieces of state, and that they persist across calls.</li>
+  <li>The refill condition <code>pointer == count</code>.</li>
+  <li>Resetting the pointer immediately after a refill.</li>
+  <li>End of file detected from a fresh <code>read4</code> returning 0, not a stale count.</li>
+  <li>Many small calls, one large call, and reading past the end.</li>
+  <li>That you recognise this as a buffered reader, and that it is not thread-safe.</li>
+</ul>

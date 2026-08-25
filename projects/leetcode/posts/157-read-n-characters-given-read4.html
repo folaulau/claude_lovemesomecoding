@@ -1,0 +1,143 @@
+<p>Read N Characters Given Read4 is an API-adaptation problem: you are handed a primitive that reads
+in fixed 4-character chunks and asked to expose one that reads exactly <code>n</code>. The algorithm
+is a loop. What is being tested is whether you handle the two ways the chunk size and
+<code>n</code> fail to line up — and whether you know what a short read means.</p>
+
+<h2>The problem</h2>
+
+<p><code>read4(buf4)</code> reads up to 4 characters from a file into <code>buf4</code> and returns
+how many it actually read. Using only that, implement <code>read(buf, n)</code>, which reads up to
+<code>n</code> characters into <code>buf</code> and returns how many it read.</p>
+
+<p><code>read</code> is called <strong>once</strong>. (Being called repeatedly is
+<a href="/fundamental-problem/leetcode-158-read-n-characters-given-read4-ii-call-multiple-times">problem
+158</a>, and it is a materially different problem.)</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">file = "abc",     n = 4   -&gt; 3, buf = "abc"      fewer characters than asked
+file = "abcde",   n = 5   -&gt; 5, buf = "abcde"
+file = "abcdABCD1234", n = 12 -&gt; 12
+file = "leetcode", n = 5  -&gt; 5, buf = "leetc"    MORE available than asked
+file = "",        n = 1   -&gt; 0</code></pre>
+
+<h2>A short read means end of file</h2>
+
+<p><code>read4</code> returning fewer than 4 is the only signal you get that the file is exhausted.
+It is not "try again" and it is not a partial-read hiccup — the contract says it reads 4 unless there
+are fewer than 4 left.</p>
+
+<p>So <code>read4</code> returning 0 is the loop's exit condition, and returning 1–3 means this is
+the last chunk. Getting this wrong gives an infinite loop on a short file, which is the failure mode
+worth naming out loud.</p>
+
+<h2>The two mismatches</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">n = 5, file = "abcdefgh"
+
+read4 -&gt; "abcd" (4)     total 4, still short of 5
+read4 -&gt; "efgh" (4)     but only ONE more character is wanted
+
+  copying all four would write past n.</code></pre>
+
+<p>The chunk you are handed can overshoot <code>n</code>, and the file can run out before
+<code>n</code>. Both need guarding, and the copy loop can do it with one condition each:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">for (i = 0; i &lt; count &amp;&amp; total &lt; n; i++)
+              ^^^^^^^^^      ^^^^^^^^^
+              file limit     caller's limit</code></pre>
+
+<p>Writing past <code>n</code> is a buffer overrun into memory the caller owns. In a real codebase
+that is a security bug, not a wrong answer — worth saying, because it is the reason the guard is not
+optional.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution extends Reader4 {
+    public int read(char[] buf, int n) {
+        char[] buf4 = new char[4];
+        int total = 0;
+
+        while (total &lt; n) {
+            int count = read4(buf4);
+            if (count == 0) break;           // short read of 0 = end of file
+
+            // Two limits: what the file gave us, and what the caller asked for.
+            for (int i = 0; i &lt; count &amp;&amp; total &lt; n; i++) {
+                buf[total++] = buf4[i];
+            }
+        }
+
+        return total;
+    }
+}</code></pre>
+
+<p><code>buf4</code> is allocated once outside the loop rather than per iteration. It is reused every
+call to <code>read4</code>, which overwrites it — no state carries between iterations, and there is
+no reason to allocate <code>n/4</code> arrays.</p>
+
+<p>The outer <code>total &lt; n</code> and the inner <code>total &lt; n</code> look redundant and are
+not. The outer one stops fetching more chunks; the inner one stops copying within the chunk you
+already have. Drop the inner and you overrun; drop the outer and you read one chunk too many from
+the file, which matters when the file is a stream.</p>
+
+<p>Note that <code>n</code> characters may be consumed from the file even though fewer are copied out
+— the final <code>read4</code> can fetch 4 and use 1. For a single call that is harmless. For
+<a href="/fundamental-problem/leetcode-158-read-n-characters-given-read4-ii-call-multiple-times">problem
+158</a> it is the entire difficulty.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">class Solution:
+    def read(self, buf: list, n: int) -&gt; int:
+        buf4 = [""] * 4
+        total = 0
+
+        while total &lt; n:
+            count = read4(buf4)
+            if count == 0:                    # end of file
+                break
+
+            for i in range(min(count, n - total)):
+                buf[total] = buf4[i]
+                total += 1
+
+        return total</code></pre>
+
+<p><code>min(count, n - total)</code> states both limits in one expression — what the file supplied
+and what the caller still wants. It reads more directly than two loop conditions, and it makes the
+overshoot case impossible to write incorrectly.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th></th><th>Time</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Chunked read</td><td><code>O(n)</code></td><td><code>O(1)</code> — one 4-character buffer</td></tr>
+  </tbody>
+</table>
+
+<p>At most <code>⌈n/4⌉</code> calls to <code>read4</code>, each doing constant work. The scratch
+buffer is 4 characters regardless of <code>n</code>, which is the point of the design — you never
+hold the whole file.</p>
+
+<h2>Why this problem exists</h2>
+
+<p>It is not really about LeetCode's <code>read4</code>. It is the shape of every buffered-I/O
+wrapper ever written: an underlying source that delivers whatever it feels like, a caller that wants
+a specific amount, and a layer in between reconciling the two. <code>InputStream.read</code> in Java
+and <code>read(2)</code> in C both return "up to" a count for the same reason, and misreading that
+as "exactly" is a classic production bug.</p>
+
+<p>Say that if it comes up. It reframes the question from a puzzle into the thing it is modelling,
+and it makes the follow-up about buffering leftovers feel inevitable rather than arbitrary.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That a short read means end of file, and drives the exit condition.</li>
+  <li>Both guards — the chunk's count and the caller's <code>n</code>.</li>
+  <li>That you never write past <code>n</code> into the caller's buffer.</li>
+  <li><code>n</code> larger than the file, and <code>n</code> smaller than one chunk.</li>
+  <li>An empty file returning 0.</li>
+  <li>That <code>buf4</code> is allocated once.</li>
+  <li>That you notice characters can be consumed but not delivered — which sets up problem 158.</li>
+</ul>

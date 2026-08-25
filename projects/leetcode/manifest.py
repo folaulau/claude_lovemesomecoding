@@ -1414,6 +1414,100 @@ POSTS = [
         ),
     },
     {
+        "number": 151,
+        "slug": "leetcode-151-reverse-words-in-a-string",
+        "algorithm": "Strings",
+        "title": "LeetCode 151 \u2013 Reverse Words in a String",
+        "file": "151-reverse-words-in-a-string.html",
+        "date": "2025-01-06T21:53:01",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "string", "two-pointers"],
+        "excerpt": (
+            "One line in Python and a real exercise in Java, which is what makes it a good "
+            "question. Reverse the whole string, then reverse each word back \u2014 the first pass fixes "
+            "the order and breaks the spelling, the second fixes the spelling without moving "
+            "anything. The spaces are the fiddly part."
+        ),
+    },
+    {
+        "number": 152,
+        "slug": "leetcode-152-maximum-product-subarray",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 152 \u2013 Maximum Product Subarray",
+        "file": "152-maximum-product-subarray.html",
+        "date": "2025-01-08T19:10:17",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "dynamic-programming"],
+        "excerpt": (
+            "Kadane with multiplication, and the change is bigger than it looks: a large negative is "
+            "not a bad prefix, it is a latent good one waiting for another negative. Carry the "
+            "minimum as well as the maximum, and watch the assignment order \u2014 curMin needs the OLD "
+            "curMax."
+        ),
+    },
+    {
+        "number": 156,
+        "slug": "leetcode-156-binary-tree-upside-down",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 156 \u2013 Binary Tree Upside Down",
+        "file": "156-binary-tree-upside-down.html",
+        "date": "2025-01-09T16:30:18",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "tree", "recursion"],
+        "excerpt": (
+            "Pure pointer surgery with no search and no complexity to argue about. The whole problem "
+            "is doing four assignments in an order that does not destroy what the next one needs \u2014 "
+            "null out root.left before reading it and the subtree is gone. Both pointers must be "
+            "nulled, not just one."
+        ),
+    },
+    {
+        "number": 157,
+        "slug": "leetcode-157-read-n-characters-given-read4",
+        "algorithm": "Implementation",
+        "title": "LeetCode 157 \u2013 Read N Characters Given Read4",
+        "file": "157-read-n-characters-given-read4.html",
+        "date": "2025-01-14T10:27:27",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "simulation", "interactive"],
+        "excerpt": (
+            "An API-adaptation problem: a primitive that reads in 4-character chunks, a caller that "
+            "wants exactly n. A short read means end of file, and both limits need guarding \u2014 "
+            "writing past n is a buffer overrun into the caller's memory, not a wrong answer."
+        ),
+    },
+    {
+        "number": 158,
+        "slug": "leetcode-158-read-n-characters-given-read4-ii-call-multiple-times",
+        "algorithm": "Implementation",
+        "title": "LeetCode 158 \u2013 Read N Characters Given Read4 II \u2013 Call Multiple Times",
+        "file": "158-read-n-characters-given-read4-ii-call-multiple-times.html",
+        "date": "2025-01-14T19:59:36",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "array", "simulation", "design"],
+        "excerpt": (
+            "The same API with one sentence changed, and that sentence changes the design rather "
+            "than the code. Problem 157 discards the surplus from its last chunk; called twice, that "
+            "surplus is lost data. Three fields of state, and you have written a buffered reader."
+        ),
+    },
+    {
+        "number": 159,
+        "slug": "leetcode-159-longest-substring-with-at-most-two-distinct-characters",
+        "algorithm": "Strings",
+        "title": "LeetCode 159 \u2013 Longest Substring with At Most Two Distinct Characters",
+        "file": "159-longest-substring-with-at-most-two-distinct-characters.html",
+        "date": "2025-01-18T17:34:44",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "string", "sliding-window", "hash-table"],
+        "excerpt": (
+            "The sliding window at its most reusable, and unlike Minimum Window Substring it "
+            "generalises to k by changing one literal. The single bug it has: a count that reaches "
+            "zero must be DELETED, not left sitting there, or the map size counts characters that "
+            "have already left the window."
+        ),
+    },
+    {
         "number": 200,
         "batch": "interview-essentials",
         "slug": "leetcode-200-number-of-islands",
