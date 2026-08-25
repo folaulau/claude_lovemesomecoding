@@ -33,12 +33,13 @@ batch and three legacy rewrites.
 | Round 17 (LeetCode 161–170) | 4 posts — **live** |
 | Rounds 18–20 (LeetCode 171–200) | 4 posts — **live** |
 | Round 21 (LeetCode 201–210) | 8 posts — **live** |
-| Round 22 (LeetCode 211–220) | 5 in the repo — 211, 215, 217, 218, 219. Not started. |
-| Site total | **866 posts** (several tracks publish in parallel; the LeetCode work accounts for 107) |
+| Round 22 (LeetCode 211–220) | 5 posts — **live** |
+| Round 23 (LeetCode 221–230) | 3 in the repo — 221, 222, 229. Not started. |
+| Site total | **870 posts** (several tracks publish in parallel; the LeetCode work accounts for 112) |
 | Category | `fundamental-problem`, already existed — no nav change needed |
 
-Live at https://lovemesomecoding.com/fundamental-problem, which now holds 118 posts: the 107
-LeetCode ones leading the archive, above the 11 legacy 2019 posts. All 107 return 200, all 107 are in
+Live at https://lovemesomecoding.com/fundamental-problem, which now holds 123 posts: the 112
+LeetCode ones leading the archive, above the 11 legacy 2019 posts. All 112 return 200, all 112 are in
 `sitemap.xml`, highlighting renders, cross-post links resolve, and the pre-existing URLs in this and
 other categories are unaffected.
 
@@ -243,7 +244,7 @@ Everything below was run and passed on 2026-08-12, covering all four published r
 blocks *out of the published HTML* — so they test what a reader would copy, not a retyped copy — and
 exercise them against the LeetCode examples plus the edge cases each post claims to handle:
 overflow, `Integer.MIN_VALUE`, empty strings, duplicate values, even-length palindromes, `""` against
-`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **1026 Python assertions and 1004 Java
+`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **1069 Python assertions and 1040 Java
 assertions, all green.** Several of those are worth more than the rest put together: problems 12 and 13
 are inverses, so both suites round-trip every integer from 1 to 3999 through `intToRoman` and back
 through `romanToInt`; problem 22's output is checked against the Catalan numbers up to n = 8 (1430
@@ -291,8 +292,15 @@ out, rounds 2 through 4 against the live site after:
   return 200.
 - All 33 post URLs return 200 and all 33 appear in `sitemap.xml`.
 
-**`npm run build`** passes, including `verify-build.mjs`: 866/866 posts served, 43/43 category counts
-agree, 103 redirects intact, 1090 HTML files emitted.
+**`npm run build`** passes, including `verify-build.mjs`: 870/870 posts served, 43/43 category counts
+agree, 104 redirects intact, 1094 HTML files emitted.
+
+**Round 22's model caught an error in a post before any test ran.** The brute-force skyline model —
+sample the height at every building edge, emit only changes — disagreed with the expected output
+written into LeetCode 218's problem statement section. The post claimed `[19,8]` was a key point; it
+is not, because the taller `[15,20,10]` still covers x = 19 and the skyline does not change until
+that building ends at 20. The post now says so explicitly, since it is exactly the kind of thing a
+reader would trip over.
 
 **Round 15's harness caught a real bug in a published solution before it shipped.** The exhaustive
 collinearity check on LeetCode 149 failed on `[[0,0],[0,0],[0,1]]` — the code returned 2 where the
@@ -370,9 +378,10 @@ this machine. The checks above were done against the rendered HTML instead.
       **The track is contiguous through LeetCode 200.**
 - [x] ~~Round 21 seeded to prod and deployed.~~ Done 2026-08-24 (dated 2025-02/03). Eight posts,
       the largest round so far.
-- [ ] Round 22 (LeetCode 211–220 has five: 211 Add and Search Word, 215 Kth Largest Element,
-      217 Contains Duplicate, 218 The Skyline Problem, 219 Contains Duplicate II). Dates continue
-      in the window before LeetCode 347.
+- [x] ~~Round 22 seeded to prod and deployed.~~ Done 2026-08-24 (dated 2025-03). Includes
+      The Skyline Problem, the hardest post in the track.
+- [ ] Round 23 (LeetCode 221–230 has three: 221 Maximal Square, 222 Count Complete Tree Nodes,
+      229 Majority Element II).
 - [ ] **Decide what happens after LeetCode 120.** Round 13 starts at 121, where the numbered rounds
       meet the interview-essentials posts and the 2022–2024 window has nothing left to give.
 - [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.

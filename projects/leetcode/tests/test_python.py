@@ -3163,6 +3163,176 @@ for n in range(1, 5):
                 bad.append(("should be empty", n, edges, order))
 check("returns a valid order exactly when 207 says one exists", bad, [])
 
+print("LeetCode 211 - Design Add and Search Words")
+ns211 = {}
+exec(compile("\n".join(blocks("211-design-add-and-search-words.html")), "worddict", "exec"), ns211)
+WordDictionary = ns211["WordDictionary"]
+wd = WordDictionary()
+for w in ("bad", "dad", "mad"):
+    wd.addWord(w)
+check('search("pad")', wd.search("pad"), False)
+check('search("bad")', wd.search("bad"), True)
+check('search(".ad")', wd.search(".ad"), True)
+check('search("b..")', wd.search("b.."), True)
+check('search("...")', wd.search("..."), True)
+check('search("....") -- length must match', wd.search("...."), False)
+check('search("") on a non-empty dictionary', wd.search(""), False)
+check("search before any add", WordDictionary().search("a"), False)
+check("all dots on an empty dictionary", WordDictionary().search("."), False)
+# Against a regex model over a random word set.
+rng = random.Random(20260907)
+words = ["".join(rng.choice("abc") for _ in range(rng.randrange(1, 5))) for _ in range(50)]
+real = WordDictionary()
+for w in words:
+    real.addWord(w)
+def matches_model(pattern):
+    return any(len(w) == len(pattern)
+               and all(pc == "." or pc == wc for pc, wc in zip(pattern, w))
+               for w in words)
+bad = []
+for n in range(1, 5):
+    for combo in itertools.product("abc.", repeat=n):
+        pattern = "".join(combo)
+        if real.search(pattern) != matches_model(pattern):
+            bad.append(pattern)
+check("matches a wildcard model on every abc/dot pattern up to length 4", bad, [])
+
+print("LeetCode 215 - Kth Largest Element in an Array")
+s = load("215-kth-largest-element-in-an-array.html")
+check("[3,2,1,5,6,4] k=2", s.findKthLargest([3,2,1,5,6,4], 2), 5)
+check("[3,2,3,1,2,4,5,5,6] k=4 (duplicates COUNT)",
+      s.findKthLargest([3,2,3,1,2,4,5,5,6], 4), 4)
+check("[1] k=1", s.findKthLargest([1], 1), 1)
+check("[2,1] k=2", s.findKthLargest([2,1], 2), 1)
+check("negatives", s.findKthLargest([-1,-3,-2], 2), -2)
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product([1, 2, 3], repeat=n):
+        want_sorted = sorted(combo, reverse=True)
+        for k in range(1, n + 1):
+            if s.findKthLargest(list(combo), k) != want_sorted[k - 1]:
+                bad.append((combo, k))
+check("matches sorted-descending indexing on every array up to length 7", bad, [])
+if hasattr(s, "findKthLargestHeap"):
+    bad = []
+    for n in range(1, 7):
+        for combo in itertools.product([1, 2, 3, 4], repeat=n):
+            for k in range(1, n + 1):
+                if s.findKthLargestHeap(list(combo), k) != sorted(combo, reverse=True)[k - 1]:
+                    bad.append((combo, k))
+    check("[explicit heap version] agrees", bad, [])
+
+print("LeetCode 217 - Contains Duplicate")
+s = load("217-contains-duplicate.html")
+check("[1,2,3,1]", s.containsDuplicate([1,2,3,1]), True)
+check("[1,2,3,4]", s.containsDuplicate([1,2,3,4]), False)
+check("[1,1,1,3,3,4,3,2,4,2]", s.containsDuplicate([1,1,1,3,3,4,3,2,4,2]), True)
+check("[1] (single)", s.containsDuplicate([1]), False)
+check("[] (empty)", s.containsDuplicate([]), False)
+bad = []
+for n in range(0, 9):
+    for combo in itertools.product([1, 2, 3], repeat=n):
+        if s.containsDuplicate(list(combo)) != (len(set(combo)) != len(combo)):
+            bad.append(combo)
+check("matches set-length comparison on every array up to length 8", bad, [])
+if hasattr(s, "containsDuplicateEarly"):
+    bad = [c for n in range(0, 8) for c in itertools.product([1, 2], repeat=n)
+           if s.containsDuplicateEarly(list(c)) != (len(set(c)) != len(c))]
+    check("[early-exit version] agrees", bad, [])
+
+print("LeetCode 218 - The Skyline Problem")
+s = load("218-the-skyline-problem.html")
+def skyline_model(buildings):
+    """Sample the height at every edge; emit only where it changes."""
+    xs = sorted({x for b in buildings for x in (b[0], b[1])})
+    out, prev = [], 0
+    for x in xs:
+        h = max((b[2] for b in buildings if b[0] <= x < b[1]), default=0)
+        if h != prev:
+            out.append([x, h])
+            prev = h
+    return out
+
+canonical = [[2,9,10],[3,7,15],[5,12,12],[15,20,10],[19,24,8]]
+check("the canonical example", [list(p) for p in s.getSkyline([list(b) for b in canonical])],
+      [[2,10],[3,15],[7,12],[12,0],[15,10],[20,8],[24,0]])
+check("[[0,2,3],[2,5,3]] (touching at the same height -- no spurious drop)",
+      [list(p) for p in s.getSkyline([[0,2,3],[2,5,3]])], [[0,3],[5,0]])
+check("single building", [list(p) for p in s.getSkyline([[1,2,1]])], [[1,1],[2,0]])
+check("no buildings", [list(p) for p in s.getSkyline([])], [])
+check("fully nested", [list(p) for p in s.getSkyline([[1,10,5],[3,4,2]])], [[1,5],[10,0]])
+check("identical buildings", [list(p) for p in s.getSkyline([[1,3,4],[1,3,4]])], [[1,4],[3,0]])
+check("adjacent, different heights",
+      [list(p) for p in s.getSkyline([[1,3,4],[3,5,2]])], [[1,4],[3,2],[5,0]])
+# Exhaustive against the sampling model on small coordinate ranges.
+bad = []
+coords = [(l, r, h) for l in range(4) for r in range(l + 1, 5) for h in (1, 2, 3)]
+for count in range(0, 3):
+    for combo in itertools.combinations(coords, count):
+        got = [list(p) for p in s.getSkyline([list(b) for b in combo])]
+        want = skyline_model([list(b) for b in combo])
+        if got != want:
+            bad.append((combo, got, want))
+check("matches height sampling on every set of up to 2 small buildings", bad, [])
+bad = []
+rng2 = random.Random(20260907)
+for trial in range(300):
+    n = rng2.randrange(1, 6)
+    bs = []
+    for _ in range(n):
+        l = rng2.randrange(0, 8)
+        r = l + 1 + rng2.randrange(0, 5)
+        bs.append([l, r, rng2.randrange(1, 6)])
+    got = [list(p) for p in s.getSkyline([list(b) for b in bs])]
+    want = skyline_model([list(b) for b in bs])
+    if got != want:
+        bad.append((bs, got, want))
+check("matches height sampling on 300 random building sets", bad, [])
+# Structural: strictly increasing x, no two consecutive equal heights, ends at 0.
+bad = []
+for trial in range(200):
+    n = rng2.randrange(1, 6)
+    bs = [[(l := rng2.randrange(0, 8)), l + 1 + rng2.randrange(0, 5), rng2.randrange(1, 6)]
+          for _ in range(n)]
+    out = [list(p) for p in s.getSkyline([list(b) for b in bs])]
+    if not out:
+        bad.append(("empty", bs)); continue
+    if [p[0] for p in out] != sorted({p[0] for p in out}):
+        bad.append(("x not strictly increasing", bs, out))
+    elif any(out[i][1] == out[i + 1][1] for i in range(len(out) - 1)):
+        bad.append(("consecutive equal heights", bs, out))
+    elif out[-1][1] != 0:
+        bad.append(("does not end at 0", bs, out))
+check("output has strictly increasing x, no repeated heights, and ends at 0", bad, [])
+
+print("LeetCode 219 - Contains Duplicate II")
+s = load("219-contains-duplicate-ii.html")
+check("[1,2,3,1] k=3", s.containsNearbyDuplicate([1,2,3,1], 3), True)
+check("[1,0,1,1] k=1", s.containsNearbyDuplicate([1,0,1,1], 1), True)
+check("[1,2,3,1,2,3] k=2", s.containsNearbyDuplicate([1,2,3,1,2,3], 2), False)
+check("[1,2,3,1] k=0 (indices must differ)", s.containsNearbyDuplicate([1,2,3,1], 0), False)
+check("[99] k=1", s.containsNearbyDuplicate([99], 1), False)
+check("[] k=1", s.containsNearbyDuplicate([], 1), False)
+check("k larger than the array", s.containsNearbyDuplicate([1,2,1], 100), True)
+def nearby_model(nums, k):
+    return any(nums[i] == nums[j]
+               for i in range(len(nums)) for j in range(i + 1, min(i + k, len(nums) - 1) + 1))
+bad = []
+for n in range(0, 9):
+    for combo in itertools.product([1, 2, 3], repeat=n):
+        for k in range(0, n + 2):
+            if s.containsNearbyDuplicate(list(combo), k) != nearby_model(list(combo), k):
+                bad.append((combo, k))
+check("matches a brute-force pair scan on every array up to length 8", bad, [])
+if hasattr(s, "containsNearbyDuplicateMap"):
+    bad = []
+    for n in range(0, 8):
+        for combo in itertools.product([1, 2, 3], repeat=n):
+            for k in range(0, n + 2):
+                if s.containsNearbyDuplicateMap(list(combo), k) != nearby_model(list(combo), k):
+                    bad.append((combo, k))
+    check("[last-seen map version] agrees", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

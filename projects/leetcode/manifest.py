@@ -1759,6 +1759,71 @@ POSTS = [
         ),
     },
     {
+        "number": 211,
+        "slug": "leetcode-211-design-add-and-search-words",
+        "algorithm": "Implementation",
+        "title": "LeetCode 211 \u2013 Design Add and Search Words Data Structure",
+        "file": "211-design-add-and-search-words.html",
+        "date": "2025-03-04T05:30:53",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "design", "trie", "depth-first-search"],
+        "excerpt": (
+            "Implement Trie with one wildcard added, and that wildcard is the whole problem. A trie search is a walk down one path; a dot turns it into a search over all of them, so the lookup stops being a loop and the complexity stops being linear."
+        ),
+    },
+    {
+        "number": 215,
+        "slug": "leetcode-215-kth-largest-element-in-an-array",
+        "algorithm": "Sorting",
+        "title": "LeetCode 215 \u2013 Kth Largest Element in an Array",
+        "file": "215-kth-largest-element-in-an-array.html",
+        "date": "2025-03-04T11:02:00",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "heap", "quickselect", "sorting"],
+        "excerpt": (
+            "A menu problem: three standard answers with genuinely different trade-offs, and the interview is choosing among them out loud. Why a MIN-heap answers a largest question, why quickselect is O(n) on average, and why the random pivot is not optional."
+        ),
+    },
+    {
+        "number": 217,
+        "slug": "leetcode-217-contains-duplicate",
+        "algorithm": "Warmup",
+        "title": "LeetCode 217 \u2013 Contains Duplicate",
+        "file": "217-contains-duplicate.html",
+        "date": "2025-03-04T15:15:33",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "hash-table", "sorting"],
+        "excerpt": (
+            "A warm-up with one real decision in it, and the decision is about space. The hash set is the default; sorting is the O(1)-space alternative that mutates the input. Noticing a time-for-space trade in an Easy problem is most of what there is to say."
+        ),
+    },
+    {
+        "number": 218,
+        "slug": "leetcode-218-the-skyline-problem",
+        "algorithm": "Sorting",
+        "title": "LeetCode 218 \u2013 The Skyline Problem",
+        "file": "218-the-skyline-problem.html",
+        "date": "2025-03-06T22:04:48",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "heap", "sorting", "sweep-line", "divide-and-conquer"],
+        "excerpt": (
+            "The hardest problem on this track, and almost none of it is the algorithm. Sweep left to right and emit a point when the tallest active building changes. The difficulty is three tie-break rules and deleting from a heap \u2014 and one sign trick gives all three rules from a single sort."
+        ),
+    },
+    {
+        "number": 219,
+        "slug": "leetcode-219-contains-duplicate-ii",
+        "algorithm": "Implementation",
+        "title": "LeetCode 219 \u2013 Contains Duplicate II",
+        "file": "219-contains-duplicate-ii.html",
+        "date": "2025-03-11T15:24:08",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "hash-table", "sliding-window"],
+        "excerpt": (
+            "Contains Duplicate with a distance limit, and the limit is what turns a set into a sliding window. Bound the set to k and a hit implies proximity for free. Plus why the last-seen map may overwrite: a closer occurrence dominates the older one forever."
+        ),
+    },
+    {
         "number": 347,
         "batch": "interview-essentials",
         "slug": "leetcode-347-top-k-frequent-elements",

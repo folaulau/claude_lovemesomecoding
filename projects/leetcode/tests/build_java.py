@@ -143,6 +143,16 @@ solution("205-isomorphic-strings.html", "S205")
 solution("206-reverse-linked-list.html", "S206")
 solution("207-course-schedule.html", "S207")
 solution("210-course-schedule-ii.html", "S210")
+solution("215-kth-largest-element-in-an-array.html", "S215")
+solution("217-contains-duplicate.html", "S217")
+solution("218-the-skyline-problem.html", "S218")
+solution("219-contains-duplicate-ii.html", "S219")
+
+# LeetCode 211 defines `class WordDictionary`, not `class Solution`.
+for block in blocks("211-design-add-and-search-words.html"):
+    if re.search(r'\bclass\s+WordDictionary\b', block):
+        parts.append(block)
+        break
 
 # LeetCode 208 defines `class Trie`, not `class Solution`.
 for block in blocks("208-implement-trie-prefix-tree.html"):
@@ -964,6 +974,33 @@ public class Main {
         int[][] out = new int[xs.length][];
         for (int i = 0; i < xs.length; i++) out[i] = xs[i].clone();
         return out;
+    }
+
+    /** Sample the skyline height at every building edge; emit only changes. */
+    static List<List<Integer>> skylineModel(int[][] buildings) {
+        TreeSet<Integer> xs = new TreeSet<>();
+        for (int[] b : buildings) { xs.add(b[0]); xs.add(b[1]); }
+
+        List<List<Integer>> out = new ArrayList<>();
+        int previous = 0;
+        for (int x : xs) {
+            int height = 0;
+            for (int[] b : buildings) if (b[0] <= x && x < b[1]) height = Math.max(height, b[2]);
+            if (height != previous) { out.add(List.of(x, height)); previous = height; }
+        }
+        return out;
+    }
+
+    /** Does any stored word match this dot-wildcard pattern? */
+    static boolean wildcardModel(List<String> words, String pattern) {
+        for (String w : words) {
+            if (w.length() != pattern.length()) continue;
+            boolean ok = true;
+            for (int i = 0; i < w.length(); i++)
+                if (pattern.charAt(i) != '.' && pattern.charAt(i) != w.charAt(i)) ok = false;
+            if (ok) return true;
+        }
+        return false;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -3760,6 +3797,164 @@ public class Main {
             }
         }
         check("matches a set of 60 words on every abc query up to length 4", trieBad, 0);
+
+        System.out.println("LeetCode 211 - Design Add and Search Words");
+        WordDictionary wd = new WordDictionary();
+        wd.addWord("bad"); wd.addWord("dad"); wd.addWord("mad");
+        check("search(pad)", wd.search("pad"), false);
+        check("search(bad)", wd.search("bad"), true);
+        check("search(.ad)", wd.search(".ad"), true);
+        check("search(b..)", wd.search("b.."), true);
+        check("search(...)", wd.search("..."), true);
+        check("search(....) -- length must match", wd.search("...."), false);
+        check("search before any add", new WordDictionary().search("a"), false);
+        // Against a wildcard model over a random word set.
+        List<String> dictWords = new ArrayList<>();
+        WordDictionary bigDict = new WordDictionary();
+        Random wdRng = new Random(20260907);
+        for (int i = 0; i < 50; i++) {
+            StringBuilder w = new StringBuilder();
+            int len = 1 + wdRng.nextInt(4);
+            for (int j = 0; j < len; j++) w.append((char) ('a' + wdRng.nextInt(3)));
+            dictWords.add(w.toString());
+            bigDict.addWord(w.toString());
+        }
+        char[] patternAlphabet = {'a', 'b', 'c', '.'};
+        int wildcardBad = 0;
+        for (int n = 1; n <= 4; n++) {
+            int combos = (int) Math.pow(4, n);
+            for (int mask = 0; mask < combos; mask++) {
+                StringBuilder pat = new StringBuilder();
+                int mm = mask;
+                for (int i = 0; i < n; i++) { pat.append(patternAlphabet[mm % 4]); mm /= 4; }
+                String pattern = pat.toString();
+                if (bigDict.search(pattern) != wildcardModel(dictWords, pattern)) wildcardBad++;
+            }
+        }
+        check("matches a wildcard model on every abc/dot pattern up to length 4", wildcardBad, 0);
+
+        System.out.println("LeetCode 215 - Kth Largest Element in an Array");
+        S215 s215 = new S215();
+        check("[3,2,1,5,6,4] k=2", s215.findKthLargest(new int[]{3,2,1,5,6,4}, 2), 5);
+        check("[3,2,3,1,2,4,5,5,6] k=4 (duplicates COUNT)",
+              s215.findKthLargest(new int[]{3,2,3,1,2,4,5,5,6}, 4), 4);
+        check("[1] k=1", s215.findKthLargest(new int[]{1}, 1), 1);
+        check("[2,1] k=2", s215.findKthLargest(new int[]{2,1}, 2), 1);
+        check("negatives", s215.findKthLargest(new int[]{-1,-3,-2}, 2), -2);
+        int kthBad = 0;
+        for (int n = 1; n <= 7; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] nums = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { nums[i] = 1 + mm % 3; mm /= 3; }
+                int[] descending = nums.clone();
+                Arrays.sort(descending);
+                for (int k = 1; k <= n; k++)
+                    if (s215.findKthLargest(nums.clone(), k) != descending[n - k]) kthBad++;
+            }
+        }
+        check("matches sorted-descending indexing on every array up to length 7", kthBad, 0);
+
+        System.out.println("LeetCode 217 - Contains Duplicate");
+        S217 s217 = new S217();
+        check("[1,2,3,1]", s217.containsDuplicate(new int[]{1,2,3,1}), true);
+        check("[1,2,3,4]", s217.containsDuplicate(new int[]{1,2,3,4}), false);
+        check("[1] (single)", s217.containsDuplicate(new int[]{1}), false);
+        check("[] (empty)", s217.containsDuplicate(new int[]{}), false);
+        int dupBad = 0;
+        for (int n = 0; n <= 8; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] nums = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { nums[i] = 1 + mm % 3; mm /= 3; }
+                Set<Integer> distinct = new HashSet<>();
+                for (int x : nums) distinct.add(x);
+                if (s217.containsDuplicate(nums.clone()) != (distinct.size() != n)) dupBad++;
+            }
+        }
+        check("matches set-length comparison on every array up to length 8", dupBad, 0);
+
+        System.out.println("LeetCode 218 - The Skyline Problem");
+        S218 s218 = new S218();
+        check("the canonical example",
+              s218.getSkyline(new int[][]{{2,9,10},{3,7,15},{5,12,12},{15,20,10},{19,24,8}}),
+              List.of(List.of(2,10), List.of(3,15), List.of(7,12), List.of(12,0),
+                      List.of(15,10), List.of(20,8), List.of(24,0)));
+        check("touching at the same height -- no spurious drop",
+              s218.getSkyline(new int[][]{{0,2,3},{2,5,3}}),
+              List.of(List.of(0,3), List.of(5,0)));
+        check("single building", s218.getSkyline(new int[][]{{1,2,1}}),
+              List.of(List.of(1,1), List.of(2,0)));
+        check("no buildings", s218.getSkyline(new int[][]{}), List.of());
+        check("fully nested", s218.getSkyline(new int[][]{{1,10,5},{3,4,2}}),
+              List.of(List.of(1,5), List.of(10,0)));
+        check("identical buildings", s218.getSkyline(new int[][]{{1,3,4},{1,3,4}}),
+              List.of(List.of(1,4), List.of(3,0)));
+        // Exhaustive on tiny inputs, then randomised on larger ones.
+        int skylineBad = 0;
+        List<int[]> smallBuildings = new ArrayList<>();
+        for (int l = 0; l < 4; l++)
+            for (int r = l + 1; r < 5; r++)
+                for (int h = 1; h <= 3; h++) smallBuildings.add(new int[]{l, r, h});
+        for (int i = 0; i < smallBuildings.size(); i++) {
+            for (int j = i + 1; j < smallBuildings.size(); j++) {
+                int[][] pair = {smallBuildings.get(i).clone(), smallBuildings.get(j).clone()};
+                if (!s218.getSkyline(deepCopy(pair)).equals(skylineModel(deepCopy(pair)))) skylineBad++;
+            }
+        }
+        check("matches height sampling on every pair of small buildings", skylineBad, 0);
+        int randomSkylineBad = 0, shapeSkylineBad = 0;
+        Random skyRng = new Random(20260907);
+        for (int trial = 0; trial < 300; trial++) {
+            int n = 1 + skyRng.nextInt(5);
+            int[][] bs = new int[n][];
+            for (int i = 0; i < n; i++) {
+                int l = skyRng.nextInt(8);
+                bs[i] = new int[]{l, l + 1 + skyRng.nextInt(5), 1 + skyRng.nextInt(5)};
+            }
+            List<List<Integer>> got = s218.getSkyline(deepCopy(bs));
+            if (!got.equals(skylineModel(deepCopy(bs)))) randomSkylineBad++;
+
+            if (got.isEmpty()) { shapeSkylineBad++; continue; }
+            for (int i = 0; i + 1 < got.size(); i++) {
+                if (got.get(i).get(0) >= got.get(i + 1).get(0)) shapeSkylineBad++;
+                if (got.get(i).get(1).equals(got.get(i + 1).get(1))) shapeSkylineBad++;
+            }
+            if (got.get(got.size() - 1).get(1) != 0) shapeSkylineBad++;
+        }
+        check("matches height sampling on 300 random building sets", randomSkylineBad, 0);
+        check("output has strictly increasing x, no repeated heights, and ends at 0",
+              shapeSkylineBad, 0);
+
+        System.out.println("LeetCode 219 - Contains Duplicate II");
+        S219 s219 = new S219();
+        check("[1,2,3,1] k=3", s219.containsNearbyDuplicate(new int[]{1,2,3,1}, 3), true);
+        check("[1,0,1,1] k=1", s219.containsNearbyDuplicate(new int[]{1,0,1,1}, 1), true);
+        check("[1,2,3,1,2,3] k=2", s219.containsNearbyDuplicate(new int[]{1,2,3,1,2,3}, 2), false);
+        check("[1,2,3,1] k=0 (indices must differ)",
+              s219.containsNearbyDuplicate(new int[]{1,2,3,1}, 0), false);
+        check("[99] k=1", s219.containsNearbyDuplicate(new int[]{99}, 1), false);
+        check("[] k=1", s219.containsNearbyDuplicate(new int[]{}, 1), false);
+        check("k larger than the array", s219.containsNearbyDuplicate(new int[]{1,2,1}, 100), true);
+        int nearbyBad = 0;
+        for (int n = 0; n <= 8; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] nums = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { nums[i] = 1 + mm % 3; mm /= 3; }
+                for (int k = 0; k <= n + 1; k++) {
+                    boolean nearbyPair = false;
+                    for (int i = 0; i < n && !nearbyPair; i++)
+                        for (int j = i + 1; j <= Math.min(i + k, n - 1) && !nearbyPair; j++)
+                            if (nums[i] == nums[j]) nearbyPair = true;
+                    if (s219.containsNearbyDuplicate(nums.clone(), k) != nearbyPair) nearbyBad++;
+                }
+            }
+        }
+        check("matches a brute-force pair scan on every array up to length 8", nearbyBad, 0);
 
         System.out.println();
         if (failures > 0) {

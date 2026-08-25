@@ -1,0 +1,247 @@
+<p>The Skyline Problem is the hardest thing on this track so far, and almost none of the difficulty
+is in the algorithm. Sweep left to right tracking the tallest active building and emit a point
+whenever that maximum changes — that is the whole idea. The difficulty is in <strong>tie-breaking
+the sort</strong> and in <strong>deleting from a heap</strong>, and both have to be right or the
+output is subtly wrong rather than obviously broken.</p>
+
+<h2>The problem</h2>
+
+<p>Given buildings as <code>[left, right, height]</code>, return the skyline as a list of
+<code>[x, height]</code> key points — the left endpoint of each horizontal segment, in order, with
+the last point at height 0.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">[[2,9,10],[3,7,15],[5,12,12],[15,20,10],[19,24,8]]
+
+ -&gt; [[2,10],[3,15],[7,12],[12,0],[15,10],[20,8],[24,0]]
+
+        15 ┤   ┌───┐
+        12 ┤   │   └───┐
+        10 ┤ ┌─┘       │        ┌────┐
+         8 ┤ │         │        │    └──┐
+         0 ┼─┴─────────┴────────┴───────┴──
+           2 3       7 12      15 19  20 24</code></pre>
+
+<p>Note that <code>19</code> produces no point even though a building starts there — the taller
+<code>[15,20,10]</code> still covers it, so the skyline does not change until that building ends at
+20. A key point marks a change in the <em>visible</em> outline, not a building edge.</p>
+
+<p>No two consecutive points may share a height — the output describes <em>changes</em>, so emitting
+<code>[7,12]</code> followed by <code>[8,12]</code> is wrong even though the picture is the same.
+That constraint is the source of most failed submissions.</p>
+
+<h2>The sweep</h2>
+
+<p>Convert each building into two events and process them left to right:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">[left, right, height]  -&gt;  (left, START, height)
+                           (right, END, height)
+
+at each x:
+    apply every event at that x
+    look at the tallest active building
+    if it differs from the last emitted height, emit [x, newMax]</code></pre>
+
+<p>The active set needs the maximum, so it is a heap — or anything with an efficient
+"largest element" query. Everything below is about making that work.</p>
+
+<h2>The three tie-breaking rules</h2>
+
+<p>Events sharing an <code>x</code> must be ordered carefully, and each rule fixes a specific wrong
+output:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">1. all STARTS before all ENDS at the same x
+     two buildings touching at x -- one ending, one starting at the same
+     height -- must not produce a spurious drop to 0 and back.
+
+2. among STARTS, TALLER first
+     otherwise a short building emits a point that the taller one
+     immediately overwrites: [x, 5] then [x, 9].
+
+3. among ENDS, SHORTER first
+     same reason mirrored: removing the short one first leaves the max
+     unchanged and emits nothing.</code></pre>
+
+<p>The standard encoding gets all three from a single sort. Represent a start as
+<code>(x, −height)</code> and an end as <code>(x, +height)</code>, then sort the pairs
+lexicographically:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">starts carry NEGATIVE heights, so they sort before ends at the same x   (rule 1)
+among starts, -9 &lt; -5, so taller comes first                            (rule 2)
+among ends,    5 &lt;  9, so shorter comes first                           (rule 3)</code></pre>
+
+<p>One sort key, three rules. Being able to explain why the sign trick produces all three is the
+single best thing to say about this problem — it is the part that looks like magic in published
+solutions.</p>
+
+<h2>Lazy deletion</h2>
+
+<p>The other difficulty: a binary heap has no "remove this particular element" in less than
+<code>O(n)</code>. When a building ends, its height must leave the active set — and you cannot reach
+into the middle of the heap to take it.</p>
+
+<p>The standard fix is <strong>lazy deletion</strong>: do not remove it. Record it in a
+"to be removed" multiset, and whenever the heap's top is something that should already be gone, pop
+and discard it. Only the top ever matters, so anything stale deeper down is harmless until it
+surfaces.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">on END(h):        toRemove[h] += 1
+before reading the max:
+    while heap is non-empty and toRemove[heap.top] &gt; 0:
+        toRemove[heap.top] -= 1
+        heap.pop()</code></pre>
+
+<p>Each height is pushed once and popped at most once, so the cleanup is amortised
+<code>O(log n)</code> per event despite the inner loop.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution {
+    public List&lt;List&lt;Integer&gt;&gt; getSkyline(int[][] buildings) {
+        // (x, -height) for a start, (x, +height) for an end.
+        // Sorting these lexicographically gives all three tie-break rules at once.
+        List&lt;int[]&gt; events = new ArrayList&lt;&gt;();
+        for (int[] b : buildings) {
+            events.add(new int[]{b[0], -b[2]});
+            events.add(new int[]{b[1], b[2]});
+        }
+        events.sort((p, q) -&gt; p[0] != q[0] ? Integer.compare(p[0], q[0])
+                                           : Integer.compare(p[1], q[1]));
+
+        PriorityQueue&lt;Integer&gt; active = new PriorityQueue&lt;&gt;(Comparator.reverseOrder());
+        Map&lt;Integer, Integer&gt; pendingRemoval = new HashMap&lt;&gt;();
+        active.offer(0);                     // ground level: the skyline is never below 0
+
+        List&lt;List&lt;Integer&gt;&gt; skyline = new ArrayList&lt;&gt;();
+        int previousMax = 0;
+
+        for (int[] event : events) {
+            int x = event[0], signed = event[1];
+
+            if (signed &lt; 0) {
+                active.offer(-signed);                       // a building starts
+            } else {
+                pendingRemoval.merge(signed, 1, Integer::sum);  // lazy delete
+            }
+
+            // Discard anything on top that has already ended.
+            while (!active.isEmpty() &amp;&amp; pendingRemoval.getOrDefault(active.peek(), 0) &gt; 0) {
+                pendingRemoval.merge(active.peek(), -1, Integer::sum);
+                active.poll();
+            }
+
+            int currentMax = active.peek();
+            if (currentMax != previousMax) {                 // only CHANGES are points
+                skyline.add(List.of(x, currentMax));
+                previousMax = currentMax;
+            }
+        }
+
+        return skyline;
+    }
+}</code></pre>
+
+<p>Seeding the heap with <code>0</code> is what makes the final point work. When the last building
+ends the heap would otherwise be empty and <code>peek()</code> would throw; with the ground level
+always present, the max drops to 0 and <code>[x, 0]</code> is emitted like any other change.</p>
+
+<p><code>Integer.compare</code> rather than subtraction in the comparator, for the overflow reason
+from <a href="/fundamental-problem/leetcode-56-merge-intervals">Merge Intervals</a>.</p>
+
+<p>The <code>currentMax != previousMax</code> guard is what enforces "no two consecutive points at
+the same height". Every event is processed; only some produce output.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">import heapq
+
+
+class Solution:
+    def getSkyline(self, buildings: list[list[int]]) -&gt; list[list[int]]:
+        # (x, -h) starts sort before (x, +h) ends; taller starts and shorter ends first.
+        events = sorted([(left, -height) for left, _, height in buildings]
+                        + [(right, height) for _, right, height in buildings])
+
+        # heapq is a MIN-heap, so heights are stored negated: heap[0] is the tallest.
+        heap = [0]                        # ground level, so the last point can be emitted
+        pending: dict[int, int] = {}
+        skyline: list[list[int]] = []
+        previous_max = 0
+
+        for x, signed in events:
+            if signed &lt; 0:
+                heapq.heappush(heap, signed)          # push the negative directly
+            else:
+                pending[-signed] = pending.get(-signed, 0) + 1
+
+            while heap and pending.get(heap[0], 0) &gt; 0:
+                pending[heap[0]] -= 1
+                heapq.heappop(heap)
+
+            current_max = -heap[0]
+            if current_max != previous_max:
+                skyline.append([x, current_max])
+                previous_max = current_max
+
+        return skyline</code></pre>
+
+<p><code>heapq</code> is a min-heap, so heights are stored negated and the smallest stored value is
+the tallest building. The <code>pending</code> map is keyed by the same negated values, which keeps
+the comparison in one representation — mixing the two is the easiest way to break this.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th></th><th>Time</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Sort the events</td><td><code>O(n log n)</code></td><td><code>O(n)</code></td></tr>
+    <tr><td>Sweep with a heap</td><td><code>O(n log n)</code></td><td><code>O(n)</code></td></tr>
+  </tbody>
+</table>
+
+<p><code>2n</code> events, each doing <code>O(log n)</code> heap work, plus the sort. The lazy
+deletion adds nothing asymptotically because each pushed height is popped at most once — that
+amortised argument is the same one behind
+<a href="/fundamental-problem/leetcode-173-binary-search-tree-iterator">BST Iterator</a> and
+<a href="/fundamental-problem/leetcode-114-flatten-binary-tree-to-linked-list">Flatten Binary
+Tree</a>, and it keeps recurring for a reason.</p>
+
+<p>The heap can hold stale entries, so its size is <code>O(n)</code> rather than the number of
+genuinely active buildings. With a <code>TreeMap</code> of height counts instead, deletion is
+immediate and the structure holds only live buildings — same complexity, less garbage, and a
+reasonable answer if the interviewer asks about the accumulation.</p>
+
+<h2>The divide-and-conquer alternative</h2>
+
+<p>There is a second standard solution: split the buildings in half, compute each skyline
+recursively, and merge the two the way merge sort merges lists — walking both and taking the
+pointwise maximum. It is <code>O(n log n)</code> as well, and the merge step has its own
+tie-breaking to get right.</p>
+
+<p>Mention it. The sweep is easier to reason about under time pressure and easier to explain, but
+knowing the problem has a divide-and-conquer shape is what connects it to
+<a href="/fundamental-problem/leetcode-23-merge-k-sorted-lists">Merge k Sorted Lists</a> — which has
+exactly the same two solutions, heap and pairwise merge, for the same reason.</p>
+
+<h2>The pattern</h2>
+
+<p>Sweep line with an active set solves a whole class of interval problems:
+<strong>Meeting Rooms II</strong> (253) sweeps <code>+1</code>/<code>−1</code> and tracks the peak;
+<strong>Employee Free Time</strong> (759) sweeps for gaps;
+<a href="/fundamental-problem/leetcode-56-merge-intervals">Merge Intervals</a> (56) is the
+degenerate case where the active set is just a counter.</p>
+
+<p>The recurring shape: <em>turn each interval into two events, sort them, and carry a structure that
+answers one question about whatever is currently open.</em> What changes between problems is only
+that question — the count, the maximum, the gap.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That you convert buildings into events and sweep.</li>
+  <li>All three tie-break rules, and ideally the sign trick that gives them from one sort.</li>
+  <li>Lazy deletion, or a structure that supports removal.</li>
+  <li>The ground-level 0 in the heap, so the final point is emitted.</li>
+  <li>That only <em>changes</em> in the maximum become output points.</li>
+  <li>Buildings that touch exactly, that nest, and that are identical.</li>
+  <li>That the amortised cost of lazy deletion is still <code>O(log n)</code>.</li>
+</ul>

@@ -70,7 +70,8 @@ span three numeric rounds (171–180, 181–190, 191–200) and were written and
 | 17 | 161–170 | 4 — 160 (see note), 168, 169, 170 | **live** since 2025-01 |
 | 18–20 | 171–200 | 4 — 173, 189, 198, 199 | **live** since 2025-01/02 |
 | 21 | 201–210 | 8 — 202, 203, 204, 205, 206, 207, 208, 210 | **live** since 2025-02/03 |
-| 22 | 211–220 | 4 — 211, 215, 217, 218, 219 | not started |
+| 22 | 211–220 | 5 — 211, 215, 217, 218, 219 | **live** since 2025-03 |
+| 23 | 221–230 | 3 — 221, 222, 229 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -102,21 +103,22 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 110 posts:
+Current distribution across the 115 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Implementation | 27 |
+| Implementation | 29 |
 | Graph Theory | 23 |
 | Strings | 15 |
 | Dynamic Programming | 15 |
+| Sorting | 10 |
 | Recursion | 10 |
-| Sorting | 8 |
 | Searching | 6 |
 | Greedy | 4 |
 | Bit Manipulation | 2 |
+| Warmup | 1 |
 
-Constructive Algorithms, Game Theory and Warmup are in the taxonomy but unused so far —
+Constructive Algorithms and Game Theory are in the taxonomy but unused so far —
 nothing published fits them.
 
 Changing an `algorithm` means re-seeding that post, which rewrites its content too. That is safe
