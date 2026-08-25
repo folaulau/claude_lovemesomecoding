@@ -64,7 +64,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 14 | 131–140 | 6 — 131, 133, 134, 136, 138, 139 | **live** since 2024-12 |
 | 15 | 141–150 | 6 — 141, 142, 144, 145, 146, 149 | **live** since 2024-12/2025-01 |
 | 16 | 151–160 | 6 — 151, 152, 156, 157, 158, 159 | **live** since 2025-01 |
-| 17 | 161–170 | 4 — 160 (see note), 168, 169, 170 | not started |
+| 17 | 161–170 | 4 — 160 (see note), 168, 169, 170 | **live** since 2025-01 |
+| 18 | 171–200 | 4 — 173, 189, 198, 199 | not started |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -96,14 +97,14 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 94 posts:
+Current distribution across the 98 posts:
 
 | Algorithm | Posts |
 |---|---|
+| Implementation | 21 |
 | Graph Theory | 19 |
-| Implementation | 18 |
+| Strings | 14 |
 | Dynamic Programming | 14 |
-| Strings | 13 |
 | Recursion | 10 |
 | Sorting | 8 |
 | Searching | 6 |
@@ -118,6 +119,11 @@ Changing an `algorithm` means re-seeding that post, which rewrites its content t
 
 `--round` and `--batch` are mutually exclusive. When these numbers come up in their real rounds
 (13, 20, 35, 55), drop the `batch` key rather than adding a duplicate entry.
+
+Round 17 uses `--batch round-17` for a different reason. LeetCode 160 belongs numerically to round
+16's block but was written a round late, and `--round 16 --write` would have re-seeded the six posts
+already published there — rewriting their content identically and bumping `modified`, which the post
+page displays. Batching the four round-17 posts publishes 160 without touching anything else.
 
 ### Legacy rewrites (`--batch legacy-rewrite`)
 

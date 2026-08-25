@@ -2669,6 +2669,146 @@ for n in range(0, 10):
             bad.append(text)
 check("matches brute force on every abc string up to length 9", bad, [])
 
+print("LeetCode 160 - Intersection of Two Linked Lists")
+s = load("160-intersection-of-two-linked-lists.html", extra=LISTNODE)
+nsL = {}
+exec(compile(LISTNODE, "listnode", "exec"), nsL)
+def build_intersecting(a_only, b_only, shared):
+    """Two lists with private prefixes and a genuinely shared tail."""
+    Node = nsL["ListNode"]
+    tail = None
+    for v in reversed(shared):
+        node = Node(v); node.next = tail; tail = node
+    def prefix(values):
+        head = tail
+        for v in reversed(values):
+            node = Node(v); node.next = head; head = node
+        return head
+    return prefix(a_only), prefix(b_only), tail
+
+headA, headB, expected = build_intersecting([4,1], [5,6,1], [8,4,5])
+check("classic example returns the shared node",
+      s.getIntersectionNode(headA, headB) is expected, True)
+headA, headB, _ = build_intersecting([2,6,4], [1,5], [])
+check("no intersection", s.getIntersectionNode(headA, headB), None)
+# Two SEPARATE nodes holding the same value must not count.
+one, two = nsL["ListNode"](3), nsL["ListNode"](3)
+check("equal values, different nodes", s.getIntersectionNode(one, two), None)
+check("either list empty", s.getIntersectionNode(None, nsL["ListNode"](1)), None)
+headA, headB, expected = build_intersecting([], [], [7])
+check("both lists ARE the shared tail", s.getIntersectionNode(headA, headB) is expected, True)
+bad = []
+for la in range(0, 5):
+    for lb in range(0, 5):
+        for lc in range(0, 5):
+            headA, headB, expected = build_intersecting(
+                list(range(la)), list(range(100, 100 + lb)), list(range(200, 200 + lc)))
+            got = s.getIntersectionNode(headA, headB)
+            want = expected if lc > 0 else None
+            if got is not want:
+                bad.append((la, lb, lc))
+check("every prefix/prefix/shared length combination up to 4", bad, [])
+# The lists must not be modified.
+headA, headB, expected = build_intersecting([4,1], [5,6,1], [8,4,5])
+s.getIntersectionNode(headA, headB)
+check("list A is unchanged", to_arr83(headA), [4,1,8,4,5])
+check("list B is unchanged", to_arr83(headB), [5,6,1,8,4,5])
+
+print("LeetCode 168 - Excel Sheet Column Title")
+s = load("168-excel-sheet-column-title.html")
+check("1", s.convertToTitle(1), "A")
+check("26 (the boundary)", s.convertToTitle(26), "Z")
+check("27 (the other boundary)", s.convertToTitle(27), "AA")
+check("28", s.convertToTitle(28), "AB")
+check("52", s.convertToTitle(52), "AZ")
+check("53", s.convertToTitle(53), "BA")
+check("701", s.convertToTitle(701), "ZY")
+check("702", s.convertToTitle(702), "ZZ")
+check("703", s.convertToTitle(703), "AAA")
+check("Integer.MAX_VALUE", s.convertToTitle(2147483647), "FXSHRXW")
+# Round-trip against the inverse, which is the self-check the post proposes.
+def title_to_number(title):
+    total = 0
+    for c in title:
+        total = total * 26 + (ord(c) - ord("A") + 1)
+    return total
+
+bad = [n for n in range(1, 20001) if title_to_number(s.convertToTitle(n)) != n]
+check("round-trips through the inverse for every n in 1..20000", bad, [])
+# Titles must be strictly increasing in length-then-lex order.
+bad = []
+previous = ""
+for n in range(1, 5000):
+    title = s.convertToTitle(n)
+    if not title or any(c < "A" or c > "Z" for c in title):
+        bad.append((n, title))
+    elif (len(title), title) <= (len(previous), previous):
+        bad.append(("not increasing", n, previous, title))
+    previous = title
+check("titles are A-Z only and strictly increasing", bad, [])
+
+print("LeetCode 169 - Majority Element")
+s = load("169-majority-element.html")
+check("[3,2,3]", s.majorityElement([3,2,3]), 3)
+check("[2,2,1,1,1,2,2]", s.majorityElement([2,2,1,1,1,2,2]), 2)
+check("[1] (single element)", s.majorityElement([1]), 1)
+check("[6,6,6,7,7]", s.majorityElement([6,6,6,7,7]), 6)
+check("[-1,-1,2]", s.majorityElement([-1,-1,2]), -1)
+# Every array that genuinely HAS a majority element, over a small alphabet.
+bad = []
+for n in range(1, 10):
+    for combo in itertools.product([1, 2, 3], repeat=n):
+        counts = collections.Counter(combo)
+        winners = [v for v, c in counts.items() if c > n // 2]
+        if not winners:
+            continue                      # the guarantee does not hold; skip
+        if s.majorityElement(list(combo)) != winners[0]:
+            bad.append(combo)
+check("finds the majority on every array up to length 9 that has one", bad, [])
+# Order must not matter.
+bad = []
+for perm in itertools.islice(itertools.permutations([5,5,5,1,2]), 60):
+    if s.majorityElement(list(perm)) != 5:
+        bad.append(perm)
+check("independent of element order", bad, [])
+
+print("LeetCode 170 - Two Sum III - Data Structure Design")
+ns170 = {}
+exec(compile("\n".join(blocks("170-two-sum-iii-data-structure-design.html")), "twosum", "exec"), ns170)
+TwoSum = ns170["TwoSum"]
+ts = TwoSum()
+ts.add(1); ts.add(3); ts.add(5)
+check("find(4) -> 1+3", ts.find(4), True)
+check("find(7)", ts.find(7), False)
+check("find(8) -> 3+5", ts.find(8), True)
+check("find(2) (needs two 1s)", ts.find(2), False)
+# THE duplicate case.
+single = TwoSum(); single.add(2)
+check("find(4) after ONE add(2)", single.find(4), False)
+double = TwoSum(); double.add(2); double.add(2)
+check("find(4) after TWO add(2)", double.find(4), True)
+zeros = TwoSum(); zeros.add(0); zeros.add(0)
+check("find(0) with two zeros", zeros.find(0), True)
+check("find before any add", TwoSum().find(0), False)
+neg = TwoSum(); neg.add(-1); neg.add(4)
+check("negatives", (neg.find(3), neg.find(-2)), (True, False))
+# Against a brute-force pair scan on random operation sequences.
+rng = random.Random(20260904)
+bad = []
+for trial in range(40):
+    real, model = TwoSum(), []
+    for step in range(60):
+        if rng.random() < 0.5:
+            value = rng.randrange(-4, 9)
+            want = any(model[i] + model[j] == value
+                       for i in range(len(model)) for j in range(i + 1, len(model)))
+            if real.find(value) != want:
+                bad.append((trial, step, "find", value)); break
+        else:
+            number = rng.randrange(-3, 6)
+            real.add(number); model.append(number)
+check("matches a brute-force pair scan over 40 random operation sequences", bad, [])
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES:")

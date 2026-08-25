@@ -1508,6 +1508,72 @@ POSTS = [
         ),
     },
     {
+        "number": 160,
+        "batch": "round-17",
+        "slug": "leetcode-160-intersection-of-two-linked-lists",
+        "algorithm": "Implementation",
+        "title": "LeetCode 160 \u2013 Intersection of Two Linked Lists",
+        "file": "160-intersection-of-two-linked-lists.html",
+        "date": "2025-01-21T17:00:29",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "linked-list", "two-pointers", "hash-table"],
+        "excerpt": (
+            "An O(1)-space solution that looks like sleight of hand: when a pointer runs off one "
+            "list, restart it on the other. The trick is two lines and the reason is one equation \u2014 "
+            "a + c + b = b + c + a, so both arrive together. Switch on null, not on the last node."
+        ),
+    },
+    {
+        "number": 168,
+        "batch": "round-17",
+        "slug": "leetcode-168-excel-sheet-column-title",
+        "algorithm": "Strings",
+        "title": "LeetCode 168 \u2013 Excel Sheet Column Title",
+        "file": "168-excel-sheet-column-title.html",
+        "date": "2025-01-23T15:33:17",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "string", "math"],
+        "excerpt": (
+            "Looks like base-26 and is not: Excel's digits run A to Z representing 1 to 26, with no "
+            "symbol for zero. That single missing digit is the entire problem, the fix is one "
+            "decrement inside the loop, and 26 vs 27 is where every wrong solution shows itself."
+        ),
+    },
+    {
+        "number": 169,
+        "batch": "round-17",
+        "slug": "leetcode-169-majority-element",
+        "algorithm": "Implementation",
+        "title": "LeetCode 169 \u2013 Majority Element",
+        "file": "169-majority-element.html",
+        "date": "2025-01-25T15:16:20",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "divide-and-conquer", "sorting"],
+        "excerpt": (
+            "Boyer-Moore voting is four lines that look like they cannot be correct, and the "
+            "counting argument is short enough to give out loud: every disagreement cancels a pair, "
+            "and a strict majority cannot be exhausted. The algorithm does not find the majority \u2014 "
+            "it eliminates everything that cannot be it."
+        ),
+    },
+    {
+        "number": 170,
+        "batch": "round-17",
+        "slug": "leetcode-170-two-sum-iii-data-structure-design",
+        "algorithm": "Implementation",
+        "title": "LeetCode 170 \u2013 Two Sum III \u2013 Data Structure Design",
+        "file": "170-two-sum-iii-data-structure-design.html",
+        "date": "2025-01-28T11:03:28",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "design", "hash-table", "two-pointers"],
+        "excerpt": (
+            "Not an algorithms problem \u2014 a question about which operation gets called more often. "
+            "Two designs with opposite costs, and the answer the interviewer wants is the sentence "
+            "that chooses between them. Plus why it must count rather than use a set: find(4) after "
+            "one add(2) is false."
+        ),
+    },
+    {
         "number": 200,
         "batch": "interview-essentials",
         "slug": "leetcode-200-number-of-islands",

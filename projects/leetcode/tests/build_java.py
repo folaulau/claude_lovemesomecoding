@@ -130,6 +130,15 @@ solution("156-binary-tree-upside-down.html", "S156")
 solution("157-read-n-characters-given-read4.html", "S157")
 solution("158-read-n-characters-given-read4-ii-call-multiple-times.html", "S158")
 solution("159-longest-substring-with-at-most-two-distinct-characters.html", "S159")
+solution("160-intersection-of-two-linked-lists.html", "S160")
+solution("168-excel-sheet-column-title.html", "S168")
+solution("169-majority-element.html", "S169")
+
+# LeetCode 170 defines `class TwoSum`, not `class Solution`.
+for block in blocks("170-two-sum-iii-data-structure-design.html"):
+    if re.search(r'\bclass\s+TwoSum\b', block):
+        parts.append(block)
+        break
 
 # LeetCode 146 defines `class LRUCache`, not `class Solution`, so it is taken verbatim.
 for block in blocks("146-lru-cache.html"):
@@ -805,6 +814,27 @@ public class Main {
     static String shapeOf(TreeNode node) {
         if (node == null) return ".";
         return "(" + node.val + " " + shapeOf(node.left) + " " + shapeOf(node.right) + ")";
+    }
+
+    /** Two lists with private prefixes and a genuinely shared tail. Returns {headA, headB, shared}. */
+    static ListNode[] buildIntersecting(int aLen, int bLen, int sharedLen) {
+        ListNode shared = null;
+        for (int i = sharedLen - 1; i >= 0; i--) {
+            ListNode node = new ListNode(200 + i);
+            node.next = shared;
+            shared = node;
+        }
+        ListNode headA = shared, headB = shared;
+        for (int i = aLen - 1; i >= 0; i--) { ListNode n = new ListNode(i); n.next = headA; headA = n; }
+        for (int i = bLen - 1; i >= 0; i--) { ListNode n = new ListNode(100 + i); n.next = headB; headB = n; }
+        return new ListNode[]{headA, headB, shared};
+    }
+
+    /** Excel title back to a column number, the inverse of problem 168. */
+    static int titleToNumber(String title) {
+        int total = 0;
+        for (char c : title.toCharArray()) total = total * 26 + (c - 'A' + 1);
+        return total;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -3170,6 +3200,125 @@ public class Main {
             }
         }
         check("matches brute force on every abc string up to length 9", distinctBad, 0);
+
+        System.out.println("LeetCode 160 - Intersection of Two Linked Lists");
+        S160 s160 = new S160();
+        ListNode[] lists = buildIntersecting(2, 3, 3);
+        check("classic example returns the shared node",
+              s160.getIntersectionNode(lists[0], lists[1]) == lists[2], true);
+        ListNode[] apart = buildIntersecting(3, 2, 0);
+        check("no intersection", s160.getIntersectionNode(apart[0], apart[1]), null);
+        // Two SEPARATE nodes holding the same value must not count.
+        check("equal values, different nodes",
+              s160.getIntersectionNode(new ListNode(3), new ListNode(3)), null);
+        check("either list empty", s160.getIntersectionNode(null, new ListNode(1)), null);
+        int interBad = 0;
+        for (int la = 0; la <= 4; la++)
+            for (int lb = 0; lb <= 4; lb++)
+                for (int lc = 0; lc <= 4; lc++) {
+                    ListNode[] built = buildIntersecting(la, lb, lc);
+                    ListNode got = s160.getIntersectionNode(built[0], built[1]);
+                    ListNode expectedNode = lc > 0 ? built[2] : null;
+                    if (got != expectedNode) interBad++;
+                }
+        check("every prefix/prefix/shared length combination up to 4", interBad, 0);
+        // Neither list may be modified.
+        ListNode[] intact = buildIntersecting(2, 3, 3);
+        String beforeA = Arrays.toString(toArr(intact[0]));
+        String beforeB = Arrays.toString(toArr(intact[1]));
+        s160.getIntersectionNode(intact[0], intact[1]);
+        check("list A is unchanged", Arrays.toString(toArr(intact[0])), beforeA);
+        check("list B is unchanged", Arrays.toString(toArr(intact[1])), beforeB);
+
+        System.out.println("LeetCode 168 - Excel Sheet Column Title");
+        S168 s168 = new S168();
+        check("1", s168.convertToTitle(1), "A");
+        check("26 (the boundary)", s168.convertToTitle(26), "Z");
+        check("27 (the other boundary)", s168.convertToTitle(27), "AA");
+        check("28", s168.convertToTitle(28), "AB");
+        check("52", s168.convertToTitle(52), "AZ");
+        check("53", s168.convertToTitle(53), "BA");
+        check("701", s168.convertToTitle(701), "ZY");
+        check("702", s168.convertToTitle(702), "ZZ");
+        check("703", s168.convertToTitle(703), "AAA");
+        check("Integer.MAX_VALUE", s168.convertToTitle(Integer.MAX_VALUE), "FXSHRXW");
+        int titleBad = 0, orderBad = 0;
+        String previousTitle = "";
+        for (int n = 1; n <= 20000; n++) {
+            String title = s168.convertToTitle(n);
+            if (titleToNumber(title) != n) titleBad++;
+            for (char c : title.toCharArray()) if (c < 'A' || c > 'Z') titleBad++;
+            if (n <= 5000) {
+                if (title.length() < previousTitle.length()
+                        || (title.length() == previousTitle.length() && title.compareTo(previousTitle) <= 0))
+                    orderBad++;
+                previousTitle = title;
+            }
+        }
+        check("round-trips through the inverse for every n in 1..20000", titleBad, 0);
+        check("titles are strictly increasing", orderBad, 0);
+
+        System.out.println("LeetCode 169 - Majority Element");
+        S169 s169 = new S169();
+        check("[3,2,3]", s169.majorityElement(new int[]{3,2,3}), 3);
+        check("[2,2,1,1,1,2,2]", s169.majorityElement(new int[]{2,2,1,1,1,2,2}), 2);
+        check("[1] (single element)", s169.majorityElement(new int[]{1}), 1);
+        check("[6,6,6,7,7]", s169.majorityElement(new int[]{6,6,6,7,7}), 6);
+        check("[-1,-1,2]", s169.majorityElement(new int[]{-1,-1,2}), -1);
+        int majorityBad = 0;
+        for (int n = 1; n <= 9; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int mask = 0; mask < combos; mask++) {
+                int[] nums = new int[n];
+                int mm = mask;
+                for (int i = 0; i < n; i++) { nums[i] = 1 + mm % 3; mm /= 3; }
+                Map<Integer, Integer> counts = new HashMap<>();
+                for (int v : nums) counts.merge(v, 1, Integer::sum);
+                Integer winner = null;
+                for (Map.Entry<Integer, Integer> e : counts.entrySet())
+                    if (e.getValue() > n / 2) winner = e.getKey();
+                if (winner == null) continue;         // no majority: guarantee does not hold
+                if (s169.majorityElement(nums.clone()) != winner) majorityBad++;
+            }
+        }
+        check("finds the majority on every array up to length 9 that has one", majorityBad, 0);
+
+        System.out.println("LeetCode 170 - Two Sum III - Data Structure Design");
+        TwoSum ts = new TwoSum();
+        ts.add(1); ts.add(3); ts.add(5);
+        check("find(4) -> 1+3", ts.find(4), true);
+        check("find(7)", ts.find(7), false);
+        check("find(8) -> 3+5", ts.find(8), true);
+        check("find(2) (needs two 1s)", ts.find(2), false);
+        // THE duplicate case.
+        TwoSum onlyOne2 = new TwoSum(); onlyOne2.add(2);
+        check("find(4) after ONE add(2)", onlyOne2.find(4), false);
+        TwoSum doubled = new TwoSum(); doubled.add(2); doubled.add(2);
+        check("find(4) after TWO add(2)", doubled.find(4), true);
+        TwoSum zeros = new TwoSum(); zeros.add(0); zeros.add(0);
+        check("find(0) with two zeros", zeros.find(0), true);
+        check("find before any add", new TwoSum().find(0), false);
+        int twoSumBad = 0;
+        for (int trial = 0; trial < 40; trial++) {
+            TwoSum real = new TwoSum();
+            List<Integer> model = new ArrayList<>();
+            Random rng = new Random(20260904 + trial);
+            for (int step = 0; step < 60; step++) {
+                if (rng.nextBoolean()) {
+                    int value = rng.nextInt(13) - 4;
+                    boolean pairExists = false;
+                    for (int i = 0; i < model.size() && !pairExists; i++)
+                        for (int j = i + 1; j < model.size() && !pairExists; j++)
+                            if (model.get(i) + model.get(j) == value) pairExists = true;
+                    if (real.find(value) != pairExists) { twoSumBad++; break; }
+                } else {
+                    int number = rng.nextInt(9) - 3;
+                    real.add(number);
+                    model.add(number);
+                }
+            }
+        }
+        check("matches a brute-force pair scan over 40 random operation sequences", twoSumBad, 0);
 
         System.out.println();
         if (failures > 0) {
