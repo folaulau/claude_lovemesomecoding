@@ -138,10 +138,18 @@ LAB_POSTS = {
 #
 # 52 lessons x 5 days = a 255-day span, 2024-05-06 -> 2025-01-16.
 #
-# ⚠️ POST DATES MUST FALL BETWEEN 2023 AND 2025, the same window the Vue and
-# Postgres tracks use. And ⚠️ `--force-dates` is NOT a one-off here: every one of
-# these 52 posts already exists with a 2018-2021 date, so the FIRST seed needs it
-# and so does any later change to START_DATE.
+# ⚠️ `--force-dates` is NOT a one-off here: every one of these 52 posts already
+# exists with a 2018-2021 date, so the FIRST seed needs it and so does any later
+# change to START_DATE.
+#
+# On the window: 2024-05 -> 2025-01 is THIS TRACK'S choice, not a site rule.
+# There is no global date ceiling — the LeetCode track retired its own
+# 2022-2024 brief on 2026-08-24 and now runs past 2025 with no ceiling above
+# problem 543. The two constraints that are real:
+#   * dates must ASCEND with the track, or the prev/next pager reads out of order
+#   * a date must not be in the FUTURE (today is 2026-08), which is the mistake
+#     the Vue track made on its first publish — it shipped 2026-09-01
+# check_content.py enforces the first and warns on the second.
 START_DATE = datetime(2024, 5, 6, 9, 0, 0)
 STEP_DAYS = 5
 

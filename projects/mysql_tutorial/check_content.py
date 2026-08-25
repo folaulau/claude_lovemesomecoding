@@ -31,6 +31,7 @@ fail the run. Once every file exists this becomes a plain pass/fail.
     lovemesomecoding_backend/.venv/bin/python projects/mysql_tutorial/check_content.py
 """
 
+import datetime as _dt
 import html
 import os
 import re
@@ -282,9 +283,17 @@ dates = [e["date"] for e in manifest.POSTS]
 if dates != sorted(dates):
     failures.append("manifest dates do not ascend — the prev/next pager would read out of order")
 
-for _d in (dates[0], dates[-1]):
-    if not ("2023-01-01" <= _d[:10] <= "2025-12-31"):
-        failures.append(f"post date {_d[:10]} is outside the 2023-2025 window this site uses")
+# A future-dated post is the real failure. There is NO site-wide date window — the
+# LeetCode track retired its own on 2026-08-24 — so the only hard rules are that dates
+# ascend (checked above) and that none is in the future. The Vue track's first publish
+# shipped 2026-09-01, which was both future-dated and invisible until someone looked.
+_today = _dt.date.today().isoformat()
+for _e in manifest.POSTS:
+    if _e["date"][:10] > _today:
+        failures.append(
+            f"{_e['slug']}: dated {_e['date'][:10]}, which is in the future (today is {_today}). "
+            "Move START_DATE back.")
+        break
 
 # (1) the 42 indexed URLs
 for frozen in sorted(manifest.FROZEN_SLUGS):
