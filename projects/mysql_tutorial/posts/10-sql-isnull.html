@@ -1,0 +1,137 @@
+<p>NULL is not a value. It is the <em>absence</em> of one — "we do not know", or "this does not
+apply". Every surprising thing about NULL follows from that one fact, and once it clicks the rest
+stops being a list of exceptions to memorise.</p>
+
+<p>The pizza schema has a good example built into it. <code>customer_order.user_id</code> is
+nullable <strong>on purpose</strong>: it holds the account that placed the order, and it is NULL
+exactly when there was no account, because the order came from a guest checkout.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, customer_name, user_id, guest_email
+FROM   customer_order
+WHERE  user_id IS NULL
+ORDER  BY id
+LIMIT  4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------+---------+-----------------------+
+| id | customer_name | user_id | guest_email           |
++----+---------------+---------+-----------------------+
+|  2 | Alex Rivera   |    NULL | guest1@example.com    |
+|  4 | Sam Chen      |    NULL | guest2@example.com    |
+|  5 | Jordan Blake  |    NULL | abandoned@example.com |
+|  7 | Priya Nair    |    NULL | guest3@example.com    |
++----+---------------+---------+-----------------------+</code></pre>
+
+<h2>Why <code>= NULL</code> never works</h2>
+
+<p>Comparing anything to NULL gives NULL — not true, not false. <code>WHERE</code> keeps only rows
+where the condition is <strong>true</strong>, so a comparison against NULL keeps nothing.
+<code>WHERE user_id = NULL</code> returns zero rows even though ten rows have a NULL
+<code>user_id</code>, and nothing warns you.</p>
+
+<p><code>IS NULL</code> and <code>IS NOT NULL</code> are the only operators that test for it:</p>
+
+<pre class="language-sql"><code class="language-sql">WHERE user_id IS NULL        -- guest orders
+WHERE user_id IS NOT NULL    -- orders from a registered account</code></pre>
+
+<p>The same logic explains a less obvious one: <code>NOT IN</code> against a list containing a
+NULL returns <em>no rows at all</em>, because "x is not equal to NULL" is unknown for every x. It
+is covered in <a href="/sql/sql-sub-query">subqueries</a>, where it bites hardest.</p>
+
+<h2>ISNULL()</h2>
+
+<p>MySQL also has an <code>ISNULL()</code> function, which returns 1 or 0. It is the same test in
+expression form, so it can appear anywhere an expression can:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT ISNULL(user_id) AS is_guest, COUNT(*) AS orders
+FROM   customer_order
+GROUP  BY ISNULL(user_id);</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+--------+
+| is_guest | orders |
++----------+--------+
+|        1 |     10 |
+|        0 |      8 |
++----------+--------+</code></pre>
+
+<p>Prefer <code>IS NULL</code> in a <code>WHERE</code> clause. It is standard SQL, it reads
+better, and — as the <a href="/sql/sql-where">WHERE</a> lesson explains — wrapping a column in a
+function stops an index on it being used.</p>
+
+<h2>Aggregates skip NULL</h2>
+
+<p>This is the behaviour that catches people out most often in reports:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS all_rows, COUNT(user_id) AS with_user, COUNT(guest_email) AS with_guest_email
+FROM   customer_order;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+-----------+------------------+
+| all_rows | with_user | with_guest_email |
++----------+-----------+------------------+
+|       18 |         8 |               10 |
++----------+-----------+------------------+</code></pre>
+
+<p><code>COUNT(*)</code> counts <em>rows</em>. <code>COUNT(column)</code> counts
+<strong>non-NULL values</strong> in that column. That is why the three numbers differ, and why
+<code>COUNT(*)</code> is what you want unless you specifically mean "how many have one".</p>
+
+<p><code>SUM</code>, <code>AVG</code>, <code>MIN</code> and <code>MAX</code> ignore NULLs too, and
+for <code>AVG</code> that changes the answer: the denominator is the count of non-NULL values, not
+the row count. An <code>AVG</code> over a column that is half NULL is an average of the half that
+is present.</p>
+
+<p>Two related quirks worth knowing: an aggregate over <em>zero</em> rows returns NULL, not 0 —
+so <code>COALESCE(SUM(x), 0)</code> is a common and sensible habit. And <code>GROUP BY</code> does
+the opposite of comparison: it puts all the NULLs together in a single group rather than treating
+them as all different.</p>
+
+<h2>Replacing NULL: COALESCE, IFNULL and NULLIF</h2>
+
+<p><code>COALESCE</code> returns its first non-NULL argument, and takes as many as you like:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id,
+       COALESCE(guest_email, 'registered account') AS contact
+FROM   customer_order
+ORDER  BY id
+LIMIT  4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+--------------------+
+| id | contact            |
++----+--------------------+
+|  1 | registered account |
+|  2 | guest1@example.com |
+|  3 | registered account |
+|  4 | guest2@example.com |
++----+--------------------+</code></pre>
+
+<p><code>IFNULL(a, b)</code> is the same thing limited to two arguments. It is MySQL-specific;
+<code>COALESCE</code> is standard SQL and handles both cases, so there is little reason to reach
+for <code>IFNULL</code>.</p>
+
+<p><code>NULLIF(a, b)</code> goes the other way — it returns NULL when the two are equal. Its one
+genuinely common use is avoiding a division by zero:</p>
+
+<pre class="language-sql"><code class="language-sql">-- returns NULL instead of raising an error when the denominator is 0
+SELECT total / NULLIF(delivery_fee, 0) FROM customer_order LIMIT 1;</code></pre>
+
+<h2>Should the column be nullable at all?</h2>
+
+<p>A nullable column is a claim that "no value" is a meaningful state. Sometimes it plainly is —
+<code>user_id</code> above, or <code>order_item.product_id</code>, which goes NULL if the product
+is later deleted so the historical order survives.</p>
+
+<p>Often it is not, and the NULL is standing in for something the schema should say properly:
+an empty string, a zero, a default, or a missing row in another table. Every nullable column is a
+branch every query has to handle. Add <code>NOT NULL</code> unless you can say what NULL
+<em>means</em> for that column.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>NULL is unknown. Comparisons against it are unknown, and <code>WHERE</code> drops
+      unknown.</li>
+  <li><code>IS NULL</code> / <code>IS NOT NULL</code> are the only tests. <code>ISNULL()</code> is
+      the expression form.</li>
+  <li><code>COUNT(*)</code> counts rows; <code>COUNT(col)</code> counts non-NULL values.</li>
+  <li><code>COALESCE</code> for a fallback, <code>NULLIF</code> to create a NULL on purpose.</li>
+  <li><code>GROUP BY</code> groups NULLs together, unlike <code>=</code>.</li>
+</ul>

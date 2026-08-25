@@ -1,0 +1,128 @@
+<p><code>LIKE</code> matches a string against a pattern. It has exactly two wildcards, which makes
+it easy to learn and easy to outgrow — this lesson covers both, plus <code>REGEXP</code> for when
+they are not enough, and the performance rule that decides whether your search can use an
+index.</p>
+
+<h2>The two wildcards</h2>
+
+<table>
+  <tr><th>Pattern</th><th>Matches</th></tr>
+  <tr><td><code>%</code></td><td>any sequence of characters, including none</td></tr>
+  <tr><td><code>_</code></td><td>exactly one character</td></tr>
+</table>
+
+<p><code>%</code> on both sides is "contains":</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product WHERE name LIKE '%Chicken%' ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+
+| name                  |
++-----------------------+
+| BBQ Chicken Pizza     |
+| Buffalo Chicken Pizza |
++-----------------------+</code></pre>
+
+<p>Anchored on the left, it is "starts with":</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product WHERE name LIKE 'P%' ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+
+| name            |
++-----------------+
+| Pepperoni Pizza |
+| Pepsi           |
++-----------------+</code></pre>
+
+<p><code>_</code> stands for one character and no more:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product WHERE name LIKE '_iet%' ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+
+| name       |
++------------+
+| Diet Pepsi |
++------------+</code></pre>
+
+<p>A pattern with no wildcard at all is just an equality test.</p>
+
+<h2>Case sensitivity is the collation's business</h2>
+
+<p><code>LIKE 'p%'</code> returns the same two rows as <code>LIKE 'P%'</code> above. That is not a
+property of <code>LIKE</code> — it is the column's collation,
+<code>utf8mb4_0900_ai_ci</code>, where <code>ci</code> means case-insensitive (and
+<code>ai</code> means accent-insensitive, so <code>e</code> matches <code>é</code> too).</p>
+
+<p>On a case-sensitive collation the same query would return only the capitalised rows. If you need
+a case-sensitive match regardless of the column, force it:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product WHERE name LIKE 'p%' COLLATE utf8mb4_0900_as_cs;</code></pre>
+
+<p>Do not reach for <code>UPPER(name) LIKE 'P%'</code> to control this. It gives the wrong answer
+about intent and, as below, it costs you the index.</p>
+
+<h2>Matching a literal % or _</h2>
+
+<p>Both wildcards are ordinary characters in real data — percentages in a description, underscores
+in a slug. <code>ESCAPE</code> names a character that turns off the next one:</p>
+
+<pre class="language-sql"><code class="language-sql">-- rows whose description contains a real "50%", not "50 followed by anything"
+SELECT name FROM product WHERE description LIKE '%50!%%' ESCAPE '!';</code></pre>
+
+<p>Backslash also works by default, but it is already an escape character in string literals, so
+you end up doubling it. Naming your own with <code>ESCAPE</code> is clearer.</p>
+
+<h2>NOT LIKE</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product WHERE name NOT LIKE '%Pizza' ORDER BY id;</code></pre>
+
+<p>The usual NULL caveat applies: a row with a NULL <code>name</code> matches neither
+<code>LIKE</code> nor <code>NOT LIKE</code>.</p>
+
+<h2>REGEXP, when two wildcards are not enough</h2>
+
+<p><code>REGEXP</code> (or its synonym <code>RLIKE</code>) takes a full regular expression:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product WHERE name REGEXP '^(Pep|Che)' ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+
+| name            |
++-----------------+
+| Pepperoni Pizza |
+| Cheese Pizza    |
+| Pepsi           |
++-----------------+</code></pre>
+
+<p>Alternation, character classes, anchors and repetition all work. It is strictly more powerful
+than <code>LIKE</code> and strictly slower — it can never use an index, so it always reads every
+row. Use it when the pattern genuinely needs it, not by default.</p>
+
+<h2>The performance rule</h2>
+
+<p>An index on a string column stores the values sorted. That makes a
+<strong>prefix</strong> search a range scan, and anything else a full scan:</p>
+
+<table>
+  <tr><th>Pattern</th><th>Can use an index?</th></tr>
+  <tr><td><code>LIKE 'Pep%'</code></td><td>yes — a range of the index</td></tr>
+  <tr><td><code>LIKE '%roni'</code></td><td>no</td></tr>
+  <tr><td><code>LIKE '%Chicken%'</code></td><td>no</td></tr>
+  <tr><td><code>REGEXP '...'</code></td><td>no</td></tr>
+</table>
+
+<p>It is the same reason a paper dictionary can find "pepper" quickly and cannot find words
+<em>ending</em> in "-roni": the ordering only helps from the left. On 14 products this costs
+nothing. On a large table a leading-<code>%</code> search reads every row every time.</p>
+
+<p>When you genuinely need "contains" over a lot of text, <code>LIKE</code> is the wrong tool —
+that is what <a href="/sql/mysql-full-text-search">full-text search</a> is for, and past a certain
+point, what a search engine is for.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>%</code> is any number of characters, <code>_</code> is exactly one.</li>
+  <li>Case sensitivity comes from the collation, not from <code>LIKE</code>.</li>
+  <li><code>ESCAPE</code> to match a literal <code>%</code> or <code>_</code>.</li>
+  <li><code>LIKE 'x%'</code> can use an index; <code>LIKE '%x'</code> and <code>REGEXP</code>
+      cannot.</li>
+</ul>

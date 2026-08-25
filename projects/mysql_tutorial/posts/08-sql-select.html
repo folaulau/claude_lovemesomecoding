@@ -1,0 +1,182 @@
+<p><code>SELECT</code> is the statement you will write more than all the others put together. It
+reads rows out of one or more tables and hands them back as a result set. This lesson covers
+choosing columns, naming them, removing duplicates, computing values, and the one piece of theory
+that explains most of the confusing errors beginners hit: the order MySQL actually evaluates a
+query in, which is not the order you type it.</p>
+
+<p>Every query here runs against the pizza database from the demo application — 14 products, 42
+price rows, 18 orders. Small enough that you can check the answers by eye.</p>
+
+<h2>Picking columns</h2>
+
+<p>Name the columns you want, separated by commas:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name, type
+FROM   product
+ORDER  BY id
+LIMIT  5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------------+-------+
+| name                | type  |
++---------------------+-------+
+| Pepperoni Pizza     | PIZZA |
+| Cheese Pizza        | PIZZA |
+| Supreme Pizza       | PIZZA |
+| Meat Lovers Pizza   | PIZZA |
+| Veggie Lovers Pizza | PIZZA |
++---------------------+-------+</code></pre>
+
+<h2>Why not <code>SELECT *</code></h2>
+
+<p><code>SELECT *</code> returns every column. It is genuinely useful when you are exploring a
+table you do not know, and it is a bad habit everywhere else:</p>
+
+<ul>
+  <li>It moves data you are not going to use. <code>product</code> has a 500-character
+      <code>description</code>; a menu list that only needs the name pays for it on every row.</li>
+  <li>It stops your query being <em>covered</em> by an index, which is one of the larger
+      performance levers available — see the <a href="/sql/mysql-index">indexes</a> lesson.</li>
+  <li>It breaks silently when the schema changes. Add a column and every
+      <code>SELECT *</code> quietly starts returning it; your application maps results by
+      position and now reads the wrong field.</li>
+</ul>
+
+<p>Explore with the star, ship with a column list.</p>
+
+<h2>Aliases</h2>
+
+<p><code>AS</code> renames a column in the output. The alias is what your application sees, so it
+is worth using whenever the column name is not the name you want:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name AS pizza, description AS blurb
+FROM   product
+WHERE  type = 'PIZZA'
+ORDER  BY display_order
+LIMIT  3;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+-----------------------------------------------------------+
+| pizza           | blurb                                                     |
++-----------------+-----------------------------------------------------------+
+| Pepperoni Pizza | Classic pepperoni over mozzarella and our signature sauce |
+| Cheese Pizza    | Simple, generous mozzarella on a hand-stretched base      |
+| Supreme Pizza   | Pepperoni, sausage, peppers, onions, mushrooms and olives |
++-----------------+-----------------------------------------------------------+</code></pre>
+
+<p>The <code>AS</code> is optional — <code>name pizza</code> works — but leaving it out makes a
+missing comma look like an alias instead of an error, so write it.</p>
+
+<p>Tables take aliases too, and once a query joins anything you will want them:
+<code>FROM product p</code> lets you write <code>p.name</code>. That is covered in the
+<a href="/sql/sql-join-or-inner-join">joins</a> lesson.</p>
+
+<h2>DISTINCT</h2>
+
+<p><code>DISTINCT</code> removes duplicate rows from the result:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT DISTINCT type FROM product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------+
+| type  |
++-------+
+| DRINK |
+| PIZZA |
++-------+</code></pre>
+
+<p>Two things worth knowing. <code>DISTINCT</code> applies to the <strong>whole row</strong>, not
+to the column it appears next to — <code>SELECT DISTINCT a, b</code> gives distinct
+<em>pairs</em>, not distinct <code>a</code>. And it is not free: MySQL has to sort or hash the
+result to find the duplicates.</p>
+
+<p>Inside <code>COUNT</code> it counts distinct values:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS rows_, COUNT(DISTINCT type) AS types
+FROM   product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------+-------+
+| rows_ | types |
++-------+-------+
+|    14 |     2 |
++-------+-------+</code></pre>
+
+<h2>Expressions</h2>
+
+<p>The select list is not limited to columns. Arithmetic, function calls and literals all work:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.name, ps.price, ROUND(ps.price * 1.0725, 2) AS with_tax
+FROM   product_size ps
+JOIN   product p ON p.id = ps.product_id
+WHERE  ps.size = 'LARGE'
+ORDER  BY ps.price DESC
+LIMIT  4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+-------+----------+
+| name                  | price | with_tax |
++-----------------------+-------+----------+
+| Meat Lovers Pizza     | 20.99 |    22.51 |
+| Supreme Pizza         | 19.99 |    21.44 |
+| BBQ Chicken Pizza     | 19.99 |    21.44 |
+| Buffalo Chicken Pizza | 19.99 |    21.44 |
++-----------------------+-------+----------+</code></pre>
+
+<p>Note the <code>ROUND</code>. <code>price</code> is <code>DECIMAL(10,2)</code>, and multiplying
+a <code>DECIMAL</code> gives you every digit of the exact answer —
+<code>22.511775</code> without it. Money arithmetic is covered in
+<a href="/sql/mysql-data-types">data types</a>.</p>
+
+<h2>The order MySQL actually evaluates a query in</h2>
+
+<p>You write a query in this order:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">SELECT  ->  FROM  ->  WHERE  ->  GROUP BY  ->  HAVING  ->  ORDER BY  ->  LIMIT</code></pre>
+
+<p>MySQL evaluates it in a different one:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">FROM  ->  WHERE  ->  GROUP BY  ->  HAVING  ->  SELECT  ->  DISTINCT  ->  ORDER BY  ->  LIMIT</code></pre>
+
+<p><code>SELECT</code> runs second to last. That single fact explains a family of errors that
+otherwise look arbitrary — <strong>a column alias does not exist yet in
+<code>WHERE</code></strong>, because <code>WHERE</code> ran before the select list was
+evaluated:</p>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1054 (42S22): Unknown column 'with_tax' in 'where clause'
+SELECT price * 1.0725 AS with_tax
+FROM   product_size
+WHERE  with_tax &gt; 20;</code></pre>
+
+<p>The fix is to repeat the expression in <code>WHERE</code>, or wrap the query in a
+<a href="/sql/sql-sub-query">derived table</a>.</p>
+
+<p>By the time <code>ORDER BY</code> runs, though, the select list <em>has</em> been evaluated —
+so the same alias works there:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.name, ps.price * 1.0725 AS with_tax
+FROM   product_size ps
+JOIN   product p ON p.id = ps.product_id
+WHERE  ps.size = 'LARGE'
+ORDER  BY with_tax DESC
+LIMIT  3;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------------------+-----------+
+| name              | with_tax  |
++-------------------+-----------+
+| Meat Lovers Pizza | 22.511775 |
+| Supreme Pizza     | 21.439275 |
+| BBQ Chicken Pizza | 21.439275 |
++-------------------+-----------+</code></pre>
+
+<p><code>HAVING</code> can use an alias for the same reason; <code>WHERE</code> and
+<code>GROUP BY</code> cannot.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Name your columns. Keep <code>SELECT *</code> for exploring.</li>
+  <li><code>AS</code> is optional and worth writing anyway — a missing comma should look like an
+      error, not an alias.</li>
+  <li><code>DISTINCT</code> applies to the whole row, and it costs a sort.</li>
+  <li><code>SELECT</code> is evaluated second to last. Aliases work in <code>ORDER BY</code> and
+      <code>HAVING</code>, and not in <code>WHERE</code>.</li>
+</ul>
+
+<p>Next: <a href="/sql/sql-where">WHERE</a>, which is where most of the work of a real query
+happens.</p>

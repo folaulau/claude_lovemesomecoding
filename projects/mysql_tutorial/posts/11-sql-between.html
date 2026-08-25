@@ -1,0 +1,121 @@
+<p><code>BETWEEN</code> is shorthand for two comparisons joined with <code>AND</code>. It is a small
+piece of syntax with one genuinely important gotcha attached, and the gotcha is about dates.</p>
+
+<h2>The basics</h2>
+
+<p><code>x BETWEEN a AND b</code> means exactly <code>x &gt;= a AND x &lt;= b</code> —
+<strong>inclusive at both ends</strong>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.name, ps.size, ps.price
+FROM   product_size ps JOIN product p ON p.id = ps.product_id
+WHERE  ps.price BETWEEN 15 AND 17
+ORDER  BY ps.price, p.name;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+--------+-------+
+| name                  | size   | price |
++-----------------------+--------+-------+
+| Cheese Pizza          | LARGE  | 15.49 |
+| Hawaiian Pizza        | MEDIUM | 15.49 |
+| Veggie Lovers Pizza   | MEDIUM | 15.99 |
+| BBQ Chicken Pizza     | MEDIUM | 16.99 |
+| Buffalo Chicken Pizza | MEDIUM | 16.99 |
+| Pepperoni Pizza       | LARGE  | 16.99 |
+| Supreme Pizza         | MEDIUM | 16.99 |
++-----------------------+--------+-------+</code></pre>
+
+<p>The long form returns the same seven rows:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS in_range
+FROM   product_size
+WHERE  price &gt;= 15 AND price &lt;= 17;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+
+| in_range |
++----------+
+|        7 |
++----------+</code></pre>
+
+<p>The lower bound must come first. <code>BETWEEN 17 AND 15</code> is not an error and matches
+nothing, which is a quiet way to get an empty report.</p>
+
+<h2>NOT BETWEEN</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.name, ps.price
+FROM   product_size ps JOIN product p ON p.id = ps.product_id
+WHERE  ps.size = 'LARGE' AND ps.price NOT BETWEEN 15 AND 19
+ORDER  BY ps.price;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+-------+
+| name                  | price |
++-----------------------+-------+
+| Bottled Water         |  2.49 |
+| Pepsi                 |  2.99 |
+| Diet Pepsi            |  2.99 |
+| Mountain Dew          |  2.99 |
+| Starry                |  2.99 |
+| Iced Tea              |  2.99 |
+| Supreme Pizza         | 19.99 |
+| BBQ Chicken Pizza     | 19.99 |
+| Buffalo Chicken Pizza | 19.99 |
+| Meat Lovers Pizza     | 20.99 |
++-----------------------+-------+</code></pre>
+
+<p><code>NOT BETWEEN</code> is <code>&lt; a OR &gt; b</code>. Note that a NULL price would appear
+in neither result — <code>BETWEEN</code> is built from comparisons, so NULL stays unknown in both
+directions. See <a href="/sql/sql-isnull">NULL and IS NULL</a>.</p>
+
+<h2>The date trap</h2>
+
+<p>This is the one to remember. <code>customer_order.created_at</code> is a
+<code>DATETIME(6)</code> — a date <em>and a time</em>. Writing a bare date as the upper bound
+means midnight:</p>
+
+<pre class="language-sql"><code class="language-sql">-- '2024-01-31' as an upper bound means '2024-01-31 00:00:00'
+SELECT CAST('2024-01-31 14:05:00' AS DATETIME) BETWEEN '2024-01-01' AND '2024-01-31' AS in_january,
+       CAST('2024-01-31 14:05:00' AS DATETIME) &gt;= '2024-01-01'
+   AND CAST('2024-01-31 14:05:00' AS DATETIME) &lt;  '2024-02-01' AS half_open;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+-----------+
+| in_january | half_open |
++------------+-----------+
+|          0 |         1 |
++------------+-----------+</code></pre>
+
+<p>An order placed at 2 pm on the 31st is <strong>not</strong> "between the 1st and the 31st".
+<code>BETWEEN '2024-01-01' AND '2024-01-31'</code> silently drops all but the first instant of the
+last day — very nearly a whole day of a monthly report, and the number still looks plausible.</p>
+
+<p>The reliable fix is the <strong>half-open range</strong>: greater-or-equal at the start, strictly
+less-than at the exclusive end.</p>
+
+<pre class="language-sql"><code class="language-sql">-- January, all of it, including 23:59:59.999999 on the 31st
+SELECT COUNT(*) FROM customer_order
+WHERE  created_at &gt;= '2024-01-01'
+  AND  created_at &lt;  '2024-02-01';</code></pre>
+
+<p>It reads slightly worse and it is correct. It also handles month lengths without you thinking
+about them, and it keeps the column bare so an index on <code>created_at</code> can still be used
+— which <code>DATE(created_at) = '2024-01-31'</code> would prevent. See
+<a href="/sql/sql-date_format">date functions</a>.</p>
+
+<p>If the column is a plain <code>DATE</code> with no time component, <code>BETWEEN</code> is safe.
+The trap is specifically <code>DATETIME</code> and <code>TIMESTAMP</code>.</p>
+
+<h2>BETWEEN on strings</h2>
+
+<p>It works on text too, comparing by collation order:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product WHERE name BETWEEN 'B' AND 'D' ORDER BY name;</code></pre>
+
+<p>Useful occasionally for alphabetical bucketing, and subject to the same off-by-one thinking:
+<code>'D'</code> as an upper bound excludes <code>'Diet Pepsi'</code>, because
+<code>'Diet Pepsi' &gt; 'D'</code>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>BETWEEN</code> is inclusive at both ends, and the low bound goes first.</li>
+  <li>On a <code>DATETIME</code>, a bare date as the upper bound means midnight — use a half-open
+      <code>&gt;= ... &lt; ...</code> range instead.</li>
+  <li>NULL is in neither <code>BETWEEN</code> nor <code>NOT BETWEEN</code>.</li>
+</ul>

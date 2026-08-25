@@ -1,0 +1,128 @@
+<p><code>LIMIT</code> caps how many rows come back. It is the last thing MySQL applies, and it is
+the basis of every "page 2 of 47" list you have ever built — including one bug that is very easy to
+ship and hard to notice.</p>
+
+<h2>LIMIT and OFFSET</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, customer_name, total FROM customer_order ORDER BY id DESC LIMIT 3;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+----------------+-------+
+| id | customer_name  | total |
++----+----------------+-------+
+| 18 | Demo Customer  | 27.02 |
+| 17 | Casey Lindgren | 40.86 |
+| 16 | Demo Customer  | 20.60 |
++----+----------------+-------+</code></pre>
+
+<p><code>OFFSET</code> skips rows before taking any:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, customer_name, total
+FROM   customer_order
+ORDER  BY total DESC, id
+LIMIT  3 OFFSET 3;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------+-------+
+| id | customer_name | total |
++----+---------------+-------+
+|  4 | Sam Chen      | 32.18 |
+| 15 | Riley Okafor  | 32.17 |
+|  8 | Demo Customer | 30.27 |
++----+---------------+-------+</code></pre>
+
+<p>MySQL also accepts the older <code>LIMIT 3, 3</code> form, where the <em>first</em> number is
+the offset. It is easy to misread; prefer the explicit <code>OFFSET</code> keyword.</p>
+
+<h2>LIMIT without ORDER BY is a bug</h2>
+
+<p>"Any 10 rows" is what <code>LIMIT 10</code> alone asks for, and it is what you get — the ten the
+chosen plan happened to produce first. Add <code>ORDER BY</code> whenever the identity of the rows
+matters, which for a paged list is always.</p>
+
+<h2>...and ORDER BY is not enough either</h2>
+
+<p>This is the bug worth internalising. Sort by a column that is <strong>not unique</strong> and
+pagination can show you the same row twice, or skip one entirely.</p>
+
+<p>Two orders in the demo data share a total:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT total, COUNT(*) AS orders
+FROM   customer_order
+GROUP  BY total
+HAVING COUNT(*) &gt; 1
+ORDER  BY total;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------+--------+
+| total | orders |
++-------+--------+
+| 18.43 |      2 |
+| 32.18 |      2 |
++-------+--------+</code></pre>
+
+<p>Orders 3 and 4 both total 32.18, so they occupy positions 3 and 4 in
+<code>ORDER BY total DESC</code> — in <em>either</em> arrangement. Nothing obliges MySQL to break
+that tie the same way twice, and the two pages are two separate query executions. Page 1 can end
+with order 3 and page 2 can begin with order 3 again. The reader sees a duplicate; another row
+never appears at all.</p>
+
+<p>The fix is to make the sort <strong>total</strong> by appending something unique — the primary
+key will do:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, customer_name, total
+FROM   customer_order
+ORDER  BY total DESC, id
+LIMIT  3;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+----------------+-------+
+| id | customer_name  | total |
++----+----------------+-------+
+| 11 | Demo Customer  | 58.19 |
+| 17 | Casey Lindgren | 40.86 |
+|  3 | Demo Customer  | 32.18 |
++----+----------------+-------+</code></pre>
+
+<p>Now every row has exactly one position, and page 2 above starts at order 4 as it should. Make
+this a habit: <strong>every paginated query ends with a unique tiebreaker.</strong></p>
+
+<h2>Why deep pages get slow</h2>
+
+<p><code>LIMIT 10 OFFSET 400000</code> does not jump to row 400,001. The server has no way to know
+where that row is, so it produces the first 400,010 rows in order and throws 400,000 of them away.
+The work grows with the offset, which means page 40,000 costs far more than page 1 — and the users
+who page that deep are usually crawlers, not people.</p>
+
+<p>The alternative is <strong>keyset</strong> (or "seek") pagination: instead of counting rows,
+remember where the last page ended and ask for what comes after it.</p>
+
+<pre class="language-sql"><code class="language-sql">-- page 1
+SELECT id, customer_name, total FROM customer_order ORDER BY id LIMIT 20;
+
+-- page 2: pass the last id from page 1, not an offset
+SELECT id, customer_name, total FROM customer_order WHERE id &gt; 20 ORDER BY id LIMIT 20;</code></pre>
+
+<p>The <code>WHERE</code> is an index seek straight to the starting point, so page 40,000 costs the
+same as page 1. When the sort key is not unique, carry both columns:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total FROM customer_order
+WHERE  (total, id) &lt; (32.18, 4)
+ORDER  BY total DESC, id DESC
+LIMIT  20;</code></pre>
+
+<p>The trade-off is real: keyset pagination gives up random access. You can offer "next" and
+"previous", not "jump to page 37". For an infinite-scroll feed or an export job that is no loss at
+all; for a table with numbered pages it is a product decision, not just a technical one.</p>
+
+<h2>LIMIT on UPDATE and DELETE</h2>
+
+<p>Both accept <code>LIMIT</code>, which is the standard way to work through a large change in
+batches instead of holding one enormous transaction. See
+<a href="/sql/sql-delete">DELETE</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>LIMIT</code> without <code>ORDER BY</code> returns arbitrary rows.</li>
+  <li><code>ORDER BY</code> on a non-unique column is not enough for pagination — append a unique
+      tiebreaker.</li>
+  <li><code>OFFSET</code> still walks every skipped row. Deep pages get proportionally slower.</li>
+  <li>Keyset pagination is flat-cost and gives up jumping to an arbitrary page.</li>
+</ul>

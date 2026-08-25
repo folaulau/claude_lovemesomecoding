@@ -1,0 +1,164 @@
+<p><code>WHERE</code> decides which rows come back. It runs before <code>SELECT</code>, over every
+row the <code>FROM</code> clause produced, and keeps the ones for which its condition is
+<strong>true</strong> — a distinction that matters more than it sounds, because in SQL a condition
+can also be <em>unknown</em>, and unknown is not kept.</p>
+
+<h2>Comparisons</h2>
+
+<p>The operators are the ones you would guess: <code>=</code>, <code>&lt;&gt;</code> (also written
+<code>!=</code>), <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name, type
+FROM   product
+WHERE  type = 'DRINK'
+ORDER  BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------+-------+
+| name          | type  |
++---------------+-------+
+| Pepsi         | DRINK |
+| Diet Pepsi    | DRINK |
+| Mountain Dew  | DRINK |
+| Starry        | DRINK |
+| Bottled Water | DRINK |
+| Iced Tea      | DRINK |
++---------------+-------+</code></pre>
+
+<p>String comparison is <strong>case-insensitive</strong> here, because the column's collation is
+<code>utf8mb4_0900_ai_ci</code> — the <code>ci</code> is "case insensitive". So
+<code>type = 'drink'</code> returns the same six rows. That is a property of the collation, not of
+MySQL, and it is worth knowing rather than assuming.</p>
+
+<h2>AND, OR, and the reason to type parentheses</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_name, order_type, total
+FROM   customer_order
+WHERE  order_type = 'DELIVERY' AND total &gt; 40
+ORDER  BY total DESC;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+------------+-------+
+| customer_name  | order_type | total |
++----------------+------------+-------+
+| Demo Customer  | DELIVERY   | 58.19 |
+| Casey Lindgren | DELIVERY   | 40.86 |
++----------------+------------+-------+</code></pre>
+
+<p><strong><code>AND</code> binds tighter than <code>OR</code></strong>, exactly like <code>×</code>
+binds tighter than <code>+</code>. Mixing them without parentheses is the single most common way to
+write a filter that looks right and is not:</p>
+
+<pre class="language-sql"><code class="language-sql">-- reads as: CANCELLED  OR  (PREPARING AND DELIVERY)
+SELECT customer_name, order_type, status
+FROM   customer_order
+WHERE  status = 'CANCELLED' OR status = 'PREPARING' AND order_type = 'DELIVERY'
+ORDER  BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+------------+-----------+
+| customer_name  | order_type | status    |
++----------------+------------+-----------+
+| Chris Vaughn   | DELIVERY   | CANCELLED |
+| Taylor Brooks  | CARRYOUT   | CANCELLED |
+| Casey Lindgren | DELIVERY   | PREPARING |
++----------------+------------+-----------+</code></pre>
+
+<p>Taylor Brooks is a <em>carryout</em> order, and the query was meant to be about deliveries. The
+parentheses are the fix:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_name, order_type, status
+FROM   customer_order
+WHERE  (status = 'CANCELLED' OR status = 'PREPARING') AND order_type = 'DELIVERY'
+ORDER  BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+------------+-----------+
+| customer_name  | order_type | status    |
++----------------+------------+-----------+
+| Chris Vaughn   | DELIVERY   | CANCELLED |
+| Casey Lindgren | DELIVERY   | PREPARING |
++----------------+------------+-----------+</code></pre>
+
+<p>Nothing warns you. Parenthesise whenever both operators appear.</p>
+
+<h2>IN</h2>
+
+<p><code>IN</code> is shorthand for a chain of <code>OR</code>s against the same column, and it is
+both shorter and harder to get wrong:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_name, status
+FROM   customer_order
+WHERE  status IN ('CANCELLED', 'PREPARING')
+ORDER  BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+-----------+
+| customer_name  | status    |
++----------------+-----------+
+| Chris Vaughn   | CANCELLED |
+| Taylor Brooks  | CANCELLED |
+| Casey Lindgren | PREPARING |
++----------------+-----------+</code></pre>
+
+<p>The list can be a <a href="/sql/sql-sub-query">subquery</a> instead of literals. If it is, read
+the warning about <code>NOT IN</code> and NULLs in that lesson before you use the negation.</p>
+
+<h2>The NULL trap</h2>
+
+<p>In the pizza schema <code>customer_order.user_id</code> is NULL exactly when the order was
+placed by a guest. Counting those the obvious way returns nothing at all:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS guest_orders
+FROM   customer_order
+WHERE  user_id = NULL;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+
+| guest_orders |
++--------------+
+|            0 |
++--------------+</code></pre>
+
+<p>There are ten such orders. The query is not wrong about the data — it is asking the wrong
+question. NULL means <em>unknown</em>, so <code>user_id = NULL</code> evaluates to unknown rather
+than to true or false, and <code>WHERE</code> keeps only rows that are true. No error, no warning,
+just an empty answer.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS guest_orders
+FROM   customer_order
+WHERE  user_id IS NULL;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+
+| guest_orders |
++--------------+
+|           10 |
++--------------+</code></pre>
+
+<p><code>IS NULL</code> and <code>IS NOT NULL</code> are the only operators that test for it. The
+full story — including how NULL behaves in aggregates and in <code>NOT IN</code> — is in
+<a href="/sql/sql-isnull">NULL, IS NULL and ISNULL()</a>.</p>
+
+<h2>Keep the column bare</h2>
+
+<p>These two find the same rows:</p>
+
+<pre class="language-sql"><code class="language-sql">-- cannot use an index on created_at: every row must be read and converted first
+SELECT COUNT(*) FROM customer_order WHERE YEAR(created_at) = 2026;
+
+-- can use one: the range is expressed in terms of the stored column
+SELECT COUNT(*) FROM customer_order WHERE created_at &gt;= '2026-01-01'
+                                      AND created_at &lt;  '2027-01-01';</code></pre>
+
+<p>Wrapping an indexed column in a function makes the index unusable, because the index stores
+<code>created_at</code> and the query asks about <code>YEAR(created_at)</code> — a different
+value, in a different order. The same applies to <code>DATE(col)</code>,
+<code>UPPER(col)</code> and arithmetic like <code>col * 2 &gt; 100</code>. Rearrange so the column
+sits alone on one side. On 18 rows it makes no measurable difference; on the 400,000-row table in
+the <a href="/sql/mysql-index">indexes</a> lesson it is the whole difference.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>WHERE</code> keeps rows where the condition is <strong>true</strong> — not merely
+      "not false".</li>
+  <li><code>AND</code> binds tighter than <code>OR</code>. Parenthesise when both appear.</li>
+  <li><code>= NULL</code> is never true. Use <code>IS NULL</code>.</li>
+  <li>Keep the indexed column bare on its side of the comparison.</li>
+</ul>
+
+<p>Next: <a href="/sql/sql-isnull">NULL and IS NULL</a> in full.</p>

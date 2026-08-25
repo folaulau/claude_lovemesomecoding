@@ -1,0 +1,126 @@
+<p>A result set has no order until you ask for one. <code>ORDER BY</code> is how you ask, and it is
+one of the last things MySQL does — after <code>WHERE</code>, after <code>GROUP BY</code>, after
+the select list has been evaluated.</p>
+
+<h2>ASC and DESC</h2>
+
+<p>Ascending is the default, so <code>ORDER BY name</code> and <code>ORDER BY name ASC</code> are
+the same thing. <code>DESC</code> reverses it:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name, display_order FROM product WHERE type = 'PIZZA' ORDER BY display_order DESC LIMIT 4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+---------------+
+| name                  | display_order |
++-----------------------+---------------+
+| Buffalo Chicken Pizza |             8 |
+| Hawaiian Pizza        |             7 |
+| BBQ Chicken Pizza     |             6 |
+| Veggie Lovers Pizza   |             5 |
++-----------------------+---------------+</code></pre>
+
+<h2>Several columns</h2>
+
+<p>Each column gets its own direction, and later columns only break ties in earlier ones:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.name, ps.size, ps.price
+FROM   product_size ps JOIN product p ON p.id = ps.product_id
+WHERE  p.type = 'DRINK'
+ORDER  BY ps.price DESC, p.name ASC
+LIMIT  5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+-------+-------+
+| name         | size  | price |
++--------------+-------+-------+
+| Diet Pepsi   | LARGE |  2.99 |
+| Iced Tea     | LARGE |  2.99 |
+| Mountain Dew | LARGE |  2.99 |
+| Pepsi        | LARGE |  2.99 |
+| Starry       | LARGE |  2.99 |
++--------------+-------+-------+</code></pre>
+
+<p>Every drink is 2.99 at large, so <code>price DESC</code> decides nothing and
+<code>name ASC</code> decides everything. Writing <code>ORDER BY price DESC, name</code> — one
+<code>DESC</code>, one implicit <code>ASC</code> — is normal and not a mistake.</p>
+
+<h2>Sorting by an alias or an expression</h2>
+
+<p>By the time <code>ORDER BY</code> runs, the select list has been evaluated, so its aliases
+exist:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT name, price * 1.0725 AS with_tax
+FROM   product_size ps JOIN product p ON p.id = ps.product_id
+ORDER  BY with_tax DESC
+LIMIT  3;</code></pre>
+
+<p>That is why an alias works here and <a href="/sql/sql-select">not in <code>WHERE</code></a>. You
+can also sort by an expression directly, or by a column you did not select at all —
+<code>ORDER BY created_at</code> is legal even when <code>created_at</code> is not in the output.</p>
+
+<p>MySQL additionally allows <code>ORDER BY 2</code>, meaning "the second column of the output".
+Avoid it: it silently re-sorts by something else the moment anyone reorders the select list.</p>
+
+<h2>Where NULLs go</h2>
+
+<p>MySQL treats NULL as lower than every value, so it sorts first in <code>ASC</code> and last in
+<code>DESC</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_name, address_line1
+FROM   customer_order
+ORDER  BY address_line1
+LIMIT  5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+---------------+
+| customer_name  | address_line1 |
++----------------+---------------+
+| Alex Rivera    | NULL          |
+| Morgan Ellis   | NULL          |
+| Dana Whitfield | NULL          |
+| Jordan Blake   | NULL          |
+| Demo Customer  | NULL          |
++----------------+---------------+</code></pre>
+
+<p>Those are the carryout orders, which have no delivery address. MySQL has no
+<code>NULLS LAST</code> clause — that is standard SQL it does not implement — so to push them to
+the other end, sort by a nullness flag first:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT customer_name, address_line1
+FROM   customer_order
+ORDER  BY address_line1 IS NULL, address_line1
+LIMIT  5;</code></pre>
+
+<p><code>address_line1 IS NULL</code> is 0 for real addresses and 1 for NULLs, so ascending puts
+the NULLs last.</p>
+
+<h2>No ORDER BY means no order</h2>
+
+<p>This is the part worth taking seriously. A query without <code>ORDER BY</code> has
+<strong>no guaranteed order at all</strong> — not "insertion order", not "primary key order".
+MySQL returns rows in whatever order the plan it chose produced them.</p>
+
+<p>It will very often look sorted, because a small table read through its clustered primary key
+comes back in key order. Then an index is added, or the table grows, or the optimizer picks a
+different plan, and the order changes with no code change at all. If order matters, say so.</p>
+
+<p>The same applies to <code>GROUP BY</code>: MySQL 8 does not sort groups implicitly. If you want
+grouped output in a particular order, add <code>ORDER BY</code>.</p>
+
+<h2>Sorting is not free</h2>
+
+<p>If an index already provides the order, MySQL reads it and sorts nothing. If it does not, the
+rows go through a sort — <code>Using filesort</code> in
+<a href="/sql/sql-explain">EXPLAIN</a>, which despite the name is usually in memory.</p>
+
+<p>Two consequences worth knowing. An index only helps if the <code>ORDER BY</code> matches its
+column order, so <code>ORDER BY a, b</code> can use an index on <code>(a, b)</code> and not one on
+<code>(b, a)</code>. And sorting by an expression — <code>ORDER BY price * 1.0725</code> — can
+never use an index, for the same reason a function in <code>WHERE</code> cannot. See
+<a href="/sql/mysql-index">indexes</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>ASC</code> is the default; each column takes its own direction.</li>
+  <li>Aliases work here because <code>ORDER BY</code> runs after <code>SELECT</code>.</li>
+  <li>NULLs sort first ascending. Use <code>ORDER BY col IS NULL, col</code> to flip that.</li>
+  <li>No <code>ORDER BY</code>, no guaranteed order — however sorted it happens to look.</li>
+</ul>
