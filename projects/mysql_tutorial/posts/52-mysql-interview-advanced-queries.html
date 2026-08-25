@@ -1,0 +1,191 @@
+<p>The query-writing questions. Each one is solved against the pizza database — 18 orders, so you can
+check the answers by eye — and every result below came from running it.</p>
+
+<h2>1. The second-highest value</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT MAX(total) AS second_highest FROM customer_order
+WHERE  total &lt; (SELECT MAX(total) FROM customer_order);</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+
+| second_highest |
++----------------+
+|          40.86 |
++----------------+</code></pre>
+
+<p>"The largest value smaller than the largest value." It handles ties correctly — if two orders
+share the top total, this still returns the next <em>distinct</em> value — and it returns NULL rather
+than erroring when there is no second value.</p>
+
+<p><code>ORDER BY total DESC LIMIT 1 OFFSET 1</code> also works and answers a subtly different
+question: it gives the second <em>row</em>, so with a tie at the top it returns the top value again.
+Know which one you were asked for.</p>
+
+<h2>2. Nth highest, with window functions</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total, dense_rank_ FROM (
+  SELECT id, total, DENSE_RANK() OVER (ORDER BY total DESC) AS dense_rank_
+  FROM customer_order) r
+WHERE  dense_rank_ = 2 ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------+-------------+
+| id | total | dense_rank_ |
++----+-------+-------------+
+| 17 | 40.86 |           2 |
++----+-------+-------------+</code></pre>
+
+<p>Change the 2 for any N. The interviewer is usually checking three things: that you reach for a
+window function, that you know <code>DENSE_RANK</code> is right here because
+<code>RANK</code> skips after a tie, and that you know <strong>a window function cannot go in
+<code>WHERE</code></strong> — so it has to be computed in a subquery or CTE and filtered outside.
+<a href="/sql/mysql-window-functions">Window functions</a></p>
+
+<h2>3. Find duplicates</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT total, COUNT(*) AS n, GROUP_CONCAT(id ORDER BY id) AS ids
+FROM   customer_order GROUP BY total HAVING COUNT(*) &gt; 1 ORDER BY total;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------+---+------+
+| total | n | ids  |
++-------+---+------+
+| 18.43 | 2 | 2,14 |
+| 32.18 | 2 | 3,4  |
++-------+---+------+</code></pre>
+
+<p><code>GROUP BY</code> the columns that define a duplicate, then <code>HAVING COUNT(*) &gt; 1</code>.
+The <code>GROUP_CONCAT</code> is what makes it actionable — you get the ids, not just a count.</p>
+
+<h3>...and delete them, keeping one</h3>
+
+<pre class="language-sql"><code class="language-sql">-- session 1: destructive. Shown, not run.
+DELETE d FROM customer_order d
+JOIN   (SELECT total, MIN(id) AS keep_id FROM customer_order
+        GROUP BY total HAVING COUNT(*) &gt; 1) k
+  ON   d.total = k.total AND d.id &gt; k.keep_id;</code></pre>
+
+<p>MySQL will not let you <code>DELETE</code> from a table you are selecting from in a subquery, so
+the join form is the answer. <code>d.id &gt; k.keep_id</code> keeps the lowest id of each group.
+Run it as a <code>SELECT</code> first — see
+<a href="/sql/mysql-run-query-in-production">running queries in production</a>.</p>
+
+<h2>4. Gaps in a sequence</h2>
+
+<pre class="language-sql"><code class="language-sql">WITH RECURSIVE seq AS (
+    SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n &lt; 20
+)
+SELECT s.n AS missing_id FROM seq s
+LEFT   JOIN customer_order o ON o.id = s.n
+WHERE  o.id IS NULL ORDER BY s.n;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+
+| missing_id |
++------------+
+|         19 |
+|         20 |
++------------+</code></pre>
+
+<p>Generate the complete series, left join the real rows onto it, keep the ones with no match. The
+same shape solves "show every day in the month including days with no orders", which is the version
+that actually comes up at work — a <code>GROUP BY date</code> simply produces no row for an empty
+day and the chart joins across the gap. <a href="/sql/mysql-cte">CTEs</a></p>
+
+<p>Without a recursive CTE you would need a numbers table, which is worth mentioning as the
+pre-MySQL-8 answer.</p>
+
+<h2>5. Rows in one table with no match in another</h2>
+
+<pre class="language-sql"><code class="language-sql">-- the anti-join
+SELECT p.id, p.name FROM product p
+LEFT   JOIN order_item i ON i.product_id = p.id
+WHERE  i.id IS NULL;</code></pre>
+
+<p>Three ways exist and they are not equivalent. <code>LEFT JOIN ... IS NULL</code> and
+<code>NOT EXISTS</code> both work correctly. <code>NOT IN</code> <strong>returns nothing at all</strong>
+if the subquery yields a single NULL — and <code>order_item.product_id</code> is nullable, so that is
+a live risk here rather than a theoretical one. Volunteering that is the whole point of the question.
+<a href="/sql/sql-sub-query">Subqueries</a></p>
+
+<h2>6. A pivot</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT order_type,
+       SUM(status = 'COMPLETED') AS completed,
+       SUM(status = 'CANCELLED') AS cancelled,
+       COUNT(*) AS total_orders
+FROM   customer_order GROUP BY order_type ORDER BY order_type;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+-----------+-----------+--------------+
+| order_type | completed | cancelled | total_orders |
++------------+-----------+-----------+--------------+
+| CARRYOUT   |         5 |         1 |            7 |
+| DELIVERY   |         8 |         1 |           11 |
++------------+-----------+-----------+--------------+</code></pre>
+
+<p>Rows into columns, in one pass. <code>SUM(condition)</code> works because a comparison is 1 or 0;
+<code>SUM(CASE WHEN … THEN 1 ELSE 0 END)</code> is the portable spelling. Use <code>SUM</code>, not
+<code>COUNT</code> — <code>COUNT(CASE … ELSE 0 END)</code> counts every row, because 0 is not NULL.</p>
+
+<p>The honest caveat to add: <strong>SQL cannot pivot on values it does not know at parse time.</strong>
+A column per status means naming each status. Dynamic pivots need generated SQL or the application.
+<a href="/sql/sql-if">IF and CASE</a></p>
+
+<h2>7. A running total</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, total, SUM(total) OVER (ORDER BY id) AS running_total
+FROM   customer_order WHERE status = 'COMPLETED' ORDER BY id LIMIT 5;</code></pre>
+
+<p>Adding <code>ORDER BY</code> to <code>OVER</code> defaults the frame to "start of partition to
+current row", which is what makes it cumulative rather than a repeated grand total. The pre-8.0
+answer was a self join on <code>a.id &lt;= b.id</code>, which is quadratic — worth mentioning to show
+you know why window functions were added.</p>
+
+<h2>8. Month-over-month growth</h2>
+
+<pre class="language-sql"><code class="language-sql">WITH monthly AS (
+    SELECT DATE_FORMAT(created_at, '%Y-%m') AS month, SUM(total) AS revenue
+    FROM   customer_order WHERE status = 'COMPLETED'
+    GROUP  BY month
+)
+SELECT month,
+       ROUND(revenue, 2) AS revenue,
+       ROUND(LAG(revenue) OVER (ORDER BY month), 2) AS previous,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+             / NULLIF(LAG(revenue) OVER (ORDER BY month), 0), 1) AS pct_change
+FROM   monthly ORDER BY month;</code></pre>
+
+<p>Aggregate to months in a CTE, then <code>LAG</code> to reach the previous row. Two details worth
+saying aloud: <code>'%Y-%m'</code> sorts correctly as a string, where <code>MONTH()</code> alone
+merges every January in your history; and <code>NULLIF(…, 0)</code> turns a zero denominator into
+NULL instead of an error.</p>
+
+<h2>9. Top N per group</h2>
+
+<pre class="language-sql"><code class="language-sql">WITH ranked AS (
+    SELECT product_name, size, line_total,
+           ROW_NUMBER() OVER (PARTITION BY product_name ORDER BY line_total DESC, id) AS rn
+    FROM   order_item
+)
+SELECT product_name, size, line_total FROM ranked WHERE rn &lt;= 2
+ORDER  BY product_name, rn;</code></pre>
+
+<p>The classic. <code>PARTITION BY</code> restarts the numbering per group, and the filter goes
+outside because a window function cannot appear in <code>WHERE</code>. Note the <code>, id</code>
+tiebreaker — without it, rows with equal <code>line_total</code> are ordered arbitrarily and the
+query returns different rows on different runs.</p>
+
+<h2>What they are really testing</h2>
+
+<ul>
+  <li><strong>Do you reach for set operations or for loops?</strong> A cursor where a join would do
+      is the answer they are watching for.</li>
+  <li><strong>Do you think about NULL?</strong> The <code>NOT IN</code> trap and
+      <code>COUNT(col)</code> versus <code>COUNT(*)</code> come up constantly.</li>
+  <li><strong>Do you think about ties?</strong> Second-highest, top-N and pagination all change
+      answer depending on how you handle them.</li>
+  <li><strong>Do you know MySQL 8?</strong> CTEs and window functions have been available for years,
+      and reaching for a correlated subquery where a window function is natural reads as out of
+      date.</li>
+  <li><strong>Would this survive production?</strong> Saying "I would <code>EXPLAIN</code> this
+      before running it on a large table" is usually worth more than the query.</li>
+</ul>
+
+<p>Say your assumptions out loud, and ask what should happen on ties, on NULLs and on empty groups.
+That conversation is most of what is being assessed.</p>

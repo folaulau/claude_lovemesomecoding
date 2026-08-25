@@ -1,0 +1,162 @@
+<p>Replication keeps a second MySQL server continuously up to date with a first. The primary writes
+its changes to the <a href="/sql/mysql-binlog">binary log</a>; the replica reads that log and
+applies them.</p>
+
+<p>It buys you read capacity, a warm standby, and somewhere to run reports without touching
+production. It is not a backup, for a reason worth being precise about.</p>
+
+<h2>Setting up a pair</h2>
+
+<p>Both servers need a unique <code>server_id</code> and the primary needs binary logging on. GTID
+mode makes everything afterwards easier, so turn it on from the start:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext"># primary: my.cnf
+server_id                = 1
+log_bin                  = binlog
+gtid_mode                = ON
+enforce_gtid_consistency = ON
+
+# replica: my.cnf
+server_id                = 2
+gtid_mode                = ON
+enforce_gtid_consistency = ON
+read_only                = ON
+super_read_only          = ON</code></pre>
+
+<p><code>read_only</code> stops ordinary accounts writing to the replica;
+<code>super_read_only</code> stops privileged ones too. Set both — <code>read_only</code> alone
+still lets anyone with <code>SUPER</code> write, and a stray write on a replica breaks replication
+in a way that is tedious to unpick.</p>
+
+<p>On the primary, an account for the replica to connect as:</p>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: run on the PRIMARY of a replication pair. Creates a server-level account.
+CREATE USER 'repl'@'%' IDENTIFIED BY 'a-strong-password';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';</code></pre>
+
+<p>Take a consistent snapshot and note where it came from:</p>
+
+<pre class="language-bash"><code class="language-bash">mysqldump -u root --all-databases --single-transaction \
+          --source-data=2 --triggers --routines --events &gt; snapshot.sql
+
+mysql -h replica -u root &lt; snapshot.sql</code></pre>
+
+<p><code>--source-data=2</code> (called <code>--master-data</code> before 8.0.26) records the
+position — or, with GTIDs, the executed GTID set — as a comment in the dump. That is the point the
+replica must start from, and getting it wrong means silently missing or duplicating
+transactions.</p>
+
+<p>Then point the replica at the primary and start:</p>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: run on the REPLICA. This checker's server is a standalone instance.
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = 'primary.internal',
+    SOURCE_USER = 'repl',
+    SOURCE_PASSWORD = 'a-strong-password',
+    SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;</code></pre>
+
+<p><code>SOURCE_AUTO_POSITION = 1</code> is what GTIDs buy you: the replica works out for itself
+which transactions it is missing, rather than you supplying a file name and byte offset. That is the
+difference between a routine failover and an afternoon of arithmetic.</p>
+
+<p>(MySQL 8.0.22 renamed this whole family of commands — <code>CHANGE MASTER TO</code> became
+<code>CHANGE REPLICATION SOURCE TO</code>, <code>SHOW SLAVE STATUS</code> became
+<code>SHOW REPLICA STATUS</code>, and so on. Older documentation uses the old names.)</p>
+
+<h2>Checking it</h2>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: run on the REPLICA. A standalone server reports ERROR 1200.
+SHOW REPLICA STATUS\G</code></pre>
+
+<p>Four fields tell you almost everything:</p>
+
+<table>
+  <tr><td><code>Replica_IO_Running</code></td><td>Should be <code>Yes</code> — it is fetching the
+      log.</td></tr>
+  <tr><td><code>Replica_SQL_Running</code></td><td>Should be <code>Yes</code> — it is applying
+      it.</td></tr>
+  <tr><td><code>Seconds_Behind_Source</code></td><td><strong>The lag.</strong> 0 is healthy, NULL
+      means replication has stopped.</td></tr>
+  <tr><td><code>Last_Error</code></td><td>Why it stopped, if it did.</td></tr>
+</table>
+
+<p>Monitor <code>Seconds_Behind_Source</code> and alert on it. Note it measures how far behind the
+<em>applied</em> transaction is, not network latency — and it reads 0 both when the replica is
+caught up and when it has nothing to do, so alert on the IO/SQL threads being <code>No</code>
+as well.</p>
+
+<h2>Lag is the thing that bites the application</h2>
+
+<p>Replication is <strong>asynchronous</strong> by default: the primary commits and tells the client
+"done" without waiting for any replica. So there is always a window where the replica does not have
+your write.</p>
+
+<p>The bug that produces is specific and common. A customer places an order — written to the primary
+— and the confirmation page reads from a replica that has not received it yet. The order appears to
+have vanished. Under load, when lag is largest, this happens most.</p>
+
+<p>Three real answers, in order of preference:</p>
+
+<ol>
+  <li><strong>Read your own writes from the primary.</strong> After a write, route that user's reads
+      to the primary for a few seconds. Simple and effective.</li>
+  <li><strong>Route by query type deliberately</strong> rather than by default — reports, exports
+      and analytics to replicas; anything a user just changed to the primary.</li>
+  <li><strong>Semi-synchronous replication</strong>, where the primary waits for at least one
+      replica to acknowledge receipt before returning. It shrinks the window at the cost of write
+      latency, and it does not eliminate it — the replica acknowledges receipt, not
+      application.</li>
+</ol>
+
+<h2>Read/write splitting</h2>
+
+<p>Splitting reads across replicas is where the capacity comes from, and it is a decision to make
+per query rather than globally. Spring supports an <code>AbstractRoutingDataSource</code> for this;
+ProxySQL does it outside the application; managed databases give you a reader endpoint.</p>
+
+<p>Whatever the mechanism, the rule holds: <strong>a read that must reflect a write the same user
+just made goes to the primary.</strong></p>
+
+<h2>When it breaks</h2>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: run on the REPLICA. A standalone server reports ERROR 1200.
+SHOW REPLICA STATUS\G          -- read Last_Error first
+
+STOP REPLICA;
+START REPLICA;                 -- after fixing the cause</code></pre>
+
+<p>The usual causes are a write that happened directly on the replica, a schema change applied in
+one place only, or a statement that is not deterministic under
+<code>STATEMENT</code> binlog format — which is the argument for <code>ROW</code>.</p>
+
+<p>You will find advice to skip the offending transaction. Understand what that means:
+<strong>the replica is now permanently missing a change</strong>, so its data differs from the
+primary's in a way nothing will report. Sometimes it is the pragmatic choice; treat it as accepting
+divergence, verify with <code>pt-table-checksum</code>, and rebuild the replica when you can.</p>
+
+<h2>⚠️ A replica is not a backup</h2>
+
+<p>This is the part to take seriously. Replication copies <em>everything</em>, promptly — including
+your mistake. <code>DROP TABLE customer_order</code> on the primary is on the replica a moment
+later. So a replica protects you against <strong>hardware failure</strong> and not at all against
+<strong>human error</strong>, which is the more common cause of data loss.</p>
+
+<p>Backups protect against human error precisely because they are a point in the past. You need
+both: replicas for availability, <a href="/sql/mysql-dump">backups</a> plus binlogs for recovery.</p>
+
+<p>A delayed replica is a useful middle ground —
+<code>CHANGE REPLICATION SOURCE TO SOURCE_DELAY = 3600</code> keeps one an hour behind, giving you
+an hour to notice a destructive statement before it arrives there.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Unique <code>server_id</code>, binlog on, GTIDs on, and both read-only flags on the
+      replica.</li>
+  <li><code>SOURCE_AUTO_POSITION = 1</code> — let GTIDs find the position for you.</li>
+  <li>Watch the IO and SQL threads and <code>Seconds_Behind_Source</code>.</li>
+  <li>Asynchronous means a read-after-write window. Route those reads to the primary.</li>
+  <li><strong>A replica is not a backup.</strong> It replicates your mistakes faithfully.</li>
+</ul>

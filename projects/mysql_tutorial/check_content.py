@@ -125,7 +125,7 @@ BIG_NUMBER = re.compile(r"\b(\d{1,3}(?:,\d{3})+)\b(?=[^.!?]*\b" + LAB_TABLES + r
 
 # 🍕 is deliberate: mysql-data-types uses it to show that MySQL's older `utf8` is a
 # 3-byte encoding that cannot store an emoji, which is the whole reason utf8mb4 exists.
-ALLOWED_NON_ASCII = set("—–’‘“”…×→±⚠️✓✗‹›°éíóúñ§🍕⅓")
+ALLOWED_NON_ASCII = set("—–’‘“”…×→←±⚠️✓✗‹›°éíóúñ§🍕⅓")
 
 
 def prose_and_code_words(result: dict) -> tuple[int, int]:

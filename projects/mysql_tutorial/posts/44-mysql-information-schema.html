@@ -1,0 +1,171 @@
+<p><code>INFORMATION_SCHEMA</code> is the database describing itself, as ordinary tables you can
+query. That is the useful part: anything you can ask about your data, you can ask about your schema
+— join it, filter it, aggregate it, generate SQL from it.</p>
+
+<p><code>SHOW</code> commands read the same underlying data in a friendlier form.
+<code>SHOW</code> for a quick look; <code>INFORMATION_SCHEMA</code> when you need to
+<em>query</em> the answer.</p>
+
+<h2>What tables exist</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT TABLE_NAME, ENGINE, TABLE_COLLATION
+FROM   information_schema.TABLES
+WHERE  TABLE_SCHEMA = 'pizza' AND TABLE_TYPE = 'BASE TABLE'
+ORDER  BY TABLE_NAME LIMIT 5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+--------+--------------------+
+| TABLE_NAME            | ENGINE | TABLE_COLLATION    |
++-----------------------+--------+--------------------+
+| DATABASECHANGELOG     | InnoDB | utf8mb4_0900_ai_ci |
+| DATABASECHANGELOGLOCK | InnoDB | utf8mb4_0900_ai_ci |
+| app_user              | InnoDB | utf8mb4_0900_ai_ci |
+| cart                  | InnoDB | utf8mb4_0900_ai_ci |
+| cart_item             | InnoDB | utf8mb4_0900_ai_ci |
++-----------------------+--------+--------------------+</code></pre>
+
+<p><code>TABLE_SCHEMA</code> is the database name — MySQL uses "schema" and "database"
+interchangeably, unlike Postgres. <code>TABLE_TYPE</code> separates tables from views. This is also
+a fast audit: an <code>ENGINE</code> that is not <code>InnoDB</code> or a collation that is not
+<code>utf8mb4</code> is worth knowing about.</p>
+
+<h2>Columns</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY
+FROM   information_schema.COLUMNS
+WHERE  TABLE_SCHEMA = 'pizza' AND TABLE_NAME = 'crust'
+ORDER  BY ORDINAL_POSITION;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------+---------------+-------------+------------+
+| COLUMN_NAME   | COLUMN_TYPE   | IS_NULLABLE | COLUMN_KEY |
++---------------+---------------+-------------+------------+
+| id            | bigint        | NO          | PRI        |
+| name          | varchar(80)   | NO          | UNI        |
+| price_delta   | decimal(10,2) | NO          |            |
+| active        | tinyint(1)    | NO          |            |
+| display_order | int           | NO          |            |
+| public_id     | char(36)      | NO          | UNI        |
+| created_at    | datetime(6)   | NO          |            |
+| updated_at    | datetime(6)   | NO          |            |
+| deleted       | tinyint(1)    | NO          | MUL        |
++---------------+---------------+-------------+------------+</code></pre>
+
+<p>Because it is a table, you can ask questions <code>DESCRIBE</code> cannot — every column called
+<code>email</code> across the whole database, every <code>DECIMAL</code> that is not
+<code>(10,2)</code>, every nullable column with no default:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE
+FROM   information_schema.COLUMNS
+WHERE  TABLE_SCHEMA = 'pizza' AND DATA_TYPE = 'decimal' AND COLUMN_TYPE &lt;&gt; 'decimal(10,2)';</code></pre>
+
+<h2>What points at this table</h2>
+
+<p>The question to answer <em>before</em> deleting anything, because of
+<a href="/sql/sql-delete">ON DELETE CASCADE</a>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT TABLE_NAME, COLUMN_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME
+FROM   information_schema.KEY_COLUMN_USAGE
+WHERE  TABLE_SCHEMA = 'pizza' AND REFERENCED_TABLE_NAME = 'customer_order'
+ORDER  BY TABLE_NAME;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+-------------+---------------------+-----------------------+
+| TABLE_NAME | COLUMN_NAME | CONSTRAINT_NAME     | REFERENCED_TABLE_NAME |
++------------+-------------+---------------------+-----------------------+
+| order_item | order_id    | fk_order_item_order | customer_order        |
++------------+-------------+---------------------+-----------------------+</code></pre>
+
+<p><code>KEY_COLUMN_USAGE</code> gives the columns; <code>REFERENTIAL_CONSTRAINTS</code> adds the
+<code>DELETE_RULE</code> and <code>UPDATE_RULE</code>, which is what tells you whether a delete
+cascades:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME, DELETE_RULE
+FROM   information_schema.REFERENTIAL_CONSTRAINTS
+WHERE  CONSTRAINT_SCHEMA = 'pizza' AND DELETE_RULE = 'CASCADE'
+ORDER  BY TABLE_NAME;</code></pre>
+
+<h2>Indexes</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT INDEX_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns_, NON_UNIQUE
+FROM   information_schema.STATISTICS
+WHERE  TABLE_SCHEMA = 'pizza' AND TABLE_NAME = 'customer_order'
+GROUP  BY INDEX_NAME, NON_UNIQUE ORDER BY INDEX_NAME;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------------------+--------------------------+------------+
+| INDEX_NAME                        | columns_                 | NON_UNIQUE |
++-----------------------------------+--------------------------+------------+
+| idx_customer_order_created_at     | created_at               |          1 |
+| idx_customer_order_deleted        | deleted                  |          1 |
+| idx_customer_order_payment_intent | stripe_payment_intent_id |          1 |
+| idx_customer_order_status         | status                   |          1 |
+| idx_customer_order_user           | user_id                  |          1 |
+| PRIMARY                           | id                       |          0 |
+| uk_customer_order_public_id       | public_id                |          0 |
++-----------------------------------+--------------------------+------------+
+</code></pre>
+
+<p><code>STATISTICS</code> has one row per <em>column</em> per index, so the
+<code>GROUP_CONCAT</code> with <code>SEQ_IN_INDEX</code> is what reassembles a composite index into
+something readable. <code>NON_UNIQUE = 0</code> means unique.</p>
+
+<p>Two audits worth running on any schema you inherit. <strong>Redundant indexes</strong> — one
+whose columns are a leading prefix of another's, which the larger index already serves (see
+<a href="/sql/mysql-index">indexes</a>). And <strong>unused indexes</strong>, which
+<code>INFORMATION_SCHEMA</code> cannot tell you, because it knows the schema and not the workload —
+that lives in <code>sys.schema_unused_indexes</code>, built on
+<code>performance_schema</code>.</p>
+
+<h2>Size on disk</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT TABLE_NAME,
+       ROUND(DATA_LENGTH  / 1024 / 1024, 1) AS data_mb,
+       ROUND(INDEX_LENGTH / 1024 / 1024, 1) AS index_mb,
+       TABLE_ROWS AS approx_rows
+FROM   information_schema.TABLES
+WHERE  TABLE_SCHEMA = 'pizza_lab'
+ORDER  BY DATA_LENGTH + INDEX_LENGTH DESC;</code></pre>
+
+<p>⚠️ <strong><code>TABLE_ROWS</code> is an estimate, not a count.</strong> For InnoDB it is sampled
+from the index and can be out by a wide margin — the same sampling that makes
+<a href="/sql/sql-explain">EXPLAIN's <code>rows</code></a> drift. Use it for "roughly how big",
+never for a number anyone will act on. <code>COUNT(*)</code> is the count.</p>
+
+<p><code>DATA_LENGTH</code> and <code>INDEX_LENGTH</code> are approximate for the same reason, and
+they do not shrink when you delete rows — InnoDB keeps the space for reuse.</p>
+
+<h2>Generating SQL from it</h2>
+
+<p>The trick that makes this genuinely powerful: query the catalogue to write your DDL.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT CONCAT('ALTER TABLE `', TABLE_NAME, '` CONVERT TO CHARACTER SET utf8mb4 ',
+              'COLLATE utf8mb4_0900_ai_ci;') AS statement
+FROM   information_schema.TABLES
+WHERE  TABLE_SCHEMA = 'pizza' AND TABLE_COLLATION &lt;&gt; 'utf8mb4_0900_ai_ci';</code></pre>
+
+<p>Run it, read every line of the output, then paste the lines you agree with.
+<strong>Read them.</strong> A generated statement is only as good as the <code>WHERE</code> clause
+that produced it, and this technique makes it equally easy to generate 200 correct statements or
+200 wrong ones.</p>
+
+<h2>The neighbouring schemas</h2>
+
+<table>
+  <tr><td><code>information_schema</code></td><td>What the schema <strong>is</strong>. Standard SQL,
+      portable in spirit.</td></tr>
+  <tr><td><code>performance_schema</code></td><td>What the server is <strong>doing</strong> —
+      statement latency, waits, locks. Detailed and verbose.</td></tr>
+  <tr><td><code>sys</code></td><td>Readable views over <code>performance_schema</code>.
+      <code>sys.schema_unused_indexes</code>, <code>sys.statements_with_full_table_scans</code>,
+      <code>sys.schema_table_lock_waits</code> — start here.</td></tr>
+  <tr><td><code>mysql</code></td><td>The server's own tables, including accounts and grants. Read
+      it; do not write it.</td></tr>
+</table>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>It is queryable, so ask questions <code>SHOW</code> cannot answer.</li>
+  <li><code>KEY_COLUMN_USAGE</code> and <code>REFERENTIAL_CONSTRAINTS</code> before you drop or
+      delete.</li>
+  <li><code>STATISTICS</code> needs <code>GROUP_CONCAT ... SEQ_IN_INDEX</code> to read composites.</li>
+  <li><code>TABLE_ROWS</code> is an estimate. <code>COUNT(*)</code> is the count.</li>
+  <li>Generate DDL from it — and read every generated line before running it.</li>
+</ul>

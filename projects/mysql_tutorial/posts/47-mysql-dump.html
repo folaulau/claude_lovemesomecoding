@@ -1,0 +1,145 @@
+<p><code>mysqldump</code> writes a database out as a text file of SQL statements — the schema, the
+data, or both. It is the backup everyone starts with, and it is genuinely good up to a point that
+this lesson tries to be honest about.</p>
+
+<h2>The command you actually want</h2>
+
+<pre class="language-bash"><code class="language-bash">mysqldump -h 127.0.0.1 -P 3308 -u root \
+  --single-transaction \
+  --routines --events --triggers \
+  pizza &gt; pizza-backup.sql</code></pre>
+
+<p>Every flag there is load-bearing:</p>
+
+<table>
+  <tr><td><code>--single-transaction</code></td>
+      <td><strong>The important one.</strong> Dumps inside one transaction, giving a consistent
+          snapshot <em>without locking</em>. Omit it and mysqldump locks the tables while it
+          reads — on a live database that is an outage. InnoDB only.</td></tr>
+  <tr><td><code>--routines</code></td><td>Stored procedures and functions. <strong>Not included by
+      default.</strong></td></tr>
+  <tr><td><code>--events</code></td><td>Scheduled events. Also not included by default.</td></tr>
+  <tr><td><code>--triggers</code></td><td>Triggers. These <em>are</em> on by default; naming it
+      documents the intent.</td></tr>
+</table>
+
+<p>The two defaults worth internalising: <strong>a plain <code>mysqldump</code> silently omits your
+procedures and events.</strong> Restore that backup and the schema comes back without them, and
+nothing says so.</p>
+
+<h2>What is in the file</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">-- MySQL dump 10.13  Distrib 8.4.10, for macos15 (arm64)
+--
+-- Host: 127.0.0.1    Database: pizza
+-- ------------------------------------------------------
+-- Server version	8.4.11
+
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+/*!50503 SET NAMES utf8mb4 */;
+/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;</code></pre>
+
+<p>Plain SQL, which is the format's great virtue: you can read it, grep it, edit it, and restore it
+into a different MySQL version. Those <code>/*!40101 ... */</code> comments are
+<strong>version-gated SQL</strong> — a comment to any other database, an executed statement to MySQL
+at or above that version.</p>
+
+<p>Note <code>FOREIGN_KEY_CHECKS=0</code>. That is what lets the restore insert tables in any order
+without tripping over foreign keys, and it is why a restore does not validate referential
+integrity.</p>
+
+<h2>Variations</h2>
+
+<pre class="language-bash"><code class="language-bash">mysqldump ... --no-data pizza &gt; schema-only.sql        # structure, no rows
+mysqldump ... --no-create-info pizza &gt; data-only.sql   # rows, no structure
+mysqldump ... pizza product product_size &gt; menu.sql    # named tables only
+mysqldump ... --databases pizza pizza_lab &gt; both.sql   # several, with CREATE DATABASE
+mysqldump ... --all-databases &gt; everything.sql         # the whole server
+
+# only some rows
+mysqldump ... pizza customer_order --where="created_at &gt;= '2026-01-01'" &gt; recent.sql</code></pre>
+
+<p><code>--databases</code> matters more than it looks: without it the dump contains no
+<code>CREATE DATABASE</code> or <code>USE</code>, so you must create the target database yourself
+and name it on restore. With it, the dump decides where it lands.</p>
+
+<h2>Restoring</h2>
+
+<pre class="language-bash"><code class="language-bash">mysql -h 127.0.0.1 -P 3308 -u root -e "CREATE DATABASE pizza_restored"
+mysql -h 127.0.0.1 -P 3308 -u root pizza_restored &lt; pizza-backup.sql</code></pre>
+
+<p>There is no <code>mysqlrestore</code> — a dump is a script, so you feed it to the client. Two
+things to know. It is <strong>single-threaded</strong> and rebuilds every index as it goes, so
+restoring is far slower than dumping: a dump that takes ten minutes can take an hour to come back.
+And <code>mysql</code> stops at the first error by default, which is what you want — running it
+with <code>--force</code> gives you a half-restored database.</p>
+
+<h2>The only test that counts</h2>
+
+<p><strong>Restore it somewhere and look.</strong> A backup you have never restored is a hypothesis.
+The failures are mundane and total: the file was truncated because the disk filled, the cron job has
+been writing to a deleted directory for six months, the dump omitted the routines, the character set
+was wrong and every accented name is mangled.</p>
+
+<pre class="language-bash"><code class="language-bash">mysql ... -e "CREATE DATABASE restore_test"
+mysql ... restore_test &lt; pizza-backup.sql
+mysql ... restore_test -e "SELECT COUNT(*) FROM customer_order; SELECT COUNT(*) FROM order_item;"
+mysql ... -e "DROP DATABASE restore_test"</code></pre>
+
+<p>Automate that and alert when it fails. Compare row counts against the source. This is the
+difference between having backups and having recovery.</p>
+
+<h2>Where mysqldump stops being the answer</h2>
+
+<p>It is a <strong>logical</strong> backup: it re-derives every row as an <code>INSERT</code> and
+replays them. That is portable and readable, and it does not scale.</p>
+
+<table>
+  <tr><th>Size</th><th>Reasonable approach</th></tr>
+  <tr><td>Under a few GB</td><td><code>mysqldump</code>, compressed, on a schedule.</td></tr>
+  <tr><td>Tens of GB</td><td><code>mysqlpump</code> or <code>mydumper</code> for parallelism,
+      or start looking below.</td></tr>
+  <tr><td>Hundreds of GB and up</td><td><strong>Physical</strong> backups — Percona XtraBackup, or
+      your cloud provider's snapshots. They copy the data files, so size affects them far
+      less.</td></tr>
+</table>
+
+<p>The other limit is <strong>granularity</strong>. A nightly dump means losing up to a day. Point-in
+-time recovery — restore last night's dump, then replay the
+<a href="/sql/mysql-binlog">binary log</a> up to the moment before the mistake — is what closes that
+gap, and it is the reason the binlog matters.</p>
+
+<h2>A workable routine</h2>
+
+<pre class="language-bash"><code class="language-bash">#!/usr/bin/env bash
+set -euo pipefail
+
+DEST=/backups/pizza-$(date +%F).sql.gz
+
+mysqldump --defaults-file=/etc/mysql/backup.cnf \
+  --single-transaction --routines --events --triggers \
+  pizza | gzip &gt; "$DEST"
+
+# fail loudly if the file is implausibly small
+[ "$(stat -f%z "$DEST")" -gt 1000000 ] || { echo "backup too small"; exit 1; }
+
+find /backups -name 'pizza-*.sql.gz' -mtime +30 -delete</code></pre>
+
+<p>Note <code>--defaults-file</code>: putting the password on the command line exposes it in the
+process list to every user on the machine. A credentials file with <code>0600</code> permissions is
+the standard answer.</p>
+
+<p>And <code>set -euo pipefail</code> is not decoration — without it, a failing
+<code>mysqldump</code> in a pipeline still produces a gzip file, exits 0, and your monitoring sees a
+successful backup of nothing.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>--single-transaction</code>, or you lock the tables you are backing up.</li>
+  <li><code>--routines</code> and <code>--events</code> are <strong>not</strong> included by
+      default.</li>
+  <li>Restoring is much slower than dumping, and single-threaded.</li>
+  <li>An untested backup is a hypothesis. Restore it on a schedule and check the counts.</li>
+  <li>Logical backups stop scaling; past that it is physical backups plus binlog replay.</li>
+</ul>

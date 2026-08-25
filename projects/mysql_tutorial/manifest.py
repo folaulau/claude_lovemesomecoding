@@ -116,6 +116,10 @@ LAB_ROWS = {
     # stale the day after it was written.
     "oldest_order": "2023-01-02",
     "newest_order": "2025-01-01",
+    # The optimizer's ESTIMATE for `status = 'PAID'`, quoted in sql-explain precisely
+    # because it is wrong: the true count is 8,000. Recorded here so the figure is
+    # declared rather than looking invented, and NOT a row count -- it drifts.
+    "estimated_rows_status_paid": 14_398,
 }
 
 # Only these posts may quote a query plan or a lab row count. EXPLAIN output is
@@ -129,8 +133,12 @@ LAB_POSTS = {
     "mysql-transaction",
     "mysql-run-query-in-production",
     "mysql-replication",
-    "mysql-interview-advanced-queries",
 }
+
+# NOT a LAB_POST: mysql-interview-advanced-queries deliberately works on the 18-order
+# demo database, where a reader can check every answer by eye. It was in this set once
+# and its examples were then measured against 400,000 orders instead — the numbers were
+# unrecognisable, and its dedupe DELETE mutated the shared fixture.
 
 # Lesson 1 is stamped START_DATE and each following lesson is STEP_DAYS later,
 # so the pager reads lesson 1 -> lesson 52. Re-base the whole track by editing
@@ -974,9 +982,13 @@ FROZEN_SLUGS: set[str] = {
 # to satisfy a checker is the failure mode, not the fix.
 TARGET_MINUTES = (4, 9)
 
-# The two interview posts are reference pages people scroll rather than lessons
-# they read start to finish, so they get a wider band.
-LONG_POSTS = {"sql-interview-fundamentals", "mysql-interview-advanced-queries"}
+# A wider band for a post that is a reference page rather than a lesson.
+#
+# The two interview posts were here while `sql-interview-fundamentals` was still the
+# 5,944-word / 27-minute original. The rewrites are 1,200 words each and read as tight
+# reference pages, so they are held to the normal band like everything else. The
+# mechanism stays for the next post that genuinely needs it.
+LONG_POSTS: set[str] = set()
 TARGET_MINUTES_LONG = (6, 15)
 
 # Posts that are ONE IDEA and are allowed to be short.

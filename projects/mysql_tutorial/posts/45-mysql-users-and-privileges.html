@@ -1,0 +1,178 @@
+<p>Connecting as <code>root</code> is fine on a laptop and is how a lot of applications end up in
+production. The cost of not fixing it is that every SQL injection, every mistaken migration and
+every stray <code>DROP</code> has the run of the whole server.</p>
+
+<p>⚠️ Everything here creates <strong>server-level</strong> accounts, not database objects. They
+outlive the database you were connected to, so each example ends by cleaning up after itself.</p>
+
+<h2>An account is a user AND a host</h2>
+
+<pre class="language-sql"><code class="language-sql">DROP USER IF EXISTS 'pizza_app'@'%';
+CREATE USER 'pizza_app'@'%' IDENTIFIED BY 'demo-password';</code></pre>
+
+<p><code>'pizza_app'@'%'</code> and <code>'pizza_app'@'localhost'</code> are
+<strong>two different accounts</strong> with two different passwords and two different sets of
+privileges. This is the single most common source of "I granted it and it still says access
+denied".</p>
+
+<table>
+  <tr><td><code>'app'@'localhost'</code></td><td>Only from the server itself, over the Unix
+      socket.</td></tr>
+  <tr><td><code>'app'@'10.0.1.%'</code></td><td>From that subnet — the useful middle ground.</td></tr>
+  <tr><td><code>'app'@'%'</code></td><td>From anywhere. Convenient, and the widest possible
+      exposure.</td></tr>
+</table>
+
+<p>MySQL matches the <strong>most specific</strong> host pattern, and it is the matched row that
+decides your privileges. That is why <code>CURRENT_USER()</code> and <code>USER()</code> can differ
+— see <a href="/sql/mysql-server-helpful-functions">server and session functions</a>. When a grant
+seems not to apply, compare them first.</p>
+
+<h2>Least privilege</h2>
+
+<pre class="language-sql"><code class="language-sql">GRANT SELECT, INSERT, UPDATE, DELETE ON pizza.* TO 'pizza_app'@'%';
+
+SHOW GRANTS FOR 'pizza_app'@'%';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------------------------------------------------------------+
+| Grants for pizza_app@%                                               |
++----------------------------------------------------------------------+
+| GRANT USAGE ON *.* TO `pizza_app`@`%`                                |
+| GRANT SELECT, INSERT, UPDATE, DELETE ON `pizza`.* TO `pizza_app`@`%` |
++----------------------------------------------------------------------+</code></pre>
+
+<p>Four verbs on one database. <code>USAGE</code> means "may connect and nothing else" — it is what
+every account has, and it is not a privilege you grant.</p>
+
+<p>Note what is <em>absent</em>: no <code>DROP</code>, no <code>ALTER</code>, no
+<code>CREATE</code>. An application that does not run migrations does not need them, and the
+difference is real:</p>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: run while connected AS pizza_app. As an admin account it simply succeeds.
+-- ERROR 1142 (42000): DROP command denied to user 'pizza_app'@'...' for table 'crust'
+DROP TABLE crust;</code></pre>
+
+<p>Give migrations their own account with DDL rights, used by the migration tool and nothing else.
+Then a compromised application cannot drop a table however badly it is exploited.</p>
+
+<h2>Granularity</h2>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: illustrative syntax. 'x'@'%' is not a real account, and MySQL 8 will not
+-- create one implicitly through GRANT.
+GRANT SELECT               ON *.*                 TO 'x'@'%';   -- every database
+GRANT SELECT               ON pizza.*             TO 'x'@'%';   -- one database
+GRANT SELECT               ON pizza.customer_order TO 'x'@'%';  -- one table
+GRANT SELECT (id, email)   ON pizza.app_user      TO 'x'@'%';   -- named columns only</code></pre>
+
+<p>Column-level grants are the neat answer to "support needs to look up a customer but must not see
+the password hash":</p>
+
+<pre class="language-sql"><code class="language-sql">DROP USER IF EXISTS 'support'@'%';
+CREATE USER 'support'@'%' IDENTIFIED BY 'demo-password';
+GRANT SELECT (id, email, full_name) ON pizza.app_user TO 'support'@'%';</code></pre>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: run while connected AS support. As an admin account it simply succeeds.
+-- ERROR 1143 (42000): SELECT command denied to user 'support'@'...'
+-- for column 'password_hash' in table 'app_user'
+SELECT password_hash FROM app_user;</code></pre>
+
+<p>A <a href="/sql/mysql-view">view</a> does the same job with more flexibility — it can compute,
+mask and join — and is usually the better tool once more than a couple of columns are involved.</p>
+
+<h2>Roles</h2>
+
+<p>MySQL 8 added roles: a named bundle of privileges you grant to accounts.</p>
+
+<pre class="language-sql"><code class="language-sql">DROP ROLE IF EXISTS 'pizza_readonly';
+CREATE ROLE 'pizza_readonly';
+GRANT SELECT ON pizza.* TO 'pizza_readonly';
+
+DROP USER IF EXISTS 'reporting'@'%';
+CREATE USER 'reporting'@'%' IDENTIFIED BY 'demo-password';
+GRANT 'pizza_readonly' TO 'reporting'@'%';</code></pre>
+
+<h3>⚠️ A granted role is not an active role</h3>
+
+<p>This is the MySQL 8 behaviour that wastes an afternoon. The grant above is in place, and the
+account still cannot read anything:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">$ mysql -u reporting -p pizza
+ERROR 1044 (42000): Access denied for user 'reporting'@'%' to database 'pizza'</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SHOW GRANTS FOR 'reporting'@'%';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------------------------------+
+| Grants for reporting@%                        |
++-----------------------------------------------+
+| GRANT USAGE ON *.* TO `reporting`@`%`         |
+| GRANT `pizza_readonly`@`%` TO `reporting`@`%` |
++-----------------------------------------------+</code></pre>
+
+<p>The role is granted but <strong>not activated</strong>. Roles must be switched on, per session,
+and the fix is to make that automatic:</p>
+
+<pre class="language-sql"><code class="language-sql">SET DEFAULT ROLE ALL TO 'reporting'@'%';</code></pre>
+
+<p>Now the connection works. (Within a session, <code>SET ROLE</code> switches roles on and off, and
+<code>SHOW GRANTS FOR CURRENT_USER() USING 'pizza_readonly'</code> shows what a role actually
+carries.) Always pair <code>GRANT role</code> with <code>SET DEFAULT ROLE</code> unless you
+specifically want the account to opt in each time.</p>
+
+<h2>Authentication plugins</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT user, host, plugin FROM mysql.user WHERE user IN ('root','pizza_app') ORDER BY user, host;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------+-----------+-----------------------+
+| user      | host      | plugin                |
++-----------+-----------+-----------------------+
+| pizza_app | %         | caching_sha2_password |
+| root      | %         | caching_sha2_password |
+| root      | localhost | caching_sha2_password |
++-----------+-----------+-----------------------+</code></pre>
+
+<p><code>caching_sha2_password</code> is the MySQL 8 default and is stronger than the old
+<code>mysql_native_password</code>. It is also why an older client may fail to connect, and why the
+demo application's JDBC URL carries <code>allowPublicKeyRetrieval=true</code> — that flag exists to
+let the client fetch the server's public key over an <em>unencrypted</em> connection. With TLS on,
+you do not need it. See <a href="/sql/mysql-connection">connections</a>.</p>
+
+<p>Downgrading an account to <code>mysql_native_password</code> to make an old client work is a real
+temptation and a real step backwards; MySQL 8.4 removes that plugin by default. Upgrade the client.</p>
+
+<h2>Revoking, and clearing up</h2>
+
+<pre class="language-sql"><code class="language-sql">REVOKE DELETE ON pizza.* FROM 'pizza_app'@'%';
+ALTER USER 'pizza_app'@'%' IDENTIFIED BY 'a-new-password';
+
+DROP USER IF EXISTS 'pizza_app'@'%';
+DROP USER IF EXISTS 'reporting'@'%';
+DROP USER IF EXISTS 'support'@'%';
+DROP ROLE IF EXISTS 'pizza_readonly';</code></pre>
+
+<p><code>FLUSH PRIVILEGES</code> is <strong>not</strong> needed after <code>GRANT</code>,
+<code>REVOKE</code> or <code>CREATE USER</code> — those update the in-memory tables directly. It is
+only required when you have modified the <code>mysql</code> tables with raw SQL, which is exactly
+what the <a href="/sql/mysql-reset-root-password">root password reset</a> does.</p>
+
+<h2>A checklist</h2>
+
+<ul>
+  <li>One account per application, not one shared account.</li>
+  <li>Separate accounts for the application and for migrations.</li>
+  <li>Narrow the host as far as your network allows.</li>
+  <li>No <code>GRANT ALL</code>, no <code>WITH GRANT OPTION</code>, no <code>*.*</code>.</li>
+  <li>An admin account for humans, distinct from the application's — see
+      <a href="/sql/mysql-connection">connections</a> on the reserved connection slot.</li>
+  <li>Audit periodically: <code>SELECT user, host FROM mysql.user</code>, then
+      <code>SHOW GRANTS</code> for anything unfamiliar.</li>
+</ul>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>User + host is the identity. <code>'app'@'%'</code> and <code>'app'@'localhost'</code> are
+      different accounts.</li>
+  <li>Grant the verbs the application uses and nothing else; keep DDL for the migration account.</li>
+  <li>A granted role does nothing until it is activated — <code>SET DEFAULT ROLE ALL</code>.</li>
+  <li><code>FLUSH PRIVILEGES</code> is only for raw edits to the <code>mysql</code> tables.</li>
+</ul>

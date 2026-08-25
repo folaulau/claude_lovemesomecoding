@@ -1,0 +1,178 @@
+<p>Running a query against production is routine right up until it is not. This lesson is the habits
+that keep an ad-hoc query from becoming an incident — measured, where it matters, against
+<code>pizza_lab</code> at <strong>400,000 orders</strong>.</p>
+
+<h2>Set the session up first</h2>
+
+<pre class="language-sql"><code class="language-sql">SET SESSION sql_safe_updates = 1;
+SET SESSION max_execution_time = 10000;   -- 10s, SELECTs only
+SET SESSION innodb_lock_wait_timeout = 10;</code></pre>
+
+<p>Three seatbelts, each stopping a different accident:</p>
+
+<ul>
+  <li><code>sql_safe_updates</code> refuses an <code>UPDATE</code> or <code>DELETE</code> whose
+      <code>WHERE</code> does not use a key — the shape of the statement that empties a table.</li>
+  <li><code>max_execution_time</code> kills a runaway <code>SELECT</code>. It does
+      <strong>not</strong> apply to writes.</li>
+  <li><code>innodb_lock_wait_timeout</code> means a statement that cannot get its lock gives up in
+      ten seconds rather than fifty.</li>
+</ul>
+
+<p>Put those in <code>~/.my.cnf</code> under <code>[client]</code> so they are on by default. Making
+yourself override a seatbelt deliberately is the entire mechanism.</p>
+
+<h2>EXPLAIN before you run it</h2>
+
+<p>Against a large table, on anything you have not run before:</p>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN DELETE FROM customer_order WHERE status = 'CANCELLED' AND created_at &lt; '2023-06-01' ORDER BY id LIMIT 1000;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+-------+---------------------------------------------------------+---------------------------+---------+-------+-------+----------+-------------+
+| id | select_type | table          | partitions | type  | possible_keys                                           | key                       | key_len | ref   | rows  | filtered | Extra       |
++----+-------------+----------------+------------+-------+---------------------------------------------------------+---------------------------+---------+-------+-------+----------+-------------+
+|  1 | DELETE      | customer_order | NULL       | range | idx_customer_order_created_at,idx_customer_order_status | idx_customer_order_status | 122     | const | 49096 |   100.00 | Using where |
++----+-------------+----------------+------------+-------+---------------------------------------------------------+---------------------------+---------+-------+-------+----------+-------------+</code></pre>
+
+<p><code>EXPLAIN</code> works on <code>UPDATE</code> and <code>DELETE</code>, not just
+<code>SELECT</code>, and it does not run them. <code>type: range</code> and an index chosen is what
+you want to see; <code>ALL</code> on a table this size is the signal to stop and think. See
+<a href="/sql/sql-explain">EXPLAIN</a> — and remember <code>rows</code> is an estimate.</p>
+
+<h2>Read before you write</h2>
+
+<pre class="language-sql"><code class="language-sql">-- 1. exactly which rows?
+SELECT COUNT(*) FROM customer_order WHERE status = 'CANCELLED' AND created_at &lt; '2023-06-01';</code></pre>
+
+<pre class="language-sql"><code class="language-sql">-- session 1: destructive if committed. Shown, not run.
+-- 2. the same WHERE, now changing them
+START TRANSACTION;
+DELETE FROM customer_order WHERE status = 'CANCELLED' AND created_at &lt; '2023-06-01' LIMIT 1000;
+-- check the reported row count against what you expected
+ROLLBACK;   -- or COMMIT</code></pre>
+
+<p>Two safety nets: the count tells you the blast radius before anything changes, and the
+transaction gives you an undo <em>if</em> you look at the row count before committing. A transaction
+you commit reflexively is not a safety net.</p>
+
+<p>⚠️ And keep it short. An open transaction holds locks; walking away from one at the prompt
+blocks other writers and stalls
+<a href="/sql/mysql-replication">replication</a>. Do not leave one open while you think.</p>
+
+<h2>Work in batches</h2>
+
+<pre class="language-sql"><code class="language-sql">-- session 1: destructive. Shown, not run.
+-- repeat until it reports 0 rows
+DELETE FROM customer_order
+WHERE  status = 'CANCELLED' AND created_at &lt; '2023-06-01'
+ORDER  BY id
+LIMIT  1000;</code></pre>
+
+<p>One statement changing 400,000 rows holds locks for its whole duration, builds an enormous undo
+log, and produces one giant transaction that a replica applies single-threaded — so replication lag
+grows for as long as it runs, and every read-from-replica in the application sees stale data.</p>
+
+<p>Batches of 1,000 to 10,000 with a pause between them keep each transaction short. The
+<code>WHERE</code> must shrink as you go, or the loop never ends. See
+<a href="/sql/sql-delete">DELETE</a>.</p>
+
+<h2>When something is already wrong</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW FULL PROCESSLIST;</code></pre>
+
+<p>The first thing to run when the database is slow. Sort by <code>Time</code>, look at the top, and
+read the <code>State</code> column — <code>Sending data</code> is ordinary work,
+<code>Waiting for table metadata lock</code> means a DDL statement is blocked behind an open
+transaction and is now blocking everything else.</p>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: 1234 is an illustrative thread id. Take a real one from PROCESSLIST.
+KILL QUERY 1234;   -- stop the statement, keep the connection
+KILL 1234;         -- stop both</code></pre>
+
+<p>Prefer <code>KILL QUERY</code>. Killing the connection makes an application's pool notice a dead
+connection and can produce a retry storm at the worst moment.</p>
+
+<p>Be aware that killing a long <code>UPDATE</code> or <code>DELETE</code> is not instant — InnoDB
+has to roll it back, which can take <em>longer</em> than the statement had been running. That is
+another argument for batches: a killed batch rolls back in a moment.</p>
+
+<h2>The slow query log</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT @@global.slow_query_log AS slow_log, @@global.long_query_time AS threshold_seconds;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+-------------------+
+| slow_log | threshold_seconds |
++----------+-------------------+
+|        0 |         10.000000 |
++----------+-------------------+</code></pre>
+
+<p>Off by default, with a 10-second threshold that is far too generous for a web application. Turn
+it on and lower it:</p>
+
+<pre class="language-sql"><code class="language-sql">-- session 1: changes server-wide settings. Shown, not run.
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 0.5;</code></pre>
+
+<pre class="language-bash"><code class="language-bash">mysqldumpslow -s t -t 10 /var/lib/mysql/slow.log     # the 10 slowest, grouped
+pt-query-digest /var/lib/mysql/slow.log              # better, if you have Percona Toolkit</code></pre>
+
+<p>Group before you optimise. A query taking 200ms and running 50,000 times an hour costs far more
+than one taking 4 seconds twice a day, and only a digest shows you that. <code>sys</code> has live
+views over the same ground — <code>sys.statement_analysis</code>,
+<code>sys.statements_with_full_table_scans</code>.</p>
+
+<h2>MAX_EXECUTION_TIME per query</h2>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 3024 (HY000): Query execution was interrupted, maximum statement
+-- execution time exceeded
+SELECT /*+ MAX_EXECUTION_TIME(1) */ COUNT(*)
+FROM   customer_order o
+JOIN   order_item i ON i.order_id = o.id
+JOIN   order_item_topping t ON t.order_item_id = i.id;</code></pre>
+
+<p>An optimizer hint capping one statement, in milliseconds. Useful for an exploratory query on a
+big table when you want to find out whether it is fast <em>without</em> finding out by waiting.</p>
+
+<h2>Schema changes</h2>
+
+<p>The riskiest thing on this page. Many <code>ALTER TABLE</code> operations rebuild the entire
+table, and they take a metadata lock — so the <code>ALTER</code> waits for open transactions, and
+<strong>every subsequent query on that table queues behind the <code>ALTER</code></strong>. A table
+that was fine a second ago is now completely blocked, and the queue grows until connections run out.
+This is a common way to take an application down with a statement that looked harmless.</p>
+
+<pre class="language-sql"><code class="language-sql">-- session 1: alters a shared table. Shown, not run.
+-- state the algorithm, and let MySQL refuse rather than surprise you
+ALTER TABLE customer_order ADD COLUMN note VARCHAR(200), ALGORITHM=INSTANT;
+ALTER TABLE customer_order ADD INDEX idx_note (note), ALGORITHM=INPLACE, LOCK=NONE;</code></pre>
+
+<p>Naming <code>ALGORITHM</code> makes MySQL <strong>error out</strong> if it cannot do it that way,
+which is far better than discovering mid-outage that it chose <code>COPY</code>. In MySQL 8 adding a
+column is usually <code>INSTANT</code> — metadata only.</p>
+
+<p>For anything that does rebuild a large table, use <code>pt-online-schema-change</code> or
+<code>gh-ost</code>: they build a copy, keep it in step with triggers or the binlog, and swap it in.
+And run it in a maintenance window regardless.</p>
+
+<h2>Before you touch production</h2>
+
+<ol>
+  <li>Run it on a <strong>replica or a restored backup</strong> first. There is usually one.</li>
+  <li>Have the <strong>undo</strong> written down before you start.</li>
+  <li>Know how you will <strong>verify</strong> success — the exact query and the expected number.</li>
+  <li>Do it when someone else is awake.</li>
+  <li>Say what you are doing in a channel where a colleague can see it.</li>
+</ol>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>sql_safe_updates</code>, <code>max_execution_time</code> and a short lock timeout, on by
+      default in your client config.</li>
+  <li><code>EXPLAIN</code> works on writes too. Use it before, not after.</li>
+  <li><code>SELECT</code> the rows first; batch anything large.</li>
+  <li><code>SHOW FULL PROCESSLIST</code> then <code>KILL QUERY</code>, and expect rollback to take
+      time.</li>
+  <li>The slow query log is off by default at 10s. Turn it on, lower it, and read a digest.</li>
+  <li><code>ALTER TABLE</code> takes a metadata lock and can queue every query on the table.</li>
+</ul>

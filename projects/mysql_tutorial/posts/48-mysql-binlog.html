@@ -1,0 +1,126 @@
+<p>The binary log records every change that modifies data, in order. It is what makes two things
+possible: <a href="/sql/mysql-replication">replication</a>, and point-in-time recovery — restoring
+last night's backup and then replaying everything up to the moment before the mistake.</p>
+
+<h2>Is it on?</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT @@log_bin, @@binlog_format, @@binlog_expire_logs_seconds, @@server_id;</code></pre>
+
+<p>On MySQL 8 the answers are typically <code>1</code>, <code>ROW</code>, <code>2592000</code>
+(30 days) and <code>1</code>. Binary logging is <strong>on by default in MySQL 8</strong>, which was
+not true of 5.7 — another place where older advice misleads.</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW BINARY LOGS;
+SHOW BINLOG EVENTS IN 'binlog.000003' LIMIT 10;</code></pre>
+
+<p>The output is a list of files with sizes. They can get very large — building the lab database for
+this track produced a single 1.1 GB binlog file — which brings us to expiry, below.</p>
+
+<h2>What it does and does not contain</h2>
+
+<p><strong>Contains:</strong> every <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>
+and DDL statement that changed something, each with a timestamp and position, grouped by
+transaction and written <em>at commit</em>.</p>
+
+<p><strong>Does not contain:</strong> <code>SELECT</code> (nothing changed), statements that matched
+no rows, or rolled-back transactions. It is not an audit log of who looked at what — that is the
+general query log or an audit plugin.</p>
+
+<h2>The three formats</h2>
+
+<table>
+  <tr><td><code>ROW</code></td><td><strong>The default and the right answer.</strong> Records the
+      actual before/after images of each changed row.</td></tr>
+  <tr><td><code>STATEMENT</code></td><td>Records the SQL text. Compact, and
+      <strong>unsafe</strong>: replaying <code>UPDATE ... SET x = RAND()</code> or
+      <code>NOW()</code> on a replica produces different data.</td></tr>
+  <tr><td><code>MIXED</code></td><td>Statement-based until MySQL judges a statement unsafe, then row
+      for that one.</td></tr>
+</table>
+
+<p>The trade is size against safety. A <code>DELETE</code> removing a million rows is one line in
+<code>STATEMENT</code> and a million row images in <code>ROW</code>. Take the size; correctness on
+the replica is not negotiable, and non-deterministic statements are commoner than they look.</p>
+
+<h2>Reading one</h2>
+
+<pre class="language-bash"><code class="language-bash">mysqlbinlog /var/lib/mysql/binlog.000004 | less
+
+# ROW format is encoded, so decode it into readable pseudo-SQL
+mysqlbinlog --base64-output=DECODE-ROWS --verbose /var/lib/mysql/binlog.000004
+
+# just a window of time
+mysqlbinlog --start-datetime="2026-08-24 14:00:00" \
+            --stop-datetime="2026-08-24 15:00:00" \
+            --base64-output=DECODE-ROWS --verbose binlog.000004
+
+# from a container
+docker exec pizza-mysql mysqlbinlog --base64-output=DECODE-ROWS --verbose \
+    /var/lib/mysql/binlog.000004 | less</code></pre>
+
+<p><code>--base64-output=DECODE-ROWS --verbose</code> is the incantation to remember. Without it,
+<code>ROW</code>-format events print as base64 blobs and the file looks useless. With it, each event
+becomes readable <code>### UPDATE</code> / <code>### WHERE</code> / <code>### SET</code> lines
+showing the old and new values of every column.</p>
+
+<p>That is how you answer "what exactly did that migration change" and "what did the row look like
+before someone broke it" — the old values are right there, so a single wrecked row can be repaired
+by hand from the log.</p>
+
+<h2>Point-in-time recovery</h2>
+
+<p>The reason the binlog earns its disk space. Someone runs a <code>DELETE</code> without a
+<code>WHERE</code> at 14:32.</p>
+
+<pre class="language-bash"><code class="language-bash"># 1. restore the most recent full backup
+mysql -u root pizza &lt; /backups/pizza-2026-08-24.sql
+
+# 2. find the moment. Look for the statement itself.
+mysqlbinlog --base64-output=DECODE-ROWS --verbose binlog.000004 | grep -n -B5 'DELETE FROM'
+
+# 3. replay everything from the backup up to just BEFORE it
+mysqlbinlog --start-position=154 --stop-position=98237 binlog.000004 | mysql -u root pizza</code></pre>
+
+<p>Positions are exact and timestamps are not — several transactions can share a second — so use
+<code>--stop-position</code> for the real thing and <code>--stop-datetime</code> only to narrow the
+search. Get the start position from the backup: <code>mysqldump --master-data=2</code> writes it
+into the dump as a comment, which is the whole reason to use that flag.</p>
+
+<p>Two things that make this work on the day: the backup and the binlogs must be
+<strong>on different storage</strong> from the database (a lost disk otherwise takes both), and you
+must have <strong>rehearsed it</strong>. Point-in-time recovery is fiddly, and the first attempt
+should not be during an incident.</p>
+
+<h2>Disk, and the thing that fills it</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT @@binlog_expire_logs_seconds / 86400 AS expire_days;</code></pre>
+
+<pre class="language-bash"><code class="language-bash">PURGE BINARY LOGS BEFORE NOW() - INTERVAL 7 DAY;   -- safe: respects replicas
+rm /var/lib/mysql/binlog.000004                    # ← never do this</code></pre>
+
+<p><strong>Never delete binlog files by hand.</strong> The server keeps an index file; removing a
+log behind its back leaves that index inconsistent, and any replica still reading that file breaks
+permanently and has to be rebuilt. <code>PURGE BINARY LOGS</code> does it properly.</p>
+
+<p>Set the retention deliberately: it must cover the gap between full backups plus enough margin to
+notice a problem, and it must exceed how long a replica can be offline. 30 days is a common default
+and is a lot of disk on a busy server.</p>
+
+<h2>The other thing it is used for</h2>
+
+<p>Change data capture. Tools like Debezium read the binlog as a replica would and turn every row
+change into an event on a stream — feeding a search index, a cache, a warehouse, or an audit trail,
+<strong>without touching the write path</strong>. No triggers, no dual writes, no application
+changes. It is the modern answer to "keep this other system in step with the database", and it works
+precisely because the binlog is already a complete, ordered record of every change.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>On by default in MySQL 8, in <code>ROW</code> format. Keep both.</li>
+  <li><code>mysqlbinlog --base64-output=DECODE-ROWS --verbose</code>, or the file looks like
+      noise.</li>
+  <li>Backup + binlog replay is point-in-time recovery. Rehearse it before you need it.</li>
+  <li>Positions are exact; timestamps are not.</li>
+  <li><code>PURGE BINARY LOGS</code>, never <code>rm</code>.</li>
+</ul>
