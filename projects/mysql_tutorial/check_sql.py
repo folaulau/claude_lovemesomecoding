@@ -121,7 +121,11 @@ NONDETERMINISTIC = re.compile(
     r"CREATE_TIME|UPDATE_TIME|CHECK_TIME)\b", re.I)
 
 MARK_ERROR = re.compile(r"^\s*--\s*ERROR\b", re.I | re.M)
-MARK_SESSION2 = re.compile(r"^\s*--\s*session\s*2\b", re.I | re.M)
+# Either half of a two-terminal demo. BOTH halves must be marked, not just the one that
+# errors: running session 1 on its own does not deadlock, it just succeeds and COMMITS --
+# which on a LAB_POST would permanently change pizza_lab's data, and restore() only drops
+# objects it does not undo writes.
+MARK_SESSION2 = re.compile(r"^\s*--\s*session\s*\d+\b", re.I | re.M)
 MARK_UNAVAILABLE = re.compile(r"^\s*--\s*unavailable:\s*(.+)$", re.I | re.M)
 MARK_NOCHECK = re.compile(r"^\s*--\s*output-varies\b", re.I | re.M)
 
@@ -263,6 +267,33 @@ def drop_db(name: str) -> None:
     my(["-e", f"DROP DATABASE IF EXISTS {name};"])
 
 
+def data_fingerprint(db: str) -> str:
+    """A cheap checksum of the lab's DATA, so an accidental write cannot pass unnoticed.
+
+    ⚠️ restore() undoes OBJECTS -- indexes, tables, views, routines -- and nothing else. It
+    cannot undo a committed UPDATE. A LAB_POST runs against `pizza_lab` itself, so one
+    block that commits quietly corrupts the fixture every later post is measured against.
+
+    That happened. mysql-deadlock illustrated consistent lock ordering with a runnable
+    START TRANSACTION ... COMMIT, which set two rows' phone to '111' permanently. Nothing
+    reported it, and the next post to quote a figure involving those rows would simply
+    have been wrong.
+
+    Comparing this before and after each lab post turns that into a loud failure.
+    """
+    rc, out = my(["-N", "-B", "-e", f"""
+        SELECT CONCAT_WS(',',
+          (SELECT CONCAT(COUNT(*), ':', COALESCE(SUM(CRC32(CONCAT_WS('|',
+              id, status, order_type, phone, customer_name, total))), 0))
+             FROM {db}.customer_order),
+          (SELECT CONCAT(COUNT(*), ':', COALESCE(SUM(CRC32(CONCAT_WS('|',
+              id, product_name, quantity, line_total))), 0)) FROM {db}.order_item),
+          (SELECT COUNT(*) FROM {db}.order_item_topping),
+          (SELECT COUNT(*) FROM {db}.app_user),
+          (SELECT COUNT(*) FROM {db}.product));"""])
+    return out.strip() if rc == 0 else ""
+
+
 def object_snapshot(db: str) -> dict[str, set]:
     """Everything a post could create, so it can be dropped again afterwards."""
     q = {
@@ -342,12 +373,14 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
     if is_lab:
         database = manifest.LAB_DB["database"]
         before = object_snapshot(database)
+        fingerprint_before = data_fingerprint(database)
         scratch = None
     else:
         scratch = f"pzcheck_{re.sub(r'[^a-z0-9]', '_', slug)}"[:60]
         clone_pizza(scratch)
         database = scratch
         before = None
+        fingerprint_before = None
 
     # One session, all blocks, sentinels between them. --force so an expect-error block
     # does not abort the rest of the post.
@@ -447,6 +480,14 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
         undone = restore(database, before)
         if undone and verbose:
             print(f"    restored {database}: dropped {', '.join(undone)}")
+        if fingerprint_before and data_fingerprint(database) != fingerprint_before:
+            failures.append(
+                f"{slug}: THIS POST CHANGED THE LAB'S DATA, and the change is committed.\n"
+                f"    `{database}` is a shared fixture -- every later post is measured against "
+                f"it, so a stray write makes their quoted results wrong with no other symptom.\n"
+                f"    Mark the offending block `-- session 1` so it is shown but not run, or have "
+                f"it work on a table the post creates itself.\n"
+                f"    Then rebuild: projects/mysql_tutorial/lab/setup.sh")
 
     return failures, stats
 
@@ -482,6 +523,21 @@ def explain_matches(expected: str, actual: str) -> bool | None:
     within 10%, which still catches a figure that was invented or copied from a different
     query, while surviving the resampling. The posts say the number is approximate.
     """
+    # FORMAT=TREE output carries the same estimates inline as `(cost=3089 rows=14398)`,
+    # and they drift for the same reason — 3089 became 3101 after the lab was rebuilt.
+    # Compare the tree's shape with those numbers masked out, then the numbers themselves
+    # with the same tolerance.
+    if "(cost=" in expected and "(cost=" in actual:
+        est = re.compile(r"(cost|rows)=([0-9.]+)")
+        if est.sub(r"\1=#", expected).strip() != est.sub(r"\1=#", actual).strip():
+            return False
+        ev = [float(m.group(2)) for m in est.finditer(expected)]
+        av = [float(m.group(2)) for m in est.finditer(actual)]
+        if len(ev) != len(av):
+            return False
+        return all(abs(e - a) <= max(1.0, ESTIMATE_TOLERANCE * max(abs(e), abs(a)))
+                   for e, a in zip(ev, av))
+
     exp_lines = [l for l in expected.strip().splitlines() if l.strip().startswith("|")]
     act_lines = [l for l in actual.strip().splitlines() if l.strip().startswith("|")]
     if not exp_lines or not act_lines:

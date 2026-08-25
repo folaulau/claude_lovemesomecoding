@@ -1,0 +1,179 @@
+<p><code>EXPLAIN</code> asks the optimizer what it intends to do with a query, before it does it. It
+is the difference between guessing why something is slow and knowing. Every plan below was taken
+from <code>pizza_lab</code> — the pizza schema at <strong>400,000 orders</strong> and
+<strong>1,000,000 line items</strong>.</p>
+
+<h2>Reading a plan</h2>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT COUNT(*) FROM customer_order WHERE status = 'PAID';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+-------------+
+| id | select_type | table          | partitions | type | possible_keys             | key                       | key_len | ref   | rows  | filtered | Extra       |
++----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+-------------+
+|  1 | SIMPLE      | customer_order | NULL       | ref  | idx_customer_order_status | idx_customer_order_status | 122     | const | 14398 |   100.00 | Using index |
++----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+-------------+</code></pre>
+
+<p>One row per table the query touches. The columns that repay attention:</p>
+
+<table>
+  <tr><td><code>type</code></td><td>How the table is reached. <strong>The first thing to
+      look at.</strong></td></tr>
+  <tr><td><code>possible_keys</code></td><td>Indexes that <em>could</em> have been used.</td></tr>
+  <tr><td><code>key</code></td><td>The one actually chosen. NULL means none.</td></tr>
+  <tr><td><code>key_len</code></td><td>How many bytes of a composite index were used — this is how
+      you tell whether all its columns are contributing.</td></tr>
+  <tr><td><code>rows</code></td><td>Estimated rows examined at this step.</td></tr>
+  <tr><td><code>filtered</code></td><td>Estimated percentage surviving the <code>WHERE</code>.</td></tr>
+  <tr><td><code>Extra</code></td><td>The important footnotes.</td></tr>
+</table>
+
+<h2>The type values, best to worst</h2>
+
+<table>
+  <tr><td><code>const</code> / <code>system</code></td><td>At most one row, via a primary or unique
+      key. As good as it gets.</td></tr>
+  <tr><td><code>eq_ref</code></td><td>One row per row of the previous table, via a unique key.
+      Ideal for a join.</td></tr>
+  <tr><td><code>ref</code></td><td>Several rows matching a non-unique index. The common good
+      case.</td></tr>
+  <tr><td><code>range</code></td><td>An index range — <code>&gt;</code>, <code>BETWEEN</code>,
+      <code>IN</code>. Fine.</td></tr>
+  <tr><td><code>index</code></td><td>A scan of the <strong>whole index</strong>. Better than
+      <code>ALL</code> because the index is narrower, and still a scan.</td></tr>
+  <tr><td><code>ALL</code></td><td>A full table scan. Fine on a small table, a problem on a large
+      one.</td></tr>
+</table>
+
+<p><code>ALL</code> is not automatically a bug: reading a small table completely is often the
+cheapest plan, and the optimizer knows it. <code>ALL</code> on a large table with a selective
+<code>WHERE</code> is the thing to chase.</p>
+
+<h2>The Extra column</h2>
+
+<table>
+  <tr><td><code>Using index</code></td><td><strong>Good.</strong> Covered — the table itself was
+      never read.</td></tr>
+  <tr><td><code>Using where</code></td><td>Neutral. Rows were filtered after being read.</td></tr>
+  <tr><td><code>Using index condition</code></td><td>Good. Index condition pushdown — filtering
+      happened at the index.</td></tr>
+  <tr><td><code>Using filesort</code></td><td>A sort was needed. Despite the name, usually in
+      memory.</td></tr>
+  <tr><td><code>Using temporary</code></td><td>A temporary table was built — common with
+      <code>GROUP BY</code>. Worth investigating with <code>Using filesort</code>.</td></tr>
+</table>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT id, customer_name FROM customer_order WHERE status = 'PAID' ORDER BY customer_name LIMIT 10;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+----------------+
+| id | select_type | table          | partitions | type | possible_keys             | key                       | key_len | ref   | rows  | filtered | Extra          |
++----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+----------------+
+|  1 | SIMPLE      | customer_order | NULL       | ref  | idx_customer_order_status | idx_customer_order_status | 122     | const | 14398 |   100.00 | Using filesort |
++----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+----------------+</code></pre>
+
+<p>The index found the 14,398 paid orders, then all of them were sorted to return ten. An index on
+<code>(status, customer_name)</code> would provide the order directly and remove the sort — see
+<a href="/sql/mysql-index">indexes</a>.</p>
+
+<h2>⚠️ `rows` is an estimate, and it moves</h2>
+
+<p>This deserves its own heading, because plans are usually presented as though the numbers were
+measurements. They are not. The optimizer derives <code>rows</code> from <strong>sampled index
+statistics</strong>, and re-running the identical query gives a different figure:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">run 1:  rows = 395261
+run 2:  rows = 394155      -- same query, same data, seconds apart</code></pre>
+
+<p>Those are two runs of one <code>EXPLAIN</code> against an unchanged table. The estimate is also
+frequently wrong in a more interesting way: the plan above estimates 14,398 rows for
+<code>status = 'PAID'</code> where the true count is <strong>8,000</strong> — off by 80%.</p>
+
+<p>None of that makes <code>EXPLAIN</code> less useful. It means:</p>
+
+<ul>
+  <li>Read <code>rows</code> as an order of magnitude, not a number. Ten versus ten million is the
+      signal; 14,398 versus 8,000 is noise.</li>
+  <li>A badly wrong estimate is itself a finding — it is how the optimizer picks a bad plan, and
+      <code>ANALYZE TABLE</code> is the first thing to try.</li>
+  <li>When you need real numbers, use <code>EXPLAIN ANALYZE</code>.</li>
+</ul>
+
+<h2>EXPLAIN ANALYZE</h2>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN ANALYZE SELECT COUNT(*) FROM customer_order WHERE status = 'PAID';</code></pre>
+
+<p><strong>It runs the query</strong> — which is the point, and the caveat. The output pairs each
+step's estimate with what actually happened:
+<code>(cost=1650 rows=14398) (actual time=0.05..8.2 rows=8000 loops=1)</code>. Estimated 14,398,
+actually 8,000.</p>
+
+<p>Because it executes, do not point it at an <code>UPDATE</code> or <code>DELETE</code> on
+anything you care about, and expect it to take as long as the query does. Available from MySQL
+8.0.18.</p>
+
+<h2>FORMAT=TREE</h2>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM customer_order WHERE status = 'PAID'\G</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">*************************** 1. row ***************************
+EXPLAIN: -> Aggregate: count(0)  (cost=3089 rows=1)
+    -> Covering index lookup on customer_order using idx_customer_order_status (status='PAID')  (cost=1650 rows=14398)</code></pre>
+
+<p>End the statement with <code>\G</code> rather than a semicolon. Tree output is one long
+multi-line string, and in the client's default table mode it is drawn inside a box that wraps
+badly; <code>\G</code> prints it vertically and readably.</p>
+
+<p>The same plan as a nested tree, read inside-out: the index lookup feeds the aggregate. For
+anything with several joins this is far easier to follow than the table, because it shows the
+<em>order</em> of operations rather than one row per table. <code>FORMAT=JSON</code> gives the
+fullest detail, including costs, and is what tooling parses.</p>
+
+<h2>A join plan</h2>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT o.id, i.product_name
+FROM   customer_order o
+JOIN   order_item i ON i.order_id = o.id
+WHERE  o.status = 'PAID';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+-------+------------+------+-----------------------------------+---------------------------+---------+----------------+-------+----------+-------------+
+| id | select_type | table | partitions | type | possible_keys                     | key                       | key_len | ref            | rows  | filtered | Extra       |
++----+-------------+-------+------------+------+-----------------------------------+---------------------------+---------+----------------+-------+----------+-------------+
+|  1 | SIMPLE      | o     | NULL       | ref  | PRIMARY,idx_customer_order_status | idx_customer_order_status | 122     | const          | 14398 |   100.00 | Using index |
+|  1 | SIMPLE      | i     | NULL       | ref  | idx_order_item_order              | idx_order_item_order      | 8       | pizza_lab.o.id |     2 |   100.00 | NULL        |
++----+-------------+-------+------------+------+-----------------------------------+---------------------------+---------+----------------+-------+----------+-------------+</code></pre>
+
+<p>Three things to read here. <strong>Rows are listed in join order</strong> — <code>o</code> is
+driven first, then <code>i</code> for each of its rows. <strong>The <code>ref</code> column names
+the source</strong>: <code>pizza_lab.o.id</code> means <code>i</code> is looked up by the id from
+<code>o</code>. And <strong>the row counts multiply</strong>: roughly 14,398 × 2 line-item lookups.
+That product, not either number alone, is the query's cost.</p>
+
+<p>The most common join problem is the driving table being wrong, or the second table showing
+<code>ALL</code> — which means the join column is unindexed and MySQL is scanning the whole table
+once per outer row.</p>
+
+<h2>How to use it</h2>
+
+<ol>
+  <li>Find the slow query — the <a href="/sql/mysql-run-query-in-production">slow query log</a> or
+      <code>SHOW FULL PROCESSLIST</code>.</li>
+  <li><code>EXPLAIN</code> it. Look at <code>type</code> and <code>rows</code> first.</li>
+  <li>Find the step examining far more rows than it returns.</li>
+  <li>Ask why: no index, an index defeated by a function, a bad estimate, or a genuinely
+      unselective filter.</li>
+  <li>Change one thing. Re-run <code>EXPLAIN</code>. Confirm with <code>EXPLAIN ANALYZE</code>.</li>
+</ol>
+
+<p>And always <code>EXPLAIN</code> a new query against a large table <em>before</em> running it.
+That habit is the cheapest incident prevention available.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>type</code> first: <code>ALL</code> on a big table with a selective filter is the
+      target.</li>
+  <li><code>Using index</code> is good; <code>Using filesort</code> and
+      <code>Using temporary</code> together are worth a look.</li>
+  <li><code>rows</code> is a sampled estimate — it drifts between runs and was 80% out here.</li>
+  <li><code>EXPLAIN ANALYZE</code> runs the query and gives real counts.</li>
+  <li><code>FORMAT=TREE</code> for anything with joins.</li>
+</ul>

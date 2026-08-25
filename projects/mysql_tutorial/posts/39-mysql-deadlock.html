@@ -1,0 +1,161 @@
+<p>A deadlock is two transactions each holding a lock the other one needs. Neither can proceed, and
+neither will ever give up on its own — so InnoDB detects the cycle and kills one of them. The
+survivor commits; the victim gets an error and has to start again.</p>
+
+<p>This is <strong>normal</strong> under concurrency, not a sign that something is broken. An
+application that writes concurrently and never retries is the actual bug.</p>
+
+<h2>Reproducing one</h2>
+
+<p>Open two terminals. Run this in the first, and the second within about two seconds:</p>
+
+<pre class="language-sql"><code class="language-sql">-- session 1
+START TRANSACTION;
+UPDATE customer_order SET phone = '111' WHERE id = 1;   -- locks row 1
+SELECT SLEEP(2);
+UPDATE customer_order SET phone = '111' WHERE id = 2;   -- wants row 2
+COMMIT;</code></pre>
+
+<pre class="language-sql"><code class="language-sql">-- session 2
+START TRANSACTION;
+UPDATE customer_order SET phone = '222' WHERE id = 2;   -- locks row 2
+SELECT SLEEP(2);
+UPDATE customer_order SET phone = '222' WHERE id = 1;   -- wants row 1
+COMMIT;</code></pre>
+
+<p>Session 1 holds row 1 and wants row 2. Session 2 holds row 2 and wants row 1. Each is waiting
+for the other. One of them gets:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction</code></pre>
+
+<p><strong>The whole transaction is rolled back</strong>, not just the failing statement. That is
+the important part for application code: everything the victim did is gone, so retrying means
+retrying from the beginning.</p>
+
+<p>Note the <strong>opposite lock order</strong>. That is the entire cause, and the entire fix.</p>
+
+<h2>Deadlock or lock wait?</h2>
+
+<p>Two different errors, often confused:</p>
+
+<table>
+  <tr><th></th><th>Deadlock (1213)</th><th>Lock wait timeout (1205)</th></tr>
+  <tr><td>Cause</td><td>A genuine cycle — A waits for B, B waits for A</td>
+      <td>One transaction held a lock too long</td></tr>
+  <tr><td>Detected</td><td>Immediately</td>
+      <td>After <code>innodb_lock_wait_timeout</code>, default <strong>50 seconds</strong></td></tr>
+  <tr><td>Rolled back</td><td>The whole transaction</td><td>Only the statement</td></tr>
+  <tr><td>Fix</td><td>Consistent lock order, and retry</td><td>Shorter transactions</td></tr>
+</table>
+
+<p>A lock wait timeout usually means a transaction stayed open far longer than it should — an HTTP
+call inside one, or a connection idle in a transaction because
+<code>autocommit</code> is off. See <a href="/sql/mysql-transaction">transactions</a>.</p>
+
+<h2>Reading the evidence</h2>
+
+<p>InnoDB keeps the most recent deadlock and will describe it:</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW ENGINE INNODB STATUS\G</code></pre>
+
+<p>Find the <code>LATEST DETECTED DEADLOCK</code> section. It is long — it dumps the locked records
+in hex — but only a few lines matter. Abridged, from the deadlock above:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">LATEST DETECTED DEADLOCK
+------------------------
+*** (1) TRANSACTION:
+TRANSACTION 64394, ACTIVE 3 sec starting index read
+UPDATE customer_order SET phone = '111' WHERE id = 2
+
+*** (1) HOLDS THE LOCK(S):
+RECORD LOCKS space id 67 page no 11 index PRIMARY of table `pizza_lab`.`customer_order`
+lock_mode X locks rec but not gap
+
+*** (2) TRANSACTION:
+UPDATE customer_order SET phone = '222' WHERE id = 1
+
+*** WE ROLL BACK TRANSACTION (2)</code></pre>
+
+<p>Read it in four parts: the two <strong>statements</strong> each transaction was blocked on, what
+each <strong>holds</strong>, what each <strong>wants</strong>, and which one was rolled back. The
+two statements are what you take back to the code — they name the two access paths that run in
+opposite orders.</p>
+
+<p><code>lock_mode X</code> is exclusive. <code>locks rec but not gap</code> means a single record
+rather than a range, which brings us to the next part.</p>
+
+<h2>Gap locks, and why MySQL deadlocks more</h2>
+
+<p>Under <code>REPEATABLE READ</code> — MySQL's default — InnoDB does not only lock the rows that
+exist. It also locks the <strong>gaps between them</strong>, so that a repeated range query cannot
+see newly inserted rows. That is what makes the isolation level work, and it means two transactions
+can conflict over rows that do not exist yet.</p>
+
+<pre class="language-sql"><code class="language-sql">-- session 1
+START TRANSACTION;
+SELECT * FROM customer_order WHERE id BETWEEN 100 AND 200 FOR UPDATE;
+-- now holds a gap lock: nobody else may INSERT an id in that range</code></pre>
+
+<p>This is why the same application can deadlock on MySQL and not on Postgres or SQL Server, which
+default to <code>READ COMMITTED</code>. Switching to <code>READ COMMITTED</code> removes most gap
+locking and genuinely reduces deadlocks — at the cost of non-repeatable reads within a
+transaction. It is a real option, and a decision to make deliberately rather than by copying a
+config file.</p>
+
+<h2>The two fixes that work</h2>
+
+<h3>1. Consistent lock order</h3>
+
+<p>If every transaction touches rows in the same order, a cycle cannot form. Order by primary key,
+always:</p>
+
+<pre class="language-sql"><code class="language-sql">-- session 1 and session 2 both do this, and neither can deadlock with the other
+START TRANSACTION;
+SELECT id FROM customer_order WHERE id IN (1, 2) ORDER BY id FOR UPDATE;
+UPDATE customer_order SET phone = '111' WHERE id IN (1, 2);
+COMMIT;</code></pre>
+
+<p>In application code the same rule applies to the order you update <em>tables</em> in: if one path
+writes <code>customer_order</code> then <code>order_item</code>, every path must. Batch jobs that
+process ids in a sorted order rather than an arbitrary one are applying the same rule.</p>
+
+<h3>2. Retry</h3>
+
+<p>Because a deadlock is a normal outcome, the caller must be able to try again:</p>
+
+<pre class="language-java"><code class="language-java">for (int attempt = 1; attempt &lt;= 3; attempt++) {
+    try {
+        return orderService.placeOrder(request);   // one transaction
+    } catch (DeadlockLoserDataAccessException e) {
+        if (attempt == 3) throw e;
+        Thread.sleep(50L * attempt);               // brief backoff
+    }
+}</code></pre>
+
+<p>Two conditions make this safe. The retried unit must be the <strong>whole transaction</strong>,
+since the victim's work was entirely rolled back. And the operation must be
+<strong>idempotent</strong> — retrying a charge is not the same as retrying a read.</p>
+
+<h2>Reducing them in the first place</h2>
+
+<ul>
+  <li><strong>Keep transactions short.</strong> Fewer locks held for less time is fewer chances to
+      collide. Do slow work before opening the transaction.</li>
+  <li><strong>Touch fewer rows.</strong> A statement without a good index locks rows it did not
+      need to examine — so an index is a concurrency fix as much as a speed one.</li>
+  <li><strong>Take the locks you need up front</strong> rather than escalating from a read to a
+      write halfway through.</li>
+  <li><strong>Watch the counter.</strong> <code>SHOW GLOBAL STATUS LIKE 'Innodb_deadlocks'</code>
+      gives you a number to trend. Zero is not the target; a rising rate is the signal.</li>
+</ul>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Deadlocks are normal under concurrency. Not retrying is the bug.</li>
+  <li>The <strong>whole transaction</strong> is rolled back, so retry the whole thing.</li>
+  <li>1213 is a cycle, detected instantly; 1205 is one slow holder, after 50 seconds.</li>
+  <li><code>SHOW ENGINE INNODB STATUS</code> names both statements involved.</li>
+  <li>Consistent lock order prevents them; <code>REPEATABLE READ</code>'s gap locks cause extra
+      ones.</li>
+</ul>
