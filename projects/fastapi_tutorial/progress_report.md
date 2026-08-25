@@ -1,7 +1,7 @@
 # FastAPI tutorial track — progress report
 
-**Status:** ✅ **PUBLISHED AND LIVE** — 18 posts on https://lovemesomecoding.com/fastapi, all 18
-URLs verified serving at the edge. Build `394b0bd`, deployed 2026-08-21.
+**Status:** ✅ **PUBLISHED AND LIVE** — 19 posts on https://lovemesomecoding.com/fastapi, all 19
+URLs verified serving at the edge. Build `42a2593`, redeployed 2026-08-25.
 **Started:** 2026-08-21
 **Where it lands:** https://lovemesomecoding.com/fastapi
 
@@ -717,6 +717,76 @@ fastapi-database-integration     block 12
 fastapi-error-handling           block 2, block 4
 fastapi-background-tasks         block 0; block 17 quotes an undeclared file
 ```
+
+---
+
+## Lesson 10 added: OAuth2 &mdash; 2026-08-25
+
+The track is **19 posts**. `fastapi-oauth2` goes in at position 10, immediately after
+authentication, because it is the same subject continued and because lesson 9 already ends by
+pointing at it. Files `10`&ndash;`18` renumbered to `11`&ndash;`19`; dates re-derived from the same
+`START_DATE`, so the track now runs **2025-09-02 &rarr; 2025-10-26**, still inside the band.
+
+### The app had no OAuth2 in it, so the app came first
+
+Nothing in StayHub used OAuth2 &mdash; lesson 9 mentioned `OAuth2PasswordBearer` only to explain
+why the app did *not* use it. Under this project's rule (quote code that has actually run), the
+implementation was built and tested before a word of the post was written.
+
+```
+app/core/oauth.py               providers · PKCE · the state store · code exchange · userinfo
+app/services/oauth_service.py   link-or-create, and the email_verified rule
+app/api/v1/routes/oauth.py      /authorize and /callback, plus the http_client dependency
+app/models/oauth_account.py     (provider, subject) -> user
+alembic/…_add_oauth_accounts    additive; autogenerate confirms it matches the model exactly
+app/api/v1/routes/auth.py       POST /auth/token — OAuth2PasswordRequestForm
+app/core/deps.py                oauth2_scheme, so the Authorize button works everywhere
+tests/test_oauth.py             44 tests, no network, httpx.MockTransport
+```
+
+**237 tests pass with Redis up; 190 pass and 47 skip with it stopped, zero fail either way** &mdash;
+which is StayHub's standing invariant and had to be re-established, not assumed. The first version
+of the test file broke it: an autouse cleanup fixture called Redis unconditionally, and because
+`redis-py` connects lazily a stopped server turned cleanup into an *error* on all 25 tests in the
+file, including the four that never touch Redis. `cache._client()` returning non-None is not the
+same question as "is Redis up".
+
+### Four guards, each confirmed by putting the bug back
+
+A security test nobody has watched fail is not a security test. Each of these was reintroduced,
+the suite run, and the change reverted:
+
+| Bug reintroduced | Tests that failed |
+|---|---|
+| drop the `email_verified` check | 2 &mdash; refusal, and "creates nothing" |
+| `GETDEL` &rarr; `GET` in `consume()` | 2 &mdash; single-use, and replay through the callback |
+| pass `next` through unchecked | 2 &mdash; absolute, and protocol-relative |
+| leave base64 padding on the PKCE challenge | 2 &mdash; both PKCE assertions |
+
+No bug failed zero tests, and none failed the whole file &mdash; which would have meant the tests
+were coupled rather than pointed.
+
+### Writing it
+
+The post is generated from the source files by line range rather than copied by hand, so a quote is
+either exactly what the repo contains or the build fails. **22 blocks checked, 21 verified quotes,
+1 illustrative, 0 drift.**
+
+First draft came out at **4,166 words / 19 min / 56% prose** &mdash; passing, but heavier on code
+than any other lesson. The cause was quoting long docstrings and then restating them in prose. The
+fix was `...` elision on six of them (`check_snippets.py` splits on that marker and still verifies
+each segment), landing at **3,579 words / 16 min / 65% prose**. That also makes it the only post in
+the track inside the agreed 15&ndash;20 band rather than below it.
+
+### What else had to move
+
+- **Post 02 drifted the moment `oauth.router` was registered** &mdash; it quotes `api/v1/router.py`.
+  Caught by `check_snippets.py`, re-quoted from source. Worth noting as the guard working on a
+  change made in the same session, not six months later.
+- **Post 09**'s "if you want the button, use `OAuth2PasswordRequestForm`" is now a promise the app
+  keeps, so it says so and links here. Its "Next:" moved from file uploads to this lesson.
+- **Post 19** gained four OAuth2 questions, and the "seventeen lessons" / "eighteen lessons" counts
+  in posts 01 and 19 were corrected.
 
 ---
 

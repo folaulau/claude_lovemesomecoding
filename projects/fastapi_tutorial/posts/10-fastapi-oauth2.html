@@ -1,0 +1,549 @@
+<p>The previous lesson gave StayHub its own login: a password, a hash, a JWT it signs
+itself. This one adds the other kind &mdash; the button that says <em>Sign in with Google</em>
+&mdash; and it is a genuinely different problem, because the middle of it happens on a domain you
+do not control and the security lives in two parameters that are easy to leave out.</p>
+
+<p>It also finishes something lesson nine started. That lesson pointed at
+<code>OAuth2PasswordBearer</code>, explained that the <strong>Authorize</strong> button on
+<code>/docs</code> needs a token endpoint in a specific shape, and left it unbuilt. StayHub has one
+now.</p>
+
+<h2>OAuth2 is not a login system</h2>
+
+<p>This is the confusion behind most of the mistakes below, so it is worth being blunt. OAuth2 is
+a <strong>delegated authorization</strong> protocol. It answers "this application may act on my
+behalf, for these scopes, until I revoke it". The word <em>authentication</em> does not appear in
+its job description, and an OAuth2 access token tells you nothing reliable about <em>who</em>
+anybody is &mdash; only that some token bearer was granted some access.</p>
+
+<p>What people actually want from a sign-in button is <strong>OpenID Connect</strong>, a thin layer
+on top of OAuth2 that adds an identity document: an <code>id_token</code>, and a
+<code>userinfo</code> endpoint that returns standard claims &mdash; <code>sub</code>,
+<code>email</code>, <code>email_verified</code>. Google is an OIDC provider. GitHub is not, which
+is why it needs special handling later.</p>
+
+<p>The practical consequence: <strong>the access token a provider gives you is not proof of
+identity, and it is not yours to hand to your own frontend.</strong> It is a key to that provider's
+API. Your server uses it once, to ask who the person is, and then mints its own token.</p>
+
+<h2>Which flow you need</h2>
+
+<table>
+  <thead><tr><th>Flow</th><th>Use it for</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>Authorization code + PKCE</td><td>a user signing in via a third party</td>
+        <td>the one you want</td></tr>
+    <tr><td>Client credentials</td><td>service-to-service, no user involved</td>
+        <td>correct, different job</td></tr>
+    <tr><td>Password grant</td><td>your own first-party login</td>
+        <td>removed in OAuth 2.1</td></tr>
+    <tr><td>Implicit</td><td>&mdash;</td><td>dead; returned tokens in a URL</td></tr>
+  </tbody>
+</table>
+
+<p>The password grant is the one FastAPI's own tutorial teaches, which is why so many people
+believe they are "doing OAuth2" when they have written a normal login form. They have &mdash; and
+that is fine. Handing your username and password to an application is exactly what the rest of
+OAuth2 exists to avoid, so it is acceptable only when the application <em>is</em> the service that
+owns the password. StayHub's is, so it keeps one.</p>
+
+<h2>The password flow, and the button it turns on</h2>
+
+<p>One dependency and one endpoint. First the declaration:</p>
+
+<pre class="language-python"><code class="language-python">oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/token", auto_error=False)</code></pre>
+
+<p>Then the endpoint it promises:</p>
+
+<pre class="language-python"><code class="language-python">@router.post("/token", response_model=AuthResponse, dependencies=[LoginRateLimit])
+def token(
+    form: Annotated[OAuth2PasswordRequestForm, Depends()], db: DbSession
+) -&gt; AuthResponse:
+    ...
+    return AuthService(db).login(form.username, form.password)</code></pre>
+
+<p><code>OAuth2PasswordRequestForm</code> is a dependency, not a pydantic model, and it takes
+<code>application/x-www-form-urlencoded</code> with fields named exactly <code>username</code> and
+<code>password</code>. Both halves of that sentence bite:</p>
+
+<pre class="language-bash"><code class="language-bash">$ curl -s -X POST localhost:8000/api/v1/auth/token \
+       -d "username=guest@stayhub.test&amp;password=guest123"
+{"accessToken":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ…","tokenType":"bearer","user":{…}}
+
+$ curl -s -X POST localhost:8000/api/v1/auth/token \
+       -H 'Content-Type: application/json' \
+       -d '{"username":"guest@stayhub.test","password":"guest123"}'
+{"message":"Please check the highlighted fields.",
+ "fieldErrors":{"username":"Field required","password":"Field required"}}   # HTTP 422</code></pre>
+
+<p>StayHub keeps <code>/auth/login</code> alongside, taking JSON with an <code>email</code> field,
+because its callers are two React apps. Two endpoints, one <code>AuthService.login</code> behind
+them. That is not duplication worth removing &mdash; the spec fixes one shape and the frontends
+want the other.</p>
+
+<p>Declaring both security schemes is what makes the <strong>Authorize</strong> button work
+everywhere rather than only on the routes that use one of them:</p>
+
+<pre class="language-json"><code class="language-json">{
+ "HTTPBearer": {
+  "type": "http",
+  "scheme": "bearer"
+ },
+ "OAuth2PasswordBearer": {
+  "type": "oauth2",
+  "flows": {
+   "password": {
+    "scopes": {},
+    "tokenUrl": "api/v1/auth/token"
+   }
+  }
+ }
+}</code></pre>
+
+<h2>Sign in with Google, in two endpoints</h2>
+
+<p>Everything else in this lesson is the authorization code flow. Two routes, and the browser
+travels between them:</p>
+
+<pre class="language-bash"><code class="language-bash">  browser                    StayHub                     Google
+     │                          │                           │
+     │  GET /authorize          │                           │
+     ├─────────────────────────&gt;│  mint state + verifier    │
+     │                          │  store both in Redis      │
+     │  307 ──────────────────────────────────────────────&gt; │
+     │                          │                           │  consent screen
+     │  307 back with ?code=…&amp;state=…                       │
+     │&lt;─────────────────────────────────────────────────────┤
+     │  GET /callback?code&amp;state│                           │
+     ├─────────────────────────&gt;│  state known? spend it    │
+     │                          │  POST code + verifier ──&gt; │
+     │                          │  &lt;── access_token         │
+     │                          │  GET userinfo ──────────&gt; │
+     │                          │  &lt;── sub, email, verified │
+     │                          │  link or create · mint OUR token
+     │  307 to the app, token in the #fragment              │
+     │&lt;─────────────────────────┤                           │</code></pre>
+
+<p>Neither endpoint is called by JavaScript. Both are ordinary page navigations, because step two
+happens on Google's domain. That single fact explains most of the design decisions below,
+including why the token cannot simply be returned in a JSON body.</p>
+
+<p>A provider is a handful of URLs and a pair of credentials:</p>
+
+<pre class="language-python"><code class="language-python">def _google() -&gt; Provider:
+    return Provider(
+        name="google",
+        authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",
+        # The OIDC userinfo endpoint, not the older `googleapis.com/oauth2/v2/userinfo`. This one
+        # returns the standard claim names — `sub`, `email`, `email_verified` — which is what the
+        # normaliser below expects and what every other OIDC provider also returns.
+        userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
+        scopes=("openid", "email", "profile"),
+        client_id=settings.oauth_google_client_id,
+        client_secret=settings.oauth_google_client_secret,
+    )</code></pre>
+
+<h2><code>state</code> is not optional</h2>
+
+<p>Leave <code>state</code> out and the flow still works, all the way through, for everybody. It is
+not a feature; it is a CSRF defence, and the attack is worth spelling out because it runs the wrong
+way round from the one people expect.</p>
+
+<p>The attacker signs in at Google <strong>as themselves</strong> and stops at the redirect,
+keeping the <code>code</code>. They then get a victim's browser to visit
+<code>/callback?code=&lt;the attacker's code&gt;</code>. Your server dutifully exchanges it, learns
+the attacker's identity, and signs the victim's browser in <strong>as the attacker</strong>. The
+victim is now working inside an account the attacker owns and reads &mdash; every address, saved
+card and trip they add from that point on.</p>
+
+<p>The fix is that a callback must carry a value you issued and remember. StayHub keeps what
+matters on the server and lets only the opaque <code>state</code> travel through the browser:</p>
+
+<pre class="language-python"><code class="language-python">class PendingLogin:
+    """Everything the callback needs that must NOT travel through the browser.
+
+    `verifier` is the secret half of PKCE. `redirect_uri` is here because the token endpoint
+    demands the identical string it saw at the authorize step, and rebuilding it from the callback
+    request is how that drifts. `next_url` is where the user was going before we interrupted them.
+    """
+
+    provider: str
+    verifier: str
+    redirect_uri: str
+    next_url: str</code></pre>
+
+<pre class="language-python"><code class="language-python">provider = oauth.get_provider(provider_name)
+verifier = oauth.new_verifier()
+redirect_uri = oauth.redirect_uri_for(provider_name)
+
+state = oauth.remember(
+    oauth.PendingLogin(
+        provider=provider_name,
+        verifier=verifier,
+        redirect_uri=redirect_uri,
+        next_url=next if next.startswith("/") and not next.startswith("//") else "/",
+    )</code></pre>
+
+<p>That produces this, which is the whole first half of the flow in one header:</p>
+
+<pre class="language-bash"><code class="language-bash">HTTP 307 -&gt; https://accounts.google.com/o/oauth2/v2/auth
+  response_type            code
+  client_id                1084...apps.googleusercontent.com
+  redirect_uri             http://localhost:8000/api/v1/auth/oauth/google/callback
+  scope                    openid email profile
+  state                    -ghwijF5bN-eimvYHSNrEMJZYzgUgTXLAipgiG0GFrI
+  code_challenge           IrRrh2ewi706b3nwokPMIzNiKp1tLXDAOnrZmqGLsqI
+  code_challenge_method    S256</code></pre>
+
+<p>Note what is <em>not</em> in that URL: the verifier. Note also <code>next</code>, which arrives
+from the browser and is forced to a path before it is stored. Passing it through unchecked is a
+textbook open redirect &mdash; a link to
+<code>/authorize?next=https://stayhub-login.example/</code> walks somebody through a real StayHub
+URL and a real Google consent screen and lands them on a copy of the site, with every step up to
+that point looking exactly right. <code>startswith("/")</code> alone is not enough:
+<code>//evil.example</code> has no scheme and is still absolute to a browser.</p>
+
+<h3>Spending it exactly once</h3>
+
+<pre class="language-python"><code class="language-python">def consume(state: str) -&gt; PendingLogin | None:
+    ...
+    client = _redis()
+    if client is None:
+        raise OAuthConfigurationError(
+            "Sign-in with a provider is temporarily unavailable.", status_code=503
+        )
+    try:
+        raw = client.getdel(_STATE_PREFIX + state)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("oauth: could not read login state: %s", exc)
+        raise OAuthConfigurationError(
+            "Sign-in with a provider is temporarily unavailable.", status_code=503
+        ) from exc
+    if raw is None:
+        return None
+    return PendingLogin(**json.loads(raw))</code></pre>
+
+<p>Two properties here, and both are load-bearing. The state is destroyed as it is read, so a
+callback cannot be replayed. And the read and the delete are <strong>one command</strong>:</p>
+
+<pre class="language-python"><code class="language-python">def test_a_state_cannot_be_replayed(self, client):
+    state = self._start(client)
+    assert client.get(
+        f"/api/v1/auth/oauth/google/callback?code=abc&amp;state={state}"
+    ).status_code == 307
+    assert client.get(
+        f"/api/v1/auth/oauth/google/callback?code=abc&amp;state={state}"
+    ).status_code == 401</code></pre>
+
+<h3>Why this store fails closed</h3>
+
+<p>StayHub's cache treats a Redis outage as a permanent miss, and its rate limiter allows the
+request &mdash; both deliberate, because an optimisation that can take the site down has stopped
+being an optimisation. This store does the opposite and refuses. The difference is what the outage
+costs: a missing cache entry costs a database read, while a missing <code>state</code> means you
+cannot tell an authorisation you issued from one somebody forged. The only safe answer to "I cannot
+verify this" is no.</p>
+
+<p>Fail open here and a Redis blip becomes a silent hole in the login path &mdash; the exact class
+of bug nobody notices until it is in an incident report. <strong>Fail open for optimisations, fail
+closed for decisions.</strong></p>
+
+<h2>PKCE, even though you are a server</h2>
+
+<p>PKCE was introduced for mobile and single-page apps that cannot keep a client secret, and the
+specification still describes it that way, so server-side applications skip it. Do not.</p>
+
+<p>It binds the code to the browser that started the flow. Send a hash of a secret at the authorize
+step; send the secret itself at the token step. Anywhere the code can leak &mdash; a
+<code>Referer</code> header off the redirect page, browser history on a shared machine, a proxy log,
+an open redirect elsewhere on your own domain &mdash; a leaked code is useless without the verifier,
+which never left your server.</p>
+
+<pre class="language-python"><code class="language-python">def new_verifier() -&gt; str:
+    ...
+    return secrets.token_urlsafe(64)
+
+
+def challenge_for(verifier: str) -&gt; str:
+    """S256: base64url(sha256(verifier)), with the padding stripped.
+
+    ⚠️ The `=` padding must go. base64url in these specs is unpadded, and Google rejects a padded
+    challenge with `invalid_grant` at the TOKEN step — one round trip after the mistake, on a
+    different endpoint, with an error that says nothing about padding.
+    """
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")</code></pre>
+
+<p>Two traps in six lines. The RFC permits a <code>plain</code> method where the verifier
+<em>is</em> the challenge; it exists for clients that cannot compute SHA-256 and it protects
+nothing, because anyone who intercepts the challenge has the verifier. And the base64url padding
+has to go &mdash; a padded challenge is accepted at the authorize step and rejected one round trip
+later at the token endpoint with <code>invalid_grant</code>, an error that says nothing about
+padding.</p>
+
+<h2>Spending the code</h2>
+
+<pre class="language-python"><code class="language-python">def exchange_code(
+    provider: Provider, code: str, verifier: str, redirect_uri: str, client: httpx.Client
+) -&gt; str:
+    ...
+    response = client.post(
+        provider.token_url,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": provider.client_id,
+            "client_secret": provider.client_secret,
+            "code_verifier": verifier,
+        },
+        headers={"Accept": "application/json"},
+    )
+    if response.status_code != 200:
+        # The provider's body here says things like {"error": "invalid_grant"}, which is useful in
+        # a log and meaningless to a person staring at a sign-in button.
+        logger.warning(
+            "oauth: %s token exchange failed with %s: %s",
+            provider.name, response.status_code, response.text[:500],
+        )
+        raise UnauthorizedException("That sign-in could not be completed. Please try again.")
+
+    token = response.json().get("access_token")
+    if not token:
+        raise UnauthorizedException("That sign-in could not be completed. Please try again.")
+    return token</code></pre>
+
+<p>The <code>redirect_uri</code> is sent again, and it must be byte-identical to the one from the
+authorize step &mdash; which is why it is stored in the pending login rather than rebuilt here.
+It is also why it is built from configuration rather than from the request:</p>
+
+<pre class="language-python"><code class="language-python">def redirect_uri_for(provider_name: str) -&gt; str:
+    ...
+    return f"{settings.oauth_redirect_base.rstrip('/')}/api/v1/auth/oauth/{provider_name}/callback"</code></pre>
+
+<p>A <code>redirect_uri</code> assembled from <code>request.url</code> follows whatever host a
+proxy &mdash; or an attacker &mdash; put in the <code>Host</code> header, and it has to match the
+string registered in the provider's console anyway. Google compares that string literally:
+<code>http</code> against <code>https</code>, or one stray slash, is
+<code>redirect_uri_mismatch</code> and nothing more helpful.</p>
+
+<p>The <code>Accept</code> header is there for GitHub, which answers its token endpoint with form
+encoding unless asked otherwise &mdash; so <code>response.json()</code> raises a decode error on a
+<code>200</code>, and the traceback points at your parsing rather than at the header you did not
+send.</p>
+
+<h3>What the provider says about the email</h3>
+
+<pre class="language-python"><code class="language-python"># ⚠️ Google returns this as a real boolean, but plenty of providers send the string
+# "true". `is True` would then be False and every login would be refused; truthiness on
+# the string "false" would accept everything. Compare against both explicitly.
+email_verified=profile.get("email_verified") in (True, "true", "True"),</code></pre>
+
+<p>Providers disagree about types. Google sends a real boolean; others send the string
+<code>"true"</code>. <code>is True</code> then fails for everybody, and truthiness accepts the
+string <code>"false"</code> &mdash; a bug that reads as correct and fails open.</p>
+
+<h2>The account takeover, and it is one <code>if</code></h2>
+
+<p>Now the identity is in hand, and the only question left is which StayHub account it is. Three
+outcomes, and the <em>order</em> is the security.</p>
+
+<p><strong>First: have we seen this provider account before?</strong></p>
+
+<pre class="language-python"><code class="language-python">def _find_linked(self, identity: OAuthIdentity) -&gt; User | None:
+    link = self.db.execute(
+        select(OAuthAccount).where(
+            OAuthAccount.provider == identity.provider,
+            OAuthAccount.subject == identity.subject,
+        )
+    ).scalar_one_or_none()
+    return link.user if link else None</code></pre>
+
+<p>Looked up by <code>subject</code>, not by email, and that choice is in the schema:</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ The provider's `sub`, never the email. Addresses get reassigned — a company deletes
+# alex@ and issues it to a new hire eighteen months later, and if the email is the join key
+# that person signs straight into Alex's account, bookings and saved cards included. `sub` is
+# the provider's permanent, opaque id for one account and it is the only safe thing to key on.
+subject: Mapped[str] = mapped_column(String(255), nullable=False)</code></pre>
+
+<p><strong>Second: does a StayHub account already use that address?</strong> Here is the bug:</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ THE account takeover, and it is one `if`.
+#
+# Without it: register a provider account using someone else's address, click "Sign in
+# with &lt;provider&gt;", and the branch below matches an existing StayHub user by email and
+# hands you their account — bookings, saved cards, trip history. Some providers will
+# happily issue you an account on an address you have not proven you own; that is exactly
+# what `email_verified` is telling you.
+#
+# Refusing outright, rather than falling through to "create a new account", is deliberate:
+# creating one would put a second, unverified row on an address that already belongs to
+# somebody, and the support ticket that follows is unanswerable.
+if not identity.email or not identity.email_verified:
+    raise ForbiddenException(
+        "Your provider has not verified that email address, so we cannot sign you in "
+        "with it. Verify it with them, or sign in with your password."
+    )</code></pre>
+
+<p>Without that check: register a provider account on somebody else's address, click the button,
+and the branch below matches an existing user by email and hands you their account. Some providers
+will happily issue an account on an address you have not proven you own &mdash; which is precisely
+what <code>email_verified</code> is telling you.</p>
+
+<p>Refusing outright, rather than falling through to "create a new account", is also deliberate.
+Creating one puts a second, unverified row on an address that already belongs to somebody, and the
+support ticket that follows has no good answer.</p>
+
+<p><strong>Third: create the account</strong> &mdash; with one detail that looks like a nicety and
+is not:</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ A RANDOM hash, not a sentinel like "" or "!". The obvious move is a value
+# that could never be a hash — and then `POST /auth/login` on that address reaches
+# `verify_password`, passlib cannot identify the string as any known scheme, and
+# it raises. The endpoint 500s instead of returning "email or password is
+# incorrect", and the crash is reachable by anyone who guesses the address.
+#
+# Hashing 32 random bytes costs one bcrypt round at signup and makes the password
+# path answer correctly and unremarkably: no password matches, ever.
+password_hash=hash_password(secrets.token_urlsafe(32)),</code></pre>
+
+<p>The obvious move is a sentinel that could never be a hash. Then <code>POST /auth/login</code> on
+that address reaches <code>verify_password</code>, passlib cannot identify the string as any known
+scheme, and it <em>raises</em>. The endpoint returns 500 instead of "email or password is
+incorrect", and the crash is reachable by anyone who guesses the address. Hashing 32 random bytes
+costs one bcrypt round at signup and makes the password path answer correctly and unremarkably.</p>
+
+<p>One more thing lives in the schema rather than the code:</p>
+
+<pre class="language-python"><code class="language-python"># ⚠️ On the PAIR. `subject` alone is not unique — Google and GitHub both number their own
+# accounts from their own sequences, so a unique index on `subject` starts rejecting real
+# logins the day the second provider is switched on, with a constraint error that names a
+# column and explains nothing.
+# Unnamed on purpose: `NAMING_CONVENTION` in db/base.py renders it
+# `uq_oauth_accounts_provider`, and a hand-written name here would differ from what
+# Alembic autogenerates — so every later `--autogenerate` proposes dropping and
+# recreating a constraint that is already correct.
+UniqueConstraint("provider", "subject"),</code></pre>
+
+<h2>Getting the token back to the browser</h2>
+
+<p>There is no <code>fetch</code> waiting for a response &mdash; the browser arrived here by
+navigation. So the token has to ride on a redirect, and where it rides matters:</p>
+
+<pre class="language-python"><code class="language-python">fragment = urlencode({"access_token": auth.access_token, "token_type": "bearer"})
+destination = f"{settings.oauth_success_redirect}?{urlencode({'next': pending.next_url})}"
+return RedirectResponse(f"{destination}#{fragment}", status_code=307)</code></pre>
+
+<p>A fragment is never sent to a server. Not to StayHub, not in a <code>Referer</code> header to
+whatever the landing page loads, not into an access log or a proxy's. A token in
+<code>?access_token=</code> is written into every one of those, and into browser history on a
+shared machine besides.</p>
+
+<pre class="language-python"><code class="language-python">def test_the_token_travels_in_the_fragment(self, client):
+    state = self._start(client)
+    location = client.get(
+        f"/api/v1/auth/oauth/google/callback?code=abc&amp;state={state}"
+    ).headers["location"]
+    parsed = urlparse(location)
+    # In the fragment, which no browser sends to any server...
+    assert "access_token=" in parsed.fragment
+    # ...and NOT in the query string, which every access log and Referer header records.
+    assert "access_token" not in parse_qs(parsed.query)</code></pre>
+
+<p>This is still the demo's simplification. A production deployment sets an
+<code>HttpOnly</code> cookie, or hands back a one-time code the app exchanges for a token &mdash;
+both of which keep it out of JavaScript's reach entirely. The fragment is the best of the options
+that do not.</p>
+
+<p>And one branch that is not an edge case:</p>
+
+<pre class="language-python"><code class="language-python">if error:
+    return RedirectResponse(
+        f"{settings.oauth_success_redirect}?{urlencode({'error': error})}", status_code=307
+    )</code></pre>
+
+<p>Every provider sends the user to your callback with <code>?error=access_denied</code> when they
+press Cancel on the consent screen. A handler that only reads <code>code</code> treats that as a
+malformed callback and shows a crash to somebody who simply changed their mind.</p>
+
+<h2>Testing a flow that leaves your network</h2>
+
+<p>The reflex is to monkeypatch <code>exchange_code</code>. Do not: that replaces the function
+under test, and the request body is exactly where these bugs live. Take the HTTP client as a
+dependency instead &mdash;</p>
+
+<pre class="language-python"><code class="language-python">def http_client():
+    ...
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        yield client</code></pre>
+
+<p>&mdash; and a test can answer the provider locally while the real code builds the real
+request:</p>
+
+<pre class="language-python"><code class="language-python">    def handler(request: httpx.Request) -&gt; httpx.Response:
+        if request.url.host == "oauth2.googleapis.com":
+            seen["token_body"] = dict(
+                pair.split("=", 1) for pair in request.content.decode().split("&amp;")
+            )
+            seen["token_accept"] = request.headers.get("accept")
+            if token_status != 200:
+                return httpx.Response(token_status, json={"error": "invalid_grant"})
+            return httpx.Response(200, json={"access_token": "google-access-token"})
+        if request.url.host == "openidconnect.googleapis.com":
+            seen["userinfo_auth"] = request.headers.get("authorization")
+            return httpx.Response(200, json=userinfo)</code></pre>
+
+<p>Forty-four tests run against that, with no network and no credentials. The four that matter most
+were each confirmed by reintroducing the bug they describe: dropping the
+<code>email_verified</code> check, turning <code>GETDEL</code> back into <code>GET</code>, passing
+<code>next</code> through unchecked, and leaving the base64 padding on the challenge. Every one of
+them failed exactly two tests and nothing else. A security test you have never seen fail is a
+security test you do not have.</p>
+
+<h2>The mistakes that actually ship</h2>
+
+<p><strong>Trusting the provider's access token as identity.</strong> It is a key to their API, not
+a statement about a person. Exchange it for your own token and forget it.</p>
+
+<p><strong>Keying the account on the email.</strong> Addresses get reassigned &mdash; a company
+deletes <code>alex@</code> and issues it to a new hire eighteen months later. If the email is the
+join key, that person signs straight into Alex's account. <code>sub</code> is the only safe
+key.</p>
+
+<p><strong>A unique index on <code>subject</code> alone.</strong> Fine until the second provider is
+switched on, at which point real logins start failing on a constraint error that names a column and
+explains nothing.</p>
+
+<p><strong>Skipping <code>state</code> because the flow works without it.</strong> It does. That is
+the problem.</p>
+
+<p><strong>Putting the token in the query string.</strong> Referer headers, access logs, browser
+history &mdash; and unlike a leaked password, nobody gets told to rotate it.</p>
+
+<p><strong>Storing the provider's refresh token when you do not use its API.</strong> StayHub reads
+one profile and never calls Google again, so it keeps nothing. A stored refresh token is a
+long-lived credential to somebody else's service sitting in your database for no reason.</p>
+
+<h2>Practical decisions</h2>
+
+<p><strong>Do not implement OIDC yourself if you can help it.</strong> This lesson does, because
+watching the round trip is the point of it. In production, a library that validates the
+<code>id_token</code> signature against the provider's rotating JWKS is worth the dependency
+&mdash; StayHub sidesteps that by reading <code>userinfo</code> over TLS instead, which is simpler
+and one more round trip.</p>
+
+<p><strong>Let one person have several providers.</strong> A separate table, not two columns on
+<code>users</code>. Columns allow exactly one provider, and the migration to a second is the one
+nobody budgets for.</p>
+
+<p><strong>Keep the password path.</strong> Providers have outages, people lose access to accounts,
+and an app that can only be entered through somebody else's login is an app you cannot support.</p>
+
+<p><strong>Ask for the fewest scopes that answer the question.</strong> <code>openid email
+profile</code> is enough to know who somebody is. Every scope past that is a consent screen that
+asks for more and converts worse.</p>
+
+<p>Next: <strong>file uploads</strong> &mdash; the endpoint where user input stops being JSON and
+starts being bytes on your disk.</p>

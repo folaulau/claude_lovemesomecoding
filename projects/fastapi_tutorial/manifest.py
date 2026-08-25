@@ -8,7 +8,7 @@ Dates are COMPUTED from START_DATE + STEP_DAYS rather than hand-written, because
 authored before it is published: when the publish date is finally known, move START_DATE and every
 lesson re-bases in order.
 
-⚠️ NINE of these eighteen slugs are not new. The whole /fastapi collection was published in June
+⚠️ NINE of these nineteen slugs are not new. The whole /fastapi collection was published in June
 2023 and every one of its URLs is indexed. They are being rewritten IN PLACE, not replaced:
 changing one of those slugs changes a live URL, and `verify-build.mjs` fails the frontend build
 when an indexed post URL stops resolving.
@@ -230,6 +230,11 @@ SNIPPET_SOURCES = {
     # Quotes across the whole track by design. Listed anyway so the blocks that ARE verbatim get
     # checked; the deliberately-wrong "what is wrong with this?" blocks carry ANTIPATTERN_MARKER
     # and are excluded.
+    "fastapi-oauth2": [
+        "app/core/oauth.py", "app/services/oauth_service.py",
+        "app/api/v1/routes/oauth.py", "app/api/v1/routes/auth.py",
+        "app/models/oauth_account.py", "app/core/deps.py", "tests/test_oauth.py",
+    ],
     "fastapi-interview-questions": [
         "app/api/v1/routes/admin.py", "app/core/deps.py", "app/schemas/common.py",
         "tests/test_api_admin.py",
@@ -374,6 +379,18 @@ _TRACK = [
     },
     # ------------------------------------------------------------ doing work
     {
+        "slug": "fastapi-oauth2",
+        "title": "FastAPI \u2013 OAuth2 and Sign in with Google",
+        "state": "new",
+        "tags": ["fastapi", "python", "oauth2", "security"],
+        "excerpt": (
+            "The authorization code flow with PKCE, built end to end: why OAuth2 is not a login "
+            "protocol, what state actually defends against, and the one if statement that stands "
+            "between a sign-in button and an account takeover. Plus the token endpoint that makes "
+            "the Authorize button on /docs work, and how to test a flow that leaves your network."
+        ),
+    },
+    {
         "slug": "fastapi-file-uploads",
         "title": "FastAPI – File Uploads Without the Holes",
         "state": "new",
@@ -484,7 +501,7 @@ _TRACK = [
         "state": "rewrite",
         "tags": ["fastapi", "python", "interview"],
         "excerpt": (
-            "The questions a FastAPI role actually asks, answered against the seventeen lessons "
+            "The questions a FastAPI role actually asks, answered against the eighteen lessons "
             "before this one. Why type hints do the validating, def versus async def and what "
             "happens to each, how dependency injection is tested, where a transaction begins and "
             "ends, what BackgroundTasks does not promise, and how a request is traced in "
