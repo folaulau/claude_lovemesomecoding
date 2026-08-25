@@ -8,6 +8,11 @@ All 31 pre-existing slugs were published between 2018 and 2023 and are indexed.
 They are being rewritten in place, NOT replaced: changing one of those slugs
 changes a live URL. The 4 marked `new` below did not exist before.
 
+`spring-boot-graphql` was added later, as lesson 15, which is why the files from
+there on are numbered one higher than they once were. Every "lesson N" reference
+in the post bodies was bumped to match — they are the index in post 1, so they
+cannot be left behind.
+
 Because the old posts carry 2018-2023 dates and `upsert_post` never overwrites an
 existing date, seeding this track needs `seed.py --force-dates` for the reading
 order to come out right. See progress_report.md.
@@ -230,9 +235,22 @@ POSTS = [
         ),
     },
     {
+        "slug": "spring-boot-graphql",
+        "title": "Spring Boot \u2013 GraphQL",
+        "file": "15-spring-boot-graphql.html",
+        "date": "2026-07-08T09:00:00",
+        "tags": ["spring-boot", "graphql", "api"],
+        "excerpt": (
+            "One endpoint, one schema, and a client that decides what comes back. Queries, "
+            "mutations and the annotations that map them, the batch loader that stops nested "
+            "fields becoming an N+1, and the two things REST gave you for free that GraphQL does "
+            "not: a status code, and URL rules that can tell an admin call from a public one."
+        ),
+    },
+    {
         "slug": "spring-boot-with-thymeleaf",
         "title": "Spring Boot – Server-Rendered Pages with Thymeleaf",
-        "file": "15-spring-boot-with-thymeleaf.html",
+        "file": "16-spring-boot-with-thymeleaf.html",
         "date": "2026-07-09T09:00:00",
         "tags": ["spring-boot", "thymeleaf", "templates"],
         "excerpt": (
@@ -246,7 +264,7 @@ POSTS = [
     {
         "slug": "spring-boot-hibernate",
         "title": "Spring Boot – JPA and Hibernate",
-        "file": "16-spring-boot-hibernate.html",
+        "file": "17-spring-boot-hibernate.html",
         "date": "2026-07-11T09:00:00",
         "tags": ["spring-boot", "jpa", "hibernate"],
         "excerpt": (
@@ -259,7 +277,7 @@ POSTS = [
     {
         "slug": "spring-boot-jdbc",
         "title": "Spring Boot – JdbcTemplate",
-        "file": "17-spring-boot-jdbc.html",
+        "file": "18-spring-boot-jdbc.html",
         "date": "2026-07-13T09:00:00",
         "tags": ["spring-boot", "jdbc", "sql"],
         "excerpt": (
@@ -272,7 +290,7 @@ POSTS = [
     {
         "slug": "spring-boot-liquibase",
         "title": "Spring Boot – Schema Migrations with Liquibase",
-        "file": "18-spring-boot-liquibase.html",
+        "file": "19-spring-boot-liquibase.html",
         "date": "2026-07-15T09:00:00",
         "tags": ["spring-boot", "liquibase", "database"],
         "excerpt": (
@@ -285,7 +303,7 @@ POSTS = [
     {
         "slug": "spring-boot-mapstruct",
         "title": "Spring Boot – Mapping DTOs with MapStruct",
-        "file": "19-spring-boot-mapstruct.html",
+        "file": "20-spring-boot-mapstruct.html",
         "date": "2026-07-17T09:00:00",
         "tags": ["spring-boot", "mapstruct", "dto"],
         "excerpt": (
@@ -298,7 +316,7 @@ POSTS = [
     {
         "slug": "spring-boot-lombok",
         "title": "Spring Boot – Lombok",
-        "file": "20-spring-boot-lombok.html",
+        "file": "21-spring-boot-lombok.html",
         "date": "2026-07-19T09:00:00",
         "tags": ["spring-boot", "lombok", "java"],
         "excerpt": (
@@ -311,7 +329,7 @@ POSTS = [
     {
         "slug": "spring-boot-cache",
         "title": "Spring Boot – Caching",
-        "file": "21-spring-boot-cache.html",
+        "file": "22-spring-boot-cache.html",
         "date": "2026-07-21T09:00:00",
         "tags": ["spring-boot", "caching", "performance"],
         "excerpt": (
@@ -324,7 +342,7 @@ POSTS = [
     {
         "slug": "spring-boot-elasticsearch",
         "title": "Spring Boot – Elasticsearch",
-        "file": "22-spring-boot-elasticsearch.html",
+        "file": "23-spring-boot-elasticsearch.html",
         "date": "2026-07-23T09:00:00",
         "tags": ["spring-boot", "elasticsearch", "search"],
         "excerpt": (
@@ -338,7 +356,7 @@ POSTS = [
     {
         "slug": "spring-security-authentication",
         "title": "Spring Security – How Authentication Works",
-        "file": "23-spring-security-authentication.html",
+        "file": "24-spring-security-authentication.html",
         "date": "2026-07-25T09:00:00",
         "tags": ["spring-security", "authentication", "spring-boot"],
         "excerpt": (
@@ -351,7 +369,7 @@ POSTS = [
     {
         "slug": "spring-boot-security-config",
         "title": "Spring Boot – Configuring the Security Filter Chain",
-        "file": "24-spring-boot-security-config.html",
+        "file": "25-spring-boot-security-config.html",
         "date": "2026-07-27T09:00:00",
         "tags": ["spring-security", "configuration", "spring-boot"],
         "excerpt": (
@@ -364,7 +382,7 @@ POSTS = [
     {
         "slug": "spring-boot-api-authentication",
         "title": "Spring Boot – Stateless API Authentication with JWT",
-        "file": "25-spring-boot-api-authentication.html",
+        "file": "26-spring-boot-api-authentication.html",
         "date": "2026-07-29T09:00:00",
         "tags": ["spring-security", "jwt", "api"],
         "excerpt": (
@@ -377,7 +395,7 @@ POSTS = [
     {
         "slug": "spring-boot-security-secured-on-method-level",
         "title": "Spring Boot – Method-Level Security",
-        "file": "26-spring-boot-security-secured-on-method-level.html",
+        "file": "27-spring-boot-security-secured-on-method-level.html",
         "date": "2026-07-31T09:00:00",
         "tags": ["spring-security", "authorization", "spring-boot"],
         "excerpt": (
@@ -390,7 +408,7 @@ POSTS = [
     {
         "slug": "spring-boot-oauth2",
         "title": "Spring Boot – OAuth2",
-        "file": "27-spring-boot-oauth2.html",
+        "file": "28-spring-boot-oauth2.html",
         "date": "2026-08-02T09:00:00",
         "tags": ["spring-security", "oauth2", "sso"],
         "excerpt": (
@@ -404,7 +422,7 @@ POSTS = [
     {
         "slug": "spring-boot-thread-pool",
         "title": "Spring Boot – Async Work and Thread Pools",
-        "file": "28-spring-boot-thread-pool.html",
+        "file": "29-spring-boot-thread-pool.html",
         "date": "2026-08-04T09:00:00",
         "tags": ["spring-boot", "async", "concurrency"],
         "excerpt": (
@@ -417,7 +435,7 @@ POSTS = [
     {
         "slug": "spring-boot-retry",
         "title": "Spring Boot – Retries",
-        "file": "29-spring-boot-retry.html",
+        "file": "30-spring-boot-retry.html",
         "date": "2026-08-06T09:00:00",
         "tags": ["spring-boot", "resilience", "retry"],
         "excerpt": (
@@ -430,7 +448,7 @@ POSTS = [
     {
         "slug": "spring-boot-jms",
         "title": "Spring Boot – Messaging with JMS",
-        "file": "30-spring-boot-jms.html",
+        "file": "31-spring-boot-jms.html",
         "date": "2026-08-08T09:00:00",
         "tags": ["spring-boot", "jms", "messaging"],
         "excerpt": (
@@ -442,7 +460,7 @@ POSTS = [
     {
         "slug": "spring-boot-email",
         "title": "Spring Boot – Sending Email",
-        "file": "31-spring-boot-email.html",
+        "file": "32-spring-boot-email.html",
         "date": "2026-08-10T09:00:00",
         "tags": ["spring-boot", "email", "javamail"],
         "excerpt": (
@@ -455,7 +473,7 @@ POSTS = [
     {
         "slug": "spring-boot-testing",
         "title": "Spring Boot – Testing",
-        "file": "32-spring-boot-testing.html",
+        "file": "33-spring-boot-testing.html",
         "date": "2026-08-12T09:00:00",
         "tags": ["spring-boot", "testing", "junit"],
         "excerpt": (
@@ -468,7 +486,7 @@ POSTS = [
     {
         "slug": "spring-boot-gradle",
         "title": "Spring Boot – Building with Gradle",
-        "file": "33-spring-boot-gradle.html",
+        "file": "34-spring-boot-gradle.html",
         "date": "2026-08-14T09:00:00",
         "tags": ["spring-boot", "gradle", "build"],
         "excerpt": (
@@ -481,7 +499,7 @@ POSTS = [
     {
         "slug": "spring-boot-code-snippets",
         "title": "Spring Boot – Cheat Sheet",
-        "file": "34-spring-boot-code-snippets.html",
+        "file": "35-spring-boot-code-snippets.html",
         "date": "2026-08-16T09:00:00",
         "tags": ["spring-boot", "reference", "cheat-sheet"],
         "excerpt": (
@@ -494,7 +512,7 @@ POSTS = [
     {
         "slug": "springboot-interview-questions",
         "title": "Spring Boot – Interview Questions",
-        "file": "35-springboot-interview-questions.html",
+        "file": "36-springboot-interview-questions.html",
         "date": "2026-08-18T09:00:00",
         "tags": ["spring-boot", "interview", "java"],
         "excerpt": (

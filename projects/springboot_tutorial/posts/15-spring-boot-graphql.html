@@ -1,0 +1,442 @@
+<p>REST gives the server the last word on the response shape: the menu grid and the order screen
+both call <code>GET /api/products</code> and both get everything. GraphQL inverts that — one
+endpoint, one schema, and the client writes the query.</p>
+
+<p>This lesson adds GraphQL to the pizza API <strong>alongside</strong> the REST controllers, calling
+the same <code>ProductService</code> and <code>CartService</code>. GraphQL is a transport, not an
+architecture: caching, transactions and validation live under the service layer and carry over
+untouched.</p>
+
+<pre class="language-graphql"><code class="language-graphql">{
+  menu(type: PIZZA) {
+    name
+    priceFor(size: LARGE)
+  }
+}</code></pre>
+
+<pre class="language-json"><code class="language-json">{"data":{"menu":[
+  {"name":"Pepperoni Pizza","priceFor":16.99},
+  {"name":"Cheese Pizza","priceFor":15.49},
+  {"name":"Supreme Pizza","priceFor":19.99}
+]}}</code></pre>
+
+<p>Two fields asked for, two returned — and no endpoint had to be written for that combination.</p>
+
+<h2>Setup</h2>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-graphql&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>That is the whole wiring — no configuration class, no registration. <strong>Provided it finds a
+schema.</strong> Boot looks in <code>classpath:graphql/**/*.graphqls</code>, and the entire
+autoconfiguration is gated on that (<code>@ConditionalOnGraphQlSchema</code>). With no schema file
+the app starts normally, logs nothing, and simply has no <code>/graphql</code> endpoint — a 404 with
+no clue anywhere as to why. The line to look for, whose absence is the whole diagnosis:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">GraphQlWebMvcAutoConfiguration : GraphQL endpoint HTTP POST /graphql</code></pre>
+
+<p>Once a schema is there, Boot inspects it against your controllers at startup and logs a report of
+unmapped fields, registrations and arguments. Read it after every schema change — it is how you find
+a field you declared and forgot to back with anything.</p>
+
+<h2>The schema is not your DTOs</h2>
+
+<p>GraphQL is schema-first: you write the contract and Spring checks your code against it. The
+temptation is to transcribe the DTOs. Resist it — <strong>everything in the schema is reachable by
+anyone who can reach the endpoint</strong>, so the schema is a publishing decision:</p>
+
+<pre class="language-graphql"><code class="language-graphql">scalar UUID
+scalar BigDecimal
+
+type Product {
+  id: UUID!
+  name: String!
+  description: String
+  type: ProductType!
+  sizes: [ProductSize!]!
+
+  "Price in one size, or null if this product is not sold in it."
+  priceFor(size: SizeName!): BigDecimal
+}
+
+type Query {
+  menu(type: ProductType): [Product!]!
+
+  # Nullable: a miss returns data.product = null AND a NOT_FOUND entry in errors.
+  product(id: UUID!): Product
+}</code></pre>
+
+<p><code>ProductDTO</code> also carries <code>createdAt</code>, <code>updatedAt</code> and
+<code>displayOrder</code>; none appears here, because every one would become a supported field the
+moment it shipped. And <code>!</code> means non-null, which carries real weight — a field left
+nullable is a decision, not laziness. See below.</p>
+
+<h2>⚠️ There are five scalars, and none of them is a decimal</h2>
+
+<p>GraphQL ships <code>Int</code>, <code>Float</code>, <code>String</code>, <code>Boolean</code> and
+<code>ID</code>. That is the entire list: no UUID, no decimal. And <code>Float</code> is an IEEE-754
+double, so publishing a price through it reintroduces exactly the drift every
+<code>BigDecimal</code> in the codebase exists to prevent — at the last hop, on the wire, where it is
+hardest to notice.</p>
+
+<pre class="language-xml"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;com.graphql-java&lt;/groupId&gt;
+    &lt;artifactId&gt;graphql-java-extended-scalars&lt;/artifactId&gt;
+    &lt;version&gt;22.0&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+<p>Boot manages <code>graphql-java</code> but not the scalar set, so the version is pinned by hand —
+same situation as springdoc in <a href="/spring-boot/spring-boot-with-swagger">lesson 14</a>.</p>
+
+<pre class="language-java"><code class="language-java">// Every `scalar` line in the schema must be given an implementation here.
+@Bean
+public RuntimeWiringConfigurer scalarConfigurer() {
+    return wiring -&gt; wiring.scalar(ExtendedScalars.UUID).scalar(ExtendedScalars.GraphQLBigDecimal);
+}</code></pre>
+
+<p>Unlike a missing schema, a declared-but-unimplemented scalar is loud:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">SchemaProblem{errors=[There is no scalar implementation for the named 'UUID' scalar type,
+                      There is no scalar implementation for the named 'BigDecimal' scalar type]}</code></pre>
+
+<p>Note what is <em>not</em> registered: a date-time scalar. The extended set's
+<code>DateTime</code> is built on <code>OffsetDateTime</code> and every timestamp in this app is a
+zoneless <code>LocalDateTime</code>, so rather than publish one through a scalar that would have to
+invent a zone, the schema has no timestamps in it at all.</p>
+
+<h2>Queries</h2>
+
+<pre class="language-java"><code class="language-java">// @Controller, not @RestController. These methods return domain objects that
+// graphql-java shapes according to the query, so there is nothing for @ResponseBody to do.
+@Controller
+@RequiredArgsConstructor
+public class MenuGraphQlController {
+
+    // The SAME service the REST controller calls. Its @Cacheable and @Transactional
+    // still apply, because they live under here rather than in the controller.
+    private final ProductService productService;
+
+    // The method name is the field name. That is the whole mapping.
+    @QueryMapping
+    public List&lt;ProductDTO&gt; menu(@Argument ProductType type) {
+        return type == null ? productService.getMenu() : productService.getByType(type);
+    }
+
+    // No try/catch: the service throws ApiException.notFound exactly as it does for REST.
+    @QueryMapping
+    public ProductDTO product(@Argument UUID id) {
+        return productService.getProductByPublicId(id);
+    }
+}</code></pre>
+
+<p><code>@Argument</code> binds by name, and a nullable argument the caller omitted arrives as
+<code>null</code> — the same "all or filtered" decision the REST controller makes with an optional
+query parameter.</p>
+
+<h2>A field that exists only in the schema</h2>
+
+<p><code>priceFor(size:)</code> has no accessor on <code>ProductDTO</code>. It is supplied by a data
+fetcher, and it can take arguments of its own — something REST has no equivalent of short of another
+endpoint.</p>
+
+<pre class="language-java"><code class="language-java">// The first parameter is the parent object. The method name matches the field, so
+// @SchemaMapping needs only the type.
+@SchemaMapping(typeName = "Product")
+public BigDecimal priceFor(ProductDTO product, @Argument SizeName size) {
+    return product.sizes().stream()
+            .filter(s -&gt; s.size() == size)
+            .map(ProductSizeDTO::price)
+            .findFirst()
+            .orElse(null);
+}</code></pre>
+
+<p>And it costs nothing when unasked: a data fetcher only runs if the query selected its field.</p>
+
+<h2>⚠️ The N+1 that nested queries invite</h2>
+
+<p>A cart line stores a product id, not a product. Exposing <code>CartItem.product</code> as a
+<code>@SchemaMapping</code> taking one <code>CartItemDTO</code> runs it <strong>once per
+line</strong>: a six-item cart makes six lookups to answer one query, and nothing in the query text
+hints at it.</p>
+
+<p>Same N+1 as <a href="/spring-boot/spring-boot-hibernate">lesson 17</a> in different clothes, and
+GraphQL invites it because the client decides the nesting. <code>@BatchMapping</code> inverts the
+signature:</p>
+
+<pre class="language-java"><code class="language-java">// graphql-java collects every CartItem at this level FIRST and calls this once with all
+// of them. One lookup, whatever the cart's size.
+@BatchMapping(typeName = "CartItem", field = "product")
+public Map&lt;CartItemDTO, ProductDTO&gt; cartItemProduct(List&lt;CartItemDTO&gt; items) {
+
+    Map&lt;UUID, ProductDTO&gt; byId = productService.getMenu().stream()
+            .collect(Collectors.toMap(ProductDTO::id, Function.identity()));
+
+    Map&lt;CartItemDTO, ProductDTO&gt; resolved = new LinkedHashMap&lt;&gt;();
+    for (CartItemDTO item : items) {
+        ProductDTO product = byId.get(item.productId());
+        if (product != null) {
+            resolved.put(item, product);
+        }
+    }
+    return resolved;
+}</code></pre>
+
+<p>The return is a map <em>from parent to value</em> — which is how each result finds the right line,
+so the parent type needs a usable <code>equals</code>/<code>hashCode</code> or it silently loses
+rows. <code>CartItemDTO</code> is a record and each line carries its own UUID, so two identical lines
+stay distinct keys.</p>
+
+<h3>Why <code>product</code> is nullable</h3>
+
+<p>A cart can outlive a product being taken off the menu. Under <code>Product!</code> that null is
+illegal, and <strong>GraphQL propagates a non-null violation upwards</strong> — it would wipe out the
+entire <code>CartItem</code>, turning "one item is no longer sold" into "the cart is missing a line".
+The honest null is the better answer, and the schema has to say so.</p>
+
+<h2>Mutations</h2>
+
+<p>Anything that writes goes under <code>Mutation</code> — a convention rather than an enforcement,
+but clients and tooling rely on it.</p>
+
+<pre class="language-graphql"><code class="language-graphql">input CartItemInput {
+  productId: UUID!
+  size: SizeName!
+  crustId: UUID
+  toppingIds: [UUID!]
+  quantity: Int!
+}
+
+input CartInput {
+  orderType: OrderType!
+  items: [CartItemInput!]!
+}
+
+type Mutation {
+  saveCart(cartId: UUID!, cart: CartInput!): Cart!
+
+  "Admin only. Enforced by @PreAuthorize, because every operation shares one URL."
+  deactivateProduct(id: UUID!): Boolean!
+}</code></pre>
+
+<p><code>input</code> is a distinct kind from <code>type</code> — inputs go in, types come out, and
+one cannot substitute for the other. Spring binds an input onto a record by matching component names,
+exactly as Jackson binds a JSON body.</p>
+
+<pre class="language-java"><code class="language-java">@MutationMapping
+public CartDTO saveCart(@Argument UUID cartId, @Argument @Valid CartWriteDTO cart) {
+    return cartService.replaceCart(cartId, cart, signedInEmail());
+}</code></pre>
+
+<p><code>@Valid</code> carries over: a quantity of 0 is refused by the <code>@Min(1)</code> on the
+record, not by controller code.</p>
+
+<h2>⚠️ <code>Principal</code> does not carry over</h2>
+
+<p>The REST controller declares <code>Principal principal</code> and gets <code>null</code> for an
+anonymous caller — that is what makes guest checkout work. Spring GraphQL resolves the same parameter
+type differently: with no authentication it throws
+<code>AuthenticationCredentialsNotFoundException</code>. So a signature copied verbatim from the REST
+controller breaks every anonymous write, and it surfaces as an opaque <code>INTERNAL_ERROR</code>
+rather than a 401 — it reads as a server bug, not an auth one. Absent authentication is a legitimate
+state here, so the method has to be able to see it:</p>
+
+<pre class="language-java"><code class="language-java">/** The signed-in caller's email, or null for a guest. Anonymous counts as a guest. */
+private String signedInEmail() {
+    Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+    return authentication == null || !authentication.isAuthenticated()
+            ? null
+            : authentication.getName();
+}</code></pre>
+
+<h2>Errors: there is no status code</h2>
+
+<p>A GraphQL request is a POST that succeeded. Every response is <strong>200</strong>, and failures
+live in an <code>errors</code> array beside whatever data did resolve. Partial data and errors
+together is the single biggest departure from REST.</p>
+
+<pre class="language-json"><code class="language-json">{"errors":[{
+   "message":"Product 00000000-0000-4000-8000-000000000000 was not found",
+   "path":["product"],
+   "extensions":{"classification":"NOT_FOUND"}
+ }],
+ "data":{"product":null}}</code></pre>
+
+<p><code>@RestControllerAdvice</code> does nothing here — there is no status to set. Unresolved, an
+exception becomes <code>INTERNAL_ERROR for &lt;some uuid&gt;</code>. That opacity is deliberate, so an
+accidental message never leaks, but it is useless to a caller who asked for a product that does not
+exist:</p>
+
+<pre class="language-java"><code class="language-java">@Component
+public class ApiExceptionResolver extends DataFetcherExceptionResolverAdapter {
+
+    @Override
+    protected GraphQLError resolveToSingleError(Throwable ex, DataFetchingEnvironment env) {
+
+        // ⚠️ Bean Validation lands here too, and NOT as anything Spring recognises.
+        // @Valid on an @Argument throws a plain ConstraintViolationException, which has no
+        // mapping of its own - so without this branch a rejected quantity is reported as
+        // INTERNAL_ERROR, indistinguishable from a crash. RestExceptionHandler gets this
+        // for free from MethodArgumentNotValidException; GraphQL has to be told.
+        if (ex instanceof ConstraintViolationException violations) {
+            return GraphqlErrorBuilder.newError(env)
+                    .errorType(ErrorType.BAD_REQUEST)
+                    .message("Validation failed")
+                    .extensions(Map.of("fieldErrors", fieldErrors(violations)))
+                    .build();
+        }
+
+        // Returning null means "not mine" and lets the next resolver handle it.
+        // ANYTHING UNRECOGNISED MUST STAY an opaque INTERNAL_ERROR.
+        if (!(ex instanceof ApiException api)) {
+            return null;
+        }
+        return GraphqlErrorBuilder.newError(env)
+                .errorType(classify(api.getError().getStatus()))
+                .message(api.getMessage())
+                .build();
+    }
+}</code></pre>
+
+<p><code>ErrorType</code> — <code>NOT_FOUND</code>, <code>BAD_REQUEST</code>,
+<code>UNAUTHORIZED</code>, <code>FORBIDDEN</code>, <code>INTERNAL_ERROR</code> — is Spring's
+stand-in for the status code, and it is what clients should branch on rather than the message
+text.</p>
+
+<h2>⚠️ Security: one URL for everything</h2>
+
+<p>This is genuinely different from <a href="/spring-boot/spring-boot-security-config">lesson
+25</a>. Reading the public menu and deactivating a product are <em>both</em> <code>POST
+/graphql</code>. There is no <code>requestMatchers("/graphql/deactivateProduct")</code> to write,
+because that path does not exist.</p>
+
+<pre class="language-java"><code class="language-java">// SecurityConfig. permitAll() here is not "GraphQL is public" - it is an admission that
+// this layer has nothing useful to say. The JWT filter still runs, so a caller who sends
+// a token IS authenticated by the time a data fetcher executes; permitAll only means the
+// request is not rejected for lacking one.
+.requestMatchers("/graphql", "/graphiql", "/graphiql/**")
+.permitAll()
+
+// ...and the controller. Not defence in depth. The ONLY defence. A mutation that forgets
+// this is open to anyone who can reach the endpoint, and no URL rule will catch it.
+@MutationMapping
+@PreAuthorize("hasRole('ADMIN')")
+public boolean deactivateProduct(@Argument UUID id) { }</code></pre>
+
+<p>So <code>@EnableMethodSecurity</code> is not optional here — without it every mutation is wide
+open. Spring Security's GraphQL integration maps the outcome: no token gives
+<code>UNAUTHORIZED</code>, a customer's token gives <code>FORBIDDEN</code> — 401 versus 403, carried
+in the body because there is no status code to carry it.</p>
+
+<h3>Cost is the caller's to decide</h3>
+
+<p>A REST client asks for one resource and gets a bounded response; a GraphQL client writes the
+query. As soon as a schema contains a cycle — one type reachable from itself — a query can nest
+through it hundreds of levels deep, and one unauthenticated request does unbounded work.</p>
+
+<pre class="language-java"><code class="language-java">// Boot picks up every Instrumentation bean and chains it, so declaring one is the whole
+// wiring. The check runs during VALIDATION, before execution, so a rejected query costs
+// no database work at all.
+@Bean
+public Instrumentation maxQueryDepthInstrumentation() {
+    return new MaxQueryDepthInstrumentation(10);
+}</code></pre>
+
+<p>The pizza schema has no cycle today — <code>cart → items → product → sizes</code> stops at five
+levels. The bean is there because that is one field away from being untrue: adding
+<code>Product.relatedItems: [Product!]</code> would open it, and nobody would call that a security
+change. (<code>MaxQueryComplexityInstrumentation</code> bounds total fields touched, rather than
+depth.)</p>
+
+<p>Two switches to turn off in production: <strong>GraphiQL</strong>, which renders your whole schema
+to anyone who loads the page, and <strong>introspection</strong>
+(<code>spring.graphql.schema.introspection.enabled=false</code>), the API it uses to read it — real
+clients ship with their queries already written and lose nothing.</p>
+
+<h2>Testing</h2>
+
+<p><code>@GraphQlTest</code> is the GraphQL equivalent of the <code>@WebMvcTest</code> slice from
+<a href="/spring-boot/spring-boot-testing">lesson 33</a> — schema, controller and data fetchers, with
+no web server, no database and no security.</p>
+
+<pre class="language-java"><code class="language-java">// ⚠️ GraphQlConfig must be imported explicitly. A slice registers @Controller beans and
+// nothing else, so without it `scalar UUID` has no implementation and the context fails
+// before a single test runs - naming a scalar, not the controller under test.
+@GraphQlTest(MenuGraphQlController.class)
+@Import({GraphQlConfig.class, ApiExceptionResolver.class})
+class MenuGraphQlControllerTest {
+
+    @Autowired private GraphQlTester graphQlTester;
+    @MockitoBean private ProductService productService;
+
+    @Test
+    void missingProductIsClassified() {
+        when(productService.getProductByPublicId(MISSING))
+                .thenThrow(ApiException.notFound("Product", MISSING));
+
+        graphQlTester.document("query($id: UUID!) { product(id: $id) { name } }")
+                .variable("id", MISSING.toString())
+                .execute()
+                .errors().expect(e -&gt; e.getErrorType() == ErrorType.NOT_FOUND).verify()
+                .path("product").valueIsNull();
+    }
+}</code></pre>
+
+<p>Two assertions worth calling out. The batch loader's purpose is a property invisible in the
+response, so assert it directly. And a security test must use a <strong>seeded</strong> id — refused
+by <code>@PreAuthorize</code> and 404 look identical from outside, so a nonexistent id would let the
+test pass with the annotation deleted:</p>
+
+<pre class="language-java"><code class="language-java">verify(productService, times(1)).getMenu();   // as a @SchemaMapping this would be 3
+
+// 200, not 403 - the HTTP request succeeded and the failure is inside the body.
+// Asserting on the status code here would pass while the endpoint was wide open.
+.andExpect(status().isOk())
+.andExpect(jsonPath("$.errors[0].extensions.classification").value("UNAUTHORIZED"))
+.andExpect(jsonPath("$.data.deactivateProduct").doesNotExist());</code></pre>
+
+<h2>GraphQL or REST?</h2>
+
+<table>
+  <thead>
+    <tr><th></th><th>REST</th><th>GraphQL</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Response shape</td><td>server decides</td><td>client decides</td></tr>
+    <tr><td>Errors</td><td>status code</td><td>200 + <code>errors</code> array</td></tr>
+    <tr><td>Authorization</td><td>URL rules and annotations</td><td>annotations only</td></tr>
+    <tr><td>Caching</td><td>HTTP, for free</td><td>hand-rolled — one POST URL is uncacheable</td></tr>
+    <tr><td>Request cost</td><td>bounded by the endpoint</td><td>bounded by whatever you enforce</td></tr>
+    <tr><td>Contract</td><td>OpenAPI, generated after</td><td>the schema, written first</td></tr>
+  </tbody>
+</table>
+
+<p><strong>GraphQL earns its keep when several clients need different slices of the same graph</strong>
+— a web app, a mobile app and a partner integration, each over-fetching or making three round trips
+against a REST API tuned for one of them. The pizza app has exactly that shape. <strong>REST stays
+the better default for a single client or a public API</strong>: HTTP caching alone is worth a great
+deal, and "this URL does this thing" is not worth giving up for a shape problem you do not have. They
+are not exclusive either, which is the point of this lesson — the pizza API serves both, over one
+service layer, in under 200 lines of Java plus the schema.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li><strong>Call the same services.</strong> If GraphQL needs its own service layer, the seam is in
+  the wrong place.</li>
+  <li><strong>The schema is a publishing decision</strong>, not a transcription of your DTOs.</li>
+  <li><strong>Register a decimal scalar.</strong> <code>Float</code> is a double, and money in a
+  double drifts.</li>
+  <li><strong><code>@BatchMapping</code>, not <code>@SchemaMapping</code>,</strong> the moment a field
+  resolves per-parent.</li>
+  <li><strong>Map your exceptions</strong>, including <code>ConstraintViolationException</code>, or
+  every failure is an opaque <code>INTERNAL_ERROR</code>.</li>
+  <li><strong>One URL means <code>@PreAuthorize</code> is the only defence.</strong> A forgotten
+  annotation is an open door.</li>
+  <li><strong>Bound the query depth</strong>, and turn off GraphiQL and introspection in
+  production.</li>
+</ul>
+
+<p>Next: <a href="/spring-boot/spring-boot-with-thymeleaf">server-rendered pages with Thymeleaf</a> —
+when a document beats any kind of API.</p>

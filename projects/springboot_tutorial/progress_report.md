@@ -283,9 +283,9 @@ projects/springboot_tutorial/
 
 | Tree | State |
 |---|---|
-| `local` | 35 posts, dates 2026-06-11 … 2026-08-18 |
-| `prod` | **35 posts live**, 573 posts total (was 569) |
-| backup | `s3://lovemesomecoding-db-.../lovemesomecoding/backups/prod-2026-08-18-pre-springboot/` |
+| `local` | 36 posts, dates 2026-06-11 … 2026-08-18 |
+| `prod` | **36 posts written**, 871 posts total. ⚠️ Lesson 15 is in the content DB but the site has NOT been rebuilt — see "GraphQL" below. |
+| backup | `.../backups/prod-2026-08-18-pre-springboot/` and `.../backups/prod-2026-08-25-pre-graphql/` (973 objects) |
 
 Verified after deploy: `verify-build` 573/573 posts, 44/44 category counts agree, 746 HTML files,
 1523 files uploaded, edge serving build `394b0bd`. **All 35 URLs return 200**, and Prism tokenises
@@ -311,3 +311,63 @@ without a manual backup step.
    outstanding item the React track left behind — it now affects two tracks.
 3. **Enable S3 object versioning** on the content bucket.
 4. **Run the pizza Playwright suite** against the 12 backend features added for this track.
+
+---
+
+## Lesson 15 — GraphQL (2026-08-25)
+
+Added on request. `/spring-boot/spring-boot-graphql`, dated 2026-07-08 so it sits between the
+springdoc lesson and Thymeleaf — GraphQL is a web-layer topic, and that is where a reader following
+the track expects it.
+
+### ⚠️ The track was renumbered
+
+Inserting at 15 rather than appending at 36 was a deliberate call: appending would have left GraphQL
+sitting after "Interview questions", which is plainly wrong for anyone reading in order. The cost is
+that everything from Thymeleaf on moved up by one, and **the numbers are load-bearing** — the index
+in lesson 1 numbers them, and 22 `lesson N` cross-references in the post bodies point at them. All of
+it was shifted together:
+
+- `posts/15..35-*.html` → `16..36-*.html` (`git mv`, so the history follows)
+- every `lesson N` for N ≥ 15 bumped by one, descending so the replacements cannot collide
+- lesson 1's index: GraphQL inserted into Part 3, and the `<ol start=…>` on Parts 4-7 bumped
+- lesson 14's "Next" now points at GraphQL; GraphQL's points at Thymeleaf
+- the cheat sheet (now 35) gained a GraphQL section and an eleventh silent failure
+
+`check_content.py` passes: 36 posts, 353 code blocks, every sample round-trips byte-for-byte. A link
+audit confirms all 36 slugs resolve.
+
+### Demo app
+
+Branch `springboot-tutorial-graphql` in `lovemesomecoding_demo_project`, commit 707b9fa, **not
+merged to main**. `com.pizza.api.graphql` + `resources/graphql/pizza.graphqls`, calling the same
+services the REST controllers call. 72 tests (9 new). Full detail in `pizza/progress_report.md`.
+
+Two defects it surfaced, both of which would have shipped: `Principal` throws rather than being null
+for an anonymous GraphQL caller (guest checkout was broken), and a `ConstraintViolationException`
+from `@Valid` has no mapping, so validation failures were opaque `INTERNAL_ERROR`s.
+
+### Claims verified by running them, not by assuming
+
+- **No schema file ⇒ no endpoint, silently.** The autoconfiguration is gated on
+  `@ConditionalOnGraphQlSchema`, so the app boots normally and 404s. My first draft said it fails the
+  context, which is what most Boot starters do — it does not. Booted with the schema removed from
+  both `src/main/resources` and `target/classes` to check.
+- **A declared-but-unimplemented scalar DOES fail the context**, with
+  `SchemaProblem{errors=[There is no scalar implementation for the named 'UUID' scalar type…]}`.
+  Booted with the scalar registration removed.
+- **Schema inspection is a report, not a gate** — it logs unmapped fields and carries on.
+- Anonymous mutation → `UNAUTHORIZED`, customer token → `FORBIDDEN`, admin token → passes the gate
+  (checked with a nonexistent id so nothing was actually mutated). All read off the running app.
+
+### State: saved, NOT published
+
+The prod content DB has the post; **the site has not been rebuilt**, so nothing is live yet. The
+build was run locally and passes — `verify-build` 871/871 posts, 42/42 category counts, 1102 HTML
+files, and `out/spring-boot/spring-boot-graphql.html` renders with 929 Prism spans and the right
+prev/next neighbours.
+
+⚠️ **Deploying needs a decision first.** `lovemesomecoding_frontend` has four uncommitted files
+(`nav.ts`, `pages.ts`, `postbuild.mjs`, `cloudfront-function.js`) from the 2026-08-24 brainteaser
+retirement. `npm run deploy` would ship those too. They look complete and match the current content
+DB, but they are not mine to publish.
