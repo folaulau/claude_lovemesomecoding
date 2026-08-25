@@ -4,6 +4,7 @@ The blocks are pulled straight out of the published HTML, so this tests what a
 reader would copy, not a retyped copy of it.
 """
 import collections
+import functools
 import html
 import math
 import re
@@ -2007,6 +2008,259 @@ for n in range(0, 6):
         if s.isPalindrome(text) != clean_model(text):
             bad.append(text)
 check("matches clean-and-reverse on every string up to length 5 over aA0P, and space", bad, [])
+
+print("LeetCode 131 - Palindrome Partitioning")
+s = load("131-palindrome-partitioning.html")
+def parts(r):
+    return sorted(tuple(x) for x in r)
+check('"aab"', parts(s.partition("aab")), parts([["a","a","b"], ["aa","b"]]))
+check('"a"', s.partition("a"), [["a"]])
+check('"aba"', parts(s.partition("aba")), parts([["a","b","a"], ["aba"]]))
+check('"abc" (only single characters)', s.partition("abc"), [["a","b","c"]])
+check('"aaa" (all 4 cuts are valid)', len(s.partition("aaa")), 4)
+# Independent model: every way to cut, filtered to all-palindrome pieces.
+def partitions_model(text):
+    out = []
+    def go(start, path):
+        if start == len(text):
+            out.append(list(path)); return
+        for end in range(start + 1, len(text) + 1):
+            piece = text[start:end]
+            if piece == piece[::-1]:
+                path.append(piece); go(end, path); path.pop()
+    go(0, [])
+    return out
+
+bad = []
+for n in range(1, 8):
+    for combo in itertools.product("ab", repeat=n):
+        text = "".join(combo)
+        if parts(s.partition(text)) != parts(partitions_model(text)):
+            bad.append(text)
+check("matches an independent model on every a/b string up to length 7", bad, [])
+# Every returned piece must be a palindrome, and concatenate back to the input.
+bad = []
+for n in range(1, 7):
+    for combo in itertools.product("aba", repeat=n):
+        text = "".join(combo)
+        for p in s.partition(text):
+            if "".join(p) != text or any(x != x[::-1] for x in p):
+                bad.append((text, p))
+check("every piece is a palindrome and the pieces reassemble the input", bad, [])
+# 2^(n-1) partitions for an all-same string, which is the worst case the post names.
+bad = [n for n in range(1, 10) if len(s.partition("a" * n)) != 2 ** (n - 1)]
+check("all-same string yields 2^(n-1) partitions", bad, [])
+
+print("LeetCode 133 - Clone Graph")
+GRAPHNODE = """
+class Node:
+    def __init__(self, val=0, neighbors=None):
+        self.val = val
+        self.neighbors = neighbors if neighbors is not None else []
+
+def build_graph(adjacency):
+    if not adjacency:
+        return None
+    nodes = [Node(i + 1) for i in range(len(adjacency))]
+    for i, neighbors in enumerate(adjacency):
+        nodes[i].neighbors = [nodes[j - 1] for j in neighbors]
+    return nodes[0]
+"""
+nsg = {}
+exec(compile(GRAPHNODE, "graphnode", "exec"), nsg)
+build_graph = nsg["build_graph"]
+s = load("133-clone-graph.html", extra=GRAPHNODE)
+
+def graph_shape(node):
+    """Adjacency by value, plus the set of object ids, for comparison."""
+    seen, order = {}, []
+    stack = [node] if node else []
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen[id(n)] = n
+        order.append(n)
+        stack.extend(n.neighbors)
+    return ({n.val: sorted(x.val for x in n.neighbors) for n in order},
+            {id(n) for n in order})
+
+for adjacency, label in (([[2,4],[1,3],[2,4],[1,3]], "the 4-cycle"),
+                         ([[]], "single node, no neighbours"),
+                         ([], "empty graph"),
+                         ([[2],[1]], "two nodes"),
+                         ([[1]], "self loop")):
+    original = build_graph(adjacency)
+    copy = s.cloneGraph(original)
+    if original is None:
+        check(f"{label}: null in, null out", copy, None)
+        continue
+    orig_shape, orig_ids = graph_shape(original)
+    copy_shape, copy_ids = graph_shape(copy)
+    check(f"{label}: same structure", copy_shape, orig_shape)
+    check(f"{label}: shares no node objects", orig_ids & copy_ids, set())
+# Mutating the copy must not touch the original.
+original = build_graph([[2,4],[1,3],[2,4],[1,3]])
+copy = s.cloneGraph(original)
+copy.val = 999
+check("mutating the copy leaves the original alone", original.val, 1)
+# Reuse: a second call must not return the first call's nodes.
+first = s.cloneGraph(original)
+second = s.cloneGraph(original)
+check("two calls produce independent copies",
+      graph_shape(first)[1] & graph_shape(second)[1], set())
+if hasattr(s, "cloneGraphBfs"):
+    bfs_copy = s.cloneGraphBfs(build_graph([[2,4],[1,3],[2,4],[1,3]]))
+    check("[BFS version] same structure", graph_shape(bfs_copy)[0],
+          graph_shape(build_graph([[2,4],[1,3],[2,4],[1,3]]))[0])
+
+print("LeetCode 134 - Gas Station")
+s = load("134-gas-station.html")
+check("[1,2,3,4,5] / [3,4,5,1,2]", s.canCompleteCircuit([1,2,3,4,5], [3,4,5,1,2]), 3)
+check("[2,3,4] / [3,4,3] (impossible)", s.canCompleteCircuit([2,3,4], [3,4,3]), -1)
+check("[5] / [4]", s.canCompleteCircuit([5], [4]), 0)
+check("[4] / [5]", s.canCompleteCircuit([4], [5]), -1)
+check("[3,3,4] / [3,4,4] (impossible)", s.canCompleteCircuit([3,3,4], [3,4,4]), -1)
+check("exact balance", s.canCompleteCircuit([1,2], [2,1]), 1)
+# Brute force: simulate from every start.
+def circuit_model(gas, cost):
+    n = len(gas)
+    for start in range(n):
+        tank, ok = 0, True
+        for step in range(n):
+            i = (start + step) % n
+            tank += gas[i] - cost[i]
+            if tank < 0:
+                ok = False; break
+        if ok:
+            return start
+    return -1
+
+bad = []
+for n in range(1, 6):
+    for g in itertools.product([0, 1, 2], repeat=n):
+        for c in itertools.product([0, 1, 2], repeat=n):
+            got, want = s.canCompleteCircuit(list(g), list(c)), circuit_model(list(g), list(c))
+            # The problem guarantees uniqueness, so the indices must match exactly.
+            if got != want:
+                bad.append((g, c, got, want))
+check("matches simulation from every start, for all gas/cost up to length 5", bad, [])
+
+print("LeetCode 136 - Single Number")
+s = load("136-single-number.html")
+check("[2,2,1]", s.singleNumber([2,2,1]), 1)
+check("[4,1,2,1,2]", s.singleNumber([4,1,2,1,2]), 4)
+check("[1] (single element)", s.singleNumber([1]), 1)
+check("[-1,-1,-2] (negatives)", s.singleNumber([-1,-1,-2]), -2)
+check("[0,1,0]", s.singleNumber([0,1,0]), 1)
+check("large values do not overflow",
+      s.singleNumber([2147483647, -2147483648, 2147483647]), -2147483648)
+bad = []
+for n in range(0, 6):
+    for combo in itertools.combinations(range(-3, 6), n):
+        for lone in range(-3, 6):
+            if lone in combo:
+                continue
+            nums = [lone] + [x for v in combo for x in (v, v)]
+            for perm in itertools.islice(itertools.permutations(nums), 24):
+                if s.singleNumber(list(perm)) != lone:
+                    bad.append(perm)
+                    break
+check("finds the lone value regardless of order, for many pairings", bad, [])
+if hasattr(s, "singleNumberLoop"):
+    bad = [xs for xs in ([2,2,1], [4,1,2,1,2], [1], [-1,-1,-2])
+           if s.singleNumberLoop(list(xs)) != s.singleNumber(list(xs))]
+    check("[explicit loop] agrees with the fold", bad, [])
+
+print("LeetCode 138 - Copy List with Random Pointer")
+RNODE = """
+class Node:
+    def __init__(self, x, next=None, random=None):
+        self.val, self.next, self.random = x, next, random
+
+def build_random_list(spec):
+    if not spec:
+        return None
+    nodes = [Node(v) for v, _ in spec]
+    for i, (_, r) in enumerate(spec):
+        nodes[i].next = nodes[i + 1] if i + 1 < len(nodes) else None
+        nodes[i].random = nodes[r] if r is not None else None
+    return nodes[0]
+
+def describe(head):
+    order, node = {}, head
+    while node:
+        order[id(node)] = len(order)
+        node = node.next
+    out, node = [], head
+    while node:
+        out.append((node.val, order.get(id(node.random)) if node.random else None))
+        node = node.next
+    return out
+
+def ids_of(head):
+    out, node = set(), head
+    while node:
+        out.add(id(node)); node = node.next
+    return out
+"""
+nsr = {}
+exec(compile(RNODE, "rnode", "exec"), nsr)
+build_random_list, describe, ids_of = nsr["build_random_list"], nsr["describe"], nsr["ids_of"]
+s = load("138-copy-list-with-random-pointer.html", extra=RNODE)
+
+SPECS = [
+    [(7, None), (13, 0), (11, 4), (10, 2), (1, 0)],
+    [(1, 1), (2, 1)],
+    [(3, None), (3, None), (3, None)],
+    [(1, 0)],
+    [],
+]
+for spec in SPECS:
+    original = build_random_list(spec)
+    copy = s.copyRandomList(original)
+    check(f"{len(spec)} nodes: structure preserved", describe(copy), describe(original))
+    check(f"{len(spec)} nodes: shares no node objects", ids_of(original) & ids_of(copy), set())
+    check(f"{len(spec)} nodes: original still intact", describe(original), spec if spec else [])
+if hasattr(s, "copyRandomListInterweaved"):
+    for spec in SPECS:
+        original = build_random_list(spec)
+        copy = s.copyRandomListInterweaved(original)
+        check(f"[interweaved] {len(spec)} nodes: structure", describe(copy), describe(build_random_list(spec)))
+        check(f"[interweaved] {len(spec)} nodes: ORIGINAL restored", describe(original), spec if spec else [])
+        check(f"[interweaved] {len(spec)} nodes: no shared objects",
+              ids_of(original) & ids_of(copy), set())
+
+print("LeetCode 139 - Word Break")
+s = load("139-word-break.html")
+check('"leetcode" / [leet, code]', s.wordBreak("leetcode", ["leet","code"]), True)
+check('"applepenapple" (reuse)', s.wordBreak("applepenapple", ["apple","pen"]), True)
+check('"catsandog" (false)',
+      s.wordBreak("catsandog", ["cats","dog","sand","and","cat"]), False)
+check('"" (empty string)', s.wordBreak("", ["a"]), True)
+check('"aaaaaa" / [aaaa, aaa] -- kills longest-first greedy',
+      s.wordBreak("aaaaaa", ["aaaa","aaa"]), True)
+check('"aaaaa" / [aaaa, aaa]', s.wordBreak("aaaaa", ["aaaa","aaa"]), False)
+check('"a" / [] (empty dictionary)', s.wordBreak("a", []), False)
+check('"cars" / [car, ca, rs]', s.wordBreak("cars", ["car","ca","rs"]), True)
+# Independent model by explicit search with memoisation.
+def breakable(text, words):
+    words = set(words)
+    @functools.lru_cache(maxsize=None)
+    def go(i):
+        if i == len(text):
+            return True
+        return any(text[i:j] in words and go(j) for j in range(i + 1, len(text) + 1))
+    return go(0)
+
+bad = []
+for n in range(0, 8):
+    for combo in itertools.product("ab", repeat=n):
+        text = "".join(combo)
+        for dictionary in (["a","b"], ["aa","b"], ["ab","a"], ["aaa","aa"], ["b"]):
+            if s.wordBreak(text, list(dictionary)) != breakable(text, tuple(dictionary)):
+                bad.append((text, dictionary))
+check("matches memoised search on every a/b string up to length 7", bad, [])
 
 print()
 if fails:

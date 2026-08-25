@@ -61,7 +61,8 @@ A round is ten LeetCode numbers, holding however many of them the source repo ac
 | 11 | 101–110 | 6 — 101, 102, 103, 104, 105, 110 | **live** since 2024-11 |
 | 12 | 111–120 | 5 — 111, 112, 114, 118, 119 | **live** since 2024-11/12 |
 | 13 | 121–130 | 3 — 122, 124, 125 (121 was already live) | **live** since 2024-12 |
-| 14 | 131–140 | 6 — 131, 133, 134, 136, 138, 139 | not started |
+| 14 | 131–140 | 6 — 131, 133, 134, 136, 138, 139 | **live** since 2024-12 |
+| 15 | 141–150 | 6 — 141, 142, 144, 145, 146, 149 | blocked on dates |
 
 `seed.py --round N` publishes exactly one round.
 
@@ -93,19 +94,19 @@ so a typo cannot quietly create a category of one.
 them, and the search index only holds url, title, category and excerpt. This is metadata waiting for
 a browse UI, not something a reader sees today.
 
-Current distribution across the 76 posts:
+Current distribution across the 82 posts:
 
 | Algorithm | Posts |
 |---|---|
-| Graph Theory | 15 |
-| Dynamic Programming | 12 |
-| Implementation | 11 |
+| Graph Theory | 16 |
+| Dynamic Programming | 13 |
+| Implementation | 12 |
 | Strings | 11 |
-| Recursion | 9 |
+| Recursion | 10 |
 | Sorting | 8 |
 | Searching | 6 |
-| Greedy | 3 |
-| Bit Manipulation | 1 |
+| Greedy | 4 |
+| Bit Manipulation | 2 |
 
 Constructive Algorithms, Game Theory and Warmup are in the taxonomy but unused so far —
 nothing published fits them.
@@ -171,29 +172,31 @@ exhausted the reservation.
 
 ### Where the window stands now
 
-Round 13 filled the gap before LeetCode 200 and the numbered track now runs continuously into the
-interview-essentials posts — the pager reads 119 → 121 → 122 → 124 → 125 → 200. What is left:
+Round 14 used the last shuffle: LeetCode 200 moved from `2024-12-14` to `2024-12-19`. What remains
+between the published posts and the end of 2024:
 
-| Gap | Days | Needed by |
-|---|---|---|
-| 125 (`2024-12-14 17:10`) → 200 (`2024-12-14 19:03`) | **0.08** | round 14 — six posts |
-| 200 → 347 (`2024-12-21`) | 6.6 | round 15 |
-| 347 → 543 (`2024-12-28`) | 6.8 | round 16 |
-| after 543 | 3 to year end | round 17 onward |
+| Gap | Days |
+|---|---|
+| 139 (`2024-12-19 03:56`) → 200 (`2024-12-19 14:22`) | 0.43 |
+| 200 → 347 (`2024-12-21`) | 1.77 |
+| 347 → 543 (`2024-12-28`) | 6.77 |
+| 543 → end of 2024 | 3.86 |
 
-**Round 14 does not fit.** Two hours for six posts. It can be unblocked by moving LeetCode 200
-forward into the 200 → 347 gap, which is the last shuffle available — after that 347 and 543 hold
-the only remaining space and there is nowhere to push them.
+**Round 15 does not fit** — six posts into ten hours. Consolidating 200, 347 and 543 to the very end
+of December would free roughly ten days for everything numbered 141–199, which is about five rounds
+at eight-hour spacing, and then the track is out of 2024 entirely.
 
-So round 14 is possible with one more `--redate`; round 16 is not, on any arrangement. **The brief
-needs a decision before then**, because the repo holds roughly 235 more numbered problems and 2024
-has two weeks left in it:
+So the choice is now unavoidable, and it is about the brief rather than the tooling:
 
-- **Re-spread the whole track** across 2022–2024. Rounds 1–5 are spaced generously; compressing them
-  frees months. It re-dates every published post once — one archive churn instead of a recurring one,
-  and it buys perhaps another ten rounds, not an unlimited number.
-- **Let later rounds run past 2024.** The original instruction said 2022–2024, which was written when
-  the track was 27 posts and nobody expected 300. This is the only option that actually scales.
+- **Re-spread the whole track across 2022–2024.** Rounds 1–5 are spaced generously and compressing
+  them frees months. It re-dates all 79 published posts once — a single archive churn — and buys
+  perhaps ten more rounds. It does not solve the problem, only postpones it further.
+- **Let later rounds run past 2024.** The `2022–2024` instruction was written when the track was 27
+  posts; the repo holds roughly 230 more numbered problems. This is the only option that scales, and
+  it needs one line changed in this document.
+
+Nothing else in the pipeline is blocked — `--redate` still works, ordering is still enforced, and
+rounds 1–14 are unaffected either way.
 
 ### Changing a date after publication
 

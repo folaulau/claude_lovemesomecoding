@@ -3,7 +3,8 @@
 Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.com under
 **Software Engineering → Fundamental Problems**, published in rounds of ten LeetCode numbers.
 
-**Status: rounds 1–13, the interview-essentials batch and three legacy rewrites are all LIVE.**
+**Status: rounds 1–14, the interview-essentials batch and three legacy rewrites are all LIVE.**
+**Round 15 is blocked on the date window — see Outstanding.**
 
 ---
 
@@ -26,15 +27,16 @@ Moving the LeetCode problems and solutions in `leetcode/` onto lovemesomecoding.
 | Round 11 (LeetCode 101–110) | 6 posts — **live** |
 | Round 12 (LeetCode 111–120) | 5 posts — **live** |
 | Round 13 (LeetCode 121–130) | 3 posts — **live** |
-| Round 14 (LeetCode 131–140) | 6 in the repo — 131, 133, 134, 136, 138, 139. Blocked on dates. |
-| Site total | **823 posts** (several tracks publish in parallel; the LeetCode work accounts for 73) |
+| Round 14 (LeetCode 131–140) | 6 posts — **live** |
+| Round 15 (LeetCode 141–150) | 6 in the repo — 141, 142, 144, 145, 146, 149. **Blocked on dates.** |
+| Site total | **829 posts** (several tracks publish in parallel; the LeetCode work accounts for 79) |
 | Category | `fundamental-problem`, already existed — no nav change needed |
 
-Live at https://lovemesomecoding.com/fundamental-problem, which now holds 84 posts: the 73 LeetCode
-ones leading the archive, above the 11 legacy 2019 posts. All 73 return 200, all 73 are in
+Live at https://lovemesomecoding.com/fundamental-problem, which now holds 90 posts: the 79 LeetCode
+ones leading the archive, above the 11 legacy 2019 posts. All 79 return 200, all 79 are in
 `sitemap.xml`, highlighting renders, cross-post links resolve, and the pre-existing URLs in this and
-other categories are unaffected. The numbered track now runs continuously into the
-interview-essentials posts: the pager reads 119 → 121 → 122 → 124 → 125 → 200.
+other categories are unaffected. The numbered track runs continuously into the interview-essentials
+posts: the pager reads 138 → 139 → 200 → 347 → 543.
 
 ### `deploy.sh` cannot verify a content-only deploy
 
@@ -196,7 +198,7 @@ Everything below was run and passed on 2026-08-12, covering all four published r
 blocks *out of the published HTML* — so they test what a reader would copy, not a retyped copy — and
 exercise them against the LeetCode examples plus the edge cases each post claims to handle:
 overflow, `Integer.MIN_VALUE`, empty strings, duplicate values, even-length palindromes, `""` against
-`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **750 Python assertions and 744 Java
+`"a*b*"`, and the pathological `"a*a*a*a*a*b"` input. **809 Python assertions and 810 Java
 assertions, all green.** Several of those are worth more than the rest put together: problems 12 and 13
 are inverses, so both suites round-trip every integer from 1 to 3999 through `intToRoman` and back
 through `romanToInt`; problem 22's output is checked against the Catalan numbers up to n = 8 (1430
@@ -221,7 +223,7 @@ for LeetCode 47 ran results through `norm()`, which sorts each inner list — co
 but it collapsed all three permutations of `[1,1,2]` into one and proved nothing about ordering.
 Permutation results now go through an order-preserving `permSet()`.
 
-**`check_content.py`** proves all 369 code blocks round-trip byte-for-byte through the backend
+**`check_content.py`** proves all 404 code blocks round-trip byte-for-byte through the backend
 normaliser, every block comes out in the exact `<pre class="language-X"><code class="language-X">`
 shape the highlighter matches, every heading has an anchor id, and no post links to a slug the track
 does not define. It also checks the manifest for duplicate slugs and non-ascending dates.
@@ -244,8 +246,8 @@ out, rounds 2 through 4 against the live site after:
   return 200.
 - All 33 post URLs return 200 and all 33 appear in `sitemap.xml`.
 
-**`npm run build`** passes, including `verify-build.mjs`: 823/823 posts served, 43/43 category counts
-agree, 101 redirects intact, 1045 HTML files emitted.
+**`npm run build`** passes, including `verify-build.mjs`: 829/829 posts served, 43/43 category counts
+agree, 101 redirects intact, 1052 HTML files emitted.
 
 **A deploy can fail after printing LIVE.** Round 8's first attempt lost two archive-page uploads to a
 transient botocore error (*"Need to rewind the stream ... but stream is not seekable"*), and the
@@ -303,13 +305,14 @@ this machine. The checks above were done against the rendered HTML instead.
 - [ ] Round 13 (LeetCode 121–130 has three not yet published: 122 Best Time to Buy and Sell Stock II,
       124 Binary Tree Maximum Path Sum, 125 Valid Palindrome — 121 is already live as an
       interview-essential). It fits the six days between LeetCode 121 and 200.
-- [ ] **Round 14 is blocked on dates.** LeetCode 125 landed two hours before LeetCode 200, and
-      round 14 has six posts. Moving 200 forward into the 200 → 347 gap unblocks it and is the last
-      shuffle available.
-- [ ] **The 2022–2024 window runs out at round 16, on any arrangement.** See "Where the window
-      stands now" in the README. Roughly 235 unpublished problems against two weeks of 2024.
-      Decide: re-spread the whole track once (buys ~10 rounds), or let later rounds run past 2024
-      (the only option that scales).
+- [x] ~~Round 14 seeded to prod and deployed.~~ Done 2026-08-24, after moving LeetCode 200 forward
+      to `2024-12-19` — the last shuffle available.
+- [ ] **BLOCKED: round 15 does not fit.** Six posts (141, 142, 144, 145, 146, 149) into the ten
+      hours left before LeetCode 200. See "Where the window stands now" in the README for the exact
+      remaining budget. Two options, both about the brief rather than the tooling:
+      re-spread the whole track across 2022–2024 (one archive churn, buys ~10 rounds, postpones
+      rather than solves), or let later rounds run past 2024 (one line changed, and the only option
+      that scales against ~230 remaining problems). **This needs an answer before round 15.**
 - [ ] **Decide what happens after LeetCode 120.** Round 13 starts at 121, where the numbered rounds
       meet the interview-essentials posts and the 2022–2024 window has nothing left to give.
 - [x] ~~Commit `projects/leetcode/`.~~ Done 2026-08-12, `e4132b6`. Not pushed — that is yours.

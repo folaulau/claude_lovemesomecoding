@@ -1220,13 +1220,109 @@ POSTS = [
         ),
     },
     {
+        "number": 131,
+        "slug": "leetcode-131-palindrome-partitioning",
+        "algorithm": "Recursion",
+        "title": "LeetCode 131 \u2013 Palindrome Partitioning",
+        "file": "131-palindrome-partitioning.html",
+        "date": "2024-12-14T21:12:31",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "backtracking", "string", "dynamic-programming"],
+        "excerpt": (
+            "Backtracking with a filter, and the cleanest illustration of where the recording "
+            "happens: Subsets records at every node, this records only when the string is fully "
+            "consumed. Get that wrong and partial partitions land in the output. Plus the "
+            "precomputed palindrome table for the repeated work."
+        ),
+    },
+    {
+        "number": 133,
+        "slug": "leetcode-133-clone-graph",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 133 \u2013 Clone Graph",
+        "file": "133-clone-graph.html",
+        "date": "2024-12-17T13:16:06",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "graph", "hash-table", "depth-first-search"],
+        "excerpt": (
+            "The traversal is the easy part. One hash map does two jobs \u2014 visited set and "
+            "old-to-new mapping \u2014 and one line decides whether the function terminates at all: "
+            "register the clone BEFORE recursing, or an undirected edge sends you straight back and "
+            "never bottoms out."
+        ),
+    },
+    {
+        "number": 134,
+        "slug": "leetcode-134-gas-station",
+        "algorithm": "Greedy",
+        "title": "LeetCode 134 \u2013 Gas Station",
+        "file": "134-gas-station.html",
+        "date": "2024-12-17T19:51:21",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "array", "greedy"],
+        "excerpt": (
+            "Eight lines of code and a proof that is the entire interview. Why a non-negative total "
+            "guarantees a solution exists, and why running dry at station i rules out every start "
+            "from the current candidate through i \u2014 which is what makes it one pass instead of "
+            "quadratic. The reset is Kadane, read differently."
+        ),
+    },
+    {
+        "number": 136,
+        "slug": "leetcode-136-single-number",
+        "algorithm": "Bit Manipulation",
+        "title": "LeetCode 136 \u2013 Single Number",
+        "file": "136-single-number.html",
+        "date": "2024-12-18T00:18:45",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "array", "bit-manipulation"],
+        "excerpt": (
+            "The problem that teaches XOR as a tool rather than a curiosity. Linear time and "
+            "constant space rule out both obvious answers, and what is left is a one-line fold \u2014 "
+            "which looks like magic until you name the three properties, including the "
+            "commutativity that handles unsorted input."
+        ),
+    },
+    {
+        "number": 138,
+        "slug": "leetcode-138-copy-list-with-random-pointer",
+        "algorithm": "Implementation",
+        "title": "LeetCode 138 \u2013 Copy List with Random Pointer",
+        "file": "138-copy-list-with-random-pointer.html",
+        "date": "2024-12-18T20:52:32",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "linked-list", "hash-table"],
+        "excerpt": (
+            "Clone Graph in a linked list's clothes: you cannot point at a node that does not exist "
+            "yet, and random pointers point forwards. The map answer is short and correct. The "
+            "O(1) answer stores the mapping inside the list itself by weaving each copy in after "
+            "its original."
+        ),
+    },
+    {
+        "number": 139,
+        "slug": "leetcode-139-word-break",
+        "algorithm": "Dynamic Programming",
+        "title": "LeetCode 139 \u2013 Word Break",
+        "file": "139-word-break.html",
+        "date": "2024-12-19T03:56:45",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "string", "dynamic-programming", "hash-table"],
+        "excerpt": (
+            "Where greedy string matching visibly fails and DP visibly saves it, with a "
+            "counterexample small enough for a whiteboard. The reframing is the usual one \u2014 can the "
+            "first i characters be built? \u2014 and dp[0] = true is doing real work. Plus why the "
+            "dictionary must be a set."
+        ),
+    },
+    {
         "number": 200,
         "batch": "interview-essentials",
         "slug": "leetcode-200-number-of-islands",
         "algorithm": "Graph Theory",
         "title": "LeetCode 200 – Number of Islands",
         "file": "200-number-of-islands.html",
-        "date": "2024-12-14T19:03:28",
+        "date": "2024-12-19T14:22:39",
         "difficulty": "Medium",
         "tags": ["leetcode", "graph", "depth-first-search", "breadth-first-search", "matrix"],
         "excerpt": (

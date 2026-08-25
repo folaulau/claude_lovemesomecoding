@@ -113,6 +113,22 @@ solution("119-pascals-triangle-ii.html", "S119")
 solution("122-best-time-to-buy-and-sell-stock-ii.html", "S122")
 solution("124-binary-tree-maximum-path-sum.html", "S124")
 solution("125-valid-palindrome.html", "S125")
+solution("131-palindrome-partitioning.html", "S131")
+solution("133-clone-graph.html", "S133")
+solution("134-gas-station.html", "S134")
+solution("136-single-number.html", "S136")
+
+solution("139-word-break.html", "S139")
+
+# Problem 138 is written against a class called `Node`, which collides with
+# problem 133's graph Node. Rename it in the extracted source only.
+def rename_node_type(src):
+    return re.sub(r'\bNode\b', 'RNode', src)
+
+for block in blocks("138-copy-list-with-random-pointer.html"):
+    if re.search(r'\bclass\s+Solution\b', block):
+        parts.append(rename_node_type(rename(block, "S138")))
+        break
 
 # Fragments that are presented as alternatives rather than the main solution.
 # LeetCode 1: the sorted two-pointer snippet is a bare loop; wrap it in a method.
@@ -239,6 +255,10 @@ parts.append("class S122States {\n  int maxProfit(int[] prices) {\n"
              "    if (prices.length == 0) return 0;\n"
              + states + "\n  }\n}")
 
+# LeetCode 138: the O(1)-space interweaving variant, a loose method.
+weave = rename_node_type(blocks("138-copy-list-with-random-pointer.html")[-1])
+parts.append("class S138Weave {\n" + weave + "\n}")
+
 # --- legacy rewrites: bare static methods and fragments, each needing a wrapper ---
 two = blocks("legacy-two-number-sum.html")
 parts.append("class L2Brute {\n" + two[0] + "\n}")
@@ -278,6 +298,20 @@ class ListNode {
     ListNode() {}
     ListNode(int val) { this.val = val; }
     ListNode(int val, ListNode next) { this.val = val; this.next = next; }
+}
+
+/** Graph node for problem 133. */
+class Node {
+    int val;
+    List<Node> neighbors = new ArrayList<>();
+    Node() {}
+    Node(int val) { this.val = val; }
+}
+
+/** Linked-list node with a random pointer, for problem 138. */
+class RNode {
+    int val; RNode next, random;
+    RNode(int val) { this.val = val; }
 }
 """
 
@@ -567,6 +601,91 @@ public class Main {
         for (char c : text.toCharArray())
             if (Character.isLetterOrDigit(c)) sb.append(Character.toLowerCase(c));
         return sb.toString().equals(sb.reverse().toString());
+    }
+
+    static Node buildGraph(int[][] adjacency) {
+        if (adjacency.length == 0) return null;
+        Node[] nodes = new Node[adjacency.length];
+        for (int i = 0; i < adjacency.length; i++) nodes[i] = new Node(i + 1);
+        for (int i = 0; i < adjacency.length; i++)
+            for (int j : adjacency[i]) nodes[i].neighbors.add(nodes[j - 1]);
+        return nodes[0];
+    }
+
+    /** Adjacency by value, plus the identity set, so a copy can be compared to its original. */
+    static Map<Integer, List<Integer>> graphShape(Node node, Set<Node> ids) {
+        Map<Integer, List<Integer>> shape = new TreeMap<>();
+        if (node == null) return shape;
+        Deque<Node> stack = new ArrayDeque<>();
+        Set<Node> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        stack.push(node);
+        while (!stack.isEmpty()) {
+            Node n = stack.pop();
+            if (!seen.add(n)) continue;
+            ids.add(n);
+            List<Integer> vals = new ArrayList<>();
+            for (Node x : n.neighbors) { vals.add(x.val); stack.push(x); }
+            Collections.sort(vals);
+            shape.put(n.val, vals);
+        }
+        return shape;
+    }
+
+    static RNode buildRandomList(int[][] spec) {
+        if (spec.length == 0) return null;
+        RNode[] nodes = new RNode[spec.length];
+        for (int i = 0; i < spec.length; i++) nodes[i] = new RNode(spec[i][0]);
+        for (int i = 0; i < spec.length; i++) {
+            nodes[i].next = i + 1 < spec.length ? nodes[i + 1] : null;
+            nodes[i].random = spec[i][1] < 0 ? null : nodes[spec[i][1]];
+        }
+        return nodes[0];
+    }
+
+    /** (value, index-of-random) per node, which pins structure without object identity. */
+    static String describeRandom(RNode head) {
+        Map<RNode, Integer> order = new IdentityHashMap<>();
+        int i = 0;
+        for (RNode n = head; n != null; n = n.next) order.put(n, i++);
+        StringBuilder sb = new StringBuilder("[");
+        for (RNode n = head; n != null; n = n.next) {
+            if (sb.length() > 1) sb.append(", ");
+            sb.append("(").append(n.val).append(",")
+              .append(n.random == null ? "null" : order.get(n.random)).append(")");
+        }
+        return sb.append("]").toString();
+    }
+
+    static Set<RNode> randomListIds(RNode head) {
+        Set<RNode> out = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (RNode n = head; n != null; n = n.next) out.add(n);
+        return out;
+    }
+
+    /** Simulate the circuit from every start, for problem 134. */
+    static int circuitModel(int[] gas, int[] cost) {
+        int n = gas.length;
+        for (int start = 0; start < n; start++) {
+            int tank = 0;
+            boolean ok = true;
+            for (int step = 0; step < n; step++) {
+                int i = (start + step) % n;
+                tank += gas[i] - cost[i];
+                if (tank < 0) { ok = false; break; }
+            }
+            if (ok) return start;
+        }
+        return -1;
+    }
+
+    /** Word Break by memoised search, as an independent model. */
+    static boolean breakableModel(String text, Set<String> words, Boolean[] memo, int i) {
+        if (i == text.length()) return true;
+        if (memo[i] != null) return memo[i];
+        for (int j = i + 1; j <= text.length(); j++)
+            if (words.contains(text.substring(i, j)) && breakableModel(text, words, memo, j))
+                return memo[i] = true;
+        return memo[i] = false;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -2468,6 +2587,169 @@ public class Main {
             }
         }
         check("matches clean-and-reverse on every string up to length 5", palBad, 0);
+
+        System.out.println("LeetCode 131 - Palindrome Partitioning");
+        S131 s131 = new S131();
+        check("aab", groups(s131.partition("aab")), "[[a, a, b], [aa, b]]");
+        check("a", s131.partition("a"), List.of(List.of("a")));
+        check("abc (only single characters)", s131.partition("abc"),
+              List.of(List.of("a", "b", "c")));
+        check("aaa (all 4 cuts are valid)", s131.partition("aaa").size(), 4);
+        int partBad = 0;
+        for (int n = 1; n <= 8; n++) {
+            for (int mask = 0; mask < (1 << n); mask++) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < n; i++) sb.append((mask >> i & 1) == 1 ? 'a' : 'b');
+                String text = sb.toString();
+                for (List<String> partition : s131.partition(text)) {
+                    StringBuilder joined = new StringBuilder();
+                    for (String piece : partition) {
+                        joined.append(piece);
+                        if (!piece.equals(new StringBuilder(piece).reverse().toString())) partBad++;
+                    }
+                    if (!joined.toString().equals(text)) partBad++;
+                }
+            }
+        }
+        check("every piece is a palindrome and the pieces reassemble the input", partBad, 0);
+        int countBad = 0;
+        for (int n = 1; n <= 9; n++)
+            if (s131.partition("a".repeat(n)).size() != (1 << (n - 1))) countBad++;
+        check("all-same string yields 2^(n-1) partitions", countBad, 0);
+
+        System.out.println("LeetCode 133 - Clone Graph");
+        S133 s133 = new S133();
+        int[][][] graphSpecs = {{{2,4},{1,3},{2,4},{1,3}}, {{}}, {{2},{1}}, {{1}}};
+        String[] graphLabels = {"the 4-cycle", "single node", "two nodes", "self loop"};
+        for (int g = 0; g < graphSpecs.length; g++) {
+            Node original = buildGraph(graphSpecs[g]);
+            Node copy = s133.cloneGraph(original);
+            Set<Node> origIds = Collections.newSetFromMap(new IdentityHashMap<>());
+            Set<Node> copyIds = Collections.newSetFromMap(new IdentityHashMap<>());
+            Map<Integer, List<Integer>> origShape = graphShape(original, origIds);
+            Map<Integer, List<Integer>> copyShape = graphShape(copy, copyIds);
+            check(graphLabels[g] + ": same structure", copyShape, origShape);
+            origIds.retainAll(copyIds);
+            check(graphLabels[g] + ": shares no node objects", origIds.size(), 0);
+        }
+        check("null in, null out", s133.cloneGraph(null), null);
+        // Mutating the copy must not touch the original.
+        Node graphOriginal = buildGraph(new int[][]{{2,4},{1,3},{2,4},{1,3}});
+        Node graphCopy = s133.cloneGraph(graphOriginal);
+        graphCopy.val = 999;
+        check("mutating the copy leaves the original alone", graphOriginal.val, 1);
+
+        System.out.println("LeetCode 134 - Gas Station");
+        S134 s134 = new S134();
+        check("[1,2,3,4,5] / [3,4,5,1,2]",
+              s134.canCompleteCircuit(new int[]{1,2,3,4,5}, new int[]{3,4,5,1,2}), 3);
+        check("[2,3,4] / [3,4,3] (impossible)",
+              s134.canCompleteCircuit(new int[]{2,3,4}, new int[]{3,4,3}), -1);
+        check("[5] / [4]", s134.canCompleteCircuit(new int[]{5}, new int[]{4}), 0);
+        check("[4] / [5]", s134.canCompleteCircuit(new int[]{4}, new int[]{5}), -1);
+        check("exact balance", s134.canCompleteCircuit(new int[]{1,2}, new int[]{2,1}), 1);
+        int gasBad = 0;
+        for (int n = 1; n <= 5; n++) {
+            int combos = (int) Math.pow(3, n);
+            for (int gm = 0; gm < combos; gm++) {
+                int[] gas = new int[n];
+                int mm = gm;
+                for (int i = 0; i < n; i++) { gas[i] = mm % 3; mm /= 3; }
+                for (int cm = 0; cm < combos; cm++) {
+                    int[] cost = new int[n];
+                    int nn = cm;
+                    for (int i = 0; i < n; i++) { cost[i] = nn % 3; nn /= 3; }
+                    if (s134.canCompleteCircuit(gas.clone(), cost.clone())
+                            != circuitModel(gas, cost)) gasBad++;
+                }
+            }
+        }
+        check("matches simulation from every start, for all gas/cost up to length 5", gasBad, 0);
+
+        System.out.println("LeetCode 136 - Single Number");
+        S136 s136 = new S136();
+        check("[2,2,1]", s136.singleNumber(new int[]{2,2,1}), 1);
+        check("[4,1,2,1,2]", s136.singleNumber(new int[]{4,1,2,1,2}), 4);
+        check("[1] (single element)", s136.singleNumber(new int[]{1}), 1);
+        check("[-1,-1,-2] (negatives)", s136.singleNumber(new int[]{-1,-1,-2}), -2);
+        check("large values do not overflow",
+              s136.singleNumber(new int[]{Integer.MAX_VALUE, Integer.MIN_VALUE, Integer.MAX_VALUE}),
+              Integer.MIN_VALUE);
+        int xorBad = 0;
+        for (int lone = -3; lone <= 5; lone++) {
+            for (int mask = 0; mask < (1 << 6); mask++) {
+                List<Integer> nums = new ArrayList<>();
+                nums.add(lone);
+                for (int slot = 0; slot < 6; slot++) {
+                    int v = slot - 3;
+                    if (v != lone && (mask >> slot & 1) == 1) { nums.add(v); nums.add(v); }
+                }
+                Collections.shuffle(nums, new Random(mask));   // order must not matter
+                int[] arr = nums.stream().mapToInt(Integer::intValue).toArray();
+                if (s136.singleNumber(arr) != lone) xorBad++;
+            }
+        }
+        check("finds the lone value regardless of order, for many pairings", xorBad, 0);
+
+        System.out.println("LeetCode 138 - Copy List with Random Pointer");
+        S138 s138 = new S138();
+        S138Weave s138w = new S138Weave();
+        int[][][] listSpecs = {
+            {{7,-1},{13,0},{11,4},{10,2},{1,0}},
+            {{1,1},{2,1}},
+            {{3,-1},{3,-1},{3,-1}},
+            {{1,0}},
+            {},
+        };
+        for (int[][] spec : listSpecs) {
+            RNode original = buildRandomList(spec);
+            String before = describeRandom(original);
+            RNode copy = s138.copyRandomList(original);
+            check(spec.length + " nodes: structure preserved", describeRandom(copy), before);
+            Set<RNode> ids = randomListIds(original);
+            ids.retainAll(randomListIds(copy));
+            check(spec.length + " nodes: shares no node objects", ids.size(), 0);
+            check(spec.length + " nodes: original still intact", describeRandom(original), before);
+
+            // The interweaving version must also RESTORE the original list.
+            RNode weaveOriginal = buildRandomList(spec);
+            RNode weaveCopy = s138w.copyRandomListInterweaved(weaveOriginal);
+            check("[interweaved] " + spec.length + " nodes: structure",
+                  describeRandom(weaveCopy), before);
+            check("[interweaved] " + spec.length + " nodes: ORIGINAL restored",
+                  describeRandom(weaveOriginal), before);
+            Set<RNode> weaveIds = randomListIds(weaveOriginal);
+            weaveIds.retainAll(randomListIds(weaveCopy));
+            check("[interweaved] " + spec.length + " nodes: no shared objects", weaveIds.size(), 0);
+        }
+
+        System.out.println("LeetCode 139 - Word Break");
+        S139 s139 = new S139();
+        check("leetcode / [leet, code]", s139.wordBreak("leetcode", List.of("leet","code")), true);
+        check("applepenapple (reuse)", s139.wordBreak("applepenapple", List.of("apple","pen")), true);
+        check("catsandog (false)",
+              s139.wordBreak("catsandog", List.of("cats","dog","sand","and","cat")), false);
+        check("empty string", s139.wordBreak("", List.of("a")), true);
+        check("aaaaaa / [aaaa, aaa] -- kills longest-first greedy",
+              s139.wordBreak("aaaaaa", List.of("aaaa","aaa")), true);
+        check("aaaaa / [aaaa, aaa]", s139.wordBreak("aaaaa", List.of("aaaa","aaa")), false);
+        check("a / [] (empty dictionary)", s139.wordBreak("a", List.of()), false);
+        List<List<String>> dictionaries = List.of(
+            List.of("a","b"), List.of("aa","b"), List.of("ab","a"), List.of("aaa","aa"), List.of("b"));
+        int breakBad = 0;
+        for (int n = 0; n <= 7; n++) {
+            for (int mask = 0; mask < (1 << n); mask++) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < n; i++) sb.append((mask >> i & 1) == 1 ? 'a' : 'b');
+                String text = sb.toString();
+                for (List<String> dict : dictionaries) {
+                    boolean model = breakableModel(text, new HashSet<>(dict),
+                                                   new Boolean[text.length() + 1], 0);
+                    if (s139.wordBreak(text, dict) != model) breakBad++;
+                }
+            }
+        }
+        check("matches memoised search on every a/b string up to length 7", breakBad, 0);
 
         System.out.println();
         if (failures > 0) {
