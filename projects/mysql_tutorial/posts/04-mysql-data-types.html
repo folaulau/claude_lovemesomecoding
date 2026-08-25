@@ -1,0 +1,150 @@
+<p>Every column has a declared type. The type decides what can be stored, how much space it takes,
+how it sorts and compares, and — for two of them — whether your arithmetic is correct. This lesson
+covers the types you will actually use and the handful of choices that cost real money to get
+wrong.</p>
+
+<h2>Integers</h2>
+
+<table>
+  <tr><th>Type</th><th>Bytes</th><th>Signed maximum</th></tr>
+  <tr><td><code>TINYINT</code></td><td>1</td><td>127</td></tr>
+  <tr><td><code>SMALLINT</code></td><td>2</td><td>32,767</td></tr>
+  <tr><td><code>MEDIUMINT</code></td><td>3</td><td>8,388,607</td></tr>
+  <tr><td><code>INT</code></td><td>4</td><td>2,147,483,647</td></tr>
+  <tr><td><code>BIGINT</code></td><td>8</td><td>9,223,372,036,854,775,807</td></tr>
+</table>
+
+<pre class="language-sql"><code class="language-sql">SELECT ~0 &gt;&gt; 33 AS int_max_signed, ~0 &gt;&gt; 32 AS int_max_unsigned, ~0 &gt;&gt; 1 AS bigint_max_signed;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+------------------+---------------------+
+| int_max_signed | int_max_unsigned | bigint_max_signed   |
++----------------+------------------+---------------------+
+|     2147483647 |       4294967295 | 9223372036854775807 |
++----------------+------------------+---------------------+</code></pre>
+
+<p><code>UNSIGNED</code> forbids negatives and doubles the positive range. It is right for a
+quantity that genuinely cannot be negative, and it has a sharp edge: subtracting past zero does not
+give you a negative number, it errors or wraps depending on <code>sql_mode</code>.</p>
+
+<p>Every primary key in the pizza schema is <code>BIGINT</code>. Four extra bytes per row is
+nothing; an <code>INT</code> primary key that reaches 2.1 billion is an outage, because
+<code>AUTO_INCREMENT</code> stops and every insert fails. It happens to real systems, usually to
+the append-only table nobody thought would grow — and note the counter does not reuse gaps, so
+deleted rows do not buy you room. <strong>Use <code>BIGINT</code> for keys.</strong></p>
+
+<p>One thing that is <em>not</em> a size: <code>INT(11)</code>. The number is a display-width hint
+that almost nothing honours, and it is deprecated in MySQL 8. <code>INT(1)</code> and
+<code>INT(11)</code> both store the same four bytes.</p>
+
+<h2>Money: DECIMAL, never FLOAT</h2>
+
+<p><code>FLOAT</code> and <code>DOUBLE</code> are binary floating point. They cannot represent 0.1
+exactly, any more than decimal can write ⅓ exactly, so the errors accumulate:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT CAST(0.1 AS FLOAT) + CAST(0.2 AS FLOAT) AS float_sum,
+       CAST(0.1 AS DECIMAL(10,2)) + CAST(0.2 AS DECIMAL(10,2)) AS decimal_sum;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------------+-------------+
+| float_sum           | decimal_sum |
++---------------------+-------------+
+| 0.30000000447034836 |        0.30 |
++---------------------+-------------+</code></pre>
+
+<p>That is a cent appearing from nowhere, and on a total of a million orders it is a reconciliation
+meeting. Every price column in the pizza schema is <code>DECIMAL(10,2)</code>: exact base-10, ten
+significant digits, two after the point.</p>
+
+<p>Read <code>DECIMAL(p, s)</code> as <em>precision</em> (total digits) and <em>scale</em> (digits
+after the point), so <code>DECIMAL(10,2)</code> holds up to 99,999,999.99. Pick the scale from the
+currency — two for dollars, zero for yen, and four if you are storing unit prices that get
+multiplied before rounding.</p>
+
+<p><code>FLOAT</code> and <code>DOUBLE</code> are the right choice for measurements, where the
+input was approximate anyway: sensor readings, coordinates, percentages. Never for money, and
+never for anything you will compare with <code>=</code>.</p>
+
+<h2>Text: VARCHAR, CHAR and TEXT</h2>
+
+<ul>
+  <li><strong><code>VARCHAR(n)</code></strong> — variable length, up to <em>n</em>
+      <strong>characters</strong>. The default for almost all text.</li>
+  <li><strong><code>CHAR(n)</code></strong> — fixed length, padded with spaces, and the padding is
+      stripped on read. Only worth it when values are genuinely all one length: a country code, or
+      the <code>CHAR(36)</code> UUID column the pizza schema uses.</li>
+  <li><strong><code>TEXT</code></strong> — up to 64 KB, with <code>MEDIUMTEXT</code> and
+      <code>LONGTEXT</code> above it. Stored away from the row, so <code>SELECT *</code> on a table
+      with a <code>TEXT</code> column costs more than you think. It also cannot have a default, and
+      can only be indexed by prefix.</li>
+</ul>
+
+<p><code>VARCHAR(255)</code> is a habit rather than a decision — it comes from an old limit that no
+longer applies. The length is a <strong>constraint</strong>, so choose it to mean something: the
+pizza schema uses <code>VARCHAR(120)</code> for a product name and <code>VARCHAR(180)</code> for an
+email because those are the lengths that are actually reasonable. There is no storage saving in a
+larger limit, but there is no protection in it either.</p>
+
+<h2>utf8mb4, and why plain <code>utf8</code> is a trap</h2>
+
+<p>MySQL's <code>utf8</code> is a <strong>3-byte</strong> encoding that predates the rest of
+Unicode. It cannot store anything outside the Basic Multilingual Plane — which means emoji, and a
+menu is exactly where someone will paste one. <code>utf8mb4</code> is real, 4-byte UTF-8.</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT CHAR_LENGTH('piZZa🍕') AS characters, LENGTH('piZZa🍕') AS bytes;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+-------+
+| characters | bytes |
++------------+-------+
+|          6 |     9 |
++------------+-------+</code></pre>
+
+<p>Six characters, nine bytes — the emoji is four of them on its own.
+<code>VARCHAR(120)</code> means 120 <em>characters</em>, not bytes, so a name column does not
+shrink when someone writes in Japanese.</p>
+
+<p>The <strong>collation</strong> decides sorting and comparison.
+<code>utf8mb4_0900_ai_ci</code> — the MySQL 8 default — is accent-insensitive and case-insensitive,
+which is why <code>WHERE name = 'pepsi'</code> matches <code>Pepsi</code>. Use
+<code>utf8mb4_0900_as_cs</code> when you need case to matter, and set it on the column rather than
+wrapping queries in <code>UPPER()</code>, which costs you the index. See
+<a href="/sql/sql-like">LIKE</a>.</p>
+
+<h2>BOOLEAN is TINYINT(1)</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT TRUE = 1 AS true_is_one, CAST(TRUE AS UNSIGNED) AS true_value;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------------+------------+
+| true_is_one | true_value |
++-------------+------------+
+|           1 |          1 |
++-------------+------------+</code></pre>
+
+<p>MySQL has no real boolean type. <code>BOOLEAN</code> and <code>BOOL</code> are aliases for
+<code>TINYINT(1)</code>, and <code>TRUE</code>/<code>FALSE</code> are aliases for 1 and 0 — which
+is why <code>DESCRIBE product</code> reports <code>tinyint(1)</code> for
+<code>active</code> and <code>deleted</code>. Write <code>BOOLEAN</code> anyway; it documents
+intent. Just be aware the column will accept 2.</p>
+
+<h2>ENUM, and why the pizza schema does not use it</h2>
+
+<p><code>ENUM('PIZZA','DRINK')</code> stores a small integer and constrains the values, which sounds
+ideal. The pizza schema uses <code>VARCHAR(20)</code> with a comment instead, and that is a
+deliberate trade:</p>
+
+<ul>
+  <li>Adding a value is an <code>ALTER TABLE</code> — a schema migration to add a menu category.</li>
+  <li>The order of the values is their sort order, so inserting one in the middle reorders
+      existing queries' results.</li>
+  <li>Application enums and database enums drift, and the database wins at the worst moment.</li>
+</ul>
+
+<p>Use <code>ENUM</code> for a genuinely closed set that will not change — a weekday. For anything
+a product manager might extend, use <code>VARCHAR</code> with a
+<code>CHECK</code> constraint, or a lookup table.</p>
+
+<h2>Choosing, in one paragraph</h2>
+
+<p>Keys <code>BIGINT</code>. Money <code>DECIMAL</code>. Text <code>VARCHAR</code> with a length
+that means something, on <code>utf8mb4</code>. Times <code>DATETIME(6)</code> — see
+<a href="/sql/sql-date-types">date and time types</a>. Flags <code>BOOLEAN</code>. Add
+<code>NOT NULL</code> unless you can say what NULL <em>means</em> for that column, and reach for
+<code>FLOAT</code> only when the number was an approximation to begin with.</p>

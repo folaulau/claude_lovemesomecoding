@@ -107,6 +107,13 @@ for _status, _value in _R["orders_by_status"].items():
 # Round spellings that are honest shorthand for the exact figure.
 LAB_NUMBERS |= {"400,000", "400k", "1,000,000", "1m", "50,000", "80,000"}
 
+# The subset that is a RESULT rather than a table size. A post may say "a copy with
+# 400,000 orders" anywhere — that is describing the lab. Quoting how many of them are
+# CANCELLED is a query result, and only a LAB_POST has that re-derived.
+LAB_RESULT_NUMBERS = set()
+for _status, _value in _R["orders_by_status"].items():
+    LAB_RESULT_NUMBERS |= {f"{_value:,}", str(_value)}
+
 # A number with a thousands separator, in prose, IN THE SAME SENTENCE as the name of a lab table.
 #
 # Both halves are needed. Small unseparated integers are everywhere in SQL ("LIMIT 10", "3308") so
@@ -116,7 +123,9 @@ LAB_NUMBERS |= {"400,000", "400k", "1,000,000", "1m", "50,000", "80,000"}
 LAB_TABLES = r"(?:orders?|items?|users?|toppings?|customers?)"
 BIG_NUMBER = re.compile(r"\b(\d{1,3}(?:,\d{3})+)\b(?=[^.!?]*\b" + LAB_TABLES + r"\b)")
 
-ALLOWED_NON_ASCII = set("—–’‘“”…×→±⚠️✓✗‹›°éíóúñ§")
+# 🍕 is deliberate: mysql-data-types uses it to show that MySQL's older `utf8` is a
+# 3-byte encoding that cannot store an emoji, which is the whole reason utf8mb4 exists.
+ALLOWED_NON_ASCII = set("—–’‘“”…×→±⚠️✓✗‹›°éíóúñ§🍕⅓")
 
 
 def prose_and_code_words(result: dict) -> tuple[int, int]:
@@ -250,11 +259,15 @@ for entry in manifest.POSTS:
                     f"{entry['slug']}: quotes the figure {number} — not one of "
                     "manifest.LAB_ROWS. If it came from a query, add it; if not, it is invented.")
     else:
+        # A post outside LAB_POSTS may DESCRIBE the lab's size — "a copy with 400,000
+        # orders" is context, and those figures are documented in LAB_ROWS. What it must
+        # not do is quote a lab-derived RESULT (a status breakdown, a group count), since
+        # check_sql.py never runs it against pizza_lab and nothing would catch a wrong one.
         for number in set(BIG_NUMBER.findall(TAGS.sub(" ", prose_html))):
-            if number in LAB_NUMBERS:
+            if number in LAB_RESULT_NUMBERS:
                 warnings.append(
-                    f"{entry['slug']}: quotes the lab figure {number} but is not in LAB_POSTS, "
-                    "so check_sql.py never runs it against pizza_lab.")
+                    f"{entry['slug']}: quotes the lab-derived figure {number} but is not in "
+                    "LAB_POSTS, so check_sql.py never re-derives it.")
 
     # (7) query plans only where they are verified.
     #

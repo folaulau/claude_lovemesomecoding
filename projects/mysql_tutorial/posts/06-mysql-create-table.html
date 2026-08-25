@@ -1,0 +1,195 @@
+<p><code>CREATE TABLE</code> is where you decide what your data is allowed to be. Every constraint
+you declare here is a rule the database enforces for every writer forever — application code, a
+migration script, someone at the <code>mysql&gt;</code> prompt at 2am. Constraints in application
+code only apply to the writers that go through that code.</p>
+
+<h2>A table, with its reasoning</h2>
+
+<p>This is the pizza schema's <code>product</code> table, near enough as written:</p>
+
+<pre class="language-sql"><code class="language-sql">-- unavailable: `product` already exists in the demo database. This is its
+-- definition, shown to be read rather than run.
+CREATE TABLE product (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name          VARCHAR(120) NOT NULL,
+    description   VARCHAR(500),
+    type          VARCHAR(20)  NOT NULL COMMENT 'PIZZA or DRINK',
+    image_url     VARCHAR(500),
+    active        BOOLEAN      NOT NULL DEFAULT TRUE,
+    display_order INT          NOT NULL DEFAULT 0,
+    created_at    DATETIME(6)  NOT NULL,
+    CONSTRAINT uk_product_name UNIQUE (name)
+);
+
+CREATE INDEX idx_product_type_active ON product (type, active);</code></pre>
+
+<p>Reading it: <code>id</code> is a surrogate key — a number with no business meaning.
+<code>AUTO_INCREMENT</code> assigns it. <code>NOT NULL</code> on <code>name</code> and
+<code>type</code> says those are required; <code>description</code> is nullable because a product
+may genuinely not have one. <code>DEFAULT</code> supplies a value when the insert omits the column.
+<code>COMMENT</code> stores documentation in the schema itself, where
+<code>SHOW CREATE TABLE</code> will show it to whoever inherits this.</p>
+
+<h2>Primary keys</h2>
+
+<p>Every table should have one. In InnoDB the primary key is the <strong>clustered index</strong> —
+the rows are physically stored in its order — so the choice has consequences beyond identity:</p>
+
+<ul>
+  <li><strong>Keep it small.</strong> Every secondary index stores the primary key as its pointer,
+      so a wide key inflates every other index on the table.</li>
+  <li><strong>Keep it ascending.</strong> <code>AUTO_INCREMENT</code> appends to the end of the
+      B-tree. A random <code>UUID</code> primary key inserts into the middle, causing page splits
+      and fragmentation.</li>
+  <li>Declare one explicitly. Without it InnoDB invents a hidden 6-byte key you cannot use.</li>
+</ul>
+
+<p>The pizza schema wants UUIDs in its API — sequential ids let anyone walk
+<code>/api/orders/1, /2, /3</code> and read other people's orders — so it carries
+<strong>both</strong>: <code>id BIGINT</code> as the key and target of every foreign key, and
+<code>public_id CHAR(36)</code> as the only identifier the API exposes. That is the standard answer
+to wanting unguessable ids without paying for a random clustered key.</p>
+
+<h2>UNIQUE</h2>
+
+<p>Two small tables to demonstrate on — a category, and an item belonging to it:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE demo_cat (
+    id   BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(60) NOT NULL,
+    CONSTRAINT uk_demo_cat_name UNIQUE (name)
+);
+
+CREATE TABLE demo_item (
+    id     BIGINT         AUTO_INCREMENT PRIMARY KEY,
+    cat_id BIGINT         NOT NULL,
+    price  DECIMAL(10, 2) NOT NULL,
+    CONSTRAINT fk_demo_item_cat FOREIGN KEY (cat_id) REFERENCES demo_cat (id) ON DELETE CASCADE,
+    CONSTRAINT ck_demo_item_price CHECK (price &gt;= 0)
+);
+
+INSERT INTO demo_cat (name) VALUES ('Pizza');</code></pre>
+
+<p>Insert that name a second time and the constraint stops you:</p>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1062 (23000): Duplicate entry 'Pizza' for key 'demo_cat.uk_demo_cat_name'
+INSERT INTO demo_cat (name) VALUES ('Pizza');</code></pre>
+
+<p>A unique constraint is the only way to actually prevent duplicates. "Check whether it exists,
+then insert" is a race: two requests can both check, both find nothing, and both insert. The
+database is the only place that can make that atomic.</p>
+
+<p>Name your constraints (<code>uk_product_name</code>). The name appears in the error, which is
+the difference between an application logging "duplicate entry for key 2" and something you can
+turn into a message for a user. A <code>UNIQUE</code> constraint creates an index, so it also
+speeds up lookups on that column. And note that NULLs are exempt — several rows may have a NULL in
+a unique column, because NULLs are not equal to each other.</p>
+
+<h2>Foreign keys</h2>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails
+INSERT INTO demo_item (cat_id, price) VALUES (999, 5.00);</code></pre>
+
+<p>That is referential integrity: the database refuses to create a row pointing at a category that
+does not exist. The interesting part is what happens when the parent is deleted, and the pizza
+schema deliberately answers it <strong>both ways</strong>:</p>
+
+<table>
+  <tr><th>Clause</th><th>On parent delete</th><th>Used for</th></tr>
+  <tr><td><code>ON DELETE CASCADE</code></td><td>children are deleted too</td>
+      <td><code>order_item</code> → <code>customer_order</code>. A line item has no meaning
+          without its order.</td></tr>
+  <tr><td><code>ON DELETE SET NULL</code></td><td>the column becomes NULL</td>
+      <td><code>order_item.product_id</code> → <code>product</code>. Delete a product and the
+          historical order survives — it kept a snapshot of the name and price.</td></tr>
+  <tr><td><code>ON DELETE RESTRICT</code></td><td>the delete is refused</td>
+      <td>the default, and the safe choice when you are unsure.</td></tr>
+</table>
+
+<p>Cascade is powerful and worth respecting: one <code>DELETE</code> can silently remove a great
+deal. It works because the pizza schema's line items genuinely belong to their order and nothing
+else references them.</p>
+
+<pre class="language-sql"><code class="language-sql">INSERT INTO demo_item (cat_id, price) VALUES (1, 9.99), (1, 12.99);
+SELECT COUNT(*) AS items_before FROM demo_item;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+
+| items_before |
++--------------+
+|            2 |
++--------------+</code></pre>
+
+<pre class="language-sql"><code class="language-sql">DELETE FROM demo_cat WHERE id = 1;
+SELECT COUNT(*) AS items_after FROM demo_item;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------------+
+| items_after |
++-------------+
+|           0 |
++-------------+</code></pre>
+
+<p>One row deleted, two more went with it. Foreign keys also need the referenced column to be
+indexed, and MySQL creates an index on the child column automatically if you have not.</p>
+
+<h2>NOT NULL and CHECK</h2>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 1048 (23000): Column 'name' cannot be null
+INSERT INTO demo_cat (name) VALUES (NULL);</code></pre>
+
+<pre class="language-sql"><code class="language-sql">-- ERROR 3819 (HY000): Check constraint 'ck_demo_item_price' is violated.
+INSERT INTO demo_item (cat_id, price) VALUES (1, -1.00);</code></pre>
+
+<p><code>CHECK</code> constraints are <strong>enforced from MySQL 8.0.16</strong> — before that
+they parsed and did nothing, which is why older advice says not to bother. They are a good fit for
+things a type cannot express: a non-negative price, an end date after a start date, a status
+restricted to a known list.</p>
+
+<p>Default to <code>NOT NULL</code>. Every nullable column is a branch every query has to handle;
+add it only when you can say what NULL <em>means</em> there. See
+<a href="/sql/sql-isnull">NULL and IS NULL</a>.</p>
+
+<h2>ALTER TABLE</h2>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE demo_cat ADD COLUMN sort_order INT NOT NULL DEFAULT 0;
+ALTER TABLE demo_cat MODIFY COLUMN name VARCHAR(100) NOT NULL;
+ALTER TABLE demo_cat ADD CONSTRAINT uk_demo_cat_sort UNIQUE (sort_order);</code></pre>
+
+<p><code>MODIFY</code> takes the <strong>whole</strong> new definition and silently drops anything
+you leave out — omit <code>NOT NULL</code> and the column becomes nullable. <code>CHANGE</code>
+does the same and also renames, so it needs the old and new name both. This is a good reason to
+keep migrations in files and review them.</p>
+
+<p>Adding a column with a default is instant in MySQL 8 (an <code>INSTANT</code> operation that
+only touches metadata). Many other changes are not: they copy the whole table. On a large table
+that means a long operation holding locks — see
+<a href="/sql/mysql-run-query-in-production">running queries in production</a> before you run one
+against something real.</p>
+
+<h2>Reading a table back</h2>
+
+<pre class="language-sql"><code class="language-sql">DESCRIBE product;             -- the columns, briefly
+SHOW CREATE TABLE product;    -- the full definition, constraints and all
+SHOW INDEX FROM product;      -- what is indexed</code></pre>
+
+<p><code>SHOW CREATE TABLE</code> is the one to reach for: it gives you exactly what MySQL would
+need to recreate the table, including the constraints and their names.</p>
+
+<h2>Migrations, not ad-hoc DDL</h2>
+
+<p>The pizza schema is not maintained by hand — it is nine ordered migration files applied by
+Liquibase, each with a rollback. That matters because the schema has to be recreated identically on
+every developer's machine, in CI, and in production, and because "what changed and when" needs an
+answer. Flyway is the other common choice; so is Django or Rails' built-in system. Pick one before
+your second environment exists.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Constraints in the database apply to every writer; constraints in code do not.</li>
+  <li><code>BIGINT AUTO_INCREMENT</code> primary key, small and ascending. Add a UUID column if the
+      API needs unguessable ids.</li>
+  <li>Name your constraints — the name is what the error message gives you.</li>
+  <li><code>ON DELETE</code> is a real decision: <code>CASCADE</code>, <code>SET NULL</code> or
+      <code>RESTRICT</code>.</li>
+  <li><code>MODIFY</code> replaces the entire column definition. Repeat every clause.</li>
+</ul>

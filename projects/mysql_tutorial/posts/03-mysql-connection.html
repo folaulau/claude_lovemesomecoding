@@ -1,0 +1,161 @@
+<p>Typing into the <code>mysql</code> client is one connection. An application is a different
+problem: it opens many, holds them open, shares them between threads, and has to survive the
+database restarting. This lesson covers the connection URL, pooling, and the timeouts that turn
+into failures overnight rather than during your tests.</p>
+
+<h2>Reading a JDBC URL</h2>
+
+<p>This is the demo application's real one:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.datasource.url=jdbc:mysql://127.0.0.1:3306/pizza?useSSL=false&amp;allowPublicKeyRetrieval=true&amp;connectionTimeZone=LOCAL&amp;preserveInstants=false
+spring.datasource.username=root
+spring.datasource.password=</code></pre>
+
+<p>Piece by piece: <code>jdbc:mysql://</code> selects the driver, then host, port, and
+<code>/pizza</code> — the <strong>default database</strong> for the session, which is what lets
+queries say <code>product</code> instead of <code>pizza.product</code>. Everything after
+<code>?</code> is driver configuration.</p>
+
+<table>
+  <tr><th>Parameter</th><th>What it does</th></tr>
+  <tr><td><code>useSSL=false</code></td>
+      <td>Turns off TLS. Fine to a container on your own machine. <strong>Not fine anywhere
+          else</strong> — over a network this sends credentials and data in clear text.</td></tr>
+  <tr><td><code>allowPublicKeyRetrieval=true</code></td>
+      <td>Needed when <code>caching_sha2_password</code> (the MySQL 8 default) authenticates over
+          an unencrypted connection. It lets the client fetch the server's public key. With TLS on
+          you do not need it.</td></tr>
+  <tr><td><code>connectionTimeZone</code> / <code>preserveInstants</code></td>
+      <td>Controls whether the driver converts date-times between zones. See below.</td></tr>
+</table>
+
+<h2>The time zone parameter is not cosmetic</h2>
+
+<p>This is the one to read twice, because it corrupts data silently. The comment in the demo app's
+configuration records what happened:</p>
+
+<pre class="language-properties"><code class="language-properties"># connectionTimeZone=LOCAL + preserveInstants=false stop the MySQL driver converting
+# DATETIME values between zones. With LocalDateTime (which has no zone) any conversion
+# is silent corruption: serverTimezone=UTC made a row stored as 2026-01-01 00:00 read
+# back as 2025-12-31 17:00.</code></pre>
+
+<p>A <code>DATETIME</code> column stores wall-clock time with <strong>no zone attached</strong>, and
+Java's <code>LocalDateTime</code> has no zone either. That is a consistent pairing — until the
+driver is told a zone and starts "helpfully" converting between it and the JVM's. Seven hours
+appear or disappear from every timestamp, no error is raised, and the values still look like
+plausible dates.</p>
+
+<p>The rule: if you store zone-less <code>DATETIME</code> and map it to
+<code>LocalDateTime</code>, tell the driver not to convert. If you genuinely need instants, use
+<code>TIMESTAMP</code> with <code>Instant</code>/<code>OffsetDateTime</code> and let the conversion
+happen deliberately. What you must not do is mix the two. See
+<a href="/sql/sql-date-types">date and time types</a>.</p>
+
+<p>The server here reports <code>@@time_zone</code> as <code>SYSTEM</code> and
+<code>@@system_time_zone</code> as <code>UTC</code>. Check both on any server you did not configure
+yourself:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT @@time_zone, @@system_time_zone;</code></pre>
+
+<h2>Connection pooling</h2>
+
+<p>Opening a MySQL connection means a TCP handshake plus authentication — a few milliseconds, which
+is enormous next to a query that takes under one. A <strong>pool</strong> opens some connections up
+front and lends them out. Spring Boot ships HikariCP and uses it by default; you configure it
+rather than install it:</p>
+
+<pre class="language-properties"><code class="language-properties">spring.datasource.hikari.maximum-pool-size=10
+spring.datasource.hikari.minimum-idle=10
+spring.datasource.hikari.connection-timeout=30000
+spring.datasource.hikari.max-lifetime=1740000
+spring.datasource.hikari.idle-timeout=600000</code></pre>
+
+<p><strong>Bigger is not better.</strong> The pool size is a limit on how much work the database
+does at once, and a database has a fixed number of cores and disks. Past that point, more
+concurrent queries means each one is slower and none finishes sooner — you have moved the queue
+from your application into the database, where it is harder to see and it holds locks while it
+waits.</p>
+
+<p>Start around <code>(2 × cores) + effective spindle count</code> — often 10 to 20, not 200 — then
+measure. And count every instance: ten application containers with a pool of 20 each is 200
+connections arriving at one server.</p>
+
+<p>Setting <code>minimum-idle</code> equal to <code>maximum-pool-size</code> gives a fixed-size
+pool. That is usually what you want in a server: it avoids a latency spike when traffic arrives and
+the pool has to grow.</p>
+
+<h2>The timeouts, and which failure each one causes</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT @@max_connections, @@wait_timeout, @@connect_timeout;</code></pre>
+
+<table>
+  <tr><th>Setting</th><th>Default</th><th>What it governs</th></tr>
+  <tr><td><code>max_connections</code></td><td>151</td>
+      <td>Server-wide cap. Exceed it and new connections are refused with <em>Too many
+          connections</em> — including the one you need to log in and investigate.</td></tr>
+  <tr><td><code>wait_timeout</code></td><td>28800 (8 hours)</td>
+      <td>How long the server keeps an <strong>idle</strong> connection before closing it.</td></tr>
+  <tr><td><code>connect_timeout</code></td><td>10 seconds</td>
+      <td>How long the server waits for a client to complete the handshake.</td></tr>
+</table>
+
+<p><code>wait_timeout</code> is the one that produces the classic overnight bug. The server closes
+an idle connection; the pool does not notice, because nothing told it; the first request next
+morning borrows that dead connection and fails with <em>Communications link failure</em>. Then it
+works fine all day, because everything is warm.</p>
+
+<p>The fix is <strong>on the pool, not the server</strong>. Keep the pool's
+<code>max-lifetime</code> comfortably below the server's <code>wait_timeout</code> so connections
+are retired before the server kills them — 1,740,000 ms (29 minutes) above is deliberately under
+the common 30-minute idle timeout on managed databases and load balancers. Raising
+<code>wait_timeout</code> instead just moves the failure to whichever middlebox has the shortest
+idle timeout.</p>
+
+<h2>Reserve a connection for yourself</h2>
+
+<p>MySQL keeps one extra slot beyond <code>max_connections</code> for an account with the
+<code>CONNECTION_ADMIN</code> privilege (or the older <code>SUPER</code>). That is what makes it
+possible to log in and run <code>SHOW PROCESSLIST</code> when the application has consumed
+everything else. It is a good reason for your admin account to be a different account from the one
+the application uses — see
+<a href="/sql/mysql-users-and-privileges">users and privileges</a> and
+<a href="/sql/mysql-run-query-in-production">running queries in production</a>.</p>
+
+<h2>Where connections actually leak</h2>
+
+<p>A pool only helps if connections come back. In modern Java the pattern that guarantees it is
+try-with-resources:</p>
+
+<pre class="language-java"><code class="language-java">try (Connection conn = dataSource.getConnection();
+     PreparedStatement ps = conn.prepareStatement(
+         "SELECT name FROM product WHERE type = ?")) {
+    ps.setString(1, "PIZZA");
+    try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) {
+            System.out.println(rs.getString("name"));
+        }
+    }
+}</code></pre>
+
+<p>Every one of those is closed even if the query throws. Miss one — an early
+<code>return</code>, an exception between <code>getConnection()</code> and the
+<code>try</code> — and that connection is gone until <code>max-lifetime</code> reclaims it. A pool
+that exhausts itself slowly under load, and recovers after a restart, is almost always a leak
+rather than a sizing problem.</p>
+
+<p>The <code>?</code> placeholder matters for a second reason: a <code>PreparedStatement</code>
+sends the value separately from the SQL, so it cannot be read as SQL. String-concatenating user
+input into a query is how SQL injection happens, and no amount of escaping is as reliable as not
+doing it.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>useSSL=false</code> belongs on your laptop and nowhere else.</li>
+  <li>Zone-less <code>DATETIME</code> plus a driver that converts zones is silent data
+      corruption.</li>
+  <li>Size the pool to what the database can do concurrently, and count every instance.</li>
+  <li>Keep pool <code>max-lifetime</code> under the server's <code>wait_timeout</code>, or you get
+      a failure every morning.</li>
+  <li>Close connections with try-with-resources; use placeholders, never concatenation.</li>
+</ul>

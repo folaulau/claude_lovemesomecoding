@@ -214,8 +214,15 @@ def split_chunks(out: str) -> dict[int, str]:
 
 # ---------------------------------------------------------------- scratch databases
 def clone_pizza(scratch: str) -> None:
-    """A full copy of the demo database. Small enough that this is cheap."""
-    tables = ["crust", "topping", "product", "product_size", "app_user",
+    """A full copy of the demo database. Small enough that this is cheap.
+
+    ⚠️ The Liquibase bookkeeping tables are copied too, and deliberately. They are not
+    interesting, but a post may quote `SHOW TABLES` — and if the clone's table list
+    differs from `pizza`'s, output captured while authoring against `pizza` will not
+    match what the checker sees. The clone has to be faithful, not tidy.
+    """
+    tables = ["DATABASECHANGELOG", "DATABASECHANGELOGLOCK",
+              "crust", "topping", "product", "product_size", "app_user",
               "customer_order", "order_item", "order_item_topping",
               "cart", "cart_item", "cart_item_topping",
               "user_address", "user_payment_method"]
@@ -387,6 +394,19 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
                 f"Add a unique tiebreaker (the primary key will do).\n"
                 f"  --- run 1 ---\n{_indent(actual)}\n"
                 f"  --- run 2 ---\n{_indent(second.get(i, ''))}")
+            continue
+
+        # `SHOW TABLES` renders its column header as `Tables_in_<database>`. A non-lab post
+        # runs against a scratch clone whose name is not `pizza`, so both the header text
+        # AND the table's column width differ — it can never match, and the diff looks like
+        # a content bug rather than a structural one. Say what it is.
+        if "Tables_in_" in expected and scratch:
+            failures.append(
+                f"{slug} block {i}: quotes `SHOW TABLES` output, which embeds the database "
+                f"name in its header (`Tables_in_pizza`). This post runs against the scratch "
+                f"clone `{scratch}`, so the header and the column width can never match.\n"
+                f"    Show the command without quoting its output, or use\n"
+                f"    SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='pizza';")
             continue
 
         if _normalise(expected) != _normalise(actual):

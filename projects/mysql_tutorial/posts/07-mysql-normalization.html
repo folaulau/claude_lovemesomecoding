@@ -1,0 +1,167 @@
+<p>Normalization is a set of rules for deciding which columns belong in which table. The goal is
+narrow: <strong>store each fact exactly once</strong>. Everything else — no update anomalies, no
+contradictory rows — follows from that.</p>
+
+<p>This lesson explains the three forms that matter using the pizza schema, then looks at the two
+places that schema deliberately breaks the rules and why each is right.</p>
+
+<h2>What goes wrong without it</h2>
+
+<p>Imagine orders stored in one flat table:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">order_id | customer      | email               | item_1          | item_1_price | item_2 | item_2_price
+---------+---------------+---------------------+-----------------+--------------+--------+-------------
+1        | Demo Customer | customer@pizza.test | Pepperoni Pizza | 16.99        | Pepsi  | 2.99
+3        | Demo Customer | customer@pizza.test | Meat Lovers     | 20.99        | NULL   | NULL</code></pre>
+
+<p>Three problems, and they have names:</p>
+
+<ul>
+  <li><strong>Update anomaly.</strong> The customer's email is stored on every order. Change it and
+      you must find every row — miss one and the database now holds two different emails for one
+      person, with nothing to say which is right.</li>
+  <li><strong>Insert anomaly.</strong> You cannot record a customer who has not ordered yet; there
+      is no row to put them in.</li>
+  <li><strong>Delete anomaly.</strong> Delete their last order and the customer disappears.</li>
+</ul>
+
+<p>And a fourth, practical one: <code>item_1</code>, <code>item_2</code>… caps the order at however
+many columns you added, and "which orders contained a Pepsi" becomes a query across every one of
+them.</p>
+
+<h2>First normal form: one value per cell</h2>
+
+<p>No repeating groups, no comma-separated lists. <code>item_1</code>/<code>item_2</code> is the
+violation, and the fix is a second table with one row per item:</p>
+
+<pre class="language-sql"><code class="language-sql">customer_order (id, customer_name, ...)
+order_item     (id, order_id, product_name, quantity, unit_price)</code></pre>
+
+<p>Now an order can have any number of items, and each is a row you can filter, join and aggregate.
+Almost every real "we cannot query this" problem is a 1NF violation — a column holding
+<code>"pepperoni,mushrooms,olives"</code> is the classic.</p>
+
+<h2>Second normal form: depend on the whole key</h2>
+
+<p>2NF only bites when the primary key is made of several columns. If a table is keyed on
+(<code>order_id</code>, <code>product_id</code>) and carries a <code>product_name</code> column,
+that name depends on <code>product_id</code> alone — half the key — so it is duplicated across every
+order containing that product.</p>
+
+<p>The fix is to move it to the table where its key is the whole key: <code>product</code>. With a
+single-column key, 2NF is automatic.</p>
+
+<h2>Third normal form: no column depending on another non-key column</h2>
+
+<p>This is the one you actually apply. Suppose <code>customer_order</code> carried:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">customer_order (id, ..., user_id, user_email, user_full_name)</code></pre>
+
+<p><code>user_email</code> does not depend on the order — it depends on <code>user_id</code>, which
+is not the key. So it is stored once per order rather than once per user, and every update anomaly
+above comes back. 3NF says move it to <code>app_user</code> and keep only the foreign key.</p>
+
+<p>The informal version is worth memorising: <strong>every non-key column depends on the key, the
+whole key, and nothing but the key.</strong></p>
+
+<h2>Where price lives, and why</h2>
+
+<p>The pizza menu is a good worked example. Price does not live on <code>product</code>, because a
+product does not have <em>a</em> price — it has one per size. Putting
+<code>small_price</code>, <code>medium_price</code>, <code>large_price</code> on
+<code>product</code> is the 1NF mistake again, wearing a disguise: adding a fourth size means an
+<code>ALTER TABLE</code>.</p>
+
+<pre class="language-sql"><code class="language-sql">product      (id, name, description, type, active)
+product_size (id, product_id, size, price)          -- UNIQUE (product_id, size)</code></pre>
+
+<p>The unique constraint on (<code>product_id</code>, <code>size</code>) is what makes it a real
+model rather than a bag of rows: it says a product has at most one price per size. A new size is a
+row, not a migration.</p>
+
+<h2>Denormalizing on purpose, twice</h2>
+
+<p>The pizza schema breaks 3NF deliberately in one place and refuses to in another, and the
+contrast is the whole point.</p>
+
+<h3>order_item snapshots the price</h3>
+
+<p><code>order_item</code> stores <code>product_name</code>, <code>crust_name</code> and
+<code>unit_price</code> even though all three could be joined from the catalogue. That looks like
+exactly the redundancy 3NF forbids. Watch what it buys:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT i.product_name, i.unit_price AS paid, ps.price AS menu_price_now
+FROM   order_item i
+JOIN   product p       ON p.id = i.product_id
+JOIN   product_size ps ON ps.product_id = p.id AND ps.size = i.size
+WHERE  i.order_id = 1
+ORDER  BY i.id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+-------+----------------+
+| product_name    | paid  | menu_price_now |
++-----------------+-------+----------------+
+| Pepperoni Pizza | 16.99 |          16.99 |
+| Pepsi           |  2.99 |           2.99 |
++-----------------+-------+----------------+</code></pre>
+
+<p>Now the menu price goes up by three dollars:</p>
+
+<pre class="language-sql"><code class="language-sql">UPDATE product_size SET price = price + 3.00 WHERE product_id = 1;
+
+SELECT i.product_name, i.unit_price AS paid, ps.price AS menu_price_now
+FROM   order_item i
+JOIN   product p       ON p.id = i.product_id
+JOIN   product_size ps ON ps.product_id = p.id AND ps.size = i.size
+WHERE  i.order_id = 1
+ORDER  BY i.id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------+-------+----------------+
+| product_name    | paid  | menu_price_now |
++-----------------+-------+----------------+
+| Pepperoni Pizza | 16.99 |          19.99 |
+| Pepsi           |  2.99 |           2.99 |
++-----------------+-------+----------------+</code></pre>
+
+<p>The customer still paid 16.99. Without the snapshot, editing the menu would silently rewrite
+history — last month's revenue report would change, and a receipt would disagree with the card
+statement.</p>
+
+<p>This is not really a normalization violation at all, once you name the fact correctly.
+<code>unit_price</code> is not "the product's price"; it is <strong>the price this customer was
+charged</strong>, which is a fact about the order and is stored exactly once. The same reasoning
+explains why <code>product_id</code> is nullable with <code>ON DELETE SET NULL</code>: delete the
+product and the order still knows what was bought.</p>
+
+<h3>cart stores no prices at all</h3>
+
+<p><code>cart_item</code> records only <em>which</em> product, size and crust were chosen. Every
+figure is recomputed from the catalogue when the cart is read.</p>
+
+<p>Opposite decision, same principle. A cart is an <strong>intention</strong>, not a record — a
+cart left overnight should pick up today's prices rather than quietly honouring yesterday's, and
+there should be exactly one source of pricing truth. An order is a historical record and must not
+move.</p>
+
+<p>The question to ask is not "is this normalized" but <strong>"which fact am I storing, and does
+it change when the source changes?"</strong> If it should move, join to it. If it should not,
+snapshot it.</p>
+
+<h2>When to stop</h2>
+
+<p>3NF is the working target. Higher forms exist and are rarely the reason a schema is in trouble.
+Denormalize for performance only after measuring — a join to a well-indexed table is cheap, and the
+usual reason to duplicate data is a counter or total that would otherwise need an expensive
+aggregate.</p>
+
+<p>If you do, write down what keeps the copy in step: a trigger, a scheduled job, application code.
+An undocumented duplicate is a bug waiting for the day the two copies disagree.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>Store each fact once. The anomalies follow from not doing it.</li>
+  <li>1NF: one value per cell — a comma-separated list is a table you have not made yet.</li>
+  <li>3NF: every non-key column depends on the key, the whole key, and nothing but the key.</li>
+  <li>Snapshot a value when it is a fact about <em>this record</em>; join when it should follow the
+      source.</li>
+</ul>

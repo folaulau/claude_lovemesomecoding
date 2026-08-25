@@ -1,0 +1,159 @@
+<p>MySQL has five date and time types. Picking between them is mostly one decision — whether the
+value should move when the time zone changes — and getting that decision wrong is the kind of bug
+that shifts every timestamp in your database by a few hours without raising an error.</p>
+
+<h2>The five types</h2>
+
+<table>
+  <tr><th>Type</th><th>Range</th><th>Bytes</th><th>Zone-aware</th></tr>
+  <tr><td><code>DATE</code></td><td>1000-01-01 to 9999-12-31</td><td>3</td><td>no</td></tr>
+  <tr><td><code>TIME</code></td><td>-838:59:59 to 838:59:59</td><td>3</td><td>no</td></tr>
+  <tr><td><code>DATETIME</code></td><td>1000-01-01 to 9999-12-31</td><td>5+</td><td><strong>no</strong></td></tr>
+  <tr><td><code>TIMESTAMP</code></td><td>1970-01-01 to 2038-01-19</td><td>4+</td><td><strong>yes</strong></td></tr>
+  <tr><td><code>YEAR</code></td><td>1901 to 2155</td><td>1</td><td>no</td></tr>
+</table>
+
+<pre class="language-sql"><code class="language-sql">SELECT CAST('2024-03-15 14:30:45.123456' AS DATETIME(6)) AS dt,
+       CAST('2024-03-15' AS DATE) AS d,
+       CAST('14:30:45' AS TIME) AS t;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------------------+------------+----------+
+| dt                         | d          | t        |
++----------------------------+------------+----------+
+| 2024-03-15 14:30:45.123456 | 2024-03-15 | 14:30:45 |
++----------------------------+------------+----------+</code></pre>
+
+<p><code>TIME</code> is worth a second look: its range is ±838 hours, well beyond a clock. It
+represents a <strong>duration</strong> as readily as a time of day.</p>
+
+<h2>DATETIME versus TIMESTAMP</h2>
+
+<p>This is the whole lesson. <code>DATETIME</code> stores the literal wall-clock value you gave it
+and hands it back unchanged. <code>TIMESTAMP</code> converts to UTC on the way in and back to the
+session's time zone on the way out.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE tz_demo (dt DATETIME, ts TIMESTAMP NULL);
+SET time_zone = '+00:00';
+INSERT INTO tz_demo VALUES ('2024-06-01 12:00:00', '2024-06-01 12:00:00');
+SELECT 'stored at +00:00' AS note, dt, ts FROM tz_demo;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------------+---------------------+---------------------+
+| note             | dt                  | ts                  |
++------------------+---------------------+---------------------+
+| stored at +00:00 | 2024-06-01 12:00:00 | 2024-06-01 12:00:00 |
++------------------+---------------------+---------------------+</code></pre>
+
+<p>Identical so far. Now read the same row from a session in a different zone — nothing has been
+written, only the reader has moved:</p>
+
+<pre class="language-sql"><code class="language-sql">SET time_zone = '-07:00';
+SELECT 'read at -07:00' AS note, dt, ts FROM tz_demo;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+---------------------+---------------------+
+| note           | dt                  | ts                  |
++----------------+---------------------+---------------------+
+| read at -07:00 | 2024-06-01 12:00:00 | 2024-06-01 05:00:00 |
++----------------+---------------------+---------------------+</code></pre>
+
+<p><code>DATETIME</code> is still noon. <code>TIMESTAMP</code> is 05:00, because 12:00 UTC
+<em>is</em> 05:00 at -07:00. Both are correct; they answer different questions:</p>
+
+<ul>
+  <li><strong>Use <code>TIMESTAMP</code></strong> for a moment in time — when something happened.
+      Two people in different countries should agree it was the same instant.</li>
+  <li><strong>Use <code>DATETIME</code></strong> for a wall-clock value that should not move. A
+      restaurant opening at 09:00 opens at 09:00 whoever is asking.</li>
+</ul>
+
+<p>The pizza schema stores <code>DATETIME(6)</code> throughout. Its Java entities map to
+<code>LocalDateTime</code>, which carries no zone either, so the pairing is consistent — and the
+application explicitly turns off the driver's zone conversion to keep it that way. That story, and
+the seven hours it cost, is in <a href="/sql/mysql-connection">connections</a>.</p>
+
+<h2>2038</h2>
+
+<p><code>TIMESTAMP</code> is a 4-byte signed count of seconds since 1970, so it runs out on
+<strong>19 January 2038</strong>. That is not far away for a column holding a subscription end date
+or a scheduled job. <code>DATETIME</code> goes to the year 9999. If you need zone-awareness past
+2038, store a <code>DATETIME</code> in UTC and convert in the application, or use
+<code>BIGINT</code> epoch milliseconds.</p>
+
+<h2>Fractional seconds</h2>
+
+<p>Both types take a precision argument from 0 to 6: <code>DATETIME(6)</code> keeps microseconds,
+<code>DATETIME</code> alone keeps none and <strong>rounds</strong> — 12:00:00.6 becomes 12:00:01,
+which is a surprising place to lose a second.</p>
+
+<p>The pizza schema uses <code>DATETIME(6)</code> for created/updated columns for a practical
+reason: two rows written in the same second are otherwise indistinguishable, and "the most recent
+one" stops being answerable. It costs three extra bytes.</p>
+
+<h2>Defaults that maintain themselves</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE audit_demo (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                           ON UPDATE CURRENT_TIMESTAMP(6)
+);</code></pre>
+
+<p><code>ON UPDATE CURRENT_TIMESTAMP</code> refreshes the column on every modification, with no
+trigger and no application code.</p>
+
+<p>The pizza schema deliberately does <strong>not</strong> use it, and the reason is worth
+knowing: its timestamps are maintained by JPA lifecycle callbacks instead, so the behaviour lives
+in one place, in the Java, and works identically on every database. Splitting it — some columns
+maintained by the database, some by the application — is how you end up debugging why one of them
+did not update. Either mechanism is fine; pick one.</p>
+
+<h2>Writing dates</h2>
+
+<p>Use <code>'YYYY-MM-DD'</code> and <code>'YYYY-MM-DD HH:MM:SS'</code>. MySQL accepts a
+remarkable variety of other formats and its guesses are not always yours. For anything else,
+parse explicitly with <code>STR_TO_DATE</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT STR_TO_DATE('15/03/2024', '%d/%m/%Y') AS parsed;</code></pre>
+
+<p>Under the default <code>sql_mode</code> an impossible date is an error rather than a silent
+zero. Older MySQL accepted <code>'0000-00-00'</code>, which is not a date and breaks every client
+library that tries to read it; if you meet one in a legacy schema, it is
+<code>NO_ZERO_DATE</code> being off.</p>
+
+<h2>The indexing trap</h2>
+
+<pre class="language-sql"><code class="language-sql">-- cannot use an index on created_at
+SELECT COUNT(*) FROM customer_order WHERE DATE(created_at) = '2024-06-01';
+
+-- can
+SELECT COUNT(*) FROM customer_order
+WHERE  created_at &gt;= '2024-06-01' AND created_at &lt; '2024-06-02';</code></pre>
+
+<p>Wrapping the column in a function makes the index unusable, because the index stores
+<code>created_at</code> and the query asks about <code>DATE(created_at)</code>. Half-open ranges
+are the habit worth forming — and see <a href="/sql/sql-between">BETWEEN</a> for why
+<code>BETWEEN</code> on a <code>DATETIME</code> quietly loses most of the last day.</p>
+
+<h2>Pulling a date apart</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT DATE('2024-03-15 14:30:45') AS date_part,
+       TIME('2024-03-15 14:30:45') AS time_part,
+       YEAR('2024-03-15') AS y, MONTH('2024-03-15') AS m, DAY('2024-03-15') AS d;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+-----------+------+------+------+
+| date_part  | time_part | y    | m    | d    |
++------------+-----------+------+------+------+
+| 2024-03-15 | 14:30:45  | 2024 |    3 |   15 |
++------------+-----------+------+------+------+</code></pre>
+
+<p>Formatting and arithmetic — <code>DATE_FORMAT</code>, <code>DATE_ADD</code>,
+<code>DATEDIFF</code>, <code>TIMESTAMPDIFF</code> — are covered in
+<a href="/sql/sql-date_format">DATE_FORMAT and date functions</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>DATETIME</code> does not move with the time zone; <code>TIMESTAMP</code> does.</li>
+  <li><code>TIMESTAMP</code> ends in 2038.</li>
+  <li>Add <code>(6)</code> unless you want your times rounded to the second.</li>
+  <li>Keep the column bare in <code>WHERE</code>, and use half-open ranges.</li>
+</ul>

@@ -1,0 +1,181 @@
+<p>You need two things to follow this track: a MySQL <strong>server</strong> to connect to, and a
+<strong>client</strong> to type into. They are separate installs, and confusing them is the first
+thing that goes wrong.</p>
+
+<p>The fastest route to a working server is Docker, because it is one command, it does not touch
+the rest of your machine, and deleting it afterwards is one more command.</p>
+
+<h2>A server in one command</h2>
+
+<pre class="language-bash"><code class="language-bash">docker run --name mysql-play \
+  -e MYSQL_ALLOW_EMPTY_PASSWORD=yes \
+  -e MYSQL_DATABASE=pizza \
+  -p 3308:3306 \
+  -d mysql:8.4</code></pre>
+
+<p>Four things worth understanding rather than copying:</p>
+
+<ul>
+  <li><code>mysql:8.4</code> pins the LTS release. <code>mysql:latest</code> moves under you.</li>
+  <li><code>MYSQL_ALLOW_EMPTY_PASSWORD</code> is an explicit opt-in — the image refuses to start
+      without a password decision. It is fine for a throwaway container on your laptop and
+      <strong>nothing you would ever do elsewhere</strong>.</li>
+  <li><code>MYSQL_DATABASE</code> creates an empty database at first boot. Without it you connect
+      successfully and then find there is nothing to connect <em>to</em>.</li>
+  <li><code>-p 3308:3306</code> maps container port 3306 to <strong>3308</strong> on your machine.
+      If you already have MySQL installed, 3306 is taken and publishing to a busy port fails at
+      startup with a bind error that says nothing about MySQL.</li>
+</ul>
+
+<p>Or, with a compose file, which is how the demo application does it:</p>
+
+<pre class="language-yaml"><code class="language-yaml">services:
+  mysql:
+    image: mysql:8.4
+    ports:
+      - "3308:3306"
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: pizza
+    command:
+      # utf8mb4 end to end. MySQL's older `utf8` is a 3-byte encoding that cannot
+      # store an emoji, and a menu is exactly where someone will paste one.
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    healthcheck:
+      # Without this the container is "up" the instant the process starts, several
+      # seconds before MySQL accepts a connection — so an app racing it dies on
+      # connection refused.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 5s
+      retries: 20
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+volumes:
+  mysql-data:</code></pre>
+
+<p>The named volume is what makes the data survive <code>docker compose down</code>. Add
+<code>-v</code> to that command when you actually want it gone.</p>
+
+<h2>Installing it directly</h2>
+
+<p>If you would rather run it on the machine itself:</p>
+
+<pre class="language-bash"><code class="language-bash"># macOS
+brew install mysql
+brew services start mysql
+
+# Debian / Ubuntu
+sudo apt update &amp;&amp; sudo apt install mysql-server
+sudo systemctl enable --now mysql
+sudo mysql_secure_installation
+
+# Windows: use the MySQL Installer from dev.mysql.com, which bundles server,
+# client and Workbench.</code></pre>
+
+<p>On Linux, run <code>mysql_secure_installation</code>. It sets a root password and removes the
+anonymous accounts and the test database that older versions shipped with. On a server that is
+reachable from anywhere, it is not optional.</p>
+
+<h2>Just the client</h2>
+
+<p>If the server is elsewhere — a container, a colleague's machine, RDS — you only need the client:</p>
+
+<pre class="language-bash"><code class="language-bash">brew install mysql-client              # macOS
+sudo apt install mysql-client          # Debian / Ubuntu
+docker exec -it mysql-play mysql -u root   # or just use the one inside the container</code></pre>
+
+<h2>Connecting</h2>
+
+<pre class="language-bash"><code class="language-bash">mysql -h 127.0.0.1 -P 3308 -u root pizza</code></pre>
+
+<p>Use <code>-h 127.0.0.1</code>, not <code>-h localhost</code>. They are not synonyms to MySQL:
+<code>localhost</code> makes the client use a <strong>Unix socket file</strong> and ignore
+<code>-P</code> entirely, so it quietly tries the local server instead of your container.
+<code>127.0.0.1</code> forces TCP. A great deal of "the port is right and it still connects to the
+wrong server" is this.</p>
+
+<p>Add <code>-p</code> (no argument) to be prompted for a password. Putting the password on the
+command line as <code>-pSecret</code> works and writes it into your shell history and the process
+list, where anyone on the machine can read it.</p>
+
+<h2>Checking it works</h2>
+
+<p>Once you are at the <code>mysql&gt;</code> prompt:</p>
+
+<pre class="language-sql"><code class="language-sql">SHOW DATABASES;
+USE pizza;
+SHOW TABLES;</code></pre>
+
+<p><code>DESCRIBE</code> shows a table's shape, and is the command you will use most while finding
+your way around an unfamiliar schema:</p>
+
+<pre class="language-sql"><code class="language-sql">DESCRIBE product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------+--------------+------+-----+---------+----------------+
+| Field         | Type         | Null | Key | Default | Extra          |
++---------------+--------------+------+-----+---------+----------------+
+| id            | bigint       | NO   | PRI | NULL    | auto_increment |
+| name          | varchar(120) | NO   | UNI | NULL    |                |
+| description   | varchar(500) | YES  |     | NULL    |                |
+| type          | varchar(20)  | NO   | MUL | NULL    |                |
+| image_url     | varchar(500) | YES  |     | NULL    |                |
+| active        | tinyint(1)   | NO   |     | 1       |                |
+| display_order | int          | NO   |     | 0       |                |
+| created_at    | datetime(6)  | NO   |     | NULL    |                |
+| public_id     | char(36)     | NO   | UNI | NULL    |                |
+| updated_at    | datetime(6)  | NO   |     | NULL    |                |
+| deleted       | tinyint(1)   | NO   | MUL | 0       |                |
++---------------+--------------+------+-----+---------+----------------+</code></pre>
+
+<p>Already worth reading: <code>PRI</code> marks the primary key, <code>UNI</code> a unique
+constraint, <code>tinyint(1)</code> is how a <code>BOOLEAN</code> is really stored, and
+<code>datetime(6)</code> keeps microseconds. All of that is covered in
+<a href="/sql/mysql-data-types">data types</a>.</p>
+
+<p>And the "is the data actually there" check:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS products FROM product;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+
+| products |
++----------+
+|       14 |
++----------+</code></pre>
+
+<h2>Loading a schema from a file</h2>
+
+<pre class="language-bash"><code class="language-bash">mysql -h 127.0.0.1 -P 3308 -u root pizza &lt; schema.sql        # from the shell
+docker exec -i mysql-play mysql -u root pizza &lt; schema.sql   # into a container</code></pre>
+
+<p>Note <code>docker exec -i</code>, not <code>-it</code>. The <code>-t</code> allocates a terminal,
+which is wrong when the input is a file and produces confusing failures.</p>
+
+<h2>A GUI, if you want one</h2>
+
+<p>MySQL Workbench is free and official; DBeaver and TablePlus are common alternatives. They are
+genuinely useful for browsing an unfamiliar schema and drawing relationship diagrams.</p>
+
+<p>Learn the command line anyway. It is what exists on a production host at 2am, it is what every
+script and CI job uses, and every example in this track is written for it.</p>
+
+<h2>Common first errors</h2>
+
+<table>
+  <tr><th>Message</th><th>Usually means</th></tr>
+  <tr><td><code>Can't connect ... (61)</code></td>
+      <td>Nothing is listening there. Check the container is running and the port matches.</td></tr>
+  <tr><td><code>Can't connect through socket</code></td>
+      <td>You used <code>localhost</code>. Use <code>127.0.0.1</code>.</td></tr>
+  <tr><td><code>Access denied for user</code></td>
+      <td>Wrong password, or the account exists for a different host — see
+          <a href="/sql/mysql-users-and-privileges">users and privileges</a>.</td></tr>
+  <tr><td><code>Unknown database 'pizza'</code></td>
+      <td>The server is up but the database was never created.</td></tr>
+  <tr><td><code>No such file or directory</code> on <code>mysql</code></td>
+      <td>The client is not installed, or not on your <code>PATH</code>.</td></tr>
+</table>
+
+<p>Next: <a href="/sql/mysql-connection">how an application connects</a> — JDBC URLs, pooling, and
+the timeouts that cause overnight failures.</p>
