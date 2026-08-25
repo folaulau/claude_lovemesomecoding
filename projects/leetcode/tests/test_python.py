@@ -7,6 +7,7 @@ import collections
 import functools
 import html
 import math
+import random
 import re
 import sys
 from pathlib import Path
@@ -2261,6 +2262,207 @@ for n in range(0, 8):
             if s.wordBreak(text, list(dictionary)) != breakable(text, tuple(dictionary)):
                 bad.append((text, dictionary))
 check("matches memoised search on every a/b string up to length 7", bad, [])
+
+print("LeetCode 141 - Linked List Cycle")
+CYCLE = LISTNODE + """
+def build_cycle(values, pos):
+    head = to_list(values)
+    if head is None or pos < 0:
+        return head
+    nodes, node = [], head
+    while node:
+        nodes.append(node); node = node.next
+    nodes[-1].next = nodes[pos]
+    return head
+"""
+nsc = {}
+exec(compile(CYCLE, "cycle", "exec"), nsc)
+build_cycle = nsc["build_cycle"]
+s = load("141-linked-list-cycle.html", extra=CYCLE)
+check("[3,2,0,-4] pos=1", s.hasCycle(build_cycle([3,2,0,-4], 1)), True)
+check("[1,2] pos=0", s.hasCycle(build_cycle([1,2], 0)), True)
+check("[1] pos=-1 (no cycle)", s.hasCycle(build_cycle([1], -1)), False)
+check("[] (empty)", s.hasCycle(build_cycle([], -1)), False)
+check("[1] pos=0 (self loop)", s.hasCycle(build_cycle([1], 0)), True)
+check("[1,2,3,4] pos=-1", s.hasCycle(build_cycle([1,2,3,4], -1)), False)
+check("[1,1] pos=-1 (equal VALUES, not a cycle)", s.hasCycle(build_cycle([1,1], -1)), False)
+bad = []
+for n in range(1, 10):
+    for pos in range(-1, n):
+        # both parities of length, and every cycle entry point
+        if s.hasCycle(build_cycle(list(range(n)), pos)) != (pos >= 0):
+            bad.append((n, pos))
+check("every list length 1..9 against every cycle entry point", bad, [])
+
+print("LeetCode 142 - Linked List Cycle II")
+s = load("142-linked-list-cycle-ii.html", extra=CYCLE)
+def entry_index(head, node):
+    i, cur = 0, head
+    while cur is not node:
+        cur = cur.next; i += 1
+    return i
+head = build_cycle([3,2,0,-4], 1)
+check("[3,2,0,-4] pos=1 returns the node at index 1", entry_index(head, s.detectCycle(head)), 1)
+head = build_cycle([1,2], 0)
+check("[1,2] pos=0 returns the head", s.detectCycle(head) is head, True)
+check("[1] no cycle", s.detectCycle(build_cycle([1], -1)), None)
+check("[] empty", s.detectCycle(build_cycle([], -1)), None)
+head = build_cycle([1], 0)
+check("self loop returns the node itself", s.detectCycle(head) is head, True)
+bad = []
+for n in range(1, 10):
+    for pos in range(-1, n):
+        head = build_cycle(list(range(n)), pos)
+        got = s.detectCycle(head)
+        if pos < 0:
+            if got is not None:
+                bad.append((n, pos, "expected None"))
+        elif got is None or entry_index(head, got) != pos:
+            bad.append((n, pos))
+check("returns the exact entry node for every length and entry point", bad, [])
+
+print("LeetCode 144 - Binary Tree Preorder Traversal")
+s = load("144-binary-tree-preorder-traversal.html", extra=TREE)
+def preorder_of_tree(node):
+    return [] if node is None else [node.val] + preorder_of_tree(node.left) + preorder_of_tree(node.right)
+check("[1,null,2,3]", s.preorderTraversal(build([1,None,2,3])), [1,2,3])
+check("empty tree", s.preorderTraversal(None), [])
+check("single node", s.preorderTraversal(build([1])), [1])
+check("[4,2,6,1,3,5,7]", s.preorderTraversal(build([4,2,6,1,3,5,7])), [4,2,1,3,6,5,7])
+bad = []
+for n in range(1, 10):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        if s.preorderTraversal(build(xs)) != preorder_of_tree(build(xs)):
+            bad.append(xs)
+check("matches a recursive model on every small tree shape", bad, [])
+# A left-leaning chain: the shape that would expose a push-order mistake.
+check("left chain", s.preorderTraversal(build([1,2,None,3])), [1,2,3])
+check("right chain", s.preorderTraversal(build([1,None,2,None,3])), [1,2,3])
+
+print("LeetCode 145 - Binary Tree Postorder Traversal")
+s = load("145-binary-tree-postorder-traversal.html", extra=TREE)
+def postorder_of_tree(node):
+    return [] if node is None else postorder_of_tree(node.left) + postorder_of_tree(node.right) + [node.val]
+check("[1,null,2,3]", s.postorderTraversal(build([1,None,2,3])), [3,2,1])
+check("empty tree", s.postorderTraversal(None), [])
+check("single node", s.postorderTraversal(build([1])), [1])
+check("[4,2,6,1,3,5,7]", s.postorderTraversal(build([4,2,6,1,3,5,7])), [1,3,2,5,7,6,4])
+bad = []
+for n in range(1, 10):
+    for mask in range(1 << (n - 1)):
+        nxt = itertools.count(1)
+        xs = [next(nxt)] + [next(nxt) if (mask >> i & 1) else None for i in range(n - 1)]
+        tree = build(xs)
+        got = s.postorderTraversal(tree)
+        if got != postorder_of_tree(build(xs)):
+            bad.append(xs)
+        elif got and got[-1] != xs[0]:
+            bad.append(("root not last", xs))
+check("matches a model, and the root is always last, on every small tree", bad, [])
+
+print("LeetCode 146 - LRU Cache")
+ns146 = {}
+exec(compile("\n".join(blocks("146-lru-cache.html")), "lru", "exec"), ns146)
+LRUCache = ns146["LRUCache"]
+cache = LRUCache(2)
+cache.put(1, 1); cache.put(2, 2)
+check("get(1) after two puts", cache.get(1), 1)
+cache.put(3, 3)                      # evicts 2, because get(1) counted as a use
+check("get(2) evicted", cache.get(2), -1)
+cache.put(4, 4)                      # evicts 1
+check("get(1) evicted", cache.get(1), -1)
+check("get(3)", cache.get(3), 3)
+check("get(4)", cache.get(4), 4)
+# put on an existing key must UPDATE, not insert a duplicate.
+cache = LRUCache(2)
+cache.put(1, 1); cache.put(1, 10); cache.put(2, 2)
+check("update does not consume capacity", (cache.get(1), cache.get(2)), (10, 2))
+# capacity 1
+cache = LRUCache(1)
+cache.put(1, 1); cache.put(2, 2)
+check("capacity 1 evicts immediately", (cache.get(1), cache.get(2)), (-1, 2))
+check("missing key returns -1", LRUCache(2).get(99), -1)
+# Cross-check against a plain list-based model on a long random operation sequence.
+class ModelLRU:
+    def __init__(self, capacity):
+        self.capacity, self.order, self.values = capacity, [], {}
+    def get(self, key):
+        if key not in self.values:
+            return -1
+        self.order.remove(key); self.order.append(key)
+        return self.values[key]
+    def put(self, key, value):
+        if key in self.values:
+            self.order.remove(key)
+        elif len(self.order) == self.capacity:
+            oldest = self.order.pop(0)
+            del self.values[oldest]
+        self.order.append(key); self.values[key] = value
+
+rng = random.Random(20260902)
+bad = []
+for capacity in (1, 2, 3, 5):
+    real, model = LRUCache(capacity), ModelLRU(capacity)
+    for step in range(400):
+        key = rng.randrange(6)
+        if rng.random() < 0.5:
+            if real.get(key) != model.get(key):
+                bad.append((capacity, step, "get", key)); break
+        else:
+            value = rng.randrange(100)
+            real.put(key, value); model.put(key, value)
+check("matches a reference LRU over 400 random ops at four capacities", bad, [])
+
+print("LeetCode 149 - Max Points on a Line")
+s = load("149-max-points-on-a-line.html")
+check("[[1,1],[2,2],[3,3]]", s.maxPoints([[1,1],[2,2],[3,3]]), 3)
+check("the six-point example",
+      s.maxPoints([[1,1],[3,2],[5,3],[4,1],[2,3],[1,4]]), 4)
+check("single point", s.maxPoints([[1,1]]), 1)
+check("two identical points", s.maxPoints([[1,1],[1,1]]), 2)
+check("vertical line", s.maxPoints([[0,0],[0,1],[0,2]]), 3)
+check("horizontal line", s.maxPoints([[0,5],[1,5],[2,5]]), 3)
+check("two points", s.maxPoints([[0,0],[1,1]]), 2)
+# Opposite directions from the anchor must count as ONE line.
+check("points on both sides of the anchor", s.maxPoints([[-1,-1],[0,0],[1,1]]), 3)
+# Large coordinates, where a floating-point slope key loses precision.
+check("large collinear coordinates",
+      s.maxPoints([[0,0],[94911151,94911150],[94911152,94911151]]), 2)
+# Brute force over every pair-defined line, using exact integer collinearity.
+def brute_points(pts):
+    n = len(pts)
+    if n <= 2:
+        return n
+    best = 1
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            (x1, y1), (x2, y2) = pts[i], pts[j]
+            if (x1, y1) == (x2, y2):
+                continue
+            count = 0
+            for (x, y) in pts:
+                # cross product zero <=> collinear, exact integer arithmetic
+                if (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1) == 0:
+                    count += 1
+            best = max(best, count)
+    # all points identical
+    if best == 1:
+        best = max(best, max(pts.count(p) for p in pts))
+    return best
+
+bad = []
+coords = [(x, y) for x in range(3) for y in range(3)]
+for n in range(1, 5):
+    for combo in itertools.combinations_with_replacement(coords, n):
+        pts = [list(p) for p in combo]
+        got, want = s.maxPoints([list(p) for p in pts]), brute_points(list(combo))
+        if got != want:
+            bad.append((pts, got, want))
+check("matches exact-collinearity brute force on every point set up to size 4", bad, [])
 
 print()
 if fails:

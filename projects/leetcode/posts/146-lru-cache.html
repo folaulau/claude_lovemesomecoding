@@ -1,0 +1,219 @@
+<p>LRU Cache is the most common design question on the list, and it is a design question rather than
+an algorithms one: no clever insight, just the recognition that <strong>no single data structure
+does what is required</strong>, and that combining two gives every operation in <code>O(1)</code>.
+It is also the problem where getting the pointer surgery right matters more than getting the idea
+right, because everyone gets the idea.</p>
+
+<h2>The problem</h2>
+
+<p>Design a cache with a fixed capacity supporting:</p>
+
+<ul>
+  <li><code>get(key)</code> — return the value, or <code>-1</code> if absent.</li>
+  <li><code>put(key, value)</code> — insert or update; if that exceeds capacity, evict the
+      <strong>least recently used</strong> entry.</li>
+</ul>
+
+<p>Both must run in <strong><code>O(1)</code> average time</strong>.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">LRUCache(2)
+put(1,1)      cache: {1=1}
+put(2,2)      cache: {1=1, 2=2}
+get(1)   -&gt; 1  1 is now the most recent
+put(3,3)      evicts 2, NOT 1     cache: {1=1, 3=3}
+get(2)   -&gt; -1
+put(4,4)      evicts 1            cache: {3=3, 4=4}
+get(1)   -&gt; -1
+get(3)   -&gt; 3
+get(4)   -&gt; 4</code></pre>
+
+<p>Note that <code>get</code> counts as a use. That is the line people skip, and it is what makes
+the fourth step evict 2 rather than 1.</p>
+
+<h2>Why one structure is not enough</h2>
+
+<table>
+  <thead><tr><th>Structure</th><th>Lookup by key</th><th>Track recency order</th></tr></thead>
+  <tbody>
+    <tr><td>Hash map</td><td><code>O(1)</code> ✓</td><td>no ordering at all</td></tr>
+    <tr><td>Array or list</td><td><code>O(n)</code></td><td>ordered, but moving an item is <code>O(n)</code></td></tr>
+    <tr><td>Doubly linked list</td><td><code>O(n)</code></td><td><code>O(1)</code> to move a node <em>you already hold</em></td></tr>
+  </tbody>
+</table>
+
+<p>The last row is the hinge. A doubly linked list can unlink and re-insert a node in constant
+time — <em>if you have a reference to it</em>. Finding it is the slow part. So:</p>
+
+<blockquote>
+  <p><strong>Hash map from key to node, doubly linked list for order.</strong> The map answers "where
+  is it", the list answers "which is oldest", and each covers exactly the other's weakness.</p>
+</blockquote>
+
+<h2>Why doubly, and why sentinels</h2>
+
+<p><strong>Doubly</strong> linked: removing a node requires rewiring its predecessor, and in a singly
+linked list finding the predecessor is <code>O(n)</code> — which would destroy the whole point.</p>
+
+<p><strong>Sentinel head and tail</strong> nodes that always exist: every real node then has a
+non-null <code>prev</code> and <code>next</code>, so unlink and insert have no special cases for the
+ends. Without them, every operation needs "is this the first node? the last? the only one?", and that
+is where the bugs live. Two wasted objects to delete a dozen branches is an excellent trade, and
+saying so is part of the answer.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">head &lt;-&gt; [most recent] &lt;-&gt; ... &lt;-&gt; [least recent] &lt;-&gt; tail
+ ^                                                       ^
+ sentinel                                         sentinel
+                                            evict from here</code></pre>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class LRUCache {
+    private static class Entry {
+        int key, value;
+        Entry prev, next;
+        Entry(int key, int value) { this.key = key; this.value = value; }
+    }
+
+    private final int capacity;
+    private final Map&lt;Integer, Entry&gt; index = new HashMap&lt;&gt;();
+    // Sentinels: every real node has a non-null prev and next, so no edge cases.
+    private final Entry head = new Entry(0, 0);
+    private final Entry tail = new Entry(0, 0);
+
+    public LRUCache(int capacity) {
+        this.capacity = capacity;
+        head.next = tail;
+        tail.prev = head;
+    }
+
+    public int get(int key) {
+        Entry entry = index.get(key);
+        if (entry == null) return -1;
+
+        moveToFront(entry);        // a read counts as a use
+        return entry.value;
+    }
+
+    public void put(int key, int value) {
+        Entry existing = index.get(key);
+
+        if (existing != null) {
+            existing.value = value;      // update, do NOT insert a duplicate
+            moveToFront(existing);
+            return;
+        }
+
+        if (index.size() == capacity) {
+            Entry lru = tail.prev;       // the node just before the tail sentinel
+            unlink(lru);
+            index.remove(lru.key);       // remove by KEY -- this is why the node stores it
+        }
+
+        Entry fresh = new Entry(key, value);
+        index.put(key, fresh);
+        insertAfterHead(fresh);
+    }
+
+    private void moveToFront(Entry entry) {
+        unlink(entry);
+        insertAfterHead(entry);
+    }
+
+    private void unlink(Entry entry) {
+        entry.prev.next = entry.next;
+        entry.next.prev = entry.prev;
+    }
+
+    private void insertAfterHead(Entry entry) {
+        entry.next = head.next;
+        entry.prev = head;
+        head.next.prev = entry;
+        head.next = entry;
+    }
+}</code></pre>
+
+<p>The node stores its own <code>key</code>, which looks redundant next to a map keyed by it. It is
+not: on eviction you hold the <em>node</em> and need to delete the corresponding <em>map entry</em>,
+and without the key on the node there is no way to do that in <code>O(1)</code>. Forgetting it is the
+most common structural bug in this problem, and the symptom is a map that grows forever.</p>
+
+<p>The update branch in <code>put</code> is the second one. Treating an existing key as an insert
+puts a duplicate node in the list, so the size accounting drifts and a stale node is eventually
+evicted instead of the real one.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">from collections import OrderedDict
+
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.cache = OrderedDict()
+
+    def get(self, key: int) -&gt; int:
+        if key not in self.cache:
+            return -1
+
+        self.cache.move_to_end(key)        # O(1): it IS a hash map plus a linked list
+        return self.cache[key]
+
+    def put(self, key: int, value: int) -&gt; None:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+
+        self.cache[key] = value
+
+        if len(self.cache) &gt; self.capacity:
+            self.cache.popitem(last=False)  # evict the oldest</code></pre>
+
+<p><code>OrderedDict</code> is exactly the structure described above — CPython implements it as a
+dict plus a doubly linked list — so <code>move_to_end</code> and <code>popitem</code> are genuinely
+<code>O(1)</code> and this is not cheating.</p>
+
+<p>It is, however, worth saying that out loud rather than letting it look like you dodged the
+question. An interviewer asking this wants to know you could build it; the honest framing is "the
+standard library has the exact structure, and here is what it is doing underneath". Be ready to
+write the Java version if asked.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th>Operation</th><th>Time</th></tr></thead>
+  <tbody>
+    <tr><td><code>get</code></td><td><code>O(1)</code> average</td></tr>
+    <tr><td><code>put</code></td><td><code>O(1)</code> average</td></tr>
+    <tr><td>Space</td><td><code>O(capacity)</code></td></tr>
+  </tbody>
+</table>
+
+<p><em>Average</em>, not worst case — hash collisions can degrade a lookup. The list operations are
+genuinely <code>O(1)</code> worst case. That distinction is worth stating precisely, because
+"<code>O(1)</code>" for a hash map is always an average.</p>
+
+<h2>The follow-ups</h2>
+
+<p><strong>Thread safety.</strong> Nothing here is safe under concurrent access — two threads can
+evict simultaneously and corrupt the list. A single lock is the honest answer; a striped or
+sharded cache is the scalable one. Say which you would build and why.</p>
+
+<p><strong>LFU Cache</strong> (460) evicts by frequency instead of recency, and needs a third
+structure: a map from frequency to a list of keys at that frequency, plus a running minimum. It is
+markedly harder and a common follow-up.</p>
+
+<p><strong>What about TTL?</strong> Real caches expire entries by time as well, which needs either
+lazy expiry on read or a separate priority queue. Mentioning it shows you have thought about caches
+rather than about this exercise.</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That you identify two structures and say what each covers.</li>
+  <li>Why the list must be doubly linked.</li>
+  <li>Sentinel nodes, and that they exist to delete edge cases.</li>
+  <li>That the node stores its key, for <code>O(1)</code> eviction from the map.</li>
+  <li>That <code>get</code> counts as a use.</li>
+  <li>That <code>put</code> on an existing key updates rather than inserting.</li>
+  <li>Capacity 1, and eviction when full.</li>
+  <li>That <code>O(1)</code> on the map is an average, not a worst case.</li>
+</ul>

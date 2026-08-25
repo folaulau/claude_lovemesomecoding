@@ -1,0 +1,193 @@
+<p>Max Points on a Line is a Hard problem whose algorithm is almost trivial — try every point as an
+anchor and group the others by slope — and whose difficulty is entirely in <strong>how you represent
+a slope</strong>. Every natural choice is wrong in a way that passes the sample tests, which is what
+makes it a good question.</p>
+
+<h2>The problem</h2>
+
+<p>Given points on a plane, return the maximum number of them that lie on the same straight line.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">[[1,1],[2,2],[3,3]]                   -&gt; 3
+[[1,1],[3,2],[5,3],[4,1],[2,3],[1,4]] -&gt; 4
+[[1,1]]                               -&gt; 1
+[[1,1],[1,1]]                         -&gt; 2      duplicate points
+[[0,0],[0,1],[0,2]]                   -&gt; 3      vertical line</code></pre>
+
+<h2>The algorithm is the easy part</h2>
+
+<p>Any line with two or more points passes through at least one point of the set. So fix each point
+as an anchor, compute the slope to every other point, and count the largest group — the line through
+the anchor with the most companions. Take the maximum over all anchors.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">for each anchor i:
+    slopes = {}
+    for each j != i:
+        slopes[slope(i, j)] += 1
+    best = max(best, 1 + max(slopes.values()))</code></pre>
+
+<p>The <code>1 +</code> is the anchor itself, which the map does not count. That is the whole
+algorithm, and it is <code>O(n²)</code>. Everything below is about the word <em>slope</em>.</p>
+
+<h2>Three ways to get the slope wrong</h2>
+
+<p><strong>Floating point.</strong> <code>(double)(y2 - y1) / (x2 - x1)</code> is the obvious choice
+and it is unsound as a hash key. Slopes that are mathematically equal can differ in the last bit, so
+collinear points land in different buckets — and it fails <em>silently</em>, on large coordinates,
+long after the samples pass. Division also has to special-case a vertical line, where the
+denominator is zero.</p>
+
+<p><strong>An unreduced pair.</strong> Keying by <code>(dy, dx)</code> without reducing treats
+<code>(1,2)</code> and <code>(2,4)</code> as different slopes, which they are not.</p>
+
+<p><strong>A reduced pair without a sign convention.</strong> After dividing by the GCD,
+<code>(1,2)</code> and <code>(-1,-2)</code> are the same direction but different keys. Points on
+opposite sides of the anchor would then be counted as two lines.</p>
+
+<h2>The representation that works</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">dy = y2 - y1,  dx = x2 - x1
+g  = gcd(|dy|, |dx|)
+dy /= g,  dx /= g
+if dx &lt; 0  (or dx == 0 and dy &lt; 0):  dy = -dy, dx = -dx     canonical sign
+
+key = (dy, dx)</code></pre>
+
+<p>Reduced to lowest terms, with a fixed sign convention so each direction has exactly one
+representation. Exact integer arithmetic throughout — no division, no rounding, no vertical special
+case, because <code>(1, 0)</code> is a perfectly good key.</p>
+
+<p>Being able to explain <em>why</em> each of the three broken versions is broken is worth more here
+than the code. The interviewer already knows the algorithm.</p>
+
+<h2>Java</h2>
+
+<pre class="language-java"><code class="language-java">class Solution {
+    public int maxPoints(int[][] points) {
+        if (points.length &lt;= 2) return points.length;
+
+        int best = 1;
+
+        for (int i = 0; i &lt; points.length; i++) {
+            // Slope, as an exact reduced fraction, to every later point.
+            Map&lt;String, Integer&gt; slopes = new HashMap&lt;&gt;();
+            int localBest = 0;
+
+            int duplicates = 0;
+
+            for (int j = i + 1; j &lt; points.length; j++) {
+                int dy = points[j][1] - points[i][1];
+                int dx = points[j][0] - points[i][0];
+
+                if (dy == 0 &amp;&amp; dx == 0) {
+                    duplicates++;      // sits on EVERY line through the anchor
+                    continue;
+                }
+
+                int g = gcd(Math.abs(dy), Math.abs(dx));
+                dy /= g; dx /= g;
+
+                // One representation per direction: (1,2) and (-1,-2) must agree.
+                if (dx &lt; 0 || (dx == 0 &amp;&amp; dy &lt; 0)) { dy = -dy; dx = -dx; }
+
+                int count = slopes.merge(dy + "/" + dx, 1, Integer::sum);
+                localBest = Math.max(localBest, count);
+            }
+
+            // + the duplicates (they lie on every line) + the anchor itself
+            best = Math.max(best, localBest + duplicates + 1);
+        }
+
+        return best;
+    }
+
+    private int gcd(int a, int b) {
+        return b == 0 ? a : gcd(b, a % b);
+    }
+}</code></pre>
+
+<p>The inner loop starts at <code>i + 1</code>, not 0. Any line through both <code>i</code> and an
+earlier point was already fully counted when that earlier point was the anchor, so scanning backwards
+is wasted work — it halves the constant factor and changes nothing else.</p>
+
+<p><strong>Duplicates need their own counter, and this is the real trap.</strong> A point identical
+to the anchor lies on <em>every</em> line through it, so it cannot go into a slope bucket of its own
+&mdash; it has to be added to whichever group turns out to be largest. Bucket it separately and
+<code>[[0,0],[0,0],[0,1]]</code> returns 2 when the answer is 3: all three points sit on the vertical
+line <code>x = 0</code>.</p>
+
+<p>Hence <code>localBest + duplicates + 1</code> &mdash; the biggest slope group, plus every copy of
+the anchor, plus the anchor. Handling duplicates first also means <code>gcd</code> is never called on
+<code>(0, 0)</code>, so the reduction needs no guard.</p>
+
+<h2>Python</h2>
+
+<pre class="language-python"><code class="language-python">from collections import defaultdict
+from math import gcd
+
+
+class Solution:
+    def maxPoints(self, points: list[list[int]]) -&gt; int:
+        if len(points) &lt;= 2:
+            return len(points)
+
+        best = 1
+
+        for i, (x1, y1) in enumerate(points):
+            slopes = defaultdict(int)
+            duplicates = 0
+            local_best = 0
+
+            for x2, y2 in points[i + 1:]:
+                dy, dx = y2 - y1, x2 - x1
+
+                if dy == 0 and dx == 0:
+                    duplicates += 1          # sits on EVERY line through the anchor
+                    continue
+
+                g = gcd(dy, dx)              # math.gcd handles negatives
+                dy, dx = dy // g, dx // g
+
+                if dx &lt; 0 or (dx == 0 and dy &lt; 0):
+                    dy, dx = -dy, -dx        # canonical direction
+
+                slopes[(dy, dx)] += 1
+                local_best = max(local_best, slopes[(dy, dx)])
+
+            best = max(best, local_best + duplicates + 1)
+
+        return best</code></pre>
+
+<p>A tuple is hashable, so no string key is needed — the same advantage that made
+<a href="/fundamental-problem/leetcode-49-group-anagrams">Group Anagrams</a> cleaner in Python.
+<code>math.gcd</code> returns a non-negative result and <code>gcd(0, 0) == 0</code>, so the
+duplicate-point case is handled without a branch.</p>
+
+<h2>Complexity</h2>
+
+<table>
+  <thead><tr><th></th><th>Time</th><th>Space</th></tr></thead>
+  <tbody>
+    <tr><td>Anchor + slope map</td><td><code>O(n² log C)</code></td><td><code>O(n)</code></td></tr>
+    <tr><td>Every triple</td><td><code>O(n³)</code></td><td><code>O(1)</code></td></tr>
+  </tbody>
+</table>
+
+<p><code>log C</code> is the GCD, on coordinates bounded by <code>C</code> — usually dropped, but
+worth naming since it is the only non-obvious factor. The map is rebuilt per anchor, so space is
+<code>O(n)</code> rather than <code>O(n²)</code>.</p>
+
+<p>There is no known sub-quadratic algorithm for this. Saying so, rather than hunting for one, is the
+right answer to "can you do better?".</p>
+
+<h2>What the interviewer is checking</h2>
+
+<ul>
+  <li>That every line through two points can be found by anchoring at one of them.</li>
+  <li>That floating-point slopes are unsound as hash keys, and why it fails silently.</li>
+  <li>Reducing by the GCD, <em>and</em> a canonical sign.</li>
+  <li>Vertical lines, without a special case.</li>
+  <li>Duplicate points — counted separately and added to <em>every</em> line, never bucketed alone.</li>
+  <li>Fewer than three points.</li>
+  <li>The <code>1 +</code> for the anchor.</li>
+  <li>That <code>O(n²)</code> is the best known bound.</li>
+</ul>

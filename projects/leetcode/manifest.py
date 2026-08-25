@@ -10,8 +10,10 @@ prev/next walks oldest-first. The dates therefore ascend with the LeetCode
 number, which is what makes the ‹ prev / next › pager read 1 -> 2 -> 5 -> 7.
 Identical timestamps would leave that ordering up to sort stability.
 
-The LeetCode dates are randomly spread across 2022-2024 (generated once with a
-fixed seed, then sorted) rather than clustered on the day they were written.
+The LeetCode dates are randomly spread from 2022 onward (generated once with a
+fixed seed per round, then sorted) rather than clustered on the day they were
+written. The track originally targeted 2022-2024; that window was exhausted at
+round 15, so later rounds run past 2024. See README.md.
 They are random but strictly ascending with the LeetCode number, because the
 ordering above depends on it. seed.py --redate is what applies a change here to
 posts that already exist -- upsert_post never re-applies `date` on its own.
@@ -1316,13 +1318,109 @@ POSTS = [
         ),
     },
     {
+        "number": 141,
+        "slug": "leetcode-141-linked-list-cycle",
+        "algorithm": "Implementation",
+        "title": "LeetCode 141 \u2013 Linked List Cycle",
+        "file": "141-linked-list-cycle.html",
+        "date": "2024-12-19T17:49:58",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "linked-list", "two-pointers", "hash-table"],
+        "excerpt": (
+            "Where Floyd's tortoise and hare earns its keep. The hash set is correct and obvious; "
+            "the two-pointer version is constant space and rests on an argument you should be able "
+            "to give, because \"they meet eventually\" is an assertion. The gap closes by exactly "
+            "one per step, so it must pass through zero."
+        ),
+    },
+    {
+        "number": 142,
+        "slug": "leetcode-142-linked-list-cycle-ii",
+        "algorithm": "Implementation",
+        "title": "LeetCode 142 \u2013 Linked List Cycle II",
+        "file": "142-linked-list-cycle-ii.html",
+        "date": "2024-12-21T09:31:36",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "linked-list", "two-pointers", "hash-table"],
+        "excerpt": (
+            "Reset one pointer to the head after they meet and both walk to the cycle's entrance. "
+            "It looks like a coincidence and it is four lines of algebra: t = k*c - m. Deriving "
+            "that is what separates recall from understanding \u2014 and it is the same trick behind "
+            "Find the Duplicate Number."
+        ),
+    },
+    {
+        "number": 144,
+        "slug": "leetcode-144-binary-tree-preorder-traversal",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 144 \u2013 Binary Tree Preorder Traversal",
+        "file": "144-binary-tree-preorder-traversal.html",
+        "date": "2024-12-25T22:50:19",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "stack", "depth-first-search"],
+        "excerpt": (
+            "The easiest of the three traversals to write iteratively, and worth doing right after "
+            "inorder because the contrast explains why: a preorder node is emitted the moment you "
+            "arrive, so there is nothing to come back for. Push right before left, since a stack "
+            "reverses what you give it."
+        ),
+    },
+    {
+        "number": 145,
+        "slug": "leetcode-145-binary-tree-postorder-traversal",
+        "algorithm": "Graph Theory",
+        "title": "LeetCode 145 \u2013 Binary Tree Postorder Traversal",
+        "file": "145-binary-tree-postorder-traversal.html",
+        "date": "2024-12-28T00:52:03",
+        "difficulty": "Easy",
+        "tags": ["leetcode", "tree", "stack", "depth-first-search"],
+        "excerpt": (
+            "The hardest traversal to write iteratively, and the standard answer avoids writing it "
+            "at all: postorder reversed is node-right-left, which is preorder with the children "
+            "swapped. Two lines changed and every awkwardness disappears \u2014 plus what it costs when "
+            "you genuinely need it bottom-up."
+        ),
+    },
+    {
+        "number": 146,
+        "slug": "leetcode-146-lru-cache",
+        "algorithm": "Implementation",
+        "title": "LeetCode 146 \u2013 LRU Cache",
+        "file": "146-lru-cache.html",
+        "date": "2025-01-01T21:43:41",
+        "difficulty": "Medium",
+        "tags": ["leetcode", "design", "hash-table", "linked-list"],
+        "excerpt": (
+            "The most common design question on the list, and a design question rather than an "
+            "algorithms one: no single structure does the job, and two together give O(1) "
+            "everywhere. Why the list must be doubly linked, why sentinels delete a dozen branches, "
+            "and why the node has to store its own key."
+        ),
+    },
+    {
+        "number": 149,
+        "slug": "leetcode-149-max-points-on-a-line",
+        "algorithm": "Implementation",
+        "title": "LeetCode 149 \u2013 Max Points on a Line",
+        "file": "149-max-points-on-a-line.html",
+        "date": "2025-01-03T01:03:48",
+        "difficulty": "Hard",
+        "tags": ["leetcode", "array", "hash-table", "math"],
+        "excerpt": (
+            "A Hard problem whose algorithm is trivial and whose difficulty is entirely how you "
+            "represent a slope. Floating point is unsound as a hash key and fails silently on large "
+            "coordinates; an unreduced pair splits equal slopes; a reduced pair without a sign "
+            "convention splits opposite directions."
+        ),
+    },
+    {
         "number": 200,
         "batch": "interview-essentials",
         "slug": "leetcode-200-number-of-islands",
         "algorithm": "Graph Theory",
         "title": "LeetCode 200 – Number of Islands",
         "file": "200-number-of-islands.html",
-        "date": "2024-12-19T14:22:39",
+        "date": "2025-02-15T11:47:03",
         "difficulty": "Medium",
         "tags": ["leetcode", "graph", "depth-first-search", "breadth-first-search", "matrix"],
         "excerpt": (
@@ -1340,7 +1438,7 @@ POSTS = [
         "algorithm": "Sorting",
         "title": "LeetCode 347 – Top K Frequent Elements",
         "file": "347-top-k-frequent-elements.html",
-        "date": "2024-12-21T08:57:11",
+        "date": "2025-07-05T16:22:41",
         "difficulty": "Medium",
         "tags": ["leetcode", "hash-table", "heap", "sorting"],
         "excerpt": (
@@ -1357,7 +1455,7 @@ POSTS = [
         "algorithm": "Graph Theory",
         "title": "LeetCode 543 – Diameter of Binary Tree",
         "file": "543-diameter-of-binary-tree.html",
-        "date": "2024-12-28T03:27:23",
+        "date": "2025-09-23T09:14:58",
         "difficulty": "Easy",
         "tags": ["leetcode", "tree", "depth-first-search", "recursion"],
         "excerpt": (

@@ -119,6 +119,17 @@ solution("134-gas-station.html", "S134")
 solution("136-single-number.html", "S136")
 
 solution("139-word-break.html", "S139")
+solution("141-linked-list-cycle.html", "S141")
+solution("142-linked-list-cycle-ii.html", "S142")
+solution("144-binary-tree-preorder-traversal.html", "S144")
+solution("145-binary-tree-postorder-traversal.html", "S145")
+solution("149-max-points-on-a-line.html", "S149")
+
+# LeetCode 146 defines `class LRUCache`, not `class Solution`, so it is taken verbatim.
+for block in blocks("146-lru-cache.html"):
+    if re.search(r'\bclass\s+LRUCache\b', block):
+        parts.append(block)
+        break
 
 # Problem 138 is written against a class called `Node`, which collides with
 # problem 133's graph Node. Rename it in the extracted source only.
@@ -686,6 +697,63 @@ public class Main {
             if (words.contains(text.substring(i, j)) && breakableModel(text, words, memo, j))
                 return memo[i] = true;
         return memo[i] = false;
+    }
+
+    static ListNode buildCycle(int[] values, int pos) {
+        if (values.length == 0) return null;
+        ListNode head = toList(values);
+        List<ListNode> nodes = new ArrayList<>();
+        for (ListNode n = head; n != null; n = n.next) nodes.add(n);
+        if (pos >= 0) nodes.get(nodes.size() - 1).next = nodes.get(pos);
+        return head;
+    }
+
+    /** Index of `target` walking from head; -1 if not reached within n steps. */
+    static int indexOfNode(ListNode head, ListNode target, int limit) {
+        int i = 0;
+        for (ListNode n = head; n != null && i <= limit; n = n.next, i++)
+            if (n == target) return i;
+        return -1;
+    }
+
+    static void preorderList(TreeNode node, List<Integer> out) {
+        if (node == null) return;
+        out.add(node.val);
+        preorderList(node.left, out);
+        preorderList(node.right, out);
+    }
+
+    static void postorderList(TreeNode node, List<Integer> out) {
+        if (node == null) return;
+        postorderList(node.left, out);
+        postorderList(node.right, out);
+        out.add(node.val);
+    }
+
+    /** Largest collinear subset, by exact integer cross products. */
+    static int maxPointsModel(int[][] pts) {
+        int n = pts.length;
+        if (n <= 2) return n;
+        int best = 1;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                if (i == j) continue;
+                long x1 = pts[i][0], y1 = pts[i][1], x2 = pts[j][0], y2 = pts[j][1];
+                if (x1 == x2 && y1 == y2) continue;
+                int count = 0;
+                for (int[] p : pts)
+                    if ((x2 - x1) * (p[1] - y1) - (y2 - y1) * (p[0] - x1) == 0) count++;
+                best = Math.max(best, count);
+            }
+        }
+        if (best == 1) {
+            for (int[] a : pts) {
+                int same = 0;
+                for (int[] b : pts) if (a[0] == b[0] && a[1] == b[1]) same++;
+                best = Math.max(best, same);
+            }
+        }
+        return best;
     }
 
     static int[] sortedInts(int[] xs) { int[] c = xs.clone(); Arrays.sort(c); return c; }
@@ -2750,6 +2818,155 @@ public class Main {
             }
         }
         check("matches memoised search on every a/b string up to length 7", breakBad, 0);
+
+        System.out.println("LeetCode 141 - Linked List Cycle");
+        S141 s141 = new S141();
+        check("[3,2,0,-4] pos=1", s141.hasCycle(buildCycle(new int[]{3,2,0,-4}, 1)), true);
+        check("[1,2] pos=0", s141.hasCycle(buildCycle(new int[]{1,2}, 0)), true);
+        check("[1] no cycle", s141.hasCycle(buildCycle(new int[]{1}, -1)), false);
+        check("empty list", s141.hasCycle(buildCycle(new int[]{}, -1)), false);
+        check("[1] pos=0 (self loop)", s141.hasCycle(buildCycle(new int[]{1}, 0)), true);
+        check("[1,1] no cycle (equal VALUES)", s141.hasCycle(buildCycle(new int[]{1,1}, -1)), false);
+        int cycleBad = 0;
+        for (int n = 1; n <= 9; n++) {
+            int[] values = new int[n];
+            for (int i = 0; i < n; i++) values[i] = i;
+            for (int pos = -1; pos < n; pos++)
+                if (s141.hasCycle(buildCycle(values, pos)) != (pos >= 0)) cycleBad++;
+        }
+        check("every list length 1..9 against every cycle entry point", cycleBad, 0);
+
+        System.out.println("LeetCode 142 - Linked List Cycle II");
+        S142 s142 = new S142();
+        ListNode c142 = buildCycle(new int[]{3,2,0,-4}, 1);
+        check("[3,2,0,-4] pos=1 returns index 1", indexOfNode(c142, s142.detectCycle(c142), 4), 1);
+        ListNode c142b = buildCycle(new int[]{1,2}, 0);
+        check("[1,2] pos=0 returns the head", s142.detectCycle(c142b) == c142b, true);
+        check("no cycle", s142.detectCycle(buildCycle(new int[]{1}, -1)), null);
+        check("empty list", s142.detectCycle(buildCycle(new int[]{}, -1)), null);
+        int entryBad = 0;
+        for (int n = 1; n <= 9; n++) {
+            int[] values = new int[n];
+            for (int i = 0; i < n; i++) values[i] = i;
+            for (int pos = -1; pos < n; pos++) {
+                ListNode head = buildCycle(values, pos);
+                ListNode got = s142.detectCycle(head);
+                if (pos < 0) { if (got != null) entryBad++; }
+                else if (got == null || indexOfNode(head, got, n) != pos) entryBad++;
+            }
+        }
+        check("returns the exact entry node for every length and entry point", entryBad, 0);
+
+        System.out.println("LeetCode 144 - Binary Tree Preorder Traversal");
+        S144 s144 = new S144();
+        check("[1,null,2,3]", s144.preorderTraversal(buildTree(1,null,2,3)), List.of(1,2,3));
+        check("empty tree", s144.preorderTraversal(null), List.of());
+        check("single node", s144.preorderTraversal(buildTree(1)), List.of(1));
+        check("[4,2,6,1,3,5,7]", s144.preorderTraversal(buildTree(4,2,6,1,3,5,7)),
+              List.of(4,2,1,3,6,5,7));
+        int preBad = 0;
+        for (int n = 1; n <= 9; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                List<Integer> model = new ArrayList<>();
+                preorderList(buildTree(xs), model);
+                if (!s144.preorderTraversal(buildTree(xs)).equals(model)) preBad++;
+            }
+        }
+        check("matches a recursive model on every small tree shape", preBad, 0);
+
+        System.out.println("LeetCode 145 - Binary Tree Postorder Traversal");
+        S145 s145 = new S145();
+        check("[1,null,2,3]", s145.postorderTraversal(buildTree(1,null,2,3)), List.of(3,2,1));
+        check("empty tree", s145.postorderTraversal(null), List.of());
+        check("single node", s145.postorderTraversal(buildTree(1)), List.of(1));
+        check("[4,2,6,1,3,5,7]", s145.postorderTraversal(buildTree(4,2,6,1,3,5,7)),
+              List.of(1,3,2,5,7,6,4));
+        int postBad = 0, rootLastBad = 0;
+        for (int n = 1; n <= 9; n++) {
+            for (Integer[] xs : treeShapesOfSize(n)) {
+                List<Integer> model = new ArrayList<>();
+                postorderList(buildTree(xs), model);
+                List<Integer> got = s145.postorderTraversal(buildTree(xs));
+                if (!got.equals(model)) postBad++;
+                else if (!got.get(got.size() - 1).equals(xs[0])) rootLastBad++;
+            }
+        }
+        check("matches a recursive model on every small tree shape", postBad, 0);
+        check("the root is always last", rootLastBad, 0);
+
+        System.out.println("LeetCode 146 - LRU Cache");
+        LRUCache lru = new LRUCache(2);
+        lru.put(1, 1); lru.put(2, 2);
+        check("get(1) after two puts", lru.get(1), 1);
+        lru.put(3, 3);                       // evicts 2, because get(1) was a use
+        check("get(2) evicted", lru.get(2), -1);
+        lru.put(4, 4);                       // evicts 1
+        check("get(1) evicted", lru.get(1), -1);
+        check("get(3)", lru.get(3), 3);
+        check("get(4)", lru.get(4), 4);
+        LRUCache updater = new LRUCache(2);
+        updater.put(1, 1); updater.put(1, 10); updater.put(2, 2);
+        check("update does not consume capacity", updater.get(1) + "," + updater.get(2), "10,2");
+        LRUCache tiny = new LRUCache(1);
+        tiny.put(1, 1); tiny.put(2, 2);
+        check("capacity 1 evicts immediately", tiny.get(1) + "," + tiny.get(2), "-1,2");
+        check("missing key returns -1", new LRUCache(2).get(99), -1);
+        // Against a deliberately naive reference implementation.
+        int lruBad = 0;
+        for (int capacity : new int[]{1, 2, 3, 5}) {
+            LRUCache real = new LRUCache(capacity);
+            LinkedHashMap<Integer, Integer> model = new LinkedHashMap<>();
+            Random rng = new Random(20260902 + capacity);
+            for (int step = 0; step < 400; step++) {
+                int key = rng.nextInt(6);
+                if (rng.nextBoolean()) {
+                    Integer expected = model.get(key);
+                    if (expected != null) { model.remove(key); model.put(key, expected); }
+                    if (real.get(key) != (expected == null ? -1 : expected)) { lruBad++; break; }
+                } else {
+                    int value = rng.nextInt(100);
+                    if (model.containsKey(key)) model.remove(key);
+                    else if (model.size() == capacity)
+                        model.remove(model.keySet().iterator().next());
+                    model.put(key, value);
+                    real.put(key, value);
+                }
+            }
+        }
+        check("matches a reference LRU over 400 random ops at four capacities", lruBad, 0);
+
+        System.out.println("LeetCode 149 - Max Points on a Line");
+        S149 s149 = new S149();
+        check("[[1,1],[2,2],[3,3]]", s149.maxPoints(new int[][]{{1,1},{2,2},{3,3}}), 3);
+        check("the six-point example",
+              s149.maxPoints(new int[][]{{1,1},{3,2},{5,3},{4,1},{2,3},{1,4}}), 4);
+        check("single point", s149.maxPoints(new int[][]{{1,1}}), 1);
+        check("two identical points", s149.maxPoints(new int[][]{{1,1},{1,1}}), 2);
+        check("vertical line", s149.maxPoints(new int[][]{{0,0},{0,1},{0,2}}), 3);
+        check("horizontal line", s149.maxPoints(new int[][]{{0,5},{1,5},{2,5}}), 3);
+        check("points on both sides of the anchor",
+              s149.maxPoints(new int[][]{{-1,-1},{0,0},{1,1}}), 3);
+        // THE duplicate trap: a copy of the anchor lies on every line through it.
+        check("duplicate anchor plus a third point",
+              s149.maxPoints(new int[][]{{0,0},{0,0},{0,1}}), 3);
+        int pointsBad = 0;
+        int[][] grid = new int[9][];
+        for (int i = 0; i < 9; i++) grid[i] = new int[]{i / 3, i % 3};
+        for (int n = 1; n <= 4; n++) {
+            int[] idx = new int[n];
+            while (true) {
+                int[][] pts = new int[n][];
+                for (int i = 0; i < n; i++) pts[i] = grid[idx[i]].clone();
+                int[][] copy = new int[n][];
+                for (int i = 0; i < n; i++) copy[i] = pts[i].clone();
+                if (s149.maxPoints(copy) != maxPointsModel(pts)) pointsBad++;
+                int k = n - 1;
+                while (k >= 0 && idx[k] == 8) { idx[k] = 0; k--; }
+                if (k < 0) break;
+                idx[k]++;
+            }
+        }
+        check("matches exact-collinearity brute force on every point set up to size 4", pointsBad, 0);
 
         System.out.println();
         if (failures > 0) {
