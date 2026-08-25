@@ -26,9 +26,9 @@ projects/mysql_tutorial/
   progress_report.md   status, decisions, and the bugs worth not repeating — read this first
 ```
 
-## The track
+## The track — ✅ published
 
-**52 posts** at `/sql/{slug}`, dated 2024-05-06 → 2025-01-16.
+**52 posts** at `/sql/{slug}`, dated 2024-05-06 → 2025-01-16. All live.
 
 ⚠️ **42 of the 52 slugs are live, indexed URLs** published 2018-2021. They are rewritten in
 place. Changing one is a dead link and `verify-build.mjs` fails the frontend build for it.

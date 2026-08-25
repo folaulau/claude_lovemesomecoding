@@ -1,6 +1,6 @@
 # MySQL tutorial track — progress report
 
-**Status:** 🟡 **13 of 52 written and PUBLISHED LIVE (2026-08-24). 39 still to write.**
+**Status:** ✅ **PUBLISHED AND LIVE.** All 52 posts on https://lovemesomecoding.com/sql, all 52 URLs verified at the edge.
 **Started:** 2026-08-24
 **Where it lands:** https://lovemesomecoding.com/sql
 
@@ -30,30 +30,34 @@ published between 2018-09-29 and 2021-09-13.
 | Lab database | ✅ `pizza_lab` built and verified: 400,000 orders, 1,000,000 items |
 | `lab/build.sql` + `setup.sh` | ✅ deterministic, reproducible, integrity-checked |
 | `seed.py` / `check_content.py` / `check_sql.py` / `authoring.py` | ✅ all four run clean |
-| Post bodies | 🟡 **13 of 52** — 55 quoted results re-derived from a live database |
+| Post bodies | ✅ **52 of 52** — 278 statement blocks executed, 160 results re-derived |
 | Content pipeline | ✅ nothing to do — see below |
 | Site nav | ✅ nothing to do — `sql` is already in the Data Store group |
 
-### Published 2026-08-24 — the 7 written posts only
+### Published 2026-08-24 — the complete track
 
-Seeded to prod with `--only`, **deliberately WITHOUT `--force-dates`**, and the frontend deployed
-(build `394b0bd`, CloudFront function republished with 101 redirects, invalidation completed).
-All 7 URLs verified serving at the edge, all 7 in the sitemap. Post count unchanged at 823;
-`/sql` still holds 42.
+Seeded to prod with `--force-dates` (the full date re-base, correct to run now that all 52 exist)
+and the frontend deployed. **All 52 URLs return 200, all 52 are in the sitemap, none contains an
+`<img>` or a `boldgrid` wrapper.** `/sql` holds 52 posts; the archive reads lesson 1 -> 52, the same
+way `/vue` and `/postgre` do.
 
-⚠️ **THE DATE RE-BASE HAS NOT HAPPENED AND MUST NOT HAPPEN YET.**
+| | before | after |
+|---|---:|---:|
+| Posts | 42 | 52 |
+| Total words | 18,643 | 50,126 |
+| Prose share | — | 73% |
+| Posts with no body | 2 | 0 |
+| `<img>` tags | 99 | **0** |
+| WordPress wrapper divs | 36 posts | **0** |
+| Quoted results verified against a live database | 0 | **160** |
 
-`--force-dates` would move these 7 from 2019-03-31 to 2024-06/07 — which, because archives sort
-newest first, lands them at the TOP of `/sql`, ahead of the 35 posts that are still WordPress
-stubs. The ‹ prev / next › pager would then walk a track that is 87% unwritten. Re-base the whole
-track in one go, once all 52 bodies exist:
+The command, for any later re-seed:
 
 ```bash
 AWS_PROFILE=folau lovemesomecoding_backend/.venv/bin/python projects/mysql_tutorial/seed.py \
     --env prod --write --force-dates
+cd lovemesomecoding_frontend && AWS_PROFILE=folau npm run deploy
 ```
-
-Until then every seed of this track uses `--only` and omits `--force-dates`.
 
 ### Posts written so far
 
