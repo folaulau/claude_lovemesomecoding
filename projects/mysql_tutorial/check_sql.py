@@ -88,8 +88,13 @@ LANG = re.compile(r'language-([\w-]+)', re.I)
 INNER_CODE = re.compile(r"^\s*<code\b[^>]*>(.*)</code>\s*$", re.S | re.I)
 
 # A block that begins with one of these is a statement we can run.
+#
+# The leading `\(*` matters: a UNION whose branches are parenthesised so each can carry
+# its own ORDER BY / LIMIT begins with "(", and without this it was classified `fragment`
+# and silently never run — the checker reporting success on a block it had skipped.
 STATEMENT_START = re.compile(
     r"^\s*(?:--[^\n]*\n\s*)*"                     # leading comments
+    r"\(*\s*"                                     # parenthesised branches, e.g. (SELECT ...) UNION
     r"(SELECT|INSERT|UPDATE|DELETE|REPLACE|WITH|CREATE|ALTER|DROP|TRUNCATE|"
     r"EXPLAIN|DESCRIBE|DESC|SHOW|SET|USE|START|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|"
     r"GRANT|REVOKE|FLUSH|ANALYZE|OPTIMIZE|CALL|PREPARE|EXECUTE|DEALLOCATE|"

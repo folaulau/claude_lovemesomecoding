@@ -1,6 +1,6 @@
 # MySQL tutorial track — progress report
 
-**Status:** 🟡 **7 of 52 written and PUBLISHED LIVE (2026-08-24). 45 still to write.**
+**Status:** 🟡 **13 of 52 written and PUBLISHED LIVE (2026-08-24). 39 still to write.**
 **Started:** 2026-08-24
 **Where it lands:** https://lovemesomecoding.com/sql
 
@@ -30,7 +30,7 @@ published between 2018-09-29 and 2021-09-13.
 | Lab database | ✅ `pizza_lab` built and verified: 400,000 orders, 1,000,000 items |
 | `lab/build.sql` + `setup.sh` | ✅ deterministic, reproducible, integrity-checked |
 | `seed.py` / `check_content.py` / `check_sql.py` / `authoring.py` | ✅ all four run clean |
-| Post bodies | 🟡 **7 of 52** — 32 quoted results re-derived from a live database |
+| Post bodies | 🟡 **13 of 52** — 55 quoted results re-derived from a live database |
 | Content pipeline | ✅ nothing to do — see below |
 | Site nav | ✅ nothing to do — `sql` is already in the Data Store group |
 
@@ -66,7 +66,16 @@ Until then every seed of this track uses `--only` and omits `--force-dates`.
 | 12 | `sql-like` | 188 | 651 | 3 | 78% | 4 |
 | 13 | `sql-order-by` | 135 | 781 | 4 | 73% | 3 |
 | 14 | `sql-limit` | 169 | 783 | 4 | 70% | 4 |
-| | **total** | **1,412** | **5,520** | | **68%** | **32** |
+| 16 | `sql-join-or-inner-join` | 165 | 878 | 4 | 71% | 3 |
+| 17 | `sql-left-join` | 99 | 886 | 4 | 61% | 7 |
+| 18 | `sql-right-join` | 56 | 635 | 3 | 78% | 2 |
+| 19 | `sql-cross-join` | 25 | 636 | 3 | 70% | 3 |
+| 20 | `sql-self-join` | 48 | 791 | 4 | 62% | 3 |
+| 21 | `mysql-union` | new | 884 | 4 | 68% | 5 |
+| | **total** | **1,805** | **10,230** | | **68%** | **55** |
+
+`mysql-union` is the first NEW post published, so `/sql` went 42 -> 43 and it is now the newest
+post in the archive (2024-08-14, its manifest date). The five rewrites kept 2019-03-31.
 
 Written out of order deliberately: the "Reading data" section shares one set of tables, so its
 outputs could be captured in batches. The remaining 45 are listed in `manifest.py` in reading
@@ -297,7 +306,17 @@ fails any compared output that differs between the runs.** `--once` skips it.
 The irony is that the post is *about* this bug — pagination over a non-unique sort key repeats and
 skips rows. It now demonstrates it with deterministic queries and a unique tiebreaker.
 
-### 4. A checker rule that cried wolf
+### 4. A block the checker skipped and reported as passing
+
+`mysql-union` quotes a UNION whose branches are parenthesised so each can carry its own
+`ORDER BY`/`LIMIT`. It therefore starts with `(`, which `STATEMENT_START` did not match, so the
+block was classified `fragment` and **never run** — while the post reported `all pass`.
+
+A checker that silently skips work is worse than one that fails, because the summary line looks
+identical either way. The `--list` output is the tell: watch the `fragment` count and know why each
+one is there. `STATEMENT_START` now allows leading parentheses.
+
+### 5. A checker rule that cried wolf
 
 The "only declared posts may show a query plan" rule searched the whole post body, so
 `sql-order-by` failed for using the words *Using filesort* in a sentence. A quoted plan is by

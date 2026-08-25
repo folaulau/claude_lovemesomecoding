@@ -1,0 +1,122 @@
+<p>A self join is a table joined to itself. It is not a separate kind of join — there is no
+<code>SELF JOIN</code> keyword — it is an ordinary <code>JOIN</code> where both sides happen to name
+the same table. Everything you know about
+<a href="/sql/sql-join-or-inner-join">INNER</a> and <a href="/sql/sql-left-join">LEFT</a> joins
+applies unchanged.</p>
+
+<p>The one thing that stops being optional is the alias. MySQL needs two different names to tell the
+two copies apart, so <code>FROM staff, staff</code> is an error and <code>FROM staff a JOIN staff
+b</code> is fine.</p>
+
+<h2>The classic: a row that points at another row</h2>
+
+<p>The pizza schema has no parent-child column, so here is a small staff table that does — each
+person's <code>manager_id</code> refers to another row in the same table:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE staff (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(80)  NOT NULL,
+    role       VARCHAR(40)  NOT NULL,
+    manager_id BIGINT       NULL,
+    CONSTRAINT fk_staff_manager FOREIGN KEY (manager_id) REFERENCES staff (id)
+);
+
+INSERT INTO staff (id, name, role, manager_id) VALUES
+    (1, 'Dana Whitfield', 'General Manager', NULL),
+    (2, 'Alex Rivera',    'Shift Lead',      1),
+    (3, 'Priya Nair',     'Shift Lead',      1),
+    (4, 'Sam Chen',       'Driver',          2),
+    (5, 'Casey Lindgren', 'Cook',            3);</code></pre>
+
+<p>The foreign key points at the table it lives in, which is legal and is what makes the shape work.
+Now pair each employee with their manager:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT e.name AS employee, e.role, m.name AS manager
+FROM   staff e
+LEFT   JOIN staff m ON m.id = e.manager_id
+ORDER  BY e.id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+-----------------+----------------+
+| employee       | role            | manager        |
++----------------+-----------------+----------------+
+| Dana Whitfield | General Manager | NULL           |
+| Alex Rivera    | Shift Lead      | Dana Whitfield |
+| Priya Nair     | Shift Lead      | Dana Whitfield |
+| Sam Chen       | Driver          | Alex Rivera    |
+| Casey Lindgren | Cook            | Priya Nair     |
++----------------+-----------------+----------------+</code></pre>
+
+<p><code>LEFT JOIN</code>, not <code>JOIN</code>: the General Manager has no manager, and an inner
+join would drop the person at the top of the tree. That is the usual bug in this query.</p>
+
+<p>This walks <strong>one</strong> level. "Everyone under Dana, however deep" is a different problem
+— you cannot express an unbounded depth by adding joins. That needs a
+<a href="/sql/mysql-cte">recursive CTE</a>, or the
+<a href="/sql/mysql-closure-table">closure table</a> pattern.</p>
+
+<h2>Comparing rows within a table</h2>
+
+<p>The other everyday use is finding pairs. Which line items travelled together in the same order?</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT i1.order_id, i1.product_name AS item_a, i2.product_name AS item_b
+FROM   order_item i1
+JOIN   order_item i2 ON i2.order_id = i1.order_id AND i2.id &gt; i1.id
+ORDER  BY i1.order_id, i1.id, i2.id
+LIMIT  5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+-------------------+-------------------+
+| order_id | item_a            | item_b            |
++----------+-------------------+-------------------+
+|        1 | Pepperoni Pizza   | Pepsi             |
+|        3 | Meat Lovers Pizza | Iced Tea          |
+|        6 | BBQ Chicken Pizza | Mountain Dew      |
+|        8 | Pepperoni Pizza   | Bottled Water     |
+|       11 | Supreme Pizza     | Meat Lovers Pizza |
++----------+-------------------+-------------------+</code></pre>
+
+<h2><code>a.id &lt; b.id</code> is the whole trick</h2>
+
+<p>That extra condition is doing more work than it looks. Without any guard, every row matches
+itself, and every genuine pair appears twice — once in each direction:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT
+    (SELECT COUNT(*) FROM order_item a JOIN order_item b ON b.order_id = a.order_id) AS no_guard,
+    (SELECT COUNT(*) FROM order_item a JOIN order_item b ON b.order_id = a.order_id AND b.id &lt;&gt; a.id) AS not_equal,
+    (SELECT COUNT(*) FROM order_item a JOIN order_item b ON b.order_id = a.order_id AND b.id &gt; a.id) AS ordered_pairs;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+-----------+---------------+
+| no_guard | not_equal | ordered_pairs |
++----------+-----------+---------------+
+|       47 |        20 |            10 |
++----------+-----------+---------------+</code></pre>
+
+<p>Three different answers to what sounds like one question:</p>
+
+<ul>
+  <li><strong>47</strong> — no guard. Includes each row paired with itself.</li>
+  <li><strong>20</strong> — <code>&lt;&gt;</code> removes the self-pairs but keeps both
+      directions, so (A, B) and (B, A) are both there. Exactly double the truth.</li>
+  <li><strong>10</strong> — <code>&gt;</code> keeps one row per unordered pair. This is the
+      answer.</li>
+</ul>
+
+<p>Use <code>&lt;</code> or <code>&gt;</code> when the pair is unordered ("these two went
+together") and <code>&lt;&gt;</code> when direction is meaningful ("A is a substitute for B" is not
+the same claim as the reverse).</p>
+
+<h2>A self join needs its indexes like any other</h2>
+
+<p>Both copies of the table are read independently, so the join column wants an index the same way
+it would across two different tables — here <code>order_item.order_id</code>, which the schema
+already indexes. Pair-finding queries also grow quadratically within each group: a self join over
+orders with a handful of items each is cheap, and one over a group of 10,000 rows is 50 million
+pairs. Filter before you pair, not after.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>A self join is an ordinary join; only the aliases become mandatory.</li>
+  <li>Use <code>LEFT JOIN</code> for parent lookups or you lose the row at the top.</li>
+  <li><code>a.id &lt; b.id</code> removes both self-pairs and mirrored duplicates.</li>
+  <li>One self join walks one level. Arbitrary depth needs a recursive CTE.</li>
+</ul>

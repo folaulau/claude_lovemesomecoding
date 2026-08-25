@@ -1,0 +1,159 @@
+<p>An <a href="/sql/sql-join-or-inner-join">inner join</a> keeps rows that match on both sides.
+A <code>LEFT JOIN</code> keeps <strong>every row from the left table</strong> whether or not the
+right side has anything, filling the missing columns with NULL.</p>
+
+<p>The pizza schema is built around a case where that matters.
+<code>customer_order.user_id</code> is nullable <em>on purpose</em>: it is NULL exactly when the
+order came from a guest checkout, with no account behind it. Ten of the eighteen demo orders are
+guest orders, so any query that joins orders to accounts has to decide what to do about them.</p>
+
+<h2>What it does</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT o.id, o.customer_name, u.email AS account_email, o.guest_email
+FROM   customer_order o
+LEFT   JOIN app_user u ON u.id = o.user_id
+ORDER  BY o.id
+LIMIT  5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------+---------------------+-----------------------+
+| id | customer_name | account_email       | guest_email           |
++----+---------------+---------------------+-----------------------+
+|  1 | Demo Customer | customer@pizza.test | NULL                  |
+|  2 | Alex Rivera   | NULL                | guest1@example.com    |
+|  3 | Demo Customer | customer@pizza.test | NULL                  |
+|  4 | Sam Chen      | NULL                | guest2@example.com    |
+|  5 | Jordan Blake  | NULL                | abandoned@example.com |
++----+---------------+---------------------+-----------------------+</code></pre>
+
+<p>Orders 2, 4 and 5 have no account. Every column that came from <code>app_user</code> is NULL for
+them — not because the account has a NULL email, but because <strong>there is no matching row at
+all</strong>. That is where outer-join NULLs come from, and it is worth keeping the two causes
+straight when you read a result.</p>
+
+<h2>The counts</h2>
+
+<p>This is the difference in one number. Inner join:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS inner_rows FROM customer_order o JOIN app_user u ON u.id = o.user_id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+
+| inner_rows |
++------------+
+|          8 |
++------------+</code></pre>
+
+<p>Left join:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS left_rows FROM customer_order o LEFT JOIN app_user u ON u.id = o.user_id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------+
+| left_rows |
++-----------+
+|        18 |
++-----------+</code></pre>
+
+<p>18 is the number of orders. That is the useful property: <strong>a left join cannot lose rows
+from the table you started with.</strong> If a report is meant to have one row per order, a left
+join guarantees it and an inner join quietly does not.</p>
+
+<h2>Finding the rows with nothing</h2>
+
+<p>Because unmatched rows get NULL on the right, testing the right side for NULL isolates exactly
+those — the anti-join:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT o.id, o.customer_name, o.guest_email
+FROM   customer_order o
+LEFT   JOIN app_user u ON u.id = o.user_id
+WHERE  u.id IS NULL
+ORDER  BY o.id
+LIMIT  4;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------+-----------------------+
+| id | customer_name | guest_email           |
++----+---------------+-----------------------+
+|  2 | Alex Rivera   | guest1@example.com    |
+|  4 | Sam Chen      | guest2@example.com    |
+|  5 | Jordan Blake  | abandoned@example.com |
+|  7 | Priya Nair    | guest3@example.com    |
++----+---------------+-----------------------+</code></pre>
+
+<p>Test a <strong>NOT NULL</strong> column of the right table — the primary key is the safe choice.
+Testing a nullable column cannot distinguish "no matching row" from "matched a row whose value is
+NULL".</p>
+
+<h2>Counting, with the zeros kept</h2>
+
+<p>The other everyday use is counting children without dropping the childless parents:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT i.id, i.product_name, COUNT(t.id) AS toppings
+FROM   order_item i
+LEFT   JOIN order_item_topping t ON t.order_item_id = i.id
+GROUP  BY i.id, i.product_name
+ORDER  BY toppings DESC, i.id
+LIMIT  5;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+---------------------+----------+
+| id | product_name        | toppings |
++----+---------------------+----------+
+| 10 | Veggie Lovers Pizza |        2 |
+| 11 | Pepperoni Pizza     |        2 |
+| 19 | Pepperoni Pizza     |        2 |
+| 26 | Supreme Pizza       |        2 |
+|  4 | Meat Lovers Pizza   |        1 |
++----+---------------------+----------+</code></pre>
+
+<p><code>COUNT(t.id)</code>, not <code>COUNT(*)</code>. An item with no toppings still produces one
+row — with NULLs on the right — so <code>COUNT(*)</code> would count that row and report 1 instead
+of 0. <code>COUNT(column)</code> ignores NULLs, which is exactly what you want here. See
+<a href="/sql/sql-isnull">NULL and IS NULL</a>.</p>
+
+<h2>The mistake everyone makes once</h2>
+
+<p>Put a condition on the right-hand table in <code>WHERE</code>, and the left join silently becomes
+an inner join:</p>
+
+<pre class="language-sql"><code class="language-sql">-- looks like a LEFT JOIN, behaves like an INNER JOIN
+SELECT COUNT(*) AS rows_returned
+FROM   customer_order o
+LEFT   JOIN app_user u ON u.id = o.user_id
+WHERE  u.role = 'CUSTOMER';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------+
+| rows_returned |
++---------------+
+|             8 |
++---------------+</code></pre>
+
+<p>Eight, not eighteen. Every guest order has <code>u.role = NULL</code>, and
+<code>NULL = 'CUSTOMER'</code> is unknown, so <code>WHERE</code> drops it. The left join did its
+job and then <code>WHERE</code> undid it.</p>
+
+<p>Move the condition into <code>ON</code> and the unmatched rows survive:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS rows_returned
+FROM   customer_order o
+LEFT   JOIN app_user u ON u.id = o.user_id AND u.role = 'CUSTOMER';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------+
+| rows_returned |
++---------------+
+|            18 |
++---------------+</code></pre>
+
+<p>The rule is worth memorising, because nothing warns you: <strong>a condition in <code>ON</code>
+decides what counts as a match; a condition in <code>WHERE</code> filters the rows that came
+out.</strong> For the left table it makes no difference. For the right table it is the difference
+between a left join and an inner one.</p>
+
+<p>The one deliberate exception is the anti-join above, where <code>WHERE ... IS NULL</code> in the
+<code>WHERE</code> clause is precisely the point.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>LEFT JOIN</code> keeps every left row; unmatched right columns come back NULL.</li>
+  <li>It cannot lose rows from the left table — which is why report queries prefer it.</li>
+  <li><code>WHERE right.pk IS NULL</code> finds the rows with no match.</li>
+  <li>Use <code>COUNT(right.col)</code>, not <code>COUNT(*)</code>, when counting children.</li>
+  <li>A filter on the right table belongs in <code>ON</code>, not <code>WHERE</code>.</li>
+</ul>

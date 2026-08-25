@@ -1,0 +1,135 @@
+<p>A relational database splits information across tables on purpose. The pizza schema keeps products
+in <code>product</code> and their per-size prices in <code>product_size</code>, so changing a price
+touches one row instead of many. A join is how you put those pieces back together in one result.</p>
+
+<p><code>INNER JOIN</code> is the one you will use most: it returns rows that have a match on
+<strong>both</strong> sides. <code>JOIN</code> with no qualifier means exactly the same thing —
+<code>INNER</code> is optional and usually left out.</p>
+
+<h2>Joining two tables</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT p.name, ps.size, ps.price
+FROM   product p
+JOIN   product_size ps ON ps.product_id = p.id
+WHERE  p.name = 'Hawaiian Pizza'
+ORDER  BY ps.price;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+--------+-------+
+| name           | size   | price |
++----------------+--------+-------+
+| Hawaiian Pizza | SMALL  | 12.49 |
+| Hawaiian Pizza | MEDIUM | 15.49 |
+| Hawaiian Pizza | LARGE  | 18.49 |
++----------------+--------+-------+</code></pre>
+
+<p>One product row, three price rows, three rows out. The product's name is repeated on each,
+because a join produces a flat table — there is no nesting in a result set.</p>
+
+<p>Two pieces of syntax are doing the work:</p>
+
+<ul>
+  <li><strong>The alias.</strong> <code>product p</code> lets you write <code>p.name</code>. Once
+      two tables are involved, a bare <code>name</code> is ambiguous and MySQL will say so.</li>
+  <li><strong>The <code>ON</code> clause.</strong> It says which rows belong together. Here it is
+      the foreign key — <code>product_size.product_id</code> points at
+      <code>product.id</code> — which is the common case but not a rule. You can join on anything
+      that compares.</li>
+</ul>
+
+<h2>How to read it</h2>
+
+<p>Conceptually MySQL pairs every row on the left with every row on the right, then keeps the pairs
+where <code>ON</code> is true. That is a useful mental model and a terrible execution plan, so the
+optimizer does something far cleverer — usually looking each match up through an index. The result
+is the same; only the speed differs. See <a href="/sql/sql-explain">EXPLAIN</a> for what it actually
+chose.</p>
+
+<h2>More than two tables</h2>
+
+<p>Joins chain. An order has line items, and a line item has toppings — three levels in the pizza
+schema:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT o.id AS order_id, i.product_name, t.topping_name, t.price
+FROM   customer_order o
+JOIN   order_item i        ON i.order_id = o.id
+JOIN   order_item_topping t ON t.order_item_id = i.id
+ORDER  BY o.id, i.id, t.id
+LIMIT  6;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+---------------------+---------------+-------+
+| order_id | product_name        | topping_name  | price |
++----------+---------------------+---------------+-------+
+|        3 | Meat Lovers Pizza   | Extra Cheese  |  1.75 |
+|        7 | Veggie Lovers Pizza | Mushrooms     |  1.00 |
+|        7 | Veggie Lovers Pizza | Green Peppers |  1.00 |
+|        8 | Pepperoni Pizza     | Extra Cheese  |  1.75 |
+|        8 | Pepperoni Pizza     | Bacon         |  1.75 |
+|       13 | Pepperoni Pizza     | Mushrooms     |  1.00 |
++----------+---------------------+---------------+-------+</code></pre>
+
+<p>Each <code>JOIN</code> adds a table and each <code>ON</code> attaches it to something already in
+the query. Notice that the result starts at order 3 — orders 1 and 2 have line items but no
+toppings on them, and an inner join drops anything without a match at <em>every</em> level. Keeping
+them is <a href="/sql/sql-left-join">LEFT JOIN</a>'s job.</p>
+
+<h2>Rows in, rows out</h2>
+
+<p>A join changes the row count, and forgetting that is the most common way to get a wrong total:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS matched_rows
+FROM   customer_order o
+JOIN   order_item i ON i.order_id = o.id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+
+| matched_rows |
++--------------+
+|           27 |
++--------------+</code></pre>
+
+<p>There are 18 orders, and 27 rows come back — one per line item. So
+<code>SUM(o.total)</code> over this join is <strong>not</strong> the revenue: every order's total is
+counted once per line item it happens to have. This is the classic fan-out bug, and it is silent.
+Aggregate the detail table, or aggregate in a subquery, but do not sum a column from the "one" side
+across a join to the "many" side. See <a href="/sql/sql-group-by-having">GROUP BY</a>.</p>
+
+<h2>Joining on something other than a key</h2>
+
+<p><code>ON</code> takes any condition, and it can have several:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT o.id, i.product_name, i.unit_price
+FROM   customer_order o
+JOIN   order_item i ON i.order_id = o.id AND i.unit_price &gt; 15
+ORDER  BY o.id
+LIMIT  3;</code></pre>
+
+<p>For an inner join, putting a filter in <code>ON</code> and putting it in <code>WHERE</code>
+give the same rows. For an outer join they emphatically do not — that difference is the whole
+point of the <a href="/sql/sql-left-join">LEFT JOIN</a> lesson, so it is worth getting the habit
+right here: <strong><code>ON</code> describes the relationship, <code>WHERE</code> filters the
+result.</strong></p>
+
+<h2>The comma join, and why not to use it</h2>
+
+<pre class="language-sql"><code class="language-sql">-- the old syntax: the relationship is buried in WHERE
+SELECT p.name, ps.price FROM product p, product_size ps WHERE ps.product_id = p.id;
+
+-- the same query, saying what it means
+SELECT p.name, ps.price FROM product p JOIN product_size ps ON ps.product_id = p.id;</code></pre>
+
+<p>Both work. The first hides the relationship among the filters, cannot express an outer join at
+all, and — if you forget the <code>WHERE</code> — silently returns every row times every row. That
+is a <a href="/sql/sql-cross-join">CROSS JOIN</a>, and it should be something you ask for rather
+than something you get.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>JOIN</code> and <code>INNER JOIN</code> are the same thing: rows matching on both
+      sides.</li>
+  <li>Alias your tables; qualify your columns.</li>
+  <li>A join to a "many" table multiplies rows — do not <code>SUM</code> the "one" side across
+      it.</li>
+  <li><code>ON</code> describes the relationship; <code>WHERE</code> filters the result.</li>
+</ul>
+
+<p>Next: <a href="/sql/sql-left-join">LEFT JOIN</a>, for when the match may not be there.</p>

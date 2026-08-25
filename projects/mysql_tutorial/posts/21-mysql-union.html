@@ -1,0 +1,158 @@
+<p>A join puts tables side by side, adding columns. <code>UNION</code> stacks result sets on top of
+each other, adding rows. Different tool, different question: use a join to bring related
+information together, and a <code>UNION</code> to treat two sets of rows as one list.</p>
+
+<h2>Stacking two queries</h2>
+
+<p>The pizza schema stores a contact address in two different places — registered accounts have
+<code>app_user.email</code>, guest orders have <code>customer_order.guest_email</code>. One mailing
+list out of both:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT u.email AS contact, 'account' AS source FROM app_user u
+UNION ALL
+SELECT o.guest_email, 'guest' FROM customer_order o WHERE o.guest_email IS NOT NULL
+ORDER  BY source, contact
+LIMIT  6;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+---------+
+| contact               | source  |
++-----------------------+---------+
+| admin@pizza.test      | account |
+| customer@pizza.test   | account |
+| abandoned@example.com | guest   |
+| guest1@example.com    | guest   |
+| guest2@example.com    | guest   |
+| guest3@example.com    | guest   |
++-----------------------+---------+</code></pre>
+
+<p>The literal <code>'account'</code> / <code>'guest'</code> column is a useful habit: once rows
+from different sources are mixed, you usually want to know which branch each came from.</p>
+
+<h2>The rules</h2>
+
+<ul>
+  <li>Every branch needs the <strong>same number of columns</strong>.</li>
+  <li>Corresponding columns need <strong>compatible types</strong>. MySQL will coerce where it can,
+      so a mismatch often produces bad data rather than an error.</li>
+  <li>Column names come from the <strong>first</strong> branch. The alias on the second one is
+      ignored, which is why the second query above does not bother naming its columns.</li>
+</ul>
+
+<h2>UNION vs UNION ALL</h2>
+
+<p>This is the part that matters. Plain <code>UNION</code> <strong>removes duplicate rows</strong>;
+<code>UNION ALL</code> keeps everything. Stacking the 18 orders' statuses onto themselves shows the
+difference:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS with_union_all FROM (
+  SELECT status FROM customer_order UNION ALL SELECT status FROM customer_order) x;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------+
+| with_union_all |
++----------------+
+|             36 |
++----------------+</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS with_union FROM (
+  SELECT status FROM customer_order UNION SELECT status FROM customer_order) x;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+
+| with_union |
++------------+
+|          5 |
++------------+</code></pre>
+
+<p>36 rows collapse to 5 — the five distinct statuses. Deduplication is a whole-row
+<code>DISTINCT</code>, so it has to sort or hash everything both branches produced.</p>
+
+<p><strong>Default to <code>UNION ALL</code>.</strong> Reach for plain <code>UNION</code> only when
+duplicates are genuinely possible <em>and</em> genuinely unwanted. Writing <code>UNION</code> out of
+habit buys a sort you did not need — and, worse, can silently delete real rows: two different
+customers who happen to share a name and a total are one row after deduplication.</p>
+
+<h2>Where ORDER BY and LIMIT go</h2>
+
+<p>A trailing <code>ORDER BY</code> applies to the <strong>combined</strong> result, not to the last
+branch — which is what you almost always want, and also why it can only reference the column names
+from the first branch. To sort or limit a branch on its own, parenthesise it:</p>
+
+<pre class="language-sql"><code class="language-sql">(SELECT id, total FROM customer_order WHERE order_type = 'DELIVERY' ORDER BY total DESC, id LIMIT 2)
+UNION ALL
+(SELECT id, total FROM customer_order WHERE order_type = 'CARRYOUT' ORDER BY total DESC, id LIMIT 2);</code></pre>
+
+<p>That is the "top 2 of each kind" shape, and it is one of the things <code>UNION ALL</code> does
+better than anything else short of a <a href="/sql/mysql-window-functions">window function</a>.</p>
+
+<h2>INTERSECT and EXCEPT</h2>
+
+<p>MySQL 8.0.31 added the other two set operators. <code>INTERSECT</code> keeps rows present in both
+branches:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT status FROM customer_order WHERE order_type = 'DELIVERY'
+INTERSECT
+SELECT status FROM customer_order WHERE order_type = 'CARRYOUT'
+ORDER  BY status;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------+
+| status    |
++-----------+
+| CANCELLED |
+| COMPLETED |
++-----------+</code></pre>
+
+<p><code>EXCEPT</code> keeps rows in the first branch that are not in the second:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT status FROM customer_order WHERE order_type = 'DELIVERY'
+EXCEPT
+SELECT status FROM customer_order WHERE order_type = 'CARRYOUT'
+ORDER  BY status;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------+
+| status    |
++-----------+
+| PAID      |
+| PREPARING |
++-----------+</code></pre>
+
+<p>Both deduplicate like <code>UNION</code> does. If you are on an older MySQL 8, the equivalents
+are a join for <code>INTERSECT</code> and a <code>LEFT JOIN ... IS NULL</code> anti-join for
+<code>EXCEPT</code>.</p>
+
+<h2>When a UNION is the wrong answer</h2>
+
+<p>Reaching for <code>UNION</code> to produce several counts over the same table is a common habit
+worth losing:</p>
+
+<pre class="language-sql"><code class="language-sql">-- three passes over the table
+SELECT 'completed' AS bucket, COUNT(*) FROM customer_order WHERE status = 'COMPLETED'
+UNION ALL
+SELECT 'cancelled', COUNT(*) FROM customer_order WHERE status = 'CANCELLED'
+UNION ALL
+SELECT 'paid', COUNT(*) FROM customer_order WHERE status = 'PAID';
+
+-- one pass, one row, and it reads better
+SELECT SUM(status = 'COMPLETED') AS completed,
+       SUM(status = 'CANCELLED') AS cancelled,
+       SUM(status = 'PAID')      AS paid
+FROM   customer_order;</code></pre>
+
+<p>That second form is <strong>conditional aggregation</strong> — see
+<a href="/sql/sql-if">IF and CASE</a>. One scan instead of three, and it gives you a row of columns
+rather than a column of rows, which is usually the shape a report wants anyway.</p>
+
+<p>The other place to stop and think: if you find yourself unioning several tables that hold the
+same kind of thing, the tables probably want to be one table with a type column — which is exactly
+what the pizza schema does with <code>product</code>, keeping pizzas and drinks together and
+separating them by <code>type</code>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>UNION</code> adds rows; a join adds columns.</li>
+  <li>Same column count, compatible types, names from the first branch.</li>
+  <li><code>UNION ALL</code> by default — plain <code>UNION</code> costs a sort and can delete real
+      rows.</li>
+  <li>A trailing <code>ORDER BY</code> applies to the whole result; parenthesise a branch to sort
+      it alone.</li>
+  <li>Several counts over one table want conditional aggregation, not a union.</li>
+</ul>
