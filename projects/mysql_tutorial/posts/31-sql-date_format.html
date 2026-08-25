@@ -1,0 +1,176 @@
+<p><code>DATE_FORMAT</code> turns a date into a string in whatever shape you want. Around it sits the
+rest of MySQL's date toolkit — arithmetic, differences, and pulling a date apart. This lesson covers
+those, and ends with the one that costs the most: grouping a report by month in a way that quietly
+disables your index.</p>
+
+<p>Which <em>type</em> to store is a separate question, answered in
+<a href="/sql/sql-date-types">date and time types</a>.</p>
+
+<h2>DATE_FORMAT</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT DATE_FORMAT('2024-03-15 14:30:45', '%W, %d %M %Y')   AS long_form,
+       DATE_FORMAT('2024-03-15 14:30:45', '%Y-%m-%d')       AS iso,
+       DATE_FORMAT('2024-03-15 14:30:45', '%d/%m/%Y %H:%i') AS uk,
+       DATE_FORMAT('2024-03-15 14:30:45', '%b %e, %Y %l:%i %p') AS us;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+------------+------------------+----------------------+
+| long_form             | iso        | uk               | us                   |
++-----------------------+------------+------------------+----------------------+
+| Friday, 15 March 2024 | 2024-03-15 | 15/03/2024 14:30 | Mar 15, 2024 2:30 PM |
++-----------------------+------------+------------------+----------------------+</code></pre>
+
+<p>The specifiers you will actually reach for:</p>
+
+<table>
+  <tr><th></th><th>Meaning</th><th></th><th>Meaning</th></tr>
+  <tr><td><code>%Y</code> / <code>%y</code></td><td>2024 / 24</td>
+      <td><code>%H</code> / <code>%l</code></td><td>hour 00-23 / 1-12</td></tr>
+  <tr><td><code>%m</code> / <code>%c</code></td><td>month 03 / 3</td>
+      <td><code>%i</code></td><td>minutes</td></tr>
+  <tr><td><code>%M</code> / <code>%b</code></td><td>March / Mar</td>
+      <td><code>%s</code></td><td>seconds</td></tr>
+  <tr><td><code>%d</code> / <code>%e</code></td><td>day 05 / 5</td>
+      <td><code>%p</code></td><td>AM / PM</td></tr>
+  <tr><td><code>%W</code> / <code>%a</code></td><td>Friday / Fri</td>
+      <td><code>%%</code></td><td>a literal percent sign</td></tr>
+</table>
+
+<p>The trap is <strong><code>%m</code> is month and <code>%i</code> is minutes</strong> —
+<code>%M</code> is the month <em>name</em> and <code>%s</code> is seconds. Writing
+<code>'%Y-%m-%d %H:%m'</code> puts the month where the minutes should be, produces a
+plausible-looking string, and is easy to miss.</p>
+
+<p>Day and month names are English unless you change <code>lc_time_names</code>. In general, prefer
+formatting for display in the <strong>application</strong>, where you have the user's locale and
+time zone; use <code>DATE_FORMAT</code> for grouping keys and for output that is genuinely
+SQL's job.</p>
+
+<h2>Arithmetic</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT DATE_ADD('2024-03-15', INTERVAL 10 DAY)     AS plus_10_days,
+       DATE_SUB('2024-03-15', INTERVAL 2 MONTH)   AS minus_2_months,
+       DATE_ADD('2024-01-31', INTERVAL 1 MONTH)   AS end_of_month,
+       LAST_DAY('2024-02-05')                     AS last_day_feb;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+----------------+--------------+--------------+
+| plus_10_days | minus_2_months | end_of_month | last_day_feb |
++--------------+----------------+--------------+--------------+
+| 2024-03-25   | 2024-01-15     | 2024-02-29   | 2024-02-29   |
++--------------+----------------+--------------+--------------+</code></pre>
+
+<p>Look at <code>end_of_month</code>. One month after 31 January is <strong>29 February</strong>,
+not the 31st, because that date does not exist — MySQL clamps to the end of the month. That is
+sensible and it is not reversible: adding a month and subtracting it again does not always return
+you to where you started. Monthly billing on the 31st needs a rule of its own.</p>
+
+<p><code>INTERVAL</code> accepts <code>SECOND</code>, <code>MINUTE</code>, <code>HOUR</code>,
+<code>DAY</code>, <code>WEEK</code>, <code>MONTH</code>, <code>QUARTER</code>, <code>YEAR</code>
+and compound units. You can also just write <code>date + INTERVAL 1 DAY</code>.</p>
+
+<h2>Differences</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT DATEDIFF('2024-03-15', '2024-01-01')                          AS days,
+       TIMESTAMPDIFF(MONTH, '2024-01-01', '2024-03-15')              AS months,
+       TIMESTAMPDIFF(HOUR, '2024-03-15 08:00', '2024-03-15 14:30')   AS hours;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------+--------+-------+
+| days | months | hours |
++------+--------+-------+
+|   74 |      2 |     6 |
++------+--------+-------+</code></pre>
+
+<p>Two functions, two conventions, and it is worth keeping them straight:</p>
+
+<ul>
+  <li><code>DATEDIFF(a, b)</code> — <strong>days only</strong>, and the arguments are
+      <em>later first</em>. <code>DATEDIFF(b, a)</code> gives -74.</li>
+  <li><code>TIMESTAMPDIFF(unit, a, b)</code> — any unit, and the arguments are
+      <em>earlier first</em>. The opposite order.</li>
+</ul>
+
+<p>Note the 6 in the last column: 08:00 to 14:30 is six and a half hours, and
+<code>TIMESTAMPDIFF</code> returns whole units, truncated. If you need the fraction, difference in
+a smaller unit and divide.</p>
+
+<h2>Pulling a date apart</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT EXTRACT(YEAR FROM '2024-03-15') AS y, EXTRACT(MONTH FROM '2024-03-15') AS m,
+       QUARTER('2024-03-15') AS q, WEEKDAY('2024-03-15') AS weekday_0_mon,
+       DAYNAME('2024-03-15') AS dayname;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------+------+------+---------------+---------+
+| y    | m    | q    | weekday_0_mon | dayname |
++------+------+------+---------------+---------+
+| 2024 |    3 |    1 |             4 | Friday  |
++------+------+------+---------------+---------+</code></pre>
+
+<p>Beware the two weekday functions: <code>WEEKDAY()</code> counts from <strong>0 = Monday</strong>
+and <code>DAYOFWEEK()</code> counts from <strong>1 = Sunday</strong>. Picking the wrong one shifts
+every "is it a weekend" check by a day, and the query still runs.</p>
+
+<h2>Parsing</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT STR_TO_DATE('15/03/2024', '%d/%m/%Y') AS parsed;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------+
+| parsed     |
++------------+
+| 2024-03-15 |
++------------+</code></pre>
+
+<p><code>STR_TO_DATE</code> is <code>DATE_FORMAT</code> in reverse, with the same specifiers. Use it
+for imported data rather than trusting MySQL to guess a format. It returns NULL and a warning when
+the string does not match.</p>
+
+<h2>Grouping by period — and the cost</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT DATE_FORMAT(d, '%Y-%m') AS month, COUNT(*) AS orders, ROUND(SUM(amount), 2) AS revenue
+FROM   (SELECT DATE('2024-01-05') AS d, 25.50 AS amount
+        UNION ALL SELECT '2024-01-19', 31.00
+        UNION ALL SELECT '2024-02-02', 18.75
+        UNION ALL SELECT '2024-02-28', 42.10
+        UNION ALL SELECT '2024-03-11', 27.40) t
+GROUP  BY month
+ORDER  BY month;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------+--------+---------+
+| month   | orders | revenue |
++---------+--------+---------+
+| 2024-01 |      2 |   56.50 |
+| 2024-02 |      2 |   60.85 |
+| 2024-03 |      1 |   27.40 |
++---------+--------+---------+</code></pre>
+
+<p><code>'%Y-%m'</code> is the right grouping key because it sorts correctly as a string —
+<code>'2024-02'</code> before <code>'2024-10'</code>. Grouping by <code>MONTH(d)</code> alone
+merges every January in your history into one bucket, which is a real reporting bug.</p>
+
+<p>Now the cost. <strong>Grouping is fine; filtering this way is not.</strong></p>
+
+<pre class="language-sql"><code class="language-sql">-- cannot use an index on created_at: every row is read and converted
+SELECT COUNT(*) FROM customer_order WHERE DATE_FORMAT(created_at, '%Y-%m') = '2024-06';
+
+-- can: a half-open range on the bare column
+SELECT COUNT(*) FROM customer_order
+WHERE  created_at &gt;= '2024-06-01' AND created_at &lt; '2024-07-01';</code></pre>
+
+<p>The index stores <code>created_at</code>; the first query asks about a string derived from it,
+which the index knows nothing about. So MySQL reads every row. The rule from
+<a href="/sql/sql-where">WHERE</a> applies to every date function: <strong>filter on a bare column
+with a range, then group with <code>DATE_FORMAT</code> if you like.</strong> The
+<code>GROUP BY</code> runs on the rows that already survived, so it costs comparatively nothing.</p>
+
+<p>If you truly need the derived value indexed, MySQL 8 can index a generated column — see
+<a href="/sql/mysql-index">indexes</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>%m</code> is month, <code>%i</code> is minutes. Not <code>%M</code>, not
+      <code>%s</code>.</li>
+  <li>Adding a month clamps to the end of the month, and is not reversible.</li>
+  <li><code>DATEDIFF</code> takes later-first; <code>TIMESTAMPDIFF</code> takes earlier-first and
+      truncates.</li>
+  <li><code>WEEKDAY</code> is 0 = Monday; <code>DAYOFWEEK</code> is 1 = Sunday.</li>
+  <li>Group by <code>DATE_FORMAT</code>, filter with a half-open range on the bare column.</li>
+</ul>

@@ -1,0 +1,170 @@
+<p>MySQL ships several hundred built-in functions. You will use perhaps twenty regularly. This is
+those, plus the two behaviours that surprise people: what <code>CONCAT</code> does with a NULL, and
+why <code>ROUND</code> gives different answers depending on the column's type.</p>
+
+<p>Dates get their own lesson — see <a href="/sql/sql-date_format">DATE_FORMAT and date
+functions</a>.</p>
+
+<h2>String functions</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT CONCAT(name, ' (', type, ')') AS label,
+       UPPER(LEFT(name, 3)) AS code,
+       CHAR_LENGTH(name) AS len,
+       REPLACE(name, 'Pizza', 'Pie') AS renamed
+FROM   product WHERE id IN (1, 20) ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------------------------+------+-----+---------------+
+| label                   | code | len | renamed       |
++-------------------------+------+-----+---------------+
+| Pepperoni Pizza (PIZZA) | PEP  |  15 | Pepperoni Pie |
+| Pepsi (DRINK)           | PEP  |   5 | Pepsi         |
++-------------------------+------+-----+---------------+</code></pre>
+
+<pre class="language-sql"><code class="language-sql">SELECT LPAD(id, 6, '0') AS padded, TRIM('  spaced  ') AS trimmed,
+       SUBSTRING(name, 1, 6) AS first6, LOCATE('Pizza', name) AS pizza_at
+FROM   product WHERE id = 1;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------+---------+--------+----------+
+| padded | trimmed | first6 | pizza_at |
++--------+---------+--------+----------+
+| 000001 | spaced  | Pepper |       11 |
++--------+---------+--------+----------+</code></pre>
+
+<p>Two things to note. <strong>String positions are 1-based</strong>, not 0-based, in both
+<code>SUBSTRING</code> and <code>LOCATE</code> — <code>LOCATE</code> returns 0 for "not found",
+which is unambiguous precisely because 0 is not a valid position. And
+<strong><code>CHAR_LENGTH</code> counts characters while <code>LENGTH</code> counts bytes</strong>,
+which differ the moment anyone uses a non-ASCII character. <code>CHAR_LENGTH</code> is almost
+always the one you want; see <a href="/sql/mysql-data-types">data types</a>.</p>
+
+<p><code>LPAD</code> is not a toy: the pizza schema uses it to build deterministic UUIDs when
+backfilling, as <code>LPAD(id, 12, '0')</code>.</p>
+
+<h2>CONCAT and NULL</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT CONCAT('a', NULL, 'b') AS concat_with_null,
+       CONCAT_WS('-', 'a', NULL, 'b') AS concat_ws_with_null;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+------------------+---------------------+
+| concat_with_null | concat_ws_with_null |
++------------------+---------------------+
+| NULL             | a-b                 |
++------------------+---------------------+</code></pre>
+
+<p><strong>One NULL anywhere in <code>CONCAT</code> makes the whole result NULL.</strong> That is
+consistent with the rest of SQL and it is a frequent source of blank fields in a UI — a customer
+with no middle name gets no name at all.</p>
+
+<p><code>CONCAT_WS</code> ("with separator") takes the separator first and
+<strong>skips NULLs</strong>, which is usually what you meant. It is the right tool for assembling
+an address out of columns that may be missing:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT CONCAT_WS(', ', address_line1, city, state, postal_code) AS address
+FROM   customer_order WHERE id IN (1, 2) ORDER BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------------------------------------+
+| address                                |
++----------------------------------------+
+| 123 Main St, Salt Lake City, UT, 84101 |
+|                                        |
++----------------------------------------+</code></pre>
+
+<p>The second order is a carryout with no address at all, so every argument is NULL and the result
+is an empty string rather than NULL. Wrap it in <code>NULLIF(…, '')</code> if you want to
+distinguish "no address" from "empty address" — see <a href="/sql/sql-isnull">NULL and IS
+NULL</a>.</p>
+
+<h2>Numeric functions</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT ROUND(16.994, 2) AS rounded, CEIL(16.01) AS ceil_, FLOOR(16.99) AS floor_,
+       ABS(-5) AS abs_, MOD(17, 5) AS mod_, TRUNCATE(16.999, 2) AS truncated;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------+-------+--------+------+------+-----------+
+| rounded | ceil_ | floor_ | abs_ | mod_ | truncated |
++---------+-------+--------+------+------+-----------+
+|   16.99 |    17 |     16 |    5 |    2 |     16.99 |
++---------+-------+--------+------+------+-----------+</code></pre>
+
+<p><code>ROUND</code> rounds; <code>TRUNCATE</code> chops. They agree here and disagree on
+<code>16.996</code>, which rounds to 17.00 and truncates to 16.99. For money, decide which one the
+business means before you write either.</p>
+
+<h2>ROUND is not one function</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT ROUND(CAST(2.5 AS DECIMAL(10,1))) AS decimal_half, ROUND(CAST(2.5 AS DOUBLE)) AS double_half,
+       ROUND(CAST(3.5 AS DECIMAL(10,1))) AS decimal_three_half, ROUND(CAST(3.5 AS DOUBLE)) AS double_three_half;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+--------------+-------------+--------------------+-------------------+
+| decimal_half | double_half | decimal_three_half | double_three_half |
++--------------+-------------+--------------------+-------------------+
+|            3 |           2 |                  4 |                 4 |
++--------------+-------------+--------------------+-------------------+</code></pre>
+
+<p>Read the middle two columns. <code>ROUND(2.5)</code> is <strong>3</strong> on a
+<code>DECIMAL</code> and <strong>2</strong> on a <code>DOUBLE</code>.</p>
+
+<p>Exact types round <em>half away from zero</em>; floating-point types round <em>half to
+even</em>, which is why 3.5 goes to 4 in both cases and 2.5 does not. This is documented behaviour
+rather than a bug, and it is a very good reason to keep money in <code>DECIMAL</code>: the same
+expression against a <code>FLOAT</code> column gives a different total, and only sometimes.</p>
+
+<h2>GROUP_CONCAT</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT o.id, GROUP_CONCAT(i.product_name ORDER BY i.id SEPARATOR ' + ') AS items
+FROM   customer_order o JOIN order_item i ON i.order_id = o.id
+WHERE  o.id IN (1, 11) GROUP BY o.id ORDER BY o.id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------------------------------------+
+| id | items                                     |
++----+-------------------------------------------+
+|  1 | Pepperoni Pizza + Pepsi                   |
+| 11 | Supreme Pizza + Meat Lovers Pizza + Pepsi |
++----+-------------------------------------------+</code></pre>
+
+<p>It rolls a whole group into one string, with its own <code>ORDER BY</code> and
+<code>SEPARATOR</code> (the default is a comma), and <code>DISTINCT</code> if you need it. Ideal
+for an order summary line.</p>
+
+<p><strong>It truncates silently at <code>group_concat_max_len</code>, which defaults to
+1024 bytes.</strong> No error, no warning — the string is just short. If you are concatenating
+anything unbounded, raise it for the session or expect to lose the tail.</p>
+
+<h2>A few more worth knowing</h2>
+
+<table>
+  <tr><td><code>UUID()</code></td><td>a random UUID as a 36-character string</td></tr>
+  <tr><td><code>RAND()</code></td><td>a random float. <code>ORDER BY RAND()</code> sorts the
+      <em>whole table</em> — fine on 14 rows, ruinous on a million</td></tr>
+  <tr><td><code>CAST(x AS type)</code></td><td>explicit conversion; clearer than relying on MySQL's
+      implicit coercion</td></tr>
+  <tr><td><code>GREATEST</code> / <code>LEAST</code></td><td>max and min <em>across columns</em>,
+      as opposed to across rows</td></tr>
+  <tr><td><code>HEX</code>, <code>MD5</code>, <code>SHA2</code></td><td>encoding and hashing.
+      <strong>Never <code>MD5</code> for passwords</strong> — use bcrypt in the application, as
+      the pizza schema does</td></tr>
+</table>
+
+<h2>The performance rule</h2>
+
+<p>A function wrapped around a column in <code>WHERE</code> makes any index on that column
+unusable, because the index stores the column and the query asks about something else:</p>
+
+<pre class="language-sql"><code class="language-sql">WHERE UPPER(name) = 'PEPSI'      -- cannot use an index on name
+WHERE name = 'Pepsi'             -- can; the collation is case-insensitive anyway</code></pre>
+
+<p>Functions in the <code>SELECT</code> list are free by comparison — they run on the rows that
+survived. It is <code>WHERE</code>, <code>JOIN ... ON</code> and <code>ORDER BY</code> where it
+costs. If you genuinely need a computed value indexed, MySQL 8 supports a generated column with an
+index on it. See <a href="/sql/mysql-index">indexes</a>.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>CONCAT</code> returns NULL if any argument is NULL; <code>CONCAT_WS</code> skips
+      them.</li>
+  <li>String positions are 1-based; <code>CHAR_LENGTH</code> counts characters,
+      <code>LENGTH</code> counts bytes.</li>
+  <li><code>ROUND(2.5)</code> is 3 on <code>DECIMAL</code> and 2 on <code>DOUBLE</code>.</li>
+  <li><code>GROUP_CONCAT</code> truncates at 1024 bytes without telling you.</li>
+  <li>Keep functions off the column in <code>WHERE</code>.</li>
+</ul>

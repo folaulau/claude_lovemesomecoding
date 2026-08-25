@@ -1,0 +1,149 @@
+<p><code>LIKE '%chicken%'</code> is how most search boxes start, and it has two problems: it cannot
+use an index, so it reads every row, and it has no idea which result is the best one. A
+<strong>FULLTEXT</strong> index fixes both — it tokenises the text into words, indexes those, and
+ranks matches by relevance.</p>
+
+<h2>Creating the index</h2>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE product ADD FULLTEXT INDEX ft_product_search (name, description);</code></pre>
+
+<p>The index covers the listed columns <strong>as a set</strong>. That matters: a
+<code>MATCH</code> must name exactly the same columns in the same order, or MySQL reports
+<em>"Can't find FULLTEXT index matching the column list"</em>. Searching <code>name</code> alone
+needs its own index.</p>
+
+<p>InnoDB has supported <code>FULLTEXT</code> since MySQL 5.6 — the old advice that it is
+MyISAM-only is long out of date.</p>
+
+<h2>Natural language mode</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT name, ROUND(MATCH(name, description) AGAINST ('chicken'), 4) AS score
+FROM   product
+WHERE  MATCH(name, description) AGAINST ('chicken')
+ORDER  BY score DESC, id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------------------+--------+
+| name                  | score  |
++-----------------------+--------+
+| BBQ Chicken Pizza     | 1.4284 |
+| Buffalo Chicken Pizza | 1.4284 |
++-----------------------+--------+</code></pre>
+
+<p><code>MATCH(cols) AGAINST (terms)</code> is the whole syntax. In the <code>WHERE</code> clause it
+filters; in the select list the same expression yields the <strong>relevance score</strong>, a
+positive float where bigger is better. The number has no absolute meaning — it is only comparable
+within one query — and MySQL is smart enough to compute it once when it appears twice.</p>
+
+<p>Natural language mode is forgiving: no operators, word order ignored, rows with more of the terms
+scoring higher. It is the right default for a search box.</p>
+
+<h2>Boolean mode</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product
+WHERE  MATCH(name, description) AGAINST ('+chicken -buffalo' IN BOOLEAN MODE)
+ORDER  BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-------------------+
+| name              |
++-------------------+
+| BBQ Chicken Pizza |
++-------------------+</code></pre>
+
+<p>Boolean mode adds operators:</p>
+
+<table>
+  <tr><td><code>+word</code></td><td>must be present</td></tr>
+  <tr><td><code>-word</code></td><td>must be absent</td></tr>
+  <tr><td><code>word*</code></td><td>prefix wildcard</td></tr>
+  <tr><td><code>"a phrase"</code></td><td>exact phrase</td></tr>
+  <tr><td><code>&gt;word</code> / <code>&lt;word</code></td><td>raise / lower this term's
+      contribution</td></tr>
+</table>
+
+<pre class="language-sql"><code class="language-sql">SELECT name FROM product
+WHERE  MATCH(name, description) AGAINST ('pepper*' IN BOOLEAN MODE)
+ORDER  BY id;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------------------+
+| name                |
++---------------------+
+| Pepperoni Pizza     |
+| Supreme Pizza       |
+| Meat Lovers Pizza   |
+| Veggie Lovers Pizza |
++---------------------+</code></pre>
+
+<p>One prefix, matching both <em>pepperoni</em> and <em>peppers</em>. Note that boolean mode does
+<strong>not</strong> sort by relevance automatically, so add your own <code>ORDER BY</code>.</p>
+
+<h2>Why short searches return nothing</h2>
+
+<p>This is the behaviour that makes people give up on full-text search, and it is two settings.</p>
+
+<p><strong>Minimum token length.</strong> InnoDB's <code>innodb_ft_min_token_size</code> defaults to
+<strong>3</strong>, so anything shorter is never indexed:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS hits_ou FROM product WHERE MATCH(name, description) AGAINST ('ou');</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+---------+
+| hits_ou |
++---------+
+|       0 |
++---------+</code></pre>
+
+<p><strong>Stopwords.</strong> InnoDB ships a list of 36 very common English words that are never
+indexed — <code>a</code>, <code>the</code>, <code>is</code>, <code>of</code>, <code>and so on</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS hits_the FROM product WHERE MATCH(name, description) AGAINST ('the');</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----------+
+| hits_the |
++----------+
+|        0 |
++----------+</code></pre>
+
+<p>You can inspect the exact list — it is a table:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT COUNT(*) AS stopwords FROM information_schema.INNODB_FT_DEFAULT_STOPWORD;</code></pre>
+
+<p>Both are changeable, and <strong>changing either requires rebuilding the index</strong>
+(<code>OPTIMIZE TABLE</code> with <code>innodb_optimize_fulltext_only</code>, or drop and recreate).
+Note also that MyISAM has its own separate setting, <code>ft_min_word_len</code>, defaulting to 4 —
+so advice you find online may be about the wrong engine.</p>
+
+<h2>What it costs</h2>
+
+<p>A <code>FULLTEXT</code> index is maintained on every insert and update to the covered columns, so
+writes get slower and the index takes space. On a table that is written far more often than it is
+searched, that trade may not be worth it.</p>
+
+<p>The index is also <strong>word-based</strong>, which is exactly why it is fast and exactly what
+it cannot do: no substring matching inside a word (beyond a prefix), no fuzzy or
+typo-tolerant matching, no stemming — <em>pizza</em> and <em>pizzas</em> are different tokens —
+and no synonyms. It also has one language's idea of what a word is; <code>ngram</code> exists for
+Chinese, Japanese and Korean.</p>
+
+<h2>Where it stops being enough</h2>
+
+<p>MySQL full-text search is a good fit for searching a product catalogue, a help centre, or a
+handful of text columns in an application that already uses MySQL. It saves you an entire extra
+system.</p>
+
+<p>Reach for a search engine — Elasticsearch or OpenSearch — when you need typo tolerance,
+stemming and synonyms, faceting and aggregations over results, ranking you can tune, or search
+across sources that are not all in this database. The demo application makes exactly that call: it
+has an optional Elasticsearch profile for product search, and runs on MySQL alone without it.</p>
+
+<p>The cost of that decision is a second copy of the data that has to be kept in step, and it is a
+real cost. Do not pay it until the list above contains something you actually need.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>MATCH</code> must name exactly the columns of the <code>FULLTEXT</code> index.</li>
+  <li>Natural language mode ranks; boolean mode takes operators and does not sort for you.</li>
+  <li>Words shorter than <code>innodb_ft_min_token_size</code> (3) and the 36 stopwords are never
+      indexed.</li>
+  <li>Changing either setting means rebuilding the index.</li>
+  <li>No stemming, no fuzziness. That is when a search engine starts earning its cost.</li>
+</ul>

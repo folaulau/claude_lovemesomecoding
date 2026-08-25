@@ -1,0 +1,125 @@
+<p>A handful of functions answer the question "where am I and what am I connected to". They are worth
+knowing because the first step in debugging almost anything is confirming you are talking to the
+server you think you are.</p>
+
+<h2>Where am I</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT VERSION()        AS server_version,
+       DATABASE()       AS current_database,
+       USER()           AS connected_as,
+       CURRENT_USER()   AS authenticated_as,
+       CONNECTION_ID()  AS thread_id;</code></pre>
+
+<p>Output varies by server and session, which is the point of asking. Two of those are not the same
+thing, and the difference matters:</p>
+
+<ul>
+  <li><strong><code>USER()</code></strong> is who you <em>said</em> you were and where from —
+      <code>root@172.17.0.1</code>.</li>
+  <li><strong><code>CURRENT_USER()</code></strong> is the account row MySQL actually
+      <em>matched</em> — possibly <code>root@%</code>, or even <code>''@'%'</code> if you landed on
+      an anonymous account.</li>
+</ul>
+
+<p>When permissions behave unexpectedly, compare the two. "I granted privileges to
+<code>app@localhost</code> and it still cannot read the table" is usually the connection having
+matched <code>app@%</code> instead. See
+<a href="/sql/mysql-users-and-privileges">users and privileges</a>.</p>
+
+<p><code>DATABASE()</code> returns NULL when no database is selected, which explains
+<em>"No database selected"</em>. <code>CONNECTION_ID()</code> gives your thread id — the number you
+pass to <code>KILL</code> when a query has to be stopped.</p>
+
+<h2>Server variables</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT @@version_comment, @@hostname, @@port, @@datadir;
+SELECT @@session.sql_mode, @@global.max_connections;</code></pre>
+
+<p><code>@@name</code> reads a system variable. Most exist at two levels: <code>@@global</code> is
+the server-wide value, <code>@@session</code> is yours. A bare <code>@@name</code> gives the session
+value where one exists.</p>
+
+<p>That distinction is the source of a common confusion. Setting a variable for your session changes
+nothing for anyone else:</p>
+
+<pre class="language-sql"><code class="language-sql">SET SESSION sql_safe_updates = 1;        -- just me, until I disconnect
+SET GLOBAL  max_connections   = 300;     -- everyone, until the server restarts</code></pre>
+
+<p><strong>Neither survives a restart.</strong> A permanent change goes in the configuration file,
+or — in MySQL 8 — through <code>SET PERSIST</code>, which writes it to
+<code>mysqld-auto.cnf</code> as well as applying it:</p>
+
+<pre class="language-sql"><code class="language-sql">SET PERSIST max_connections = 300;</code></pre>
+
+<p>Note also that <code>SET GLOBAL</code> usually affects only <em>new</em> connections — existing
+sessions keep the value they started with, which is why a setting change sometimes appears to do
+nothing until you reconnect.</p>
+
+<h2>SHOW VARIABLES and SHOW STATUS</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW VARIABLES LIKE 'innodb_buffer_pool%';   -- configuration: what it is set to
+SHOW STATUS    LIKE 'Threads_%';             -- counters: what has happened
+SHOW GLOBAL STATUS LIKE 'Questions';</code></pre>
+
+<p>The pair is worth keeping straight. <strong>Variables are settings; status is measurement.</strong>
+Status counters are mostly cumulative since the server started, so a single reading tells you
+little — take two, subtract, and divide by the elapsed time. A rate is meaningful; a total since an
+unknown start time is not.</p>
+
+<p>A few worth knowing by name: <code>Threads_connected</code> and <code>Threads_running</code>
+(the second is the one that indicates trouble), <code>Slow_queries</code>,
+<code>Innodb_row_lock_waits</code>, and <code>Aborted_connects</code>.</p>
+
+<h2>What is happening right now</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW PROCESSLIST;          -- your queries, or everyone's with PROCESS privilege
+SHOW FULL PROCESSLIST;     -- without truncating the query text at 100 characters</code></pre>
+
+<p>This is the first thing to run when the database is slow. Sort by <code>Time</code> and look at
+the top: a query that has been running for 400 seconds is usually your answer. <code>KILL 1234</code>
+stops one by its <code>Id</code> — and note <code>KILL QUERY 1234</code> stops the statement while
+leaving the connection alive, which is gentler.</p>
+
+<p><code>SHOW ENGINE INNODB STATUS</code> is the deeper version, and is where the details of the
+most recent deadlock live. See <a href="/sql/mysql-deadlock">deadlocks</a> and
+<a href="/sql/mysql-run-query-in-production">running queries in production</a>.</p>
+
+<h2>Two small ones for testing</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT SLEEP(3);              -- block this session for 3 seconds
+SELECT BENCHMARK(1000000, MD5('x'));</code></pre>
+
+<p><code>SLEEP</code> is genuinely useful: it is how you hold a lock open long enough to watch
+another session wait for it, which is how the deadlock lesson reproduces one on purpose.</p>
+
+<p><code>BENCHMARK</code> re-runs a <em>scalar expression</em> many times and reports the elapsed
+time. It measures expression evaluation only — it does not fetch rows, so it cannot tell you
+anything about a query's real cost. For that, use
+<a href="/sql/sql-explain">EXPLAIN ANALYZE</a>.</p>
+
+<h2>Sizing things on disk</h2>
+
+<pre class="language-sql"><code class="language-sql">SELECT TABLE_NAME,
+       ROUND(DATA_LENGTH  / 1024 / 1024, 1) AS data_mb,
+       ROUND(INDEX_LENGTH / 1024 / 1024, 1) AS index_mb
+FROM   information_schema.TABLES
+WHERE  TABLE_SCHEMA = 'pizza'
+ORDER  BY DATA_LENGTH + INDEX_LENGTH DESC
+LIMIT  5;</code></pre>
+
+<p>Useful for finding what is actually big, and for noticing when indexes outweigh the data. These
+figures are <strong>estimates</strong> that move as InnoDB resamples — treat them as approximate,
+and see <a href="/sql/mysql-information-schema">INFORMATION_SCHEMA</a> for the rest of the
+catalogue.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li><code>USER()</code> is what you claimed; <code>CURRENT_USER()</code> is what MySQL matched.
+      Compare them when permissions surprise you.</li>
+  <li><code>@@global</code> and <code>@@session</code> are different values;
+      <code>SET GLOBAL</code> affects new connections.</li>
+  <li>Nothing survives a restart except the config file or <code>SET PERSIST</code>.</li>
+  <li>Variables are settings, status is measurement — take two readings and subtract.</li>
+  <li><code>SHOW FULL PROCESSLIST</code> first when the database is slow.</li>
+</ul>
