@@ -405,7 +405,10 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
         # Non-determinism first: an output that changes between two runs cannot be quoted
         # at all, and reporting "does not match" for it would send you looking for the
         # wrong bug.
-        if second is not None and _normalise(second.get(i, "")) != _normalise(actual):
+        drifted = explain_matches(second.get(i, ""), actual) if second is not None else None
+        if second is not None and (drifted is False or
+                                   (drifted is None and
+                                    _normalise(second.get(i, "")) != _normalise(actual))):
             stats["nondeterministic"] = stats.get("nondeterministic", 0) + 1
             failures.append(
                 f"{slug} block {i}: OUTPUT IS NOT DETERMINISTIC — two runs of the same "
@@ -429,7 +432,8 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
                 f"    SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='pizza';")
             continue
 
-        if _normalise(expected) != _normalise(actual):
+        agrees = explain_matches(expected, actual)
+        if agrees is False or (agrees is None and _normalise(expected) != _normalise(actual)):
             failures.append(
                 f"{slug} block {i}: quoted output does not match what the database returns.\n"
                 f"  --- quoted ---\n{_indent(expected)}\n"
@@ -450,6 +454,64 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
 def _normalise(text: str) -> str:
     """Trailing whitespace and blank lines only. Column alignment IS compared."""
     return "\n".join(line.rstrip() for line in text.strip().splitlines() if line.strip())
+
+
+EXPLAIN_HEADER = re.compile(r"\|\s*select_type\s*\|")
+# The columns of EXPLAIN that are ESTIMATES rather than facts.
+ESTIMATE_COLUMNS = {"rows", "filtered"}
+ESTIMATE_TOLERANCE = 0.10
+
+
+def _cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def explain_matches(expected: str, actual: str) -> bool | None:
+    """Compare two EXPLAIN tables, tolerating drift in the estimate columns.
+
+    Returns None when this is not a pair of EXPLAIN tables, so the caller falls back to an
+    exact comparison.
+
+    ⚠️ WHY THIS EXISTS. `rows` and `filtered` are the optimizer's ESTIMATES, derived from
+    sampled index statistics that InnoDB refreshes on its own. Two identical EXPLAINs
+    seconds apart returned 395,261 and 394,155 for the same query, and 198,045 / 196,939
+    for another. Quoting them exactly makes a post fail for no reason anybody can act on.
+
+    What a lesson actually claims is the SHAPE of the plan — `type`, which `key` was
+    chosen, what is in `Extra`. Those are compared exactly. The estimate is compared
+    within 10%, which still catches a figure that was invented or copied from a different
+    query, while surviving the resampling. The posts say the number is approximate.
+    """
+    exp_lines = [l for l in expected.strip().splitlines() if l.strip().startswith("|")]
+    act_lines = [l for l in actual.strip().splitlines() if l.strip().startswith("|")]
+    if not exp_lines or not act_lines:
+        return None
+    if not (EXPLAIN_HEADER.search(exp_lines[0]) and EXPLAIN_HEADER.search(act_lines[0])):
+        return None
+    if len(exp_lines) != len(act_lines):
+        return False
+
+    header = _cells(exp_lines[0])
+    if header != _cells(act_lines[0]):
+        return False
+
+    for exp_row, act_row in zip(exp_lines[1:], act_lines[1:]):
+        e, a = _cells(exp_row), _cells(act_row)
+        if len(e) != len(a):
+            return False
+        for name, ev, av in zip(header, e, a):
+            if name in ESTIMATE_COLUMNS:
+                try:
+                    ef, af = float(ev), float(av)
+                except ValueError:
+                    if ev != av:
+                        return False
+                    continue
+                if abs(ef - af) > max(1.0, ESTIMATE_TOLERANCE * max(abs(ef), abs(af))):
+                    return False
+            elif ev != av:
+                return False
+    return True
 
 
 def _indent(text: str) -> str:

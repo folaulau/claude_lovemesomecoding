@@ -201,6 +201,24 @@ for entry in manifest.POSTS:
     # Prose only — a `.png` inside a code sample is a filename, not an image.
     prose_html = OUT_PRE.sub(" ", body)
 
+    # (8) a quoted result table must not be ragged.
+    #
+    # The mysql client draws tables where every line is the same width. Hand-editing one --
+    # trimming a border while adjusting a value -- leaves a short rule that renders as a
+    # visibly broken table. check_sql.py cannot catch it: it compares the `|` rows and
+    # ignores the `+--+` rules entirely, so a truncated border passes there.
+    for lang, block in pairs:
+        if lang != "plaintext":
+            continue
+        rows = [l for l in html.unescape(block).splitlines() if l.strip()]
+        if len(rows) < 3 or not rows[0].startswith("+--"):
+            continue
+        widths = {len(l) for l in rows}
+        if len(widths) > 1:
+            failures.append(
+                f"{entry['slug']}: a quoted result table has ragged borders "
+                f"(line widths {sorted(widths)}). It will render broken.")
+
     # (4) no images
     hits = IMAGE_MARKERS.findall(prose_html)
     if hits:

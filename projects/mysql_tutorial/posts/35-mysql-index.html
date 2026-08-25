@@ -1,0 +1,202 @@
+<p>Indexes are the largest single lever on query speed, and the one place where a small change turns
+a query from unusable into instant. Every plan in this lesson was measured against
+<code>pizza_lab</code> — the pizza schema filled to <strong>400,000 orders</strong> and
+<strong>1,000,000 line items</strong>, because at the demo database's 18 rows InnoDB reads
+everything and there is nothing to learn.</p>
+
+<h2>What an index is</h2>
+
+<p>A B-tree holding the indexed column's values in sorted order, each with a pointer back to the
+row. Sorted order is the whole trick: finding a value is a handful of steps down the tree instead of
+a walk through every row.</p>
+
+<p>Without one:</p>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT * FROM customer_order WHERE customer_name = 'Customer 42';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table          | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+----------------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | customer_order | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 396091 |    10.00 | Using where |
++----+-------------+----------------+------------+------+---------------+------+---------+------+--------+----------+-------------+</code></pre>
+
+<p><code>type: ALL</code> and no <code>possible_keys</code> — a full table scan of every row to find
+a handful. Add the index:</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX idx_demo_name ON customer_order (customer_name);
+
+EXPLAIN SELECT id, total FROM customer_order WHERE customer_name = 'Customer 42';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+------+---------------+---------------+---------+-------+------+----------+-------+
+| id | select_type | table          | partitions | type | possible_keys | key           | key_len | ref   | rows | filtered | Extra |
++----+-------------+----------------+------------+------+---------------+---------------+---------+-------+------+----------+-------+
+|  1 | SIMPLE      | customer_order | NULL       | ref  | idx_demo_name | idx_demo_name | 602     | const |    8 |   100.00 | NULL  |
++----+-------------+----------------+------------+------+---------------+---------------+---------+-------+------+----------+-------+</code></pre>
+
+<p><strong>396,091 rows examined becomes 8.</strong> That is the entire subject in one comparison.</p>
+
+<p>One caveat on every plan in this lesson: <code>rows</code> is an <em>estimate</em> the optimizer
+derives from sampled statistics, and it moves by a fraction of a percent between identical runs. Read
+these figures as approximate — it is the order of magnitude that carries the argument.</p>
+
+<h2>What it costs</h2>
+
+<p>An index is a second copy of that column, kept sorted, updated on <strong>every</strong> insert,
+update and delete that touches it. So:</p>
+
+<ul>
+  <li>Writes get slower, roughly in proportion to the number of indexes on the table.</li>
+  <li>It takes disk and, more importantly, space in the buffer pool.</li>
+  <li>An index nothing uses is pure cost. Find them in
+      <a href="/sql/mysql-information-schema">INFORMATION_SCHEMA</a> and drop them.</li>
+</ul>
+
+<p>Index the columns you filter, join and sort on. Not every column, and not "just in case".</p>
+
+<h2>The clustered primary key</h2>
+
+<p>InnoDB stores the rows themselves inside the primary key's B-tree. That has two consequences
+worth knowing:</p>
+
+<p><strong>A primary-key lookup is one operation.</strong> The plan says <code>const</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT id, total FROM customer_order WHERE id = 12345;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+-------+---------------+---------+---------+-------+------+----------+-------+
+| id | select_type | table          | partitions | type  | possible_keys | key     | key_len | ref   | rows | filtered | Extra |
++----+-------------+----------------+------------+-------+---------------+---------+---------+-------+------+----------+-------+
+|  1 | SIMPLE      | customer_order | NULL       | const | PRIMARY       | PRIMARY | 8       | const |    1 |   100.00 | NULL  |
++----+-------------+----------------+------------+-------+---------------+---------+---------+-------+------+----------+-------+</code></pre>
+
+<p><strong>A secondary index lookup is usually two.</strong> The secondary index stores the primary
+key as its pointer, so MySQL finds the key there and then walks the clustered index to fetch the
+row. This is why a wide primary key inflates every other index, and why the
+<a href="/sql/mysql-create-table">CREATE TABLE</a> lesson insists on a small ascending one.</p>
+
+<h2>Covering indexes</h2>
+
+<p>If the index contains every column the query needs, the second lookup never happens — the plan
+says <code>Using index</code>:</p>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT COUNT(*) FROM customer_order WHERE status = 'PAID';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+-------------+
+| id | select_type | table          | partitions | type | possible_keys             | key                       | key_len | ref   | rows  | filtered | Extra       |
++----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+-------------+
+|  1 | SIMPLE      | customer_order | NULL       | ref  | idx_customer_order_status | idx_customer_order_status | 122     | const | 14398 |   100.00 | Using index |
++----+-------------+----------------+------------+------+---------------------------+---------------------------+---------+-------+-------+----------+-------------+</code></pre>
+
+<p><code>Using index</code> is the phrase to look for — it means the table itself was never touched.
+This is also the strongest practical argument against <code>SELECT *</code>: one extra column can
+be the difference between a covered query and one that fetches every row.</p>
+
+<h2>Composite indexes and the leftmost rule</h2>
+
+<p>An index on several columns is ordered by the first, then the second within that, and so on —
+like a phone book sorted by surname then first name.</p>
+
+<pre class="language-sql"><code class="language-sql">CREATE INDEX idx_demo_composite ON customer_order (status, order_type, created_at);
+
+EXPLAIN SELECT COUNT(*) FROM customer_order WHERE status = 'PAID' AND order_type = 'DELIVERY';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+------+----------------------------------------------+--------------------+---------+-------------+------+----------+-------------+
+| id | select_type | table          | partitions | type | possible_keys                                | key                | key_len | ref         | rows | filtered | Extra       |
++----+-------------+----------------+------------+------+----------------------------------------------+--------------------+---------+-------------+------+----------+-------------+
+|  1 | SIMPLE      | customer_order | NULL       | ref  | idx_customer_order_status,idx_demo_composite | idx_demo_composite | 204     | const,const | 9718 |   100.00 | Using index |
++----+-------------+----------------+------------+------+----------------------------------------------+--------------------+---------+-------------+------+----------+-------------+</code></pre>
+
+<p>Both leading columns used, and covered. The <strong>leftmost prefix rule</strong> says an index on
+<code>(a, b, c)</code> serves queries on <code>a</code>, on <code>a, b</code>, and on
+<code>a, b, c</code> — but not on <code>b</code> alone, because the index is not sorted by
+<code>b</code> until you have fixed <code>a</code>.</p>
+
+<h3>Except MySQL 8 sometimes can skip it</h3>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT COUNT(*) FROM customer_order WHERE order_type = 'DELIVERY';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+-------+--------------------+--------------------+---------+------+--------+----------+----------------------------------------+
+| id | select_type | table          | partitions | type  | possible_keys      | key                | key_len | ref  | rows   | filtered | Extra                                  |
++----+-------------+----------------+------------+-------+--------------------+--------------------+---------+------+--------+----------+----------------------------------------+
+|  1 | SIMPLE      | customer_order | NULL       | range | idx_demo_composite | idx_demo_composite | 204     | NULL | 197630 |   100.00 | Using where; Using index for skip scan |
++----+-------------+----------------+------------+-------+--------------------+--------------------+---------+------+--------+----------+----------------------------------------+</code></pre>
+
+<p>The query names only the <em>second</em> column and MySQL used the index anyway —
+<strong>"Using index for skip scan"</strong>, an optimisation added in MySQL 8.0.13. It works by
+treating the index as one sub-range per distinct value of the leading column, which pays off only
+when that column has <em>few</em> distinct values. <code>status</code> has five, so it does.</p>
+
+<p>Do not read this as "column order no longer matters". Look at the row estimate: 198,045 against
+9,718 for the properly-ordered query. Skip scan rescues a query the index was not designed for; it
+is not a substitute for designing it right. <strong>Put the equality columns first, and the most
+selective of them first among those.</strong></p>
+
+<p>Drop it again before the next section, so the plans below reflect the schema's own indexes:</p>
+
+<pre class="language-sql"><code class="language-sql">DROP INDEX idx_demo_composite ON customer_order;</code></pre>
+
+<h2>The four ways to lose your index</h2>
+
+<p>A function around the column is the classic:</p>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT COUNT(*) FROM customer_order WHERE YEAR(created_at) = 2024;</code></pre>
+
+<p>That plan reports <code>possible_keys: NULL</code> and <code>type: index</code>, and the usual
+summary of it is too strong. The index cannot be used to <em>find</em> anything — but MySQL still
+scanned the whole <em>index</em> rather than the whole table, because the index is narrower and
+happens to cover the query. So it is not quite as slow as a table scan, and it still examines
+essentially every row in the table.</p>
+
+<p>(Its <code>rows</code> figure is deliberately not quoted here: it is an estimate that changes
+between identical runs. <a href="/sql/sql-explain">EXPLAIN</a> shows why.)</p>
+
+<p>The range form is the fix, and its plan is a different shape entirely:</p>
+
+<pre class="language-sql"><code class="language-sql">EXPLAIN SELECT COUNT(*) FROM customer_order WHERE created_at &gt;= '2024-06-01' AND created_at &lt; '2024-07-01';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+-------+-------------------------------+-------------------------------+---------+------+-------+----------+--------------------------+
+| id | select_type | table          | partitions | type  | possible_keys                 | key                           | key_len | ref  | rows  | filtered | Extra                    |
++----+-------------+----------------+------------+-------+-------------------------------+-------------------------------+---------+------+-------+----------+--------------------------+
+|  1 | SIMPLE      | customer_order | NULL       | range | idx_customer_order_created_at | idx_customer_order_created_at | 8       | NULL | 33296 |   100.00 | Using where; Using index |
++----+-------------+----------------+------------+-------+-------------------------------+-------------------------------+---------+------+-------+----------+--------------------------+</code></pre>
+
+<p>The four to watch for:</p>
+
+<ol>
+  <li><strong>A function on the column.</strong> <code>YEAR(created_at)</code>,
+      <code>DATE(created_at)</code>, <code>UPPER(name)</code>. Rewrite as a range.</li>
+  <li><strong>A leading wildcard.</strong> <code>LIKE '%roni'</code> cannot use sorted order at all.
+      <code>LIKE 'Pep%'</code> can. See <a href="/sql/sql-like">LIKE</a>.</li>
+  <li><strong>A type mismatch.</strong> Comparing a <code>VARCHAR</code> column to a number makes
+      MySQL convert the column, which is a function in disguise.</li>
+  <li><strong>Low selectivity.</strong> If a value matches a large share of the table, the optimizer
+      decides a scan is cheaper than millions of index lookups plus row fetches — and it is usually
+      right.</li>
+</ol>
+
+<p>If you genuinely need a computed value indexed, MySQL 8 lets you index a
+<strong>generated column</strong>:</p>
+
+<pre class="language-sql"><code class="language-sql">ALTER TABLE customer_order
+    ADD COLUMN order_year INT AS (YEAR(created_at)) VIRTUAL,
+    ADD INDEX idx_demo_year (order_year);</code></pre>
+
+<h2>Reading and cleaning up</h2>
+
+<pre class="language-sql"><code class="language-sql">SHOW INDEX FROM customer_order;
+DROP INDEX idx_demo_name ON customer_order;
+DROP INDEX idx_demo_year ON customer_order;
+ALTER TABLE customer_order DROP COLUMN order_year;</code></pre>
+
+<p><code>SHOW INDEX</code> reports <code>Cardinality</code>, the estimated number of distinct values
+— an estimate, refreshed by <code>ANALYZE TABLE</code>. When a query suddenly picks a bad plan,
+stale statistics are a real suspect.</p>
+
+<h2>What to remember</h2>
+
+<ul>
+  <li>An index turns a scan into a lookup: 396,091 rows became 8.</li>
+  <li>It costs on every write. Unused indexes are pure loss.</li>
+  <li><code>Using index</code> means covered — the table was never touched.</li>
+  <li>Composite indexes work left to right; skip scan sometimes rescues you, at ~20× the rows.</li>
+  <li>Functions, leading wildcards and type mismatches all take the lookup away.</li>
+</ul>
