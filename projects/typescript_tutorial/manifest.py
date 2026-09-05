@@ -23,7 +23,7 @@ CATEGORY = {
         "TypeScript from the first annotation to a codebase that holds together — the type "
         "system itself, then what changes when you point it at a real project: unions instead of "
         "enums, generics that earn their place, the tsconfig flags that decide what compiles, "
-        "decorators, and React. Every example is lifted from a working marketplace app, so the "
+        "decorators, and React. Every example is lifted from a working pizza ordering app, so "
         "code in these posts is code that runs."
     ),
 }
@@ -254,7 +254,7 @@ _TRACK = [
         "excerpt": (
             "Start here. What TypeScript actually is — a type checker that erases itself, not a "
             "language that runs — the three kinds of bug it catches and the one class it cannot, "
-            "the exact versions this track is written against, the marketplace app every example "
+            "the exact versions this track is written against, the pizza ordering app every example "
             "is taken from, and the full lesson index in reading order."
         ),
     },

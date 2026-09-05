@@ -211,6 +211,38 @@ The 38% "quoted from code that runs" figure is expected and is explained at leng
 of one rule, which belong in no repository. The number that matters is the drift count, and it is
 zero.
 
+## QA on `:3000` (2026-09-05)
+
+Ran the dev server against the seeded `local` tree and checked the things that fail silently.
+
+| Check | Result |
+|---|---|
+| All 21 post URLs | 200 |
+| `/typescript` archive | 21 post links, h1 "TypeScript Tutorials" |
+| Nav | `typescript` present in the JavaScript group |
+| Prism highlighting | 13/13 blocks on `typescript-enums` carry token markup — `typescript`, `tsx`, `json`, `javascript` all highlight |
+| TOC anchors | present on every `<h2>` (14 on the enums post) |
+| Reading time | renders "8 min read" |
+| **Prev/next pager** | walked lesson 1 → 21; order matches the manifest exactly, lesson 1 has no prev, lesson 21 has no next |
+| **Cross-links** | 21 distinct internal hrefs across the track, every one resolves 200 and points at a slug in this track |
+| Derived indexes | `categories.json` count 21 · `by-category/typescript.json` 21 · `index/posts.json` 21 · `search/index.json` 21 |
+| Sitemap | 21 `/typescript/` URLs |
+
+The pager walk is the one worth keeping: it is the only check that proves the computed dates
+actually produce the intended reading order, and it walks the real rendered HTML rather than the
+manifest.
+
+### One error this caught
+
+The category description and lesson 1's excerpt both described the source as *"a working
+marketplace app"* — left over from when this track was going to be written from the contractor
+marketplace. The source is a **pizza ordering app**. Both strings fixed in `manifest.py` and the
+category re-seeded.
+
+Worth noting the class of mistake: it survived every automated check, because nothing verifies that
+prose about the app is true of the app. `check_snippets.py` proves the *code* is real; it has
+nothing to say about a sentence.
+
 ## Log
 
 **2026-09-05** — Surveyed the ground. Confirmed no `typescript` category exists, settled length
