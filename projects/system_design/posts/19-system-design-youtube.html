@@ -1,0 +1,569 @@
+<p>Every case study up to here has been a transactional system. Airbnb, Amazon and the airline all
+came down to the same question &mdash; two people want the same thing at the same moment, who gets
+it &mdash; and in all three the write rate was trivial while the correctness was hard.</p>
+
+<p>YouTube is the other kind of system entirely. Nobody contends for a video. The hard part is
+bytes: an upload is a multi-gigabyte file rather than a row, playback is a sustained stream rather
+than a request, and the storage and bandwidth numbers are large enough that they decide the
+architecture before any of the interesting logic does.</p>
+
+<p>It is also the first system in this track whose <strong>business model sits in the request
+path</strong>. A booking system can put payments off to one side. A video platform has to decide,
+between the click and the first frame, whether to play an advertisement and which one &mdash; and
+it gets a fraction of a second to do it. So ads, and the marketing machinery that surrounds them,
+are designed here as first-class parts of the system rather than an appendix, because that is what
+they are.</p>
+
+<p><strong>As with the Amazon and airline posts</strong>, this is design work rather than a running
+application: no laptop transcodes a petabyte. Where a mechanism has already been shown working
+earlier in the track &mdash; the outbox, the cache, the queue &mdash; it is linked rather than
+re-invented.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                           OUT OF SCOPE (say so)
+  upload a video                     live streaming
+  transcode it                       comments and moderation
+  watch it, anywhere, any device     copyright matching
+  metadata, search, channels         creator payouts (the ledger, not the money)
+  view counts and watch time         the recommendation MODEL itself
+  recommendations (the plumbing)     video codecs as codecs
+  advertising: decide, insert, bill
+  subscriptions and notifications
+
+WORTH ASKING
+  ad-supported or subscription?    -> both, and that changes the playback path
+  how long may an upload take?     -> minutes to be watchable, hours to be perfect
+  is a view count exact?           -> NO for display, YES for anything billed
+  global?                          -> then the CDN is the product, not an add-on
+
+NON-FUNCTIONAL
+  playback: start fast, never stall   a stall is the only unforgivable failure
+  upload:   may be slow, never lost   a creator re-uploading is a lost creator
+  counts:   eventually consistent     except the ones money depends on
+  read:write ~ 2000:1                 enormous read amplification</code></pre>
+
+<p>The two lines worth defending out loud are the last two. Splitting view counting into <em>the
+number we show</em> and <em>the number we bill</em> is the single decision that keeps the analytics
+pipeline from having to be a financial system. And a read-to-write ratio of two thousand to one
+means the upload path and the playback path are two different systems that happen to share a
+database.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<p>Do this one properly, because unusually the arithmetic changes the design rather than confirming
+it.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  500,000 uploads/day, average 10 minutes
+        1,000,000,000 views/day, average 5 minutes watched
+
+UPLOADS   500k / 86,400            = ~6/sec        peak x3 = ~18/sec
+SOURCE    10 min at 20 Mbps        = ~1.5 GB per video
+          500k x 1.5 GB            = 750 TB/day arriving
+
+STORED    the ladder, all renditions together:
+            144p 0.1 + 240p 0.3 + 360p 0.7
+          + 480p 1.2 + 720p 2.5 + 1080p 4.5   = ~9.3 Mbps
+          x 600 sec                            = ~700 MB per video
+          500k x 700 MB                        = 350 TB/day = ~128 PB/year
+
+EGRESS    1e9 views x 300 sec x 2.5 Mbps (720p)
+          = 7.5e11 Mb/day = ~94 PB/day
+          94 PB / 86,400                       = ~1.1 TB/sec
+                                               = ~8.7 Tbps average
+                                       peak x2 = ~17 Tbps
+
+ADS       ~1 ad opportunity per 2 views        = 500M decisions/day
+          500M / 86,400                        = ~6,000/sec  peak x2.5 = 15,000/sec</code></pre>
+
+<p>Three of those numbers are worth saying out loud. <strong>Egress is roughly three hundred times
+ingest.</strong> Storage grows by a petabyte every three days and never shrinks. And the ad
+decisioning tier &mdash; fifteen thousand decisions a second, each of which must answer before a
+frame is due &mdash; is a higher-QPS service than anything in the previous three case studies
+combined.</p>
+
+<p>What follows from that is the whole architecture in one line: <strong>almost no watch traffic may
+ever reach your servers.</strong> At 17 Tbps you are not scaling an origin, you are making sure the
+origin is asked for almost nothing. The CDN is not an optimisation on top of this system. It
+<em>is</em> this system, and the origin is the thing that fills it.</p>
+
+<h2>Step 3 &mdash; The shape</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">                        ┌────────────────────────────────────────┐
+   creator ──upload──&gt;  │  upload service (resumable, chunked)    │
+                        └───────────────┬────────────────────────┘
+                                        │ raw object
+                                        v
+                             ┌──────────────────────┐
+                             │  object storage: raw │
+                             └──────────┬───────────┘
+                                        │ one message per video
+                                        v
+                        ┌───────────────────────────────┐
+                        │  transcode queue  ──&gt; workers │  segment-level,
+                        │  (priority: low rungs first)  │  idempotent, parallel
+                        └───────────────┬───────────────┘
+                                        │ segments + manifests
+                                        v
+                        ┌───────────────────────────────┐        ┌──────────────┐
+                        │  object storage: renditions   │ &lt;──────│ metadata DB  │
+                        │  = CDN ORIGIN                 │        │ (Postgres)   │
+                        └───────────────┬───────────────┘        └──────┬───────┘
+                                        │ pull-through                  │
+                          ┌─────────────┴──────────────┐                │
+                          │   CDN: edge / regional     │                │
+                          └─────────────┬──────────────┘                │
+                                        │ 99%+ of all bytes             │
+   viewer &lt;──segments────────────────────┘                              │
+      │                                                                 │
+      ├──&gt; playback API ──&gt; manifest + playback token  ─────────────────┘
+      │
+      ├──&gt; AD DECISION SERVICE ──&gt; which ad, or none (hard deadline)
+      │
+      └──&gt; event beacons ──&gt; Kafka ──&gt; ┬──&gt; counters   (views, watch time)
+                                       ├──&gt; billing    (impressions, quartiles)
+                                       ├──&gt; warehouse  (recommendations, marketing)
+                                       └──&gt; archive    (replay when logic changes)</code></pre>
+
+<p>Four things on that diagram are load-bearing. The transcode stage is a queue of small
+independent jobs rather than one big one. The rendition store is the CDN origin, so there is no
+separate copy to keep in step. The ad decision is a <em>sibling</em> of playback rather than a step
+inside it &mdash; it can fail without stopping the video. And every client event goes to one
+pipeline that then forks, because the alternative is three pipelines that disagree about how many
+times a video was watched.</p>
+
+<h2>Step 4 &mdash; Upload is a protocol, not a POST</h2>
+
+<p>A 1.5 GB upload over a phone connection will be interrupted. Designing as though it will not is
+the mistake, and the fix is that the client uploads <em>chunks</em> against a session it can
+resume.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   POST /uploads                    -&gt; { upload_id, chunk_size, expires }
+   PUT  /uploads/{id}/chunks/7      -&gt; 204        (any order, retryable)
+   PUT  /uploads/{id}/chunks/7      -&gt; 204        (again: same result)
+   GET  /uploads/{id}               -&gt; { received: [0..6, 8..12], missing: [7] }
+   POST /uploads/{id}/complete      -&gt; { video_id, state: "processing" }
+
+   Chunks go DIRECT to object storage with a presigned URL.
+   The API sees control messages only; the bytes never touch it.</code></pre>
+
+<p>Two consequences are worth stating. A chunk PUT is idempotent because it is identified by index
+rather than by arrival, which means a client that loses its connection mid-chunk simply sends it
+again &mdash; the same reasoning as the idempotency keys in the
+<a href="/system-design/system-design-concurrency-and-locking">concurrency post</a>. And the bytes
+bypassing the API is what stops eighteen uploads a second from needing an application tier sized for
+750 TB a day.</p>
+
+<p>Deduplicate on a content hash while you are here. Re-uploads of the identical file are common
+enough &mdash; the same trailer posted to forty channels &mdash; that hashing the source and
+pointing the second video at the first one's renditions is a real saving on the largest cost line
+in the system.</p>
+
+<h2>Step 5 &mdash; Transcoding is a fan-out, not a job</h2>
+
+<p>The naive version transcodes a video by handing the file to a machine and waiting. For a
+three-hour upload that is a job which takes hours, occupies one machine, and starts from the
+beginning if the machine dies.</p>
+
+<p>Split it instead. Video is already made of independently decodable chunks &mdash; cut the source
+on those boundaries and every piece becomes a separate task.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   video 10 min ──split──&gt;  60 segments of ~10 sec
+                                │
+                                │  x 6 renditions
+                                v
+                         360 INDEPENDENT tasks
+                                │
+        ┌───────────────────────┴────────────────────────┐
+        │ each task: (video_id, rendition, segment_no)   │
+        │ - keyed, so a retry overwrites rather than     │
+        │   duplicates                                   │
+        │ - writes ONE object, then marks itself done    │
+        └────────────────────────────────────────────────┘
+
+   PRIORITY   360p and 720p first  ──&gt; publishable in minutes
+              1080p, 144p after    ──&gt; the long tail finishes later
+              a video goes live when its FIRST ladder rung is complete</code></pre>
+
+<p>That last rule is the product decision hiding in the pipeline. A creator does not want to wait
+for the 4K rendition before anyone can watch; transcoding the cheap rungs first and publishing
+against them turns hours of latency into minutes, and the rest of the ladder appears while the
+video is already accumulating views.</p>
+
+<p>The task key is the same trick used everywhere else in this track: because a task is identified
+by <code>(video_id, rendition, segment)</code> and writes exactly one object, running it twice is
+harmless. That makes the whole pipeline at-least-once, which is the only delivery guarantee a queue
+gives you cheaply &mdash; see the
+<a href="/system-design/system-design-message-queues">message queues post</a>.</p>
+
+<h2>Step 6 &mdash; Delivery, and why the manifest is the interesting file</h2>
+
+<p>The player does not download a video. It downloads a small text manifest describing what exists,
+then fetches segments one at a time, choosing a rendition per segment based on how fast the last
+few arrived. That is adaptive bitrate, and it is why a video degrades to a blurry picture instead
+of stalling when a train enters a tunnel.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   manifest.m3u8                 short TTL   (seconds)  &mdash; may change
+     ├─ 360p/seg-000.ts ... 059  immutable   (a year)   &mdash; never changes
+     ├─ 720p/seg-000.ts ... 059  immutable
+     └─ 1080p/seg-000.ts ...059  immutable
+
+   CACHING follows directly from that split:
+
+     segments   Cache-Control: public, max-age=31536000, immutable
+                content-addressed path, so a re-encode is a NEW path
+     manifest   Cache-Control: public, max-age=10
+                because ads, new renditions and takedowns change it</code></pre>
+
+<p>Splitting the cache lifetime like that is what makes a 99% edge hit rate reachable. The bytes
+&mdash; all 94 PB a day of them &mdash; are immutable and cacheable forever. The only thing that
+needs to be fresh is a few kilobytes of text.</p>
+
+<p>Then there is the long tail, which is the part people miss. Watch time is extremely concentrated:
+a small fraction of videos accounts for most viewing, and the remaining millions are watched
+occasionally from everywhere. Caching that tail at every edge is worthless &mdash; each copy would
+serve one request and then expire.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   viewer ──&gt; EDGE (small, hot)      hit: the popular few %
+                 │ miss
+                 v
+              REGIONAL (large, warm)  hit: most of the rest
+                 │ miss
+                 v
+              ORIGIN (object storage)  should be a rounding error
+
+   Tiered caching exists so that a cold video is fetched from the origin
+   ONCE per region rather than once per edge.</code></pre>
+
+<h2>Step 7 &mdash; Advertising, which is in the playback path</h2>
+
+<p>Ads are where this design stops resembling the others. Everything else here can be slow and
+recover; an ad decision that is late is simply not made, because the alternative is a viewer
+staring at a black frame.</p>
+
+<p>Start with where an ad can go. Break positions are chosen at transcode time, not at playback
+time: the pipeline already walks the video, so it records candidate cue points on segment
+boundaries, and a mid-roll may only be inserted at one of them. Deciding break positions later
+would mean cutting a segment at request time, which is exactly the work you cannot afford.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   video timeline
+   0:00 ─────────────────────────────────────────────────── 10:00
+    ^                    ^                  ^                  ^
+   PRE-ROLL           MID-ROLL           MID-ROLL          POST-ROLL
+   before frame 1     cue at 3:20        cue at 7:00       after the end
+
+   Cue points are SEGMENT BOUNDARIES recorded during transcode.
+   Eligibility is a policy question, not a technical one:
+     video length &gt;= 8 min, advertiser-safe rating, creator opted in.</code></pre>
+
+<p>The decision itself is a request the player makes in parallel with fetching the first segments,
+and the contract that matters is the deadline.</p>
+
+<pre class="language-json"><code class="language-json">POST /ads/decide
+{
+  "video_id": "v_8817263",
+  "break": "pre-roll",
+  "context": { "category": "cooking", "rating": "general", "language": "en" },
+  "viewer":  { "id_type": "signed-in", "country": "GB", "device": "mobile" },
+  "session": "s_9f21c0",
+  "deadline_budget": "hard"
+}
+
+200 OK
+{
+  "decision_id": "d_44f1a9",
+  "fill": true,
+  "creative": {
+    "id": "cr_5512", "duration_sec": 15, "skippable_after_sec": 5,
+    "manifest": "https://cdn.example.com/ads/cr_5512/manifest.m3u8"
+  },
+  "tracking": {
+    "impression": "https://ads.example.com/e/imp?d=d_44f1a9",
+    "quartiles":  ["...25", "...50", "...75", "...complete"]
+  },
+  "reason": "campaign_88 won at 4.20 CPM; 3 competing bids; freq cap 2/3 remaining"
+}</code></pre>
+
+<p>Four things in that exchange are deliberate.</p>
+
+<p><strong>Fill is optional.</strong> <code>"fill": false</code> is a normal, frequent, successful
+response. An ad system that cannot say &ldquo;no ad&rdquo; will eventually delay a video to find
+one.</p>
+
+<p><strong>The deadline is the contract.</strong> The player starts a timer with the request and
+plays content when it expires, whatever the ad service is doing. This inverts the usual
+availability argument: the ad tier does not need to be more available than playback, it needs to
+<em>fail invisibly</em>. Losing an ad costs one impression. Delaying playback costs the viewer.</p>
+
+<p><strong>The reason is returned.</strong> That is the same instinct as the lineage endpoint in the
+<a href="/system-design/system-design-customer-data-platform">customer data platform post</a>:
+an auction that cannot explain itself cannot be debugged, and advertisers ask.</p>
+
+<p><strong>The creative is a manifest.</strong> The ad is served by exactly the same delivery path as
+the content, which means it is already cached at the edge &mdash; and an ad that buffers is worse
+than no ad at all.</p>
+
+<h3>Client-side or server-side insertion</h3>
+
+<p>This is the genuine architectural fork in the ad design, and it is a good interview answer
+because both sides are defensible.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">CSAI  player fetches content manifest, then ad manifest, and switches
+      + content manifests stay IDENTICAL for everyone -&gt; fully cacheable
+      + simple, and the player controls the countdown UI
+      - a visible player switch: different buffer, sometimes a stall
+      - trivially blocked, because the ad is a separate request
+
+SSAI  the server stitches ad segments INTO the manifest before serving it
+      + one continuous stream: no switch, no second buffer, no stall
+      + very hard to block: it is the same stream
+      - the manifest is now PER VIEWER -&gt; that small text file stops
+        being cacheable, and you have just added a request per view
+      - tracking beacons must be fired server-side from playback position
+
+   The manifest is kilobytes and the segments are megabytes, so SSAI costs
+   far less than it looks: the SEGMENTS are still shared. It buys the
+   better viewer experience for a per-view manifest render.</code></pre>
+
+<p>The reason the trade is affordable is worth spelling out, because it looks expensive and is not.
+Personalising the manifest does not personalise the video. Every viewer still pulls the same
+immutable content segments and the same immutable ad segments from the edge; only the few kilobytes
+of text describing the order are unique. You gave up caching on 0.01% of the bytes.</p>
+
+<h3>Billing has to be exactly once, and beacons are not</h3>
+
+<p>An impression is money. The beacon that reports it is an HTTP request from a phone on a bad
+connection, which means it will sometimes arrive twice and sometimes not at all &mdash; the
+at-least-once problem again, except that here duplicates are fraud rather than noise.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   decision_id is minted by the AD SERVER, before the ad plays.
+   Every beacon for that playback carries it.
+
+   beacon ──&gt; Kafka topic  ads.events   (keyed by decision_id)
+                  │
+                  v
+            dedupe on (decision_id, event_type)   &lt;-- the whole trick
+                  │
+                  ├──&gt; billing ledger    append-only, reconciled daily
+                  └──&gt; warehouse         everything else
+
+   VALIDITY is a rule, not an accident: an impression counts when the
+   first quartile fires. A request that never played is not an impression,
+   which is also the honest definition when an advertiser audits you.</code></pre>
+
+<p>Because the identifier is issued by the server rather than the client, a replayed or forged
+beacon collapses onto a decision that was actually made. Deduplicating on
+<code>(decision_id, event_type)</code> then makes the ledger idempotent, and an append-only ledger
+is what lets a disputed invoice be reconstructed months later.</p>
+
+<h2>Step 8 &mdash; Views, watch time, and which number is real</h2>
+
+<p>&ldquo;How many views?&rdquo; is a trap, because the honest system has two answers and knows
+which is which.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   DISPLAY COUNT              BILLING / PAYOUT COUNT
+   approximate, fast          exact, slow, auditable
+   incremented in a counter   derived from the event archive
+   updated within seconds     settled on a schedule
+   may be revised down        never silently changed
+
+   A view = playback started AND 30 seconds watched (or the whole video
+   if shorter). State the rule; it is a product decision, not a default.</code></pre>
+
+<p>The display count runs through the streaming path: events land in Kafka, a stream job aggregates
+per video per minute, and a serving store holds the running total. It can be a little wrong for a
+few seconds and nobody is harmed.</p>
+
+<p>The payout count is recomputed from the archived events, which is possible only because the
+events were archived in the first place &mdash; the same replay property the customer data platform
+post depends on. When the definition of a valid view changes, or a fraud rule is tightened, you do
+not patch a counter. You re-derive from the log.</p>
+
+<p>Watch time, not views, is the number the rest of the system runs on: it is what advertisers buy,
+what recommendations optimise, and what a creator is paid against. It is also the only one of the
+three that resists the obvious gaming.</p>
+
+<h2>Step 9 &mdash; Marketing: getting the video watched</h2>
+
+<p>A video nobody sees is a storage bill. The distribution machinery is half the product, and in an
+interview it is usually the half nobody prepares.</p>
+
+<p><strong>Recommendations</strong> follow the pattern from the Amazon post: expensive work offline,
+cheap lookup online.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   OFFLINE (hourly / daily, in the warehouse)
+     watch history ──&gt; candidate generation ──&gt; a few hundred video ids
+                                                per user or per cohort
+   ONLINE (per request, milliseconds of budget)
+     candidates ──&gt; filter (watched? blocked? region? age-rated?)
+                ──&gt; rank   (predicted watch time, freshness, diversity)
+                ──&gt; page
+
+   The online tier NEVER computes candidates. It filters and ranks a list
+   that already exists, which is what makes the home page a cache read.</code></pre>
+
+<p><strong>Subscription notifications</strong> are a fan-out problem and the
+<a href="/system-design/system-design-notification-system">notification system post</a> is the
+answer to it: a publish writes one row, a worker fans out to subscribers, and the delivery is
+at-least-once with deduplication. The channel-specific part is that a creator with ten million
+subscribers must not produce ten million pushes in one second &mdash; the fan-out is spread over
+minutes, and prioritised by who actually opens notifications from that channel.</p>
+
+<p><strong>Campaigns and experiments</strong> need one thing the plumbing does not give you for
+free: assignment must be <em>stored</em>, not recomputed.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">   BAD   variant = hash(user_id + experiment) % 2
+         -&gt; changes the day you add a variant or rename the experiment,
+            and every user silently switches arm mid-experiment
+
+   GOOD  assignment written once, on first exposure, and read thereafter
+         -&gt; the arm is a fact about that user, joinable to every event,
+            and the analysis is a join rather than a re-derivation
+
+   THE SHARED BUDGET, which teams forget:
+     ads, subscription pushes, digest emails and re-engagement campaigns
+     all spend the SAME viewer attention. One frequency cap per viewer,
+     enforced across all of them, or four teams each send "only two a
+     day" and the viewer gets eight and uninstalls.</code></pre>
+
+<p>That last block is the point of this section. Ads, notifications and lifecycle marketing are
+usually owned by different teams with different dashboards, and the system only behaves if there is
+a single per-viewer contact budget they all draw from. It is the cheapest thing on this page to
+design and the most expensive to retrofit.</p>
+
+<p><strong>Attribution</strong> closes the loop: a paid install or a shared link carries a campaign
+tag, the tag is stored on the session, and it rides the same event pipeline as everything else. One
+pipeline, forked at the end &mdash; which is why the diagram in step 3 has a single arrow into
+Kafka.</p>
+
+<h2>Step 10 &mdash; The schema</h2>
+
+<pre class="language-sql"><code class="language-sql">CREATE TABLE video (
+    id              BIGINT      PRIMARY KEY,
+    channel_id      BIGINT      NOT NULL,
+    title           TEXT        NOT NULL,
+    duration_sec    INTEGER,
+    source_hash     CHAR(64),                  -- dedupe identical re-uploads
+    state           TEXT        NOT NULL,      -- uploading|processing|live|removed
+    visibility      TEXT        NOT NULL,      -- public|unlisted|private
+    monetisable     BOOLEAN     NOT NULL DEFAULT FALSE,
+    published_at    TIMESTAMPTZ
+);
+
+CREATE TABLE video_rendition (
+    video_id        BIGINT      NOT NULL REFERENCES video(id),
+    rendition       TEXT        NOT NULL,      -- 144p ... 1080p
+    state           TEXT        NOT NULL,      -- pending|ready|failed
+    segment_count   INTEGER,
+    bytes           BIGINT,
+    PRIMARY KEY (video_id, rendition)
+);
+
+CREATE TABLE ad_break (
+    video_id        BIGINT      NOT NULL REFERENCES video(id),
+    position_sec    INTEGER     NOT NULL,      -- ON a segment boundary
+    kind            TEXT        NOT NULL,      -- pre|mid|post
+    PRIMARY KEY (video_id, position_sec)
+);
+
+-- Append-only, partitioned by day. This is the table an advertiser audits,
+-- so nothing in it is ever updated in place.
+CREATE TABLE ad_impression (
+    decision_id     UUID        NOT NULL,
+    event_type      TEXT        NOT NULL,      -- impression|q1|q2|q3|complete|skip
+    occurred_at     TIMESTAMPTZ NOT NULL,
+    campaign_id     BIGINT      NOT NULL,
+    video_id        BIGINT      NOT NULL,
+    viewer_country  CHAR(2),
+    PRIMARY KEY (decision_id, event_type, occurred_at)
+) PARTITION BY RANGE (occurred_at);</code></pre>
+
+<p>Two notes. <code>video_rendition</code> having its own state is what allows a video to be live
+while half its ladder is still encoding &mdash; the playback API builds the manifest from the rungs
+that are <code>ready</code>. And <code>ad_impression</code> having a primary key that includes the
+event type is the deduplication rule from step 7 expressed as a constraint, which is always better
+than expressing it as code: a duplicate beacon becomes a conflict rather than a second charge.</p>
+
+<p>Note what is <em>not</em> in Postgres. No segments, no view counters, no watch history. The
+relational store holds the things that must be consistent and are small; the petabytes live in
+object storage and the counts live in the streaming path.</p>
+
+<h2>The whole thing</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">   UPLOAD          chunks -&gt; object storage, session resumable, hash-deduped
+     v
+   TRANSCODE       360 keyed tasks, cheap rungs first, cue points recorded
+     v
+   PUBLISH         live when rung one is ready; manifest built from ready rungs
+     v
+   WATCH           manifest (short TTL) + segments (immutable, ~99% edge hits)
+     |
+     ├─ AD         decide in parallel, hard deadline, "no ad" is a valid answer
+     |             stitched (SSAI) or switched (CSAI); ad segments cached too
+     v
+   EVENTS          one Kafka pipeline, forked:
+                     counters   -&gt; approximate, fast, shown
+                     billing    -&gt; deduped on decision_id, append-only, audited
+                     warehouse  -&gt; recommendations, campaigns, attribution
+                     archive    -&gt; replay when a definition changes
+     v
+   DISTRIBUTE      recommendations (offline candidates, online ranking)
+                   notifications (fan-out, spread, one shared frequency cap)</code></pre>
+
+<h2>Failure modes</h2>
+
+<ul>
+  <li><strong>The origin gets asked for everything.</strong> A bad cache header, or a manifest
+      accidentally made unique per viewer, and the CDN stops absorbing 99% of the bytes. At these
+      volumes that is not a slow site, it is an origin that is simply gone. Watch the offload ratio,
+      not the origin's own latency &mdash; by the time the origin looks slow it is already over.</li>
+  <li><strong>Transcode backlog on a viral day.</strong> The queue is the right shape for this, but
+      only if priority is respected: cheap rungs for new videos must jump ahead of 4K rungs for
+      videos already published and watchable.</li>
+  <li><strong>The ad service becomes a dependency of playback.</strong> This is the one that hurts,
+      and it happens by accident &mdash; a retry added &ldquo;for fill rate&rdquo;, a timeout raised
+      during a revenue push. The deadline has to be enforced by the player, which has no incentive to
+      be generous, rather than by the ad service.</li>
+  <li><strong>Double-counted impressions.</strong> A client retrying beacons plus a pipeline
+      replaying a partition, and the invoice is wrong in the advertiser's favour to notice and yours
+      to refund. The deduplication key is the defence and it belongs in the schema.</li>
+  <li><strong>Notification storm.</strong> Ten million subscribers, one publish, no spreading. It
+      shows up as a push provider rate-limiting you, which looks like their fault and is not.</li>
+  <li><strong>A rendition that silently never completes.</strong> Nobody notices, because the video
+      plays &mdash; at 360p, forever. Renditions need a completeness check, not just a task queue.</li>
+</ul>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;How do you store the video?&rdquo;</strong> &mdash; you do not store the video.
+      You store segments per rendition in object storage, immutable and content-addressed, and the
+      database stores only what points at them.</li>
+  <li><strong>&ldquo;How does playback start quickly?&rdquo;</strong> &mdash; a short manifest, a low
+      opening rendition that the player upgrades from, and segments that are almost always already
+      at the edge.</li>
+  <li><strong>&ldquo;Where do the ads come from?&rdquo;</strong> &mdash; cue points fixed at
+      transcode, a decision made in parallel with playback under a hard deadline, and creatives
+      delivered by the same CDN path as the content.</li>
+  <li><strong>&ldquo;What if the ad server is down?&rdquo;</strong> &mdash; the video plays. That is
+      the whole answer, and it is the right one.</li>
+  <li><strong>&ldquo;Are view counts exact?&rdquo;</strong> &mdash; the displayed one is not and does
+      not need to be; the billed one is, and is derived from the archived event log rather than from
+      the counter.</li>
+  <li><strong>&ldquo;SSAI or CSAI?&rdquo;</strong> &mdash; SSAI for the viewer experience and
+      because it survives blocking; the cost is a per-viewer manifest, which is kilobytes, while the
+      segments stay shared.</li>
+  <li><strong>&ldquo;How do you stop bombarding people?&rdquo;</strong> &mdash; one frequency cap per
+      viewer, shared by ads, notifications and marketing, enforced centrally.</li>
+</ul>
+
+<p>The thread running through all of it is that this system is defined by what it refuses to do at
+request time. It does not transcode on demand, it does not compute recommendations on demand, it
+does not serve bytes from the origin, and it does not wait for an ad. Every one of those is the
+same move &mdash; do the expensive thing in advance, and make the request path a lookup &mdash;
+which is the through-line of the entire track, applied to a system whose scale leaves no room to
+get it wrong.</p>
+
+<p>Next, and last: <a href="/system-design/system-design-interview-questions">the interview
+questions</a> &mdash; everything in this track, condensed into answers short enough to say out
+loud.</p>

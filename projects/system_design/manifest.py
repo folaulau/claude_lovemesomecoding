@@ -30,8 +30,8 @@ CATEGORY = {
     "description": (
         "System design from the parts list to the whiteboard — estimation, load balancing, "
         "caching, database scaling, consistency, queues, concurrency and rate limiting, then "
-        "full walkthroughs of Airbnb, Amazon, an airline booking system, a URL shortener, chat "
-        "and notifications. Every mechanism is shown working in a real booking application "
+        "full walkthroughs of Airbnb, Amazon, an airline booking system, YouTube, a URL "
+        "shortener, chat and notifications. Every mechanism is shown working in a real booking application "
         "rather than described, and every number quoted was measured on the machine that wrote "
         "it."
     ),
@@ -255,6 +255,9 @@ SNIPPET_SOURCES = {
     ],
     "system-design-url-shortener": [],
     "system-design-chat-system": [],
+    # Not StayHub. A customer data platform has no counterpart in a booking application, so this
+    # post is schema and Java presented as design — the same footing as Amazon and Delta.
+    "system-design-customer-data-platform": [],
     "system-design-notification-system": [
         "app/services/notification_service.py", "app/services/outbox_service.py",
         "app/models/outbox.py", "app/services/booking_service.py",
@@ -268,6 +271,9 @@ SNIPPET_SOURCES = {
     ],
     "system-design-amazon": [],
     "system-design-delta-airlines": [],
+    # Not StayHub either. Nothing in a booking application transcodes video or runs an ad auction,
+    # so this post is schema, JSON contracts and diagrams — Amazon and Delta's footing again.
+    "system-design-youtube": [],
     "system-design-interview-questions": [],
 }
 
@@ -452,6 +458,26 @@ _TRACK = [
         ),
     },
     {
+        "slug": "system-design-customer-data-platform",
+        "title": "Designing a Customer Data Platform",
+        "state": "new",
+        # ⚠️ An EXPLICIT date, and the only one in the track. Folau asked for a 2024 date on this
+        # post specifically, and it was written after the other eighteen were already live with
+        # the dates computed below. Slotting it between chat-system (2024-09-28) and
+        # notification-system (2024-12-19) with a hand-set date is what lets it join the track
+        # without re-dating a single published post: the computed index skips explicit entries,
+        # so every other lesson keeps the exact date it already has in prod.
+        "date": "2024-11-08T09:00:00",
+        "tags": ["system-design", "interview", "case-study"],
+        "excerpt": (
+            "CRM, Billing and Support each think they own the customer, they disagree, and they "
+            "arrive out of order. The design that produces one profile and can still explain why "
+            "it chose every value — field-level observations, a pure survivorship function, "
+            "identity resolution with reversible merges, and a lineage endpoint that shows what "
+            "lost."
+        ),
+    },
+    {
         "slug": "system-design-notification-system",
         "title": "Designing a Notification System",
         "state": "rewrite",
@@ -506,6 +532,26 @@ _TRACK = [
         ),
     },
     {
+        "slug": "system-design-youtube",
+        "title": "Designing YouTube",
+        "state": "new",
+        # ⚠️ The SECOND explicit date, for the same reason as the customer data platform above:
+        # this post was written after the track was already live, and the computed sequence has no
+        # free slot before the interview post that stays inside DATE_RANGE. Hand-setting a date
+        # between delta-airlines (2025-08-22) and interview-questions (2025-11-12) inserts it
+        # without moving a single published date.
+        "date": "2025-10-08T09:00:00",
+        "tags": ["system-design", "interview", "case-study"],
+        "excerpt": (
+            "The first case study here that is not a transactional system: nobody contends for "
+            "a video, and the difficulty is bytes. Resumable uploads, transcoding as a fan-out of "
+            "keyed tasks, and the cache split that makes a 99% edge hit rate reachable — then "
+            "advertising as part of the playback path, server-side against client-side insertion, "
+            "impression billing that has to be exactly once, and the recommendation and campaign "
+            "machinery that gets a video watched."
+        ),
+    },
+    {
         "slug": "system-design-interview-questions",
         "title": "System Design Interview Questions",
         "state": "rewrite",
@@ -543,18 +589,31 @@ def _date(index: int) -> str:
     return (START_DATE + timedelta(days=index * STEP_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-POSTS = [
-    {
-        "slug": entry["slug"],
-        "title": entry["title"],
-        "file": f"{i + 1:02d}-{entry['slug']}.html",
-        "date": _date(i),
-        "tags": entry["tags"],
-        "excerpt": entry["excerpt"],
-        "state": entry["state"],
-    }
-    for i, entry in enumerate(_TRACK)
-]
+# An entry carrying its own "date" uses it verbatim AND does not consume a slot in the computed
+# sequence. That is what keeps a later insertion free: adding one hand-dated post in the middle of
+# the track leaves every computed date — and therefore every already-published post — untouched.
+# `file` still numbers by list position, because that number is the teaching order.
+def _build_posts() -> list[dict]:
+    posts, computed = [], 0
+    for i, entry in enumerate(_TRACK):
+        if "date" in entry:
+            date = entry["date"]
+        else:
+            date = _date(computed)
+            computed += 1
+        posts.append({
+            "slug": entry["slug"],
+            "title": entry["title"],
+            "file": f"{i + 1:02d}-{entry['slug']}.html",
+            "date": date,
+            "tags": entry["tags"],
+            "excerpt": entry["excerpt"],
+            "state": entry["state"],
+        })
+    return posts
+
+
+POSTS = _build_posts()
 
 # Slugs that already exist on the live site and must never change. All seven predate this rewrite;
 # check_content.py fails if one leaves the manifest, and seed.py refuses to write to prod if one is
@@ -567,14 +626,15 @@ assert FROZEN_SLUGS == set(EXISTING), (
     "the frozen slugs and the measured baseline must describe the same seven posts: "
     f"{FROZEN_SLUGS ^ set(EXISTING)}"
 )
-assert len(POSTS) == 18, f"the track is 18 posts, got {len(POSTS)}"
+assert len(POSTS) == 20, f"the track is 20 posts, got {len(POSTS)}"
 
-_first = START_DATE
-_last = START_DATE + timedelta(days=(len(POSTS) - 1) * STEP_DAYS)
-assert DATE_RANGE[0] <= _first and _last <= DATE_RANGE[1], (
-    "the computed post dates must stay inside DATE_RANGE: "
-    f"{_first:%Y-%m-%d}..{_last:%Y-%m-%d} vs "
-    f"{DATE_RANGE[0]:%Y-%m-%d}..{DATE_RANGE[1]:%Y-%m-%d}"
+# Checked against the dates POSTS actually carries, not against the computed endpoints, because
+# an explicitly dated entry never passes through _date() and the endpoint arithmetic cannot see it.
+_dates = [datetime.strptime(p["date"], "%Y-%m-%dT%H:%M:%S") for p in POSTS]
+_out = [p["slug"] for p, d in zip(POSTS, _dates) if not DATE_RANGE[0] <= d <= DATE_RANGE[1]]
+assert not _out, (
+    f"post dates must stay inside {DATE_RANGE[0]:%Y-%m-%d}..{DATE_RANGE[1]:%Y-%m-%d}, "
+    f"but these fall outside: {_out}"
 )
 assert set(SNIPPET_SOURCES) == {e["slug"] for e in _TRACK}, (
     "every post needs a SNIPPET_SOURCES entry, even an empty one: "

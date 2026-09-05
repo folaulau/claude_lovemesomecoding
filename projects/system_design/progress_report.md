@@ -472,6 +472,149 @@ Deployed: 2013 files, 95 redirects, invalidation complete, edge serving build `3
 slots. If future-dating is not intentional there, it has the same sitemap `<lastmod>` problem this
 change just fixed here.
 
+## Lesson 14 added: Designing a Customer Data Platform (2026-08-29)
+
+The track is now **19 posts**. `system-design-customer-data-platform` was written from a separate
+design brief (see `projects/customer_data_platform/`) and slotted into the track.
+
+### The date problem, and why the manifest grew a new mechanism
+Folau asked for the post to carry a 2024 date. Dates here are COMPUTED from `START_DATE +
+index * STEP_DAYS`, so an inserted post normally shifts every date after it — and all eighteen
+existing posts are live with the 2022–2025 dates set on 2026-08-24. Re-dating them again to make
+room for one post is churn on published pages for no reader benefit.
+
+Three options were considered:
+
+| Option | Cost |
+|---|---|
+| `STEP_DAYS` 82 → 80, 19 computed dates | Fits 2022–2025, but re-dates all 18 live posts |
+| Append at the end with an explicit date | `check_content.py` fails: manifest dates must ascend |
+| **Explicit date that skips the computed index** | **Zero change to any published post** ← chosen |
+
+So `_build_posts()` replaced the POSTS comprehension: an entry carrying its own `"date"` uses it
+verbatim **and does not consume a slot in the computed sequence**. Every other lesson keeps the
+exact date it already had in prod — verified post-seed, all 18 unchanged.
+
+The post sits at position 14 (`2024-11-08`), between `chat-system` (2024-09-28) and
+`notification-system` (2024-12-19). Files 14–18 were renamed to 15–19; slugs and therefore URLs are
+untouched.
+
+### Other manifest changes
+- `assert len(POSTS) == 19`.
+- The DATE_RANGE assertion now checks **the dates POSTS actually carries**, not the computed
+  endpoints. It had to: an explicitly dated entry never passes through `_date()`, so endpoint
+  arithmetic cannot see it and would have asserted against a post that does not exist.
+- `SNIPPET_SOURCES` entry is **empty**, following the Amazon and Delta precedent. This post is not
+  StayHub — a CDP has no counterpart in a booking app — so its code is schema and Java presented as
+  design. `check_snippets.py` skips Java (not in `SOURCE_LANGS`) and classes the SQL and JSON as
+  illustrative, which is the honest result.
+
+### Deviation worth flagging
+This is the only post in the track whose code is **Java/Spring Boot** rather than FastAPI. That was
+Folau's explicit instruction on the brief ("use springboot as the backend api", and "dont use any
+demo app because none of them is a good fit"). It is a real inconsistency with the other eighteen,
+recorded here rather than smoothed over.
+
+### Verification
+- `check_content.py` — all 19 pass. New post: 3,367 words, 65% prose, 7 plaintext diagrams, 15 min.
+- `check_snippets.py` — "no drift". 48/90 checked blocks quoted from running code.
+- `seed.py --env prod --republish --write` — 18 updates, 1 create; 873 posts in the tree;
+  "indexes verified: all 19 posts agree" (no `_reindex` drift this run).
+- `npm run deploy` — 873/873 posts, 42/42 categories agree, 2,239 files, build `42a2593` at the edge.
+- Live: page returns 200, renders "November 8, 2024", Java blocks are Prism-highlighted, the archive
+  lists it 14th in lesson order, the pager walks chat-system → CDP → notification-system, and the
+  sitemap carries the URL.
+
+---
+
+## Lesson 19 added: Designing YouTube (2026-08-31)
+
+Folau asked for a YouTube design post, then mid-write added **"include adds and marketing"** — so
+advertising and the distribution machinery are designed here as first-class parts of the system
+rather than an appendix. That instruction shaped the post: steps 7 and 9 (ads, marketing) are the
+two longest sections, and the ad decision appears in the architecture diagram as a *sibling* of
+playback rather than a step inside it.
+
+### Where it goes and why
+
+Position **19**, between `delta-airlines` (2025-08-22) and `interview-questions` (2025-11-12).
+The interview post has to stay last — it is the wrap-up and it links to everything above it — so
+"append at the end" was never available.
+
+That forced the same date problem as lesson 14, and the mechanism built then solved it unchanged:
+
+| | |
+|---|---|
+| Computed slot after `interview-questions` | 2026-02-02 — outside `DATE_RANGE`, and in the future |
+| Shrink `STEP_DAYS` to fit | re-dates all 19 live posts |
+| **Explicit date, skipping the computed index** | **zero change to any published date** ← used |
+
+`"date": "2025-10-08T09:00:00"`. `_build_posts()` already skips explicit entries when advancing the
+computed sequence, so every other lesson kept the exact date it had in prod — confirmed against the
+seed output. This is now the **second** hand-dated entry; if a third is ever needed the mechanism
+scales, but the comment on each explicit date should keep saying *why* it is explicit.
+
+`file` still numbers by list position, so `19-system-design-interview-questions.html` was
+`git mv`d to `20-`. Slug unchanged, so the indexed URL is untouched.
+
+### Two cross-references had to move with it
+
+Inserting a post before the last one breaks the chain the posts state in prose, and neither of
+these is caught by any check:
+
+- `delta-airlines` ended **"Next, and last: the interview questions"**. It now points at YouTube,
+  and the "and last" is gone. Left uncaught this would have been a live page telling readers the
+  track ends one post early.
+- `interview-questions` opened with "it assumes the other **seventeen**". That was *already* stale —
+  lesson 14 made it eighteen and nobody updated it — so it is now "the other **nineteen**". Worth
+  noting as a standing hazard: prose that counts the track goes stale on every insertion, and
+  `check_content.py` cannot see it. A grep for spelled-out numbers is the cheapest guard before any
+  future insertion.
+
+`manifest.CATEGORY["description"]` also gained YouTube in its list of walkthroughs, because
+`upsert_category` rewrites the stored standfirst from the manifest on every seed.
+
+### Content decisions
+
+- **`SNIPPET_SOURCES` is empty**, the Amazon/Delta/URL-shortener footing. Nothing in StayHub
+  transcodes video or runs an ad auction, so the post is SQL, JSON contracts and ASCII diagrams —
+  no Python pretending to come out of a repository. `check_snippets.py` reports 2 illustrative
+  blocks and no drift.
+- **No Java this time.** Lesson 14 used Spring Boot because Folau asked for it there specifically;
+  that instruction did not carry over, so this post returns to the track's convention.
+- Deliberately avoided the words `measured`/`benchmark` and any `N ms` figure. Every number on the
+  page is arithmetic the reader can check (uploads/day → TB/day → Tbps), which
+  `CLAIMS_MEASUREMENT` correctly does not fire on. Nothing here was run on this machine and the
+  post must not imply otherwise.
+- The estimate is the load-bearing section: **egress is ~300x ingest**, ~17 Tbps at peak, which is
+  what makes "almost no watch traffic may reach your servers" a conclusion rather than an opinion.
+- Ads coverage: cue points fixed at transcode, decision in parallel under a hard deadline with
+  `"fill": false` as a normal answer, SSAI vs CSAI with the cache cost quantified (the manifest is
+  kilobytes; the segments stay shared), and impression billing deduped on a **server-minted**
+  `decision_id` so a replayed beacon collapses rather than double-charging.
+- Marketing coverage: offline candidates + online ranking, subscription fan-out spread over
+  minutes, stored experiment assignment (not `hash(user) % 2`), and the **one shared frequency cap**
+  across ads, pushes and campaigns — the cheapest thing to design up front and the most expensive
+  to retrofit.
+
+### Verification
+
+```
+check_content.py    all 20 pass — youtube 4,240 words / 19 min / 63% prose / 14 plaintext blocks
+check_snippets.py   no drift; 48/92 checked blocks quoted from running code
+seed.py --env prod --republish --write
+                    20 posts, 874 in tree (was 873)
+                    indexes verified: all 20 posts agree
+npm run deploy      874/874 posts, 42/42 category counts agree, 2,241 files, build 42a2593
+live                200, "October 8, 2025", 2 json / 2 sql / 28 plaintext blocks,
+                    82 prism keyword tokens, pager reads
+                    ‹ Airline Booking System · Interview Questions ›
+```
+
+At 19 minutes it is the longest post in the track, and the only one above 18 — the ads and
+marketing sections are the extra four minutes. It is inside the 15-20 budget with 160 words of
+headroom under the cap.
+
 ## Still to do
 
 1. **Submit the sitemap to Search Console** if the eleven new URLs should be indexed promptly.

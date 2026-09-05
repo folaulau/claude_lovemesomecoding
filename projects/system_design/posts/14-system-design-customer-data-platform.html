@@ -1,0 +1,518 @@
+<p>Three systems each believe they own the customer. The CRM has her as Alex Rivera. The billing
+platform has her as Alexandra M Rivera. The support desk has her as alex rivera, with a typo in the
+email address. All three send updates continuously, the updates arrive out of order, and every one
+of them sends a partial record.</p>
+
+<p>The job is to produce one profile. The harder half of the job is to say, when someone disputes a
+value, exactly why that value won &mdash; and that second requirement is the one that shapes the
+whole design. Every obvious implementation of the first requirement makes the second one
+impossible.</p>
+
+<p>A note on the code before we start. Unlike the earlier case studies, this one is not taken from
+StayHub: a customer data platform has no counterpart in a booking application. What follows is
+schema and Java presented as design, on the same footing as the <a
+href="/system-design/system-design-amazon">Amazon</a> and <a
+href="/system-design/system-design-delta-airlines">airline</a> posts, rather than as something
+measured on this machine.</p>
+
+<h2>Step 1 &mdash; Scope</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">IN SCOPE                            OUT OF SCOPE (say so)
+  ingest from CRM, Billing, Support   probabilistic / ML matching
+  normalize to a canonical schema     real-time segmentation
+  handle duplicates                   a self-serve rule builder UI
+  handle out-of-order events          cross-device identity graphs
+  resolve identity across sources     marketing campaign execution
+  merge into one profile
+  explain every chosen value
+  emit updates downstream
+
+WORTH ASKING
+  can a value ever be wrong on
+    purpose?                        -> yes. sources disagree legitimately
+  who wins when they conflict?      -> NOT "most recent". see step 6
+  is a merge reversible?            -> it has to be. see step 7
+  who consumes the output?          -> decides how chatty the events are
+
+NON-FUNCTIONAL
+  correctness > freshness            a wrong profile is acted on by 3 systems
+  every value must be explainable    this is a hard requirement, not a nice-to-have
+  reprocessing must converge         same input, same answer, any order
+  write-heavy, read-light            ~35 writes/sec, profile reads are rarer</code></pre>
+
+<p>That third non-functional is unusual and worth saying out loud in an interview. Most systems are
+allowed to be path-dependent &mdash; the state you end up in depends on the order things happened.
+A unification platform is not, because the moment two replays of the same data produce two different
+profiles, no explanation you give about any value is trustworthy.</p>
+
+<h2>Step 2 &mdash; Estimate</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  8M customers across 3 source systems
+        3M record updates/day
+        ~6 populated fields per record
+
+RATE    3M / 86,400        = ~35 updates/sec
+        nightly billing file, x12 burst  = ~400/sec peak
+FIELDS  3M x 6             = 18M field values seen/day
+CHANGED ~8% of resent values actually differ
+                           = ~1.4M observations written/day
+STORAGE 1.4M x 250 B x 365 = ~125 GB/year, ~500M rows/year
+CANDIDATES per field, per customer:  3-12</code></pre>
+
+<p>Read the first and last lines together, because between them they decide the whole design.</p>
+
+<p><strong>Thirty-five writes a second is nothing.</strong> No sharding, no queue-based load
+levelling, no exotic storage. A single Postgres handles this without noticing. So none of the
+engineering goes into throughput.</p>
+
+<p><strong>Three to twelve candidates per field</strong> means that recomputing a field's value from
+every observation ever recorded for it is trivial work &mdash; a dozen rows, a sort, a comparison.
+That is the number that makes the central idea in step 5 affordable. If it were three million, the
+design would have to be something else.</p>
+
+<p><strong>Eight percent</strong> is the other one to notice. Sources re-send whole records
+constantly and most fields are byte-identical to last time. Storing every field of every record
+would grow the database with traffic instead of with change &mdash; a twelvefold difference here.
+Storing an observation only when the value actually differs is not an optimisation, it is what makes
+the model viable at all.</p>
+
+<h2>Step 3 &mdash; The shape</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">  CRM ──┐
+Billing ─┼─> ingest-api ──> Kafka ──┬──> S3 raw archive ──┐
+Support ─┘   (202, dedupe) records.raw                    │ replay
+                                    │                     │
+                                    v                     │
+                              resolver <───────────────────┘
+                            normalize, match,
+                            append, re-resolve
+                                    │
+                          ┌─────────┴──────────┐
+                          v                    v
+                     PostgreSQL           Kafka profile.changed
+                  observation             (field-level diff,
+                  record_owner             from an outbox)
+                  profile_field                  │
+                  decision_log         ┌─────────┼─────────┐
+                          ^            v         v         v
+                          └── profile-api   warehouse   marketing</code></pre>
+
+<p>The archive is not a backup. Because everything the resolver produces is <em>derived</em>, a bug
+in normalization or in the survivorship rules is fixed by changing the rule and replaying
+<code>records.raw</code> &mdash; not by writing a script that hand-patches profiles. That replay
+edge is the reason the raw copy is written before any interpretation happens, and it is the first
+thing to point at when someone asks what happens when the matching logic is wrong.</p>
+
+<p>Ingest is a separate deployable from resolution for the ordinary reason: their load shapes are
+unrelated. Ingest is spiky and must answer in milliseconds; resolution is throughput work that
+scales on Kafka partitions. One service would force them to share a scaling decision.</p>
+
+<h2>Step 4 &mdash; Normalize before you compare</h2>
+
+<p>The three records for Alex Rivera contain two phone numbers, <code>415-555-0148</code> and
+<code>(415) 555 0148</code>. Those are not a conflict. They are one number in two formats, and if
+they reach the survivorship rules as strings, the system will confidently pick a winner between two
+values that were never in disagreement.</p>
+
+<p>So normalization runs first and it is boring on purpose: phones to E.164, emails trimmed and
+lower-cased, addresses through one verification provider, names case-folded <em>for comparison</em>
+but stored exactly as the source sent them. Getting the last one wrong is how a profile ends up
+displaying ALEXANDRA RIVERA in a marketing email.</p>
+
+<p>Every observation is stamped with the version of the normalizer that produced it. That matters
+because a normalization change is retroactive: rows written under the old rules were normalized
+differently, so changing the rules means a replay, and until it finishes the two versions coexist in
+the table. A version number on the row is how you tell them apart. A version number in a config file
+somewhere is not.</p>
+
+<h2>Step 5 &mdash; The decision that makes it explainable</h2>
+
+<p>Here is the whole design, in one sentence:</p>
+
+<p><strong>The unified profile is not a row that sources take turns updating. It is a pure function
+over an append-only set of field observations, recomputed on every arrival.</strong></p>
+
+<p>An incoming record is not merged into anything. It is exploded into one immutable row per
+populated field &mdash; source, field, value, the source&rsquo;s own updated-at timestamp, the event
+id. The winning value for a field is then derived from every observation ever recorded for it.</p>
+
+<p>Two of the stated requirements stop being features and become properties.</p>
+
+<p>The first is out-of-order delivery. Consider a customer changing her phone number, where a retry
+delivers the older update second:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ARRIVES  1st   CRM   source_updated_at 10:41   +1 415 555 0172
+         2nd   CRM   source_updated_at 10:05   +1 415 555 0148   <- a retry
+
+OVERWRITE ON ARRIVAL                RESOLVE OVER THE CANDIDATE SET
+  phone = 0172                        candidates = [0172 @10:41, 0148 @10:05]
+  phone = 0148   <- WRONG             phone = max by source_updated_at
+                                            = 0172   <- right, in any order</code></pre>
+
+<p>On the left, arrival order is an input to the result. On the right it is not, and there is no
+&ldquo;is this newer than what we already have?&rdquo; check anywhere in the flow &mdash; a late
+event simply adds a candidate, and the function returns the same answer either way. Everything else
+in this post, replay included, is downstream of removing that one edge.</p>
+
+<p>The second property is lineage. If the winner is a function of stored candidates, then the answer
+to &ldquo;why is her email this?&rdquo; is the candidate set plus the rule that eliminated each
+loser. There is nothing to log at decision time for that question to be answerable, which is
+fortunate, because a system that has to remember why it did something will eventually forget.</p>
+
+<h2>Step 6 &mdash; Survivorship, in four rules</h2>
+
+<p>Which source wins which field is a business decision, so it lives in configuration rather than in
+code, and the service refuses to start if any canonical field has no authoritative source at all.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">FIELD               AUTHORITY (best first)      WHY
+legal_name          BILLING > CRM > SUPPORT     the name on the payment instrument
+email               CRM > SUPPORT > BILLING     captured with the consent record
+phone               SUPPORT > CRM > BILLING     corrected live, on the call
+billing_address     BILLING                     anything else is a guess
+shipping_address    CRM > SUPPORT               billing never sees it
+lifecycle_stage     CRM                         no other source can compute it
+marketing_consent   CRM > SUPPORT               has its own provenance requirement</code></pre>
+
+<p>The rules apply in order. Only authoritative sources are candidates at all &mdash; Billing
+sending a <code>lifecycle_stage</code> is noise, not a low-priority opinion. Then <strong>authority
+tier beats recency, and never the other way round</strong>: recency only ever competes inside a
+tier. Within the winning tier the greatest <code>source_updated_at</code> wins, and if that winner
+is a tombstone the field is cleared. Ties break on the event id.</p>
+
+<p>The second rule is the one people argue with, and the argument is worth having. &ldquo;Most
+recent wins&rdquo; sounds neutral and fair. What it actually means is that a support agent
+mistyping an address at 4pm silently overwrites a billing address the payment processor verified last
+week. Recency is only meaningful between sources that are equally entitled to an opinion.</p>
+
+<pre class="language-java"><code class="language-java">@Service
+@RequiredArgsConstructor
+public class SurvivorshipResolver {
+
+    /**
+     * Deterministic ordering within an authority tier.
+     *
+     * &lt;p&gt;The tiebreak is the source's own {@code eventId} and NOT the observation's row id.
+     * A replay from the archive mints new row ids, so a row-id tiebreak would let the replay
+     * settle on a different value than the original run. The tiebreak has to come from the
+     * data, not from our storage.
+     */
+    private static final Comparator&lt;Observation&gt; WITHIN_TIER =
+            Comparator.comparing(Observation::getSourceUpdatedAt)
+                      .thenComparing(Observation::getEventId);
+
+    private final FieldAuthorityPolicy authority;
+
+    public Resolution resolve(CanonicalField field, List&lt;Observation&gt; candidates) {
+        List&lt;Observation&gt; eligible = candidates.stream()
+                .filter(o -&gt; authority.tier(field, o.getSource()) != NOT_AUTHORITATIVE)
+                .toList();
+
+        if (eligible.isEmpty()) {
+            return Resolution.empty(field, Rule.NO_AUTHORITATIVE_SOURCE, candidates);
+        }
+
+        int bestTier = eligible.stream()
+                .mapToInt(o -&gt; authority.tier(field, o.getSource()))
+                .min()
+                .orElseThrow();
+
+        // Recency only ever competes inside a tier. A newer Support record must not displace
+        // a Billing address, however long ago Billing last spoke.
+        Observation winner = eligible.stream()
+                .filter(o -&gt; authority.tier(field, o.getSource()) == bestTier)
+                .max(WITHIN_TIER)
+                .orElseThrow();
+
+        return winner.isTombstone()
+                ? Resolution.cleared(field, winner, Rule.TOMBSTONE, candidates)
+                : Resolution.of(field, winner, Rule.AUTHORITY_THEN_RECENCY, candidates);
+    }
+}</code></pre>
+
+<p>Read what this class does <em>not</em> do. It takes no repository, reads no current profile, and
+consults no clock. Given the same candidates it returns the same answer on any machine at any time
+in any arrival order. That is what makes replay safe and what makes the explanation in step 8
+honest rather than reconstructed.</p>
+
+<p>One detail in it is easy to get wrong and expensive to discover. The tiebreak is the
+source&rsquo;s <code>eventId</code>, not the observation&rsquo;s own row id, because a replay from
+the archive generates new row ids &mdash; and a tiebreak on those would let a replay legitimately
+settle on a different value than the original run. Convergence is the entire premise; the tiebreak
+has to come from the data.</p>
+
+<h2>Step 7 &mdash; Identity resolution</h2>
+
+<p>Matching is deterministic on normalized keys, and the keys are split into two classes. The split
+is the whole safety mechanism.</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">STRONG   email, phone, account_number, tax_id
+         -> may attach a record to a customer
+         -> may link two customers (a merge)
+
+WEAK     name + postcode, device_id, household_address
+         -> may attach
+         -> may NEVER merge on its own
+
+GUARDRAILS on a merge
+  two independent STRONG keys must agree, or a human decides
+  refuse if the identity component would exceed 25 keys
+  the losing customer_id is never deleted -> customer_alias
+  serialize merges per component, lock rows in customer_id order</code></pre>
+
+<p>A weak key merging on its own is how a family sharing a household address becomes one person, and
+how a shared support login collapses a small business into its office manager. The 25-key ceiling
+catches the same failure from the other side: real people do not accumulate that many identifiers,
+so that shape is a shared inbox and it belongs in the review queue.</p>
+
+<p>Un-merging has to be cheap, because you will do it. That is why <code>record_owner</code> &mdash;
+which source record belongs to which customer &mdash; is the only mutable link in the system. A
+merge rewrites rows there and nowhere else, so the observations stay honestly append-only and an
+unmerge is a delete plus a re-resolve rather than an archaeological dig. The retired
+<code>customer_id</code> moves to <code>customer_alias</code> and keeps resolving forever, because
+downstream systems are holding it.</p>
+
+<p>Merges are also the one genuinely order-sensitive operation here, which is worth admitting rather
+than glossing. Two concurrent merges touching the same component can interleave into a state neither
+intended, so they are serialized per component with row locks taken in <code>customer_id</code>
+order &mdash; the same discipline the <a
+href="/system-design/system-design-concurrency-and-locking">concurrency post</a> applies to double
+booking, for the same reason.</p>
+
+<h2>Step 8 &mdash; Explaining a value</h2>
+
+<p>This endpoint is the deliverable that the requirement was really asking for. It re-runs the rules
+over the current candidate set and reports what each rule eliminated.</p>
+
+<pre class="language-json"><code class="language-json">{
+  "field": "email",
+  "value": "alex.rivera@example.com",
+  "decidedBy": "AUTHORITY_THEN_RECENCY",
+  "winner": {
+    "source": "CRM",
+    "sourceRecordId": "c-8821",
+    "sourceUpdatedAt": "2024-11-04T10:05:11Z",
+    "normalizerVersion": 4
+  },
+  "rejected": [
+    {
+      "source": "BILLING",
+      "value": "a.rivera@example.com",
+      "sourceUpdatedAt": "2024-11-06T09:12:00Z",
+      "eliminatedBy": "AUTHORITY_TIER",
+      "reason": "BILLING is tier 3 for email; CRM is tier 1. Recency does not cross tiers."
+    },
+    {
+      "source": "SUPPORT",
+      "value": "alex.rivera@exampl.com",
+      "sourceUpdatedAt": "2024-10-28T16:40:00Z",
+      "eliminatedBy": "AUTHORITY_TIER",
+      "reason": "SUPPORT is tier 2 for email; CRM is tier 1."
+    }
+  ]
+}</code></pre>
+
+<p>Notice that the rejected Billing address is <em>newer</em> than the winner. Without this endpoint
+that looks like a bug, and someone will open a ticket about it roughly once a week. With it, the
+answer is on the page and the conversation moves to where it belongs: whether the authority order is
+right, which is a business question.</p>
+
+<p>A separate <code>decision_log</code> table records what changed and when. That is a different
+question from why a value is what it is, and conflating the two produces a table that answers
+neither well.</p>
+
+<h2>Step 9 &mdash; Applying a record, and emitting</h2>
+
+<pre class="language-java"><code class="language-java">@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ResolutionService {
+
+    private final ObservationDAO observations;
+    private final ProfileFieldDAO profileFields;
+    private final DecisionLogDAO decisionLog;
+    private final OutboxDAO outbox;
+    private final SurvivorshipResolver resolver;
+
+    @Transactional
+    public void apply(UUID customerId, List&lt;Observation&gt; incoming) {
+        List&lt;Observation&gt; appended = observations.appendIfChanged(incoming);
+        if (appended.isEmpty()) {
+            return;                     // the source re-sent an identical record
+        }
+
+        EnumSet&lt;CanonicalField&gt; touched = appended.stream()
+                .map(Observation::getField)
+                .collect(Collectors.toCollection(() -&gt; EnumSet.noneOf(CanonicalField.class)));
+
+        List&lt;FieldChange&gt; changes = new ArrayList&lt;&gt;();
+        for (CanonicalField field : touched) {
+            Resolution next = resolver.resolve(field, observations.candidates(customerId, field));
+            ProfileField current = profileFields.find(customerId, field);
+
+            if (next.sameValueAs(current)) {
+                continue;               // resolved to what we already had: no log, no emit
+            }
+            profileFields.upsert(customerId, next);
+            decisionLog.record(customerId, current, next);
+            changes.add(FieldChange.between(current, next));
+        }
+
+        if (!changes.isEmpty()) {
+            outbox.enqueue(ProfileChanged.of(customerId, changes));
+        }
+    }
+}</code></pre>
+
+<p>Two things in there are load-bearing.</p>
+
+<p>The outbox row is written <em>inside</em> the same transaction as the profile change. Publishing
+to Kafka after the commit means a crash in between leaves a downstream consumer permanently
+disagreeing with the profile store, and nothing would ever detect it &mdash; the same argument the
+<a href="/system-design/system-design-message-queues">message queues post</a> makes, and the reason
+that pattern keeps reappearing.</p>
+
+<p>The <code>sameValueAs</code> check is the other one. A late observation very often loses, and
+emitting <code>profile.changed</code> for it would wake every consumer with an event whose before
+and after are identical. At three sources re-sending full records, that is most of the traffic. The
+check belongs here, once, rather than in every consumer.</p>
+
+<h2>Step 10 &mdash; The schema</h2>
+
+<pre class="language-sql"><code class="language-sql">-- The only mutable link in the system. A merge rewrites rows here and nowhere else.
+create table record_owner (
+    source           text not null,
+    source_record_id text not null,
+    customer_id      uuid not null references customer(id),
+    primary key (source, source_record_id)
+);
+
+-- Append-only. Never updated. Never deleted outside an erasure request.
+create table observation (
+    id                 text        not null,     -- ULID, time-ordered
+    source             text        not null,
+    source_record_id   text        not null,
+    field              text        not null,
+    value              jsonb,                    -- null iff tombstone
+    tombstone          boolean     not null default false,
+    source_updated_at  timestamptz not null,
+    event_id           text        not null,
+    normalizer_version int         not null,
+    ingested_at        timestamptz not null default now(),
+    -- Postgres requires the partition key in every unique constraint, hence the leading
+    -- source_record_id. It costs nothing: an event_id belongs to one source record.
+    primary key (source_record_id, id),
+    unique (source_record_id, event_id, field)
+) partition by hash (source_record_id);
+
+create table profile_field (
+    customer_id            uuid not null references customer(id),
+    field                  text not null,
+    value                  jsonb,
+    winning_observation_id text,       -- no FK: observation is partitioned
+    rule                   text not null,
+    resolved_at            timestamptz not null default now(),
+    primary key (customer_id, field)
+);
+
+create table decision_log (
+    id            bigserial primary key,
+    customer_id   uuid   not null,
+    field         text   not null,
+    old_value     jsonb,
+    new_value     jsonb,
+    rule          text   not null,
+    candidate_ids text[] not null,     -- the exact set the rule ran over
+    decided_at    timestamptz not null default now()
+);</code></pre>
+
+<p>Three tables carry the design: <code>observation</code> holds evidence, <code>profile_field</code>
+holds the derived answer, <code>decision_log</code> holds the history. Losing the second one costs
+you a recomputation. Losing the first one costs you the system.</p>
+
+<h2>The whole thing</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">record arrives (CRM | Billing | Support)
+      |
+      v
+  duplicate event_id? ---- yes ---> drop, count it
+      | no
+      v
+  normalize to canonical schema (v4)
+      |
+      v
+  valid, >= 1 identifier? -- no ---> quarantine (replayable)
+      | yes
+      v
+  explode into field observations
+      |
+      v
+  matches a customer? ----- no ---> allocate customer_id ---+
+      | yes                                                 |
+      v                                                     |
+  links two customers? --- yes ---> guardrails:             |
+      | no                          merge, or review queue --+
+      v <-----------------------------------------------------+
+  append observations (append-only, only if changed)
+      |
+      v
+  re-resolve every touched field  <- pure function, ALL candidates
+      |
+      v
+  any winning value changed? - no -> stop. no downstream noise
+      | yes
+      v
+  profile_field + decision_log + outbox   (ONE transaction)
+      |
+      v
+  emit profile.changed (field-level diff)</code></pre>
+
+<h2>Failure modes</h2>
+
+<ul>
+  <li><strong>A source starts sending garbage.</strong> Quarantine catches malformed records, but
+      well-formed nonsense &mdash; every customer suddenly named &ldquo;null&rdquo; &mdash; passes.
+      The defence is a rate-of-change alarm per source per field, not validation.</li>
+  <li><strong>An over-merge.</strong> Two customers become one and three downstream systems act on
+      it. Detection is the component-size alarm; recovery is the unmerge path, which is only cheap
+      because <code>record_owner</code> was kept separate from the beginning.</li>
+  <li><strong>A normalizer change with no replay.</strong> Old and new rows compare differently, so
+      matching quietly degrades. This is why the version is on the row.</li>
+  <li><strong>Outbox relay stalls.</strong> Profiles are correct, consumers are stale, and nothing
+      is obviously broken. Alarm on the age of the oldest unpublished row, not on queue depth.</li>
+  <li><strong>Erasure versus append-only.</strong> These genuinely conflict. The resolution is
+      crypto-shredding: encrypt observation values with a per-customer data key and make erasure the
+      destruction of that key. The rows survive, unreadable, so immutability holds for everyone
+      else.</li>
+</ul>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;What if two updates arrive out of order?&rdquo;</strong> &mdash; nothing
+      happens. Arrival order is not an input to the result; a late event adds a candidate and the
+      function returns the same answer.</li>
+  <li><strong>&ldquo;How do you know which value is right?&rdquo;</strong> &mdash; you do not.
+      You know which source is entitled to decide, per field, and you can show the losers.</li>
+  <li><strong>&ldquo;Why not just take the most recent?&rdquo;</strong> &mdash; because a support
+      typo would overwrite a verified billing address. Recency only competes inside an authority
+      tier.</li>
+  <li><strong>&ldquo;What happens when your matching logic is wrong?&rdquo;</strong> &mdash; fix the
+      rule, replay the archive. Everything downstream of ingest is derived.</li>
+  <li><strong>&ldquo;How do you undo a bad merge?&rdquo;</strong> &mdash; delete the alias, rewrite
+      <code>record_owner</code>, re-resolve. The observations never moved.</li>
+  <li><strong>&ldquo;Won&rsquo;t the observation table grow forever?&rdquo;</strong> &mdash; it grows
+      with change, not with traffic, because a re-sent identical value is not appended. Hash
+      partitioning plus a 24-month hot window handles the rest.</li>
+  <li><strong>&ldquo;How do consumers avoid a thundering herd?&rdquo;</strong> &mdash; the event
+      carries a field-level diff and is not emitted at all when nothing won differently.</li>
+</ul>
+
+<p>If there is one thing to take from this case study, it is that the hardest requirement was not
+&ldquo;merge the records&rdquo; but &ldquo;explain the merge&rdquo; &mdash; and that the second one,
+taken seriously, produced a simpler system than the first one would have. Storing evidence and
+deriving the answer is less machinery than storing the answer and trying to remember how you got
+there.</p>
+
+<p>Next: <a href="/system-design/system-design-notification-system">designing a notification
+system</a>, where the same outbox appears again, and the interesting problem is delivering exactly
+once to someone who has three devices.</p>
