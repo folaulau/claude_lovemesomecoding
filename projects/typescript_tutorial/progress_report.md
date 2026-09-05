@@ -1,6 +1,6 @@
 # TypeScript tutorial track — progress report
 
-**Status:** WRITTEN AND SEEDED TO `local` — not yet on prod
+**Status:** PUBLISHED — live on prod, 2026-09-05
 **Started:** 2026-09-05
 **Where it lands:** https://lovemesomecoding.com/typescript
 
@@ -192,8 +192,9 @@ is the signature of a quote that has gone stale.
       existed. Frontend typechecks clean.
 - [x] Seed `local` — 21 posts written, archive holds 21, category count 21, dates
       2026-07-07 → 2026-09-05 ascending.
-- [ ] **Review on `:3000`**, then seed `prod` (`seed.py --env prod --write`) and deploy the frontend
-      so the nav entry ships with the category.
+- [x] Review on `:3000` — see the QA table below.
+- [x] Seed `prod` — 21 posts written, tree went 874 → 895, category count 21.
+- [x] Deploy the frontend, so the nav entry ships with the category.
 - [ ] `contractor/progress_report.md` is stale — it says phase 0/1 while the app is much further
       along. Not this track's job to fix, but do not trust it.
 
@@ -242,6 +243,30 @@ category re-seeded.
 Worth noting the class of mistake: it survived every automated check, because nothing verifies that
 prose about the app is true of the app. `check_snippets.py` proves the *code* is real; it has
 nothing to say about a sentence.
+
+## Published (2026-09-05)
+
+```
+seed.py --env prod --write     874 -> 895 posts, category count 21
+npm run deploy                 895/895 posts served
+                               43/43 category counts agree
+                               cloudfront function republished (104 redirects, 6.8 KB / 10 KB)
+                               invalidation complete
+                               edge verified serving build ed63902
+```
+
+Verified against https://lovemesomecoding.com after the invalidation:
+
+| Check | Result |
+|---|---|
+| 21 post URLs | 21/21 return 200 |
+| `/typescript` | 200, 21 post links, title "TypeScript Tutorials" |
+| Nav | `/typescript` present in the JavaScript dropdown |
+| Sitemap | 21 `/typescript/` URLs |
+| Highlighting | 13/13 blocks on the enums post carry Prism tokens |
+| Reading time | "8 min read" |
+| **Pager on live** | walked lesson 1 → 21, order matches the manifest, no prev on 1, no next on 21 |
+| Category copy | says "pizza ordering app" — the marketplace fix is live |
 
 ## Log
 
