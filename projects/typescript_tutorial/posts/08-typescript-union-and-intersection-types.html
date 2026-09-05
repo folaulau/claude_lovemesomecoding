@@ -1,0 +1,286 @@
+<p>Two operators combine types. A union, <code>A | B</code>, is a value that is <em>one of</em> these.
+An intersection, <code>A &amp; B</code>, is a value that is <em>all of</em> these at once. Unions
+you will use constantly; intersections rather less, and knowing why is half of this lesson.</p>
+
+<h2>Unions</h2>
+
+<pre class="language-typescript"><code class="language-typescript">let id: string | number;
+
+id = 'abc';   // fine
+id = 42;      // fine
+id = true;    // error</code></pre>
+
+<p>The pipe reads as "or". You have already met the most important special case — a union of
+<a href="/typescript/typescript-basic-types">literal types</a>, which is how the pizza app models
+every fixed set of values it has:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type ProductType = 'PIZZA' | 'DRINK';
+export type SizeName = 'SMALL' | 'MEDIUM' | 'LARGE';
+export type ToppingCategory = 'MEAT' | 'VEGGIE' | 'CHEESE';
+export type OrderType = 'DELIVERY' | 'CARRYOUT';</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">export type OrderStatus =
+  | 'PENDING_PAYMENT'
+  | 'PAID'
+  | 'PREPARING'
+  | 'COMPLETED'
+  | 'CANCELLED';</code></pre>
+
+<p>The leading <code>|</code> on the first member is optional and purely cosmetic — it lets every
+line look the same, which makes the diff clean when a status is added.</p>
+
+<p>What you get for that is real. <code>SizeName</code> is not a comment saying which strings are
+allowed; it is enforced at every assignment, every function call and every object literal in the
+codebase. Misspell <code>'MEDUIM'</code> and the build stops.</p>
+
+<h2>You can only reach what they have in common</h2>
+
+<p>The rule that governs everything about unions: until you narrow, you may only use members that
+exist on <em>every</em> branch.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+function pad(id: string | number) {
+  return id.padStart(8, '0');
+  //        ~~~~~~~~~
+  // Property 'padStart' does not exist on type 'string | number'.
+}</code></pre>
+
+<p><code>padStart</code> exists on <code>string</code> and not on <code>number</code>, so it is not
+available on the union. This is not TypeScript being awkward — the value really might be a number,
+and calling <code>padStart</code> on it really would throw.</p>
+
+<p>What <em>is</em> allowed is anything both have:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function describe(id: string | number) {
+  return id.toString();   // fine, both have toString
+}</code></pre>
+
+<p>To get at the rest, you prove which branch you are on. That is
+<a href="/typescript/typescript-narrowing">narrowing</a>, and it is the next lesson, because unions
+are only half a tool without it.</p>
+
+<h2>Assignability runs one way</h2>
+
+<p>A member is assignable to the union. The union is not assignable to a member.</p>
+
+<pre class="language-typescript"><code class="language-typescript">let size: SizeName = 'LARGE';         // fine
+let anySize: SizeName | null = size;  // fine — widening
+
+// This does not compile.
+let back: SizeName = anySize;
+//  ~~~~
+// Type 'SizeName | null' is not assignable to type 'SizeName'.</code></pre>
+
+<p>Obvious when stated, and the source of most union errors you will actually see — usually as
+<code>string</code> failing to be assignable to a literal union, which is the widening problem from
+<a href="/typescript/typescript-basic-types">lesson 3</a>.</p>
+
+<h2>Unions of objects</h2>
+
+<p>The members do not have to be primitives. When they are object types, you get the most useful
+pattern in the language:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type Outcome = { ok: true } | { ok: false; failure: ApiFailure };</code></pre>
+
+<p>That is from the Angular admin store, and it says something a single interface cannot: the
+<code>failure</code> field exists <em>if and only if</em> <code>ok</code> is <code>false</code>.
+Written as one shape with an optional field —</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface Outcome { ok: boolean; failure?: ApiFailure }</code></pre>
+
+<p>— you would have four possible combinations instead of two, including the nonsense ones: a
+success carrying a failure, and a failure carrying nothing. The union makes those unrepresentable.</p>
+
+<p>Because <code>ok</code> has a literal type in each branch, checking it tells the compiler which
+branch you are in. That is a <strong>discriminated union</strong>, and
+<a href="/typescript/typescript-narrowing">lesson 10</a> shows what it buys you.</p>
+
+<h2>A worked example: modelling a screen's state</h2>
+
+<p>The best argument for unions is what they let you stop writing. Here is the shape almost every
+data-loading component starts as:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface State {
+  loading: boolean;
+  error: string | null;
+  data: Order[] | null;
+}</code></pre>
+
+<p>Three independent fields is eight combinations, and only three of them are real. The type
+permits <code>{ loading: true, error: 'Boom', data: [...] }</code> — loading, and failed, and
+holding results — which is not a state your code should ever have to render.</p>
+
+<p>So every component that uses it develops the same defensive ladder, and they do not all get it
+in the same order:</p>
+
+<pre class="language-tsx"><code class="language-tsx">if (state.loading) return &lt;Spinner /&gt;;
+if (state.error) return &lt;Alert&gt;{state.error}&lt;/Alert&gt;;
+if (!state.data) return null;          // can this happen? nobody is sure
+return &lt;OrderTable orders={state.data} /&gt;;</code></pre>
+
+<p>That third line is the tell. It exists because the type cannot say "if we are not loading and
+there is no error, there is definitely data", so every reader has to guess.</p>
+
+<p>A union says it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type State =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'success'; data: Order[] };</code></pre>
+
+<p>Four states, exactly four, and each carries precisely the data that state has. There is no
+success without data and no error without a message, because those combinations cannot be
+constructed. The <code>data</code> field does not exist to be null-checked; in the only branch
+where you can reach it, it is there.</p>
+
+<p>This is the same move the Angular app's <code>Outcome</code> makes, and it is worth reaching for
+whenever you notice a group of fields whose validity depends on each other.</p>
+
+<h2>Optional properties are unions too</h2>
+
+<p>A small thing that ties earlier lessons together. This:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface OrderCreateRequest {
+  guestEmail?: string;
+}</code></pre>
+
+<p>gives <code>guestEmail</code> the type <code>string | undefined</code> when you read it. The
+<code>?</code> is a union with extra rules about whether the key must be present — see
+<a href="/typescript/typescript-object-types">lesson 6</a> — but the value you get out is an
+ordinary union, and everything in this lesson applies to it.</p>
+
+<p>That is why <code>address.label.toUpperCase()</code> fails: <code>toUpperCase</code> is not
+available on every member of <code>string | undefined</code>, exactly as <code>padStart</code> was
+not available on <code>string | number</code>. One rule, not two.</p>
+
+<h2>Intersections</h2>
+
+<p>An intersection demands everything from both sides:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface Timestamped { createdAt: string; updatedAt: string }
+interface Identified { id: UUID }
+
+type Entity = Timestamped &amp; Identified;
+
+const e: Entity = {
+  id: 'abc',
+  createdAt: '2026-09-01T09:00:00',
+  updatedAt: '2026-09-01T09:00:00',
+};   // all three required</code></pre>
+
+<p>Note the direction, which reads backwards at first. <code>|</code> gives you <em>fewer</em>
+guaranteed members than either side; <code>&amp;</code> gives you <em>more</em>. A union of two
+object types is the smaller thing to work with, even though "or" sounds bigger.</p>
+
+<h2>Conflicting properties give you never</h2>
+
+<p>The intersection of two incompatible types is not an error at the declaration. It is
+<code>never</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Impossible = string &amp; number;   // never — no value is both</code></pre>
+
+<p>With objects it happens per property, which is worse because the type still looks usable:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type A = { price: number };
+type B = { price: string };
+type C = A &amp; B;               // price: never
+
+// This does not compile.
+const c: C = { price: 9.99 };
+//                     ~~~~
+// Type 'number' is not assignable to type 'never'.</code></pre>
+
+<p>Nothing complained when <code>C</code> was declared. The error arrives at every attempt to
+create one, pointing at the value rather than the mistake. This is the trap
+<a href="/typescript/typescript-interfaces-vs-type-aliases">lesson 7</a> mentioned —
+<code>interface extends</code> catches the same conflict at the declaration.</p>
+
+<h2>Where intersections are actually worth it</h2>
+
+<p>Three cases come up often enough to name.</p>
+
+<p><strong>Adding to someone else's props.</strong> A component that wraps a native element and adds
+its own options:</p>
+
+<pre class="language-tsx"><code class="language-tsx">type ButtonProps = React.ButtonHTMLAttributes&lt;HTMLButtonElement&gt; &amp; {
+  variant: 'primary' | 'danger';
+  loading?: boolean;
+};</code></pre>
+
+<p>You could not write that with <code>interface extends</code> as conveniently, and it is the
+single most common intersection in React code.</p>
+
+<p><strong>Combining derived types.</strong> When both halves come from utility types, an
+intersection is the only thing that joins them:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type ProductDraft = Omit&lt;Product, 'id'&gt; &amp; { tempId: string };</code></pre>
+
+<p><strong>Branding.</strong> The trick from lesson 3, which is an intersection with a type that has
+no values:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type OrderId = string &amp; { readonly __brand: 'OrderId' };</code></pre>
+
+<p>Outside those, if you are describing a domain object, prefer <code>interface extends</code>. You
+get the conflict check and better error messages for free.</p>
+
+<h2>Unions are sets, and behave like them</h2>
+
+<p>Three consequences of that, all of which save confusion later.</p>
+
+<p><strong>Order is irrelevant.</strong> These are the same type, and TypeScript may print it back
+to you in either order:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type A = 'PAID' | 'CANCELLED';
+type B = 'CANCELLED' | 'PAID';   // identical to A</code></pre>
+
+<p><strong>Duplicates collapse.</strong> <code>'PAID' | 'PAID'</code> is just
+<code>'PAID'</code>, and <code>string | 'PAID'</code> is just <code>string</code> — because the
+literal is already a member of <code>string</code>, adding it changes nothing. That last one catches
+people out: a union with a wide member in it is only as narrow as its widest member.</p>
+
+<p><strong><code>never</code> disappears</strong>, as
+<a href="/typescript/typescript-special-types">lesson 4</a> covered. The empty set contributes
+nothing.</p>
+
+<p>One more that is occasionally useful to know: <code>boolean</code> is itself a union,
+<code>true | false</code>. That is why a conditional type over a <code>boolean</code> distributes
+into two branches, and why <code>Exclude&lt;boolean, false&gt;</code> gives you
+<code>true</code>.</p>
+
+<h2>Unions distribute; intersections do not</h2>
+
+<p>One behaviour worth knowing before it surprises you. Some type operations applied to a union are
+applied to each member separately and the results re-joined:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Boxed&lt;T&gt; = T extends unknown ? T[] : never;
+
+type A = Boxed&lt;string | number&gt;;   // string[] | number[]
+                                    // NOT (string | number)[]</code></pre>
+
+<p>That is <em>distribution</em>, and it is why <code>Exclude</code> and <code>Extract</code> work.
+It only happens for conditional types over a naked type parameter, which is a mouthful covered
+properly in <a href="/typescript/typescript-mapped-and-conditional-types">lesson 15</a>. Mentioned
+here so that when a union unexpectedly turns into a union of arrays, you know the word to search
+for.</p>
+
+<p>One practical upshot of duplicates collapsing: adding a member to a union is a safe change for
+producers and a breaking change for consumers. Anything that <em>creates</em> an
+<code>OrderStatus</code> still compiles; anything that <code>switch</code>es over one now has a case
+it does not handle. Which is precisely why the exhaustiveness check in the next lesson is worth the
+three lines it costs.</p>
+
+<h2>A rule of thumb</h2>
+
+<p>Reach for a union whenever a value has a small, known set of possibilities — a status, a size, a
+mode, a result that either worked or did not. That is most of the modelling you will do, and it is
+the thing TypeScript does better than most type systems.</p>
+
+<p>Reach for an intersection when you are genuinely bolting two independent sets of properties
+together and neither owns the other. If one of them is clearly the base, <code>extends</code> says
+so more clearly.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-enums">Enums, and What to Use Instead</a> — why the pizza app has
+108 TypeScript files and not one <code>enum</code> in any of them.</p>

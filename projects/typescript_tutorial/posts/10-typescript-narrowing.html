@@ -1,0 +1,302 @@
+<p>A union is only half a tool. <code>string | number</code> lets you accept both and then stops you
+using either, and the thing that gets you the rest of the way is <strong>narrowing</strong>: writing
+a check the compiler can read, so that inside the block it knows which branch you are on.</p>
+
+<p>TypeScript does this by following your control flow. You are not annotating anything here — you
+are writing ordinary JavaScript, and the checker is reading it.</p>
+
+<h2>typeof</h2>
+
+<p>The simplest guard, and it works on the primitives:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function pad(id: string | number) {
+  if (typeof id === 'string') {
+    return id.padStart(8, '0');   // id is string here
+  }
+  return id.toFixed(0);           // and number here
+}</code></pre>
+
+<p>Note the second line. After the <code>if</code> returns, the only remaining possibility is
+<code>number</code>, so nothing further is needed — TypeScript narrows on the way out of a branch as
+well as into one.</p>
+
+<p>The one trap: <code>typeof null === 'object'</code>, a JavaScript quirk TypeScript inherits
+faithfully. Checking <code>typeof x === 'object'</code> does not exclude <code>null</code>.</p>
+
+<h2>Truthiness, and where it misleads</h2>
+
+<p>A plain <code>if</code> narrows out <code>null</code> and <code>undefined</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function render(imageUrl: string | null) {
+  if (imageUrl) {
+    return imageUrl.toUpperCase();   // string
+  }
+  return 'No image';
+}</code></pre>
+
+<p>Convenient, and wrong whenever an empty string, <code>0</code> or <code>false</code> is a
+meaningful value:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function label(count: number | null) {
+  if (count) return `${count} items`;
+  return 'None';        // also returns 'None' for 0 — probably a bug
+}</code></pre>
+
+<p>When the distinction matters, compare explicitly:</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (count !== null) { /* 0 gets here too */ }</code></pre>
+
+<p>This is why the app's helpers check <code>if (sub.field)</code> in one place and
+<code>value !== null</code> in another — the first is a string that is meaningless when empty, the
+second is not.</p>
+
+<h2>Equality</h2>
+
+<p>Comparing two values narrows both of them, and comparing against a literal narrows to it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function fee(orderType: OrderType, subtotal: number) {
+  if (orderType === 'DELIVERY' &amp;&amp; subtotal &gt; 0) {
+    return DELIVERY_FEE;
+  }
+  return 0;
+}</code></pre>
+
+<p>Inside that block <code>orderType</code> is <code>'DELIVERY'</code> exactly. On the union of
+five order statuses, a chain of <code>===</code> checks narrows one member at a time.</p>
+
+<h2>The in operator</h2>
+
+<p>For object unions, <code>in</code> asks whether a property exists:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Result = { data: Order[] } | { error: string };
+
+function show(result: Result) {
+  if ('error' in result) {
+    return result.error;      // the error branch
+  }
+  return result.data.length;  // the data branch
+}</code></pre>
+
+<p>Useful when the branches have no shared discriminator field. When they do — and you control the
+type — the discriminated union below is better.</p>
+
+<h2>instanceof</h2>
+
+<p>For anything with a constructor, including your own error classes. This is the pizza app's Redux
+error edge, and it is a clean example of three narrowings in four lines:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function toApiFailure(err: unknown, fallback: string): ApiFailure {
+  if (err instanceof ApiError) {
+    return { message: err.message, fieldErrors: err.fieldErrors() };
+  }
+  return { message: err instanceof Error ? err.message : fallback, fieldErrors: {} };
+}</code></pre>
+
+<p>Start with <code>unknown</code>, on which nothing is allowed. The first check proves
+<code>ApiError</code>, which is what makes <code>err.fieldErrors()</code> — a method on that class
+and no other — legal. The second proves <code>Error</code>, which permits <code>.message</code>.
+Neither is available before its check, and that is the point.</p>
+
+<p>The Angular half narrows the same way, over a different set of classes:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  static from(error: unknown): ApiError {
+    if (error instanceof ApiError) return error;
+
+    if (error instanceof HttpErrorResponse) {</code></pre>
+
+<p>One caveat worth knowing. <code>instanceof</code> is a prototype check, so subclassing built-ins
+can break it when compiling to ES5. The app leaves a note where it matters:</p>
+
+<pre class="language-typescript"><code class="language-typescript">    // TypeScript compiling to ES5 breaks `instanceof` for subclassed built-ins. This app targets
+    // ES2022 so it is not strictly needed, but it costs one line and removes a nasty trap.
+    Object.setPrototypeOf(this, ApiError.prototype);</code></pre>
+
+<h2>Discriminated unions</h2>
+
+<p>The best-behaved pattern in the language. Give every member of a union a common property with a
+different literal type, and checking that one property narrows the whole object:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type Outcome = { ok: true } | { ok: false; failure: ApiFailure };</code></pre>
+
+<p>The discriminant is <code>ok</code>, and because its type is <code>true</code> in one branch and
+<code>false</code> in the other, a single check settles which shape you have:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const result = await done;
+
+if (result.ok) {
+  toast.success('Saved.');
+} else {
+  showErrors(result.failure);   // only reachable here, and guaranteed present
+}</code></pre>
+
+<p><code>result.failure</code> in the first branch is a compile error, and in the second branch it
+is not optional. Compare that with a single interface carrying <code>failure?: ApiFailure</code>,
+where the property is reachable everywhere and guaranteed nowhere.</p>
+
+<p>Any literal type works as a discriminant — the <code>status: 'loading' | 'success'</code> shape
+from the previous lesson is the same idea with five branches instead of two. A string field named
+<code>kind</code>, <code>type</code> or <code>status</code> is the usual convention.</p>
+
+<h2>Exhaustiveness: making the compiler check for you</h2>
+
+<p>Here is what discriminated unions really buy. Narrow through every case and the leftover type is
+<code>never</code>, which you can assert:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function statusLabel(status: OrderStatus): string {
+  switch (status) {
+    case 'PENDING_PAYMENT': return 'Awaiting payment';
+    case 'PAID':            return 'Paid';
+    case 'PREPARING':       return 'In the oven';
+    case 'COMPLETED':       return 'Completed';
+    case 'CANCELLED':       return 'Cancelled';
+    default: {
+      const unreachable: never = status;
+      return unreachable;
+    }
+  }
+}</code></pre>
+
+<p>Today that compiles, because all five cases are handled and <code>status</code> in the
+<code>default</code> has type <code>never</code>.</p>
+
+<p>Now add <code>'REFUNDED'</code> to <code>OrderStatus</code>. The <code>default</code> is
+reachable with <code>status: 'REFUNDED'</code>, that is not assignable to <code>never</code>, and
+the build fails <em>here</em> — pointing at the function that has not been updated:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Type '"REFUNDED"' is not assignable to type 'never'.</code></pre>
+
+<p>That is the mechanism that turns "add a status" from a search-and-hope exercise into a task with
+a list. It is worth doing in every switch over a union that matters, and it costs three lines.</p>
+
+<p>Note that <code>noFallthroughCasesInSwitch</code> — on in both pizza configs — is the
+complementary guard, catching a <code>case</code> that forgets its <code>break</code>.</p>
+
+<h2>Type predicates: teaching the compiler your own check</h2>
+
+<p>Sometimes the check is a function, and by default a <code>boolean</code> return tells TypeScript
+nothing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+function isProduct(value: unknown): boolean {
+  return typeof value === 'object' &amp;&amp; value !== null &amp;&amp; 'sizes' in value;
+}
+
+if (isProduct(thing)) {
+  thing.sizes;   // 'thing' is still unknown
+  //    ~~~~~
+}</code></pre>
+
+<p>Change the return type to a <strong>type predicate</strong> and the call site narrows:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function isProduct(value: unknown): value is Product {
+  return typeof value === 'object' &amp;&amp; value !== null &amp;&amp; 'sizes' in value;
+}</code></pre>
+
+<p><code>value is Product</code> means "if this returns true, treat the argument as a
+<code>Product</code>". That is a promise <em>you</em> are making — the compiler checks the body is
+plausible but cannot verify the logic, so a sloppy predicate is an assertion in disguise. Keep them
+short and obviously correct.</p>
+
+<p>This is also the fix for the <code>filter</code> problem from
+<a href="/typescript/typescript-arrays-and-tuples">lesson 5</a>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const real = urls.filter((u): u is string =&gt; u !== null);   // string[]</code></pre>
+
+<p>TypeScript 5.5 improved this: a simple arrow function whose body is obviously a narrowing check
+now has its predicate inferred, so the annotation is often unnecessary in newer code. Writing it
+explicitly still works and is clearer at a glance.</p>
+
+<h2>Assertion functions</h2>
+
+<p>A variant that throws instead of returning a boolean, narrowing everything after the call:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function assertIsProduct(value: unknown): asserts value is Product {
+  if (!isProduct(value)) throw new Error('Not a product');
+}
+
+assertIsProduct(thing);
+thing.sizes;   // narrowed from here on</code></pre>
+
+<p>Handy at a boundary where a bad value means the operation cannot continue. One quirk: an
+assertion function must have an explicit type annotation at the point it is declared — it cannot be
+an arrow function assigned to an inferred <code>const</code>.</p>
+
+<h2>The built-in guards</h2>
+
+<p>A few standard functions are declared as type predicates, so they narrow without you doing
+anything. <code>Array.isArray</code> is the one you will reach for:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function count(value: Order | Order[]) {
+  if (Array.isArray(value)) {
+    return value.length;   // Order[]
+  }
+  return 1;                // Order
+}</code></pre>
+
+<p>Its signature is <code>isArray(arg: any): arg is any[]</code> — the same
+<code>x is T</code> form you can write yourself.</p>
+
+<p>Optional chaining and nullish coalescing are narrowing tools too, and often the shortest route:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const name = user?.fullName ?? user?.email ?? 'Account';</code></pre>
+
+<p>Each <code>?.</code> short-circuits to <code>undefined</code> when the left side is absent, so the
+result type is a union ending in <code>undefined</code>, and <code>??</code> then removes it by
+supplying a value. The Angular app builds its navbar label exactly this way.</p>
+
+<p>Note that <code>??</code> differs from <code>||</code> in precisely the way that matters here: it
+falls back only on <code>null</code> and <code>undefined</code>, not on <code>0</code> or the empty
+string. Reach for it by default, for the same reason the truthiness section warned about
+<code>if</code>.</p>
+
+<h2>Where narrowing is lost</h2>
+
+<p>Two situations where the checker gives up, both of which look like bugs until you know the
+reason.</p>
+
+<p><strong>Reassignment.</strong> Narrowing tracks a variable, and any assignment resets it.</p>
+
+<p><strong>Callbacks.</strong> This is the common one:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+function send(order: Order | null) {
+  if (!order) return;
+
+  setTimeout(() =&gt; {
+    console.log(order.id);
+    //          ~~~~~
+    // 'order' is possibly 'null'.
+  }, 1000);
+}</code></pre>
+
+<p>TypeScript cannot know when the callback runs, and if <code>order</code> were a
+<code>let</code> that something else reassigned, the narrowing would no longer hold. With a
+<code>const</code> parameter this particular case is safe and the compiler is being conservative —
+but the fix is the same and costs nothing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function send(order: Order | null) {
+  if (!order) return;
+  const confirmed = order;                        // captured, and const
+  setTimeout(() =&gt; console.log(confirmed.id), 1000);
+}</code></pre>
+
+<p>The same thing bites on class properties, which genuinely can change between the check and the
+use. A local copy is the standard answer there too.</p>
+
+<h2>Narrowing is not validation</h2>
+
+<p>A closing distinction, because it is the one people get wrong. Narrowing convinces the
+<em>compiler</em>. It does not check anything the compiler was not already able to see.</p>
+
+<p>A type predicate is the clearest case: <code>value is Product</code> is a promise you make, and
+the body is not verified against it. Write a predicate that checks one field and claims a
+twelve-field interface, and every call site will believe you.</p>
+
+<p>So at a real boundary — a response, a stored value, a message from elsewhere — narrowing is a way
+of organising your checks, not a substitute for writing them. If the data genuinely arrives
+untrusted, the check has to be exhaustive, and a schema library is the honest tool.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-functions">Functions</a> — parameters, overloads, and typing the
+callbacks that most of this lesson's examples were quietly passing around.</p>

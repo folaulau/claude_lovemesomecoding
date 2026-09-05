@@ -1,0 +1,280 @@
+<p>TypeScript is JavaScript with a type checker bolted on and then taken away again. That sentence is
+worth unpacking, because almost every surprise people hit in their first month comes from missing
+one half of it.</p>
+
+<h2>What it actually is</h2>
+
+<p>TypeScript is not a language that runs. Nothing executes TypeScript — not Node, not any browser.
+What happens is that a compiler reads your annotated code, checks it, and then <em>deletes every
+annotation</em> and emits ordinary JavaScript.</p>
+
+<p>Here is the whole idea in one file. This is TypeScript:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const TAX_RATE = 0.085;
+export const DELIVERY_FEE = 3.99;
+
+export function formatMoney(amount: number): string {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+  }).format(amount);
+}</code></pre>
+
+<p>And this is what ships to the browser:</p>
+
+<pre class="language-javascript"><code class="language-javascript">export const TAX_RATE = 0.085;
+export const DELIVERY_FEE = 3.99;
+
+export function formatMoney(amount) {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+  }).format(amount);
+}</code></pre>
+
+<p>The <code>: number</code> and the <code>: string</code> are gone. They were never for the
+runtime; they were for the compiler, and the compiler has finished with them.</p>
+
+<p>Two consequences follow immediately, and they matter more than any syntax you will learn.</p>
+
+<p><strong>Your types cannot check anything at runtime.</strong> If you declare that a function
+returns a <code>User</code> and the server sends back something else, TypeScript will not notice
+and cannot notice. It checked your code; it has no opinion about the network.</p>
+
+<p><strong>TypeScript costs your users nothing.</strong> No library is downloaded, no wrapper runs
+around your functions, the bundle does not grow. Whatever price you pay, you pay it at build time.</p>
+
+<h2>What it catches</h2>
+
+<p>Roughly three things, in descending order of how often they actually bite.</p>
+
+<p><strong>Typos and shape errors.</strong> The largest category by far, and the least glamorous.
+You wrote <code>order.totl</code>, or you passed an object missing a field, or a function's
+arguments were in the wrong order. These are found the moment you type them rather than when a
+customer finds them.</p>
+
+<p><strong>Nulls.</strong> With <code>strictNullChecks</code> on, a value that might be missing has
+to say so in its type, and you cannot use it until you have handled the missing case. This is a
+large fraction of the runtime errors a JavaScript app produces, moved to compile time.</p>
+
+<p><strong>Changes that do not land everywhere.</strong> This is the one people underrate. Rename a
+field on a shared type and the build fails in all nine places that used it, including the two you
+had forgotten about. Refactoring a large JavaScript codebase is guesswork with grep; in TypeScript
+it is a task with a definition of done.</p>
+
+<h2>What it does not catch</h2>
+
+<p>It is worth being precise about this, because overconfidence in the type checker causes its own
+bugs.</p>
+
+<p>Anything that crosses the boundary into your program is unchecked. An HTTP response, a
+<code>localStorage</code> value, a URL parameter, a message from another window — you can
+<em>declare</em> what shape you expect, and TypeScript will believe you. It has no way to verify it.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This compiles. It says nothing about what the server actually sent.
+const user = await api.get&lt;User&gt;('/api/auth/me', { auth: true });</code></pre>
+
+<p>Nor does it catch logic errors. <code>subtotal - tax</code> typechecks perfectly and is still
+wrong. Types constrain shape, not meaning.</p>
+
+<h2>A real example of the difference</h2>
+
+<p>Abstract arguments about type safety are unconvincing, so here is a concrete one from the
+application this track uses. A cart line looks like this:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface CartItem {
+  lineId: string;
+  productId: UUID;
+  productName: string;
+// ...
+  size: SizeName;
+  basePrice: number;
+// ...
+  crustPriceDelta: number;
+  toppings: Topping[];
+  quantity: number;
+}</code></pre>
+
+<p>And the function that prices one:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function unitPrice(item: CartItem): number {
+  const toppingsTotal = item.toppings.reduce((sum, t) =&gt; sum + t.price, 0);
+  return round2(item.basePrice + item.crustPriceDelta + toppingsTotal);
+}</code></pre>
+
+<p>Now suppose someone renames <code>crustPriceDelta</code> to <code>crustSurcharge</code>, because
+it reads better. In JavaScript, <code>item.crustPriceDelta</code> quietly becomes
+<code>undefined</code>, and <code>number + undefined</code> is <code>NaN</code>. The pizza does not
+crash the page — it costs <code>$NaN</code>, which renders, and which somebody eventually reports
+as "the price is broken sometimes".</p>
+
+<p>In TypeScript the rename fails the build, at every site, before anything runs. That is the
+entire value proposition in one field.</p>
+
+<h2>Types are about shape, not names</h2>
+
+<p>One idea to carry into everything that follows, because it explains behaviour that otherwise
+looks arbitrary: TypeScript's type system is <strong>structural</strong>. Two types are compatible
+if their shapes are compatible. What they are called is irrelevant.</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface Product { id: string; name: string; }
+interface Snack   { id: string; name: string; }
+
+const cheese: Product = { id: 'p1', name: 'Cheese' };
+const snack: Snack = cheese;   // fine — the shapes match</code></pre>
+
+<p>In Java or C# that assignment is an error: <code>Product</code> is not <code>Snack</code>,
+regardless of what is inside them. TypeScript does not work that way, and it is not a shortcut —
+it is the correct model for JavaScript, where objects are bags of properties and nothing carries a
+class name at runtime that the checker could rely on.</p>
+
+<p>The practical upshot is that you can describe data you do not own. You never have to make the
+server's JSON "implement" anything; you write down the shape you expect and TypeScript checks your
+usage against it.</p>
+
+<h2>You do not have to annotate everything</h2>
+
+<p>The most common beginner mistake is writing types the compiler already knows.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// Noise. TypeScript already knows both of these.
+const taxRate: number = 0.085;
+const label: string = formatMoney(total);</code></pre>
+
+<p>The literal <code>0.085</code> is a number; <code>formatMoney</code> is declared to return a
+string. Saying so again adds nothing and gives you a second place to be wrong. What the app
+actually writes is this:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const TAX_RATE = 0.085;
+export const DELIVERY_FEE = 3.99;</code></pre>
+
+<p>Inference does most of the work. In practice you annotate three things: function
+<em>parameters</em>, which cannot be inferred because the compiler has no idea who will call you;
+the shapes of data crossing a boundary; and the occasional return type you want pinned down
+deliberately. Everything else, let it infer.</p>
+
+<h2>What to do about the boundary</h2>
+
+<p>Since the checker cannot see the network, the honest position is that
+<code>api.get&lt;User&gt;(…)</code> is a <em>claim</em>, not a guarantee. There are three ways teams
+handle that, and it is worth knowing where you stand.</p>
+
+<p><strong>Trust the contract.</strong> The API is yours, its DTOs are generated from the same
+schema, and a mismatch is a deployment bug you would find immediately. This is what the pizza app
+does, and its types file says so out loud:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/**
+ * Shared domain types.
+ *
+ * These mirror the Spring Boot API's DTOs exactly. Keeping one file as the contract means that if
+ * the shapes drift, TypeScript fails the build instead of the UI failing at runtime.
+ */</code></pre>
+
+<p>Note what that comment is careful <em>not</em> to claim. Keeping one file means a drift shows up
+in one place instead of nine — it does not mean the compiler checked the server.</p>
+
+<p><strong>Generate the types.</strong> From an OpenAPI document or a GraphQL schema. The types
+still are not verified at runtime, but they cannot be wrong by hand.</p>
+
+<p><strong>Validate at the edge.</strong> A schema library parses the response and either returns a
+value you genuinely know the shape of, or throws. This is the only one of the three that is
+actually a guarantee, and it costs you a runtime dependency and a schema written twice.</p>
+
+<p>All three are defensible. What is not defensible is not knowing which one you are relying on.</p>
+
+<h2>How you will experience it day to day</h2>
+
+<p>Mostly, not as a build step. The same type information drives your editor, so the feedback
+arrives as you type: completion that knows the fields of the object under your cursor, rename
+across a project, jump-to-definition that works, and the red underline appearing on the line you
+just broke rather than in a terminal two minutes later.</p>
+
+<p>That is worth saying because it changes what the annotations are <em>for</em>. Writing
+<code>item: CartItem</code> is not paperwork filed for the compiler's benefit. It is what makes
+<code>item.</code> offer you twelve real fields instead of nothing.</p>
+
+<h2>The versions this track uses</h2>
+
+<p>Everything here was run on these, rather than assumed:</p>
+
+<table>
+  <thead><tr><th>Tool</th><th>Version</th></tr></thead>
+  <tbody>
+    <tr><td>TypeScript</td><td>6.0.3 (React app) · 5.9.3 (Angular app)</td></tr>
+    <tr><td>Node</td><td>22.23.2</td></tr>
+    <tr><td>React · Vite · Redux Toolkit</td><td>19.2.8 · 8.2.0 · 2.12.0</td></tr>
+    <tr><td>Angular · NgRx · RxJS</td><td>21.2.0 · 21.1.1 · 7.8</td></tr>
+  </tbody>
+</table>
+
+<p>The two TypeScript versions are not an oversight. Angular pins its own compiler and had not
+moved to 6.x, and the two apps are configured with flags that <em>contradict</em> each other — the
+React one forbids decorators, the Angular one is built on them. Several lessons here are much
+sharper because of that, and we will come back to it.</p>
+
+<h2>The application every example comes from</h2>
+
+<p>The snippets in this track are not written for the track. They are lifted from a working pizza
+ordering application — a storefront, a cart, Stripe checkout, an order history and an admin area —
+built twice over the same Spring Boot API: once in React and once in Angular.</p>
+
+<p>That matters for a language tutorial specifically. It is easy to demonstrate a type system with
+examples invented to demonstrate a type system, and the result teaches you syntax you will never
+reach for. Everything below is code that runs, and where a rule is shown being broken it is
+labelled as such.</p>
+
+<h2>The lessons, in order</h2>
+
+<p><strong>Getting started</strong></p>
+
+<ul>
+  <li><a href="/typescript/typescript-set-up">Setting Up a Project</a> — two projects, two setups, and why one of them never emits a file</li>
+  <li><a href="/typescript/typescript-basic-types">The Basic Types</a> — and the annotations you should not write</li>
+  <li><a href="/typescript/typescript-special-types">any, unknown, never and void</a> — the four types that are not values</li>
+</ul>
+
+<p><strong>Shaping data</strong></p>
+
+<ul>
+  <li><a href="/typescript/typescript-arrays-and-tuples">Arrays and Tuples</a></li>
+  <li><a href="/typescript/typescript-object-types">Object Types</a> — optional, readonly, index signatures, excess property checks</li>
+  <li><a href="/typescript/typescript-interfaces-vs-type-aliases">Interfaces vs Type Aliases</a> — the three differences that are real</li>
+  <li><a href="/typescript/typescript-union-and-intersection-types">Unions and Intersections</a></li>
+  <li><a href="/typescript/typescript-enums">Enums, and What to Use Instead</a></li>
+  <li><a href="/typescript/typescript-narrowing">Narrowing and Type Guards</a></li>
+</ul>
+
+<p><strong>Behaviour</strong></p>
+
+<ul>
+  <li><a href="/typescript/typescript-functions">Functions</a></li>
+  <li><a href="/typescript/typescript-classes">Classes</a></li>
+  <li><a href="/typescript/typescript-generics">Generics</a></li>
+  <li><a href="/typescript/typescript-utility-types">The Utility Types Worth Knowing</a></li>
+  <li><a href="/typescript/typescript-mapped-and-conditional-types">keyof, Mapped and Conditional Types</a></li>
+  <li><a href="/typescript/typescript-type-assertions">Assertions, as const and satisfies</a></li>
+</ul>
+
+<p><strong>Real projects</strong></p>
+
+<ul>
+  <li><a href="/typescript/typescript-modules">Modules and Type-Only Imports</a></li>
+  <li><a href="/typescript/typescript-tsconfig">tsconfig, the Flags That Matter</a></li>
+  <li><a href="/typescript/typescript-decorators">Decorators</a></li>
+  <li><a href="/typescript/typescript-with-react">TypeScript with React</a></li>
+  <li><a href="/typescript/typescript-interview-questions">Interview Questions</a></li>
+</ul>
+
+<h2>Is it worth it?</h2>
+
+<p>For a script, no. For anything with more than one contributor or a lifespan beyond a few weeks,
+the question answers itself the first time you rename a field.</p>
+
+<p>The honest cost is not the annotations — most of those you do not write, because the compiler
+infers them. It is that you will occasionally spend twenty minutes describing something to the type
+system that you already understand perfectly. That is the trade: some friction now, in exchange for
+a class of bug that never reaches production and a codebase that can be changed without fear.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-set-up">Setting Up a Project</a> — getting a compiler running,
+and the difference between a setup that emits JavaScript and one that only checks it.</p>

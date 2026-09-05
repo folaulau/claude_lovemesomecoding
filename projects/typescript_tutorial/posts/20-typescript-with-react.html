@@ -1,0 +1,303 @@
+<p>React and TypeScript fit together unusually well, because a component is a function and its props
+are an object — both of which the type system already describes precisely. Most of what follows is
+applying earlier lessons rather than learning new syntax.</p>
+
+<p>The one genuinely React-specific idea is at the end: a context pattern that removes an
+<code>| undefined</code> from every consumer in the app.</p>
+
+<h2>Props</h2>
+
+<p>A component's props are one object, so its type is one object type:</p>
+
+<pre class="language-tsx"><code class="language-tsx">interface Props {
+  product: Product;
+  onSelect: (product: Product) =&gt; void;
+}</code></pre>
+
+<pre class="language-tsx"><code class="language-tsx">export const ProductCard = memo(function ProductCard({ product, onSelect }: Props) {</code></pre>
+
+<p>Destructure in the signature, annotate the whole parameter. That is the entire convention, and
+it holds for every component in a codebase.</p>
+
+<p>For one or two props an inline type is fine:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function AppNavbar({ onOpenCart }: { onOpenCart: () =&gt; void }) { /* … */ }</code></pre>
+
+<p>Note there is no <code>React.FC</code> here, and that is deliberate. It used to be the standard
+way to type a component; it is now generally discouraged, because it implicitly added a
+<code>children</code> prop to components that did not take one and made generic components awkward.
+Annotating the parameter is simpler and says more.</p>
+
+<h2>children</h2>
+
+<p>Anything between a component's tags arrives as <code>children</code>, and the type for "whatever
+React can render" is <code>ReactNode</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">import type { ReactNode } from 'react';
+
+export function AuthProvider({ children }: { children: ReactNode }) {</code></pre>
+
+<p><code>ReactNode</code> covers elements, strings, numbers, arrays, <code>null</code> and
+<code>undefined</code> — which is what you want, because all of those are legal children.</p>
+
+<p>Two neighbours worth distinguishing. <code>ReactElement</code> is specifically a JSX element, so
+a string child would be rejected — occasionally what you want, usually too strict.
+<code>JSX.Element</code> is what a component returns. When in doubt, <code>ReactNode</code>.</p>
+
+<p>Note also the <code>import type</code> on that line. <code>ReactNode</code> is a type and nothing
+else, so under <code>verbatimModuleSyntax</code> —
+<a href="/typescript/typescript-modules">lesson 17</a> — it has to say so.</p>
+
+<h2>useState</h2>
+
+<p>Usually you write nothing:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  const [loading, setLoading] = useState(false);
+  const [initialising, setInitialising] = useState(true);</code></pre>
+
+<p><code>loading</code> is <code>boolean</code>, inferred from the initial value. The type argument
+is needed when the initial value does not represent the full range — which is almost always the
+<code>null</code> case:</p>
+
+<pre class="language-tsx"><code class="language-tsx">  const [user, setUser] = useState&lt;User | null&gt;(null);
+  const [error, setError] = useState&lt;string | null&gt;(null);</code></pre>
+
+<p>Without <code>&lt;User | null&gt;</code>, the state would infer as <code>null</code> and
+<code>setUser(someUser)</code> would be an error. The rule: <strong>annotate when the initial value
+is <code>null</code>, <code>undefined</code> or an empty array</strong>, because in each case the
+initial value tells the compiler less than the truth.</p>
+
+<p>The setter also accepts a function, and both forms are typed for you:</p>
+
+<pre class="language-tsx"><code class="language-tsx">setCount((n) =&gt; n + 1);   // n is number</code></pre>
+
+<h2>useRef has two shapes</h2>
+
+<p>Which one you get depends on the initial value, and the difference is the source of a common
+error.</p>
+
+<pre class="language-tsx"><code class="language-tsx">const inputRef = useRef&lt;HTMLInputElement&gt;(null);   // RefObject — .current is read-only
+const timerRef = useRef&lt;number | undefined&gt;(undefined);   // MutableRefObject</code></pre>
+
+<p>The first is for DOM elements: you pass it to <code>ref={inputRef}</code> and React assigns it,
+so your code only reads. The second is a mutable box for instance-ish values you assign yourself —
+a timer id, a previous value, a flag.</p>
+
+<p>Either way <code>.current</code> may be <code>null</code>, so it needs checking before use. That
+is honest rather than annoying: the element does not exist until after the first render.</p>
+
+<h2>Events</h2>
+
+<p>Handlers attached inline are typed by context and need no annotation:</p>
+
+<pre class="language-tsx"><code class="language-tsx">          &lt;button type="button" onClick={() =&gt; onSelect(product)}&gt;</code></pre>
+
+<p>When a handler is declared separately, the context is gone and you supply the type:</p>
+
+<pre class="language-tsx"><code class="language-tsx">function handleSubmit(event: React.FormEvent&lt;HTMLFormElement&gt;) {
+  event.preventDefault();
+}
+
+function handleChange(event: React.ChangeEvent&lt;HTMLInputElement&gt;) {
+  setEmail(event.target.value);   // typed as string
+}</code></pre>
+
+<p>The type parameter is the element, and it is what makes <code>event.target.value</code> a
+<code>string</code> rather than an error. Get it wrong — <code>HTMLElement</code> instead of
+<code>HTMLInputElement</code> — and <code>value</code> does not exist.</p>
+
+<p>The common ones are <code>ChangeEvent</code>, <code>FormEvent</code>,
+<code>MouseEvent</code> and <code>KeyboardEvent</code>. If you cannot remember which, write the
+handler inline first, hover the parameter, and copy what the editor says.</p>
+
+<h2>The context pattern</h2>
+
+<p>This is the piece worth taking away, because the naive version pushes a null check into every
+consumer.</p>
+
+<p>A context needs a default value, and for a context holding real application state there is no
+sensible default — the value only exists inside the provider. So you say so:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const AuthContext = createContext&lt;AuthContextValue | undefined&gt;(undefined);</code></pre>
+
+<p>Correct, and now <code>useContext(AuthContext)</code> returns
+<code>AuthContextValue | undefined</code> everywhere, and forty components have to handle a case
+that cannot happen if the provider is mounted.</p>
+
+<p>The fix is to check once, in a custom hook, and let narrowing do the rest:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function useAuth(): AuthContextValue {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used inside an &lt;AuthProvider&gt;');
+  }
+  return context;
+}</code></pre>
+
+<p>Three things happen there. The return type is <code>AuthContextValue</code> with no
+<code>undefined</code>, because the <code>if</code> has narrowed it —
+<a href="/typescript/typescript-narrowing">lesson 10</a> again. Consumers write
+<code>const { user, isAdmin } = useAuth()</code> and get a value they can use immediately. And a
+component rendered outside the provider fails with a sentence explaining what is wrong, rather than
+reading properties of <code>undefined</code> somewhere further in.</p>
+
+<p>The value itself is an interface like any other:</p>
+
+<pre class="language-tsx"><code class="language-tsx">interface AuthContextValue {
+  user: User | null;
+  isAuthenticated: boolean;
+  isAdmin: boolean;
+  login: (email: string, password: string) =&gt; Promise&lt;void&gt;;
+  register: (email: string, password: string, fullName: string) =&gt; Promise&lt;void&gt;;
+  logout: () =&gt; void;
+  error: string | null;
+  loading: boolean;
+  /** True until the stored token has been checked against the API on first load. */
+  initialising: boolean;
+}</code></pre>
+
+<p>Note <code>user: User | null</code> stays nullable. That one <em>is</em> a real state — nobody is
+logged in — and the type should say so.</p>
+
+<h2>Async, and typing what comes back</h2>
+
+<p>The generic HTTP wrapper from <a href="/typescript/typescript-generics">lesson 13</a> is what
+makes data-loading components readable:</p>
+
+<pre class="language-tsx"><code class="language-tsx">        const me = await api.get&lt;User&gt;('/api/auth/me', { auth: true, signal: controller.signal });
+        setUser(me);</code></pre>
+
+<p><code>me</code> is a <code>User</code>, so <code>setUser</code> accepts it, and if the state and
+the endpoint disagree the build says so.</p>
+
+<p>The error path is the <code>unknown</code> narrowing from
+<a href="/typescript/typescript-special-types">lesson 4</a>, and the app does it inline:</p>
+
+<pre class="language-tsx"><code class="language-tsx">      } catch (err) {
+        const message =
+          err instanceof ApiError ? err.message : 'Could not reach the server. Is the API running?';
+        setError(message);</code></pre>
+
+<h2>Typed Redux hooks</h2>
+
+<p>If you use Redux Toolkit, do this once and forget it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type RootState = ReturnType&lt;typeof store.getState&gt;;
+export type AppDispatch = typeof store.dispatch;</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">export const useAppDispatch = useDispatch.withTypes&lt;AppDispatch&gt;();
+export const useAppSelector = useSelector.withTypes&lt;RootState&gt;();</code></pre>
+
+<p>Components import <code>useAppSelector</code> rather than <code>useSelector</code>, and state is
+typed without a generic at every call site. The comment in the app explains why the types are
+derived rather than declared: add a slice and <code>RootState</code> grows by itself.</p>
+
+<h2>Typing a custom hook</h2>
+
+<p>A hook is a function, so it is typed like one — but the return shape deserves a decision rather
+than an inference.</p>
+
+<p>Return an <strong>object</strong> when the values have names:</p>
+
+<pre class="language-tsx"><code class="language-tsx">interface UseOrdersResult {
+  orders: Order[];
+  loading: boolean;
+  error: string | null;
+  reload: () =&gt; void;
+}
+
+export function useOrders(): UseOrdersResult { /* … */ }</code></pre>
+
+<p>Return a <strong>tuple</strong> only when the caller should be free to rename the parts
+positionally, which is why <code>useState</code> does it. And if you do return a tuple, say so —
+otherwise TypeScript infers an array of the union, as
+<a href="/typescript/typescript-arrays-and-tuples">lesson 5</a> covered:</p>
+
+<pre class="language-tsx"><code class="language-tsx">export function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = useCallback(() =&gt; setOn((v) =&gt; !v), []);
+  return [on, toggle] as const;   // readonly [boolean, () =&gt; void]
+}</code></pre>
+
+<p>Without <code>as const</code> the return type is <code>(boolean | (() =&gt; void))[]</code>, and
+destructuring it gives both names that useless union.</p>
+
+<p>The <code>useAuth</code> hook above is the object form, and it does the other thing a good custom
+hook does: it turns an awkward type at the boundary into a comfortable one for every caller.</p>
+
+<h2>Extending an element's props</h2>
+
+<p>A component that wraps a native element should accept everything that element accepts. Intersect
+with React's own prop types rather than listing them:</p>
+
+<pre class="language-tsx"><code class="language-tsx">type ButtonProps = React.ButtonHTMLAttributes&lt;HTMLButtonElement&gt; &amp; {
+  variant: 'primary' | 'danger';
+  loading?: boolean;
+};
+
+export function Button({ variant, loading, ...rest }: ButtonProps) {
+  return &lt;button className={variant} disabled={loading} {...rest} /&gt;;
+}</code></pre>
+
+<p><code>onClick</code>, <code>type</code>, <code>aria-label</code> and everything else a button
+takes now typecheck, and the rest spread carries them through. The equivalents for other elements
+are <code>InputHTMLAttributes</code>, <code>AnchorHTMLAttributes</code> and so on, plus
+<code>ComponentProps&lt;'button'&gt;</code> if you would rather not remember the names.</p>
+
+<p>Use <code>Omit</code> when you need to replace one of the native props — a
+<code>Select</code> whose <code>onChange</code> hands back a parsed value rather than an event is
+<code>Omit&lt;SelectHTMLAttributes&lt;HTMLSelectElement&gt;, 'onChange'&gt; &amp; { onChange: (value: T) =&gt; void }</code>.</p>
+
+<h2>Generic components</h2>
+
+<p>A component can take a type parameter, which is how you write a reusable table or list:</p>
+
+<pre class="language-tsx"><code class="language-tsx">interface ListProps&lt;T&gt; {
+  items: T[];
+  renderItem: (item: T) =&gt; ReactNode;
+}
+
+export function List&lt;T&gt;({ items, renderItem }: ListProps&lt;T&gt;) {
+  return &lt;ul&gt;{items.map((item, i) =&gt; &lt;li key={i}&gt;{renderItem(item)}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+<p>Used as <code>&lt;List items={products} renderItem={(p) =&gt; p.name} /&gt;</code>, and
+<code>p</code> is a <code>Product</code> — inferred from <code>items</code>, with nothing written at
+the call site.</p>
+
+<p>Remember the <code>.tsx</code> wrinkle from lesson 13: an arrow function needs
+<code>&lt;T,&gt;</code> with the trailing comma. A <code>function</code> declaration, as above, does
+not.</p>
+
+<h2>What actually goes wrong</h2>
+
+<p>Four errors account for most of the time people lose here, and all four have short answers.</p>
+
+<p><strong>"Type 'null' is not assignable…" from <code>useState</code>.</strong> The initial value
+was <code>null</code> and no type argument was given. Add <code>&lt;User | null&gt;</code>.</p>
+
+<p><strong>"Property 'value' does not exist on type 'EventTarget'."</strong> The event's element
+parameter is wrong or missing. <code>React.ChangeEvent&lt;HTMLInputElement&gt;</code>, not
+<code>Event</code>.</p>
+
+<p><strong>"'X' is possibly 'undefined'" on a context value.</strong> You called
+<code>useContext</code> directly instead of going through the hook that checks. That is what the
+hook is for.</p>
+
+<p><strong>A key prop error on a mapped list.</strong> Usually the element type is wider than you
+think — often <code>any[]</code> from an untyped source, or the empty-array inference from
+<a href="/typescript/typescript-arrays-and-tuples">lesson 5</a>. Look at where the array came from
+rather than at the JSX.</p>
+
+<p>The pattern in all four: the error is where the type was <em>established</em>, not where it was
+used. That is the general skill this track has been building — read an error as a question about
+provenance.</p>
+
+<p>None of this needs a library, a plugin or a convention beyond annotating your props. React's own
+types do the rest, and most of what looks React-specific here is a lesson from earlier in the track
+wearing different clothes.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-interview-questions">Interview Questions</a> — the last lesson,
+answering the questions a TypeScript role actually asks against the twenty before it.</p>

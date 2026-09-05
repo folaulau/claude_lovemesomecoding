@@ -1,0 +1,265 @@
+<p>Four types here do not describe ordinary values. Two of them look interchangeable and are not —
+choosing between <code>any</code> and <code>unknown</code> is one of the few decisions in this
+language that genuinely changes how safe a codebase is.</p>
+
+<h2>any turns the checker off</h2>
+
+<p><code>any</code> means "stop checking this". Every operation on an <code>any</code> is allowed,
+and the result is another <code>any</code>.</p>
+
+<pre class="language-typescript"><code class="language-typescript">let response: any = await fetch('/api/orders').then((r) =&gt; r.json());
+
+response.total.toFixed(2);        // fine
+response.nonsense.deeply.nested;  // also fine
+response();                       // still fine</code></pre>
+
+<p>None of those are checked, and the last two throw at runtime. That is not a bug in TypeScript;
+it is precisely what you asked for.</p>
+
+<p>The property that makes <code>any</code> genuinely dangerous is that it <strong>spreads</strong>.
+An <code>any</code> assigned to something else makes that thing effectively unchecked too, and
+because no error is ever reported, nothing tells you how far it went. One <code>any</code> at an
+API boundary can quietly disable type checking across a whole feature.</p>
+
+<p>It arrives in three ways. You wrote it. You imported an untyped package. Or —
+most often — <code>noImplicitAny</code> is off and a parameter you forgot to annotate became
+<code>any</code> silently. That last one is why <code>strict</code> matters.</p>
+
+<p>There are legitimate uses: a genuinely dynamic value, a migration in progress, a type so awkward
+that describing it costs more than it returns. What makes them legitimate is that they are
+deliberate. If you must, leave a note saying so — a bare <code>any</code> is indistinguishable from
+one somebody gave up on.</p>
+
+<h2>unknown is the one you want</h2>
+
+<p><code>unknown</code> is <code>any</code>'s careful twin. Anything is assignable <em>to</em> it,
+and you can do nothing <em>with</em> it until you have proved what it is.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+function report(err: unknown) {
+  console.log(err.message);
+  //              ~~~~~~~
+  // 'err' is of type 'unknown'.
+}</code></pre>
+
+<p>That error is the feature. The value might be a string, a number, or <code>null</code> — nothing
+guarantees a <code>.message</code>. To use it, prove something first:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function report(err: unknown) {
+  if (err instanceof Error) {
+    console.log(err.message); // fine — err is an Error in here
+  }
+}</code></pre>
+
+<p>Inside that block <code>err</code> is an <code>Error</code>, so <code>.message</code> is
+allowed. This is <a href="/typescript/typescript-narrowing">narrowing</a>, and it is the reason
+<code>unknown</code> is usable rather than merely safe.</p>
+
+<h2>Where the app uses it</h2>
+
+<p>Two places, and they are the two places every application has.</p>
+
+<p><strong>Errors.</strong> Anything can be thrown in JavaScript — a string, a number, an object
+that is not an <code>Error</code> — so a caught value is genuinely unknown. The pizza app's Redux
+layer takes it as such:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function toApiFailure(err: unknown, fallback: string): ApiFailure {
+  if (err instanceof ApiError) {
+    return { message: err.message, fieldErrors: err.fieldErrors() };
+  }
+  return { message: err instanceof Error ? err.message : fallback, fieldErrors: {} };
+}</code></pre>
+
+<p>Read the shape of it: two proofs and a fallback. If it is the app's own
+<code>ApiError</code>, use the structured body. If it is any other <code>Error</code>, use the
+message. Otherwise use the caller's fallback string, because there is nothing trustworthy to
+show.</p>
+
+<p>That third branch is what <code>unknown</code> buys you. With <code>any</code>, the natural code
+is <code>err.message</code>, which produces <code>undefined</code> for a thrown string and shows the
+user a blank error box.</p>
+
+<p>The Angular half solves the same problem the same way:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError || error instanceof Error) {
+    return error.message || fallback;
+  }
+  return fallback;
+}</code></pre>
+
+<p><strong>Request bodies.</strong> The other direction — a value the function will not inspect,
+only forward:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface RequestOptions {
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  body?: unknown;</code></pre>
+
+<p><code>body</code> is <code>unknown</code> rather than <code>any</code> because the HTTP wrapper
+has no business knowing its shape — it only passes it to <code>JSON.stringify</code>. Typing it
+<code>any</code> would say the same thing while also volunteering to stop checking anything that
+touches it.</p>
+
+<h2>Downgrading an any you did not choose</h2>
+
+<p>Some <code>any</code> values are handed to you. <code>JSON.parse</code> is the one everybody
+meets: it is declared to return <code>any</code>, because it genuinely cannot know better.</p>
+
+<p>That means the moment you parse a response, an unchecked value is loose in your program. The app
+closes it off on the same line:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const text = await response.text();
+const parsed = text ? (JSON.parse(text) as unknown) : null;</code></pre>
+
+<p><code>as unknown</code> looks like it is doing nothing. It is doing the most valuable thing in
+the function: converting a value the compiler has stopped checking into one it insists you check.
+From here on, <code>parsed</code> cannot be used without a deliberate decision about what it is —
+which, a few lines later, is exactly what happens:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  if (!response.ok) {
+    const errorBody = parsed as ApiErrorBody | null;</code></pre>
+
+<p>That second assertion is still a claim rather than a check — see
+<a href="/typescript/typescript-type-assertions">lesson 16</a> — but it is a claim made once, in
+the one file that talks to the network, instead of implicitly everywhere the response travels.</p>
+
+<p>The general move is worth remembering: <strong>when a library hands you <code>any</code>, widen
+it to <code>unknown</code> immediately</strong>, then narrow deliberately.</p>
+
+<h2>object, {} and Object are not what you want</h2>
+
+<p>Three types look like they might mean "some object" and all three disappoint.</p>
+
+<pre class="language-typescript"><code class="language-typescript">let a: object;   // any non-primitive. No properties are readable.
+let b: {};       // anything except null and undefined. Yes, including numbers.
+let c: Object;   // effectively the same as {}. Never write this.</code></pre>
+
+<p><code>{}</code> is the surprising one — it means "not <code>null</code> or
+<code>undefined</code>", so <code>const x: {} = 42</code> compiles. It is not a description of an
+object at all.</p>
+
+<p><code>object</code> at least excludes primitives, but you still cannot read any property off it,
+which makes it about as useful as <code>unknown</code> and considerably less honest.</p>
+
+<p>If you want "an object with unknown properties", write an index signature, which
+<a href="/typescript/typescript-object-types">lesson 6</a> covers:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function fieldErrors(): Record&lt;string, string&gt; {
+  const result: Record&lt;string, string&gt; = {};</code></pre>
+
+<p>That is what the app does for its per-field validation messages, and it is readable: string keys,
+string values, and the compiler will hold you to both.</p>
+
+<h2>catch already gives you unknown</h2>
+
+<p>With <code>strict</code> on, a caught value is <code>unknown</code> automatically:</p>
+
+<pre class="language-typescript"><code class="language-typescript">try {
+  await placeOrder(cart);
+} catch (err) {
+  // err is unknown, not any
+  setError(failureMessage(err, 'Could not place your order.'));
+}</code></pre>
+
+<p>This changed in TypeScript 4.4, via <code>useUnknownInCatchVariables</code>. It is included in
+<code>strict</code>, and it is why the two helpers above exist at all — a codebase that catches
+errors in twenty components wants one function that turns an unknown into a displayable string,
+rather than twenty slightly different guesses.</p>
+
+<h2>never: the type with no values</h2>
+
+<p><code>never</code> is the empty type. No value has it, which sounds useless and is not.</p>
+
+<p>It is what a function that does not finish returns:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function fail(message: string): never {
+  throw new Error(message);
+}</code></pre>
+
+<p>Not <code>void</code> — <code>void</code> means "returns, with nothing useful". This never
+returns at all, and saying so lets TypeScript understand that code after a call to it is
+unreachable.</p>
+
+<p>You will also meet it as the result of an impossible narrowing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function check(value: string) {
+  if (typeof value === 'number') {
+    value; // value is never — a string cannot also be a number
+  }
+}</code></pre>
+
+<p>That looks like a curiosity. It is actually the most useful thing in this lesson, because it
+turns into an exhaustiveness check: narrow a union down through every case and the leftover is
+<code>never</code>, so assigning it to a <code>never</code> variable compiles only while every case
+really is handled. Add a member to the union and that line fails. The full pattern is in
+<a href="/typescript/typescript-narrowing">Narrowing</a>.</p>
+
+<p>One more property, which explains behaviour you will otherwise find baffling:
+<strong><code>never</code> vanishes from a union</strong>. <code>string | never</code> is just
+<code>string</code>, because adding "no values at all" to a set of values changes nothing.</p>
+
+<p>That is why a conditional type that filters a union works at all, and why a union you expected
+sometimes collapses to something narrower than you wrote. It is also the mechanism behind
+<code>Exclude</code>, in <a href="/typescript/typescript-utility-types">lesson 14</a>.</p>
+
+<h2>void: returns nothing worth having</h2>
+
+<p><code>void</code> is the return type of a function whose result you should ignore.</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const tokenStore = {
+  get: (): string | null =&gt; localStorage.getItem(TOKEN_KEY),
+  set: (token: string) =&gt; localStorage.setItem(TOKEN_KEY, token),
+  clear: () =&gt; localStorage.removeItem(TOKEN_KEY),
+};</code></pre>
+
+<p><code>set</code> and <code>clear</code> return <code>void</code> — inferred, not written.
+<code>get</code> returns <code>string | null</code>, because <code>localStorage</code> gives back
+<code>null</code> for a missing key and the type says so.</p>
+
+<p>Two things about <code>void</code> catch people out.</p>
+
+<p><strong>It is not <code>undefined</code>.</strong> A <code>void</code> function may return
+anything at all; the type is a promise about the <em>caller</em>, saying the value will not be
+used. A function typed <code>(): undefined</code> must actually return <code>undefined</code>.</p>
+
+<p><strong>A function returning something is assignable to a <code>void</code> callback type.</strong>
+This looks like a hole and is deliberate:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const onSelect: (product: Product) =&gt; void = (product) =&gt; items.push(product);</code></pre>
+
+<p><code>push</code> returns a number; the callback type says <code>void</code>; it compiles. It
+has to, or you could never pass <code>arr.push</code> or any other value-returning function as a
+handler. The contract is only that the caller will ignore whatever comes back.</p>
+
+<h2>Which to use</h2>
+
+<table>
+  <thead><tr><th>Type</th><th>Use it when</th></tr></thead>
+  <tbody>
+    <tr><td><code>unknown</code></td><td>the value could be anything and you will check. The default choice.</td></tr>
+    <tr><td><code>any</code></td><td>you have decided to stop checking, on purpose, with a comment.</td></tr>
+    <tr><td><code>never</code></td><td>this cannot happen — throwing functions, exhaustive switches.</td></tr>
+    <tr><td><code>void</code></td><td>the return value is not meaningful.</td></tr>
+  </tbody>
+</table>
+
+<p>The short version: <strong>when you are about to write <code>any</code>, write
+<code>unknown</code> instead</strong>. It will make the compiler ask you a question, and the answer
+to that question is almost always a real bug you were about to ship.</p>
+
+<p>If you want one measure of how healthy a TypeScript codebase is, count the <code>any</code>s. Not
+because every one is wrong — some are the right call — but because a codebase with fifty of them
+has stopped choosing. The ESLint rule <code>no-explicit-any</code> exists for teams that want the
+count enforced rather than monitored; setting it to warn rather than error is a reasonable middle
+position, since it makes each one a visible decision without blocking work.</p>
+
+<p>The same goes for <code>@ts-ignore</code> and its better-behaved replacement
+<code>@ts-expect-error</code>. Prefer the second: it suppresses the error on the next line
+<em>and</em> fails the build once that line stops having an error, so a suppression cannot outlive
+the problem it was hiding. A <code>@ts-ignore</code> written in 2024 is still silently ignoring
+something today.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-arrays-and-tuples">Arrays and Tuples</a> — collections, and the
+difference between a list of things and a fixed-length row.</p>

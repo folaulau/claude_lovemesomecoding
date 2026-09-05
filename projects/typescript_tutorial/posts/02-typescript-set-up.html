@@ -1,0 +1,294 @@
+<p>There is one compiler, <code>tsc</code>, and it does two separable jobs: it <strong>checks</strong>
+your code and it <strong>emits</strong> JavaScript. Almost everything confusing about modern
+TypeScript setups comes from the fact that most projects now let it do only the first.</p>
+
+<h2>The smallest possible setup</h2>
+
+<p>TypeScript is an ordinary dev dependency. There is nothing to install globally.</p>
+
+<pre class="language-bash"><code class="language-bash">npm init -y
+npm install --save-dev typescript
+npx tsc --init</code></pre>
+
+<p><code>tsc --init</code> writes a <code>tsconfig.json</code>. Its presence is what marks a
+directory as a TypeScript project — <code>tsc</code> with no arguments looks for it, reads the
+options and the file list from it, and ignores whatever is on the command line.</p>
+
+<p>Write a file:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// src/greet.ts
+export function greet(name: string): string {
+  return `Hello, ${name}`;
+}
+
+console.log(greet('world'));</code></pre>
+
+<p>and compile it:</p>
+
+<pre class="language-bash"><code class="language-bash">npx tsc              # writes src/greet.js
+node src/greet.js    # Hello, world</code></pre>
+
+<p>That is the whole loop in its original form: <code>tsc</code> reads <code>.ts</code>, writes
+<code>.js</code>, Node runs the <code>.js</code>. Set <code>outDir</code> and the output lands in
+<code>dist/</code> instead of beside the source, which is what you want for anything real.</p>
+
+<p>Two flags are worth knowing on day one. <code>--watch</code> recompiles on save.
+<code>--noEmit</code> checks without writing anything — and that second one is where modern
+projects live.</p>
+
+<h2>Why most projects stop it emitting</h2>
+
+<p>If you are building for a browser, something already transforms your code: Vite, esbuild, SWC,
+webpack, the Angular CLI. That tool needs to bundle, split, minify, handle CSS and hash filenames.
+Removing type annotations is a trivial extra for it.</p>
+
+<p>And it is <em>much</em> faster at that than <code>tsc</code>, for a reason worth understanding:
+those tools strip types <strong>without checking them</strong>. Erasing <code>: string</code> is a
+syntactic operation on one file. Verifying that <code>: string</code> is <em>true</em> requires
+building a model of the entire program.</p>
+
+<p>Which leads to the trap. A bundler will happily build code that does not typecheck. It never
+looked.</p>
+
+<p>So the two jobs get split: the bundler emits, and <code>tsc</code> checks and emits nothing.
+That is exactly what the React half of the pizza app does:</p>
+
+<pre class="language-json"><code class="language-json">"scripts": {
+  "dev": "vite",
+  "build": "tsc -b &amp;&amp; vite build",
+  "lint": "oxlint",
+  "preview": "vite preview",</code></pre>
+
+<pre class="language-json"><code class="language-json">  "typecheck": "tsc -b --noEmit",</code></pre>
+
+<p><code>tsc -b &amp;&amp; vite build</code> is the important line. The <code>&amp;&amp;</code> is
+load-bearing: type errors fail the build before Vite runs at all. Drop it — run only
+<code>vite build</code>, as plenty of projects do by accident — and you have a deployment pipeline
+that ships type errors, silently, forever.</p>
+
+<p>Note also what <code>npm run dev</code> does <em>not</em> do. Vite's dev server strips types and
+serves; it does not typecheck. Your editor does that as you work, which is why the gap goes
+unnoticed until CI or a teammate without the same editor setup.</p>
+
+<h2>noEmit is not a downgrade</h2>
+
+<p>The React app's config turns emitting off outright:</p>
+
+<pre class="language-json"><code class="language-json">    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",</code></pre>
+
+<p>Read that as a statement of responsibility rather than a limitation. <code>tsc</code> is being
+used as a type checker — a linter of a very thorough kind — and Vite is the compiler.
+<code>moduleResolution: "bundler"</code> says the same thing from the other direction: resolve
+imports the way the bundler will, because the bundler is the one that has to find them.</p>
+
+<p><code>allowImportingTsExtensions</code> is only legal <em>because</em> of
+<code>noEmit</code> — writing <code>./money.ts</code> in an import would produce broken JavaScript
+if TypeScript were emitting it, so the compiler refuses that combination.</p>
+
+<h2>Why there are three tsconfig files</h2>
+
+<p>Open <code>tsconfig.json</code> in that project and there is nothing in it:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}</code></pre>
+
+<p>This is <strong>project references</strong>, and it is what the <code>-b</code> ("build mode")
+flag in those scripts is for. The root config compiles nothing itself; it points at two real
+configs and <code>tsc -b</code> builds both.</p>
+
+<p>The split exists because the two halves run in different places. Application code runs in a
+browser and needs DOM types. <code>vite.config.ts</code> runs in Node and needs Node's. Give both
+to both and you get a project where <code>document</code> autocompletes inside a build script and
+<code>process.env</code> autocompletes inside a component — each of which is a crash waiting to
+happen.</p>
+
+<p>So the app config takes the DOM:</p>
+
+<pre class="language-json"><code class="language-json">    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],</code></pre>
+
+<p>and the Node one takes Node:</p>
+
+<pre class="language-json"><code class="language-json">    "target": "es2023",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "skipLibCheck": true,</code></pre>
+
+<p>Same language, two environments, two configs. One <code>include</code> covers
+<code>src</code>, the other covers exactly one file — <code>vite.config.ts</code>.</p>
+
+<h2>Which files are in the project</h2>
+
+<p>A tsconfig decides its own file list, and getting this wrong produces the two most confusing
+beginner symptoms: errors from files you thought you had excluded, and no errors at all from files
+you thought you were checking.</p>
+
+<p>Three settings control it. <code>include</code> takes glob patterns and is what you almost
+always want. <code>exclude</code> subtracts from <code>include</code> — it does not exclude a file
+that something else <code>import</code>s, which surprises people. <code>files</code> takes an
+explicit list and is for the rare case where you mean exactly these.</p>
+
+<p>Both halves of the pizza app use the simple form. The React app's is one line:</p>
+
+<pre class="language-json"><code class="language-json">  "include": ["src"]</code></pre>
+
+<p>The Angular app has to be more careful, because tests live beside the code they test:</p>
+
+<pre class="language-json"><code class="language-json">  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "src/**/*.spec.ts"
+  ]</code></pre>
+
+<p>One thing to know: <code>exclude</code> defaults to
+<code>node_modules</code>, <code>bower_components</code>, <code>jspm_packages</code> and your
+<code>outDir</code>. Write your own <code>exclude</code> and you <em>replace</em> that default, so
+remember to keep <code>node_modules</code> in it unless you enjoy typechecking your dependencies.</p>
+
+<h2>Turn strict on, on day one</h2>
+
+<p>The single most consequential line in a new tsconfig:</p>
+
+<pre class="language-json"><code class="language-json">    "strict": true</code></pre>
+
+<p>It is not one check. It switches on a family of them — <code>strictNullChecks</code>,
+<code>noImplicitAny</code>, <code>strictFunctionTypes</code> and several more — and
+<code>strictNullChecks</code> alone accounts for most of the value people get out of TypeScript.
+Without it, every type silently includes <code>null</code> and <code>undefined</code>, and the
+runtime errors you adopted TypeScript to prevent are all still possible.</p>
+
+<p>On a new project this costs nothing, because there is no existing code to fix. On an old one it
+is the last step rather than the first, as above. Both configurations in the pizza app have it on,
+and <a href="/typescript/typescript-tsconfig">lesson 18</a> takes the family apart flag by flag.</p>
+
+<h2>Types for libraries you did not write</h2>
+
+<p>Your dependencies are shipped as JavaScript. TypeScript needs to know their shapes, and there
+are two ways it gets them.</p>
+
+<p><strong>The package ships its own.</strong> Modern libraries do — React Router, Redux Toolkit
+and the Stripe SDKs all include <code>.d.ts</code> files, and there is nothing to install.</p>
+
+<p><strong>Somebody else wrote them.</strong> For packages that do not, the community maintains
+declarations under the <code>@types</code> scope, which is why the dev dependencies list this:</p>
+
+<pre class="language-json"><code class="language-json">    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",</code></pre>
+
+<p>React itself is plain JavaScript; <code>@types/react</code> is the file that says what
+<code>useState</code> does. Install the wrong major version of it and you get errors that look like
+your code is wrong when the declarations are.</p>
+
+<p>If a package has no types at all, <code>import</code>ing it is an error under
+<code>strict</code>. The escape hatch is one line in a <code>.d.ts</code> file of your own:</p>
+
+<pre class="language-typescript"><code class="language-typescript">declare module 'some-untyped-package';</code></pre>
+
+<p>Everything from it is then <code>any</code> — which is a decision, not a fix. More on that in
+<a href="/typescript/typescript-modules">Modules</a>.</p>
+
+<h2>Running TypeScript without compiling it first</h2>
+
+<p>For a script or a one-off, the compile-then-run cycle is tedious. Two ways round it.</p>
+
+<p>Node has understood TypeScript syntax natively since 22.6, and does it by <em>stripping</em>
+types — the same trick as a bundler, with the same caveat:</p>
+
+<pre class="language-bash"><code class="language-bash">node src/greet.ts</code></pre>
+
+<p>No checking happens. Node deletes the annotations and runs what is left, so a file full of type
+errors runs perfectly. Useful, as long as you know that is what it is.</p>
+
+<p>The other option is <code>tsx</code>, which does the same thing with better ergonomics and a
+watch mode:</p>
+
+<pre class="language-bash"><code class="language-bash">npm install --save-dev tsx
+npx tsx watch src/server.ts</code></pre>
+
+<p>Either way the rule from earlier holds: something still has to run <code>tsc</code>.</p>
+
+<h2>Adding TypeScript to a JavaScript project</h2>
+
+<p>You rarely start clean. The migration path is deliberately gradual, and it is worth knowing that
+you do not have to rename anything to begin.</p>
+
+<pre class="language-json"><code class="language-json">{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "noEmit": true
+  },
+  "include": ["src"]
+}</code></pre>
+
+<p><code>allowJs</code> lets <code>.js</code> files into the project. <code>checkJs</code> then
+typechecks them — inferring from JSDoc comments and from the code itself. That alone, on an
+untouched JavaScript codebase, will usually find real bugs before you have written a single
+annotation.</p>
+
+<p>From there the order that works is: get it green with <code>strict</code> off, rename files to
+<code>.ts</code> a few at a time starting with the leaves, then turn on the strict flags one by one
+rather than all at once. <a href="/typescript/typescript-tsconfig">tsconfig, the Flags That
+Matter</a> goes through them individually, which is exactly how you want to enable them.</p>
+
+<p>What does not work is renaming everything on a Friday and turning on <code>strict</code>. That
+produces four thousand errors, no way to tell the important ones from the noise, and a branch
+nobody merges.</p>
+
+<h2>The Angular setup, for contrast</h2>
+
+<p>The Angular half of the same application has none of this:</p>
+
+<pre class="language-json"><code class="language-json">  "scripts": {
+    "ng": "ng",
+    "start": "ng serve",
+    "build": "ng build",</code></pre>
+
+<p><code>ng build</code> typechecks, compiles templates, bundles and optimises in one step, because
+the Angular CLI owns the whole toolchain. There is no separate <code>tsc</code> line to forget.</p>
+
+<p>The cost is that you get Angular's opinions with it, including its TypeScript version — the
+Angular app here is on 5.9.3 while the React one is on 6.0.3. That is not neglect; the compiler is
+part of the framework's supported set. It is the usual trade: less to assemble, less to choose.</p>
+
+<h2>The commands you will actually run</h2>
+
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>npm run dev</code></td><td>dev server. Fast, and does <strong>not</strong> typecheck.</td></tr>
+    <tr><td><code>npm run typecheck</code></td><td><code>tsc -b --noEmit</code>. The whole project, checked, no output.</td></tr>
+    <tr><td><code>npm run build</code></td><td>typecheck, then bundle. Fails on the first type error.</td></tr>
+    <tr><td><code>npx tsc --noEmit --watch</code></td><td>a terminal that goes red the moment you break something.</td></tr>
+  </tbody>
+</table>
+
+<p>If you take one thing from this lesson: <strong>make sure something runs
+<code>tsc</code> in CI</strong>. The dev server does not, the bundler does not, and a project where
+only the editor checks types is a project whose type errors are one contributor away from being
+merged.</p>
+
+<p>The failure is quiet, which is what makes it worth guarding. Nobody reports a missing typecheck;
+the app builds, deploys and works. You find out months later, when a rename that should have failed
+in nine files failed in none of them, and the type annotations turn out to have been decorative for
+some time.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-basic-types">The Basic Types</a> — and, more usefully, which
+annotations you should not bother writing.</p>

@@ -1,0 +1,319 @@
+<p>Most of what you describe in a real application is objects. This lesson is the vocabulary for that:
+optional properties, readonly, nesting, open-ended keys, and one rule about object literals that
+looks like a bug the first time you meet it.</p>
+
+<h2>Describing a shape</h2>
+
+<p>An object type lists property names and their types. You can write it inline:</p>
+
+<pre class="language-typescript"><code class="language-typescript">let size: { size: SizeName; price: number };</code></pre>
+
+<p>or give it a name, which is what you do as soon as it is used twice:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface ProductSize {
+  id: UUID;
+  size: SizeName;
+  price: number;
+}</code></pre>
+
+<p>Separators are interchangeable — semicolons, commas, or newlines all work. Semicolons are the
+usual choice in a multi-line declaration and this track uses them throughout.</p>
+
+<p>Whether to reach for <code>interface</code> or <code>type</code> is
+<a href="/typescript/typescript-interfaces-vs-type-aliases">the next lesson</a>. For everything
+below, they behave the same.</p>
+
+<h2>Optional properties</h2>
+
+<p>A <code>?</code> after the name means the property may be absent:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface AddressWriteRequest {
+  label?: string;
+  recipientName?: string;
+  phone?: string;
+  line1: string;
+  line2?: string;
+  city: string;
+  state: string;
+  postalCode: string;
+  primary?: boolean;
+}</code></pre>
+
+<p>Read that as a form: <code>line1</code>, <code>city</code>, <code>state</code> and
+<code>postalCode</code> are required, and the rest may be left out entirely. It is a precise
+description of what the endpoint accepts, and it is enforced at every call site.</p>
+
+<p>Reading an optional property gives you <code>T | undefined</code>, so you have to deal with the
+absent case:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+function describe(address: AddressWriteRequest) {
+  return address.label.toUpperCase();
+  //     ~~~~~~~~~~~~~
+  // 'address.label' is possibly 'undefined'.
+}</code></pre>
+
+<p>The usual fixes are <code>??</code> for a default, or optional chaining:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const label = address.label ?? 'Home';
+const shouted = address.label?.toUpperCase();   // string | undefined</code></pre>
+
+<h2>Optional is not the same as nullable</h2>
+
+<p>Three declarations that people treat as interchangeable and are not:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface A { phone?: string }              // may be MISSING
+interface B { phone: string | undefined }   // must be PRESENT, may be undefined
+interface C { phone: string | null }        // must be PRESENT, may be null</code></pre>
+
+<p>With <code>B</code>, <code>{ }</code> is an error — you have to write
+<code>{ phone: undefined }</code>. With <code>A</code> it is fine. The difference matters as soon
+as anything iterates keys, spreads the object, or serialises it: an absent property does not appear
+in <code>JSON.stringify</code> output, while an explicit <code>undefined</code> is dropped and an
+explicit <code>null</code> is kept.</p>
+
+<p>The pizza app uses both deliberately, and the split follows the direction of travel. Data coming
+<em>from</em> the API uses <code>| null</code>, because the server sends the key with a null value:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface Order {
+  id: UUID;
+  status: OrderStatus;
+  orderType: OrderType;
+  customerName: string;
+  email: string;
+  phone: string | null;
+  addressLine1: string | null;
+  addressLine2: string | null;</code></pre>
+
+<p>Data going <em>to</em> the API uses <code>?</code>, because an omitted field is simply not sent:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface OrderCreateRequest {
+  orderType: OrderType;
+  customerName: string;
+  guestEmail?: string;
+  phone?: string;
+  addressLine1?: string;</code></pre>
+
+<p>Same concept, opposite conventions, and the types record which is which. That is a good habit:
+let the type say what the wire format actually does rather than what is convenient.</p>
+
+<h2>readonly properties</h2>
+
+<p><code>readonly</code> stops assignment after construction:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class ApiError extends Error {
+  readonly status: number;
+  readonly body: ApiErrorBody | null;</code></pre>
+
+<p>Assigning to <code>err.status</code> anywhere else is a compile error. As with readonly arrays,
+two caveats: it is <strong>shallow</strong>, so <code>err.body.message</code> is still writable,
+and it is <strong>compile-time only</strong> — nothing is frozen at runtime and
+<code>Object.assign</code> will happily overwrite it.</p>
+
+<p>It is also not part of assignability in the direction you might expect. A type with
+<code>readonly</code> properties accepts a mutable object and vice versa; TypeScript treats the
+modifier as advice to the code that holds the reference, not as part of the shape.</p>
+
+<h2>Nesting</h2>
+
+<p>Property types are types, so they nest without any special syntax:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface ReportDashboard {
+  summary: {
+    totalOrders: number;
+    totalRevenue: number;
+    averageOrderValue: number;
+    itemsSold: number;
+  };</code></pre>
+
+<p>Here <code>summary</code> is written inline because nothing else refers to it. The moment a
+second thing does, pull it out and name it — an anonymous shape repeated in two places is two
+shapes that will disagree.</p>
+
+<h2>Index signatures, for genuinely open keys</h2>
+
+<p>Sometimes the keys are data rather than structure. An index signature says "any key of this type
+maps to a value of that type":</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface FieldErrors {
+  [field: string]: string;
+}</code></pre>
+
+<p>In practice most people write the utility-type version, which means the same thing and is
+shorter:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  fieldErrors(): Record&lt;string, string&gt; {
+    const result: Record&lt;string, string&gt; = {};
+    for (const sub of this.body?.errors ?? []) {
+      if (sub.field) result[sub.field] = sub.message;
+    }
+    return result;
+  }</code></pre>
+
+<p>That is the pizza app turning the API's list of validation errors into a lookup, so a form can
+render each message under the right input. The keys are field names from the server — genuinely
+unknown at compile time — which is exactly when an index signature is right.</p>
+
+<p>Two things to know. Reading a missing key gives you the value type rather than
+<code>undefined</code>, unless <code>noUncheckedIndexedAccess</code> is on — the same optimism
+array indexing has. And if you mix an index signature with named properties, the named ones must
+be compatible with it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+interface Config {
+  [key: string]: string;
+  retries: number;
+  ~~~~~~~
+  // Property 'retries' of type 'number' is not assignable to
+  // 'string' index type 'string'.
+}</code></pre>
+
+<p>The signature promised every key is a string, and <code>retries</code> breaks that promise.</p>
+
+<p>Use index signatures sparingly. If you know the keys, list them — you lose autocomplete and
+misspelling protection the moment you reach for <code>Record&lt;string, T&gt;</code>. When the keys
+are a known set, <code>Record&lt;OrderStatus, T&gt;</code> is far better, and
+<a href="/typescript/typescript-utility-types">lesson 14</a> shows why.</p>
+
+<h2>Objects are compared by shape</h2>
+
+<p>This is worth stating plainly here, because it explains most of what follows and a good deal of
+what surprises people later.</p>
+
+<p>TypeScript does not care what a type is called. If a value has the properties a type requires,
+of the right types, it is assignable — even if the two were declared independently and know nothing
+about each other.</p>
+
+<pre class="language-typescript"><code class="language-typescript">function label(thing: { name: string }) {
+  return thing.name.toUpperCase();
+}
+
+label(product);   // fine — a Product has a name: string
+label(topping);   // fine — so does a Topping
+label(crust);     // fine</code></pre>
+
+<p>Three unrelated interfaces, one function, no inheritance and no <code>implements</code>. In a
+nominal language you would need a shared base type or an interface each of them declares. Here the
+requirement <em>is</em> the type.</p>
+
+<p>This is what makes small parameter types worth writing. A function that only reads a name should
+ask for <code>{ name: string }</code> rather than <code>Product</code> — it becomes usable with
+anything that has one, and it documents exactly what it touches.</p>
+
+<h2>Getting part of a shape</h2>
+
+<p>Rather than hand-writing a subset, derive it. The app does this when it needs a lighter version
+of a type, and <a href="/typescript/typescript-utility-types">lesson 14</a> covers the full set:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type ProductSummary = Pick&lt;Product, 'id' | 'name' | 'imageUrl'&gt;;
+type ProductDraft = Omit&lt;Product, 'id' | 'createdAt' | 'updatedAt'&gt;;
+type PartialProduct = Partial&lt;Product&gt;;   // every property optional</code></pre>
+
+<p>The reason to derive rather than retype is the same as everywhere else in this track: a copy is
+a thing that can fall out of step. Rename a field on <code>Product</code> and
+<code>Pick&lt;Product, 'name'&gt;</code> fails the build; a hand-written
+<code>{ name: string }</code> does not.</p>
+
+<h2>Excess property checks</h2>
+
+<p>Here is the rule that looks inconsistent until you know the reasoning.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+const topping: ToppingWriteRequest = {
+  name: 'Pepperoni',
+  price: 1.5,
+  category: 'MEAT',
+  active: true,
+  colour: 'red',
+  ~~~~~~
+  // Object literal may only specify known properties, and 'colour'
+  // does not exist in type 'ToppingWriteRequest'.
+};</code></pre>
+
+<p>Reasonable enough. But now assign through a variable and the same object is accepted:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const draft = {
+  name: 'Pepperoni',
+  price: 1.5,
+  category: 'MEAT' as const,
+  active: true,
+  colour: 'red',
+};
+
+const topping: ToppingWriteRequest = draft;   // fine</code></pre>
+
+<p>That is not a bug. TypeScript is structural — <code>draft</code> has everything
+<code>ToppingWriteRequest</code> requires, and having <em>more</em> than required is normally
+harmless. That is the same rule that lets you pass a full <code>Order</code> where only
+<code>{ id: string }</code> was asked for.</p>
+
+<p>The literal case is special-cased on top, because a property written directly at the assignment
+is almost always a typo or a misunderstanding — there is nowhere else the extra key could usefully
+be going. So freshly-written literals get the stricter treatment, and objects that have been around
+get the structural one.</p>
+
+<p>Knowing this saves real time when a spread suddenly stops complaining, and it explains why
+adding a variable "fixes" an error that was telling you something true.</p>
+
+<h2>Two ways to escape the check, and when each is right</h2>
+
+<p>Sometimes the extra property is genuinely intended. Three options, in descending order of how
+much they preserve.</p>
+
+<p><strong>Add it to the type</strong> — if it belongs there, this is not an escape at all, it is
+the fix.</p>
+
+<p><strong>Use <code>satisfies</code></strong>, which checks the object against the type without
+changing its inferred type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const topping = {
+  name: 'Pepperoni',
+  price: 1.5,
+  category: 'MEAT',
+  active: true,
+} satisfies ToppingWriteRequest;</code></pre>
+
+<p>Here <code>topping.name</code> is still the literal <code>'Pepperoni'</code>, not widened to
+<code>string</code> — which an annotation would have done. That is usually what you wanted, and
+<a href="/typescript/typescript-type-assertions">lesson 16</a> is about why.</p>
+
+<p><strong>Assert with <code>as</code></strong> — which silences the check and everything else with
+it. Available, rarely correct.</p>
+
+<h2>Describing an object you did not design</h2>
+
+<p>A last practical note. When you are writing the type for a payload somebody else defined, resist
+the urge to tidy it. The type's job is to say what is actually there.</p>
+
+<p>The app's error envelope is a good example — it mirrors the Spring Boot API field for field,
+including the optional list that is only present on validation failures:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/** One invalid field, from the API's ApiSubError. */
+export interface ApiSubError {
+  field: string | null;
+  message: string;
+}
+
+/** The single error envelope every endpoint returns. */
+export interface ApiErrorBody {
+  statusCode: number;
+  error: string;
+  message: string;
+  path: string;
+  timestamp: string;
+  errors?: ApiSubError[];
+}</code></pre>
+
+<p><code>field</code> is <code>string | null</code> because a whole-request error has no field, and
+<code>errors</code> is optional because most responses do not carry one. Both facts came from the
+server, not from what would have been convenient — and both are why the
+<code>fieldErrors()</code> helper above has to check <code>sub.field</code> before using it.</p>
+
+<p>A type that quietly rounds off the awkward parts of a payload is worse than no type, because it
+reads as documentation while being wrong. If the server can send you a null, say so, and let the
+compiler make everyone deal with it.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-interfaces-vs-type-aliases">Interfaces vs Type Aliases</a> —
+they overlap almost entirely, so the question is which three differences are real.</p>

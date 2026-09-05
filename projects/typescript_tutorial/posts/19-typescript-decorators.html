@@ -1,0 +1,287 @@
+<p>A decorator is a function that runs when a class is defined, receiving the thing it is attached to
+and either recording something about it or replacing it. That is the whole idea. Everything else is
+detail — including the awkward detail that TypeScript currently has two incompatible decorator
+systems.</p>
+
+<h2>What you are actually looking at</h2>
+
+<p>Here is a pipe from the Angular half of the pizza app:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Pipe({ name: 'money' })
+export class MoneyPipe implements PipeTransform {
+  transform(value: number | null | undefined): string {
+    return formatMoney(value ?? 0);
+  }
+}</code></pre>
+
+<p><code>@Pipe({ name: 'money' })</code> is a function call. It returns a decorator, which Angular
+applies to <code>MoneyPipe</code> when the module loads, and which records "this class is a pipe
+named <code>money</code>" in a metadata table Angular keeps.</p>
+
+<p>Nothing about <code>MoneyPipe</code> changes. It is still a class with one method. What has
+happened is that a framework now <em>knows something about it</em> — enough to find it when a
+template writes <code>{{ total | money }}</code>.</p>
+
+<p>That is the pattern behind almost every decorator you will meet: <strong>attach metadata that a
+framework reads later</strong>.</p>
+
+<h2>The four in this codebase</h2>
+
+<p><code>@Component</code> marks a class as a component and supplies its selector, template and
+change-detection strategy:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Component({
+  selector: 'app-product-card',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [MoneyPipe],</code></pre>
+
+<p><code>@Injectable</code> marks a class as available for injection, and
+<code>providedIn: 'root'</code> makes it a singleton for the whole application:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable({ providedIn: 'root' })
+export class AuthService {</code></pre>
+
+<p><code>@Directive</code> marks behaviour attachable to an element somebody else owns:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Directive({
+  selector: '[appAutofocus]',
+})
+export class Autofocus {</code></pre>
+
+<p>And <code>@Pipe</code>, above. In every case the class is ordinary and the decorator is
+registration.</p>
+
+<h2>Writing one</h2>
+
+<p>A class decorator is a function taking the constructor:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function logged(constructor: Function) {
+  console.log(`defined ${constructor.name}`);
+}
+
+@logged
+class CartService {}
+// logs "defined CartService" when the module loads — not when one is constructed</code></pre>
+
+<p>To take arguments, return the decorator from a factory. That is why every Angular decorator has
+parentheses:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function tag(label: string) {
+  return function (constructor: Function) {
+    Reflect.defineMetadata?.('tag', label, constructor);
+  };
+}
+
+@tag('cart')
+class CartService {}</code></pre>
+
+<p>Method, property, accessor and parameter decorators exist too, each with a different signature.
+The most useful thing to know is the order: decorators are <strong>evaluated</strong> top to bottom
+and <strong>applied</strong> bottom to top, which matters when two of them wrap the same method.</p>
+
+<h2>The metadata trick behind dependency injection</h2>
+
+<p>This is the part that looks like magic, and is not.</p>
+
+<p>Frameworks such as NestJS resolve dependencies from a constructor's <em>parameter types</em>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+class OrderService {
+  constructor(private readonly repo: OrderRepository) {}
+}</code></pre>
+
+<p>But types are erased. At runtime there is no <code>OrderRepository</code> in that signature —
+so how does the injector know what to supply?</p>
+
+<p>The answer is <code>emitDecoratorMetadata</code>. When a class carries a decorator and that flag
+is on, TypeScript emits a side table of the parameter types as runtime values:</p>
+
+<pre class="language-javascript"><code class="language-javascript">Reflect.metadata("design:paramtypes", [OrderRepository])</code></pre>
+
+<p>The framework reads <code>design:paramtypes</code> and looks each constructor up. It is the one
+place where TypeScript's type information survives into the running program — and it only works for
+things that exist at runtime. A parameter typed as an interface emits <code>Object</code>, which is
+why DI frameworks make you inject classes or explicit tokens.</p>
+
+<p>Note also that this requires <code>reflect-metadata</code> to be imported once at startup, and
+that it is specific to the legacy decorator system.</p>
+
+<h2>Two decorator systems</h2>
+
+<p>Here is the state of play, which is genuinely confusing and worth stating plainly.</p>
+
+<p><strong>Legacy decorators</strong> — enabled with <code>experimentalDecorators</code>. Based on a
+proposal that never became a standard. This is what Angular, NestJS and TypeORM use, and it is what
+<code>emitDecoratorMetadata</code> works with.</p>
+
+<pre class="language-json"><code class="language-json">    "isolatedModules": true,
+    "experimentalDecorators": true,</code></pre>
+
+<p><strong>Standard decorators</strong> — shipped in TypeScript 5.0, implementing the Stage 3
+proposal that will become part of JavaScript. Enabled by default, with a different signature: a
+class decorator receives <code>(value, context)</code> rather than just the constructor.</p>
+
+<p>They are not compatible, and you cannot use both in one project. <code>emitDecoratorMetadata</code>
+does not apply to the standard ones, so frameworks that depend on parameter-type reflection are
+still on the legacy flag — which is why an Angular project in 2026 still sets an option called
+"experimental".</p>
+
+<p>If you are writing your own decorators in a new project, write standard ones. If you are working
+in Angular or NestJS, use what the framework uses.</p>
+
+<h2>Why the React half has none</h2>
+
+<p>Back to the flag from <a href="/typescript/typescript-tsconfig">lesson 18</a>:</p>
+
+<pre class="language-json"><code class="language-json">    "erasableSyntaxOnly": true,</code></pre>
+
+<p>Decorators are on its banned list, for the reason that runs through this whole track: a decorator
+has to <em>emit</em> a call. It is not an annotation to be deleted, it is code.</p>
+
+<p>Which is fine, because React needs nothing from them. A component is a function, a hook is a
+function call, and there is no injector wanting to know a constructor's parameter types. The
+metadata problem decorators solve does not arise.</p>
+
+<h2>Angular is moving away from them too</h2>
+
+<p>Worth noticing, because it changes what modern Angular code looks like. The framework is
+replacing decorator-based declarations with plain functions.</p>
+
+<p>Dependency injection used to be a constructor parameter, resolved from its type. The app uses
+<code>inject()</code> instead:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class Autofocus {
+  private readonly host = inject&lt;ElementRef&lt;HTMLElement&gt;&gt;(ElementRef);</code></pre>
+
+<p>That is an ordinary function call with an explicit type argument. No parameter, no metadata
+emission, nothing inferred from an erased type — and it works in a field initialiser, which a
+constructor parameter cannot.</p>
+
+<p>Inputs and outputs have gone the same way. <code>@Input()</code> and <code>@Output()</code>
+became functions:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  /** `input.required` makes a missing binding a COMPILE error, not an undefined at runtime. */
+  readonly product = input.required&lt;Product&gt;();
+  readonly selected = output&lt;Product&gt;();</code></pre>
+
+<p>And that comment is the point. <code>input.required&lt;Product&gt;()</code> carries its type as a
+real type argument, so the compiler can check every binding. The decorator version could not — it
+had to describe the type in a place the template checker had a harder time reaching.</p>
+
+<p>Even the transform is a value rather than a convention:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  readonly appAutofocus = input(true, { transform: booleanAttribute });</code></pre>
+
+<p><code>@Component</code>, <code>@Injectable</code>, <code>@Pipe</code> and <code>@Directive</code>
+remain, because a class still has to be <em>registered</em> as one of those things and a decorator
+is a reasonable way to say so. Everything that was about types has moved to functions with type
+arguments.</p>
+
+<h2>A standard decorator, end to end</h2>
+
+<p>Since the standard form is what new code should use, here is one complete. A method decorator
+that logs how long a call took:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function timed&lt;This, Args extends unknown[], Return&gt;(
+  target: (this: This, ...args: Args) =&gt; Return,
+  context: ClassMethodDecoratorContext&lt;This, typeof target&gt;,
+) {
+  const name = String(context.name);
+
+  return function (this: This, ...args: Args): Return {
+    const start = performance.now();
+    try {
+      return target.call(this, ...args);
+    } finally {
+      console.log(`${name} took ${(performance.now() - start).toFixed(1)}ms`);
+    }
+  };
+}</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">class Cart {
+  @timed
+  recalculate() { /* … */ }
+}</code></pre>
+
+<p>Three things distinguish this from the legacy form. It receives the method itself as
+<code>target</code>, rather than a property descriptor to mutate. It receives a
+<code>context</code> object carrying the member's name, kind and static-ness. And it
+<em>returns a replacement</em>, which is how it wraps.</p>
+
+<p>The generics are doing real work: <code>This</code>, <code>Args</code> and <code>Return</code>
+are inferred from the method being decorated, so the wrapper has exactly the same signature and
+nothing is widened to <code>any</code>. That is the practical improvement over the legacy system,
+where a decorator typically returned <code>PropertyDescriptor</code> and the types were lost.</p>
+
+<p>The context object also gives you <code>addInitializer</code>, for work that should happen when
+an instance is constructed — which is how you would implement something like auto-binding a method
+to its instance.</p>
+
+<h2>The shapes you can decorate</h2>
+
+<table>
+  <thead><tr><th>Target</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>class</td><td>registration — <code>@Component</code>, <code>@Injectable</code></td></tr>
+    <tr><td>method</td><td>wrapping — logging, retries, caching, authorisation</td></tr>
+    <tr><td>getter / setter</td><td>the same, around a property access</td></tr>
+    <tr><td>field</td><td>transforming the initial value, or registering the field</td></tr>
+    <tr><td>parameter</td><td><strong>legacy only</strong> — <code>@Inject</code>, <code>@Body</code></td></tr>
+  </tbody>
+</table>
+
+<p>That last row matters if you are reading NestJS: parameter decorators such as
+<code>@Body()</code> and <code>@Param()</code> are not part of the standard proposal, which is
+another reason those frameworks remain on <code>experimentalDecorators</code>.</p>
+
+<h2>When to write your own</h2>
+
+<p>Rarely, in application code. A decorator hides control flow: the reader sees
+<code>@Retry(3)</code> and has to go elsewhere to learn what happens. That is a good trade when the
+behaviour is genuinely cross-cutting and the alternative is repeating it everywhere — logging,
+caching, transactions, authorisation — and a bad one when a higher-order function would read more
+plainly.</p>
+
+<p>They are also, structurally, a framework feature. The reason Angular and NestJS use them heavily
+is that they need a registry of classes and their roles. If you are not building something with a
+registry, the case is thin.</p>
+
+<h2>What to remember</h2>
+
+<p>Three things, if the two-systems business has crowded everything else out.</p>
+
+<p><strong>A decorator is a function that runs at definition time.</strong> Not when an instance is
+created, not when a method is called. <code>@Pipe(...)</code> executes as the module loads, and
+whatever it does has happened before your code runs.</p>
+
+<p><strong>Almost all of them are registration.</strong> The class is ordinary; the decorator tells
+a framework it exists and what role it plays. Once you read them that way, Angular and NestJS stop
+looking magical.</p>
+
+<p><strong>They emit code</strong>, which is why they are the fourth item on
+<code>erasableSyntaxOnly</code>'s banned list alongside <code>enum</code> and parameter properties,
+and why a project's decision about that flag decides whether they are available at all.</p>
+
+<p>A practical note for anyone starting a project today. If you are choosing a framework, the
+decorator question is settled for you: Angular and NestJS use them heavily, React and Vue do not use
+them at all. What you should not do is enable <code>experimentalDecorators</code> in a project that
+has no framework requiring it, on the grounds that decorators look tidy. That commits your source to
+a non-standard dialect for a syntax preference.</p>
+
+<p>The confusion around decorators is almost entirely historical rather than conceptual. Strip away
+the two competing systems and the flag names, and what remains is one sentence: a function, called
+with the thing below it, at the moment that thing is defined. Everything Angular and NestJS do with
+them is an application of that.</p>
+
+<p>If you want to see it for yourself, put a <code>console.log</code> in a class decorator and load
+the module without constructing anything. Watching it fire is worth more than any explanation.</p>
+
+<p>And if you are reading a framework's source to work out what one of its decorators does, look
+for where the metadata is <em>read</em> rather than where it is written. The decorator itself is
+almost always three lines; the interesting code is the injector, the router or the template compiler
+that consults the table afterwards.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-with-react">TypeScript with React</a> — props, hooks, events, and
+the context pattern that removes an <code>| undefined</code> from every consumer.</p>

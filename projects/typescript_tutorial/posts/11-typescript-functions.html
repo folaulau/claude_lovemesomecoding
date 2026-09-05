@@ -1,0 +1,281 @@
+<p>Functions are where most annotations in a codebase live, because parameters are the one thing
+TypeScript cannot infer. This lesson covers the syntax, the function <em>type</em> — which is what
+you annotate a callback with — and overloads, which are less often the right answer than people
+expect.</p>
+
+<h2>Parameters and returns</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export function formatMoney(amount: number): string {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+  }).format(amount);
+}</code></pre>
+
+<p>Parameters are annotated individually; the return type goes after the parameter list. The return
+type is optional — TypeScript will infer it — and
+<a href="/typescript/typescript-basic-types">lesson 3</a> covers when writing it is worth the
+keystrokes. Short version: pin it on anything exported.</p>
+
+<p>The same applies to arrow functions and methods:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const money = (amount: number): string =&gt; formatMoney(amount);</code></pre>
+
+<h2>Optional, default and rest parameters</h2>
+
+<p>A <code>?</code> makes a parameter optional, and optional parameters must come last:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function greet(name: string, title?: string) {
+  return title ? `${title} ${name}` : name;   // title is string | undefined
+}</code></pre>
+
+<p>A default value implies optional, and the type is inferred from the default:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function pluralise(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}</code></pre>
+
+<p>Note the difference between the two. With <code>?</code>, the parameter's type includes
+<code>undefined</code> and you handle it. With a default, it does not — the default has already
+replaced <code>undefined</code> by the time the body runs. Prefer a default when there is a sensible
+one; it removes a check.</p>
+
+<p>Rest parameters take an array type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function cx(...parts: Array&lt;string | false | null | undefined&gt;): string {
+  return parts.filter(Boolean).join(' ');
+}</code></pre>
+
+<h2>The function type</h2>
+
+<p>To describe a function you are receiving rather than defining, you need a type for it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">(product: Product) =&gt; void</code></pre>
+
+<p>Parameter list, fat arrow, return type. That is what a callback prop is annotated with, and it
+is the second-most common type in a React codebase after the domain objects:</p>
+
+<pre class="language-tsx"><code class="language-tsx">interface Props {
+  product: Product;
+  onSelect: (product: Product) =&gt; void;
+}</code></pre>
+
+<p>The parameter <em>names</em> in a function type are documentation only — they need not match the
+implementation. What is checked is the count, the types and the order.</p>
+
+<p>Two things about this type that catch people out.</p>
+
+<p><strong>Fewer parameters is allowed.</strong> A function taking no arguments is assignable to
+<code>(product: Product) =&gt; void</code>:</p>
+
+<pre class="language-tsx"><code class="language-tsx">&lt;ProductCard product={product} onSelect={() =&gt; setOpen(true)} /&gt;</code></pre>
+
+<p>That has to work, or <code>arr.forEach(() =&gt; count++)</code> would be an error. A caller
+passing more information than the callback wants is harmless.</p>
+
+<p><strong>A <code>void</code> return accepts any return.</strong> Covered in
+<a href="/typescript/typescript-special-types">lesson 4</a> — the contract is that the caller will
+ignore the value, not that there is none.</p>
+
+<h2>Contextual typing</h2>
+
+<p>When a function is written where its type is already known, the parameters need no annotation:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const subtotal = round2(items.reduce((sum, item) =&gt; sum + lineTotal(item), 0));</code></pre>
+
+<p><code>sum</code> and <code>item</code> are typed by <code>reduce</code>. The same happens with
+event handlers, promise callbacks and anything passed to a typed parameter — which is why real
+TypeScript has far fewer annotations than tutorials suggest.</p>
+
+<p>It only works in that direction. Declare the function separately and the context is gone:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+const add = (sum, item) =&gt; sum + lineTotal(item);
+//           ~~~
+// Parameter 'sum' implicitly has an 'any' type.
+
+items.reduce(add, 0);</code></pre>
+
+<h2>Call signatures and methods</h2>
+
+<p>A function type inside an object type can be written two ways:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface Formatter {
+  transform(value: number): string;      // method shorthand
+  format: (value: number) =&gt; string;     // property with a function type
+}</code></pre>
+
+<p>Almost the same. The one real difference is variance under
+<code>strictFunctionTypes</code>: method shorthand parameters are checked bivariantly (looser),
+property-style ones contravariantly (stricter, and more correct). If that sentence means nothing
+yet, the practical rule is that the property form catches more mistakes, and the method form exists
+because changing it would break how the built-in library types are declared.</p>
+
+<p>Angular's <code>PipeTransform</code> uses the method form, and the app implements it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Pipe({ name: 'money' })
+export class MoneyPipe implements PipeTransform {
+  transform(value: number | null | undefined): string {
+    return formatMoney(value ?? 0);
+  }
+}</code></pre>
+
+<p>Note the parameter type. The pipe is called from a template where the value may not have arrived
+yet, so it accepts the absent cases and decides what they mean — <code>?? 0</code> — rather than
+making every template guard against it.</p>
+
+<h2>Overloads</h2>
+
+<p>When one function genuinely has two call shapes, you can declare several signatures over a single
+implementation:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function parseRange(days: number): [Date, Date];
+function parseRange(from: string, to: string): [Date, Date];
+function parseRange(a: number | string, b?: string): [Date, Date] {
+  // one implementation, handling both
+}</code></pre>
+
+<p>The first two lines are what callers see. The third is the implementation signature — it must be
+compatible with all of them, and it is <strong>not</strong> callable. A caller cannot pass
+<code>(number, string)</code> even though the implementation signature would allow it.</p>
+
+<p>Overloads are less useful than they look, and there is usually a better option.</p>
+
+<p><strong>Prefer optional parameters</strong> when the difference is only whether an argument is
+present. Two overloads that differ by one optional argument are two declarations doing what
+<code>?</code> does in one.</p>
+
+<p><strong>Prefer a union</strong> when the difference is the argument's type but the return type is
+the same. The app's HTTP layer is a good example of what that looks like:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface RequestOptions {
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  body?: unknown;
+  /** Send the bearer token. Public endpoints (the menu, guest checkout) do not need it. */
+  auth?: boolean;
+  signal?: AbortSignal;
+}</code></pre>
+
+<p>Five methods, one options object, no overloads. Every difference between the calls is an optional
+property rather than a separate signature.</p>
+
+<p><strong>Prefer a generic</strong> when the return type depends on the argument type. This is the
+case overloads are most often misused for — <a href="/typescript/typescript-generics">lesson 13</a>
+covers it, and it is almost always the better answer.</p>
+
+<p>What is left for overloads is the genuine case: two call shapes whose return types differ and
+cannot be expressed by a type parameter. That is rare in application code and common in library
+code, which is where you will mostly meet them.</p>
+
+<h2>An options object beats four parameters</h2>
+
+<p>Worth stating as a design point, since TypeScript makes the alternative pleasant. Compare:</p>
+
+<pre class="language-typescript"><code class="language-typescript">request(path, 'POST', body, true, signal);</code></pre>
+
+<p>with what the app actually writes:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  post: &lt;T&gt;(path: string, body?: unknown, opts?: Omit&lt;RequestOptions, 'method' | 'body'&gt;) =&gt;
+    request&lt;T&gt;(path, { ...opts, method: 'POST', body }),</code></pre>
+
+<p>Positional booleans are unreadable at the call site and impossible to extend without touching
+every caller. An options object is self-documenting, each field can be optional independently, and
+adding one is a non-breaking change.</p>
+
+<p>The <code>Omit&lt;RequestOptions, 'method' | 'body'&gt;</code> there is doing something neat —
+it removes the two options this wrapper has already decided, so a caller cannot pass a
+<code>method</code> to <code>post</code>. That is <a href="/typescript/typescript-utility-types">lesson
+14</a>.</p>
+
+<h2>Async functions</h2>
+
+<p>An <code>async</code> function always returns a promise, and the annotation says what it resolves
+to — not what it returns:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function request&lt;T&gt;(path: string, options: RequestOptions = {}): Promise&lt;T&gt; {</code></pre>
+
+<p>Writing <code>: T</code> there is an error. The value handed back is a promise, and the type has
+to say so.</p>
+
+<p>Inside the function you return the resolved value and TypeScript wraps it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function total(id: UUID): Promise&lt;number&gt; {
+  const order = await api.get&lt;Order&gt;(`/api/orders/${id}`, { auth: true });
+  return order.total;   // a number; the promise wrapping is automatic
+}</code></pre>
+
+<p>Promises do not nest — <code>Promise&lt;Promise&lt;number&gt;&gt;</code> is flattened to
+<code>Promise&lt;number&gt;</code> — which is why returning another async call from an async function
+works without ceremony.</p>
+
+<p>Two mistakes the type system catches, and one it does not.</p>
+
+<p><strong>Caught: forgetting <code>await</code>.</strong> The value is a
+<code>Promise&lt;Order&gt;</code> rather than an <code>Order</code>, so
+<code>order.total</code> fails. Under <code>strict</code> this is usually a clear error rather than
+a mystery — although a promise in a template string is not, since anything can be interpolated.</p>
+
+<p><strong>Caught: an async function passed where a synchronous callback was expected</strong>, if
+the callback type has a non-<code>void</code> return.</p>
+
+<p><strong>Not caught: an unhandled rejection.</strong> There is no checked-exception concept here.
+A function's type says nothing about what it can throw, and this is the largest hole in the type
+system for everyday code. It is why the pizza app funnels failures through
+<code>toApiFailure</code> and <code>errorMessage</code> rather than relying on each caller to
+remember.</p>
+
+<p>If you want the failure to be part of the type, that is the <code>Outcome</code> shape from
+<a href="/typescript/typescript-union-and-intersection-types">lesson 8</a> — return a discriminated
+union instead of throwing, and the compiler will make callers handle both branches.</p>
+
+<h2>this in functions</h2>
+
+<p>If a function uses <code>this</code>, you can type it with a fake first parameter that is erased
+at compile time:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function handleClick(this: HTMLButtonElement, event: MouseEvent) {
+  this.disabled = true;
+}</code></pre>
+
+<p><code>this</code> is not a real parameter and callers do not pass it. The
+<code>noImplicitThis</code> flag — part of <code>strict</code> — is what makes an untyped
+<code>this</code> an error in the first place.</p>
+
+<p>In modern code this comes up rarely, because arrow functions capture <code>this</code>
+lexically and most callbacks are arrows. It is mostly useful when working with older DOM APIs or
+libraries that call your function with a bound receiver.</p>
+
+<h2>Functions that never return</h2>
+
+<p>A function that always throws is typed <code>never</code> rather than <code>void</code>, and the
+difference is not pedantry — it changes what the compiler knows about the code after the call:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function fail(message: string): never {
+  throw new Error(message);
+}
+
+function total(order: Order | null) {
+  if (!order) fail('No order');
+  return order.total;   // order is narrowed to Order, because fail() cannot return
+}</code></pre>
+
+<p>Type it <code>void</code> and that last line is an error, because as far as the checker is
+concerned <code>fail</code> might return and <code>order</code> might still be <code>null</code>.</p>
+
+<p>The same applies to the assertion functions from
+<a href="/typescript/typescript-narrowing">lesson 10</a>, and to any process-exiting helper.</p>
+
+<p>One more habit worth forming while we are on signatures: name your parameters for the caller, not
+for the body. A function type's parameter names appear in editor hints at every call site, so
+<code>onSelect: (product: Product) =&gt; void</code> tells a reader more than
+<code>onSelect: (p: Product) =&gt; void</code>, at a cost of six characters paid once.</p>
+
+<p>And prefer a named function to an arrow assigned to a <code>const</code> when the function is
+exported. The declaration form is hoisted, gets a real name in stack traces, and — as
+<a href="/typescript/typescript-generics">lesson 13</a> notes — avoids the trailing-comma
+awkwardness when it is generic in a <code>.tsx</code> file.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-classes">Classes</a> — access modifiers, the two kinds of
+private, and the build flag that bans one of TypeScript's most-used class features.</p>

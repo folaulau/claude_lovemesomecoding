@@ -1,0 +1,318 @@
+<p>These two do almost the same job, which is exactly why the question keeps being asked. Most of the
+advice you will find is someone's preference dressed up as a rule. There are three real
+differences, and once you know them the choice mostly makes itself.</p>
+
+<h2>They start out identical</h2>
+
+<pre class="language-typescript"><code class="language-typescript">interface ProductSize {
+  id: UUID;
+  size: SizeName;
+  price: number;
+}
+
+type ProductSizeAlias = {
+  id: UUID;
+  size: SizeName;
+  price: number;
+};</code></pre>
+
+<p>Those are the same type. Both can be implemented by a class, extended, used as a parameter type,
+made optional or readonly, and given an index signature. Neither is faster at runtime, because
+neither exists at runtime.</p>
+
+<p>So the differences are at the edges. There are three.</p>
+
+<h2>Difference 1: type can name anything</h2>
+
+<p>An <code>interface</code> describes an object shape. A <code>type</code> gives a name to
+<em>any</em> type at all — and that is the difference you will hit first.</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type UUID = string;</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">export type ProductType = 'PIZZA' | 'DRINK';
+export type SizeName = 'SMALL' | 'MEDIUM' | 'LARGE';
+export type ToppingCategory = 'MEAT' | 'VEGGIE' | 'CHEESE';
+export type OrderType = 'DELIVERY' | 'CARRYOUT';</code></pre>
+
+<p>None of those can be an interface. A union is not an object shape, and neither is a primitive
+alias, a tuple, or anything built with a mapped or conditional type.</p>
+
+<p>The same applies to a union of object shapes, which the Angular admin store uses to say "either
+it worked, or here is why it did not":</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type Outcome = { ok: true } | { ok: false; failure: ApiFailure };</code></pre>
+
+<p>That is a discriminated union — <a href="/typescript/typescript-narrowing">lesson 10</a> — and it
+has to be a <code>type</code>.</p>
+
+<h2>Difference 2: interfaces merge, aliases do not</h2>
+
+<p>Declare an interface twice and TypeScript combines the declarations:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface Product { id: UUID }
+interface Product { name: string }
+
+// Product now has both id and name.</code></pre>
+
+<p>Do the same with a <code>type</code> and it is an error: <em>Duplicate identifier</em>.</p>
+
+<p>Inside your own codebase, merging is mostly a hazard — two declarations of the same name in
+different files, silently combining, is rarely what anyone intended. It exists for
+<strong>declaration merging</strong> across module boundaries, which is how you extend a type you
+do not own.</p>
+
+<p>The canonical example, and one you will meet in any Vite project, is adding your own environment
+variables:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// src/vite-env.d.ts
+interface ImportMetaEnv {
+  readonly VITE_API_BASE_URL: string;
+}</code></pre>
+
+<p>Vite declares <code>ImportMetaEnv</code>; your declaration merges into it; and
+<code>import.meta.env.VITE_API_BASE_URL</code> is now typed. There is no way to do that with a
+<code>type</code>, because you cannot reopen an alias.</p>
+
+<p>The same trick is how you add a property to Express's <code>Request</code>, or a method to a
+library's options object. If you never need it — and most application code never does — this
+difference costs you nothing either way.</p>
+
+<h2>Difference 3: extends and &amp; are not quite the same</h2>
+
+<p>Both can combine types. Interfaces use <code>extends</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface Timestamped {
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface Product extends Timestamped {
+  id: UUID;
+  name: string;
+}</code></pre>
+
+<p>Aliases use an intersection:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Product = Timestamped &amp; {
+  id: UUID;
+  name: string;
+};</code></pre>
+
+<p>Same result here. They differ on <strong>conflict</strong>. <code>extends</code> checks that the
+child is compatible with the parent and errors if not:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+interface Base { price: number }
+interface Sale extends Base { price: string }
+//        ~~~~
+// Interface 'Sale' incorrectly extends interface 'Base'.
+// Types of property 'price' are incompatible.</code></pre>
+
+<p>The intersection version reports nothing at the declaration. Instead <code>price</code> silently
+becomes <code>number &amp; string</code>, which is <code>never</code> — and you find out much later,
+at the point where you try to assign one:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Sale = Base &amp; { price: string };   // no error here
+
+const s: Sale = { price: 9.99 };        // error, a long way from the cause</code></pre>
+
+<p>Failing at the declaration is better than failing at every use site, which is the strongest
+argument for <code>interface</code> in the one case where they genuinely differ.</p>
+
+<p>There is a secondary, practical difference: interfaces get a name in error messages and
+<code>tsc</code> caches them, while a complex intersection is expanded and printed in full. On a
+big project this shows up both as slower checks and as error messages the width of your screen.</p>
+
+<h2>Both take type parameters</h2>
+
+<p>Neither is limited to a fixed shape. Both can be generic, with the same syntax:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/** Spring's paginated envelope, trimmed to what the UI uses. */
+export interface Page&lt;T&gt; {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  number: number;
+  size: number;
+}</code></pre>
+
+<p><code>Page&lt;Order&gt;</code> and <code>Page&lt;AdminUser&gt;</code> then describe the two
+paginated endpoints the admin area calls, with one declaration. Written as an alias it would be
+<code>type Page&lt;T&gt; = { … }</code> and behave identically —
+<a href="/typescript/typescript-generics">lesson 13</a> covers the mechanics.</p>
+
+<p>Where the alias pulls ahead is when the type parameter is used for something other than a
+property type — a conditional, a mapped type, a union built from <code>T</code>. Interfaces cannot
+express any of those, so anything derived ends up as a <code>type</code> whatever your house style
+says.</p>
+
+<h2>Both handle recursion</h2>
+
+<p>Self-referencing types work either way, which matters more than it sounds because most real
+domain models are recursive somewhere. The app's is, two levels down:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface OrderItem {
+  id: UUID;
+  productId: UUID | null;
+  productName: string;
+// ...
+  toppings: OrderItemTopping[];
+}</code></pre>
+
+<p>A directly recursive alias is fine too, as long as the recursion goes through an object or array
+rather than being a bare self-reference:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type MenuNode = {
+  name: string;
+  children: MenuNode[];   // fine
+};
+
+type Bad = Bad | string;  // Type alias 'Bad' circularly references itself</code></pre>
+
+<p>The rule is that the compiler needs something concrete to stop at. A property, an array element
+or a function parameter all qualify; a union of yourself does not.</p>
+
+<h2>What the app does</h2>
+
+<p>The convention in the pizza codebase is easy to state, and it is the one most teams land on.</p>
+
+<p><strong>Interface for a named object shape</strong> — the domain entities, the request and
+response payloads, the props of a component:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface CartTotals {
+  subtotal: number;
+  tax: number;
+  deliveryFee: number;
+  total: number;
+  itemCount: number;
+}</code></pre>
+
+<p><strong><code>type</code> for everything a shape cannot express</strong> — the unions, the
+aliases, the derived types:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type OrderStatus =
+  | 'PENDING_PAYMENT'
+  | 'PAID'
+  | 'PREPARING'
+  | 'COMPLETED'
+  | 'CANCELLED';</code></pre>
+
+<p>Follow that and you will rarely have to think about it: if you are describing an object and
+giving it a name, use <code>interface</code>; otherwise you have no choice anyway.</p>
+
+<h2>Neither one validates anything</h2>
+
+<p>Worth restating in this lesson specifically, because the word "interface" carries baggage from
+languages where it means something enforced at runtime.</p>
+
+<p>An <code>interface</code> in TypeScript is not a contract a value signs. It is a description the
+compiler checks your <em>code</em> against, and it is erased before anything runs. There is no
+reflection, no <code>instanceof Product</code>, and no way to ask at runtime whether a value
+matches one. If you need that, you need a schema library — the same conclusion
+<a href="/typescript/typescript-get-started">lesson 1</a> reached about API responses.</p>
+
+<h2>The one thing that is not a difference</h2>
+
+<p>A myth worth killing: <code>interface</code> is not more "object-oriented" and does not imply
+inheritance or a class. A class can <code>implements</code> either one:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Formatter = { transform(value: number): string };
+
+class MoneyFormatter implements Formatter {
+  transform(value: number): string {
+    return formatMoney(value);
+  }
+}</code></pre>
+
+<p>That compiles. <code>implements</code> takes any object type, and this remains a structural
+language regardless of which keyword declared the shape.</p>
+
+<p>Angular's own code makes the point in the other direction. <code>PipeTransform</code> is an
+interface, and the app implements it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Pipe({ name: 'money' })
+export class MoneyPipe implements PipeTransform {
+  transform(value: number | null | undefined): string {
+    return formatMoney(value ?? 0);
+  }
+}</code></pre>
+
+<p>The <code>implements</code> clause there is a compile-time assertion, nothing more. It checks
+the class has a matching <code>transform</code> and then disappears. Angular finds the pipe through
+the <code>@Pipe</code> decorator, not through the interface — see
+<a href="/typescript/typescript-decorators">lesson 19</a>.</p>
+
+<h2>Where the argument actually shows up</h2>
+
+<p>Three situations account for nearly every real instance of this question.</p>
+
+<p><strong>Component props.</strong> Both work, and the React ecosystem is genuinely split. The
+pizza app uses an interface:</p>
+
+<pre class="language-tsx"><code class="language-tsx">interface Props {
+  product: Product;
+  onSelect: (product: Product) =&gt; void;
+}</code></pre>
+
+<p>The one thing that occasionally decides it: if your props are a union — a component that takes
+<em>either</em> a <code>href</code> <em>or</em> an <code>onClick</code>, say — you need a
+<code>type</code>. Some teams use <code>type</code> everywhere for props purely so the rule never
+has an exception.</p>
+
+<p><strong>Extending third-party types.</strong> Interface, because merging is the only mechanism.
+Covered above.</p>
+
+<p><strong>Public API of a library.</strong> Interface, and here the merging behaviour flips from
+hazard to feature: your consumers can extend your types without you having to anticipate every
+extension. If you export an alias, they cannot.</p>
+
+<p>Everywhere else, the decision is worth about ten seconds of anyone's time.</p>
+
+<h2>A note on satisfies</h2>
+
+<p>Both work with <code>satisfies</code>, which is worth knowing because it removes one bad reason
+to pick a <code>type</code>. You do not need an alias to check an object against a shape without
+adopting it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const totals = {
+  subtotal: 21.98,
+  tax: 1.87,
+  deliveryFee: 3.99,
+  total: 27.84,
+  itemCount: 2,
+} satisfies CartTotals;</code></pre>
+
+<p><code>CartTotals</code> is an interface, and the operator is perfectly happy with it. See
+<a href="/typescript/typescript-type-assertions">lesson 16</a>.</p>
+
+<h2>The short answer</h2>
+
+<table>
+  <thead><tr><th>You want to</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>name an object shape</td><td><code>interface</code></td></tr>
+    <tr><td>name a union, primitive or tuple</td><td><code>type</code> — no choice</td></tr>
+    <tr><td>extend a type from a library</td><td><code>interface</code> — no choice</td></tr>
+    <tr><td>derive a type from another</td><td><code>type</code></td></tr>
+    <tr><td>define props for a component</td><td>either; be consistent</td></tr>
+  </tbody>
+</table>
+
+<p>Whichever you pick, pick it consistently. The cost of the wrong choice here is very low; the cost
+of a codebase where the two are mixed at random is a small tax on every file you read.</p>
+
+<p>If your team wants the decision made once and enforced, the typescript-eslint rule
+<code>consistent-type-definitions</code> does it, and takes either answer as its setting. That is
+usually a better use of the argument than having it again in each review — the two constructs are
+close enough that the consistency is worth more than the choice.</p>
+
+<p>One last practical note for reading other people's code: a project that uses <code>type</code>
+everywhere is not doing anything unusual, and neither is one that uses <code>interface</code>
+everywhere. Both conventions are common and both are defensible. Where you should look twice is a
+declaration that <em>had</em> to be one or the other — a union, or a merge into a library type —
+because that one is telling you something about the design rather than about the house style.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-union-and-intersection-types">Unions and Intersections</a> — the
+two ways of combining types, and why only one of them is used constantly.</p>

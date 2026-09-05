@@ -1,0 +1,275 @@
+<p>A generic is a type parameter — an argument to a type, rather than to a value. The reason to reach
+for one is always the same: there is a <em>relationship</em> between two types that would otherwise
+be lost, and the generic is how you say what it is.</p>
+
+<h2>The problem they solve</h2>
+
+<p>Here is a function that fetches JSON. Without generics it has to say something about what comes
+back, and both options are bad:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function request(path: string): Promise&lt;any&gt; { /* … */ }
+
+const product = await request('/api/products/1');
+product.nmae;          // no error. any is contagious.</code></pre>
+
+<p>Be honest instead, and the caller pays. This does not compile without an assertion at every
+call site:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function request(path: string): Promise&lt;unknown&gt; { /* … */ }
+
+const product = await request('/api/products/1');
+product.name;          // error — and now every caller must assert</code></pre>
+
+<p>The first gives up checking. The second is honest but pushes an assertion onto every one of the
+forty call sites. What you actually want is for the caller to say what it expects <em>once</em>, and
+for the function to hand it back:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function request&lt;T&gt;(path: string, options: RequestOptions = {}): Promise&lt;T&gt; {</code></pre>
+
+<p>That is the pizza app's HTTP layer. <code>T</code> is a placeholder, chosen by the caller, and
+the return type is expressed in terms of it. One implementation serves every endpoint.</p>
+
+<h2>Reading the syntax</h2>
+
+<p><code>&lt;T&gt;</code> after the function name declares the parameter; it can then be used
+anywhere a type can. <code>T</code> is conventional for a single one, but a descriptive name is
+better once there are two — <code>&lt;TResponse, TBody&gt;</code> reads far better than
+<code>&lt;T, U&gt;</code>.</p>
+
+<p>Calling it, you can supply the type argument explicitly:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const me = await api.get&lt;User&gt;('/api/auth/me', { auth: true });</code></pre>
+
+<p><code>me</code> is a <code>User</code>. Nothing was asserted and nothing was checked at runtime —
+which is the honest caveat from <a href="/typescript/typescript-get-started">lesson 1</a>, and
+exactly why the app keeps this claim in one file rather than scattering it.</p>
+
+<h2>Inference: usually you do not pass it</h2>
+
+<p>When the type parameter appears in the <em>arguments</em>, TypeScript works it out:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function first&lt;T&gt;(items: T[]): T | undefined {
+  return items[0];
+}
+
+first([1, 2, 3]);          // T inferred as number
+first(product.sizes);      // T inferred as ProductSize</code></pre>
+
+<p>You almost never write <code>first&lt;number&gt;([1, 2, 3])</code>. The reason
+<code>api.get&lt;User&gt;</code> does need its argument is that <code>T</code> appears only in the
+return type — there is nothing to infer it from, so it defaults to <code>unknown</code> unless you
+say.</p>
+
+<p>That is a useful rule of thumb for reading generic code: <strong>if the type parameter is not in
+the parameters, the caller has to supply it.</strong></p>
+
+<h2>Passing a type parameter through</h2>
+
+<p>The most instructive part of the app's HTTP layer is what sits on top of <code>request</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const api = {
+  get: &lt;T&gt;(path: string, opts?: Omit&lt;RequestOptions, 'method' | 'body'&gt;) =&gt;
+    request&lt;T&gt;(path, { ...opts, method: 'GET' }),
+  post: &lt;T&gt;(path: string, body?: unknown, opts?: Omit&lt;RequestOptions, 'method' | 'body'&gt;) =&gt;
+    request&lt;T&gt;(path, { ...opts, method: 'POST', body }),</code></pre>
+
+<p>Each method declares its own <code>&lt;T&gt;</code> and forwards it. The caller writes
+<code>api.post&lt;AuthenticationResponse&gt;(…)</code> and gets that type back, while the method
+fixes the parts it has already decided.</p>
+
+<p>Notice how little else this costs. There is one implementation of the fetch, the token header and
+the error handling; the five wrappers add a verb each. Without the type parameter you would need
+either five copies or an assertion at every call site.</p>
+
+<h2>Constraints</h2>
+
+<p>An unconstrained <code>T</code> could be anything, so you can do almost nothing with it. To use a
+property, require it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+function label&lt;T&gt;(item: T): string {
+  return item.name;
+  //          ~~~~
+  // Property 'name' does not exist on type 'T'.
+}</code></pre>
+
+<p>The last line of this one does not compile, which is the point of the constraint:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function label&lt;T extends { name: string }&gt;(item: T): string {
+  return item.name;
+}
+
+label(product);   // fine
+label(topping);   // fine
+label(42);        // error</code></pre>
+
+<p><code>extends</code> here means "at least" rather than inheritance. It is the same structural
+rule as everywhere else — anything with a <code>name: string</code> qualifies.</p>
+
+<p>The question worth asking is why this is generic at all, since
+<code>label(item: { name: string })</code> would also work. The answer is what the function
+<em>returns</em>: if it returned the item rather than a string, the generic version preserves the
+exact type and the non-generic one flattens it to <code>{ name: string }</code>. Which leads to the
+rule below.</p>
+
+<h2>Defaults, and multiple parameters</h2>
+
+<p>A type parameter can have a default, used when it is neither supplied nor inferable:</p>
+
+<pre class="language-typescript"><code class="language-typescript">interface ApiResult&lt;T = unknown&gt; {
+  data: T;
+  status: number;
+}</code></pre>
+
+<p>And there can be several, each constrained independently:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function pluck&lt;T, K extends keyof T&gt;(item: T, key: K): T[K] {
+  return item[key];
+}
+
+pluck(product, 'name');   // string
+pluck(product, 'sizes');  // ProductSize[]
+pluck(product, 'nope');   // does not compile — not a key of Product</code></pre>
+
+<p>That one is worth studying, because it is the shape most "clever" generics take.
+<code>K extends keyof T</code> says the key must be one of <code>T</code>'s own keys, and
+<code>T[K]</code> is the type of that property. The return type is therefore different for every
+call — which no overload could reasonably express.
+<a href="/typescript/typescript-mapped-and-conditional-types">Lesson 15</a> covers
+<code>keyof</code> and indexed access properly.</p>
+
+<h2>Generic interfaces and classes</h2>
+
+<p>Types can take parameters too. The app uses one for the API's pagination envelope:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/** Spring's paginated envelope, trimmed to what the UI uses. */
+export interface Page&lt;T&gt; {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  number: number;
+  size: number;
+}</code></pre>
+
+<p><code>Page&lt;Order&gt;</code> and <code>Page&lt;AdminUser&gt;</code> then describe two different
+endpoints, and combining it with the HTTP wrapper reads exactly as you would hope:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const page = await api.get&lt;Page&lt;Order&gt;&gt;('/api/admin/orders?page=0', { auth: true });
+page.content[0].total;   // number</code></pre>
+
+<p>Classes work the same way, with the parameter on the class and usable in every member.</p>
+
+<h2>When not to reach for one</h2>
+
+<p>Generics have a cost — they make a signature harder to read — so they should be earning something.
+Two rules cover most cases.</p>
+
+<p><strong>If the type parameter appears only once, you do not need it.</strong></p>
+
+<pre class="language-typescript"><code class="language-typescript">function log&lt;T&gt;(value: T): void { /* … */ }   // pointless
+function log(value: unknown): void { /* … */ }  // says the same thing, more clearly</code></pre>
+
+<p>A type parameter used once connects nothing to anything. The whole purpose is to tie two
+positions together — a parameter to a return type, or one parameter to another.</p>
+
+<p><strong>If a union would do, use the union.</strong> <code>T extends 'DELIVERY' | 'CARRYOUT'</code>
+is almost always worse than <code>OrderType</code>, unless you are specifically preserving which
+member was passed.</p>
+
+<p>The test to apply: <em>what relationship am I preserving?</em> For <code>request&lt;T&gt;</code>
+it is "the type the caller asked for is the type they get back". For <code>pluck</code> it is
+"the return type is the property type of the key you passed". If you cannot finish that sentence,
+you probably want a plain parameter type.</p>
+
+<h2>Where inference goes wrong</h2>
+
+<p>Three situations account for most confusing generic errors.</p>
+
+<p><strong>Inference widens.</strong> TypeScript infers the general type, not the literal, unless
+something asks otherwise:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function wrap&lt;T&gt;(value: T) {
+  return { value };
+}
+
+wrap('DELIVERY');   // { value: string }  — not { value: 'DELIVERY' }</code></pre>
+
+<p>If you need the literal preserved, constrain the parameter so a literal type is the only sensible
+inference:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function wrap&lt;const T extends string&gt;(value: T) {
+  return { value };
+}
+
+wrap('DELIVERY');   // { value: 'DELIVERY' }</code></pre>
+
+<p>The <code>const</code> modifier on the type parameter, added in TypeScript 5.0, tells the compiler
+to infer as though the argument had <code>as const</code> on it. Before it existed, the same job
+needed <code>T extends string</code> plus a call site that wrote the assertion itself.</p>
+
+<p><strong>Inference happens from every argument at once.</strong> When a parameter appears twice,
+both call sites contribute and you can get a union you did not want:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function pair&lt;T&gt;(a: T, b: T) { /* … */ }
+
+pair(1, 'two');   // T becomes string | number, and it compiles</code></pre>
+
+<p>That is usually not the intent. Two parameters, <code>&lt;A, B&gt;</code>, says what you meant.</p>
+
+<p><strong>A default parameter can be inferred away.</strong> When you want one position to define
+<code>T</code> and another merely to be checked against it, <code>NoInfer</code> — TypeScript 5.4 —
+is the tool:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function pick&lt;T&gt;(options: T[], selected: NoInfer&lt;T&gt;) { /* … */ }
+
+pick(['SMALL', 'MEDIUM'], 'LARGE');   // now an error, as it should be</code></pre>
+
+<p>Without it, <code>'LARGE'</code> contributes to <code>T</code> as well, widening it to include
+the very value the call should have rejected.</p>
+
+<h2>A note on the syntax in .tsx files</h2>
+
+<p>One practical wrinkle. In a <code>.tsx</code> file, <code>&lt;T&gt;</code> on an arrow function
+is ambiguous with JSX, and the parser guesses wrong:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const first = &lt;T&gt;(items: T[]) =&gt; items[0];   // parsed as a JSX element</code></pre>
+
+<p>The fix is a trailing comma, which is odd-looking and standard:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const first = &lt;T,&gt;(items: T[]) =&gt; items[0];</code></pre>
+
+<p>Or use a <code>function</code> declaration, which has no such ambiguity. This does not arise in
+<code>.ts</code> files — which is why the app's <code>api.ts</code> can write
+<code>get: &lt;T&gt;(path: string, …)</code> without the comma.</p>
+
+<h2>Reading someone else's generic signature</h2>
+
+<p>Library types can look forbidding. A recipe that works on most of them: <strong>substitute a
+concrete type for each parameter and read it again.</strong></p>
+
+<pre class="language-typescript"><code class="language-typescript">function pluck&lt;T, K extends keyof T&gt;(item: T, key: K): T[K];</code></pre>
+
+<p>Put <code>T = Product</code> and <code>K = 'sizes'</code> through it and you get
+<code>(item: Product, key: 'sizes') =&gt; ProductSize[]</code>, which is obvious. The generic version
+is that, said once for every possible pair.</p>
+
+<p>The other half of reading them is knowing which parameters the caller supplies and which are
+inferred, which is the rule from earlier: anything appearing in the parameter list gets inferred,
+anything appearing only in the return type has to be passed.</p>
+
+<p>Two shorthands that show up constantly and are worth recognising on sight.
+<code>&lt;T extends unknown[]&gt;</code> constrains to any array, usually so a rest parameter can be
+forwarded. And <code>&lt;T extends (...args: never[]) =&gt; unknown&gt;</code> constrains to any
+function, which is how wrappers like <code>ReturnType</code> are declared — the
+<code>never[]</code> is deliberate, and makes the constraint accept every function rather than only
+those taking <code>any</code>.</p>
+
+<p>And a naming note: single letters are conventional but not compulsory. In a signature with more
+than one parameter, spelling them out — <code>&lt;TResponse, TBody&gt;</code> — costs nothing and
+saves the reader scrolling back to work out which is which.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-utility-types">The Utility Types Worth Knowing</a> — the generics
+that ship with TypeScript, including the <code>Omit</code> that has appeared in three lessons now
+without explanation.</p>

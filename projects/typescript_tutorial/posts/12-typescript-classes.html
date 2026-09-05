@@ -1,0 +1,286 @@
+<p>Classes are JavaScript's, not TypeScript's — <code>class</code>, <code>extends</code>,
+<code>static</code> and <code>#private</code> all run without a compiler. What TypeScript adds is
+field types, access modifiers, <code>abstract</code>, <code>implements</code>, and one shorthand
+that some builds refuse to compile.</p>
+
+<h2>Fields and constructors</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export class ApiError extends Error {
+  readonly status: number;
+  readonly body: ApiErrorBody | null;
+
+  constructor(status: number, message: string, body: ApiErrorBody | null) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+  }</code></pre>
+
+<p>Fields are declared with their types before the constructor. Under <code>strict</code>, every
+declared field must actually be assigned in the constructor — the
+<code>strictPropertyInitialization</code> check — or the compiler will point out that it could be
+<code>undefined</code> despite the type saying otherwise.</p>
+
+<p>Three ways out when a field genuinely is assigned elsewhere: give it a default, widen the type to
+include <code>undefined</code>, or use the definite assignment assertion <code>!</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">class Loader {
+  private data!: Order[];   // "trust me, something assigns this"
+}</code></pre>
+
+<p>That last one is a promise you are making with no evidence, so treat it as you would
+<code>as</code> — occasionally right, usually a sign the design wants rethinking.</p>
+
+<h2>Subclassing Error</h2>
+
+<p>The class above is worth pausing on, because it is the most common custom class in a frontend and
+it has two traps.</p>
+
+<p><strong><code>this.name</code> must be set by hand.</strong> Without it the error reports itself
+as <code>Error</code>, which makes logs harder to read than they need to be.</p>
+
+<p><strong><code>instanceof</code> can break.</strong> When compiling to ES5, subclassing a built-in
+loses the prototype chain and <code>err instanceof ApiError</code> comes back <code>false</code> —
+silently, for every check in the codebase. The Angular version of the same class guards against
+it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">    // TypeScript compiling to ES5 breaks `instanceof` for subclassed built-ins. This app targets
+    // ES2022 so it is not strictly needed, but it costs one line and removes a nasty trap.
+    Object.setPrototypeOf(this, ApiError.prototype);</code></pre>
+
+<p>Both apps target ES2022, so neither needs it. It is one line, and the failure it prevents is the
+kind that takes an afternoon.</p>
+
+<p>A class can also hold behaviour, which is the reason to use one here rather than a plain object:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  /** Field errors as a lookup, for rendering next to inputs. */
+  fieldErrors(): Record&lt;string, string&gt; {
+    const result: Record&lt;string, string&gt; = {};
+    for (const sub of this.body?.errors ?? []) {
+      if (sub.field) result[sub.field] = sub.message;
+    }
+    return result;
+  }</code></pre>
+
+<h2>public, private, protected</h2>
+
+<p>The usual three, with <code>public</code> the default:</p>
+
+<pre class="language-typescript"><code class="language-typescript">class CartService {
+  public readonly itemCount = 0;   // `public` is redundant
+  protected items: CartItem[] = [];
+  private taxRate = TAX_RATE;
+}</code></pre>
+
+<p>The critical thing about TypeScript's <code>private</code>: it is <strong>compile-time
+only</strong>. It is erased, and at runtime the property is an ordinary one that any code can read:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const service = new CartService();
+// service.taxRate;             // compile error
+(service as any).taxRate;       // runs fine — the property is right there</code></pre>
+
+<p>JavaScript's own private fields, prefixed with <code>#</code>, are genuinely inaccessible:</p>
+
+<pre class="language-typescript"><code class="language-typescript">class CartService {
+  #taxRate = TAX_RATE;
+}
+
+// (service as any).#taxRate — a syntax error, not a workaround</code></pre>
+
+<p>Which to use? <code>#</code> when the value must really be inaccessible — a secret, or an
+invariant you cannot let anyone break. <code>private</code> when you are documenting intent to
+your own team, which is most of the time, and which keeps the field visible in a debugger.</p>
+
+<p>One consequence of <code>private</code> being compile-time: two classes with the same shape but
+different <code>private</code> members are <em>not</em> compatible. Private members are the one
+place this structural language behaves nominally.</p>
+
+<h2>Parameter properties, and the flag that bans them</h2>
+
+<p>TypeScript's most-used class shorthand. Put a modifier on a constructor parameter and it becomes
+a field, assigned automatically:</p>
+
+<pre class="language-typescript"><code class="language-typescript">class CartService {
+  constructor(private readonly api: ApiService) {}
+}</code></pre>
+
+<p>That is the whole class — <code>this.api</code> exists and is assigned. Written out it would be
+three lines saying <code>api</code> three times.</p>
+
+<p>It is also a construct that has to <strong>emit</strong> code: the assignment does not exist in
+the source, so a compiler has to generate it. Which brings us back to the flag from
+<a href="/typescript/typescript-enums">lesson 9</a>, set in the React app's config:</p>
+
+<pre class="language-json"><code class="language-json">    "erasableSyntaxOnly": true,</code></pre>
+
+<p>Under it, parameter properties do not compile — same as <code>enum</code>, and for the same
+reason. A type-stripper deletes annotations; it does not synthesise assignments.</p>
+
+<p>So the React half writes the long form, and its <code>ApiError</code> is what that looks like:
+three <code>readonly</code> declarations and three assignments in the constructor. The Angular half
+has <code>experimentalDecorators</code> and no such flag, so it uses parameter properties
+throughout — as does every NestJS codebase you will read.</p>
+
+<p>Neither is wrong. The point is that this is a build-configuration question rather than a style
+one, and knowing which regime you are in tells you what your options are.</p>
+
+<h2>Getters and setters</h2>
+
+<pre class="language-typescript"><code class="language-typescript">class Cart {
+  private items: CartItem[] = [];
+
+  get itemCount(): number {
+    return this.items.reduce((n, item) =&gt; n + item.quantity, 0);
+  }
+
+  set orderType(value: OrderType) {
+    this._orderType = value;
+  }
+}</code></pre>
+
+<p>Accessors are called like properties. Since TypeScript 4.3 the getter and setter may have
+different types — useful for a setter that accepts several input forms and a getter that returns
+one normalised value.</p>
+
+<p>A getter with no setter is read-only from outside, which is often a better way to expose derived
+state than a method, because the call site reads as data.</p>
+
+<h2>abstract</h2>
+
+<p>An abstract class cannot be instantiated and may declare members without implementations:</p>
+
+<pre class="language-typescript"><code class="language-typescript">abstract class BaseStore&lt;T&gt; {
+  protected items: T[] = [];
+
+  abstract load(): Promise&lt;T[]&gt;;
+
+  async refresh(): Promise&lt;void&gt; {
+    this.items = await this.load();
+  }
+}</code></pre>
+
+<p>A subclass must implement <code>load</code>. The value over an interface is that
+<code>refresh</code> is shared real code — an interface can only describe, not provide.</p>
+
+<p>Note that <code>abstract</code> is a TypeScript construct with no runtime representation: the
+emitted class is an ordinary one, and the "cannot instantiate" rule is enforced only by the
+compiler.</p>
+
+<h2>implements versus extends</h2>
+
+<p>They are often confused and do quite different things.</p>
+
+<p><code>extends</code> inherits — you get the parent's implementation. A class extends exactly one
+class.</p>
+
+<p><code>implements</code> checks — you get nothing, and the compiler verifies your class has the
+required members. A class may implement any number of types, and either an
+<code>interface</code> or a <code>type</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class MoneyPipe implements PipeTransform {
+  transform(value: number | null | undefined): string {
+    return formatMoney(value ?? 0);
+  }
+}</code></pre>
+
+<p><code>implements PipeTransform</code> gives <code>MoneyPipe</code> nothing at all. It asserts
+that the class has a compatible <code>transform</code>, and then it is erased. Angular finds this
+pipe through the <code>@Pipe</code> decorator; the <code>implements</code> clause is there so a
+mistyped method name fails the build rather than the template.</p>
+
+<p>One subtlety: <code>implements</code> does not <em>add</em> types. If the interface declares
+<code>transform(value: number)</code> and your method omits the annotation, the parameter is
+implicitly <code>any</code> — it is not filled in from the interface. Annotate the members
+yourself.</p>
+
+<h2>static members</h2>
+
+<p><code>static</code> members belong to the class rather than to an instance, and they take the
+same modifiers:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  /** Build one from whatever Angular threw. */
+  static from(error: unknown): ApiError {
+    if (error instanceof ApiError) return error;</code></pre>
+
+<p>That is the Angular <code>ApiError</code>, and the static factory is doing something a
+constructor cannot: deciding <em>whether</em> to create a new instance. Given an
+<code>ApiError</code> it returns it unchanged; given an <code>HttpErrorResponse</code> it converts;
+given anything else it falls back. A constructor must always construct.</p>
+
+<p>Static factories are also where you put alternative construction paths that would otherwise be
+overloads — <code>Order.fromCart(cart)</code> and <code>Order.fromJson(body)</code> read better than
+one constructor branching on its argument.</p>
+
+<h2>Generic classes</h2>
+
+<p>A class can take type parameters, usable throughout its members:</p>
+
+<pre class="language-typescript"><code class="language-typescript">class Store&lt;T&gt; {
+  private items: T[] = [];
+
+  add(item: T): void {
+    this.items.push(item);
+  }
+
+  all(): readonly T[] {
+    return this.items;
+  }
+}
+
+const orders = new Store&lt;Order&gt;();</code></pre>
+
+<p>One restriction worth knowing: the parameter is not available in <code>static</code> members. A
+static belongs to the class itself, which exists once, while <code>T</code> varies per instance —
+so there is nothing for it to refer to.</p>
+
+<h2>A class is a type and a value</h2>
+
+<p>Declaring a class creates two things: a type describing its instances, and a value — the
+constructor — that exists at runtime.</p>
+
+<pre class="language-typescript"><code class="language-typescript">let err: ApiError;                  // the instance TYPE
+const Ctor: typeof ApiError = ApiError;   // the constructor VALUE</code></pre>
+
+<p>This is why <code>instanceof ApiError</code> works where <code>instanceof SomeInterface</code>
+cannot: the class survives compilation, the interface does not. It is also why a class is the right
+tool for something you need to narrow to at runtime — which is exactly why both halves of the pizza
+app model their API failures as a class rather than a plain object.</p>
+
+<h2>Do you need classes at all?</h2>
+
+<p>In a React codebase, mostly not. The pizza React app has exactly one class —
+<code>ApiError</code> — and it exists because <code>instanceof</code> is the cleanest way to
+recognise it. Components are functions, state lives in hooks, and helpers are plain exported
+functions.</p>
+
+<p>Angular and NestJS are the opposite: services, pipes, directives and components are all classes,
+because their dependency injection identifies things by constructor. That is a framework decision
+rather than a language one.</p>
+
+<p>Reach for a class when you have state and behaviour that genuinely belong together, or when you
+need runtime identity. Otherwise a function and a type will do, and will be easier to test.</p>
+
+<h2>Ordinary functions, mostly</h2>
+
+<p>One last framing, since this lesson has covered a lot of syntax. Everything above describes
+classes; almost none of it argues for them.</p>
+
+<p>The questions worth asking before reaching for one: does this have state and behaviour that
+genuinely belong together? Do I need <code>instanceof</code> to recognise it later? Is a framework
+going to construct it for me? Three yeses and a class is right. Three nos and a function with a
+typed parameter will be shorter, easier to test, and easier to tree-shake.</p>
+
+<p>The pizza codebase is a fair demonstration of both halves of that. Its React app has one class,
+for an error it needs to recognise with <code>instanceof</code>. Its Angular app has dozens, because
+Angular's injector constructs them. Same domain, same developer, opposite answers — decided by the
+framework rather than by preference.</p>
+
+<p>If you are coming from a language where everything is a class, the adjustment worth making is
+that a module here already does what a class of static methods does — it groups related functions
+under a name, with private helpers that are simply not exported. <code>money.ts</code> in this app
+is exactly that, and it needs no class to be one.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-generics">Generics</a> — how the app's HTTP wrapper returns the
+right type for every endpoint without an overload per URL.</p>

@@ -1,0 +1,255 @@
+<p><code>as</code> is you overruling the type checker. It is the one construct in this language that
+can turn a compiling program into a crashing one, so it is worth knowing precisely what it does,
+when it is legitimate, and what to reach for instead — which, more often than not, is
+<code>satisfies</code>.</p>
+
+<h2>What as does</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const value: unknown = 'PAID';
+const status = value as OrderStatus;</code></pre>
+
+<p>No check happens. Nothing is converted. The compiler simply treats <code>value</code> as an
+<code>OrderStatus</code> from that point on, because you said so.</p>
+
+<p>Contrast with an annotation, which asks rather than tells. The first line here does not compile;
+the second does:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const a: OrderStatus = value;   // error — unknown is not assignable
+const b = value as OrderStatus; // fine — you have taken responsibility</code></pre>
+
+<p>There is an older angle-bracket syntax, <code>&lt;OrderStatus&gt;value</code>, which is
+equivalent and unusable in <code>.tsx</code> files because it collides with JSX. Do not use it.</p>
+
+<h2>It cannot assert anything you like</h2>
+
+<p>One guardrail exists: the two types must overlap in one direction or the other.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+const n = 'PAID' as number;
+//        ~~~~~~~~~~~~~~~~
+// Conversion of type 'string' to type 'number' may be a mistake because neither
+// type sufficiently overlaps with the other.</code></pre>
+
+<p>The escape hatch is to go via <code>unknown</code>, which overlaps with everything:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const n = 'PAID' as unknown as number;</code></pre>
+
+<p>That double assertion is a genuine signal. It is TypeScript telling you the two types have
+nothing to do with each other, and you replying that you would like to proceed anyway. Sometimes
+that is correct — but it should never be casual, and it deserves a comment saying why.</p>
+
+<p>The Angular admin store has one, and it is a fair example of the legitimate case:</p>
+
+<pre class="language-typescript"><code class="language-typescript">      map((action): Outcome =&gt;
+        action.type === success.type
+          ? { ok: true }
+          : { ok: false, failure: (action as unknown as { failure: ApiFailure }).failure },
+      ),</code></pre>
+
+<p>The action arriving off the stream is typed as a bare <code>{ type: string }</code>, because the
+helper is written to work with any pair of actions. The code has just checked
+<code>action.type === failure.type</code>, so it knows the payload is there — but that knowledge
+came from a runtime comparison the type system cannot follow back to a shape. The assertion records
+what the check established.</p>
+
+<h2>Where assertions are genuinely right</h2>
+
+<p>Four situations account for nearly all the honest ones.</p>
+
+<p><strong>Parsed JSON.</strong> <code>JSON.parse</code> returns <code>any</code>, and something has
+to decide what it is. The pizza app does it once, in the file that owns the network:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  if (!response.ok) {
+    const errorBody = parsed as ApiErrorBody | null;</code></pre>
+
+<p>Note that it does not assert the success case in the same way — that comes back as the caller's
+<code>T</code>, which is the same claim made one level up. Either way the assertion is confined to
+one module rather than repeated at forty call sites.</p>
+
+<p><strong>DOM queries.</strong> <code>querySelector</code> cannot know what it will find:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const input = document.querySelector('#email') as HTMLInputElement;</code></pre>
+
+<p><strong>A value the framework guarantees.</strong> Angular's <code>HttpErrorResponse</code>
+carries an untyped <code>error</code> blob, so the interceptor names it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">      const body = (error.error ?? null) as ApiErrorBody | null;</code></pre>
+
+<p><strong>Deliberately fixing a literal's type</strong> — which is <code>as const</code>, below,
+and is not really the same operation at all.</p>
+
+<h2>The non-null assertion</h2>
+
+<p>A postfix <code>!</code> removes <code>null</code> and <code>undefined</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const el = document.getElementById('root')!;   // HTMLElement, not | null</code></pre>
+
+<p>Same warning, smaller and easier to type. It is most defensible where the value's existence is
+guaranteed by something outside the type system — an element the framework mounts into, a map key
+you just set.</p>
+
+<p>Where it is least defensible is inside business logic, because there
+<a href="/typescript/typescript-narrowing">narrowing</a> would have proved the same thing for free.
+If you find yourself writing <code>order!.total</code>, the question to ask is why
+<code>order</code> is nullable at that point at all.</p>
+
+<p>The related <code>!</code> on a class field is the definite assignment assertion from
+<a href="/typescript/typescript-classes">lesson 12</a> — different syntax position, same kind of
+promise.</p>
+
+<h2>as const</h2>
+
+<p>This one is different in kind, and much safer. <code>as const</code> asks for the
+<em>narrowest</em> type rather than a different one, so it never lies:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const a = [7, 30, 90];             // number[]
+const b = [7, 30, 90] as const;    // readonly [7, 30, 90]</code></pre>
+
+<p>Three things happen at once. Literals stay literal instead of widening; arrays become readonly
+tuples; object properties become <code>readonly</code>. The app uses it exactly where the values
+themselves matter:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const RANGES = [7, 30, 90] as const;</code></pre>
+
+<p>and on a single value, to stop it widening into a plain <code>string</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">              category: 'MEAT' as const,</code></pre>
+
+<p>That second one is from the Angular cart service, building a topping object. Without
+<code>as const</code>, <code>category</code> infers as <code>string</code>, the object is no longer
+assignable to <code>Topping</code> — whose <code>category</code> is
+<code>ToppingCategory</code> — and you get an error that looks like it is about the object when it
+is about one field.</p>
+
+<p>That is the widening problem from <a href="/typescript/typescript-basic-types">lesson 3</a>, and
+<code>as const</code> is its usual fix.</p>
+
+<h2>satisfies</h2>
+
+<p>Added in TypeScript 4.9, and it resolves a genuine dilemma. Consider a lookup you want checked
+against a type, but whose exact values you also want to keep:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const STATUS_LABEL: Record&lt;OrderStatus, string&gt; = {
+  PENDING_PAYMENT: 'Awaiting payment',
+  PAID: 'Paid',
+  PREPARING: 'In the oven',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled',
+};
+
+STATUS_LABEL.PAID;      // string
+STATUS_LABEL.SHIPPED;   // does not compile, which is what you wanted</code></pre>
+
+<p>The annotation checks the keys, which is what you wanted. But it also <em>widens</em> the values:
+every label is now <code>string</code>, and the fact that <code>PAID</code> is specifically
+<code>'Paid'</code> has been thrown away.</p>
+
+<p>Drop the annotation and the values stay precise — but nothing checks the keys any more, so a
+missing status goes unnoticed. You cannot have both. That is what <code>satisfies</code> is
+for:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const STATUS_LABEL = {
+  PENDING_PAYMENT: 'Awaiting payment',
+  PAID: 'Paid',
+  PREPARING: 'In the oven',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled',
+} satisfies Record&lt;OrderStatus, string&gt;;</code></pre>
+
+<p>Now a missing or misspelt key is still an error, <em>and</em> <code>STATUS_LABEL.PAID</code> has
+type <code>'Paid'</code>. The type is checked against but not applied.</p>
+
+<p>The rule is easy to remember once you have the three side by side:</p>
+
+<table>
+  <thead><tr><th>Form</th><th>Checks the value?</th><th>Changes the inferred type?</th></tr></thead>
+  <tbody>
+    <tr><td><code>const x: T = …</code></td><td>yes</td><td>yes — widens to <code>T</code></td></tr>
+    <tr><td><code>const x = … as T</code></td><td><strong>no</strong></td><td>yes — forces <code>T</code></td></tr>
+    <tr><td><code>const x = … satisfies T</code></td><td>yes</td><td>no</td></tr>
+  </tbody>
+</table>
+
+<p><code>satisfies</code> is what most people reaching for <code>as</code> actually wanted: they
+wanted the object checked, not the checker silenced.</p>
+
+<h2>Replacing an assertion with a check</h2>
+
+<p>Most assertions in application code can be turned into something honest, and the transformation
+is usually short. Here is the shape it takes.</p>
+
+<p>Before — an assertion carrying an assumption:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const raw = localStorage.getItem('pizza.cart');
+const cart = JSON.parse(raw!) as ServerCart;
+renderCart(cart);</code></pre>
+
+<p>Two claims there, neither checked. That <code>raw</code> is not <code>null</code> — it is, the
+first time anyone visits. And that whatever was stored is a <code>ServerCart</code> — it was, until
+the shape changed in a release and every returning visitor got a blank page.</p>
+
+<p>After — the same code, with the claims turned into questions:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function readCart(): ServerCart | null {
+  const raw = localStorage.getItem('pizza.cart');
+  if (raw === null) return null;
+
+  const parsed: unknown = JSON.parse(raw);
+  if (!isServerCart(parsed)) return null;
+
+  return parsed;
+}</code></pre>
+
+<p>Four extra lines, no assertions, and the failure modes are now handled rather than assumed. Note
+the <code>: unknown</code> annotation on the parse — the trick from
+<a href="/typescript/typescript-special-types">lesson 4</a>, downgrading <code>any</code> so the
+compiler insists on the check that follows.</p>
+
+<p>The guard itself is a type predicate, and how thorough it needs to be depends on how much you
+trust the source. For <code>localStorage</code>, which contains whatever your own code left there
+several releases ago, thorough is the right answer.</p>
+
+<h2>A word on the other as</h2>
+
+<p>One piece of syntax that is not an assertion at all, and reads as though it might be. In a mapped
+type, <code>as</code> means key remapping:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Getters&lt;T&gt; = {
+  [K in keyof T as `get${Capitalize&lt;string &amp; K&gt;}`]: () =&gt; T[K];
+};</code></pre>
+
+<p>Nothing is being overruled there — it is transforming each key as it goes. Same keyword, unrelated
+meaning, and covered in <a href="/typescript/typescript-mapped-and-conditional-types">lesson 15</a>.
+Likewise <code>as const</code>, which asks for the narrowest type rather than asserting a different
+one.</p>
+
+<p>So "count the <code>as</code>es" is a poor code-quality metric on its own. The one to look for is
+<code>as SomeType</code> — a bare type on the right — and its louder cousin
+<code>as unknown as</code>.</p>
+
+<h2>A rule for reviews</h2>
+
+<p>Every <code>as</code> and every <code>!</code> is a place the type system was told to stop
+working, so each one deserves the same question: <em>what do you know that the compiler does
+not?</em></p>
+
+<p>Good answers exist — the shape of a response, an element the framework mounted, a check made two
+lines up that the type system cannot follow. Write it in a comment, and confine it to the boundary
+module rather than letting it spread inward.</p>
+
+<p>Bad answers all sound the same: the error was inconvenient. In that case the error was usually
+right, and the fix is a narrowing check, a better type, or <code>satisfies</code>.</p>
+
+<p>A last practical point about where assertions live. Both halves of the pizza app confine theirs
+to one file each — <code>lib/api.ts</code> and <code>core/api-error.ts</code>, the two modules that
+talk to the network. Nothing further in has any, because by the time a value reaches a component it
+has a real type.</p>
+
+<p>That is the pattern worth copying. Assertions are a boundary concern: they belong where untyped
+data enters, made once, next to a comment explaining the claim. An assertion in the middle of a
+component is nearly always a sign that the boundary above it was not typed properly.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-modules">Modules and Type-Only Imports</a> — <code>import
+type</code>, why a bundler needs you to say it, and what happens to your imports at build time.</p>

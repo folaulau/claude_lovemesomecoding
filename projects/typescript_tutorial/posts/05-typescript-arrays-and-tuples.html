@@ -1,0 +1,276 @@
+<p>An array holds any number of one kind of thing. A tuple holds a fixed number of things whose types
+depend on their position. JavaScript uses the same square brackets for both, which is why
+TypeScript has to be told which you meant.</p>
+
+<h2>Two ways to write an array type</h2>
+
+<pre class="language-typescript"><code class="language-typescript">let sizes: ProductSize[];
+let sizesAgain: Array&lt;ProductSize&gt;;</code></pre>
+
+<p>They are identical — the same type, no difference in behaviour. Pick one and be consistent. The
+common convention, and the one the pizza app follows, is <code>T[]</code> for simple element types:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface Product {
+// ...
+  sizes: ProductSize[];
+  createdAt: string;
+  updatedAt: string;
+}</code></pre>
+
+<p>and <code>Array&lt;T&gt;</code> when the element type is written inline and would make the
+brackets hard to find:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface ReportDashboard {
+  summary: {
+    totalOrders: number;
+    totalRevenue: number;
+    averageOrderValue: number;
+    itemsSold: number;
+  };
+  revenueByDay: Array&lt;{ day: string; orders: number; revenue: number }&gt;;
+  topProducts: Array&lt;{ productName: string; unitsSold: number; revenue: number }&gt;;
+  statusBreakdown: Array&lt;{ status: string; count: number }&gt;;
+}</code></pre>
+
+<p>Written the other way that last line is <code>{ status: string; count: number }[]</code>, where
+the <code>[]</code> is easy to miss at the end of a long line. That is the whole argument for the
+generic form, and it is a readability preference rather than a rule.</p>
+
+<h2>Where the brackets go matters</h2>
+
+<p>One genuine trap. These two are different types:</p>
+
+<pre class="language-typescript"><code class="language-typescript">let a: (string | null)[];   // an array, whose items may be null
+let b: string[] | null;     // either an array of strings, or null</code></pre>
+
+<p>Without the parentheses, <code>string | null[]</code> parses as the second — <code>[]</code>
+binds tighter than <code>|</code>. If you mean an array of nullable things, parenthesise.</p>
+
+<p>This shows up constantly with the app's nullable fields. <code>imageUrl: string | null</code>
+is one value; a list of them would be <code>(string | null)[]</code>.</p>
+
+<h2>Inference and the empty array</h2>
+
+<p>TypeScript infers array types from their contents, and does the sensible thing with a mixed
+list:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const names = ['Cheese', 'Pepperoni'];   // string[]
+const mixed = ['Cheese', 3];             // (string | number)[]</code></pre>
+
+<p>The empty array is the exception, and it is worth knowing why it behaves oddly:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const found = [];        // any[]
+found.push('Cheese');    // now string[]
+found.push(42);          // now (string | number)[]</code></pre>
+
+<p>An empty literal starts as an <em>evolving</em> <code>any[]</code> and takes its type from what
+you push, within the same scope. Useful in a loop; a problem when the array escapes to somewhere
+that push cannot be seen. Annotate it when you know:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const errors: string[] = [];</code></pre>
+
+<h2>readonly arrays</h2>
+
+<p>Prefix an array type with <code>readonly</code> and mutating methods disappear from it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+function total(items: readonly CartItem[]) {
+  items.sort((a, b) =&gt; a.quantity - b.quantity);
+  //    ~~~~
+  // Property 'sort' does not exist on type 'readonly CartItem[]'.
+}</code></pre>
+
+<p>That error is a good one to have caught. <code>sort</code> mutates in place, so a "harmless"
+sort inside a display helper reorders the caller's cart. <code>readonly</code> on the parameter
+makes that a compile error rather than a bug report about items jumping around.</p>
+
+<p>The same type can be written <code>ReadonlyArray&lt;CartItem&gt;</code>. Note that it is
+shallow: the array cannot be changed, but the objects in it can.</p>
+
+<p>Also note this is a <em>compile-time</em> restriction. A <code>readonly string[]</code> is an
+ordinary array at runtime with all its methods intact — nothing is frozen. <code>readonly</code>
+constrains your code, not the value.</p>
+
+<h2>Types flow through the array methods</h2>
+
+<p>You mostly do not annotate anything when working with arrays, because <code>map</code>,
+<code>filter</code> and <code>reduce</code> carry the element type through for you:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function calculateTotals(items: CartItem[], orderType: 'DELIVERY' | 'CARRYOUT'): CartTotals {
+  const subtotal = round2(items.reduce((sum, item) =&gt; sum + lineTotal(item), 0));</code></pre>
+
+<p><code>item</code> is a <code>CartItem</code> and <code>sum</code> is a <code>number</code>,
+neither written down. <code>reduce</code>'s type says the accumulator matches the initial value —
+the <code>0</code> — and the callback receives the array's element type.</p>
+
+<p><code>map</code> changes the element type as you would hope:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const prices = product.sizes.map((s) =&gt; s.price);   // number[]
+const labels = product.sizes.map((s) =&gt; s.size);    // SizeName[]</code></pre>
+
+<p>There is one place this breaks down, and it catches everyone.</p>
+
+<h2>filter does not narrow</h2>
+
+<p>Removing the nulls from a list does not change its type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// This does not compile.
+const urls: (string | null)[] = products.map((p) =&gt; p.imageUrl);
+const real: string[] = urls.filter((u) =&gt; u !== null);
+//    ~~~~
+// Type '(string | null)[]' is not assignable to type 'string[]'.</code></pre>
+
+<p>You know the result has no nulls in it. TypeScript does not, because <code>filter</code> is
+typed to return an array of the same element type — it has no way to interpret an arbitrary
+predicate.</p>
+
+<p>The fix is a <strong>type predicate</strong>, a return type of the form <code>x is T</code> that
+tells the compiler what a <code>true</code> result means:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const real = urls.filter((u): u is string =&gt; u !== null);   // string[]</code></pre>
+
+<p>The <code>(u): u is string</code> is doing all the work. <a href="/typescript/typescript-narrowing">Narrowing</a>
+covers predicates properly; for now, know that this is why <code>filter(Boolean)</code> almost
+never gives you the type you wanted.</p>
+
+<h2>Indexing is more optimistic than it should be</h2>
+
+<p>By default, reading any index gives you the element type, with no acknowledgement that the array
+might be shorter than you think:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const sizes: ProductSize[] = product.sizes;
+const first = sizes[0];       // ProductSize — even if the array is empty
+first.price.toFixed(2);       // compiles. Throws at runtime on an empty array.</code></pre>
+
+<p>That is a real hole in an otherwise strict type system, and it is not covered by
+<code>strict</code>. The flag that closes it is <code>noUncheckedIndexedAccess</code>, which makes
+every indexed read <code>ProductSize | undefined</code> and forces you to handle the empty case.</p>
+
+<p>It is off by default, and it is genuinely noisy — every loop body that indexes an array needs a
+check. Worth turning on for new code; expect a long afternoon if you enable it on an existing
+project. <code>at()</code>, <code>find()</code> and destructuring all return possibly-undefined
+values regardless, so much of your code already handles this.</p>
+
+<h2>Tuples</h2>
+
+<p>A tuple is an array type where the <em>length</em> is fixed and each position has its own type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">let entry: [string, number];
+
+entry = ['PAID', 12];    // fine
+entry = [12, 'PAID'];    // wrong order — error
+entry = ['PAID', 12, 3]; // too long — error</code></pre>
+
+<p>Compare that with what you get without the tuple type. An array literal of two different things
+infers as <code>(string | number)[]</code>, which loses everything useful: the length, which
+position is which, and the ability to read <code>entry[0]</code> as a string.</p>
+
+<p>Tuples are best when the elements have no good names — a coordinate pair, a key/value entry, a
+returned pair. The moment a name would help, an object is clearer.</p>
+
+<h2>Named members, optional and rest</h2>
+
+<p>Tuple members can be labelled. The labels are documentation only, but they show up in editor
+hints and error messages, which is enough to justify them:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Range = [min: number, max: number];</code></pre>
+
+<p>A tuple can have optional trailing members, and a rest element for a variable tail:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Point = [x: number, y: number, z?: number];
+type Command = [name: string, ...args: string[]];</code></pre>
+
+<p><code>Command</code> is "a string, then any number of strings" — the two are different types,
+and only the first element is guaranteed.</p>
+
+<h2>The tuple you use every day</h2>
+
+<p>If you have written React, you have used tuples heavily without noticing:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const [user, setUser] = useState&lt;User | null&gt;(null);
+const [loading, setLoading] = useState(false);</code></pre>
+
+<p><code>useState</code> returns a tuple: the value first, the setter second. That is exactly why
+array destructuring works on it, and why you can name the two halves whatever you like — the
+meaning is positional, not by key.</p>
+
+<p>It also explains a small mystery. If <code>useState</code> returned
+<code>(User | null | Function)[]</code>, then <code>setUser</code> would have that whole union as
+its type and calling it would not typecheck. The tuple is what keeps position 0 the value and
+position 1 the setter.</p>
+
+<h2>Getting a tuple by accident, or on purpose</h2>
+
+<p>TypeScript will not infer a tuple unless you ask. This returns an array type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function bounds() {
+  return [0, 100];   // number[], not [number, number]
+}</code></pre>
+
+<p>Two ways to get the tuple. Annotate the return type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function bounds(): [number, number] {
+  return [0, 100];
+}</code></pre>
+
+<p>or use <code>as const</code>, which freezes the literal into
+<code>readonly [0, 100]</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const bounds = [0, 100] as const;</code></pre>
+
+<p>Those give different things — the first is a mutable tuple of any two numbers, the second is a
+readonly tuple of exactly those two values.
+<a href="/typescript/typescript-type-assertions">Lesson 16</a> covers <code>as const</code>
+properly, and it is worth reading before you sprinkle it about.</p>
+
+<h2>Spreading and destructuring</h2>
+
+<p>Both work as you would expect, and both preserve types.</p>
+
+<pre class="language-typescript"><code class="language-typescript">const cheapest = Math.min(...product.sizes.map((s) =&gt; s.price));</code></pre>
+
+<p>Spreading a <code>number[]</code> into <code>Math.min</code> is allowed because
+<code>Math.min</code> takes a rest parameter of numbers. Spread a tuple and TypeScript knows the
+arity, so it can check the call against a fixed-parameter function too.</p>
+
+<p>Destructuring an array gives you possibly-undefined values only under
+<code>noUncheckedIndexedAccess</code>; a tuple always gives you the exact positional types:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const [min, max]: [number, number] = bounds();   // both number
+const [head, ...tail] = ['a', 'b', 'c'];         // head: string, tail: string[]</code></pre>
+
+<h2>Which to reach for</h2>
+
+<p>In application code, arrays almost always. Every collection in the pizza app's domain — sizes,
+toppings, order items, addresses — is an array of a named type, because each element is a thing
+with a name and fields.</p>
+
+<p>Tuples earn their place in three situations: a function returning two values that have no
+natural container, a fixed-shape pair like a coordinate or a range, and the return type of a hook
+you want destructured positionally. Outside those, an object with named properties reads better
+and survives a fourth field being added.</p>
+
+<p>Worth mentioning the neighbours. <code>Set&lt;T&gt;</code> and <code>Map&lt;K, V&gt;</code> are
+both generic and both typed exactly as you would hope:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const selectedToppingIds = new Set&lt;UUID&gt;();
+const byId = new Map&lt;UUID, Product&gt;();
+
+byId.get('abc')?.name;   // Product | undefined — get() admits it might miss</code></pre>
+
+<p>Note that <code>Map.get</code> returns <code>V | undefined</code> honestly, where array indexing
+does not. If you are keeping a lookup table, a <code>Map</code> gives you better types than an
+object with an index signature, and it does not confuse your keys with
+<code>Object.prototype</code>.</p>
+
+<p>One last habit worth forming: when a function only reads a list, type the parameter
+<code>readonly T[]</code>. It costs nothing, it documents that the function does not reorder or
+mutate what it was given, and it turns a whole category of action-at-a-distance bug into a compile
+error. The cost is that callers holding a mutable array can still pass it, so there is no downside
+at the boundary — assignability runs the permissive direction.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-object-types">Object Types</a> — optional properties, readonly,
+index signatures, and the excess property check that rejects an extra key on a literal while
+letting the same object through in a variable.</p>

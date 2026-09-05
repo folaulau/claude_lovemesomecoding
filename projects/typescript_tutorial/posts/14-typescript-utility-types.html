@@ -1,0 +1,264 @@
+<p>TypeScript ships a set of generic types that transform other types. They are ordinary generics —
+nothing magic — and knowing eight or nine of them removes most of the hand-written duplication from
+a codebase.</p>
+
+<p>The reason to use them is always the same: a derived type cannot fall out of step with the type
+it came from, and a hand-copied one always eventually does.</p>
+
+<h2>Partial and Required</h2>
+
+<p><code>Partial&lt;T&gt;</code> makes every property optional:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type ProductPatch = Partial&lt;Product&gt;;
+// { id?: UUID; name?: string; description?: string; … }</code></pre>
+
+<p>Which is exactly the shape of a PATCH payload, or of an update function's argument:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function applyEdits(product: Product, edits: Partial&lt;Product&gt;): Product {
+  return { ...product, ...edits };
+}</code></pre>
+
+<p><code>Required&lt;T&gt;</code> is the inverse, stripping every <code>?</code>. Less common, but
+useful for the "after defaults have been applied" version of an options type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function resolve(opts: RequestOptions): Required&lt;RequestOptions&gt; { /* … */ }</code></pre>
+
+<p>Both are shallow. Nested objects keep their original optionality — a deep version has to be
+written by hand, and <a href="/typescript/typescript-mapped-and-conditional-types">lesson 15</a>
+shows how.</p>
+
+<h2>Pick and Omit</h2>
+
+<p>Two sides of the same coin. <code>Pick</code> keeps the keys you name:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type ProductSummary = Pick&lt;Product, 'id' | 'name' | 'imageUrl'&gt;;</code></pre>
+
+<p><code>Omit</code> removes them:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type ProductDraft = Omit&lt;Product, 'id' | 'createdAt' | 'updatedAt'&gt;;</code></pre>
+
+<p>The pizza app uses <code>Omit</code> to stop a caller passing options the wrapper has already
+decided — and it is the clearest small example of a utility type doing real work:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const api = {
+  get: &lt;T&gt;(path: string, opts?: Omit&lt;RequestOptions, 'method' | 'body'&gt;) =&gt;
+    request&lt;T&gt;(path, { ...opts, method: 'GET' }),</code></pre>
+
+<p><code>RequestOptions</code> has <code>method</code>, <code>body</code>, <code>auth</code> and
+<code>signal</code>. <code>api.get</code> fixes the first two, so its <code>opts</code> parameter is
+the remaining two. Passing <code>{ method: 'POST' }</code> to <code>api.get</code> is a compile
+error, which is the correct outcome and would have been impossible to express with a hand-written
+interface that did not track <code>RequestOptions</code>.</p>
+
+<p>One difference worth knowing: <code>Pick</code> requires its keys to exist on
+<code>T</code>, while <code>Omit</code> does not. <code>Omit&lt;Product, 'nmae'&gt;</code> compiles
+and silently removes nothing. If a rename should break your derived types, <code>Pick</code> is the
+safer of the two.</p>
+
+<h2>Record</h2>
+
+<p>Builds an object type from a key type and a value type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">  fieldErrors(): Record&lt;string, string&gt; {
+    const result: Record&lt;string, string&gt; = {};</code></pre>
+
+<p>That is the open-ended form — any string key — which is the index signature from
+<a href="/typescript/typescript-object-types">lesson 6</a> written more briefly.</p>
+
+<p>The far more interesting form is a <em>closed</em> key type:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const STATUS_LABEL: Record&lt;OrderStatus, string&gt; = {
+  PENDING_PAYMENT: 'Awaiting payment',
+  PAID: 'Paid',
+  PREPARING: 'In the oven',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled',
+};</code></pre>
+
+<p>Now the object must have <strong>exactly</strong> those five keys — no more, no fewer. Add
+<code>'REFUNDED'</code> to <code>OrderStatus</code> and this fails to compile until somebody writes
+the label:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Property 'REFUNDED' is missing in type '{ PENDING_PAYMENT: string; … }'
+but required in type 'Record&lt;OrderStatus, string&gt;'.</code></pre>
+
+<p>This is the same guarantee the <code>never</code> exhaustiveness check gives a
+<code>switch</code>, and it is cheaper — one annotation instead of a default branch. Whenever you
+have a lookup keyed by a union, type it this way. The alternative fails silently, rendering a blank
+label for the new status.</p>
+
+<h2>ReturnType and typeof</h2>
+
+<p><code>ReturnType&lt;F&gt;</code> extracts what a function type returns. Paired with
+<code>typeof</code> it lets you derive a type from a <em>value</em>, which is where it earns its
+place.</p>
+
+<p>The pizza app's Redux store is the example, and the comment above it makes the argument better
+than I can:</p>
+
+<pre class="language-typescript"><code class="language-typescript">/*
+ * Types derived FROM the store rather than declared alongside it, so they can never drift out of
+ * step with the reducers above. Add a slice and RootState grows automatically.
+ */
+export type RootState = ReturnType&lt;typeof store.getState&gt;;
+export type AppDispatch = typeof store.dispatch;</code></pre>
+
+<p>Read <code>RootState</code> from the inside out. <code>store.getState</code> is a function
+value; <code>typeof store.getState</code> is its type; <code>ReturnType&lt;…&gt;</code> is what it
+returns — which is the shape of the whole store, assembled from the four reducers.</p>
+
+<p>Write that shape by hand and you have two descriptions of the same thing. Add a slice and one of
+them is wrong, with nothing to tell you.</p>
+
+<p>The pre-typed hooks then hang off those two types:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const useAppDispatch = useDispatch.withTypes&lt;AppDispatch&gt;();
+export const useAppSelector = useSelector.withTypes&lt;RootState&gt;();</code></pre>
+
+<p>Related: <code>Parameters&lt;F&gt;</code> gives a function's parameters as a tuple, and
+<code>Awaited&lt;T&gt;</code> unwraps a promise — <code>Awaited&lt;ReturnType&lt;typeof
+fetchOrders&gt;&gt;</code> is "whatever that async function resolves to", which is a common and
+genuinely useful combination.</p>
+
+<h2>Exclude, Extract and NonNullable</h2>
+
+<p>These three operate on unions rather than objects.</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Settled = Exclude&lt;OrderStatus, 'PENDING_PAYMENT'&gt;;
+// 'PAID' | 'PREPARING' | 'COMPLETED' | 'CANCELLED'
+
+type Active = Extract&lt;OrderStatus, 'PAID' | 'PREPARING'&gt;;
+// 'PAID' | 'PREPARING'
+
+type Url = NonNullable&lt;Product['imageUrl']&gt;;
+// string  (was string | null)</code></pre>
+
+<p><code>Exclude</code> removes members, <code>Extract</code> keeps them,
+<code>NonNullable</code> drops <code>null</code> and <code>undefined</code>. All three are
+conditional types over a union, which is why they distribute member by member — the behaviour
+mentioned in <a href="/typescript/typescript-union-and-intersection-types">lesson 8</a>.</p>
+
+<p><code>NonNullable</code> is the one you will use most, usually after a narrowing check has
+already established the value is there.</p>
+
+<h2>Readonly</h2>
+
+<pre class="language-typescript"><code class="language-typescript">type FrozenCart = Readonly&lt;CartTotals&gt;;</code></pre>
+
+<p>Every property becomes <code>readonly</code>. Shallow, like the others, and compile-time only —
+<code>Object.freeze</code> is the runtime version and they are unrelated.</p>
+
+<h2>The two string ones</h2>
+
+<p>Less used but occasionally exactly right: <code>Uppercase</code>, <code>Lowercase</code>,
+<code>Capitalize</code> and <code>Uncapitalize</code> transform string literal types.</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Loud = Uppercase&lt;OrderType&gt;;   // 'DELIVERY' | 'CARRYOUT' — already loud
+type Event = `on${Capitalize&lt;'select' | 'close'&gt;}`;   // 'onSelect' | 'onClose'</code></pre>
+
+<p>That second one is a template literal type, and it is how libraries generate typed event-handler
+prop names from a list of events.</p>
+
+<h2>Writing the ones TypeScript does not ship</h2>
+
+<p>The built-in set is deliberately small. Three more are common enough that most codebases end up
+writing them, and each is a short exercise in the machinery from the next lesson.</p>
+
+<p><strong><code>Prettify</code></strong> — the most useful one nobody tells you about. Intersections
+and derived types are printed in error messages exactly as they were computed, so a hover can show
+you <code>Omit&lt;Product, 'id'&gt; &amp; { tempId: string }</code> rather than the fields. This
+flattens it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Prettify&lt;T&gt; = {
+  [K in keyof T]: T[K];
+} &amp; {};</code></pre>
+
+<p>It does nothing at all to the type — it maps every key to itself. What it changes is how the
+compiler <em>displays</em> it, because the result is a fresh object type rather than a record of how
+it was built. Wrap a confusing derived type in it and the tooltip becomes readable.</p>
+
+<p><strong><code>DeepPartial</code></strong> — because <code>Partial</code> is shallow, and a nested
+draft needs the whole tree optional:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type DeepPartial&lt;T&gt; = {
+  [K in keyof T]?: T[K] extends object ? DeepPartial&lt;T[K]&gt; : T[K];
+};</code></pre>
+
+<p>Watch out for what counts as an <code>object</code>: arrays, <code>Date</code> and functions all
+do, so a naive version makes the elements of an array optional too. Production versions special-case
+those, which is a good illustration of why the built-in set stops where it does.</p>
+
+<p><strong><code>RequireAtLeastOne</code></strong> — for an options object where several fields are
+individually optional but at least one must be present:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type RequireAtLeastOne&lt;T, K extends keyof T = keyof T&gt; =
+  Omit&lt;T, K&gt; &amp; { [P in K]-?: Required&lt;Pick&lt;T, P&gt;&gt; &amp; Partial&lt;Omit&lt;T, P&gt;&gt; }[K];</code></pre>
+
+<p>That one is genuinely hard to read, and it is included as an honest example of the ceiling. If
+your team cannot maintain a type, a runtime check and a comment may serve better. The line between
+"expressive" and "write-only" is real, and it is closer than enthusiasm suggests.</p>
+
+<h2>A caution about overloading the derived</h2>
+
+<p>Derived types have one failure mode worth naming. Chain enough of them and an error message
+becomes a paragraph, and the person reading it cannot tell which link is wrong:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Thing = Partial&lt;Omit&lt;Pick&lt;Product, 'name' | 'sizes'&gt;, 'sizes'&gt;&gt;;</code></pre>
+
+<p>That is <code>{ name?: string }</code>, arrived at by three steps that could have been zero. The
+rule of thumb: derive when the source type is likely to change and the derivation expresses a real
+relationship — a create payload really is "the entity without its server-assigned fields". Do not
+derive as a puzzle.</p>
+
+<h2>The list worth memorising</h2>
+
+<table>
+  <thead><tr><th>Type</th><th>Does</th><th>Reach for it when</th></tr></thead>
+  <tbody>
+    <tr><td><code>Partial&lt;T&gt;</code></td><td>all optional</td><td>a patch payload, or a form's draft state</td></tr>
+    <tr><td><code>Required&lt;T&gt;</code></td><td>all required</td><td>after defaults are applied</td></tr>
+    <tr><td><code>Readonly&lt;T&gt;</code></td><td>all readonly</td><td>a value a function must not mutate</td></tr>
+    <tr><td><code>Pick&lt;T, K&gt;</code></td><td>keeps keys</td><td>a summary or list-row shape</td></tr>
+    <tr><td><code>Omit&lt;T, K&gt;</code></td><td>drops keys</td><td>a create payload, or fixing options</td></tr>
+    <tr><td><code>Record&lt;K, V&gt;</code></td><td>builds an object</td><td><strong>a lookup keyed by a union</strong></td></tr>
+    <tr><td><code>Exclude&lt;T, U&gt;</code></td><td>removes union members</td><td>a narrowed subset of a status</td></tr>
+    <tr><td><code>Extract&lt;T, U&gt;</code></td><td>keeps union members</td><td>the same, from the other side</td></tr>
+    <tr><td><code>NonNullable&lt;T&gt;</code></td><td>drops null/undefined</td><td>after a guard</td></tr>
+    <tr><td><code>ReturnType&lt;F&gt;</code></td><td>a function's result</td><td>deriving a type from a value</td></tr>
+    <tr><td><code>Parameters&lt;F&gt;</code></td><td>a function's arguments</td><td>wrapping a function</td></tr>
+    <tr><td><code>Awaited&lt;T&gt;</code></td><td>unwraps a promise</td><td>with <code>ReturnType</code>, on an async function</td></tr>
+  </tbody>
+</table>
+
+<p>If you take one thing from the table, take <code>Record&lt;SomeUnion, T&gt;</code>. It is the
+cheapest way to make "we added a case and forgot to handle it somewhere" into a build failure, and
+that class of bug is otherwise found by users.</p>
+
+<h2>Where they come from</h2>
+
+<p>None of these is built into the compiler. Every one is declared in TypeScript's own library file
+in a few lines of ordinary type syntax, and you can read them:</p>
+
+<pre class="language-typescript"><code class="language-typescript">type Partial&lt;T&gt; = { [K in keyof T]?: T[K] };
+type Required&lt;T&gt; = { [K in keyof T]-?: T[K] };
+type Pick&lt;T, K extends keyof T&gt; = { [P in K]: T[P] };
+type Exclude&lt;T, U&gt; = T extends U ? never : T;
+type Omit&lt;T, K extends keyof never&gt; = Pick&lt;T, Exclude&lt;keyof T, K&gt;&gt;;</code></pre>
+
+<p>That last line explains the <code>Pick</code>/<code>Omit</code> asymmetry noted earlier.
+<code>Omit</code> is <code>Pick</code> over <code>Exclude&lt;keyof T, K&gt;</code>, and
+<code>Exclude</code> silently ignores anything not present — so a misspelt key removes nothing
+rather than erroring.</p>
+
+<p><a href="/typescript/typescript-mapped-and-conditional-types">The next lesson</a> takes that
+syntax apart. The point of showing it here is that there is no magic layer: if the built-in set does
+not have what you need, you can write it in the same language.</p>
+
+<p>One habit that follows from all of this: when you find yourself typing out a shape that already
+exists somewhere, stop and ask which utility would derive it. Most of the time one will, and the
+derived version is the one that still compiles after somebody renames a field.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-mapped-and-conditional-types">keyof, Mapped and Conditional
+Types</a> — the machinery every one of these is built from, and how to write your own.</p>

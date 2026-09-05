@@ -1,0 +1,275 @@
+<p>The pizza application has 108 TypeScript files across two frontends, models five different sets of
+fixed values, and contains not a single <code>enum</code>. That is deliberate, and the reasons are
+worth understanding — <code>enum</code> is the one construct in this language that behaves unlike
+everything else in it.</p>
+
+<h2>What an enum is</h2>
+
+<pre class="language-typescript"><code class="language-typescript">enum OrderStatus {
+  PendingPayment,
+  Paid,
+  Preparing,
+  Completed,
+  Cancelled,
+}
+
+const status = OrderStatus.Paid;   // 1</code></pre>
+
+<p>By default the members are numbered from zero. You can assign strings instead, which is what
+anyone modelling an API does:</p>
+
+<pre class="language-typescript"><code class="language-typescript">enum OrderStatus {
+  PendingPayment = 'PENDING_PAYMENT',
+  Paid = 'PAID',
+  Preparing = 'PREPARING',
+  Completed = 'COMPLETED',
+  Cancelled = 'CANCELLED',
+}</code></pre>
+
+<p>It looks tidy, it autocompletes, and it groups the values under a name. So what is the
+objection?</p>
+
+<h2>It is the one feature that emits JavaScript</h2>
+
+<p>Everything else in TypeScript disappears at build time. An <code>enum</code> does not — it
+compiles into a real object that exists at runtime:</p>
+
+<pre class="language-javascript"><code class="language-javascript">var OrderStatus;
+(function (OrderStatus) {
+  OrderStatus["PendingPayment"] = "PENDING_PAYMENT";
+  OrderStatus["Paid"] = "PAID";
+  OrderStatus["Preparing"] = "PREPARING";
+  OrderStatus["Completed"] = "COMPLETED";
+  OrderStatus["Cancelled"] = "CANCELLED";
+})(OrderStatus || (OrderStatus = {}));</code></pre>
+
+<p>That is a violation of the model set out in <a href="/typescript/typescript-get-started">lesson
+1</a>: types are erased, and here a type declaration has generated code. Every awkward thing about
+enums follows from it.</p>
+
+<h2>The numeric reverse mapping</h2>
+
+<p>A numeric enum emits <em>twice</em> as many keys as you wrote, because it builds a reverse map
+so you can go from value back to name:</p>
+
+<pre class="language-javascript"><code class="language-javascript">OrderStatus[0] = "PendingPayment";
+OrderStatus["PendingPayment"] = 0;</code></pre>
+
+<p>Which means <code>Object.keys(OrderStatus)</code> gives you ten entries for a five-member enum,
+and iterating one requires filtering out the numbers. Anybody who has written a dropdown from a
+numeric enum has met this.</p>
+
+<p>Worse, a numeric enum accepts any number at all in some positions, which is not what a fixed set
+of values ought to do. String enums do not have either problem — which is a reason to prefer them,
+and also an early sign that the feature has more corners than it should.</p>
+
+<h2>const enum does not work in modern builds</h2>
+
+<p>The usual answer to the emitted-object problem is <code>const enum</code>, which inlines the
+values and emits nothing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const enum Size { Small = 'SMALL' }
+const s = Size.Small;   // compiles to: const s = "SMALL";</code></pre>
+
+<p>Except that inlining requires the compiler to see the declaration and the use site together, and
+tools that compile one file at a time cannot. That is Babel, esbuild, SWC and Vite — which is to
+say, most of what builds a frontend today.</p>
+
+<p>Hence <code>isolatedModules</code>, which both pizza configs effectively require, and which makes
+exporting a <code>const enum</code> across a module boundary an error. The feature is not usable in
+the setup most projects have.</p>
+
+<h2>And some builds reject enum outright</h2>
+
+<p>The React half of the pizza app compiles with this:</p>
+
+<pre class="language-json"><code class="language-json">    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true</code></pre>
+
+<p><code>erasableSyntaxOnly</code> bans every TypeScript construct that has to <em>emit</em>
+something to work. That is <code>enum</code>, parameter properties, namespaces with runtime members,
+and decorators.</p>
+
+<p>The flag exists because of the direction the tooling has moved. Node can now run
+<code>.ts</code> files directly by stripping types — and stripping is all it does, so anything
+requiring real compilation cannot work. Turning the flag on is how a project guarantees its source
+stays runnable by a type-stripper.</p>
+
+<p>So in that project the question is not stylistic. <code>enum</code> does not compile.</p>
+
+<h2>What to use instead</h2>
+
+<p>For a set of values that come from an API, a union of string literals:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type OrderStatus =
+  | 'PENDING_PAYMENT'
+  | 'PAID'
+  | 'PREPARING'
+  | 'COMPLETED'
+  | 'CANCELLED';</code></pre>
+
+<p>Look at what this gives you that the enum did not. The values <strong>are</strong> the API's
+strings, so no conversion is needed in either direction —
+<code>JSON.parse</code> output is already of the right type, and no mapping table has to be
+maintained. Nothing is emitted. Autocomplete works. And an invalid value is a compile error, which
+was the whole point.</p>
+
+<p>Assignment is direct, with no import of the enum object:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const status: OrderStatus = 'PAID';</code></pre>
+
+<p>Compare with <code>OrderStatus.Paid</code>, which requires a value import and gives you a name
+that is not the thing on the wire.</p>
+
+<h2>When you need the values at runtime</h2>
+
+<p>The one genuine advantage of an enum is that it exists as an object, so you can iterate it. A
+union cannot be iterated — it is erased.</p>
+
+<p>The replacement is a <code>const</code> array or object, with the type
+<em>derived</em> from it so the two can never disagree. The app does exactly this for its report
+date ranges:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const RANGES = [7, 30, 90] as const;</code></pre>
+
+<p>Without <code>as const</code> that is <code>number[]</code> and nothing is gained. With it, the
+type is <code>readonly [7, 30, 90]</code> — the exact values, in order, frozen — so
+<code>RANGES[number]</code> is the union <code>7 | 30 | 90</code> and the array can be mapped over
+to render the buttons.</p>
+
+<p>The same pattern for a named set:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const ORDER_STATUS = {
+  PENDING_PAYMENT: 'PENDING_PAYMENT',
+  PAID: 'PAID',
+  PREPARING: 'PREPARING',
+  COMPLETED: 'COMPLETED',
+  CANCELLED: 'CANCELLED',
+} as const;
+
+export type OrderStatus = (typeof ORDER_STATUS)[keyof typeof ORDER_STATUS];</code></pre>
+
+<p>That second line reads as "the type of any value in that object", and it resolves to exactly the
+union written by hand earlier. Add a key and the union grows by itself, which is the entire reason
+to derive it rather than write it twice.
+<a href="/typescript/typescript-mapped-and-conditional-types">Lesson 15</a> takes that expression
+apart piece by piece.</p>
+
+<p>You get an ordinary object you can iterate, a union that cannot drift from it, plain strings that
+match the database, and — unlike an enum — nothing generated that you did not write.</p>
+
+<h2>Rendering a dropdown from each</h2>
+
+<p>The concrete version of the iteration question, since it is what people actually hit. With an
+enum you iterate the object and filter out the reverse mappings:</p>
+
+<pre class="language-tsx"><code class="language-tsx">// numeric enum — the values are the strings, the keys are the numbers, or vice versa
+{Object.values(OrderStatus)
+  .filter((v) =&gt; typeof v === 'string')
+  .map((v) =&gt; &lt;option key={v}&gt;{v}&lt;/option&gt;)}</code></pre>
+
+<p>With a <code>const</code> array there is nothing to filter, and the type comes out right:</p>
+
+<pre class="language-tsx"><code class="language-tsx">const ORDER_STATUSES = [
+  'PENDING_PAYMENT', 'PAID', 'PREPARING', 'COMPLETED', 'CANCELLED',
+] as const;
+
+type OrderStatus = (typeof ORDER_STATUSES)[number];
+
+{ORDER_STATUSES.map((s) =&gt; &lt;option key={s}&gt;{s}&lt;/option&gt;)}</code></pre>
+
+<p><code>(typeof ORDER_STATUSES)[number]</code> is "the type of any element of that array", which
+is the union again. One declaration, a list you can map over, and a type derived from it.</p>
+
+<p>Order is also preserved and meaningful, which matters for a dropdown and which an enum object
+does not promise.</p>
+
+<h2>If you already have enums</h2>
+
+<p>There is no urgency. An existing string enum is not a bug, and a migration for its own sake is
+churn. If you do move, the steps that keep the build green throughout:</p>
+
+<ol>
+  <li>Make sure it is a <strong>string</strong> enum first, with the values matching the wire
+      format. Numeric enums have to be dealt with before anything else, because their values are
+      not the data.</li>
+  <li>Add the union type beside it: <code>type OrderStatus = 'PAID' | …</code>. At this point
+      <code>OrderStatus.Paid</code> and <code>'PAID'</code> are mutually assignable, so both work.</li>
+  <li>Replace <code>OrderStatus.Paid</code> with <code>'PAID'</code> a file at a time.</li>
+  <li>Delete the enum. Anything still using it fails the build, which is the list of what is left.</li>
+</ol>
+
+<p>Step 2 is what makes this safe — a string enum member <em>is</em> assignable to its literal type,
+so the two representations coexist for as long as you need.</p>
+
+<h2>If you are coming from Java or C#</h2>
+
+<p>Worth saying plainly, because the word is the same and the thing is not.</p>
+
+<p>A Java enum is a class. Its members are singleton instances, they can carry fields and methods,
+they are nominally typed, and <code>values()</code> is part of the language. Switching over one is
+checked for exhaustiveness by the compiler.</p>
+
+<p>A TypeScript enum is a plain object with some compile-time checking layered on. It has no
+methods, no fields beyond its value, and — because the language is structural — a string enum
+member is interchangeable with its literal string. That last point surprises people most: the type
+is not sealed the way a nominal enum is.</p>
+
+<p>So the instinct "a fixed set of values means an enum" transfers, but the construct that best
+serves it here is the union. You keep exhaustiveness checking — see
+<a href="/typescript/typescript-narrowing">the next lesson</a> — and lose nothing you were relying
+on.</p>
+
+<h2>Side by side</h2>
+
+<table>
+  <thead><tr><th></th><th><code>enum</code></th><th>literal union</th><th><code>as const</code> object</th></tr></thead>
+  <tbody>
+    <tr><td>emits runtime code</td><td>yes</td><td>no</td><td>yes — but it is code you wrote</td></tr>
+    <tr><td>iterable at runtime</td><td>yes</td><td>no</td><td>yes</td></tr>
+    <tr><td>value equals the API string</td><td>only if you assign it</td><td>always</td><td>always</td></tr>
+    <tr><td>works under <code>isolatedModules</code></td><td>not as <code>const enum</code></td><td>yes</td><td>yes</td></tr>
+    <tr><td>works under <code>erasableSyntaxOnly</code></td><td><strong>no</strong></td><td>yes</td><td>yes</td></tr>
+  </tbody>
+</table>
+
+<h2>The one place you cannot avoid them</h2>
+
+<p>A dependency may export an enum, and then you have to use it as a value:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { LogLevel } from 'some-library';
+
+configure({ level: LogLevel.Debug });</code></pre>
+
+<p>That import cannot be <code>import type</code>, because <code>LogLevel.Debug</code> is a property
+access on a real runtime object. It is one of the clearest illustrations of what makes enums
+different from every other type construct — and a small argument against exporting one from a
+library you publish, since you are making that decision for every consumer.</p>
+
+<h2>So is enum always wrong?</h2>
+
+<p>No, and it is worth being fair about it. If you are writing a Node service compiled by
+<code>tsc</code> itself, with no bundler and no <code>erasableSyntaxOnly</code>, a string enum is
+perfectly serviceable and the grouping under a namespace is genuinely pleasant.</p>
+
+<p>Angular projects use them without difficulty for the same reason — the Angular compiler handles
+whole programs, so none of the isolated-module problems arise.</p>
+
+<p>But the default has moved, and the reason is not fashion. The two alternatives above do
+everything an enum does, work in every build setup, and produce exactly the JavaScript you wrote.
+When a feature's replacement is strictly simpler, the feature stops being the obvious choice.</p>
+
+<p>TypeScript's own team has been fairly direct about this: if they were designing the language
+today, enums would probably not be in it.</p>
+
+<p>The practical test, if you want one: <em>does anything need to enumerate these values at
+runtime?</em> If not, use the union — it is less code and less output. If so, use a
+<code>const</code> object or array and derive the union from it. The enum sits awkwardly between
+the two, doing both jobs at the cost of being unlike everything else in the language.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-narrowing">Narrowing and Type Guards</a> — how to get from a
+union back to a single type, which is what makes all of this usable.</p>

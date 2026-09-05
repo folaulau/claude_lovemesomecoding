@@ -1,0 +1,254 @@
+<p>Modules are JavaScript's, and TypeScript adds one idea to them: an import can be for a
+<em>type</em>, which means it must disappear at build time. That sounds like a detail. It is the
+source of most module-related confusion in a modern TypeScript project, and of a compiler flag both
+halves of the pizza app turn on.</p>
+
+<h2>The ordinary part</h2>
+
+<pre class="language-typescript"><code class="language-typescript">// money.ts
+export const TAX_RATE = 0.085;
+export function formatMoney(amount: number): string { /* … */ }
+
+// elsewhere
+import { formatMoney, TAX_RATE } from '../lib/money';</code></pre>
+
+<p>Named exports, as in any ES module. Types are exported the same way:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export type UUID = string;
+export interface Product { /* … */ }</code></pre>
+
+<p>A file with any top-level <code>import</code> or <code>export</code> is a module, and its
+top-level names are private to it. A file with neither is a <em>script</em>, and its declarations go
+into the global scope — which is occasionally what you want for an ambient declaration file, and
+never what you want by accident.</p>
+
+<h2>import type</h2>
+
+<p>Here is the thing that is specific to TypeScript:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import type { ApiErrorBody } from '../types';</code></pre>
+
+<p>That is the first line of the app's HTTP module, and the <code>type</code> keyword says the
+import exists only for the type checker. The compiler removes the whole statement, so no
+<code>require</code> and no <code>import</code> of <code>../types</code> appears in the output.</p>
+
+<p>Why say it explicitly, when the compiler could work it out? Because in a modern build,
+<strong>nothing has the whole picture</strong>.</p>
+
+<p>Vite, esbuild and SWC transform one file at a time. Looking at
+<code>import { ApiErrorBody } from '../types'</code>, such a tool cannot tell whether
+<code>ApiErrorBody</code> is a type to be erased or a value to be kept — that answer is in a
+different file it has not read. Guess "keep" and you emit an import of a module that has no runtime
+exports at all. Guess "drop" and you delete a real one.</p>
+
+<p><code>import type</code> removes the guess. It is why the pattern is everywhere in the pizza
+codebase, in both frameworks:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { HttpErrorResponse } from '@angular/common/http';
+import type { ApiErrorBody } from './models';</code></pre>
+
+<p>Two imports, two intentions, stated. <code>HttpErrorResponse</code> is used with
+<code>instanceof</code>, so it must survive to runtime; <code>ApiErrorBody</code> is a shape and
+must not.</p>
+
+<h2>The three flags behind it</h2>
+
+<p><strong><code>isolatedModules</code></strong> tells the compiler to reject anything a
+single-file transform could not handle, so <code>tsc</code> catches the problem rather than the
+bundler shipping something broken. Both pizza configs are effectively under it; the Angular one sets
+it explicitly.</p>
+
+<p><strong><code>verbatimModuleSyntax</code></strong> goes further, and is what the React app
+uses:</p>
+
+<pre class="language-json"><code class="language-json">    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",</code></pre>
+
+<p>The rule it enforces is simple: imports without <code>type</code> are emitted exactly as
+written, and imports with it are dropped entirely. No cleverness, no elision of things that turned
+out to be unused. If you import a type without saying <code>type</code>, you get an error telling
+you to say it.</p>
+
+<p>The consequence people notice first is that a value import with no remaining runtime use is
+<em>kept</em> — which is correct, because that import may exist for its side effects.</p>
+
+<p><strong><code>moduleDetection: "force"</code></strong> treats every file as a module, so a file
+that happens to have no imports does not silently become a global script.</p>
+
+<p>You can also mark individual names inside a shared import, which is handy when a module exports
+both:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { ApiError, type ApiErrorBody } from './api';</code></pre>
+
+<h2>Module resolution</h2>
+
+<p>How a specifier becomes a file. Two settings matter now, and the rest are legacy.</p>
+
+<p><strong><code>"bundler"</code></strong> — resolve the way Vite, webpack or esbuild will. Extensions
+may be omitted, <code>package.json</code> <code>exports</code> is respected, and the bundler does
+the real work. This is what a frontend project wants, and what the React app sets.</p>
+
+<p><strong><code>"nodenext"</code></strong> — resolve the way Node does, which means honouring the
+ESM rules strictly. The consequence that surprises everyone: in an ESM Node project you must write
+the file extension, and it must be <code>.js</code> even though the file on disk is
+<code>.ts</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { toUserDto } from './serializers.js';   // the file is serializers.ts</code></pre>
+
+<p>That looks wrong and is correct. The import specifier describes the <em>output</em>, and
+TypeScript does not rewrite specifiers. Node will be loading <code>serializers.js</code>, so that is
+what the import must say. Any TypeScript backend on ESM is full of these.</p>
+
+<p>The React app sets <code>allowImportingTsExtensions</code>, which permits the opposite —
+writing <code>./money.ts</code> — and is legal only because <code>noEmit</code> is on. There would
+be no way to produce valid JavaScript from it otherwise.</p>
+
+<h2>Default exports</h2>
+
+<p>They work, and most style guides now discourage them:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export default function formatMoney(amount: number) { /* … */ }
+import anyNameAtAll from '../lib/money';   // the name is not checked</code></pre>
+
+<p>A default import can be called anything, so a typo becomes a rename rather than an error,
+automated refactoring cannot follow it, and two files can import the same thing under two names.
+Named exports have none of those problems, and the pizza app uses them throughout — the one common
+exception being frameworks that require a default, such as a page component in some routers.</p>
+
+<h2>Declaration files</h2>
+
+<p>A <code>.d.ts</code> file contains types and no implementation. You will meet them in three
+ways.</p>
+
+<p><strong>Shipped by a package.</strong> Most modern libraries include their own, and there is
+nothing to do.</p>
+
+<p><strong>From DefinitelyTyped.</strong> <code>npm i -D @types/react</code> and similar, for
+packages that do not.</p>
+
+<p><strong>Written by you</strong>, for the gaps. Two common cases — declaring a module that has no
+types at all, and telling TypeScript about a non-code import:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// src/globals.d.ts
+declare module 'legacy-widget';          // everything from it is `any`
+
+declare module '*.svg' {
+  const src: string;
+  export default src;
+}</code></pre>
+
+<p>The third case is the declaration merging from
+<a href="/typescript/typescript-interfaces-vs-type-aliases">lesson 7</a> — adding your environment
+variables to Vite's <code>ImportMetaEnv</code>, or a field to Express's <code>Request</code>.</p>
+
+<p>Note that <code>declare module 'x'</code> with no body is a blunt instrument: it silences the
+error and gives you <code>any</code>, with the spreading behaviour from
+<a href="/typescript/typescript-special-types">lesson 4</a>. Declaring the handful of functions you
+actually call is usually twenty minutes better spent.</p>
+
+<h2>Barrel files</h2>
+
+<p>An <code>index.ts</code> that re-exports a directory:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export * from './money';
+export * from './api';</code></pre>
+
+<p>Convenient for imports, and worth being wary of in application code. A barrel makes every
+importer depend on the whole directory, which hurts tree-shaking, slows the type checker, and is a
+reliable source of circular imports — the classic being two modules that both import from the
+barrel that exports them both.</p>
+
+<p>The pizza app's <code>src/types/index.ts</code> is a barrel of a safe kind: it contains the
+declarations rather than re-exporting them, and it is types only, so nothing survives to runtime.
+That is the case where the pattern costs nothing.</p>
+
+<h2>Circular imports</h2>
+
+<p>Two modules importing each other is legal in ES modules and legal in TypeScript, and it works
+fine for types — the checker resolves the whole program, so a cycle of pure type references is
+harmless.</p>
+
+<p>Values are another matter. A cycle in runtime imports means one of the two modules runs before
+the other has finished initialising, and whatever it reads is <code>undefined</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// money.ts
+import { TAX_RATE } from './config';
+export const rate = TAX_RATE;   // undefined if config imported money first</code></pre>
+
+<p>The type system does not warn you. <code>TAX_RATE</code> is declared <code>number</code> and it
+is, eventually — the type is right and the value is not there yet.</p>
+
+<p>Two things make cycles much less likely. Put shared types in a leaf module that imports nothing,
+which is what <code>src/types/index.ts</code> is. And use <code>import type</code> wherever the
+import is only a type, because such an import is erased and cannot participate in a runtime cycle at
+all. That second one is a genuine benefit of the explicit syntax beyond keeping the bundler happy.</p>
+
+<h2>Side-effect imports</h2>
+
+<p>An import with no bindings runs the module for what it does rather than what it exports:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import 'bootstrap/dist/css/bootstrap.min.css';
+import 'reflect-metadata';</code></pre>
+
+<p>These must never be written as <code>import type</code>, and they are the reason
+<code>verbatimModuleSyntax</code> keeps an import whose bindings are all unused — the compiler
+cannot know whether the module was imported for its side effects.</p>
+
+<h2>Re-exporting</h2>
+
+<p>Three forms, and the middle one is easy to get wrong:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export { formatMoney } from './money';        // a value
+export type { Product } from './types';       // a type — note where `type` goes
+export * from './money';                       // everything</code></pre>
+
+<p>Under <code>isolatedModules</code>, re-exporting a type without <code>export type</code> is an
+error, for exactly the reason <code>import type</code> exists: a single-file transform cannot tell
+whether <code>Product</code> is a value that must be forwarded at runtime.</p>
+
+<p><code>export * as ns from './money'</code> gives you a namespace object, which is occasionally
+tidier than a barrel and has the same tree-shaking caveats.</p>
+
+<h2>Path aliases</h2>
+
+<p>Deep relative imports are the usual reason people reach for aliases:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { formatMoney } from '../../../lib/money';   // where am I?</code></pre>
+
+<p>TypeScript's half is <code>paths</code>, relative to <code>baseUrl</code>:</p>
+
+<pre class="language-json"><code class="language-json">    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }</code></pre>
+
+<p>The trap is that this configures <strong>the type checker only</strong>. TypeScript will resolve
+<code>@/lib/money</code> and report no error; your bundler will then fail to find it at build time,
+or worse, at runtime.</p>
+
+<p>So the alias has to be declared twice — once for <code>tsc</code> and once for whatever actually
+builds. In Vite that is <code>resolve.alias</code>; in Jest, <code>moduleNameMapper</code>; in Node,
+the <code>imports</code> field in <code>package.json</code>. Keeping the two in step is the cost of
+the feature, and it is why plenty of projects, including this one, simply do not use aliases.</p>
+
+<p>One more thing worth knowing when you inherit an older codebase: <code>namespace</code> and
+<code>import x = require('y')</code> are pre-modules TypeScript, from before ES modules existed.
+They still work, <code>erasableSyntaxOnly</code> rejects namespaces with runtime members, and there
+is no reason to write either in new code. If you meet them, they are doing what a module does, less
+well.</p>
+
+<p>The short version of this whole lesson: modules behave as they do in JavaScript, and the one
+thing you have to add is saying which imports are types. Do that, and almost every module-related
+error you will hit — a bundler emitting an import of nothing, a re-export failing under
+<code>isolatedModules</code>, a circular import resolving to <code>undefined</code> — either
+disappears or becomes a compile error with a clear message.</p>
+
+<p>Everything else is JavaScript, and behaves the way it does everywhere else.</p>
+
+<h2>Next</h2>
+
+<p><a href="/typescript/typescript-tsconfig">tsconfig, the Flags That Matter</a> — the strict family
+one flag at a time, and the two real configurations in this app that contradict each other on
+purpose.</p>
