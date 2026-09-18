@@ -1,0 +1,272 @@
+<p>Most of what a mobile app does is show a list of things. It is also where SwiftUI performance is
+won or lost, and where the difference between three containers that look interchangeable turns out to
+matter a great deal.</p>
+
+<p>This lesson is <code>List</code> against <code>LazyVStack</code> against <code>LazyVGrid</code>,
+what identity is really doing, and what the framework gives you instead of React's <code>memo</code>
+— including the part you still have to do yourself.</p>
+
+<h2>The one that is not lazy</h2>
+
+<p>Start with the mistake, because it is easy to make and invisible until it is not:</p>
+
+<pre class="language-swift"><code class="language-swift">ScrollView {
+    VStack {
+        ForEach(orders) { order in
+            OrderCard(order: order)
+        }
+    }
+}
+</code></pre>
+
+<p>A <code>VStack</code> builds <strong>every</strong> child before showing you the first one. With
+a dozen orders nothing is wrong. With five hundred, opening the screen constructs five hundred
+views, runs five hundred bodies, and holds all of them in memory — and because it happens on the
+main thread, the app is unresponsive while it does.</p>
+
+<p>The fix is one word:</p>
+
+<pre class="language-swift"><code class="language-swift">        ScrollView {
+            LazyVStack(spacing: Spacing.md) {
+</code></pre>
+
+<p>"Lazy" means children are built as they approach the viewport and discarded as they leave.
+Reaching for the eager container in a scrolling list is the single most common SwiftUI performance
+mistake, and the habit is worth forming before you have a list long enough to notice.</p>
+
+<h2>Grids</h2>
+
+<p>A grid is the same idea with columns. The demo app's menu is two columns of product cards:</p>
+
+<pre class="language-swift"><code class="language-swift">    private let columns = [
+        GridItem(.flexible(), spacing: Spacing.md),
+        GridItem(.flexible(), spacing: Spacing.md),
+    ]
+</code></pre>
+
+<p>Three kinds of <code>GridItem</code> cover everything. <code>.flexible()</code> shares the space
+equally, which is what a fixed number of columns wants. <code>.adaptive(minimum:)</code> fits as
+many as it can, so the column count changes with the screen — the right choice for a photo grid.
+<code>.fixed()</code> pins a width, which is occasionally what a sidebar needs and usually not what
+you want.</p>
+
+<pre class="language-swift"><code class="language-swift">                LazyVGrid(columns: columns, spacing: Spacing.md) {
+                    ForEach(visible) { product in
+                        ProductCardView(product: product) { productBeingBuilt = product }
+                    }
+                }
+</code></pre>
+
+<p>Note the closure passed to each card. That is how a row reports a tap upward without knowing what
+happens next — the card's job is to draw a product and say when it was pressed.</p>
+
+<h2>List, and when to prefer it</h2>
+
+<p><code>List</code> is lazy too, and it brings a great deal the others do not: swipe actions,
+selection, section headers, the standard row insets and separators, pull-to-refresh, and the
+platform's own scrolling behaviour. If you are building something that should look like Settings or
+Mail, use it — reimplementing swipe-to-delete on a <code>LazyVStack</code> is a bad afternoon.</p>
+
+<p>The reason the demo app does not is styling. Its rows are brand-coloured cards on a cream
+background, and stripping <code>List</code> back to that means fighting its insets, separators and
+backgrounds on every row. When the design is a feed of cards rather than a table of rows,
+<code>LazyVStack</code> starts from nothing and stays out of the way.</p>
+
+<h2>Identity, and why a bad id is a rendering bug</h2>
+
+<p><code>ForEach</code> needs to tell items apart across updates — to know that this row is the same
+row it drew before, moved, rather than a different one. That is identity, and it drives animation,
+state retention and scroll position.</p>
+
+<p>The clean way is <code>Identifiable</code>:</p>
+
+<pre class="language-swift"><code class="language-swift">struct Product: Codable, Identifiable, Hashable {
+    let id: UUIDString
+    let name: String
+</code></pre>
+
+<p>Then <code>ForEach(products)</code> needs no key path at all. Two failure modes are worth
+knowing.</p>
+
+<p><strong><code>id: \.self</code> on a value that can repeat.</strong> For a
+<code>[String]</code> with two identical entries, SwiftUI sees one identity and the list behaves
+bizarrely — rows sharing state, animations jumping. It is fine for a genuinely unique set and a trap
+everywhere else.</p>
+
+<p><strong>An id derived from the index.</strong> Insert at the top and every item's identity
+shifts by one, so the framework believes every row changed. Everything re-renders, state moves
+between rows, and the insertion animates as a total replacement.</p>
+
+<h3>Enumerating without losing identity</h3>
+
+<p>Sometimes you need the index — to draw a divider between items rather than before the first one.
+The idiom keeps the element's own id:</p>
+
+<pre class="language-swift"><code class="language-swift">                ForEach(Array(cart.items.enumerated()), id: \.element.id) { index, item in
+                    if index > 0 { HairlineDivider(isSpaced: false) }
+</code></pre>
+
+<p>Identity comes from <code>element.id</code>, the index is only used for layout. Using
+<code>id: \.offset</code> there would be the index mistake with extra steps.</p>
+
+<h2>What replaced React.memo</h2>
+
+<p>If you have come from React, list performance means <code>memo</code> on every row and
+<code>useCallback</code> on every handler, because without both, a state change in the parent
+re-renders every row on screen.</p>
+
+<p>SwiftUI needs neither. A <code>View</code> is a value, and the framework compares the old and new
+values structurally before deciding to redraw — so a card whose <code>product</code> is unchanged is
+not re-rendered even though its parent was. The memoisation is the framework's job, not the
+author's.</p>
+
+<p>What <em>does</em> transfer is the obligation to keep the value cheap to compare. Three rules
+follow:</p>
+
+<ul>
+  <li><strong>Pass the data, not the store.</strong> A row that takes the whole cart depends on the
+  whole cart; a row that takes one line depends on one line.</li>
+  <li><strong>Keep rows small and specific.</strong> <code>ProductCardView</code> takes a
+  <code>Product</code> and a closure, and that is the entire surface.</li>
+  <li><strong>Do the work outside the body.</strong> Sorting or filtering inside a row's
+  <code>body</code> happens on every redraw, of every row.</li>
+</ul>
+
+<h3>Filtering, and where it belongs</h3>
+
+<pre class="language-swift"><code class="language-swift">            let visible = catalogue.products.filter(filter.matches)
+</code></pre>
+
+<p>Computed once, above the <code>ForEach</code>, rather than inside it. For a dozen products this
+is free; the habit matters when the collection is large or the predicate is not trivial. If the
+filtering were genuinely expensive, it would move into the view model as a stored value updated when
+its inputs change — but reach for that only once you have measured, because a cache that can go
+stale is a worse bug than a slow list.</p>
+
+<h2>Pull to refresh</h2>
+
+<p>There is no reload button on a phone, so a list that fetches once and never again is a list the
+customer cannot fix when something looks stale. One modifier:</p>
+
+<pre class="language-swift"><code class="language-swift">    private func list(orders: [Order], model: OrdersViewModel) -&gt; some View {
+        ScrollView {
+            LazyVStack(spacing: Spacing.md) {
+                if let email = auth.user?.email {
+                    Text(email)
+                        .textStyle(.caption, tone: .muted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                ForEach(orders) { order in
+                    Button {
+                        router.push(.order(id: order.id))
+                    } label: {
+                        orderCard(order)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(accessibilityLabel(for: order))
+                }
+            }
+            .padding(Spacing.lg)
+        }
+        .background(Theme.colors.background)
+        .refreshable { await model.load(showsLoadingState: false) }
+    }
+</code></pre>
+
+<p>Two details make it behave. <code>.refreshable</code> keeps the system spinner on screen for
+exactly as long as the <code>await</code> takes, which is why the view model exposes an awaitable
+reload rather than a fire-and-forget one — hand it something that returns immediately and the
+spinner flashes and vanishes.</p>
+
+<p>And <code>showsLoadingState: false</code>: replacing the list with a full-screen spinner when the
+customer has just dragged it down makes the content disappear under their finger. The refresh
+control is already the progress indicator.</p>
+
+<h3>A row is a button, not a tappable stack</h3>
+
+<p>Notice how the whole card is wrapped in a <code>Button</code> with
+<code>.buttonStyle(.plain)</code>. That is deliberate and it is an accessibility decision as much as
+a visual one. A <code>.onTapGesture</code> on a <code>VStack</code> also works and carries no
+semantics at all: VoiceOver does not announce it as a button, the system does not give it the press
+feedback, and it does not respond to switch control or a keyboard. <code>.plain</code> strips the
+default styling while keeping every one of those behaviours.</p>
+
+<h3>What a row should actually contain</h3>
+
+<p>Rows tend to grow. Keeping one readable is mostly a matter of splitting it into named pieces and
+being deliberate about text:</p>
+
+<pre class="language-swift"><code class="language-swift">    private var details: some View {
+        VStack(alignment: .leading, spacing: Spacing.xs) {
+            Text(product.name)
+                .textStyle(.subheading)
+                .lineLimit(1)
+
+            Text(product.description)
+                .textStyle(.caption, tone: .muted)
+                .lineLimit(2, reservesSpace: true)
+
+            HStack {
+                priceLabel
+                Spacer(minLength: Spacing.sm)
+                Text(product.type == .pizza ? "Build it →" : "Add →")
+                    .font(.system(size: FontSize.sm, weight: .semibold))
+                    .foregroundStyle(Theme.colors.primary)
+            }
+            .padding(.top, Spacing.xs)
+        }
+        .padding(Spacing.md)
+    }
+</code></pre>
+
+<p><code>reservesSpace: true</code> is the line that makes a grid line up. Without it a one-line
+description makes its card shorter than the one beside it, and the two columns drift apart down the
+page. It is the native answer to a fixed-height clamp in CSS, and the sort of thing that only shows
+up once your content is real rather than lorem ipsum.</p>
+
+<h2>Scrolling, targeted</h2>
+
+<p>Two modifiers worth knowing before you need them. <code>ScrollViewReader</code> gives a
+<code>scrollTo(id)</code> for jumping to an item — the standard answer to "scroll to the bottom
+after sending a message". And <code>.scrollDismissesKeyboard(.interactively)</code> lets a drag
+dismiss the keyboard, which on a form is the difference between a usable screen and one where the
+submit button is unreachable.</p>
+
+<h2>Measuring rather than guessing</h2>
+
+<p>Every rule above is a default worth following, not a substitute for looking. Three things to
+reach for, in order.</p>
+
+<p><strong>Run in Release.</strong> Debug builds are unoptimised and SwiftUI in particular is much
+slower under them; a great many "performance problems" are the debugger.
+<strong>Instruments</strong>, and specifically the SwiftUI template, shows which bodies are running
+and how often — usually the surprise is not that a body is slow but that it runs far more often than
+expected. And <strong>a real device</strong>, because your Mac is several times faster than the
+phone your customer has.</p>
+
+<h2>A note on very large lists</h2>
+
+<p>If a list is thousands of rows, the container stops being the bottleneck and the data does. Two
+things start to matter: fetching a page at a time rather than everything, and keeping each row's
+model small so that holding a screenful is cheap. The demo app's order history fetches twenty and
+has no pagination UI yet — a gap its README states rather than hides, because "there is no second
+page" is a product decision and "the second page silently never loads" is a bug.</p>
+
+<h2>Empty and failed are list states too</h2>
+
+<p>A list has at least four states, and the one that ships broken is always the same. Loading, a
+list with content, a list with nothing in it, and a request that failed. Rendering a spinner and
+forgetting the fourth gives you a screen that spins forever the first time the backend is down — and
+because it only happens when something else is already wrong, it is rarely caught before release.</p>
+
+<p>An empty result deserves its own treatment rather than being drawn as a list of zero rows. "No
+orders yet" with a button into the menu is a destination; a blank screen is a dead end. Lesson 11
+makes this a type so the framework stops you skipping a case, which is the only way it reliably
+stops happening.</p>
+
+<h2>Next</h2>
+
+<p>Lists lead to detail screens, and detail screens lead to forms. The next lesson is text input —
+the keyboard as part of your UI, the autocapitalisation default that breaks every email field, and
+validation rules that live outside the view and can be tested in microseconds.</p>

@@ -1,0 +1,272 @@
+<p>Navigation is where SwiftUI apps most often end up with code nobody wants to touch. The framework
+has had three generations of API in five years, most tutorials still show the oldest, and the shape
+that scales is not the shape you reach for first.</p>
+
+<p>This lesson is the modern one: a stack driven by a path of values, typed routes, and a tab bar
+where each tab remembers where it was.</p>
+
+<h2>Why routes should be values</h2>
+
+<p>The API almost everyone meets first is <code>NavigationLink(destination:)</code>, which takes the
+destination view directly. It works, and it has a flaw that only shows up at size: the destination
+is built <strong>eagerly</strong>, at the moment the link is rendered. A list of fifty orders
+constructs fifty detail screens nobody asked for.</p>
+
+<p><code>NavigationStack</code> with a <code>path</code> inverts that. You append a small value; the
+view is built only when it is actually shown:</p>
+
+<pre class="language-swift"><code class="language-swift">enum AppRoute: Hashable {
+    case checkout
+    case order(id: UUIDString)
+}
+</code></pre>
+
+<p>Two lines, and both destinations the app can push. <code>Hashable</code> is the only requirement
+— the stack uses it to tell entries apart.</p>
+
+<p>The second payoff is bigger than the first: navigation becomes <em>data</em>. "The customer is
+two levels deep looking at order X" is a <code>[AppRoute]</code>, which can be asserted on in a
+test, logged with a bug report, or restored after the system terminated your app in the background.
+None of that is possible when the position is implied by which views happen to be alive.</p>
+
+<h2>The stack</h2>
+
+<pre class="language-swift"><code class="language-swift">                NavigationStack(path: router.path(for: tab)) {
+                    rootScreen(for: tab)
+                        .navigationDestination(for: AppRoute.self) { route in
+                            destination(for: route)
+                        }
+</code></pre>
+
+<p>Three pieces. The <code>path</code> binding is the stack's contents, and it is two-way — the
+system writes to it when the customer swipes back, so your model always reflects the truth.
+<code>navigationDestination(for:)</code> registers how to turn a route into a view. And the closure
+runs lazily, once, when that route is pushed.</p>
+
+<p>Turning a route into a screen is then an ordinary <code>switch</code>:</p>
+
+<pre class="language-swift"><code class="language-swift">    @ViewBuilder
+    private func destination(for route: AppRoute) -&gt; some View {
+        switch route {
+        case .checkout:
+            CheckoutView()
+        case let .order(id):
+            OrderConfirmationView(orderID: id)
+        }
+    }
+</code></pre>
+
+<p>Exhaustive, so adding a route stops the build until somebody says what it shows.
+<code>@ViewBuilder</code> is what allows the branches to return different view types.</p>
+
+<h3>Where to register the destination</h3>
+
+<p>A trap worth naming: <code>navigationDestination</code> must be attached <em>inside</em> the
+<code>NavigationStack</code>, on a view in its content — not on the stack itself. Put it on the
+stack and pushes do nothing at all, with a purple runtime warning if you are lucky and silence if
+you are not.</p>
+
+<h2>Tabs, and why each needs its own stack</h2>
+
+<p>A tab bar is a <code>TabView</code>, and every tab holds a <code>NavigationStack</code>. The
+question people get wrong is whether those stacks share a path.</p>
+
+<p>They must not. One shared path means switching tabs inherits the previous tab's stack — tap
+Orders, open an order, switch to Menu, and the menu appears two levels deep with a back button to
+somebody else's screen. Per-tab paths are what make each tab remember where it was, which is what
+every iOS user expects without being able to articulate it.</p>
+
+<pre class="language-swift"><code class="language-swift">@MainActor
+@Observable
+final class AppRouter {
+    var selectedTab: AppTab = .home
+    var presentedSheet: AppSheet?
+
+    var homePath = NavigationPath()
+    var menuPath = NavigationPath()
+    var ordersPath = NavigationPath()
+    var profilePath = NavigationPath()
+</code></pre>
+
+<p><code>NavigationPath</code> is a type-erased stack, so it can hold routes of several different
+types at once. A plain <code>[AppRoute]</code> also works and is simpler when — as here — there is
+only one route type; the erased version costs nothing and leaves the door open.</p>
+
+<h3>Routing without knowing which tab you are in</h3>
+
+<p>Four paths means four places to append to, and no feature should have to care which. One method
+resolves it:</p>
+
+<pre class="language-swift"><code class="language-swift">    func push(_ route: AppRoute) {
+        switch selectedTab {
+        case .home: homePath.append(route)
+        case .menu: menuPath.append(route)
+        case .orders: ordersPath.append(route)
+        case .profile: profilePath.append(route)
+        }
+    }
+</code></pre>
+
+<p>Now the checkout button on the cart sheet works identically whether the customer opened the cart
+from Home or from Orders. The feature says <code>router.push(.checkout)</code> and nothing else.</p>
+
+<h2>Programmatic navigation</h2>
+
+<p>Because the path is just a value, moving around is ordinary code. Three operations cover almost
+everything.</p>
+
+<p><strong>Push</strong> appends, as above. <strong>Pop to root</strong> assigns an empty path.
+And <strong>replace</strong> — the one people reach for late and need more than they expect:</p>
+
+<pre class="language-swift"><code class="language-swift">    func replaceStack(with route: AppRoute) {
+        switch selectedTab {
+        case .home: homePath = NavigationPath([route])
+        case .menu: menuPath = NavigationPath([route])
+        case .orders: ordersPath = NavigationPath([route])
+        case .profile: profilePath = NavigationPath([route])
+        }
+    }
+</code></pre>
+
+<p>This is what runs after a successful payment. Pushing the confirmation screen would leave checkout
+underneath it, and the back gesture would return the customer to a payment form for an order that
+has already been paid for. Clearing the stack first is the native equivalent of a web router's
+<code>replace</code>, and the reason to have it is a real bug rather than tidiness.</p>
+
+<h3>Dismissing from inside a screen</h3>
+
+<p>A pushed screen that wants to go back does not need the router at all:</p>
+
+<pre class="language-swift"><code class="language-swift">    @Environment(\.dismiss) private var dismiss
+</code></pre>
+
+<p>Calling <code>dismiss()</code> pops a pushed view or closes a sheet, whichever it is in. Prefer
+it for "close me" and keep the router for "go somewhere specific" — a screen that knows how to
+dismiss itself is reusable in both contexts.</p>
+
+<h2>Tabs as a closed set</h2>
+
+<p>The tabs themselves are an enum, so the tab bar is generated rather than listed:</p>
+
+<pre class="language-swift"><code class="language-swift">enum AppTab: Hashable, CaseIterable {
+    case home
+    case menu
+    case orders
+    case profile
+
+    var title: String {
+        switch self {
+        case .home: "Home"
+        case .menu: "Menu"
+        case .orders: "Orders"
+        case .profile: "Profile"
+        }
+    }
+</code></pre>
+
+<p>Which means the bar itself is a loop:</p>
+
+<pre class="language-swift"><code class="language-swift">                .tabItem {
+                    Label(tab.title, systemImage: tab.systemImage)
+                }
+                .tag(tab)
+</code></pre>
+
+<p>Adding a fifth tab is then one enum case and one <code>switch</code> arm the compiler asks for,
+rather than four edits in three files that are easy to leave half-finished.</p>
+
+<p><code>.tag</code> is what connects a tab to the selection binding, and omitting it is a common
+cause of "my tab bar does not switch". <code>Label</code> takes an SF Symbol name — a system icon
+set that tints with the tab bar's colours, scales with Dynamic Type and carries accessibility
+descriptions. The React Native version of this app uses emoji and comments that a real app would use
+an icon set; this is that app.</p>
+
+<h3>What is deliberately not a tab</h3>
+
+<p>The cart. It is a toolbar button that opens a sheet, so the customer never loses the screen they
+were on — tapping a fifth tab to check the basket and then navigating back to the menu is the
+friction this avoids. Worth stating because "is this a destination or an overlay?" is a design
+decision that navigation code will otherwise make for you by default.</p>
+
+<h2>Modals belong in the same model</h2>
+
+<p>A sheet is navigation too, and the instinct is to give each one a boolean. Three
+<code>@State private var isXPresented</code> flags allow two sheets to be "presented" at once,
+which SwiftUI resolves by showing one and silently ignoring the other — a bug that looks like a tap
+being dropped. One optional enum makes that unrepresentable:</p>
+
+<pre class="language-swift"><code class="language-swift">enum AppSheet: Identifiable, Hashable {
+    case cart
+    case signIn
+    case register
+
+    var id: Self { self }
+}
+</code></pre>
+
+<p><code>var id: Self { self }</code> is the idiom for making an enum <code>Identifiable</code>
+when the case itself is the identity. Lesson 8 goes into what <code>.sheet(item:)</code> then buys
+you; the point here is that modal presentation lives in the router beside the stacks, because it is
+the same question.</p>
+
+<h2>The navigation bar</h2>
+
+<p>The bar is configured from the content, not from the stack — another consequence of views being
+values. A screen states what it wants and the nearest stack obeys:</p>
+
+<pre class="language-swift"><code class="language-swift">                        .toolbar { cartToolbarItem }
+                        .toolbarBackground(Theme.colors.surfaceInverse, for: .navigationBar)
+                        .toolbarBackground(.visible, for: .navigationBar)
+                        .toolbarColorScheme(.dark, for: .navigationBar)
+</code></pre>
+
+<p>Two of those need explaining. <code>.toolbarBackground(.visible, …)</code> is required because
+iOS hides the bar's background until content scrolls under it — without it, a dark brand bar appears
+only when the customer scrolls, which reads as a rendering bug. And
+<code>.toolbarColorScheme(.dark, …)</code> tells the system the bar is dark so it draws the title
+and buttons light; it is about the <em>bar</em>, not the app.</p>
+
+<p>Titles are set per screen with <code>.navigationTitle()</code>, and
+<code>.navigationBarTitleDisplayMode(.inline)</code> chooses between the large scrolling title and
+the compact one. Both belong on the screen, for the same reason: the screen knows what it is called,
+the container does not.</p>
+
+<h2>Deep links</h2>
+
+<p>Because routes are values, a URL handler is a parser and nothing more: turn the URL into an
+<code>AppRoute</code>, select the right tab, append. <code>onOpenURL</code> is where that goes.</p>
+
+<p>The demo app declares a URL scheme already — not for deep linking, but because Stripe needs
+somewhere to return to after a bank's 3D Secure page. That is lesson 17; the point here is that the
+scheme is registered in <code>Info.plist</code> and the routing model is ready for it.</p>
+
+<h2>What to avoid</h2>
+
+<p>Two patterns that look reasonable and are not.</p>
+
+<p><strong>Do not nest a <code>NavigationStack</code> inside another one.</strong> It is the most
+common cause of double navigation bars and back buttons that go to the wrong place. One stack per
+tab, and screens inside it are plain views.</p>
+
+<p><strong>Do not put a <code>TabView</code> inside a <code>NavigationStack</code>.</strong> It is
+the wrong way round — the tabs are the outer structure and each one owns a stack, not the other way
+about. Getting this backwards produces an app where the navigation bar belongs to the wrong screen.</p>
+
+<h2>One more thing the router makes easy</h2>
+
+<p>Because navigation is state in an object rather than a side effect in a view, a few things that
+are normally awkward become ordinary. Popping to root and switching tab is two calls from anywhere
+— it is what the "Back to the menu" button on the receipt screen does. Presenting sign-in from three
+different places needs no shared parent, because nothing is being passed down. And a test can drive
+the router directly and assert on the resulting path without rendering a single view.</p>
+
+<p>The cost is one more type to hold in your head, and a rule to keep: <strong>features ask the
+router to navigate; they do not read its state to decide what to draw.</strong> Once a screen starts
+branching on where it is in the stack, the router has become a second, worse source of truth.</p>
+
+<h2>Next</h2>
+
+<p>Navigation usually starts from a list, and lists are where SwiftUI performance is won or lost.
+The next lesson is <code>List</code> against <code>LazyVStack</code> against
+<code>LazyVGrid</code>, why identity matters more than it looks, and what the framework does instead
+of React's <code>memo</code>.</p>

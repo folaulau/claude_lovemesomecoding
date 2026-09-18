@@ -1,0 +1,287 @@
+<p>On the web a form is markup and the browser handles the rest. On a phone the keyboard is part of
+your interface, and the difference between a pleasant form and an infuriating one is almost entirely
+in details that are invisible until you use it with your thumbs.</p>
+
+<p>This lesson covers those details, then focus management, then a validation model that keeps the
+rules out of the view and testable in microseconds.</p>
+
+<h2>The keyboard is your UI</h2>
+
+<p>Three modifiers decide how a field behaves, and skipping any of them produces a field that works
+in the simulator and annoys a real customer.</p>
+
+<p><code>keyboardType</code> chooses the layout — <code>.emailAddress</code> puts an "@" on the main
+keyboard, <code>.numberPad</code> shows digits only. <code>textContentType</code> tells iOS what the
+field <em>means</em>, which is what drives AutoFill. And <code>textInputAutocapitalization</code>
+has a default that is wrong more often than it is right.</p>
+
+<p>That last one deserves its own warning. The default is sentence capitalisation, so an email field
+left alone produces "Folau@example.com" and the server rejects it. It is the single most common
+mobile form bug, and it is invisible to anyone testing with a hardware keyboard.</p>
+
+<p>Because the three only work together, the demo app bundles them:</p>
+
+<pre class="language-swift"><code class="language-swift">    func emailField() -&gt; some View {
+        keyboardType(.emailAddress)
+            .textContentType(.emailAddress)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+    }
+</code></pre>
+
+<p>A field with <code>.emailAddress</code> content type but sentence capitalisation still produces
+the broken address — and that partial configuration is exactly what a copy-pasted field ends up
+with. One modifier makes the correct combination the easy one.</p>
+
+<h3>AutoFill is worth more than it looks</h3>
+
+<p><code>textContentType</code> is what offers the Keychain's password bar above the keyboard.
+Without <code>.password</code> on a sign-in field, a saved credential is invisible and the customer
+retypes it every time — and on a registration field, <code>.newPassword</code> rather than
+<code>.password</code> is what makes iOS offer to <em>generate</em> a strong one.</p>
+
+<p>The address types matter too: <code>.streetAddressLine1</code>, <code>.addressCity</code>,
+<code>.addressState</code> and <code>.postalCode</code> let the system fill a whole delivery address
+from a contact card in one tap. For a checkout form that is a measurable difference in completion.</p>
+
+<h2>A field worth reusing</h2>
+
+<p>SwiftUI's <code>TextField</code> is a bare input: no label, no error slot, no focus styling. Every
+app ends up wrapping it, and the wrapper is worth getting right once:</p>
+
+<pre class="language-swift"><code class="language-swift">struct LabeledTextField: View {
+    let title: String
+    @Binding var text: String
+    var isRequired = false
+    var hint: String?
+    /// Usually a server-side field error, rendered under the input in red.
+    var error: String?
+    var isSecure = false
+
+    @FocusState private var isFocused: Bool
+</code></pre>
+
+<p>The <code>@Binding</code> is the important part of the interface: the field does not own the
+text, it edits somebody else's. Everything else is presentation — a label, an optional hint, an
+optional error, and whether to obscure what is typed.</p>
+
+<pre class="language-swift"><code class="language-swift">            Group {
+                if isSecure {
+                    SecureField("", text: $text)
+                } else {
+                    TextField("", text: $text)
+                }
+            }
+            .focused($isFocused)
+            .font(.system(size: FontSize.base))
+            .foregroundStyle(Theme.colors.text)
+            .padding(.horizontal, Spacing.md)
+            .frame(height: 46)
+            .background(Theme.colors.surface)
+            .overlay(
+                RoundedRectangle(cornerRadius: Radius.sm)
+                    .strokeBorder(borderColor, lineWidth: 1.5)
+            )
+</code></pre>
+
+<p><code>Group</code> is the trick that lets one set of modifiers apply to two different view types
+— without it, the <code>if</code> would need the whole modifier chain duplicated in both branches.</p>
+
+<p>The focus ring is drawn by swapping the border colour, because there is no <code>:focus</code>
+pseudo-class to hook. That is what <code>@FocusState</code> is for, and it is more capable than the
+web equivalent because it is <strong>writable</strong>: a screen can move focus, not merely observe
+it.</p>
+
+<h3>Placeholder is not a label</h3>
+
+<p>Both <code>TextField</code> calls above pass <code>""</code> as the placeholder, and the label is
+a separate <code>Text</code> above the field. That is deliberate. A placeholder disappears the moment
+someone types, so a form built from placeholders is a form you cannot check over before submitting —
+and it is invisible to VoiceOver as a label. Use a placeholder for an example value, never for the
+field's name.</p>
+
+<h2>Focus and the keyboard's return key</h2>
+
+<p>There is no Tab key on a phone. If you do not wire up field-to-field movement, the customer
+dismisses the keyboard between every field, and on a six-field checkout that is enough friction to
+lose them.</p>
+
+<pre class="language-swift"><code class="language-swift">    @FocusState private var focusedField: Field?
+
+    private enum Field: Hashable {
+        case email
+        case password
+    }
+</code></pre>
+
+<p>An optional enum, because "no field focused" is a real state. Each field claims a value:</p>
+
+<pre class="language-swift"><code class="language-swift">                        .submitLabel(.next)
+                        .focused($focusedField, equals: .email)
+</code></pre>
+
+<p><code>.submitLabel</code> changes what the return key <em>says</em> — "next" on an intermediate
+field, "go" on the last one. It is a one-word change that makes a form feel finished.</p>
+
+<p>Then one handler moves through them:</p>
+
+<pre class="language-swift"><code class="language-swift">            .onSubmit {
+                switch focusedField {
+                case .email: focusedField = .password
+                case .password: Task { await submit() }
+                case nil: break
+                }
+            }
+</code></pre>
+
+<p>Exhaustive, so adding a field to the enum makes the compiler ask what the return key should do
+from it. That is a small thing, and it is the difference between a form that stays correct as it
+grows and one that quietly stops chaining halfway down.</p>
+
+<h3>Dismissing the keyboard</h3>
+
+<p>iOS has no tap-outside-to-dismiss convention the way the web does, so a keyboard covering the
+submit button with no obvious way to close it is a dead end. One modifier on the scroll view fixes
+it:</p>
+
+<pre class="language-swift"><code class="language-swift">                .scrollDismissesKeyboard(.interactively)
+</code></pre>
+
+<p>Now dragging the page pushes the keyboard down with it, which is what customers already try.</p>
+
+<h2>Validation belongs outside the view</h2>
+
+<p>The instinct is to validate in the view, next to the fields. It works, and it puts the rules
+somewhere you cannot test without rendering a screen. Splitting them out costs one type:</p>
+
+<pre class="language-swift"><code class="language-swift">struct CheckoutForm: Equatable {
+    var customerName = ""
+    var email = ""
+    var phone = ""
+    var addressLine1 = ""
+    var city = ""
+    var state = ""
+    var postalCode = ""
+</code></pre>
+
+<p>A plain value, so the rules below are a pure function of it — no observation, no main actor, no
+view.</p>
+
+<p>Errors are keyed by an enum rather than a string:</p>
+
+<pre class="language-swift"><code class="language-swift">    enum Field: Hashable, CaseIterable {
+        case customerName
+        case email
+        case addressLine1
+        case city
+        case state
+        case postalCode
+    }
+</code></pre>
+
+<p><code>errors["postalCode"]</code> compiles with any typo and silently shows nothing;
+<code>errors[.postalCode]</code> does not compile if the case does not exist.</p>
+
+<h3>Rules that depend on context</h3>
+
+<p>Validation is rarely per-field in isolation. A delivery address is required for delivery and
+meaningless for pickup, and irrelevant again when a saved address is selected:</p>
+
+<pre class="language-swift"><code class="language-swift">    static func validate(_ form: CheckoutForm, context: Context) -&gt; [CheckoutForm.Field: String] {
+        var errors: [CheckoutForm.Field: String] = [:]
+
+        if form.customerName.trimmed.isEmpty {
+            errors[.customerName] = "Please tell us who the order is for."
+        }
+
+        if !isPlausibleEmail(form.email) {
+            errors[.email] = "We need a valid email to send the receipt."
+        }
+
+        guard context.orderType == .delivery, context.needsTypedAddress else { return errors }
+</code></pre>
+
+<p>The <code>guard</code> is the whole context rule in one line. Validating the address fields for a
+pickup order would block a customer whose form is perfectly complete — a bug you would never
+notice, because you would be testing delivery.</p>
+
+<h3>Be permissive</h3>
+
+<p>An address is validated by the delivery driver, not by a regular expression. The rules only have
+to be strict enough to catch a typo and loose enough never to reject a real address — and the
+"correct" RFC 5322 email pattern rejects addresses that work.</p>
+
+<pre class="language-swift"><code class="language-swift">    static func isPlausibleEmail(_ value: String) -&gt; Bool {
+        let trimmed = value.trimmed
+        guard !trimmed.contains(" ") else { return false }
+
+        let parts = trimmed.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty else { return false }
+</code></pre>
+
+<p>Something, an @, something, a dot, something. Written with <code>split</code> rather than a
+regular expression on purpose: it is easier to read, it cannot backtrack pathologically, and it says
+exactly what it checks. Over-validating an email is a classic way to lose a customer.</p>
+
+<h3>Do not shout at a blank field</h3>
+
+<p>Errors stay hidden until the first submit. A form that turns red before the customer has reached a
+field is hostile, and one that clears an error while they are still typing in that field is nearly
+as bad. The demo app tracks a single "has this been submitted" flag and gates the display on it —
+the rules run whenever, the messages appear when asked for.</p>
+
+<h2>Testing the rules</h2>
+
+<p>This is the return on pulling validation out. The tests need no view, no simulator and no async:</p>
+
+<pre class="language-swift"><code class="language-swift">    func testPickupDoesNotRequireAnAddress() {
+        var form = validForm()
+        form.addressLine1 = ""
+        form.city = ""
+        form.state = ""
+        form.postalCode = ""
+
+        XCTAssertTrue(CheckoutFormValidator.validate(form, context: pickup).isEmpty)
+    }
+</code></pre>
+
+<p>Twelve tests cover the whole form and run in under a millisecond. The email cases are the ones
+worth writing carefully — a list of addresses that must be accepted, including
+<code>sam.carter+pizza@example.co.uk</code>, next to a list of obvious typos that must not be. That
+second list is how you stop somebody "tightening" the rule later and silently locking out a real
+customer.</p>
+
+<h2>Numbers, dates and the other controls</h2>
+
+<p>Not every field is text. SwiftUI ships <code>Toggle</code>, <code>Picker</code>,
+<code>DatePicker</code>, <code>Slider</code> and <code>Stepper</code>, and they are all bound the
+same way — hand them a <code>@Binding</code> and they handle the rest.</p>
+
+<p>Two things to know. <code>TextField(value:format:)</code> binds directly to a number with a
+format style, which saves parsing a string by hand and rejects nonsense as you type. And SwiftUI's
+own <code>Form</code> container gives you the grouped, inset appearance of Settings for free —
+worth using when that <em>is</em> the design, and worth avoiding when your form is brand-styled
+cards, because unpicking its insets and backgrounds is more work than starting from a
+<code>VStack</code>.</p>
+
+<h2>Server errors land on fields too</h2>
+
+<p>Client validation is a convenience; the server is the authority, and it knows things the device
+cannot — that an email is already registered, that a postcode does not exist. When it replies with
+per-field messages, they belong under the right input rather than in one banner that says "something
+in this form is wrong, find it". That is what the <code>error:</code> slot on the field component is
+for, and lesson 11 covers where those messages come from.</p>
+
+<h2>Accessibility, in one paragraph</h2>
+
+<p>A custom field wrapper loses the semantics the system control had. The demo app's component
+restores them: the whole thing is one accessibility element with the label as its name, and an error
+is exposed as its value so VoiceOver announces it. A red border says nothing to somebody who cannot
+see it, and a field whose error is only a colour is a field they cannot fix. Lesson 18 covers this
+properly.</p>
+
+<h2>Next</h2>
+
+<p>Most forms in this app appear in a sheet rather than a pushed screen. The next lesson is sheets
+and modals — detents, the presentation API that resets a form for free, and the boolean flag that
+makes a tap look like it was dropped.</p>

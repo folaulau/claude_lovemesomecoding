@@ -158,11 +158,19 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Features/Menu/MenuView.swift",
         f"{A}/Pizza/Features/Menu/Components/ProductCardView.swift",
         f"{A}/Pizza/Features/Orders/OrdersView.swift",
+        # The identity section quotes the model that makes `ForEach(products)` work without a key
+        # path, and the enumerated-with-element-id idiom from the cart.
+        f"{A}/Pizza/Domain/Models/Catalog.swift",
+        f"{A}/Pizza/Features/Cart/Components/CartSheetView.swift",
     ],
     "ios-forms-and-input": [
         f"{A}/Pizza/Core/DesignSystem/Components/LabeledTextField.swift",
         f"{A}/Pizza/Features/Auth/SignInView.swift",
         f"{A}/Pizza/Features/Checkout/CheckoutForm.swift",
+        # The keyboard-dismiss modifier, and the validator tests that are the payoff for keeping
+        # the rules out of the view.
+        f"{A}/Pizza/Core/DesignSystem/Components/ScreenContainer.swift",
+        f"{A}/PizzaTests/CheckoutFormValidatorTests.swift",
     ],
     "ios-sheets-and-modals": [
         f"{A}/Pizza/Core/DesignSystem/Components/SheetScaffold.swift",
@@ -170,6 +178,10 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Features/Menu/MenuView.swift",
         f"{A}/Pizza/Features/Profile/ProfileView.swift",
         f"{A}/Pizza/App/AppRouter.swift",
+        # The builder sheet is the `.sheet(item:)` example, and its preview is the presentation idiom.
+        f"{A}/Pizza/Features/Menu/Components/PizzaBuilderSheet.swift",
+        # The detents are applied where the sheet is presented, which is the root view.
+        f"{A}/Pizza/App/RootView.swift",
     ],
     "ios-design-system": [
         f"{A}/Pizza/Core/DesignSystem/Tokens.swift",

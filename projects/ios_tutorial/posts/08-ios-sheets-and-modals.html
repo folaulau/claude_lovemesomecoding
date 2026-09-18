@@ -1,0 +1,289 @@
+<p>A sheet is the phone's answer to a dialog, and SwiftUI's version of it is one of the places the
+framework has genuinely less code than the alternatives. It is also where a specific, avoidable bug
+shows up constantly: a tap that appears to do nothing.</p>
+
+<p>This lesson is the presentation APIs, the difference between the two that matters most, detents,
+alerts, and the shared chrome that stops every sheet in an app looking slightly different.</p>
+
+<h2>Two presentation APIs</h2>
+
+<p>The one everyone learns first takes a boolean:</p>
+
+<pre class="language-swift"><code class="language-swift">.sheet(isPresented: $isShowingCart) { CartSheetView() }
+</code></pre>
+
+<p>The other takes an optional value:</p>
+
+<pre class="language-swift"><code class="language-swift">        .sheet(item: $productBeingBuilt) { product in
+            PizzaBuilderSheet(product: product) { productBeingBuilt = nil }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.hidden)
+        }
+</code></pre>
+
+<p>Non-nil presents, <code>nil</code> dismisses, and the closure receives the unwrapped value. It
+is strictly better than the boolean whenever the sheet is <em>about</em> something, and the reason
+is not convenience.</p>
+
+<h3>Why <code>item:</code> resets state for free</h3>
+
+<p><code>.sheet(item:)</code> builds a fresh view for each <strong>distinct</strong> value. Open a
+different pizza and it is a different view — new identity, new <code>@State</code>, so every
+selection starts from that product's defaults with no code at all.</p>
+
+<p>With a boolean you get one sheet whose state persists between presentations. The customer
+configures a large stuffed-crust pepperoni, closes it, opens a margherita, and finds the previous
+pizza's toppings. The usual fix is an effect that copies the new product into state when the flag
+flips — which renders the old values for a frame first, and is the exact pattern the React Native
+version of this app needs a bumped counter and a paragraph of comment to avoid. Here, choosing the
+right modifier is the whole solution.</p>
+
+<h3>The boolean trap</h3>
+
+<p>The related bug is having several booleans. Three <code>@State private var isXPresented</code>
+flags let two sheets be "presented" at once, and SwiftUI resolves that by showing one and silently
+ignoring the other. It reads as a dropped tap, and it is intermittent, because it depends on which
+flag was set last.</p>
+
+<p>One optional enum makes it unrepresentable:</p>
+
+<pre class="language-swift"><code class="language-swift">enum AppSheet: Identifiable, Hashable {
+    case cart
+    case signIn
+    case register
+
+    var id: Self { self }
+}
+</code></pre>
+
+<p>Now "which sheet is open" has exactly one answer at all times, and presenting a second one
+replaces the first rather than racing it.</p>
+
+<h3>When the value is not naturally Identifiable</h3>
+
+<p>The profile screen's form sheet either adds an address or edits one. A bare
+<code>Address?</code> cannot express that, because <code>nil</code> already means "closed":</p>
+
+<pre class="language-swift"><code class="language-swift">    private enum AddressFormMode: Identifiable {
+        case add
+        case edit(Address)
+
+        var id: String {
+            switch self {
+            case .add: "new"
+            case let .edit(address): address.id
+            }
+        }
+</code></pre>
+
+<p>Both states get a spelling, and because the ids differ, switching from adding to editing rebuilds
+the sheet and resets the form — the same identity mechanism, used deliberately.</p>
+
+<h2>Detents</h2>
+
+<p>A sheet does not have to be full height. Detents are the resting positions it can snap to:</p>
+
+<pre class="language-swift"><code class="language-swift">            CartSheetView()
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.hidden)
+</code></pre>
+
+<p>Two entries means the customer can drag between half height and full. A cart with one line does
+not need the whole screen, and the smaller detent leaves the menu visible behind it — which keeps
+the customer oriented in a way a full-screen modal does not.</p>
+
+<p>Beyond <code>.medium</code> and <code>.large</code> there are <code>.height(300)</code> and
+<code>.fraction(0.3)</code> for something specific. Related modifiers worth knowing:
+<code>.presentationBackgroundInteraction(.enabled)</code> lets the customer interact with what is
+behind a half-height sheet, and <code>.interactiveDismissDisabled()</code> stops a swipe-to-dismiss
+— appropriate for a form with unsaved changes, and irritating anywhere else.</p>
+
+<h2>Shared chrome</h2>
+
+<p>SwiftUI gives you the presentation, the drag gesture and the animation. What it does not give you
+is the inside: a title that stays put while content scrolls under it, and a footer pinned above the
+safe area. Left to each screen, those drift apart.</p>
+
+<pre class="language-swift"><code class="language-swift">struct SheetScaffold&lt;Content: View, Footer: View&gt;: View {
+    let title: String
+    let onClose: () -&gt; Void
+    @ViewBuilder let content: () -&gt; Content
+    @ViewBuilder let footer: () -&gt; Footer
+</code></pre>
+
+<p>Two <code>@ViewBuilder</code> closures — a body and a footer — so a caller fills both and gets the
+grabber, the title row and the close button without asking. The builder sheet puts its live price and
+"Add to cart" in the footer; the cart puts its totals and checkout button there.</p>
+
+<p>A convenience initialiser covers the sheets with no footer:</p>
+
+<pre class="language-swift"><code class="language-swift">extension SheetScaffold where Footer == EmptyView {
+    init(
+        title: String,
+        onClose: @escaping () -&gt; Void,
+        @ViewBuilder content: @escaping () -&gt; Content
+    ) {
+        self.init(title: title, onClose: onClose, content: content) { EmptyView() }
+    }
+}
+</code></pre>
+
+<p>Constraining an extension on the generic parameter is a very Swift thing to do, and this is the
+common case for it: the second closure only exists when the caller wants it.</p>
+
+<p>Inside, the layout is three regions — a fixed header, a scrolling middle, and a footer that only
+appears if the caller supplied one:</p>
+
+<pre class="language-swift"><code class="language-swift">            HStack {
+                Text(title)
+                    .textStyle(.heading)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: FontSize.md, weight: .semibold))
+                        .foregroundStyle(Theme.colors.textMuted)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close")
+            }
+            .padding(.horizontal, Spacing.lg)
+            .padding(.bottom, Spacing.md)
+</code></pre>
+
+<p><code>.contentShape(Rectangle())</code> is the modifier people miss. Without it only the drawn
+glyph is tappable, so the 44-point frame is a lie — it looks like a large target and behaves like a
+small one. It tells SwiftUI to treat the whole frame as hit-testable, and it is worth reaching for
+any time a tappable area is mostly empty space.</p>
+
+<h3>The close button is not optional</h3>
+
+<p>Swipe-to-dismiss exists, and it is not discoverable enough to be the only way out. An explicit
+close control matters more for accessibility than for convenience — a customer using VoiceOver or
+Switch Control cannot swipe a sheet away. The scaffold gives it a 44-point tappable frame and an
+accessibility label, and hides the drag indicator because the grabber is drawn as part of the header
+instead.</p>
+
+<h2>Dismiss before you navigate</h2>
+
+<p>A sheet still presented over a pushed screen swallows every tap on it. So the checkout button in
+the cart does these two things in this order:</p>
+
+<pre class="language-swift"><code class="language-swift">                router.dismissSheet()
+                router.push(.checkout)
+</code></pre>
+
+<p>Both happen in the same run loop pass, so there is no visible gap — but reversing them gives you
+a checkout screen that appears and then ignores you. This is worth remembering as a general rule:
+finish with the modal layer before moving the layer underneath it.</p>
+
+<h2>Alerts and confirmations</h2>
+
+<p>A sheet is for a task. An alert is for a question, and specifically for one the customer must
+answer before anything else happens.</p>
+
+<pre class="language-swift"><code class="language-swift">        .alert(item: $pendingDeletion) { deletion in
+            Alert(
+                title: Text(deletion.title),
+                message: Text(deletion.message),
+                primaryButton: .destructive(Text("Delete")) {
+                    Task { report(await deletion.confirm()) }
+                },
+                secondaryButton: .cancel()
+            )
+        }
+</code></pre>
+
+<p>Three decisions in that snippet. It is the <strong>system's</strong> alert rather than a custom
+sheet, because for "are you sure you want to delete this" matching the platform is what makes it
+read as serious. The destructive button is marked <code>.destructive</code>, which colours it red
+and tells assistive technology what it is. And it uses <code>item:</code> again, so two rapid taps
+cannot stack two dialogs.</p>
+
+<p>The value being presented carries the action itself:</p>
+
+<pre class="language-swift"><code class="language-swift">    private struct PendingDeletion: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+        let confirm: () async -&gt; ActionOutcome
+    }
+</code></pre>
+
+<p>One alert handles every deletion on the screen. The row that raised it supplies the copy and the
+closure; the alert does not know whether it is deleting an address or a card.</p>
+
+<h3>Do not use an alert for confirmation of success</h3>
+
+<p>"Added to your cart" must not interrupt. An alert steals focus, blocks the screen and demands a
+tap to dismiss — appropriate for a question, hostile for a confirmation nobody asked for. That is
+what a toast is for, and the demo app presents them as an overlay at the root so a message fired
+from inside a sheet is still visible above it.</p>
+
+<p>For a menu of destructive choices, <code>confirmationDialog</code> is the right control rather
+than an alert with four buttons — it is the action sheet that slides up from the bottom, and it is
+what iOS users expect from "more options".</p>
+
+<h2>The keyboard inside a sheet</h2>
+
+<p>A sheet with a form has a problem the rest of the app does not: the keyboard covers the bottom of
+a container that is already only part of the screen. SwiftUI handles most of it — the sheet's
+content is inset for the keyboard automatically — but two things still need doing.</p>
+
+<p>The scrolling region needs <code>.scrollDismissesKeyboard(.interactively)</code>, or the customer
+has no way to get the keyboard out of the way of the footer button. And a form sheet wants
+<code>.presentationDetents([.large])</code> rather than a medium one, because a half-height sheet
+that grows to fit the keyboard and then shrinks again is visually chaotic. The address form in this
+app takes the large detent for exactly that reason.</p>
+
+<h2>Previewing a sheet</h2>
+
+<p>Sheets are awkward in previews because a preview renders a view, not a presentation. The idiom is
+to present from an empty view:</p>
+
+<pre class="language-swift"><code class="language-swift">#Preview {
+    let environment = AppEnvironment.preview()
+    return Color.clear.sheet(isPresented: .constant(true)) {
+        CartSheetView()
+            .environment(environment.cart)
+            .environment(AppRouter())
+    }
+}
+</code></pre>
+
+<p><code>.constant(true)</code> is a binding that cannot change, which is exactly right here — the
+preview never dismisses. This gets you the real detents and the real presentation chrome rather than
+the sheet's contents floating in a rectangle, and it is the difference between a preview that shows
+the design and one that shows a component.</p>
+
+<h2>Full-screen covers</h2>
+
+<p><code>fullScreenCover</code> is the sheet's heavier sibling: no card, no swipe to dismiss, the
+whole screen. It is right for onboarding, a camera, a media player — anything where the app behind
+genuinely should not be visible or reachable.</p>
+
+<p>It is wrong for most things. Sign-in in this app is a sheet precisely because ordering never
+requires an account, and the card-over-the-app presentation is the platform's way of saying "this is
+a detour, you can leave". A full-screen cover would imply the customer has to get through it.</p>
+
+<h2>What a sheet should not be</h2>
+
+<p>Two habits worth resisting.</p>
+
+<p><strong>A sheet inside a sheet.</strong> It works — iOS stacks them — and it almost always means
+the first sheet should have been a pushed screen. Two cards deep, the customer has lost track of
+what dismissing will return them to, and the swipe gesture becomes ambiguous.</p>
+
+<p><strong>A sheet as a router.</strong> If a modal's job is to offer three destinations, those are
+navigation, and the tab bar or a pushed list expresses it better. A modal is for finishing something
+and coming back — the test is whether the customer returns to where they were, and whether that is
+the point.</p>
+
+<h2>Next</h2>
+
+<p>Every component so far — the card, the field, the scaffold — has quietly used tokens and a theme
+without explanation. The next lesson is that layer: tokens, a semantic tier over them, and
+components that consume the semantic tier, plus why skipping the middle one makes a retune
+impossible.</p>
