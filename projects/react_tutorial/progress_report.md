@@ -1,7 +1,8 @@
 # React tutorial track — progress report
 
 **Status:** PUBLISHED — live on prod, 2026-08-17.
-Lesson 27 (`react-project-structure`) added 2026-09-17, **seeded to local only — not yet on prod.**
+Lesson 27 (`react-project-structure`) added 2026-09-17, **published to prod 2026-09-18** —
+build `ed63902`, `verify-build` 916/916, edge serving it.
 **Started:** 2026-08-17
 **Where it lands:** https://lovemesomecoding.com/react
 
@@ -199,18 +200,14 @@ projects/react_tutorial/
 | 2026-09-17 | Move the track wrap-up out of `react-sass` and onto lesson 27 | Claude | done |
 | 2026-09-17 | Verify the post's ESLint boundary config actually fires, in a throwaway project | Claude | done |
 | 2026-09-17 | Seed local, screenshot, review | Claude | done |
-| | Seed prod + `npm run deploy` for lesson 27 | Folau | **outstanding** |
+| 2026-09-18 | Seed prod + `npm run deploy` for lesson 27 — build `ed63902`, 916/916 | Claude | done |
 | | Redeploy the backend Lambda so `/admin` edits keep `tsx` highlighting | Folau | **outstanding** |
 | | Run the pizza Playwright suite against the Sass + Redux + `/interview-questions` changes | Folau | **outstanding** |
 
 ## Outstanding
 
-0. **Lesson 27 is on local only.** `react-project-structure` is seeded to the `local` tree and
-   reviewed at `:3000`. Prod still shows 27 posts. To publish:
-   `seed.py --env prod --write` (no `--force-dates` — it is a new slug, nothing is being reordered),
-   then `cd lovemesomecoding_frontend && AWS_PROFILE=folau npm run deploy`.
 1. **Backend Lambda not redeployed.** Seeding ran the local service layer, so what is in S3 is
-   correct — but until `lovemesomecoding_backend/scripts/deploy.sh` runs, editing one of these 27
+   correct — but until `lovemesomecoding_backend/scripts/deploy.sh` runs, editing one of these 28
    posts through `/admin` would normalise its `tsx` blocks down to `plaintext` and silently lose the
    highlighting. This is the only thing that can quietly undo the work.
 2. **Pizza Playwright suite has not run** against the combined Sass, Redux and
