@@ -1,0 +1,283 @@
+<p>Taking a card payment is the part of an app where a mistake is expensive in a way a layout bug is
+not. The good news is that the correct approach is also the least work — provided you resist the
+tempting alternative.</p>
+
+<p>This lesson is Stripe's payment sheet, the two-step flow it forces, and how to keep the SDK from
+spreading into the rest of your app.</p>
+
+<h2>Do not build a card form</h2>
+
+<p>Stripe ships <strong>PaymentSheet</strong>: a native sheet rendered by the SDK in its own view,
+which collects the card and confirms the payment. The alternative is a card field you style yourself,
+and it is the wrong call for one reason that settles it.</p>
+
+<p>With PaymentSheet the card number never touches your code. Your binary stays out of PCI scope,
+and you get Apple Pay, saved cards, 3D Secure and every payment method Stripe adds later for free. A
+hand-rolled field handles none of that and puts your code one careless refactor away from touching a
+card number.</p>
+
+<h2>Order first, then pay</h2>
+
+<p>Checkout is two steps, and it has to be:</p>
+
+<pre class="language-swift"><code class="language-swift">    enum Step: Equatable {
+        case collectingDetails
+        case awaitingPayment(OrderCreateResponse)
+</code></pre>
+
+<p>Step one creates the order server-side. The server prices the cart from the database, saves it as
+<code>PENDING_PAYMENT</code>, opens a Stripe PaymentIntent and returns its client secret. Step two
+hands that secret to the sheet.</p>
+
+<p>The order must exist first, because the PaymentIntent is what the sheet confirms. Modelling the
+two steps as an enum rather than a <code>createdOrder != nil</code> check matters: they are genuinely
+different screens with different actions, and the boolean version admits a third state where an
+order exists and the form is still editable.</p>
+
+<h3>What is not in the request</h3>
+
+<pre class="language-swift"><code class="language-swift">            items: items.map { item in
+                OrderCreateRequest.Item(
+                    productId: item.productID,
+                    size: item.size,
+                    crustId: item.crustID,
+                    toppingIds: item.toppings.map(\.id),
+                    quantity: item.quantity
+                )
+            }
+</code></pre>
+
+<p>Identifiers and quantities. No prices — not a subtotal, not a line total, not a grand total. The
+server decides what the cart costs, and a patched app sending <code>total: 0.01</code> changes
+nothing because there is nowhere to put it.</p>
+
+<p>This is the security boundary of the whole feature, and it is worth stating plainly: <strong>the
+device is never the authority on money.</strong> Everything the app computes is a preview shown
+before the customer commits.</p>
+
+<h2>Quarantine the SDK behind a protocol</h2>
+
+<pre class="language-swift"><code class="language-swift">enum PaymentOutcome: Equatable {
+    case succeeded
+    case cancelled
+    case failed(message: String)
+}
+</code></pre>
+
+<p><code>cancelled</code> is its own case, not an error, and that distinction is the reason this enum
+exists. Stripe reports a dismissed sheet as a failure — so the naive mapping shows "Your payment
+failed" to somebody who simply changed their mind. It is easy to ship and hard to notice, because it
+only happens to customers who did not complete the purchase and therefore never complain.</p>
+
+<pre class="language-swift"><code class="language-swift">@MainActor
+protocol PaymentGateway {
+    /// Opens the payment sheet and returns once the customer is done with it.
+    func pay(_ request: PaymentRequest) async -&gt; PaymentOutcome
+    /// Collects a card against a SetupIntent WITHOUT charging it, for the profile screen.
+    func saveCard(setupIntentClientSecret: String) async -&gt; CardSetupOutcome
+    /// False when no publishable key is configured — the UI then explains, rather than failing at
+    /// the moment of tapping "Pay".
+    var isReady: Bool { get }
+}
+</code></pre>
+
+<p>Three things fall out of the abstraction, and all three are worth more than the indirection
+costs.</p>
+
+<p><strong>Checkout is testable.</strong> The view model's tests inject a gateway that returns
+<code>.succeeded</code> or <code>.cancelled</code> on demand. Driving the real sheet from a test is
+not merely hard — it is a system UI the test cannot touch.</p>
+
+<p><strong>Previews work.</strong> <code>PaymentSheet</code> needs a
+<code>UIViewController</code> to present from, which a preview does not have.</p>
+
+<p><strong>Stripe lives in one file.</strong> Nothing outside the payment folder imports the SDK, so
+replacing it is a single-file change rather than an archaeology exercise.</p>
+
+<pre class="language-swift"><code class="language-swift">@MainActor
+final class StubPaymentGateway: PaymentGateway {
+    var isReady: Bool
+    var nextPaymentOutcome: PaymentOutcome
+    var nextCardSetupOutcome: CardSetupOutcome
+
+    private(set) var payCallCount = 0
+    private(set) var lastRequest: PaymentRequest?
+</code></pre>
+
+<p>Not a no-op — it returns a <em>configured</em> outcome, so a test can exercise the cancelled path
+and the failed path as easily as the happy one. <code>isReady</code> defaults to false, so a
+misconfigured build shows the explanatory copy rather than pretending it can take money.</p>
+
+<h2>Bridging a completion handler into async</h2>
+
+<p>Stripe's API is completion-based. <code>withCheckedContinuation</code> brings it into
+<code>async</code>:</p>
+
+<pre class="language-swift"><code class="language-swift">        let result = await withCheckedContinuation { continuation in
+            sheet.present(from: presenter) { result in
+                continuation.resume(returning: result)
+            }
+        }
+
+        switch result {
+        case .completed:
+            return .succeeded
+        case .canceled:
+            return .cancelled
+        case let .failed(error):
+            return .failed(message: error.localizedDescription)
+        }
+</code></pre>
+
+<p>"Checked" is the variant that traps if the continuation is resumed twice or never. Both are leaks
+this code could otherwise introduce silently — a completion handler that is dropped hangs the caller
+forever, with no error and no crash, which is among the harder bugs to diagnose from a report.</p>
+
+<h3>Finding a view controller from SwiftUI</h3>
+
+<pre class="language-swift"><code class="language-swift">        guard var controller = scene?.keyWindow?.rootViewController else { return nil }
+        while let presented = controller.presentedViewController {
+            controller = presented
+        }
+        return controller
+</code></pre>
+
+<p>SwiftUI has no view controllers and <code>PaymentSheet</code> needs one. Walking the window
+hierarchy is the standard bridge, and the <code>while</code> loop is the part that is usually
+missing — presenting from the root while a sheet is already up throws "attempt to present on a view
+controller whose view is not in the window hierarchy".</p>
+
+<h2>The return URL</h2>
+
+<pre class="language-swift"><code class="language-swift">        configuration.returnURL = returnURL
+</code></pre>
+
+<p>This is what brings the customer back after a 3D Secure redirect into their bank's page. It has to
+match a URL scheme declared in <code>Info.plist</code>:</p>
+
+<pre class="language-markup"><code class="language-markup">	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.lovemesomecoding.pizza.ios</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>pizzaios</string>
+			</array>
+		</dict>
+	</array>
+</code></pre>
+
+<p>Get it wrong and the app is simply never reopened, leaving a paid order the customer never sees
+confirmed — a failure that only appears for cards that require authentication, which is to say not
+on your test card.</p>
+
+<h2>The device does not decide that a payment succeeded</h2>
+
+<p>Stripe accepting the card means Stripe accepted the card. Your order is still
+<code>PENDING_PAYMENT</code> until your <em>backend</em> hears about it, through a webhook or by
+asking.</p>
+
+<pre class="language-swift"><code class="language-swift">    func pay() async -&gt; UUIDString? {
+        guard case let .awaitingPayment(created) = step,
+              let clientSecret = created.clientSecret else { return nil }
+</code></pre>
+
+<p>On success the view model returns the order id, the cart is cleared, and the app navigates to a
+confirmation screen that <em>polls your own server</em> for the status. There is no "mark this order
+paid" endpoint, because anyone can call your API.</p>
+
+<p>Polling rather than relying solely on the webhook is deliberate: a webhook does not reach a laptop
+unless <code>stripe listen</code> is running, and even in production it can arrive seconds later than
+the customer does.</p>
+
+<h3>Returning an optional rather than throwing</h3>
+
+<p>Three outcomes — paid, cancelled, failed — collapse into one decision for the caller. Cancellation
+in particular must not be an error: the order is still reserved and the customer can try again. A
+thrown error would force every call site to write a <code>catch</code> that distinguishes the two,
+which is exactly the mistake the enum was introduced to prevent.</p>
+
+<h2>Saving a card without charging it</h2>
+
+<p>The profile screen collects a card for later. That is a <strong>SetupIntent</strong>, not a
+PaymentIntent — same sheet, no charge. The server opens it, the sheet collects the details, and only
+the opaque <code>pm_…</code> token comes back to be saved.</p>
+
+<p>Never the number, never the CVC, never the cardholder name. If a <code>cardNumber</code> property
+appears anywhere in an app doing this correctly, something has gone badly wrong.</p>
+
+<h2>Configuring the sheet</h2>
+
+<pre class="language-swift"><code class="language-swift">    private func baseConfiguration() -&gt; PaymentSheet.Configuration {
+        var configuration = PaymentSheet.Configuration()
+        configuration.merchantDisplayName = merchantDisplayName
+        configuration.returnURL = returnURL
+        configuration.allowsDelayedPaymentMethods = false
+        return configuration
+    }
+</code></pre>
+
+<p><code>merchantDisplayName</code> is what the customer sees at the top of the sheet and in the
+Apple Pay confirmation, so it should be the name they recognise from the App Store rather than your
+company's legal entity.</p>
+
+<p><code>allowsDelayedPaymentMethods</code> is the one to think about. Enabling it offers methods
+that confirm hours or days later — bank debits, some local schemes — which is right for a
+subscription and wrong for a pizza. If you enable it, your fulfilment has to wait for the webhook
+rather than for the sheet, and that is a backend change more than an app one.</p>
+
+<h2>Building with the SDK, and building without it</h2>
+
+<pre class="language-swift"><code class="language-swift">#if canImport(StripePaymentSheet)
+import StripePaymentSheet
+import StripePayments
+</code></pre>
+
+<p>The demo app guards the whole Stripe implementation, with a fallback that refuses loudly:
+<code>isReady</code> is false, every call fails with an explanation, and the checkout screen renders
+the "payment is not configured" branch it already has for a missing key.</p>
+
+<p>This is not a way to make payment optional in production. It is what keeps the repository
+buildable for somebody who clones it without network access, or who removes the package to read the
+rest of the app — and on the machine this track was written on it earned its keep for a third reason,
+because that toolchain could not compile the SDK's asset catalogues at all.</p>
+
+<h2>Keys</h2>
+
+<p>The <strong>publishable</strong> key is public by design: it identifies the account and can only
+create intents, never charge one. It ships in the binary via a build setting. The
+<strong>secret</strong> key lives on your server and nowhere else — if one ever lands in a
+repository, the only correct response is to roll it in the dashboard rather than to delete the
+commit.</p>
+
+<h2>Testing this</h2>
+
+<p>The view model's tests cover all three outcomes without a network. The one worth writing first is
+the cancellation case, because it is the one that ships broken:</p>
+
+<pre class="language-swift"><code class="language-swift">        let orderID = await model.pay()
+
+        XCTAssertNil(orderID)
+        XCTAssertNil(model.errorMessage, "A cancelled payment must not show a red message.")
+</code></pre>
+
+<p>Beyond that, Stripe's test cards cover the interesting paths — <code>4242…</code> succeeds,
+<code>4000 0025 0000 3155</code> requires authentication, <code>4000 0000 0000 9995</code> declines
+for insufficient funds. The second is the one worth exercising on a real device, because it is the
+only way to find out whether your return URL is right.</p>
+
+<h2>What is still missing</h2>
+
+<p>Worth stating rather than leaving as an apparent oversight: the demo app can save cards and can
+take payments, and checkout does not yet offer the saved ones. It always collects a fresh card.</p>
+
+<p>Wiring the two together is a server-side change more than an app one — it means creating the
+PaymentIntent with a customer and a stored payment method attached, and the app's part is a picker
+above the pay button. All three of the web frontends in the same project share the gap, which is
+usually a sign that it is the next thing to do rather than something everybody forgot.</p>
+
+<h2>Next</h2>
+
+<p>The payment sheet is accessible because Stripe made it so. Everything around it is your
+responsibility, and a drawn control carries no meaning at all. The next lesson is accessibility.</p>

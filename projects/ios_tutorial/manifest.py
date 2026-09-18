@@ -264,6 +264,8 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Features/Checkout/Payment/StripePaymentGateway.swift",
         f"{A}/Pizza/Features/Checkout/CheckoutViewModel.swift",
         f"{A}/Pizza/Resources/Info.plist",
+        # The cancellation test, which is the case that ships broken.
+        f"{A}/PizzaTests/ViewModelTests.swift",
     ],
     "ios-accessibility": [
         f"{A}/Pizza/Core/DesignSystem/Components/SegmentedPicker.swift",
@@ -271,6 +273,11 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Core/DesignSystem/Components/StateViews.swift",
         f"{A}/Pizza/Core/DesignSystem/Components/PriceRow.swift",
         f"{A}/Pizza/Features/Checkout/Components/SavedAddressPicker.swift",
+        # The header trait, the toast announcement and the cart button's label.
+        f"{A}/Pizza/Core/DesignSystem/Components/SheetScaffold.swift",
+        f"{A}/Pizza/Core/DesignSystem/Components/ToastView.swift",
+        f"{A}/Pizza/Core/DesignSystem/Components/PizzaButton.swift",
+        f"{A}/Pizza/Features/Cart/Components/CartToolbarButton.swift",
     ],
     "ios-testing": [
         f"{A}/PizzaTests/CartReducerTests.swift",
