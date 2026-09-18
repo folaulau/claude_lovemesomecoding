@@ -16,7 +16,7 @@ WordPress is no longer in the request path.
 | Site | https://lovemesomecoding.com (also `www`) |
 | Admin console | https://lovemesomecoding.com/admin — user `folauk` |
 | Admin API | https://api.lovemesomecoding.com |
-| Content | **916 posts**, 44 categories, 12 static pages, 336 images  <br>(posts/categories per `verify-build` on the 2026-09-18 deploy; pages/images not re-counted) |
+| Content | **938 posts**, 45 categories, 12 static pages, 336 images  <br>(posts/categories per `verify-build` on the 2026-09-18 iOS-track deploy; pages/images not re-counted) |
 | Cost | ≈ **$0.60/month** + $16/yr domain (was $25/mo on DreamHost) |
 
 ### Architecture
@@ -36,6 +36,14 @@ It is the cutover rollback target and Search Console needs 30 days to confirm in
 Rollback = point the apex/www ALIAS records back to `69.163.227.84` (60s TTL).
 
 ### Outstanding
+
+- [ ] ⚠️ **Deploy the backend, or do not edit `/ios` posts in `/admin`.** The `swift` entry in
+      `SUPPORTED_LANGUAGES` (`app/services/content.py`) exists only in the local working copy — the
+      deployed Lambda does not have it, so saving an iOS post through the admin console re-normalises
+      every Swift block to `plaintext` and the next build ships the track unhighlighted. The live
+      site is correct today because `seed.py` runs the local service layer.
+      ⚠️ That file also carries ~50 lines of uncommitted work from earlier tracks, and a deploy
+      would carry `schemas.py`, `posts.py` and `test_posts.py` too — review before deploying.
 - [ ] Commit the Oracle track — three repos have uncommitted changes
       (`projects/oracle/progress_report.md` lists them). The content itself is live.
 - [ ] Store GitHub PAT so **Publish** works: `aws ssm put-parameter --name /lovemesomecoding/prod/github-token --type SecureString --value ghp_xxx --region us-west-2 --profile folau`

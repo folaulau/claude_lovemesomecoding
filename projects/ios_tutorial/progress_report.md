@@ -1,9 +1,9 @@
 # iOS tutorial track — progress report
 
-**Status:** ✅ **Seeded to `local` and verified.** 22 lessons written, both checkers green, site builds.
-**NOT published to prod.** That is a separate, deliberate step — see "Still open".
+**Status:** ✅ **LIVE.** All 22 published to prod and deployed 2026-09-18 (build `8548437`).
+⚠️ **One follow-up is outstanding and it is not cosmetic** — see "Still open".
 **Started / last updated:** 2026-09-18
-**Where it will land:** https://lovemesomecoding.com/ios, under a new **Mobile** nav dropdown
+**Where it landed:** https://lovemesomecoding.com/ios, under the new **Mobile** nav dropdown
 
 ---
 
@@ -136,15 +136,42 @@ Dates run 2026-07-17 → 2026-09-18, three days apart, so lesson 22 is newest.
 
 ---
 
+## Published — 2026-09-18
+
+Seeded prod (916 → 938 posts, category count 22) and deployed.
+
+```
+verify-build   938/938 posts served, 45/45 category counts agree, 1185 html files
+deploy         2401 files to s3://lovemesomecoding.com (build 8548437)
+edge           cloudfront function republished (104 redirects), invalidation complete,
+               https://lovemesomecoding.com/version.txt -> 8548437
+```
+
+Verified against the **live site** after invalidation rather than trusting the deploy's own check:
+
+- All 22 post URLs return 200.
+- `/ios` returns 200 and lists all 22.
+- The nav reads `… Data Store · Software Engineering · Mobile · JavaScript …`.
+- `/ios/ios-concurrency` serves 24 `language-swift` blocks with 337 Prism token spans and **zero**
+  `language-plaintext` — the Swift grammar is working end to end.
+- 22 entries in the sitemap.
+- The pager works: lesson 1 has no previous and links forward to `ios-swift-essentials`.
+
 ## Still open
 
-- **Publish to prod.** `python projects/ios_tutorial/seed.py --env prod --write`, then deploy. Not
-  done — it was not asked for, and it triggers a real rebuild and CloudFront invalidation.
-- **Commit the backend `swift` language addition.** It is entangled with pre-existing uncommitted
-  changes in `app/services/content.py`. **Publishing before this lands would ship all 22 lessons as
-  plaintext**, because the backend decides the `language-` class at save time.
+- ⚠️ **Deploy the backend, or do not edit these posts in `/admin`.** The `swift` language
+  registration exists only in the local working copy of
+  `lovemesomecoding_backend/app/services/content.py`. The **deployed Lambda does not have it**, so
+  saving any iOS post through the admin console will re-normalise every Swift block to
+  `plaintext` and the next build will ship the track unhighlighted.
+  The seed was unaffected because `seed.py` runs the local service layer, which is why the site is
+  correct today.
+  ⚠️ That file also carries ~50 lines of uncommitted changes from earlier tracks, and a backend
+  deploy would carry `schemas.py`, `posts.py` and `test_posts.py` with it — none of which were
+  reviewed this session. **Worth a look before deploying rather than a reflex.**
 - **Review the content.** It has been checked mechanically — length, prose share, snippet accuracy,
   markup — and not read end to end by a human.
-- **Look at it in a browser.** The Chrome extension was unavailable this session.
+- **Look at it in a browser.** The Chrome extension was unavailable this session; every check above
+  is HTTP plus HTML parsing.
 - Consider whether `react-native` should move into the Mobile group. Deliberately left under
   JavaScript for now.
