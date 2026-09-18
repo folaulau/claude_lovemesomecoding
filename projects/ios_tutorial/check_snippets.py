@@ -59,6 +59,11 @@ SOURCE_LANGS = {"swift", "yaml", "properties", "markup"}
 
 SOURCE_SUFFIXES = {".swift", ".yml", ".yaml", ".xcconfig", ".plist", ".sh"}
 
+# Config dotfiles have NO suffix as far as pathlib is concerned — `Path(".swiftformat").suffix` is
+# the empty string — so a suffix test alone silently skips them, and a lesson quoting one is then
+# reported as naming a file that "does not exist in the app". Matching on the whole name is the fix.
+SOURCE_FILENAMES = {".swiftformat"}
+
 # How many opening lines must match before a near-miss counts as drift rather than an invented
 # example that happens to start with a common line.
 #
@@ -236,7 +241,7 @@ def load_sources() -> dict[str, list[str]]:
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        if path.suffix not in SOURCE_SUFFIXES:
+        if path.suffix not in SOURCE_SUFFIXES and path.name not in SOURCE_FILENAMES:
             continue
         try:
             sources[str(path.relative_to(APP))] = lines(path.read_text(encoding="utf-8"))

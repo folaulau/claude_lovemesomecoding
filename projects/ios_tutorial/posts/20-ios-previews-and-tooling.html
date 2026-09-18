@@ -1,0 +1,290 @@
+<p>The tools around the code decide how fast you can work in it. This lesson is previews that render
+instantly against realistic data — including their failure states — plus the linting and formatting
+configuration worth having, and the instruments to reach for before guessing.</p>
+
+<h2>Previews are not a demo feature</h2>
+
+<p>A preview renders a view in Xcode's canvas without launching the app. Used properly it is your
+main feedback loop: change a padding value, see it immediately, on three device sizes at once.</p>
+
+<p>Used carelessly it is a feature you stop using by week two, because the previews fetch from a
+backend that is not running and every canvas shows a spinner forever. The difference between those
+two outcomes is entirely about whether the app's dependencies can be swapped, which is why this
+lesson comes after the one about the composition root rather than near the beginning.</p>
+
+<h2>Make every dependency fake-able</h2>
+
+<p>This is the return on the composition root from lesson 14. One function hands the whole app a
+stubbed graph:</p>
+
+<pre class="language-swift"><code class="language-swift">    static func preview(
+        catalogue: CatalogRepository = PreviewCatalogRepository(),
+        orders: OrderRepository = PreviewOrderRepository(),
+        profile: ProfileRepository = PreviewProfileRepository()
+    ) -&gt; AppEnvironment {
+</code></pre>
+
+<p>Previews run in a host process with no backend, no Keychain entitlement and no view controller to
+present a payment sheet from — so every one of those is replaced, and a canvas renders instantly and
+deterministically.</p>
+
+<pre class="language-swift"><code class="language-swift">#Preview("Loaded") {
+    let environment = AppEnvironment.preview()
+    return NavigationStack {
+        MenuView()
+            .environment(environment.menu)
+            .environment(environment.cart)
+            .environment(environment.toasts)
+    }
+}
+</code></pre>
+
+<p>Wrapping in a <code>NavigationStack</code> matters more than it looks: without it the navigation
+title and toolbar do not render, so the preview shows a screen missing its chrome and you end up
+tuning spacing against the wrong layout.</p>
+
+<h3>The state nobody previews</h3>
+
+<pre class="language-swift"><code class="language-swift">#Preview("Failed") {
+    let environment = AppEnvironment.preview(
+        catalogue: PreviewCatalogRepository(error: APIError.network(message: "The backend is not running."))
+    )
+</code></pre>
+
+<p>The error branch is the one nobody looks at, because reproducing it means turning the backend off.
+Here it is one line, and it sits in the canvas beside the happy path — which is how the copy in it
+gets read at all, let alone written well.</p>
+
+<p>Worth a preview each: loaded, empty, failed, and the long-content case. Those four cover most of
+the layout bugs that otherwise reach a customer.</p>
+
+<h2>Data that is realistic, not tidy</h2>
+
+<pre class="language-swift"><code class="language-swift">    static let pepperoni = Product(
+        id: "22222222-2222-2222-2222-222222222222",
+        name: "Classic Pepperoni",
+        description: "Double pepperoni, mozzarella, our house tomato sauce.",
+        type: .pizza,
+        imageUrl: nil,
+        active: true,
+        displayOrder: 2,
+</code></pre>
+
+<p>Preview data that is too neat hides exactly the problems previews exist to catch — the two-line
+product name, the long topping list, the missing image, the price that is four digits. The fixture
+file is shared with the tests, which keeps one set of awkward-enough examples rather than two sets of
+convenient ones.</p>
+
+<p>All of it lives under <code>#if DEBUG</code>, so none of it — including the sample email addresses
+— is compiled into a release build.</p>
+
+<h3>Previews that need state</h3>
+
+<p>A component taking a <code>@Binding</code> has nowhere to bind to in a preview. On Xcode 16
+<code>@Previewable</code> solves it inline; on 15 the portable answer is a small wrapper view:</p>
+
+<pre class="language-swift"><code class="language-swift">private struct SavedAddressPickerPreview: View {
+    @State private var selectedID = SampleData.address.id
+
+    var body: some View {
+        SavedAddressPicker(
+            addresses: [SampleData.address],
+            selectedID: $selectedID,
+            newAddressID: CheckoutViewModel.newAddressID
+        )
+</code></pre>
+
+<p>It also exercises the component the way a screen actually uses it, which the inline version does
+not — you can tap between options in the canvas and watch the selection move.</p>
+
+<h3>When a preview will not build</h3>
+
+<p>Previews compile your whole module, so a preview failure is usually a compile error somewhere
+else. The other frequent cause is a missing <code>.environment</code> line — reading a type nobody
+injected is a crash, not a compile error, so the canvas dies with a diagnostic that points at the
+framework rather than at the line you forgot.</p>
+
+<h3>Previewing the conditions you cannot reproduce</h3>
+
+<p>A preview can be configured with environment overrides, and the two worth using habitually are the
+ones that are awkward to set up on a device.</p>
+
+<p><code>.dynamicTypeSize(.accessibility3)</code> renders the screen at a large accessibility text
+size, which is where truncation and overlap appear. <code>.environment(\.layoutDirection, .rightToLeft)</code>
+mirrors the layout, which catches anything positioned with a hard-coded leading offset. Adding a
+preview at the largest text size beside the default one is thirty seconds and catches a class of bug
+that is otherwise reported from the field.</p>
+
+<p>Naming previews matters too, because the canvas lists them by name.
+<code>#Preview("Failed")</code> is findable; three unnamed previews are not.</p>
+
+<h2>Linting, kept small</h2>
+
+<p>A linter earns its place by catching what review keeps catching. A linter with two hundred rules
+earns resentment: people learn to silence it, and then it catches nothing.</p>
+
+<pre class="language-yaml"><code class="language-yaml">disabled_rules:
+  # Three and four line closures are the shape of SwiftUI. This rule fires on almost every view.
+  - multiple_closures_with_trailing_closure
+  # `content()` in a @ViewBuilder property is not "unused" — the compiler disagrees with the rule.
+  - unused_closure_parameter
+</code></pre>
+
+<p>Both of those fire constantly on idiomatic SwiftUI, and a rule that is wrong most of the time
+trains people to ignore the output.</p>
+
+<p>The one worth turning up:</p>
+
+<pre class="language-yaml"><code class="language-yaml">force_unwrapping:
+  severity: error
+</code></pre>
+
+<p>Force-unwrapping is the single most common cause of crashes in iOS apps. Making it an error in app
+code and allowing it in tests — where a crash is a clear test failure — is the configuration that
+matches how it is actually used.</p>
+
+<p>And the ones worth turning on, because they catch real mistakes rather than style:</p>
+
+<pre class="language-yaml"><code class="language-yaml">opt_in_rules:
+  - array_init
+  - closure_spacing
+  - contains_over_filter_count
+  - contains_over_first_not_nil
+  - empty_count
+  - empty_string
+  - explicit_init
+  - first_where
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+  - last_where
+</code></pre>
+
+<p>Half of those are performance: <code>first_where</code> catches <code>filter { }.first</code>,
+which builds a whole array to take one element, and <code>contains_over_filter_count</code> catches
+the same mistake spelled differently. <code>implicitly_unwrapped_optional</code> is the important
+one after force-unwrapping — an <code>Int!</code> is a crash waiting for the right ordering.</p>
+
+<p>Line length is the other setting worth tuning rather than accepting. Under
+<code>line_length:</code>:</p>
+
+<pre class="language-yaml"><code class="language-yaml">  warning: 110
+  error: 140
+  ignores_comments: true
+  ignores_urls: true
+</code></pre>
+
+<p><code>ignores_comments</code> is the important half. Wrapping prose to fit a code limit makes it
+harder to read, and a linter that fights your explanations is a linter that discourages writing
+them.</p>
+
+<h3>Size limits catch the thing size limits are for</h3>
+
+<pre class="language-yaml"><code class="language-yaml">type_body_length:
+  warning: 320
+  error: 450
+
+file_length:
+  warning: 500
+  error: 700
+  ignore_comment_only_lines: true
+</code></pre>
+
+<p><code>ignore_comment_only_lines</code> is the setting that makes these usable in a codebase that
+explains itself. Without it, a well-documented file trips the limit for the wrong reason, and the
+pressure it creates is to delete the comments.</p>
+
+<p>Note that <code>function_body_length</code> is disabled entirely. A SwiftUI <code>body</code> is
+legitimately long and legitimately nested, and the rule fires on almost every view — the
+<em>type</em> length limit is the one that catches a view that has genuinely grown too big, which is
+the real signal.</p>
+
+<h2>Formatting is not worth arguing about</h2>
+
+<p>So do not argue about it — commit a configuration and let a tool apply it.</p>
+
+<pre class="language-properties"><code class="language-properties">--indent 4
+--maxwidth 110
+--wraparguments before-first
+--wrapparameters before-first
+--wrapcollections preserve
+--closingparen balanced
+--commas always
+--trimwhitespace always
+--stripunusedargs closure-only
+--self remove
+</code></pre>
+
+<p>Two rules in that file are disabled with reasons, which is the part worth copying. <code>redundantType</code>
+would rewrite <code>let x: ViewState&lt;Catalogue&gt; = .idle</code> into a form where the type is
+implicit, and here the explicit type is the documentation.</p>
+
+<h2>The debugger is a tool, not a fallback</h2>
+
+<p>Three habits that save more time than they cost.</p>
+
+<p><strong>Breakpoint actions.</strong> A breakpoint can log an expression and continue automatically,
+which is a print statement you did not have to write, recompile for, or remember to remove.</p>
+
+<p><strong>The view hierarchy inspector.</strong> The button in the debug bar freezes the running UI
+into a 3D exploded view, which is the fastest way to answer "why is this view 400 points tall" — the
+answer is usually a <code>frame</code> or a <code>Spacer</code> two levels up from where you were
+looking.</p>
+
+<p><strong><code>Self._printChanges()</code></strong> in a <code>body</code> prints which property
+caused that redraw. It is the single most useful line for understanding why a view is updating more
+than you expected, and it goes straight back out again once you know.</p>
+
+<p>And prefer <code>Logger</code> over <code>print</code> for anything you would want from a customer's
+device. It goes to the unified log, viewable in Console.app, and it redacts interpolated values by
+default — which is what stops an email address ending up in a diagnostic file somebody emails around.</p>
+
+<h2>Instruments, before guessing</h2>
+
+<p>Three templates cover almost everything.</p>
+
+<p><strong>Time Profiler</strong> samples the stack. The usual surprise is not that something is slow
+but that it runs far more often than expected. <strong>Allocations</strong> and
+<strong>Leaks</strong> find retain cycles, which in SwiftUI almost always means a closure capturing
+<code>self</code> strongly. And the <strong>SwiftUI template</strong> shows which view bodies are
+evaluating and how often — the fastest way to find a view that redraws on every keystroke.</p>
+
+<p>One rule before any of it: <strong>profile a Release build on a real device.</strong> Debug builds
+are unoptimised and SwiftUI in particular is much slower under them, so a great many "performance
+problems" turn out to be the debugger.</p>
+
+<h2>Keeping the project honest</h2>
+
+<pre class="language-bash"><code class="language-bash">./Scripts/generate-project.sh
+</code></pre>
+
+<p>Where the project file is generated from a manifest, the two can drift — someone changes a build
+setting in Xcode's editor, commits the <code>.pbxproj</code>, and the next regeneration silently
+discards it. The fix is a CI step that regenerates and fails if the result differs from what was
+committed, which lesson 21 sets up.</p>
+
+<h2>One more thing worth automating</h2>
+
+<p>A pre-commit hook that runs the formatter is the difference between a diff that shows what changed
+and one that shows what changed plus forty lines of re-indentation. It is three lines of shell, and
+it removes an entire category of review comment.</p>
+
+<h2>What to set up on day one</h2>
+
+<p>In order of return, for a project that does not have any of this yet:</p>
+
+<ul>
+  <li><strong>Previews with stub data</strong>, including a failure preview. This is the one that
+  changes how the day feels.</li>
+  <li><strong>SwiftFormat on a pre-commit hook</strong>, so formatting never appears in a diff.</li>
+  <li><strong>SwiftLint with a small rule set</strong>, treating force-unwrapping as an error.</li>
+  <li><strong>The project generated from a manifest</strong>, once more than one person is adding
+  files.</li>
+</ul>
+
+<p>All four are an afternoon together, and each one keeps paying every day afterwards. The order
+matters because the first is the only one you notice immediately — the others are things you stop
+having to think about, which is a harder benefit to feel and a larger one.</p>
+
+<h2>Next</h2>
+
+<p>The last practical lesson: build configuration, signing, CI, and getting an app onto the store.</p>

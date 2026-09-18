@@ -1,0 +1,249 @@
+<p>These are the questions an iOS role actually asks, answered against the twenty-one lessons before
+this one. Short answers with the reasoning behind them, because the follow-up is always "why?" and
+that is the part being assessed.</p>
+
+<h2>Swift</h2>
+
+<h3>Struct or class?</h3>
+
+<p>A struct is a value — assigning it copies. A class is a reference — assigning it shares. Default to
+struct, and reach for a class when you genuinely need shared identity or a lifetime other types
+observe.</p>
+
+<p>In a SwiftUI app the reason is concrete: the framework compares values to decide what to redraw,
+so a model that can be mutated behind its back is a model whose changes it cannot see. Models are
+structs; the stores that own them are classes.</p>
+
+<h3>What does <code>some View</code> mean?</h3>
+
+<p>An opaque return type: "a specific type conforming to <code>View</code>, and I am not telling you
+which". The real type of a SwiftUI body is enormous and grows with every modifier. You never want to
+write it and the compiler wants to know it for diffing to be fast.</p>
+
+<p>Not the same as <code>any View</code>, which erases the type and boxes it — slower, and it loses
+the information SwiftUI uses to compare.</p>
+
+<h3>When do you need <code>[weak self]</code>?</h3>
+
+<p>When a closure is stored as a property or outlives the call that created it. A closure captures
+strongly, so an object owning a closure that captures that object is a cycle neither side escapes.</p>
+
+<pre class="language-swift"><code class="language-swift">        dismissalTasks[toast.id] = Task { [weak self] in
+            try? await Task.sleep(for: self?.visibleDuration ?? .seconds(3))
+            guard !Task.isCancelled else { return }
+            self?.dismiss(toast.id)
+        }
+</code></pre>
+
+<p>A closure passed to <code>map</code> and used immediately does not need it.</p>
+
+<h3>Optional handling — which form when?</h3>
+
+<p><code>??</code> when the fallback is obvious and local. <code>guard let</code> for a
+precondition, because it leaves the happy path unindented and the unwrapped value in scope.
+<code>if let</code> when only a branch needs it. <code>map</code> on an optional when you are
+transforming a value that may not be there. And <code>!</code> essentially never in app code.</p>
+
+<h2>SwiftUI</h2>
+
+<h3>What does <code>@State</code> actually store?</h3>
+
+<p>Not the value — the view struct is thrown away constantly. <code>@State</code> is storage SwiftUI
+keeps <em>outside</em> the view, keyed to the view's identity.</p>
+
+<p>Which is why identity matters so much: change it and the state is discarded and rebuilt. That is
+behind both "my state reset for no reason" and "these two things are sharing state that should not
+be".</p>
+
+<h3>@State, @Binding, @Observable, @Environment — how do you choose?</h3>
+
+<p>Ask who owns it. This view owns it and nobody else needs it: <code>@State</code>. Someone else
+owns it and lent me write access: <code>@Binding</code>. Several views share it and it outlives any
+one of them: an <code>@Observable</code> class. It comes from far above and the layers in between do
+not care: <code>@Environment</code>.</p>
+
+<p>The rule underneath: state lives at the lowest level that can see everything needing it.</p>
+
+<h3>What did <code>@Observable</code> change?</h3>
+
+<p><code>ObservableObject</code> required <code>@Published</code> on every property and invalidated
+<em>every</em> observer when <em>any</em> of them changed. The macro tracks reads at the property
+level, so a view reading one property is not redrawn when a different one changes.</p>
+
+<p>For a small type it is invisible. For a store four screens read, it is the difference between
+redrawing a badge and redrawing a menu.</p>
+
+<h3>How does SwiftUI decide to redraw?</h3>
+
+<p>It re-runs <code>body</code>, compares the resulting value tree with the previous one, and updates
+only what differs. Hence the rule that <code>body</code> must be pure and cheap — it can run when you
+do not expect it, more than once, and be discarded without being shown.</p>
+
+<p>Practically: pass a row the data it needs rather than the whole store, and do filtering and sorting
+outside the body.</p>
+
+<h3>List versus LazyVStack?</h3>
+
+<p>Both are lazy. <code>List</code> brings swipe actions, selection, separators, the platform's
+insets and pull-to-refresh, and is right when your design should look like Settings. A
+<code>LazyVStack</code> starts from nothing, which is right when your rows are brand-styled cards and
+you would otherwise be fighting <code>List</code>'s appearance on every one.</p>
+
+<p>The trap is the one that is <em>not</em> lazy: a plain <code>VStack</code> in a
+<code>ScrollView</code> builds every child before showing the first.</p>
+
+<h3>Why is <code>id: \.self</code> risky?</h3>
+
+<p>Because it uses the value as identity. A collection containing two equal elements gives SwiftUI one
+identity for both, and rows start sharing state and animating strangely. An index-derived id is the
+same mistake: insert at the top and every identity shifts, so the framework believes everything
+changed.</p>
+
+<h2>Concurrency</h2>
+
+<h3>What does <code>@MainActor</code> guarantee?</h3>
+
+<p>That the annotated code runs on the main actor, checked at compile time rather than asserted at
+runtime. What it does not mean is that everything runs on the main thread — an <code>async</code>
+method on a main-actor type suspends at each <code>await</code>, and the awaited work happens
+elsewhere.</p>
+
+<h3>How does cancellation work?</h3>
+
+<p>Cooperatively. Cancelling a task sets a flag; the task is expected to notice, either by checking
+<code>Task.isCancelled</code> or by calling something that throws <code>CancellationError</code> —
+<code>Task.sleep</code> most often.</p>
+
+<p>Structured concurrency means it propagates: cancel a task and everything it awaits is cancelled
+too. In SwiftUI, <code>.task</code> gives you that for free when a view disappears.</p>
+
+<h3>What is actor reentrancy, and why should you care?</h3>
+
+<p>An actor guarantees one task executes its code at a time. It does <strong>not</strong> guarantee a
+method runs to completion before another starts — at every <code>await</code> inside an actor
+method, the actor can service somebody else.</p>
+
+<p>So state read before an <code>await</code> may be stale after it. Re-check anything you depend on
+after awaiting. This is the check-then-act race in a new costume, and it is the one thing about
+actors worth being careful with.</p>
+
+<h3><code>async let</code> or a task group?</h3>
+
+<p><code>async let</code> when you know the operations at compile time — it is two lines and reads
+clearly. A task group when the number is dynamic. Both give you cancellation and error propagation;
+the group additionally lets you process results as they arrive.</p>
+
+<h2>Architecture</h2>
+
+<h3>Is MVVM an architecture?</h3>
+
+<p>Only a third of one. It says a view renders and a view model holds logic, and nothing about where
+networking lives or what a view model may depend on. An app can be perfectly MVVM and still have a
+view model that builds URLs, parses JSON and caches to disk.</p>
+
+<p>The decision that matters is which direction dependencies point. Repository protocols in the
+domain layer, implementations in the data layer, and nothing in a feature importing
+<code>URLSession</code>.</p>
+
+<h3>How would you make a screen testable?</h3>
+
+<p>Inject its dependencies rather than letting it construct them, and put anything with rules in
+something that does not need rendering.</p>
+
+<pre class="language-swift"><code class="language-swift">protocol CatalogRepository: Sendable {
+    func products() async throws -&gt; [Product]
+    func toppings() async throws -&gt; [Topping]
+    func crusts() async throws -&gt; [Crust]
+}
+</code></pre>
+
+<p>A test hands over a repository returning three pizzas from an array, and the view model cannot
+tell the difference. Follow-up you should expect: "and how do you test the network layer?" —
+<code>URLProtocol</code>, so the real session builds the real request.</p>
+
+<h3>Show me a pure function worth testing</h3>
+
+<pre class="language-swift"><code class="language-swift">    func hasSameConfiguration(as other: CartItem) -&gt; Bool {
+        guard productID == other.productID, size == other.size, crustID == other.crustID else {
+            return false
+        }
+        return toppings.map(\.id).sorted() == other.toppings.map(\.id).sorted()
+    }
+</code></pre>
+
+<p>Two cart lines are the same only if the product, size, crust and topping <em>set</em> all match.
+The sort is the detail worth pointing at in an interview: selection order is not part of a pizza, so
+{pepperoni, mushroom} and {mushroom, pepperoni} must be one configuration. Without it a customer gets
+two lines for the same thing; without the whole function, a plain pepperoni and one with extra cheese
+collapse into one and they are charged for the wrong pizza.</p>
+
+<h3>Why a reducer for the cart and not for everything?</h3>
+
+<p>Because the cart is the state four screens read, three can change, and getting it wrong charges
+somebody for the wrong pizza. A pure reducer makes the rules testable in microseconds, gives every
+mutation a name, and leaves the store holding only effects.</p>
+
+<p>For four fields of screen-local form state, it would be ceremony. Knowing which is which is the
+actual skill, and saying so is a better answer than defending either extreme.</p>
+
+<h3>Singletons — what is wrong with them?</h3>
+
+<p>Testing, before design. A singleton is shared state every test inherits, which makes tests affect
+each other and "did this touch the network?" unanswerable. It also hides the dependency graph, so
+there is no file that tells you what the app is made of.</p>
+
+<h2>Practical</h2>
+
+<h3>Where do you store an auth token, and why?</h3>
+
+<p>The Keychain, with <code>kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly</code>.
+<em>AfterFirstUnlock</em> so background work still functions with the screen locked;
+<em>ThisDeviceOnly</em> so it is never copied into an iCloud backup — a session token belongs to one
+device, and syncing it hands a live session to a machine the customer may not control.</p>
+
+<p>Not <code>UserDefaults</code>, which is readable by anyone with a backup.</p>
+
+<h3>What happens when your app is backgrounded?</h3>
+
+<p>It goes inactive, then background with a short window to finish work, then suspended. From there it
+can be <strong>terminated with no callback at all</strong> — so anything you meant to save had to be
+saved before suspension.</p>
+
+<p>Concretely: a debounced write must be flushed on <code>scenePhase</code> changing, or a customer
+who adds something and immediately switches apps loses it.</p>
+
+<h3>How do you avoid the eternal spinner?</h3>
+
+<pre class="language-swift"><code class="language-swift">enum ViewState&lt;Value&gt; {
+    case idle
+    case loading
+    case loaded(Value)
+    case empty
+    case failed(message: String, isRetryable: Bool)
+    // accessors and constructors follow
+</code></pre>
+
+<p>Make it unrepresentable. Three booleans describe eight combinations, five of them nonsense; five
+cases describe five real states, and the compiler insists a view handles all of them.</p>
+
+<h2>The questions to ask back</h2>
+
+<p>An interview is two-way, and these tell you more about a codebase than any answer they give about
+process.</p>
+
+<ul>
+  <li>What is your minimum deployment target, and how do you decide when to move it?</li>
+  <li>UIKit, SwiftUI or both — and if both, where is the boundary?</li>
+  <li>What does your test suite cover, and how long does it take?</li>
+  <li>How long from merge to a build in TestFlight?</li>
+  <li>What is the oldest part of the codebase, and what would you change about it?</li>
+</ul>
+
+<p>The last one is the best question on the list. Everyone has an answer, and how specific it is tells
+you whether the team is allowed to look at their own code honestly.</p>
+
+<h2>That is the track</h2>
+
+<p>Twenty-two lessons, from an empty Xcode project to an app on the store, all of it built from one
+working application rather than from snippets. The code is worth reading in full — the comments in it
+are the argument for every decision these lessons describe, written next to the thing they justify.</p>

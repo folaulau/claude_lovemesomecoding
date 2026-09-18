@@ -1,0 +1,279 @@
+<p>Most iOS testing advice is either "aim for 80% coverage" or "just write UI tests", and both
+produce suites that are slow, brittle and quietly ignored. This lesson is what is actually worth
+testing in a SwiftUI app, in the order the return diminishes — and the techniques for the parts that
+are genuinely awkward.</p>
+
+<h2>What to test, in order</h2>
+
+<p><strong>Pure rules first.</strong> Pricing, validation, the cart reducer, date formatting. They
+cost nothing to test, they run in microseconds, and they are where a bug is most expensive.</p>
+
+<p><strong>The networking layer next</strong>, through a real <code>URLSession</code> against a
+stubbed transport, so the assertions are about the bytes you would actually send.</p>
+
+<p><strong>Then stores and view models</strong> against hand-written doubles. This is where
+behaviour lives — did signing out clear the token, does a cancelled payment stay silent.</p>
+
+<p><strong>Views, barely.</strong> Snapshot tests are brittle and UI tests are slow. The demo app has
+130 tests and no UI test target at all, and the reason is worth stating: its three sibling web
+frontends are covered by Playwright suites that drive the real flows, and duplicating that here would
+mostly be testing SwiftUI rather than this app.</p>
+
+<h2>Pure rules</h2>
+
+<pre class="language-swift"><code class="language-swift">    func testADifferentToppingSetIsADifferentLine() {
+        // Without this, a plain pepperoni and a pepperoni with extra cheese would collapse into one
+        // line and the customer would be charged for the wrong pizza.
+        var state = CartReducer.reduce(.initial, .add(item(toppings: [])))
+        state = CartReducer.reduce(state, .add(item(toppings: [SampleData.toppings[4]])))
+
+        XCTAssertEqual(state.items.count, 2)
+    }
+</code></pre>
+
+<p>No view, no async, no main actor, no setup. Fifteen tests cover the cart's rules and run in about
+a millisecond together.</p>
+
+<p>The ones worth writing carefully are the negative cases and the properties rather than the
+examples. That topping <em>order</em> does not make a different pizza. That reducing does not mutate
+the state it was given. That dropping a quantity to zero removes the line. Those are the rules that
+are hard to hold in your head and easy to break in a refactor.</p>
+
+<h3>Money in particular</h3>
+
+<pre class="language-swift"><code class="language-swift">    func testRoundingIsHalfUpRatherThanBankers() {
+        // Swift's default `.rounded()` is `.toNearestOrEven`, which would give 0.12 here. A price
+        // is rounded half UP, which is what a customer expects and what a till does.
+        XCTAssertEqual(Money.rounded(0.125), 0.13)
+        XCTAssertEqual(Money.rounded(0.135), 0.14)
+    }
+</code></pre>
+
+<p>Two assertions that encode a decision somebody made deliberately. Without the test, a future
+refactor to <code>value.rounded()</code> looks harmless and changes what customers are charged by a
+cent in a way nobody would notice for months.</p>
+
+<h2>Testing the network for real</h2>
+
+<p>The usual advice is to hide <code>URLSession</code> behind a protocol and inject a fake. That
+tests the code <em>around</em> the session and skips the session itself — so it cannot catch a wrong
+HTTP method, a missing header, or a body that fails to encode, which are exactly the mistakes this
+layer makes.</p>
+
+<pre class="language-swift"><code class="language-swift">final class StubURLProtocol: URLProtocol {
+    /// Called with the outgoing request; returns the response and body to reply with.
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -&gt; (HTTPURLResponse, Data))?
+
+    /// A session wired to this protocol and nothing else.
+    static func makeSession() -&gt; URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+</code></pre>
+
+<p><code>URLProtocol</code> sits <em>underneath</em> <code>URLSession</code>. The real session runs,
+builds the real request, and this hands back a canned response. So a test can assert on what was
+sent:</p>
+
+<pre class="language-swift"><code class="language-swift">        XCTAssertNil(
+            captured.value?.value(forHTTPHeaderField: "Authorization"),
+            "A public endpoint must not leak the token."
+        )
+</code></pre>
+
+<p>That is a security property, tested. The paired assertion checks the bearer token <em>is</em>
+attached when the endpoint asks for it, and together they prove the one flag in the whole networking
+layer behaves.</p>
+
+<h3>One rule, and it is not optional</h3>
+
+<pre class="language-swift"><code class="language-swift">    override func tearDown() {
+        StubURLProtocol.handler = nil
+        session = nil
+        super.tearDown()
+    }
+</code></pre>
+
+<p>The handler is process-global. A stale closure left behind answers the <em>next</em> test's
+request, producing a failure that moves when the test order changes — which is the most expensive
+kind to chase, because it looks like flakiness rather than a bug.</p>
+
+<h2>Doubles, written by hand</h2>
+
+<p>A mocking framework would remove the boilerplate and add a dependency, a code-generation step and
+a layer between a failing test and the reason it failed. At this size the boilerplate is cheaper — and
+a double you wrote is one you can read when a test starts failing for a reason the framework does not
+explain.</p>
+
+<pre class="language-swift"><code class="language-swift">final class CatalogRepositorySpy: CatalogRepository, @unchecked Sendable {
+    var products: [Product] = SampleData.products
+    var toppings: [Topping] = SampleData.toppings
+    var crusts: [Crust] = SampleData.crusts
+    var error: Error?
+
+    private(set) var productsCallCount = 0
+</code></pre>
+
+<p>Configurable results, and a record of what was asked for. Asserting on the <em>call</em> is what
+catches the bugs a return value cannot: a screen that fetches twice, a write that never happens, a
+request sent without authentication.</p>
+
+<h2>Testing async and main-actor code</h2>
+
+<p>This used to need expectations and timeouts. It no longer does — a test method can be
+<code>async</code> and <code>await</code> the thing it is testing:</p>
+
+<pre class="language-swift"><code class="language-swift">    @MainActor
+    func testARejectedTokenIsDiscardedRatherThanLeftBehind() async {
+        let secureStore = InMemorySecureStore(seed: [.authToken: "expired.token"])
+        let repository = AuthRepositorySpy(currentUserResult: .failure(APIError.unauthorized))
+        let (store, _, tokenStore) = makeStore(repository: repository, secureStore: secureStore)
+
+        await store.restoreSession()
+
+        XCTAssertFalse(store.isAuthenticated)
+        let remaining = await tokenStore.currentToken()
+        XCTAssertNil(remaining)
+    }
+</code></pre>
+
+<p>Linear, no callbacks, no timeout to tune. The two <code>await</code>s are different actors — the
+store is main-actor isolated, the token store is an actor — and the test crosses both without
+ceremony.</p>
+
+<h3>@MainActor on the class does not compile cleanly</h3>
+
+<p>The tempting spelling is <code>@MainActor final class AuthStoreTests: XCTestCase</code>, and it
+produces a warning that becomes an error in Swift 6 — so effectively it <strong>does not
+compile</strong> going forward:</p>
+
+<pre class="language-swift"><code class="language-swift">// warning: main actor-isolated class 'AuthStoreTests' has different actor
+//          isolation from nonisolated superclass 'XCTestCase';
+//          this is an error in Swift 6
+@MainActor
+final class AuthStoreTests: XCTestCase {
+}
+</code></pre>
+
+<p><code>XCTestCase</code> is nonisolated and a subclass may not add isolation its superclass does
+not have. Annotate each test <em>method</em> instead. It is more typing and it is more honest — the
+isolation belongs to the work, not to the fixture.</p>
+
+<h2>Testing a debounce without sleeping for real</h2>
+
+<p>The cart writes 300 ms after the last change, and a test that waits 300 ms is a test that makes
+the suite slow. Inject the interval:</p>
+
+<pre class="language-swift"><code class="language-swift">        let store = CartStore(
+            repository: repository,
+            identifierStore: CartIdentifierStore(store: InMemoryKeyValueStore(seed: seed)),
+            menuStore: menu,
+            // Effectively no debounce, so a test does not have to sleep to observe a write.
+            persistDebounce: .milliseconds(1)
+        )
+</code></pre>
+
+<p>A timing value that is a constant is a timing value a test has to live with. Making it a
+constructor parameter with a production default costs nothing and turns an untestable behaviour into
+an ordinary one.</p>
+
+<p>The most valuable test in that file asserts something does <em>not</em> happen:</p>
+
+<pre class="language-swift"><code class="language-swift">        XCTAssertEqual(repository.replaceCallCount, 0)
+        XCTAssertFalse(store.isHydrated)
+</code></pre>
+
+<p>Nothing is written before hydration — because writing an empty cart over a saved one is the worst
+bug this type can have, and it would only reproduce for customers who already had a basket.</p>
+
+<h2>Testing routes without a socket</h2>
+
+<p>Because an <code>Endpoint</code> is inert data, the whole routing layer is testable with plain
+assertions:</p>
+
+<pre class="language-swift"><code class="language-swift">    func testMyOrdersCarriesPagingAndRequiresAuthentication() {
+        let endpoint = OrderEndpoints.myOrders(page: 2, size: 10)
+
+        XCTAssertEqual(url(endpoint), "http://localhost:8085/api/orders/mine?page=2&amp;size=10")
+        XCTAssertTrue(endpoint.requiresAuthentication)
+    }
+</code></pre>
+
+<p>A path typo is caught by a test that never opens a socket. The version of this test that earns its
+place most is the one that loops:</p>
+
+<pre class="language-swift"><code class="language-swift">        for endpoint in endpoints {
+            XCTAssertTrue(endpoint.requiresAuthentication, "\(endpoint.path) must be authenticated")
+            XCTAssertTrue(endpoint.path.hasPrefix("/api/me/"), "\(endpoint.path) must be under /api/me")
+        }
+</code></pre>
+
+<p>Every profile route, asserted to be authenticated and to carry no user id in its path. That is a
+security property written as a test rather than as a comment — and a new endpoint added to the list
+is checked automatically, which a comment would not be.</p>
+
+<h2>Tests as documentation of a decision</h2>
+
+<p>The best tests in this suite are the ones whose names state a rule and whose failure messages
+explain it:</p>
+
+<pre class="language-swift"><code class="language-swift">        XCTAssertEqual(
+            repository.createCallCount, 0,
+            "Do not create a cart server-side just because someone opened the app."
+        )
+</code></pre>
+
+<p>Somebody who breaks that in two years gets the reasoning along with the failure, rather than a
+line number and a zero that was expected to be a zero.</p>
+
+<h2>Sample data that is not too tidy</h2>
+
+<p>Both the tests and the previews share one fixture file, and the data in it is deliberately
+awkward: a pizza with three sizes, a crust with a surcharge and two without, an address with a second
+line, a card with no expiry at all.</p>
+
+<p>Fixtures that are too neat hide exactly the problems tests exist to catch. A
+<code>PaymentMethod</code> whose brand and last four digits are always present never exercises the
+branch that renders "Card •••• ????", and that branch is the one that will be hit by a real record
+from a payment provider having a bad day.</p>
+
+<h2>Arrange, act, assert</h2>
+
+<p>Every test above has the same three-part shape with blank lines between them, and it is worth being
+deliberate about. The arrange block builds the world, the act block is one line, and the assertions
+follow. When the act block is more than a line or two, that is usually a signal the test is covering
+two things and should be two tests.</p>
+
+<p>The other habit worth forming: one factory per suite for the fixture, with defaulted parameters,
+so each test overrides only what it is actually about. <code>makeStore(repository:)</code> and
+<code>item(toppings:)</code> in this suite both exist for that reason, and they are why the tests read
+as statements of a rule rather than as setup with an assertion at the bottom.</p>
+
+<h2>What about UI tests?</h2>
+
+<p><code>XCUITest</code> drives the real app through the accessibility layer. It is the only way to
+test a full flow end to end, and it is slow, brittle, and prone to failing for reasons that have
+nothing to do with your change.</p>
+
+<p>The pragmatic position: a handful for the flows that would cost you money if they broke — sign in,
+add to cart, check out — and nothing else. And note the dependency, because it is a good argument for
+lesson 18: a UI test finds elements by accessibility identifier and label, so an app with good
+accessibility is an app that is straightforward to test, and one without is one where every test
+starts by adding identifiers.</p>
+
+<h2>Running them</h2>
+
+<pre class="language-bash"><code class="language-bash">xcodebuild test -project Pizza.xcodeproj -scheme Pizza \
+    -destination 'platform=iOS Simulator,name=iPhone 15'
+</code></pre>
+
+<p>Coverage is enabled in the scheme, and it is worth reading as a map of what is untested rather
+than as a number to maximise. In this app the views show near zero and that is the expected result,
+not a gap — everything worth asserting was extracted into something that does not need rendering,
+which was the point of the architecture in the first place.</p>
+
+<h2>Next</h2>
+
+<p>Tests tell you whether the logic is right. Previews tell you whether the screen is, and the next
+lesson is them — plus the linting and formatting configuration worth having.</p>

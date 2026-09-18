@@ -286,23 +286,35 @@ SNIPPET_SOURCES = {
         f"{A}/PizzaTests/Support/TestDoubles.swift",
         f"{A}/PizzaTests/ViewModelTests.swift",
         f"{A}/PizzaTests/EndpointTests.swift",
+        # The money and store suites, quoted for the "a test documents a decision" argument.
+        f"{A}/PizzaTests/MoneyTests.swift",
+        f"{A}/PizzaTests/StoreTests.swift",
     ],
     "ios-previews-and-tooling": [
         f"{A}/Pizza/Data/Repositories/PreviewRepositories.swift",
         f"{A}/Pizza/Features/Menu/MenuView.swift",
         f"{A}/Pizza/Features/Checkout/Components/SavedAddressPicker.swift",
         f"{A}/.swiftlint.yml", f"{A}/.swiftformat",
+        # The stubbed graph the previews run against, and the regeneration script.
+        f"{A}/Pizza/App/AppEnvironment.swift",
+        f"{A}/Scripts/generate-project.sh",
     ],
     "ios-build-and-ship": [
         f"{A}/project.yml", f"{A}/Config/Shared.xcconfig", f"{A}/Config/Release.xcconfig",
         f"{A}/Pizza/Resources/Info.plist",
         f"{A}/Scripts/generate-project.sh",
         ".github/workflows/ios.yml",
+        # The debug configuration, quoted for the API-host and $() escaping section.
+        f"{A}/Config/Debug.xcconfig",
     ],
     "ios-interview-questions": [
         f"{A}/Pizza/Domain/Services/CartReducer.swift",
         f"{A}/Pizza/Core/Utilities/ViewState.swift",
         f"{A}/Pizza/Core/Persistence/TokenStore.swift",
+        f"{A}/Pizza/Domain/Models/Cart.swift",
+        f"{A}/Pizza/App/ToastCenter.swift",
+        f"{A}/Pizza/Features/Menu/MenuStore.swift",
+        f"{A}/Pizza/Domain/Repositories/Repositories.swift",
     ],
 }
 

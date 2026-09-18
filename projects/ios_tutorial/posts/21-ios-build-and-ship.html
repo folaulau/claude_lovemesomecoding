@@ -1,0 +1,288 @@
+<p>The distance between "it runs on my simulator" and "it is on the App Store" is mostly
+configuration, and configuration is where a project accumulates decisions nobody can see. This lesson
+is how to keep those decisions reviewable, plus signing, CI, and the release path with the rejections
+worth avoiding.</p>
+
+<h2>Build settings belong in a file</h2>
+
+<p>Xcode will happily let you set every build setting through its project editor, and they land in
+<code>project.pbxproj</code> — a file nobody reads and therefore nobody reviews. A setting changed
+there appears in a pull request as an unreadable line, which is how a release-only flag gets flipped
+and stays flipped for a month.</p>
+
+<pre class="language-properties"><code class="language-properties">PRODUCT_BUNDLE_IDENTIFIER = com.lovemesomecoding.pizza.ios
+MARKETING_VERSION = 1.0.0
+CURRENT_PROJECT_VERSION = 1
+
+IPHONEOS_DEPLOYMENT_TARGET = 17.0
+SWIFT_VERSION = 5.0
+TARGETED_DEVICE_FAMILY = 1,2
+</code></pre>
+
+<p>Two of those are the version, and the distinction trips people up. <code>MARKETING_VERSION</code>
+is what customers see — 1.0.0, then 1.1.0. <code>CURRENT_PROJECT_VERSION</code> is the build number,
+which must increase with every upload to App Store Connect and is otherwise invisible. Uploading a
+build whose number you already used is the most common first rejection, and it happens at upload
+rather than review.</p>
+
+<h3>The setting that must not be shared</h3>
+
+<pre class="language-properties"><code class="language-properties">// PRODUCT_NAME is deliberately NOT set here.
+</code></pre>
+
+<p>An <code>.xcconfig</code> assigned at the <em>project</em> level applies to every target, and
+<code>PRODUCT_NAME</code> is what the Swift module name derives from. Setting it there gave the app
+and its test bundle the same module name, and the build then failed with four "Multiple commands
+produce …" errors that name the symptom and not the cause.</p>
+
+<p>It belongs on the target. And while you are there, <code>PRODUCT_MODULE_NAME</code> is worth
+setting explicitly — otherwise a product called "StayHub Pizza" gives you a module called
+<code>StayHub_Pizza</code>, and <code>@testable import Pizza</code> does not compile.</p>
+
+<h3>Debug and Release differ, deliberately</h3>
+
+<pre class="language-properties"><code class="language-properties">SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG
+SWIFT_OPTIMIZATION_LEVEL = -Onone
+ONLY_ACTIVE_ARCH = YES
+</code></pre>
+
+<p>Debug builds unoptimised for the active architecture only, which is why they are fast to build and
+slow to run. Release compiles whole-module with optimisation, and it is the only configuration worth
+drawing a performance conclusion from.</p>
+
+<p><code>DEBUG</code> is what gates <code>#if DEBUG</code>, which is how the sample data and preview
+repositories stay out of the shipped binary.</p>
+
+<h2>Where the API host comes from</h2>
+
+<pre class="language-properties"><code class="language-properties">PIZZA_API_BASE_URL = http:$()/$()/localhost:8085
+</code></pre>
+
+<p>Not a typo. In an <code>.xcconfig</code>, <code>//</code> starts a comment — so writing the URL
+normally gives you the string <code>http:</code>, silently. <code>$()</code> is an empty variable
+substitution that separates the two slashes without changing the result.</p>
+
+<p>The release file points somewhere else entirely, which is the whole point of having two:</p>
+
+<pre class="language-properties"><code class="language-properties">PIZZA_API_BASE_URL = https:$()/$()/api.pizza.example.com
+
+PIZZA_STRIPE_PUBLISHABLE_KEY =
+
+SWIFT_OPTIMIZATION_LEVEL = -O
+SWIFT_COMPILATION_MODE = wholemodule
+VALIDATE_PRODUCT = YES
+</code></pre>
+
+<p>The same source ships to every environment and the host is a build setting rather than a code
+edit. For a third environment — staging — the shape is one more <code>.xcconfig</code> and one more
+configuration, not a branch in the source.</p>
+
+<p>The app reads those values from <code>Info.plist</code>, and the fallback is deliberately
+asymmetric: a debug build with nothing configured defaults to localhost, and a release build with
+nothing configured <em>traps at launch</em>. Shipping a binary that silently talks to
+<code>localhost</code> is far worse than one that refuses to start on the machine of the person who
+can still fix it.</p>
+
+<h2>Info.plist: if you own it, you own all of it</h2>
+
+<p>Xcode synthesises the standard bundle keys when it generates the plist for you. Supply your own
+and you own every one of them — and omitting them is <strong>not a build error</strong>:</p>
+
+<pre class="language-markup"><code class="language-markup">	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+</code></pre>
+
+<p>The app compiles, links and signs, and then the simulator refuses to install it: "The application's
+Info.plist does not contain a valid CFBundleVersion". Every value is a build-setting substitution, so
+the version lives in one <code>.xcconfig</code> rather than being duplicated.</p>
+
+<h3>The keys that get you rejected</h3>
+
+<p>Any API that touches private data needs a usage-description string, and the wording is read by a
+human reviewer. "This app needs camera access" is a rejection; "Used to photograph a receipt when
+reporting a problem with an order" is not. The crash if you forget one entirely is immediate and
+unmistakable.</p>
+
+<pre class="language-markup"><code class="language-markup">	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</code></pre>
+
+<p>App Transport Security blocks plain HTTP, and the development backend is
+<code>http://localhost:8085</code>. <code>NSAllowsLocalNetworking</code> opens local addresses only.
+The tempting alternative — <code>NSAllowsArbitraryLoads</code> — disables HTTPS enforcement for the
+entire app and is rejected without a written justification. A production build talks to an
+<code>https://</code> API and needs neither.</p>
+
+<h2>Targets, in the manifest</h2>
+
+<p>Under the app target's <code>settings.base</code>, alongside <code>INFOPLIST_FILE</code> and
+<code>PRODUCT_NAME</code>:</p>
+
+<pre class="language-yaml"><code class="language-yaml">        PRODUCT_MODULE_NAME: Pizza
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SUPPORTED_PLATFORMS: iphoneos iphonesimulator
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+</code></pre>
+
+<p>The <code>INFOPLIST_KEY_</code> prefix is worth knowing: Xcode merges those build settings into
+the generated plist, so simple values can live beside the rest of the configuration instead of in
+XML. Orientation is a good example — it is a product decision, it changes rarely, and it reads better
+here than in a plist nobody opens.</p>
+
+<h2>Icons and the launch screen</h2>
+
+<p>Two small things that block a submission if they are wrong.</p>
+
+<p>The app icon is a single 1024×1024 image in the asset catalogue; the system generates the rest.
+It must have no alpha channel and no rounded corners — the system rounds it — and a PNG exported with
+transparency is rejected at upload rather than at review.</p>
+
+<p>The launch screen is not a splash screen and must not be used as one. It is drawn before your code
+runs, so it cannot show anything dynamic, and the guidance is that it should resemble the first screen
+of your app so the transition is invisible. A logo on a coloured background technically passes and
+makes the app feel slower than it is.</p>
+
+<h2>Signing</h2>
+
+<p>Three things that sound alike. A <strong>certificate</strong> identifies you. An <strong>App
+ID</strong> identifies the app and its capabilities. A <strong>provisioning profile</strong> ties the
+two together and lists the devices a development build may run on.</p>
+
+<p>Automatic signing in Xcode manages all three, and for most teams that is the right answer. What is
+worth knowing is that <strong>none of it is needed for the simulator</strong>:</p>
+
+<pre class="language-properties"><code class="language-properties">CODE_SIGN_STYLE = Automatic
+CODE_SIGNING_REQUIRED[sdk=iphonesimulator*] = NO
+CODE_SIGNING_ALLOWED[sdk=iphonesimulator*] = NO
+</code></pre>
+
+<p>Which means a fresh clone builds and tests without an Apple account at all. That matters for CI —
+where storing a signing identity is real work — and it matters for anyone reading the repository.</p>
+
+<h2>CI</h2>
+
+<pre class="language-yaml"><code class="language-yaml">    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_15.4.app
+</code></pre>
+
+<p>Pinned, not <code>macos-latest</code>. A runner image upgrade changes the Xcode version, the
+simulator runtimes and the Swift compiler all at once, which turns "someone's PR broke the build"
+into a half-day of archaeology. Upgrading then becomes a deliberate, reviewable commit.</p>
+
+<p>macOS runners cost roughly ten times a Linux minute, so the path filter is not a detail — a change
+to an unrelated part of the repository must not start a Mac.</p>
+
+<h3>Check the generated project still matches its manifest</h3>
+
+<pre class="language-yaml"><code class="language-yaml">      - name: Check the project matches project.yml
+        run: |
+          brew install xcodegen
+          ./Scripts/generate-project.sh
+          if ! git diff --quiet -- Pizza.xcodeproj; then
+            echo "::error::Pizza.xcodeproj is out of date. Run ./Scripts/generate-project.sh and commit the result."
+            git diff --stat -- Pizza.xcodeproj
+            exit 1
+          fi
+</code></pre>
+
+<p>Where the project is generated and committed, the two can drift: someone changes a setting in
+Xcode's editor, commits the <code>.pbxproj</code>, and the next regeneration silently discards it.
+Regenerating and diffing in CI is what makes that impossible rather than merely discouraged.</p>
+
+<h3>Cache what is expensive</h3>
+
+<pre class="language-yaml"><code class="language-yaml">      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('pizza/pizza-ios-mobile/Pizza.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+</code></pre>
+
+<p>Keyed on <code>Package.resolved</code>, which is committed for exactly this reason: the key
+changes only when a dependency version does, so the cache is reused until it is genuinely stale.
+Committing that file is also what makes a build reproducible — without it, two people resolving the
+same range can get different versions.</p>
+
+<p>And upload the result bundle on failure. A CI log tells you a test failed; an
+<code>.xcresult</code> tells you which assertion, with the full context, opened in Xcode.</p>
+
+<h2>Archive and upload</h2>
+
+<p>Two commands, and they are the same ones Xcode's menu runs:</p>
+
+<pre class="language-bash"><code class="language-bash">xcodebuild archive -project Pizza.xcodeproj -scheme Pizza \
+    -destination 'generic/platform=iOS' -archivePath build/Pizza.xcarchive
+
+xcodebuild -exportArchive -archivePath build/Pizza.xcarchive \
+    -exportOptionsPlist ExportOptions.plist -exportPath build
+</code></pre>
+
+<p>Then TestFlight before the store, always. Internal testers get a build in minutes with no review;
+external testers need a short review. It is the only realistic way to find the things that only
+happen on a real device on a real network — and the crash reports come back symbolicated through the
+Organizer.</p>
+
+<h2>The review, and what actually gets rejected</h2>
+
+<p>Most rejections are not about your code.</p>
+
+<p><strong>Missing or vague usage descriptions</strong> is the most common. <strong>Broken
+functionality</strong> is the second — a reviewer hits a screen that requires a login they do not
+have, so provide a demo account in App Review notes. <strong>Account deletion</strong> is required if
+your app can create an account, and it must be reachable in the app rather than only on a website.
+And if you <strong>sell digital content</strong>, it goes through in-app purchase.</p>
+
+<p>Physical goods — a pizza — do not. That is why this app takes card payments with Stripe and is
+entirely within the rules.</p>
+
+<h2>Privacy, which is now a build artefact</h2>
+
+<p>Two requirements that are recent enough to catch people out.</p>
+
+<p>A <strong>privacy manifest</strong> — <code>PrivacyInfo.xcprivacy</code> — declares the data your
+app collects and the reason it uses certain common APIs. Several third-party SDKs ship their own, and
+Xcode aggregates them into the report you paste into App Store Connect. It is a file, so it belongs in
+review like any other.</p>
+
+<p>And <strong>required-reason APIs</strong>: a handful of ordinary calls, including file timestamps
+and <code>UserDefaults</code>, now need a declared reason in that manifest. The failure is an email
+after upload rather than a build error, which is exactly the kind of thing to set up once at the
+start rather than the week you planned to ship.</p>
+
+<h2>Distributing to people who are not customers</h2>
+
+<p>Beyond the App Store there are two paths worth knowing exist. <strong>Ad hoc</strong> distribution
+installs on specific registered devices, which is the older way to get a build to a colleague.
+<strong>Enterprise</strong> distribution is for internal apps at a company and comes with real
+obligations about who may install it.</p>
+
+<p>For almost everything, TestFlight has replaced both — it needs no device registration, it handles
+updates, and it gives you the crash reports.</p>
+
+<h2>A pre-release checklist</h2>
+
+<ul>
+  <li>Build number incremented.</li>
+  <li>Release configuration pointed at the production API, and verified rather than assumed.</li>
+  <li>No <code>NSAllowsArbitraryLoads</code>, no debug logging of anything sensitive.</li>
+  <li>Tested on a real device, on cellular, and with the app killed and relaunched.</li>
+  <li>The largest Dynamic Type size does not break a screen.</li>
+  <li>A demo account in the review notes.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>One lesson left: the questions an iOS interview actually asks, answered against everything in this
+track.</p>
