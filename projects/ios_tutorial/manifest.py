@@ -228,6 +228,9 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Data/Repositories/RemoteRepositories.swift",
         f"{A}/Pizza/Domain/Services/CartReducer.swift",
         f"{A}/Pizza/Features/Cart/CartStore.swift",
+        # The pure pricing rules that live beside the reducer, and the reducer's own tests.
+        f"{A}/Pizza/Domain/Services/CartPricing.swift",
+        f"{A}/PizzaTests/CartReducerTests.swift",
     ],
     "ios-dependency-injection": [
         f"{A}/Pizza/App/AppEnvironment.swift",
