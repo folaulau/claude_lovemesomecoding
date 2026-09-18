@@ -1,0 +1,262 @@
+<p>A browser tab lives until somebody closes it. Your app does not get that courtesy: it can be
+suspended mid-sentence, and terminated without warning while the customer is looking at something
+else entirely.</p>
+
+<p>This lesson is what actually happens, the two places it changes how you write code, and the
+startup ordering that is load-bearing rather than tidy.</p>
+
+<h2>The states</h2>
+
+<p>An iOS app moves between five, and three of them matter to you.</p>
+
+<p><strong>Active</strong> — on screen, receiving events. <strong>Inactive</strong> — on screen but
+not receiving them: mid app-switcher, a call arriving, Control Centre pulled down.
+<strong>Background</strong> — off screen, running briefly on borrowed time.
+<strong>Suspended</strong> — in memory, executing nothing. And then <strong>terminated</strong>,
+which from your process's point of view does not happen at all: it simply stops, with no callback
+and no chance to save.</p>
+
+<p>That last point is the one to internalise. <strong>You do not get told you are being killed.</strong>
+The system reclaims memory by terminating suspended apps, and a suspended app has already stopped
+running. Anything you were going to save had to be saved before you were suspended.</p>
+
+<h2>scenePhase</h2>
+
+<p>SwiftUI reports the transitions through the environment:</p>
+
+<pre class="language-swift"><code class="language-swift">    @Environment(\.scenePhase) private var scenePhase
+</code></pre>
+
+<p>Three values — <code>.active</code>, <code>.inactive</code>, <code>.background</code> — and one
+place to observe them:</p>
+
+<pre class="language-swift"><code class="language-swift">        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background || newPhase == .inactive {
+                environment.cart.flushPendingWrites()
+            }
+        }
+</code></pre>
+
+<p><code>.inactive</code> is included alongside <code>.background</code> on purpose. It arrives
+<em>first</em>, while the app is still running normally, so the write starts during the app-switcher
+animation rather than in the much shorter and less certain window after it.</p>
+
+<h2>The mobile-only problem</h2>
+
+<p>The demo app's cart is debounced: three taps on "+" become one request 300 ms after the last one.
+That is correct on the web, where a tab stays alive and the timer always gets to fire.</p>
+
+<p>On a phone it is a bug waiting for the right customer. Add a pizza, immediately switch apps, and
+the system may suspend the process before the debounce elapses — and may then terminate it. The
+basket is gone, and nothing anywhere logged a failure, because nothing failed.</p>
+
+<pre class="language-swift"><code class="language-swift">    func flushPendingWrites() {
+        guard isHydrated else { return }
+        persistTask?.cancel()
+        persistTask = Task { await self.persist() }
+    }
+</code></pre>
+
+<p>Cancel the pending debounce, write immediately. Two details are worth naming.</p>
+
+<p>The <code>guard isHydrated</code> is the most important line in the file. Writing before the saved
+cart has loaded would overwrite it with an empty one — the worst bug this type can have, and one
+that would only reproduce for customers who already had a basket.</p>
+
+<p>And the task is deliberately <em>not</em> awaited by the caller. <code>scenePhase</code> changes
+synchronously and the system gives a short, unguaranteed window afterwards; this races to use it
+rather than pretending it can block. If the work genuinely needs longer, that is what
+<code>beginBackgroundTask</code> is for — and it is worth knowing it exists and that the extra time
+is measured in seconds, not minutes.</p>
+
+<h3>What "saving" means, defined once</h3>
+
+<p>The flush and the debounce both call the same method, so there is one implementation of what a
+save is rather than two that drift:</p>
+
+<pre class="language-swift"><code class="language-swift">    private func persist() async {
+        do {
+            let identifier: UUIDString
+            if let cartID {
+                identifier = cartID
+            } else {
+                // Do not create a cart row just because someone opened the app and browsed.
+                guard !state.items.isEmpty else { return }
+                let created = try await repository.createCart()
+                identifier = created.id
+                cartID = identifier
+                identifierStore.save(identifier)
+            }
+
+            _ = try await repository.replaceCart(id: identifier, with: writeRequest())
+        } catch {
+            guard !ErrorPresenter.isCancellation(error) else { return }
+            AppLog.cart.error("Could not persist the cart: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+</code></pre>
+
+<p>Two lifecycle-shaped decisions in there. A cart row is not created until there is something in it,
+so opening the app and browsing away leaves nothing behind. And a failed save is logged rather than
+surfaced — the cart still works for this session, it simply will not survive a relaunch, and a toast
+on every tap would be a worse experience than the failure it reports.</p>
+
+<p>The write itself is an idempotent replacement of the whole cart rather than a sequence of add and
+remove calls. That is what makes the flush safe to fire at an awkward moment: a retry cannot double
+an item, and the device never has to reconcile a partial sequence of writes it is unsure landed.</p>
+
+<h2>Launch, and the gate an async read forces</h2>
+
+<p>The second place the lifecycle changes your code is the first frame.</p>
+
+<p>On the web the session token comes out of <code>localStorage</code> synchronously, so the very
+first render already knows whether anyone is signed in. Here it is in the Keychain and reading it is
+asynchronous, so for a moment the app genuinely does not know.</p>
+
+<p>Render the signed-out UI during that gap and the Profile tab flashes "Sign in" and then swaps —
+and a screen gated on authentication would bounce a signed-in customer out of the tab they just
+opened.</p>
+
+<pre class="language-swift"><code class="language-swift">        Group {
+            if auth.isRestoringSession {
+                LaunchPlaceholder()
+            } else {
+                tabs
+            }
+        }
+</code></pre>
+
+<p>The placeholder is deliberately the launch screen's own content rather than a spinner. Matching
+what the system already drew makes the transition into the app invisible, instead of a flash of a
+second, different loading state.</p>
+
+<h3>Restoring is not the same as having a token</h3>
+
+<pre class="language-swift"><code class="language-swift">    func restoreSession() async {
+        defer { isRestoringSession = false }
+
+        guard await tokenStore.currentToken() != nil else { return }
+
+        do {
+            user = try await repository.currentUser()
+        } catch {
+            AppLog.auth.info("Stored session could not be restored; clearing the token.")
+            await tokenStore.clear()
+            user = nil
+        }
+    }
+</code></pre>
+
+<p>The presence of a token proves nothing — it may have expired or been revoked — so
+<code>/api/auth/me</code> is the source of truth. A failure drops the token rather than leaving a
+dead one behind that makes every later authenticated call fail with a confusing 401.</p>
+
+<p><code>defer</code> guarantees the flag clears on every path, including the throwing one. Without
+it, a failed restore leaves the app on its launch placeholder forever.</p>
+
+<h2>The startup sequence is ordered, deliberately</h2>
+
+<pre class="language-swift"><code class="language-swift">        .task {
+            await auth.restoreSession()
+            await menu.reload()
+            await cart.hydrate()
+        }
+</code></pre>
+
+<p>Three awaits, and the order is load-bearing. The session is restored first because an
+authenticated request needs the token. The menu is loaded next. The cart hydrates <em>last</em>,
+because a saved line holds only identifiers — its price and crust surcharge come from the catalogue,
+so hydrating first would produce a basket full of zero-priced lines.</p>
+
+<p>Worth noticing what this costs: the three run in sequence, so launch is as slow as all of them.
+That is the right trade here because each genuinely depends on the last, but it is the kind of thing
+to measure rather than assume — if the menu did not feed the cart, those two would be
+<code>async let</code>.</p>
+
+<p><code>.task</code> also cancels automatically if the view goes away, so there is no
+<code>onAppear</code> plus manual cancellation to get wrong.</p>
+
+<h2>Rebuilding a cart from identifiers</h2>
+
+<p>Hydration is the other half of the round trip, and it is where the ordering rule above becomes
+concrete:</p>
+
+<pre class="language-swift"><code class="language-swift">            let items = cart.items.map { line -&gt; CartItem in
+                let product = catalogue.product(id: line.productId)
+                let crust = catalogue.crust(id: line.crustId)
+
+                return CartItem(
+                    lineID: UUID(),
+                    productID: line.productId,
+                    productName: line.productName,
+                    productType: line.productType,
+                    imageURL: product?.imageUrl,
+                    size: line.size,
+                    basePrice: product?.price(for: line.size) ?? 0,
+</code></pre>
+
+<p>The stored line carries identifiers and quantities; the price comes from the catalogue. Hydrate
+before the menu has loaded and every <code>basePrice</code> falls through to that <code>?? 0</code>
+— a basket that looks right and totals nothing.</p>
+
+<p>The other decision there is generating a fresh <code>lineID</code> rather than reusing the
+server's. A line's identity on the device is "this configuration", not a database row, which is what
+lets two identical pizzas added separately collapse into one line with quantity two.</p>
+
+<h3>When the saved cart is gone</h3>
+
+<pre class="language-swift"><code class="language-swift">            AppLog.cart.info("Saved cart could not be loaded; forgetting the stored identifier.")
+            identifierStore.clear()
+            self.cartID = nil
+</code></pre>
+
+<p>Deleted server-side, or a stale id left over from pointing the app at a different environment.
+Forgetting it beats leaving the device aimed at a cart that will never load — which would fail
+identically on every launch, forever, for that one customer.</p>
+
+<h2>Cold launch, warm launch, and what you can control</h2>
+
+<p>A cold launch starts a process. A warm one resumes a suspended app and is nearly instant. You
+mostly control the first, and the rule is that nothing expensive belongs before the first frame —
+<code>@main</code> should build a dependency graph and get out of the way, with the network work
+happening in a <code>.task</code> the UI is already visible for.</p>
+
+<p>The demo app's graph construction is a handful of struct initialisers and one Keychain read, which
+is why the launch gate is measured in frames rather than seconds.</p>
+
+<h2>State restoration</h2>
+
+<p>Because the system terminates apps routinely, a customer who returns after an hour is often
+starting a fresh process. Restoring what they were doing is what makes that invisible.</p>
+
+<p>The demo app restores the important half — the cart, from the server — and deliberately not the
+navigation position. That is a reasonable line for a shopping app: the basket is the customer's work
+and the screen they were on is not. Where you want the whole thing,
+<code>@SceneStorage</code> persists small values per scene automatically, and the reason the router
+in lesson 5 keeps navigation as an array of values rather than as implied view state is that an array
+of values is something you could store there.</p>
+
+<h2>Push notifications and background work</h2>
+
+<p>Two things the demo app does not do, worth knowing the shape of. A silent push can wake a
+suspended app to fetch something, and <code>BGTaskScheduler</code> can run periodic work the system
+decides when to grant. Both are ways of getting execution time you would not otherwise have, and both
+are granted at the system's discretion rather than yours — code that assumes a background task ran
+on schedule is code that will be wrong for somebody with Low Power Mode on.</p>
+
+<h2>A checklist</h2>
+
+<ul>
+  <li>Flush anything debounced on <code>.inactive</code>.</li>
+  <li>Never assume a callback before termination. There is not one.</li>
+  <li>Gate the first frame on anything asynchronous that decides what the UI should be.</li>
+  <li>Verify the token, do not trust its presence.</li>
+  <li>Test it for real: background the app from the app switcher, then swipe up to kill it, then
+  relaunch. That sequence is the only way to find these bugs, and it takes ten seconds.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>The cart survives everything a phone can do to it. The next lesson turns it into an order and
+takes money for it — Stripe's payment sheet, quarantined behind a protocol so checkout stays
+testable.</p>

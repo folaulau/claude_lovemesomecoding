@@ -1,0 +1,278 @@
+<p>"Where do I save this?" has four reasonable answers on iOS, and picking the wrong one is
+occasionally a security incident rather than a preference. This lesson is the decision, then the
+Keychain in detail, because it is the one with an API that fights back.</p>
+
+<h2>The four places</h2>
+
+<p><strong><code>UserDefaults</code></strong> — small, unencrypted, key-value. Preferences, the last
+tab, a feature flag. Readable by anyone with a backup of the device.</p>
+
+<p><strong>The Keychain</strong> — small, encrypted, survives an app update, wiped on uninstall.
+Tokens, passwords, anything you would be embarrassed to see in a backup.</p>
+
+<p><strong>The file system</strong> — documents, images, downloaded data. Sandboxed per app, and the
+directory you choose decides whether it is backed up and whether the system may delete it under disk
+pressure.</p>
+
+<p><strong>A database</strong> — SwiftData or Core Data, for structured data you query. Worth it when
+you have relationships and predicates, overkill when you have a token and a cart id.</p>
+
+<h2>Naming the keys once</h2>
+
+<pre class="language-swift"><code class="language-swift">enum StorageKey: String, CaseIterable {
+    /// The JWT. Goes in the Keychain, never in `UserDefaults`.
+    case authToken = "pizza.token"
+    /// Which server-side cart belongs to this device. Not a secret — see `CartIdentifierStore`.
+    case cartIdentifier = "pizza.cartId"
+}
+</code></pre>
+
+<p>A typo in a storage key fails <em>silently</em> — the read returns nil and the app behaves as if
+the customer had never signed in. Naming them in one enum removes that whole class of bug, and it
+makes it obvious at a glance what this app leaves on the device, which is a question worth being able
+to answer quickly.</p>
+
+<h2>Two protocols, because the split is a decision</h2>
+
+<pre class="language-swift"><code class="language-swift">protocol SecureStore: Sendable {
+    func string(for key: StorageKey) throws -&gt; String?
+    func set(_ value: String, for key: StorageKey) throws
+    func removeValue(for key: StorageKey) throws
+}
+</code></pre>
+
+<pre class="language-swift"><code class="language-swift">protocol KeyValueStore: Sendable {
+    func string(for key: StorageKey) -&gt; String?
+    func set(_ value: String, for key: StorageKey)
+    func removeValue(for key: StorageKey)
+}
+</code></pre>
+
+<p>Two protocols with almost the same shape, and keeping them separate is the point. It makes the
+decision explicit at every call site: a value written to the plain store is readable by anyone with a
+backup, so putting a token there has to be a mistake somebody can <em>see</em> in review rather than
+one that hides behind a shared API.</p>
+
+<p>Note that only the secure one throws. A Keychain operation can genuinely fail —
+<code>UserDefaults</code> effectively cannot, and pretending otherwise would put a
+<code>try</code> at every call site for nothing.</p>
+
+<h2>The Keychain</h2>
+
+<p>The web equivalent of a session token is <code>localStorage</code>, with an apology that any XSS
+bug can read it. On a phone there is a better answer: the Keychain is encrypted, inaccessible to
+other apps, and survives an app update while being wiped on uninstall.</p>
+
+<h3>The accessibility class is the decision that matters</h3>
+
+<pre class="language-swift"><code class="language-swift">        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+</code></pre>
+
+<p>Two halves, both deliberate.</p>
+
+<p><strong>AfterFirstUnlock</strong> means readable once the customer has unlocked the phone since
+boot, so a background refresh still works with the screen locked. <code>WhenUnlocked</code> is
+stricter and would break any future background task; <code>Always</code> is deprecated and
+unencrypted at rest.</p>
+
+<p><strong>ThisDeviceOnly</strong> means never copied into an iCloud Keychain backup. A session token
+is bound to <em>this</em> device, and syncing one to a restored iPad hands a live session to a
+machine the customer may no longer control.</p>
+
+<p>This is the line to think hardest about. The default if you omit it is
+<code>kSecAttrAccessibleWhenUnlocked</code>, which is reasonable but syncs.</p>
+
+<h3>Save is delete-then-add, and that is not a mistake</h3>
+
+<pre class="language-swift"><code class="language-swift">    func set(_ value: String, for key: StorageKey) throws {
+        guard let data = value.data(using: .utf8) else { throw Failure.unreadableData }
+
+        // Delete first: SecItemAdd returns errSecDuplicateItem for an existing key.
+        try? removeValue(for: key)
+
+        var query = baseQuery(for: key)
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw Failure.unexpectedStatus(status) }
+    }
+</code></pre>
+
+<p><code>SecItemUpdate</code> fails when the item is absent and <code>SecItemAdd</code> fails when it
+is present. Delete-then-add is not elegant; it is the only spelling that is correct in both states
+without an extra round trip to find out which one applies.</p>
+
+<h3>Absent is not an error</h3>
+
+<pre class="language-swift"><code class="language-swift">        switch status {
+        case errSecSuccess:
+            guard let data = item as? Data, let value = String(data: data, encoding: .utf8) else {
+                throw Failure.unreadableData
+            }
+            return value
+        case errSecItemNotFound:
+            // Absent is a normal state — nobody has signed in yet — not an error.
+            return nil
+        default:
+            throw Failure.unexpectedStatus(status)
+        }
+</code></pre>
+
+<p>Treating <code>errSecItemNotFound</code> as a failure means every caller writes a
+<code>catch</code> that turns it back into nil. Three cases, and the middle one is the common
+path.</p>
+
+<h3>The service attribute</h3>
+
+<p><code>kSecAttrService</code> namespaces your items, and the bundle identifier is the conventional
+value. It matters as soon as you have a second target — an extension, a widget — because without it
+they would collide, and with an access group they can deliberately share.</p>
+
+<h2>Wrapping it in an actor</h2>
+
+<p>The raw store is synchronous and throwing. What the app wants is something safe to touch from
+several places at once:</p>
+
+<pre class="language-swift"><code class="language-swift">actor TokenStore: AuthTokenProviding {
+    private let secureStore: SecureStore
+    private var cachedToken: String?
+    private var hasLoaded = false
+</code></pre>
+
+<p>The token is genuinely contended: the HTTP client reads it on every authenticated request, sign-in
+writes it, sign-out clears it — and a customer can tap "Sign out" while a refresh is in flight. An
+actor serialises that with no lock to remember.</p>
+
+<p>It also caches, because a Keychain read is a syscall into <code>securityd</code> — not slow
+enough to see, but pointless to repeat dozens of times a session. "Load once, then reuse" is unsafe
+to write in a shared object without a lock; inside an actor it is just code.</p>
+
+<h3>Failures, and what they should mean</h3>
+
+<pre class="language-swift"><code class="language-swift">    func currentToken() async -&gt; String? {
+        if hasLoaded { return cachedToken }
+        cachedToken = try? secureStore.string(for: .authToken)
+        hasLoaded = true
+        return cachedToken
+    }
+</code></pre>
+
+<p>A Keychain read failure is swallowed to nil rather than thrown. The only honest interpretation of
+"we cannot read the token" is "there is no session", and every caller would have to turn a thrown
+error into exactly that anyway.</p>
+
+<p>The write is the opposite and more interesting:</p>
+
+<pre class="language-swift"><code class="language-swift">    func store(_ token: String) async {
+        cachedToken = token
+        hasLoaded = true
+        do {
+            try secureStore.set(token, for: .authToken)
+        } catch {
+            AppLog.storage.error("Could not persist the auth token: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+</code></pre>
+
+<p>The write failed, but the in-memory token is still good. The session works for as long as the app
+is running; it simply will not survive a relaunch. Failing the sign-in over this would be a worse
+outcome than a session that is merely short-lived — and logging it means the failure is still
+visible to whoever has to explain it later.</p>
+
+<h2>The unencrypted half</h2>
+
+<pre class="language-swift"><code class="language-swift">struct CartIdentifierStore: Sendable {
+    private let store: KeyValueStore
+
+    init(store: KeyValueStore) { self.store = store }
+
+    var identifier: UUIDString? { store.string(for: .cartIdentifier) }
+
+    func save(_ identifier: UUIDString) { store.set(identifier, for: .cartIdentifier) }
+</code></pre>
+
+<p>The cart id is deliberately <em>not</em> in the Keychain. It identifies a basket, not a person,
+and the server treats it as a claim rather than an authorisation. Two reasons it would be the wrong
+home: the Keychain is for secrets and diluting that makes the rule harder to enforce, and Keychain
+items can survive app deletion in some configurations — a reinstalled app pointing at a stranger's
+abandoned cart is a bug that would be very hard to explain.</p>
+
+<h2>Fakes for both</h2>
+
+<pre class="language-swift"><code class="language-swift">final class InMemorySecureStore: SecureStore, @unchecked Sendable {
+    private var storage: [StorageKey: String] = [:]
+    private let lock = NSLock()
+
+    init(seed: [StorageKey: String] = [:]) { storage = seed }
+</code></pre>
+
+<p>Not a nicety. A preview runs in a host process with no Keychain entitlement, so the real store
+fails there — and a test that shares the Keychain with the app under development is a test that
+passes or fails depending on whether somebody happened to be signed in. The <code>seed</code>
+parameter is what lets a test start from "already signed in" in one line.</p>
+
+<h2>Testing storage</h2>
+
+<p>With both stores behind protocols, the interesting behaviour is testable without touching the
+device at all:</p>
+
+<pre class="language-swift"><code class="language-swift">    func testItReadsTheKeychainOnceAndCachesAfterwards() async {
+        let secureStore = CountingSecureStore(seed: [.authToken: "abc.123"])
+        let store = TokenStore(secureStore: secureStore)
+
+        let first = await store.currentToken()
+        let second = await store.currentToken()
+
+        XCTAssertEqual(first, "abc.123")
+        XCTAssertEqual(second, "abc.123")
+        XCTAssertEqual(secureStore.readCount, 1, "Every authenticated request would otherwise hit securityd.")
+    }
+</code></pre>
+
+<p>Counting the reads is the only way to test a cache — the return value is identical either way.
+The two failure cases are worth testing explicitly too: that an unreadable Keychain reads as "no
+session", and that a failed <em>write</em> still leaves a usable one. Both are judgement calls
+written into the code, and a test is how they stay judgement calls rather than becoming accidents.</p>
+
+<h2>UserDefaults is thread-safe, but not Sendable</h2>
+
+<pre class="language-swift"><code class="language-swift">struct UserDefaultsKeyValueStore: KeyValueStore, @unchecked Sendable {
+    private let defaults: UserDefaults
+</code></pre>
+
+<p>Apple documents <code>UserDefaults</code> as thread-safe, but it predates <code>Sendable</code>
+and has never been annotated, so the compiler cannot know. <code>@unchecked</code> is the escape
+hatch for exactly this: a promise the author is making on the type's behalf. It should never appear
+without a comment saying who made the promise and why it holds — an unexplained
+<code>@unchecked Sendable</code> is indistinguishable from someone silencing a warning they did not
+read.</p>
+
+<h2>What about SwiftData?</h2>
+
+<p>SwiftData is the modern persistence framework: declare a <code>@Model</code>, query it with
+<code>@Query</code>, and SwiftUI updates as it changes. It is genuinely pleasant, and this app does
+not use it because it has nothing to store — the catalogue comes from the server on launch and the
+cart lives in the backend so it survives a reinstall and a second device.</p>
+
+<p>Reach for it when you have data that is yours: notes, offline drafts, a local cache with
+relationships worth querying. Reach past it when your data belongs to a server and the device is a
+view onto it. Adding a database to hold a copy of something you are going to re-fetch anyway buys a
+synchronisation problem.</p>
+
+<h2>A short checklist</h2>
+
+<ul>
+  <li>Tokens, passwords, keys → Keychain, <code>ThisDeviceOnly</code> unless you have a reason.</li>
+  <li>Preferences and non-secret identifiers → <code>UserDefaults</code>.</li>
+  <li>Files the customer would miss → Documents. Re-downloadable caches → Caches, which the system
+  may purge.</li>
+  <li>Never log a token, and never put one in an analytics event. <code>Logger</code> redacts
+  interpolated values by default, which is one more reason to prefer it over <code>print</code>.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>Reading the Keychain is asynchronous, which forces a decision at launch that the web never has to
+make. The next lesson is the app lifecycle: the launch gate, and the write you must flush before the
+system suspends you.</p>

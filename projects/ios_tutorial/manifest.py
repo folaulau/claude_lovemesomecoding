@@ -250,6 +250,8 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Core/Persistence/KeyValueStore.swift",
         f"{A}/Pizza/Core/Persistence/StorageKey.swift",
         f"{A}/Pizza/Core/Persistence/CartIdentifierStore.swift",
+        # The cache test, which is the only way to prove a cache is a cache.
+        f"{A}/PizzaTests/SupportTypeTests.swift",
     ],
     "ios-app-lifecycle": [
         f"{A}/Pizza/App/PizzaApp.swift",
