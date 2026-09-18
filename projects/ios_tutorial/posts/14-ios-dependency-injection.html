@@ -1,0 +1,295 @@
+<p>Dependency injection sounds like something that needs a framework. It does not. It is one
+question — <em>who decides which concrete types this app runs with?</em> — and the answer that works
+is a single initialiser you can read.</p>
+
+<p>This lesson is that initialiser, the case against the singleton it replaces, and how the graph
+reaches a view without being threaded through every layer in between.</p>
+
+<h2>Why not a singleton</h2>
+
+<p>Every type in the demo app could have been a <code>static let shared</code>. Three reasons none
+of them is.</p>
+
+<p><strong>Tests would share the app's wiring.</strong> A singleton HTTP client is a client every
+test talks through, and "did this test touch the network?" stops being answerable. Worse, tests start
+affecting each other through shared state, which produces failures that move when you reorder them.</p>
+
+<p><strong>The graph would be invisible.</strong> Dependencies expressed as global access are
+dependencies nobody can see. There is no file that tells you what this app is made of, and no way to
+know what breaks when you change something.</p>
+
+<p><strong>There is nowhere to swap a fake.</strong> Not just in tests — in SwiftUI previews, in a
+demo mode, in a UI test that needs a deterministic backend.</p>
+
+<h2>The composition root</h2>
+
+<pre class="language-swift"><code class="language-swift">@MainActor
+@Observable
+final class AppEnvironment {
+    // Configuration
+    let configuration: APIConfiguration
+
+    // Data layer
+    let authRepository: AuthRepository
+    let catalogRepository: CatalogRepository
+    let cartRepository: CartRepository
+    let orderRepository: OrderRepository
+    let profileRepository: ProfileRepository
+
+    // Application state
+    let auth: AuthStore
+    let menu: MenuStore
+    let cart: CartStore
+    let toasts: ToastCenter
+
+    // Payment
+    let paymentGateway: PaymentGateway
+</code></pre>
+
+<p>Every property is a <em>protocol</em> except the stores. That is the point: the container knows
+what the app needs, not how any of it is implemented.</p>
+
+<p>The production graph is one function:</p>
+
+<pre class="language-swift"><code class="language-swift">    static func live() -&gt; AppEnvironment {
+        let configuration = APIConfiguration.fromBundle()
+        let tokenStore = TokenStore(secureStore: KeychainSecureStore())
+        let client = URLSessionHTTPClient(configuration: configuration, tokenProvider: tokenStore)
+
+        return AppEnvironment(
+            configuration: configuration,
+            tokenStore: tokenStore,
+            authRepository: RemoteAuthRepository(client: client),
+            catalogRepository: RemoteCatalogRepository(client: client),
+            cartRepository: RemoteCartRepository(client: client),
+            orderRepository: RemoteOrderRepository(client: client),
+            profileRepository: RemoteProfileRepository(client: client),
+            cartIdentifierStore: CartIdentifierStore(store: UserDefaultsKeyValueStore()),
+            paymentGateway: StripePaymentGateway(
+                publishableKey: configuration.stripePublishableKey
+            )
+        )
+    }
+</code></pre>
+
+<p>Read it top to bottom and you know the whole shape of the app. The order is the dependency graph
+made literal — the token store first because the client needs it to attach a bearer token,
+repositories next because they need the client. If it were wrong, this would not compile.</p>
+
+<h2>The ordering rule the compiler enforces</h2>
+
+<p>One dependency in the demo app is genuinely load-bearing:</p>
+
+<pre class="language-swift"><code class="language-swift">        self.cart = CartStore(
+            repository: cartRepository,
+            identifierStore: cartIdentifierStore,
+            menuStore: menu
+        )
+</code></pre>
+
+<p>Rehydrating a saved cart needs the catalogue to re-price it, because a stored line holds only
+identifiers. Hydrate before the menu loads and you get a basket full of zero-priced items.</p>
+
+<p>What makes this worth showing is the comparison. The React Native version of this app expresses
+the same constraint as the <em>order of two provider components</em>, with a comment warning not to
+swap them — and getting it wrong crashes at runtime, on the first launch that happens to have a
+saved cart. Here it is a constructor parameter. There is no ordering to get wrong, because a store
+that does not exist yet cannot be passed.</p>
+
+<p>That is the general argument for constructor injection over ambient access: it turns a rule you
+have to remember into one the compiler already checked.</p>
+
+<h2>Handing it to the views</h2>
+
+<p>The root builds it once and puts it in the environment:</p>
+
+<pre class="language-swift"><code class="language-swift">    @State private var environment = AppEnvironment.live()
+</code></pre>
+
+<p><code>@State</code> rather than <code>let</code>, because SwiftUI re-creates the <code>App</code>
+struct on any invalidation. A <code>let</code> would rebuild the whole graph — new stores, an empty
+cart, a lost session — every time.</p>
+
+<p>Then the stores go in individually alongside it, so a view that only needs the cart can ask for
+the cart rather than reaching through a container:</p>
+
+<pre class="language-swift"><code class="language-swift">                .environment(environment)
+                .environment(environment.auth)
+                .environment(environment.menu)
+                .environment(environment.cart)
+                .environment(environment.toasts)
+</code></pre>
+
+<p>Both are injected on purpose. A screen reads a store directly; a screen that needs to
+<em>construct</em> something — a view model with three dependencies — reads the container.</p>
+
+<h3>Building a view model from the container</h3>
+
+<pre class="language-swift"><code class="language-swift">        .task {
+            guard model == nil else { return }
+
+            let model = CheckoutViewModel(
+                orderRepository: environment.orderRepository,
+                profileRepository: environment.profileRepository,
+                paymentGateway: environment.paymentGateway
+            )
+            model.prefill(from: auth.user)
+            self.model = model
+
+            await model.loadSavedAddresses(isAuthenticated: auth.isAuthenticated)
+        }
+</code></pre>
+
+<p>Built in <code>.task</code>, not in <code>init</code>, and that is not a style choice:
+<code>@Environment</code> is not readable from an initialiser, because the property wrappers are not
+populated until the view is installed in the hierarchy. Trying is a runtime crash, not a compile
+error.</p>
+
+<p>The <code>guard</code> keeps it to once per appearance rather than once per redraw. Without it,
+re-entering the screen would discard whatever the customer had typed.</p>
+
+<h2>The doubles the container swaps in</h2>
+
+<p>An injected protocol is only useful if there is something else to inject. The demo app ships two
+kinds of double, and the distinction is worth drawing.</p>
+
+<p><strong>Preview doubles</strong> return realistic data immediately:</p>
+
+<pre class="language-swift"><code class="language-swift">struct PreviewCatalogRepository: CatalogRepository {
+    var products: [Product] = SampleData.products
+    var toppings: [Topping] = SampleData.toppings
+    var crusts: [Crust] = SampleData.crusts
+    /// Set to simulate the failure branch — the state previews most often forget to look at.
+    var error: Error?
+
+    func products() async throws -&gt; [Product] { try result(products) }
+</code></pre>
+
+<p>The sample data behind them is deliberately <em>realistic</em> rather than tidy: a pizza with
+three sizes, a crust with a surcharge, a two-line address, a card with no expiry. Preview data that
+is too neat hides exactly the layout problems previews exist to catch — the two-line product name,
+the long topping list, the missing field.</p>
+
+<p><strong>Test spies</strong> hold the same canned responses and additionally record what they
+were asked for. <code>OrderRepositorySpy</code> declares a settable
+<code>Result&lt;OrderCreateResponse, Error&gt;</code> so a test can choose success or failure, and
+beside it:</p>
+
+<pre class="language-swift"><code class="language-swift">    private(set) var createCallCount = 0
+    private(set) var lastCreateRequest: OrderCreateRequest?
+    private(set) var lastCreateWasAuthenticated: Bool?
+</code></pre>
+
+<p>Asserting on the <em>call</em> as well as the result is what catches the bugs a return value
+cannot: a screen that fetches twice, a write that never happens, a request sent without
+authentication. The whole preview file is wrapped in <code>#if DEBUG</code>, so none of it — including
+the sample email addresses — is compiled into a release build.</p>
+
+<h2>What this makes possible: previews</h2>
+
+<pre class="language-swift"><code class="language-swift">    static func preview(
+        catalogue: CatalogRepository = PreviewCatalogRepository(),
+        orders: OrderRepository = PreviewOrderRepository(),
+        profile: ProfileRepository = PreviewProfileRepository()
+    ) -&gt; AppEnvironment {
+</code></pre>
+
+<p>One function hands the entire app a stubbed graph. Previews run in a host process with no backend,
+no Keychain entitlement and no view controller to present a payment sheet from — so everything that
+would reach outside the process is replaced, and a preview renders instantly and deterministically
+instead of showing a spinner that never resolves.</p>
+
+<p>The parameters are what make it useful rather than merely functional. Each preview can override
+one repository, which is how the failure state gets a preview of its own:</p>
+
+<pre class="language-swift"><code class="language-swift">#Preview("Failed") {
+    let environment = AppEnvironment.preview(
+        catalogue: PreviewCatalogRepository(error: APIError.network(message: "The backend is not running."))
+    )
+</code></pre>
+
+<p>The error branch is the one nobody looks at, because reproducing it means turning the backend off.
+Here it is one line, and it is visible beside the happy path in the canvas.</p>
+
+<h2>What this makes possible: tests</h2>
+
+<p>Tests do not use the container at all — they construct exactly what they need:</p>
+
+<pre class="language-swift"><code class="language-swift">    @MainActor
+    private func makeStore(
+        repository: AuthRepositorySpy = AuthRepositorySpy(),
+        secureStore: SecureStore = InMemorySecureStore()
+    ) -&gt; (AuthStore, AuthRepositorySpy, TokenStore) {
+        let tokenStore = TokenStore(secureStore: secureStore)
+        return (AuthStore(repository: repository, tokenStore: tokenStore), repository, tokenStore)
+    }
+</code></pre>
+
+<p>No network, no Keychain, no shared state between tests. That is only possible because
+<code>AuthStore</code> takes its dependencies rather than reaching for them.</p>
+
+<h2>The protocol that breaks a cycle</h2>
+
+<p>One dependency in this graph is circular if you draw it naively. The HTTP client needs the auth
+token. The token belongs to the session, which is restored by calling the HTTP client. Depending on a
+concrete type in both directions would not compile.</p>
+
+<pre class="language-swift"><code class="language-swift">protocol AuthTokenProviding: Sendable {
+    func currentToken() async -&gt; String?
+}
+</code></pre>
+
+<p>One method. The client now knows only "something can give me a token", which is also exactly what
+a test needs to stub. This is the general shape of the fix: when two types need each other, the one
+with the smaller requirement gets a protocol describing just that requirement — and it usually turns
+out to be a better boundary than the concrete dependency was.</p>
+
+<h2>What does not go in the container</h2>
+
+<p>Not everything is a dependency. Pure functions —
+<code>Money.format</code>, <code>CartPricing.totals</code>, <code>CartReducer.reduce</code> — are
+called directly as statics, and injecting them would be pure ceremony: they perform no I/O, they
+have no state, and a test can call them as they are.</p>
+
+<p>The test is whether substituting it in a test would ever be useful. For a repository, yes. For a
+rounding function, no. Applying dependency injection to everything is how a codebase acquires forty
+protocols with one implementation each, which is the failure mode that gives the pattern its
+reputation.</p>
+
+<h2>The rules, in four lines</h2>
+
+<ul>
+  <li><strong>Depend on protocols</strong>, not concrete types, wherever the concrete type does I/O.</li>
+  <li><strong>Inject through the initialiser.</strong> A type should never construct something it
+  talks to over a network.</li>
+  <li><strong>One composition root</strong>, and it is the only place concrete types are named.</li>
+  <li><strong>No singletons</strong> for anything stateful or anything that performs I/O.</li>
+</ul>
+
+<h2>Reading the environment is not static</h2>
+
+<p>One sharp edge worth knowing before you rely on this. <code>@Environment(MenuStore.self)</code>
+on a type nobody injected is a <em>crash</em>, not a compile error. SwiftUI has no way to prove at
+build time that an ancestor supplied it.</p>
+
+<p>In practice it fails the first time you render that screen, which is soon enough that it is rarely
+a real problem — but it is the reason previews have to inject the same things the app does, and the
+reason a preview that suddenly crashes is usually missing one <code>.environment</code> line rather
+than broken in any interesting way.</p>
+
+<h2>When a framework would help</h2>
+
+<p>Manual injection scales further than people expect, and it stops being pleasant somewhere around
+"the initialiser has twenty parameters and half of them are only forwarded". At that point the
+options are to split the container by feature, or reach for something like Factory or
+swift-dependencies.</p>
+
+<p>Both are reasonable. Neither removes the need to understand what is above, because a resolution
+failure in a container is a runtime crash where a missing constructor parameter is a compile error —
+and the framework's job is to hide exactly the wiring you would otherwise be reading in one place.</p>
+
+<h2>Next</h2>
+
+<p>The container's first line constructs a Keychain-backed store, which has gone unexplained for two
+lessons. The next one is persistence: where each thing belongs, and why the split is a security
+decision rather than a convenience one.</p>

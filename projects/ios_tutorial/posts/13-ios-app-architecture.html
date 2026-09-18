@@ -1,0 +1,248 @@
+<p>Ask what architecture an iOS app should use and you get acronyms: MVC, MVVM, VIPER, TCA, Clean.
+Most of that conversation is about naming, and it skips the decision that actually determines whether
+a codebase stays readable — which is <strong>which direction the dependencies point</strong>.</p>
+
+<p>This lesson is the layering the demo app uses, why MVVM is not an architecture, and the one piece
+of state worth being strict about.</p>
+
+<h2>MVVM is a third of the answer</h2>
+
+<p>MVVM says: a view renders, a view model holds its state and logic, a model is the data. That is
+useful and it is not an architecture. It says nothing about where the networking lives, what a view
+model is allowed to depend on, or how you would swap a backend for a fake.</p>
+
+<p>An app can be perfectly MVVM and still have a view model that constructs a
+<code>URLSession</code>, parses JSON, caches to disk and knows the shape of the API. All the logic
+is out of the view, and the codebase is still one tangled layer.</p>
+
+<h2>Four layers, dependencies pointing inwards</h2>
+
+<pre class="language-bash"><code class="language-bash">Pizza/
+  App/         composition root, routing, app lifecycle
+  Core/        networking, persistence, design system, utilities — knows nothing about pizza
+  Domain/      models, pure rules, repository protocols
+  Data/        endpoints and the HTTP implementations of those protocols
+  Features/    Home · Menu · Cart · Checkout · Orders · Auth · Profile
+</code></pre>
+
+<p><code>Features</code> depends on <code>Domain</code>. <code>Data</code> depends on
+<code>Domain</code>. <code>Domain</code> depends on nothing. That inversion is the whole design, and
+it is worth being concrete about what it buys before looking at how it is done.</p>
+
+<h2>The boundary: protocols in Domain, implementations in Data</h2>
+
+<pre class="language-swift"><code class="language-swift">protocol OrderRepository: Sendable {
+    /// `authenticated` is a parameter rather than a constant because this same call serves guests.
+    /// With a token the order is attached to the account; without one, `guestEmail` is how the
+    /// customer gets their receipt.
+    func createOrder(_ request: OrderCreateRequest, authenticated: Bool) async throws -&gt; OrderCreateResponse
+    /// Asks the SERVER whether the payment settled. Deliberately not "mark this order paid" — the
+    /// device is never the authority on money, and anyone can call our API.
+    func paymentStatus(orderID: UUIDString) async throws -&gt; Order
+    func myOrders(page: Int, size: Int) async throws -&gt; Page&lt;Order&gt;
+}
+</code></pre>
+
+<p>The protocol is declared in the <em>domain</em> layer and implemented in the <em>data</em> layer.
+So the feature code depends on an abstraction it owns, and the networking code depends on it too —
+both point inward at the same thing.</p>
+
+<p>Three consequences, in increasing order of how much they matter:</p>
+
+<ul>
+  <li>Nothing under <code>Features/</code> imports <code>URLSession</code>, <code>Endpoint</code> or
+  even <code>APIError</code> by way of a repository.</li>
+  <li>Swapping the transport — GraphQL, a local database, an offline cache — touches
+  <code>Data/</code> and nothing else.</li>
+  <li><strong>Testing needs no server.</strong> A test injects a repository that returns three
+  pizzas from an array, and the view model under test cannot tell.</li>
+</ul>
+
+<p>That last one is the practical payoff, and it is why this is worth doing in an app of any size
+rather than only in a large one.</p>
+
+<h3>Every method is async throws</h3>
+
+<p>No <code>Result</code>, no completion handler. Swift concurrency makes the error path the
+language's own, so a caller that forgets to handle a failure does not compile. And a protocol full
+of <code>async throws</code> methods is trivially implementable by a test double, which the
+completion-handler shape is not.</p>
+
+<h2>Keep the implementations thin</h2>
+
+<pre class="language-swift"><code class="language-swift">struct RemoteOrderRepository: OrderRepository {
+    private let client: HTTPClient
+
+    init(client: HTTPClient) { self.client = client }
+
+    func createOrder(
+        _ request: OrderCreateRequest,
+        authenticated: Bool
+    ) async throws -&gt; OrderCreateResponse {
+        try await client.send(OrderEndpoints.create(request, authenticated: authenticated))
+    }
+</code></pre>
+
+<p>An endpoint in, a decoded model out. The thinness is deliberate: a repository that also cached,
+retried or mapped errors would be a place for logic to accumulate where no test would look for it.
+Caching belongs in a store, retrying belongs to the caller that knows whether it is safe, and error
+mapping already happened in the client.</p>
+
+<p>They are <code>struct</code>s holding one <code>let</code> — values, cheap to make, impossible to
+mutate into an inconsistent state, and <code>Sendable</code> without further thought.</p>
+
+<h2>Where the rules live</h2>
+
+<p>The domain layer is not just models. It is also the rules that are pure functions of them, and
+pulling those out is where most of the testing value comes from.</p>
+
+<pre class="language-swift"><code class="language-swift">enum CartPricing {
+    static let taxRate = 0.085
+    static let deliveryFee = 3.99
+
+    /// Price of ONE unit of a cart line: base size price + crust surcharge + toppings.
+    static func unitPrice(of item: CartItem) -&gt; Double {
+        let toppingsTotal = item.toppings.reduce(0) { $0 + $1.price }
+        return Money.rounded(item.basePrice + item.crustPriceDelta + toppingsTotal)
+    }
+</code></pre>
+
+<p>No SwiftUI, no networking, no storage. Nothing here performs I/O, which is what makes the whole
+file unit-testable in milliseconds — and it is the part of the app most worth testing, because it is
+the part a customer checks.</p>
+
+<h2>The state worth being strict about</h2>
+
+<p>Most screen state is fine as properties on an observable object. The cart is not most state: four
+screens read it, three can change it, and getting it wrong means charging somebody for the wrong
+pizza.</p>
+
+<pre class="language-swift"><code class="language-swift">enum CartAction: Equatable {
+    case add(CartItem)
+    case remove(lineID: UUID)
+    case setQuantity(lineID: UUID, quantity: Int)
+    case setOrderType(OrderType)
+    /// Replace everything with what the server had saved.
+    case hydrate(CartState)
+    case clear
+}
+</code></pre>
+
+<p>Every way the cart can change, as a closed set. Then one pure function applies them:</p>
+
+<pre class="language-swift"><code class="language-swift">    static func reduce(_ state: CartState, _ action: CartAction) -&gt; CartState {
+        var state = state
+
+        switch action {
+        case let .add(item):
+            if let index = state.items.firstIndex(where: { $0.hasSameConfiguration(as: item) }) {
+                state.items[index].quantity += item.quantity
+            } else {
+                state.items.append(item)
+            }
+</code></pre>
+
+<p><code>var state = state</code> copies, because <code>CartState</code> is a value — so the input
+is never mutated and the same state plus the same action always produces the same result.</p>
+
+<h3>Why bother, when @Observable already works</h3>
+
+<p>The store could mutate <code>items</code> directly and SwiftUI would redraw. Three reasons it does
+not, and they matter more as an app grows.</p>
+
+<p><strong>The rules are testable without the app.</strong> <code>reduce</code> is a function from a
+value to a value. Its tests construct a state, apply an action and assert — no view, no network, no
+async, no main actor. Fifteen of them run in microseconds.</p>
+
+<p><strong>Every mutation has a name.</strong> "The quantity changed" is an event with a spelling,
+not an assignment somewhere in a view's closure. When a cart ends up in a state nobody expected,
+there is a finite list of things that could have caused it.</p>
+
+<p><strong>The store is left with one job.</strong> Everything in <code>CartStore</code> is now
+effects — persistence, hydration, the background flush — and none of it is tangled with the rules.</p>
+
+<p>The cost is indirection, and it is a real cost. For four fields of screen-local form state a
+reducer would be ceremony. For the cart it pays for itself, and knowing which is which is the actual
+skill.</p>
+
+<h3>One funnel</h3>
+
+<pre class="language-swift"><code class="language-swift">    private func dispatch(_ action: CartAction) {
+        state = CartReducer.reduce(state, action)
+        schedulePersist()
+    }
+</code></pre>
+
+<p>One place applies the reducer and one place schedules the write, so a new command cannot forget to
+persist — which is the mistake that leaves a cart looking right until the app restarts.</p>
+
+<h3>What the tests look like</h3>
+
+<pre class="language-swift"><code class="language-swift">    func testAddingTheSameConfigurationBumpsTheQuantity() {
+        var state = CartReducer.reduce(.initial, .add(item(quantity: 2)))
+        state = CartReducer.reduce(state, .add(item(quantity: 3)))
+
+        XCTAssertEqual(state.items.count, 1, "The same pizza twice is one line, not two.")
+        XCTAssertEqual(state.items[0].quantity, 5)
+    }
+</code></pre>
+
+<p>Three lines, no setup. The interesting ones are the negative cases — that a different topping set
+is a <em>different</em> line, and that topping order is not part of a pizza's identity, because
+{pepperoni, mushroom} and {mushroom, pepperoni} are one configuration. Those are exactly the rules
+that are hard to hold in your head and easy to break in a refactor.</p>
+
+<h2>Feature folders</h2>
+
+<p>Inside <code>Features/</code>, group by what a file is <em>for</em>, not by what it is. All the
+view models together reads well in a tutorial and badly at scale, because one change then touches
+four folders and no folder tells you what the app does.</p>
+
+<p>A feature owns its state, its screens and its components, and opening
+<code>Features/Checkout/</code> shows you everything checkout is. The rule that keeps it honest:
+<strong>shared things move down, never sideways.</strong> When two features need the same component
+it moves into the design system, not into whichever feature got there first. A feature importing
+from a sibling feature is the smell that says something belongs a level lower.</p>
+
+<p>One deliberate exception in this app: checkout reads the cart's store, because a checkout without
+a cart is meaningless. That is a real dependency rather than a shortcut, and it points in one
+direction only.</p>
+
+<h2>Where a view model fits</h2>
+
+<p>With the layers in place, a view model becomes small: it holds screen state, calls repositories,
+and exposes something a view can render. <code>CheckoutViewModel</code> is the largest in the app
+and it is still only form state, a two-step flow and the payment outcomes.</p>
+
+<p>And several screens have none. A view model earns its place where there is state with rules or
+derived values worth testing — not by decree. A codebase where every screen has one has stopped
+making the decision.</p>
+
+<h2>The models are the contract</h2>
+
+<p>One more thing lives in <code>Domain</code>: the types the API speaks in. They are plain
+<code>Codable</code> values with no behaviour beyond what belongs to them — an <code>Order</code>
+knows how to format its own address, a <code>SizeName</code> knows it displays as "Medium".</p>
+
+<p>What they deliberately do not know is how they are fetched. That is the line that keeps the domain
+independent, and it is easy to cross without noticing: the moment a model has a
+<code>static func fetch()</code> on it, the layering is gone and every test of that model needs a
+network.</p>
+
+<h2>What this is not</h2>
+
+<p>This is not Clean Architecture, and there are no use-case objects. A <code>LoadMenuUseCase</code>
+wrapping a single repository call is a file that exists to satisfy a diagram. When a piece of logic
+genuinely spans repositories, it becomes a type in <code>Domain/Services</code> — which is where
+<code>CartPricing</code> and <code>CartReducer</code> already live.</p>
+
+<p>The test for adding a layer is whether it removes a dependency or only renames one. By that
+measure the repository protocols earn their place — they genuinely stop features knowing about HTTP
+— and a use-case wrapper would not, because the feature would depend on exactly the same things
+through one more file.</p>
+
+<h2>Next</h2>
+
+<p>Repositories are protocols, so something has to decide which implementations the app runs with.
+The next lesson is that decision: a composition root instead of singletons, and why a
+<code>static shared</code> is a testing problem before it is a design one.</p>

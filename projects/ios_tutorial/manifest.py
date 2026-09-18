@@ -234,6 +234,12 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/App/PizzaApp.swift",
         f"{A}/Pizza/Data/Repositories/PreviewRepositories.swift",
         f"{A}/Pizza/Features/Checkout/CheckoutView.swift",
+        # The test-side payoff: spies that record calls, a store built with everything injected,
+        # and the one-method protocol that breaks the client/session cycle.
+        f"{A}/PizzaTests/Support/TestDoubles.swift",
+        f"{A}/PizzaTests/StoreTests.swift",
+        f"{A}/Pizza/Core/Networking/HTTPClient.swift",
+        f"{A}/Pizza/Features/Menu/MenuView.swift",
     ],
     "ios-persistence-and-keychain": [
         f"{A}/Pizza/Core/Persistence/SecureStore.swift",
