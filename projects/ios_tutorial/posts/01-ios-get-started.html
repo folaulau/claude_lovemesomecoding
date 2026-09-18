@@ -1,0 +1,265 @@
+<p>This track builds a native iOS app in Swift and SwiftUI, and every example in it is lifted from
+one working application — a pizza ordering app that talks to a real backend, holds a basket across
+a force-quit, and takes a card payment. Nothing here is a snippet written to make a point and then
+thrown away.</p>
+
+<p>This first lesson is the ground you stand on: what you need installed, what each part of Xcode is
+actually for, and how an iOS project is put together. If you have shipped for the web, the framework
+will feel familiar quickly. The <em>project</em> will not, and that is where most of the early
+friction lives.</p>
+
+<h2>What you need</h2>
+
+<p>A Mac, and Xcode from the App Store. That is the whole list — Xcode bundles the Swift compiler,
+the simulators, the debugger, the profiler and Interface Builder. There is no separate SDK download
+and no package manager to install first.</p>
+
+<p>Two things are worth knowing before you start. Xcode is large, around 15&nbsp;GB, and the
+simulator runtimes are separate downloads of roughly 7&nbsp;GB each, so the first hour is mostly
+waiting. And you do <strong>not</strong> need a paid Apple Developer account to build and run on a
+simulator, or even on your own device — that only becomes necessary to distribute.</p>
+
+<p>These lessons were written against a specific toolchain, and they say so wherever it matters:</p>
+
+<pre class="language-bash"><code class="language-bash">xcodebuild -version     # Xcode 15.4
+swift --version         # Apple Swift version 5.10
+</code></pre>
+
+<p>That pins a few ceilings. <code>@Observable</code> is available, because it needs iOS 17. Swift 6
+language mode is not. Where a lesson would read differently on a newer Xcode, it names the version
+that changes it rather than quietly assuming yours.</p>
+
+<h2>The parts of Xcode</h2>
+
+<p>Xcode is an IDE, a build system, a device manager and a profiler wearing one icon, and knowing
+which part you are arguing with saves a lot of time.</p>
+
+<p>The <strong>editor</strong> is the obvious half. The <strong>canvas</strong> beside it renders
+SwiftUI previews — a live version of the view you are editing, which is where most of your feedback
+loop happens once you are comfortable. The <strong>simulator</strong> is a full iOS running on your
+Mac; it is genuinely the OS, not a mock, which is why it can run your app but cannot fake a camera
+or a real payment.</p>
+
+<p>Then the parts you meet later and should know exist: the <strong>debugger</strong> with
+<code>po</code> and view-hierarchy capture, <strong>Instruments</strong> for time profiles and leaks,
+and the <strong>Organizer</strong> for archives and crash reports from the field.</p>
+
+<p>The simulator is fast and convenient and it lies about four things in particular: performance,
+because your Mac is far quicker than a phone; the camera, GPS and other hardware it can only
+approximate; memory pressure, which it never really applies; and anything involving the Keychain
+under a real device's security policies. Everything in this track runs in the simulator, but the
+last thing you do before shipping is run it on hardware.</p>
+
+<h2>Targets, schemes and configurations</h2>
+
+<p>Three words that all sound like "the project" and are not.</p>
+
+<p>A <strong>target</strong> is one thing that gets built — an app, a test bundle, a widget. The
+demo app has two: the app and its tests. A <strong>scheme</strong> is a saved answer to "what do I
+want to happen when I press Run?" — which targets to build, which configuration to use, which
+arguments to launch with. A <strong>build configuration</strong> is a named set of build settings,
+conventionally <code>Debug</code> and <code>Release</code>.</p>
+
+<p>Most of the confusion is that all three are edited in different places and any of them can be the
+reason your change did nothing.</p>
+
+<h3>Build settings belong in a file, not in a dialog</h3>
+
+<p>Xcode will happily let you set every build setting through its project editor. The trouble is
+where they land: <code>project.pbxproj</code>, a file nobody can read and therefore nobody reviews.
+A setting changed there shows up in a pull request as an unreadable line, which is exactly how a
+release-only flag gets flipped and stays flipped for a month.</p>
+
+<p>An <code>.xcconfig</code> file is plain text, so the same change becomes a line a human can
+evaluate:</p>
+
+<pre class="language-properties"><code class="language-properties">PRODUCT_BUNDLE_IDENTIFIER = com.lovemesomecoding.pizza.ios
+MARKETING_VERSION = 1.0.0
+CURRENT_PROJECT_VERSION = 1
+
+IPHONEOS_DEPLOYMENT_TARGET = 17.0
+SWIFT_VERSION = 5.0
+TARGETED_DEVICE_FAMILY = 1,2
+</code></pre>
+
+<p><code>TARGETED_DEVICE_FAMILY = 1,2</code> means iPhone and iPad.
+<code>IPHONEOS_DEPLOYMENT_TARGET</code> is the oldest iOS you support, and it is a product decision
+wearing a build setting's clothes — every API newer than it needs an availability check.</p>
+
+<h3>One .xcconfig trap, and it fails silently</h3>
+
+<pre class="language-properties"><code class="language-properties">PIZZA_API_BASE_URL = http:$()/$()/localhost:8085
+</code></pre>
+
+<p>That is not a typo. In an <code>.xcconfig</code>, <code>//</code> starts a comment — so writing
+<code>http://localhost:8085</code> gives you the string <code>http:</code> and no warning at all.
+<code>$()</code> is an empty variable substitution that separates the two slashes without changing
+the result. Every iOS developer meets this once.</p>
+
+<h2>The .xcodeproj problem</h2>
+
+<p>A project file is a directory containing <code>project.pbxproj</code>: a serialised object graph
+with hex identifiers for every file, group and build phase. It works, and it is unreadable. Two
+people adding a file on separate branches produces a merge conflict in a format neither of them can
+resolve by reading it.</p>
+
+<p>The demo app takes the common escape route: the project is <em>generated</em> from a manifest,
+and the manifest is what gets reviewed.</p>
+
+<pre class="language-yaml"><code class="language-yaml">name: Pizza
+options:
+  bundleIdPrefix: com.lovemesomecoding.pizza
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+</code></pre>
+
+<p>That is XcodeGen. The generated <code>.xcodeproj</code> is still committed, so a reader clones
+the repository and opens it with nothing to install — but when a build setting changes, the diff
+that matters is one legible line of YAML.</p>
+
+<h3>It is regenerated by a script, for a specific reason</h3>
+
+<pre class="language-bash"><code class="language-bash">if grep -q "PBXFileSystemSynchronizedRootGroup" "$PBXPROJ"; then
+    echo "error: the generated project uses synchronized groups, which require object version 77." >&2
+    echo "       Remove the downgrade below and raise the minimum Xcode version instead." >&2
+    exit 1
+fi
+</code></pre>
+
+<p>XcodeGen 2.46 writes project format 77, which Xcode 15 refuses to open outright, and it ignores
+its own option for choosing otherwise. The script downgrades the format and then guards the
+downgrade — if the project ever legitimately needs the newer format, the build fails loudly instead
+of producing something that will not open. A workaround you cannot see is a workaround that
+outlives its reason.</p>
+
+<h3>A scheme, written down</h3>
+
+<p>Schemes are the part people forget is configuration at all, because Xcode creates one silently
+and it usually works. Declaring it makes the intent visible:</p>
+
+<pre class="language-yaml"><code class="language-yaml">schemes:
+  Pizza:
+    build:
+      targets:
+        Pizza: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: true
+      coverageTargets:
+        - Pizza
+      targets:
+        - PizzaTests
+    archive:
+      config: Release
+</code></pre>
+
+<p>Run uses Debug, archive uses Release, tests gather coverage against the app target. None of that
+is surprising — the value is that it is stated rather than inherited, so when a build behaves
+differently in CI you have somewhere to look.</p>
+
+<h2>How the source is laid out</h2>
+
+<p>Xcode imposes nothing here. A new project is a flat folder, and it stays pleasant for about a
+week. The demo app is organised in layers, which lesson 13 argues for properly:</p>
+
+<pre class="language-bash"><code class="language-bash">Pizza/
+  App/         composition root, routing, app lifecycle
+  Core/        networking, persistence, design system, utilities — knows nothing about pizza
+  Domain/      models, pure rules, repository protocols
+  Data/        endpoints and the HTTP implementations of those protocols
+  Features/    Home · Menu · Cart · Checkout · Orders · Auth · Profile
+PizzaTests/
+</code></pre>
+
+<p>One thing that catches people moving from other ecosystems: <strong>folders on disk are not
+modules.</strong> Every file in a target shares one namespace, so there are no imports between these
+folders and no <code>export</code> keyword. Access control is per file and per type —
+<code>private</code>, <code>fileprivate</code>, <code>internal</code> (the default, meaning
+"anywhere in this target") and <code>public</code>.</p>
+
+<h2>Where an app starts</h2>
+
+<p>There is no <code>main</code> function to find. The entry point is a struct marked
+<code>@main</code>:</p>
+
+<pre class="language-swift"><code class="language-swift">@main
+@MainActor
+struct PizzaApp: App {
+    @State private var environment = AppEnvironment.live()
+
+    /// Reports foreground / background / inactive. The cart's background flush depends on it.
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environment(environment)
+                .environment(environment.auth)
+                .environment(environment.menu)
+                .environment(environment.cart)
+                .environment(environment.toasts)
+                .preferredColorScheme(.light)
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background || newPhase == .inactive {
+                environment.cart.flushPendingWrites()
+            }
+        }
+    }
+}
+</code></pre>
+
+<p>An <code>App</code> has a <code>body</code> made of scenes, a <code>Scene</code> has a body made
+of views, and a view has a body made of more views. It is the same shape all the way down, which is
+the first thing SwiftUI gets right.</p>
+
+<p>Two details from that snippet come back repeatedly. <code>@State</code> holds the dependency
+graph rather than a plain <code>let</code>, because SwiftUI re-creates this struct whenever
+something invalidates — a <code>let</code> would rebuild the whole app's state each time.
+And <code>scenePhase</code> reports when the app leaves the foreground, which on a phone is the
+difference between a saved basket and a lost one.</p>
+
+<h2>The app these lessons are built on</h2>
+
+<p>The demo app is a customer-facing ordering app: browse a menu, build a pizza, keep a basket that
+survives being force-quit, check out as a guest or signed in, and pay by card. It is roughly 8,000
+lines of Swift with 130 tests, and it was written to be read — the architectural decisions in it
+already carry comments explaining themselves.</p>
+
+<p>Running it needs the backend up, and then:</p>
+
+<pre class="language-bash"><code class="language-bash">cd pizza-ios-mobile && open Pizza.xcodeproj    # then press Run
+</code></pre>
+
+<p>One thing to know if you try it on a physical device: <code>localhost</code> is the
+<em>phone</em>, not your Mac. The Mac's address on the network goes in the debug configuration —
+which is exactly why the API host is a build setting rather than a constant in the source.</p>
+
+<p>Everything Xcode does is also available from a terminal, which is what CI uses and what makes a
+build reproducible:</p>
+
+<pre class="language-bash"><code class="language-bash">xcodebuild build -project Pizza.xcodeproj -scheme Pizza \
+    -destination 'platform=iOS Simulator,name=iPhone 15'
+
+xcodebuild test -project Pizza.xcodeproj -scheme Pizza \
+    -destination 'platform=iOS Simulator,name=iPhone 15'
+</code></pre>
+
+<p>The <code>-destination</code> argument is the one that generates confusing errors. If it reports
+that no destination matches, the usual cause is a simulator runtime that is not installed rather
+than anything wrong with the project — <code>xcrun simctl list runtimes</code> tells you in one
+line, and an empty list is the answer.</p>
+
+<h2>What comes next</h2>
+
+<p>The next lesson is the Swift you need before SwiftUI makes sense — value types, optionals, enums
+with associated values, protocols, and the error model. It is deliberately not a tour of the whole
+language; it is the subset a SwiftUI app leans on every single day, shown through the models of the
+app above.</p>
+
+<p>After that the track moves outward in rings: views and layout, state, navigation, lists and
+forms, then the parts a tutorial usually stops before — networking, concurrency, architecture, the
+Keychain, what a phone does to your process, payments, accessibility, testing and shipping.</p>

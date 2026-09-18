@@ -1,0 +1,259 @@
+<p>SwiftUI has four property wrappers for state and they are not interchangeable. Choosing wrongly
+does not usually produce an error — it produces a screen that does not update, or one that resets
+itself, which is considerably worse.</p>
+
+<p>This lesson is the decision procedure, then what <code>@Observable</code> actually changed, then
+the line between state a screen owns and state the app owns.</p>
+
+<h2>The four, and when each applies</h2>
+
+<p>Start with the question "who owns this?", not "what type is it?".</p>
+
+<ul>
+  <li><strong><code>@State</code></strong> — this view owns it, nothing else needs it. A filter
+  selection, whether a sheet is open, what is typed in a field.</li>
+  <li><strong><code>@Binding</code></strong> — someone else owns it and has lent me write access.
+  A child component that edits a parent's value.</li>
+  <li><strong><code>@Observable</code></strong> (on a class) — several views share it and it
+  outlives any one of them. The cart, the signed-in user.</li>
+  <li><strong><code>@Environment</code></strong> — how a view reaches something injected from far
+  above without every layer in between passing it down.</li>
+</ul>
+
+<p>The rule underneath all four: <strong>state lives at the lowest level that can see everything
+that needs it.</strong> Moving state upward "just in case" is how a small app acquires a global
+store and a re-render problem.</p>
+
+<h2>@State</h2>
+
+<p><code>@State</code> gives a view a piece of storage that survives its <code>body</code> being
+re-run. That is necessary because the view struct itself does not survive — SwiftUI throws it away
+and builds a new one constantly. <code>@State</code> is kept outside, keyed to the view's identity.</p>
+
+<pre class="language-swift"><code class="language-swift">    @State private var filter: Filter = .all
+    @State private var productBeingBuilt: Product?
+</code></pre>
+
+<p>Two things that are always true of good <code>@State</code>. It is <code>private</code> — nobody
+outside the view has any business touching it. And it is small: which filter is showing, which
+product is being configured. Notice the second one does double duty, because "no product" and "sheet
+closed" are the same fact, so modelling them as one optional removes a state that could disagree
+with itself.</p>
+
+<h3>Identity, and the reset you did not ask for</h3>
+
+<p><code>@State</code> is tied to a view's <em>identity</em>. Change the identity and the state is
+discarded and rebuilt. This is the mechanism behind a class of bug that looks like magic in both
+directions — state mysteriously resetting, or mysteriously persisting between two things that should
+have been separate.</p>
+
+<p>It is also a tool. In the demo app the pizza builder is presented with
+<code>.sheet(item:)</code>, which builds a fresh view for each distinct product — so opening a
+different pizza starts from that pizza's defaults with no code at all. The React Native version of
+the same screen needs a counter bumped on every open and a long comment explaining why, because there
+the reset has to be arranged by hand.</p>
+
+<h2>@Binding</h2>
+
+<p>A <code>@Binding</code> is a read-write handle to state owned elsewhere. The parent passes it
+with <code>$</code>:</p>
+
+<pre class="language-swift"><code class="language-swift">                SegmentedPicker(
+                    segments: Filter.allCases.map { .init(value: $0, label: $0.title) },
+                    selection: $filter
+                )
+</code></pre>
+
+<p>The picker can now write the parent's filter without knowing anything about the parent. This is
+what makes a component reusable: it declares "I need somewhere to put a selection", and every caller
+supplies a different one.</p>
+
+<p>Bindings can also be built by hand, which is how you adapt one shape to another — an optional
+property to a non-optional <code>TextField</code>, or a computed value to a control. That escape
+hatch exists and is normal; it is written as <code>Binding(get:set:)</code>.</p>
+
+<h2>@Observable</h2>
+
+<p>For state shared across screens you need a reference type, and since iOS 17 the way to make one
+observable is a macro. The catalogue store is declared
+<code>@MainActor @Observable final class MenuStore</code>, and its state is one property:</p>
+
+<pre class="language-swift"><code class="language-swift">    private(set) var state: ViewState&lt;Catalogue&gt; = .idle
+
+    var catalogue: Catalogue { state.value ?? Catalogue() }
+
+    var isLoading: Bool { state.isLoading }
+
+    private let repository: CatalogRepository
+    private var loadTask: Task&lt;Void, Never&gt;?
+</code></pre>
+
+<p>Three annotations, all load-bearing.</p>
+
+<p><strong><code>@Observable</code></strong> replaced <code>ObservableObject</code>, and it changed
+something real. The old protocol required <code>@Published</code> on every property and invalidated
+<em>every</em> observer when <em>any</em> published property changed. The macro tracks reads at the
+property level instead: a view that reads only <code>isLoading</code> is not redrawn when
+<code>catalogue</code> changes. For a small type that is invisible; for a store four screens read,
+it is the difference between redrawing a badge and redrawing a menu.</p>
+
+<p><strong><code>@MainActor</code></strong> puts the whole type on the main actor. Everything here
+drives UI, so the compiler — not a runtime assertion — now enforces that it is only touched from the
+main thread. This is what prevents the classic "publishing changes from background threads" crash;
+lesson 12 goes into what it costs.</p>
+
+<p><strong><code>private(set)</code></strong> means views can read <code>state</code> and cannot
+assign to it. Every change goes through a method on the store, which is what makes the store's
+guarantees worth anything. A store whose properties anyone can write is a struct with extra
+ceremony.</p>
+
+<h3>@Bindable</h3>
+
+<p><code>@Observable</code> types have no <code>$</code> projection by default. When a control needs
+to write one, <code>@Bindable</code> produces the bindings:</p>
+
+<pre class="language-swift"><code class="language-swift">        @Bindable var cart = cart
+</code></pre>
+
+<p>That line looks like it does nothing and is doing the whole job — it is the replacement for
+<code>@ObservedObject</code>'s <code>$</code> syntax. In the demo app it lets a picker write
+<code>cart.orderType</code> directly, while the store's setter still routes the change through its
+reducer. The view gets two-way syntax; the store keeps its invariant.</p>
+
+<h3>Changes go through methods</h3>
+
+<p><code>private(set)</code> forces every mutation into a method, and that turns out to be where the
+interesting code lives. The toast centre is the smallest complete example — showing a message also
+schedules its removal, and dismissing one by hand has to cancel that:</p>
+
+<pre class="language-swift"><code class="language-swift">    func show(_ message: String, style: Toast.Style = .success) {
+        let toast = Toast(message: message, style: style)
+        toasts.append(toast)
+
+        dismissalTasks[toast.id] = Task { [weak self] in
+            try? await Task.sleep(for: self?.visibleDuration ?? .seconds(3))
+            guard !Task.isCancelled else { return }
+            self?.dismiss(toast.id)
+        }
+    }
+
+    func dismiss(_ id: Toast.ID) {
+        dismissalTasks[id]?.cancel()
+        dismissalTasks[id] = nil
+        toasts.removeAll { $0.id == id }
+    }
+</code></pre>
+
+<p>If <code>toasts</code> were writable from outside, a caller could append a message without the
+timer and it would sit on screen forever — and the type would have no way to stop them. That is the
+whole argument for the access modifier: it is not about hiding, it is about the object being able to
+keep a promise.</p>
+
+<h2>@Environment</h2>
+
+<p>Passing a store down six levels of view is miserable, and every intermediate view that only
+forwards it gains a dependency it does not use. The environment solves the same problem React's
+context does:</p>
+
+<pre class="language-swift"><code class="language-swift">                .environment(environment)
+                .environment(environment.auth)
+                .environment(environment.menu)
+                .environment(environment.cart)
+                .environment(environment.toasts)
+</code></pre>
+
+<p>Injected once at the root, read anywhere below:</p>
+
+<pre class="language-swift"><code class="language-swift">    @Environment(MenuStore.self) private var menu
+    @Environment(AuthStore.self) private var auth
+    @Environment(AppRouter.self) private var router
+</code></pre>
+
+<p>For <code>@Observable</code> types this needs no <code>EnvironmentKey</code> — the type is the
+key. There is one sharp edge: reading a type nobody injected is a crash, not a compile error. In
+practice the crash happens the first time you render that screen, which is soon enough that it is
+rarely a real problem, but it is worth knowing that the guarantee is not static.</p>
+
+<p>The environment also carries system values — <code>\.scenePhase</code>,
+<code>\.colorScheme</code>, <code>\.isEnabled</code>, <code>\.dismiss</code> — read the same way
+with a key path.</p>
+
+<h2>Screen state or app state?</h2>
+
+<p>This is the decision that shapes a codebase, and it is easy to get wrong in the generous
+direction.</p>
+
+<p>The demo app has exactly three shared stores — authentication, the catalogue, the cart — plus a
+toast centre. Everything else belongs to one screen. The test is not "might something else want
+this one day"; it is "does something else need it <em>now</em>". Three screens read the cart, so the
+cart is shared. Nobody outside the profile screen needs the list of saved addresses, so that state
+lives in a view model beside it.</p>
+
+<p>The cost of getting it wrong in the sharing direction is not just re-renders. State in a store
+lives for the whole session, so a screen that puts its scratch state there finds it still populated
+the next time it is opened — and two instances of the same screen share one selection.</p>
+
+<h3>The view model, and when it earns its place</h3>
+
+<p>A screen with rules gets an <code>@Observable</code> object of its own:</p>
+
+<pre class="language-swift"><code class="language-swift">@MainActor
+@Observable
+final class PizzaBuilderViewModel {
+    let product: Product
+
+    var selectedSize: SizeName
+    var selectedCrustID: UUIDString?
+    var quantity: Int = 1
+
+    private(set) var selectedToppingIDs: Set&lt;UUIDString&gt; = []
+</code></pre>
+
+<p>Four interacting selections, a price derived from them, and a topping list to group and toggle.
+That is enough rules to be worth extracting and worth testing without rendering anything.</p>
+
+<p>The home screen, by contrast, has no view model at all. It reads two stores and lays them out.
+Adding a <code>HomeViewModel</code> that forwarded those reads would be ceremony — and a codebase
+where <em>every</em> screen has one teaches the wrong lesson, which is that the pattern is a rule
+rather than a response to complexity.</p>
+
+<h3>Holding a view model in @State</h3>
+
+<p>A reference type in <code>@State</code> looks wrong and is right. <code>@State</code> gives it a
+lifetime tied to the view's identity, so it is constructed once and kept across every redraw. A
+plain <code>let</code> would rebuild it — and reset every selection — on each one, which for a sheet
+that redraws on every topping tap means it would never survive the first.</p>
+
+<h2>Derived values, not stored ones</h2>
+
+<p>Notice that the builder stores selections and computes the price, rather than storing a price and
+updating it from four setters. Four places that can forget is four places that will, and the failure
+mode — a total briefly wrong after a tap — is exactly the kind of bug that survives review. A
+computed property cannot be stale.</p>
+
+<p>The same reasoning runs through the stores: <code>catalogue</code> and <code>isLoading</code>
+above are both computed from <code>state</code>. One source of truth, and no way for two properties
+to disagree about what is happening.</p>
+
+<h2>What replaced ObservableObject, in one table</h2>
+
+<p>If you are reading older code or older tutorials, the mapping is worth having:</p>
+
+<ul>
+  <li><code>ObservableObject</code> + <code>@Published</code> becomes <code>@Observable</code>, with
+  no per-property annotation.</li>
+  <li><code>@ObservedObject</code> becomes a plain property, or <code>@Bindable</code> when you need
+  <code>$</code>.</li>
+  <li><code>@StateObject</code> becomes <code>@State</code>.</li>
+  <li><code>@EnvironmentObject</code> becomes <code>@Environment(Type.self)</code>.</li>
+</ul>
+
+<p>The old spellings still work, and mixing them is fine while a codebase migrates. What you lose by
+staying on the old ones is the per-property tracking, which is the entire reason the new macro
+exists.</p>
+
+<h2>Next</h2>
+
+<p>State that several screens share raises the obvious question of how you get between those screens.
+The next lesson is navigation: typed routes as values, a stack per tab, and pushing a destination
+after a payment without the back gesture returning to it.</p>

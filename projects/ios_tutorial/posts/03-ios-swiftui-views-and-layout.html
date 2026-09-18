@@ -1,0 +1,252 @@
+<p>SwiftUI looks like a templating language and is not one. Almost everything surprising about it
+follows from a single fact: <strong>a View is a value, not an object</strong>. Get that straight
+early and the rest of the framework stops being mysterious.</p>
+
+<p>This lesson is the mental model, then the layout system, then modifiers — with the card that every
+screen in the demo app is built from as the worked example.</p>
+
+<h2>A View is a value</h2>
+
+<p>In UIKit, a view is an object you create, keep a reference to, and mutate — set its text, change
+its colour, add it to a parent. In SwiftUI you create a <em>description</em> of what should be on
+screen, hand it over, and throw it away.</p>
+
+<pre class="language-swift"><code class="language-swift">struct PriceRow: View {
+    let label: String
+    let amount: Double
+    var isEmphasised = false
+
+    var body: some View {
+        HStack {
+            Text(label)
+            Spacer(minLength: Spacing.md)
+            Text(Money.format(amount))
+                .monospacedDigit()
+        }
+        // styling and accessibility modifiers follow
+</code></pre>
+
+<p>That struct is cheap. SwiftUI builds it, compares it with the previous one, works out what
+actually changed, and updates only that. Your <code>body</code> may run many times a second and is
+supposed to be trivial — which leads directly to the first rule of the framework:</p>
+
+<p><strong><code>body</code> must be a pure function of the view's inputs.</strong> No network
+calls, no writing to state, no side effects. It can run when you do not expect it, more than once,
+and be discarded without being shown.</p>
+
+<h3>What <code>some View</code> means</h3>
+
+<p><code>some View</code> is an opaque return type: "a specific type conforming to <code>View</code>,
+and I am not telling you which". It matters because the real type of a SwiftUI body is enormous —
+an <code>HStack&lt;TupleView&lt;(Text, Spacer, ModifiedContent&lt;…&gt;)&gt;&gt;</code> that grows
+with every modifier. You never want to write it, and the compiler wants to know it for the diffing
+to be fast. <code>some</code> gives both.</p>
+
+<h2>Stacks, and how layout is negotiated</h2>
+
+<p>Three containers do most of the work: <code>VStack</code> stacks vertically,
+<code>HStack</code> horizontally, <code>ZStack</code> back to front. Each takes an alignment and a
+spacing, and you should set both deliberately — the defaults are "centre" and "a system value that
+is not your design system".</p>
+
+<p>Layout in SwiftUI is a conversation, and it always goes the same way:</p>
+
+<ol>
+  <li>The parent <strong>proposes</strong> a size to the child.</li>
+  <li>The child <strong>chooses</strong> its own size, and may ignore the proposal entirely.</li>
+  <li>The parent <strong>places</strong> the child.</li>
+</ol>
+
+<p>The child choosing is the part that surprises people. A <code>Text</code> takes only the width it
+needs; an <code>Image</code> takes its natural size; a <code>Color</code> takes everything offered.
+The parent cannot force a child to be a size — it can only propose one.</p>
+
+<h3>Spacer and frame</h3>
+
+<p><code>Spacer()</code> is a view that expands to fill the space its parent offers, which is how
+the price row above pushes its amount to the trailing edge. It is not padding: it is a participant
+in the layout that happens to be invisible.</p>
+
+<p><code>.frame()</code> is how you constrain the conversation:</p>
+
+<pre class="language-swift"><code class="language-swift">            .frame(maxWidth: .infinity, alignment: .leading)
+</code></pre>
+
+<p>Read that as "propose the full available width to me, and put my content at the leading edge".
+The distinction between <code>width:</code> and <code>maxWidth:</code> is worth internalising:
+<code>width: 200</code> is a demand, <code>maxWidth: 200</code> is a ceiling. Most layout bugs where
+something is mysteriously centred, or mysteriously full-width, are a <code>frame</code> saying
+something other than what the author meant.</p>
+
+<h2>Modifiers, and why order is not decoration</h2>
+
+<p>A modifier does not mutate the view it is called on. It <em>wraps</em> it and returns a new view.
+So <code>.padding().background(.red)</code> and <code>.background(.red).padding()</code> are
+different pictures: the first paints red behind a padded view, the second pads a red view.</p>
+
+<p>Here is a case from the demo app where getting it wrong looks like the modifier did nothing at
+all:</p>
+
+<pre class="language-swift"><code class="language-swift">    var body: some View {
+        content()
+            .padding(isFlush ? 0 : Spacing.lg)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.colors.surface)
+            .clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+            .cardShadow()
+    }
+</code></pre>
+
+<p>Modifier order is inside-out. Clipping first rounds the surface, and the shadow is then drawn
+from that rounded silhouette. Reverse the last two and the clip removes the shadow along with the
+corners — which reads, at a glance, as a shadow modifier that simply is not working.</p>
+
+<p><code>style: .continuous</code> is the other detail there. It is the squircle Apple uses
+throughout iOS rather than a circular-arc corner, and once you have seen the difference on a large
+radius you cannot unsee it.</p>
+
+<h2>Building a container others can fill</h2>
+
+<p>The card above is not a one-off — it is the surface every screen in the app sits on. Making a
+container reusable in SwiftUI means taking a <code>@ViewBuilder</code> closure:</p>
+
+<pre class="language-swift"><code class="language-swift">struct CardContainer&lt;Content: View&gt;: View {
+    /// Removes the internal padding, for a card whose child manages its own edges (e.g. an image
+    /// that has to reach the rounded corner).
+    var isFlush = false
+    @ViewBuilder let content: () -&gt; Content
+</code></pre>
+
+<p><code>@ViewBuilder</code> is the attribute that lets the caller write several views in a row and
+have them collected into one — it is the same machinery that makes a <code>VStack</code>'s body
+work. Without it the closure would have to return exactly one view and callers would be wrapping
+things in stacks constantly.</p>
+
+<p>Used, it disappears into the call site:</p>
+
+<pre class="language-swift"><code class="language-swift">    private var deliveryCard: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: Spacing.xs) {
+                Text("Delivery").textStyle(.label, tone: .muted)
+                Text("To your door in ~30 min").textStyle(.subheading)
+                Text("A \(Money.format(CartPricing.deliveryFee)) delivery fee applies. Pickup is always free.")
+                    .textStyle(.caption, tone: .muted)
+            }
+        }
+    }
+</code></pre>
+
+<p>Note that the card knows nothing about delivery, and the delivery copy knows nothing about
+corner radii or shadows. That separation is the whole return on writing the container.</p>
+
+<h3>Computed properties instead of one enormous body</h3>
+
+<p><code>deliveryCard</code> is a <code>private var</code> returning <code>some View</code>, and
+the screen's <code>body</code> just lists them. This is the cheapest readability win in SwiftUI —
+there is no runtime cost, because it is the same value tree either way, and it turns a 200-line
+<code>body</code> into a table of contents.</p>
+
+<p>One Swift 5.10 gotcha comes with it: <code>body</code> is main-actor isolated but a helper
+property on the same struct is <strong>not</strong>. A computed property that reads main-actor state
+does not compile until the view type itself is marked <code>@MainActor</code>. Every screen in the
+demo app carries that annotation for exactly this reason.</p>
+
+<h3>Composing containers out of containers</h3>
+
+<p>Once you have one container, the next one is built from it rather than beside it. Nearly every
+section in the app is a card with a small uppercase heading, so that pairing became its own type:</p>
+
+<pre class="language-swift"><code class="language-swift">    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: Spacing.md) {
+                HStack(spacing: Spacing.sm) {
+                    Text(title).textStyle(.label, tone: .muted)
+                    if let accessory {
+                        Spacer(minLength: Spacing.sm)
+                        accessory
+                    }
+                }
+                content()
+            }
+        }
+    }
+</code></pre>
+
+<p>The optional <code>accessory</code> is the small extension that stops this being a special case —
+it is how the profile screen puts an "Add" button in a section header without a second component
+existing. A container that takes one closure is useful; one that takes a closure and an optional
+slot covers most of what a screen needs.</p>
+
+<h3>The identity trap in a conditional</h3>
+
+<p><code>if</code> inside a <code>body</code> does not just hide a view — it changes the
+<em>identity</em> of what is there. Two different branches are two different views as far as SwiftUI
+is concerned, so switching between them destroys the first and builds the second: state inside it is
+lost, and transitions animate as an insert and a removal rather than a change.</p>
+
+<p>Most of the time that is exactly right. When it is not — when you wanted the same view with a
+different value — the fix is to move the condition inside the modifier rather than around the view.
+<code>.padding(isFlush ? 0 : Spacing.lg)</code> in the card above is that pattern: one view, one
+identity, a value that varies.</p>
+
+<h2>Text, and the things that are not CSS</h2>
+
+<p>Several habits from the web have no equivalent and need replacing:</p>
+
+<ul>
+  <li><code>.lineLimit(2, reservesSpace: true)</code> is text truncation that also keeps the space,
+  so a one-line description does not make its card shorter than the one beside it.</li>
+  <li><code>.monospacedDigit()</code> stops numbers jittering as they change — without it, the
+  decimal point of a total shifts left and right while a stepper is held down.</li>
+  <li><code>.multilineTextAlignment()</code> aligns the lines <em>within</em> a text view;
+  <code>.frame(alignment:)</code> aligns the view within its parent. They are different questions
+  and they are constantly confused.</li>
+</ul>
+
+<h2>Safe areas</h2>
+
+<p>The screen is not a rectangle you own. A notch, a camera cut-out, the home indicator and the
+rounded corners all eat into it, and content placed at the top edge is drawn <em>under</em> the
+notch.</p>
+
+<p>The good news is that SwiftUI handles this by default — a <code>ScrollView</code> already insets
+its content — which is exactly why it is worth naming. Unlike React Native, there is no hook to call
+and no manual padding. Where it stops being automatic is when you deliberately push past the edge
+with <code>.ignoresSafeArea()</code>, and then the responsibility comes back to you.</p>
+
+<pre class="language-swift"><code class="language-swift">    private var stack: some View {
+        VStack(alignment: .leading, spacing: Spacing.lg) {
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(isPadded ? Spacing.lg : 0)
+        .padding(.bottom, Spacing.lg + bottomInset)
+    }
+</code></pre>
+
+<p>That bottom padding is not safe-area work — the framework already did that. It is breathing room
+so the last control does not sit flush against the home indicator, where it is genuinely awkward to
+press.</p>
+
+<h2>When the built-in layout runs out</h2>
+
+<p>Three escape hatches, in the order you should reach for them.</p>
+
+<p><code>GeometryReader</code> reports the size proposed to it, which is occasionally the only way
+to size something relative to its parent. Use it sparingly: it takes all the space offered, so
+dropping one into a stack tends to rearrange everything around it, and the usual outcome is a
+layout that is harder to reason about than the one it replaced.</p>
+
+<p><code>ViewThatFits</code> tries a list of layouts and picks the first that fits — the right tool
+for "side by side if there is room, stacked if not", and one line instead of a size class check.</p>
+
+<p>Then there is the <code>Layout</code> protocol, which lets you take part in the layout pass
+directly. The demo app needs it exactly once, because SwiftUI ships nothing that wraps: no
+<code>HStack</code> flows onto a second line, and a row of topping chips has to. Lesson 9 builds
+that one; the point here is that the escape hatch exists and is a normal thing to use, not a defeat.</p>
+
+<h2>Next</h2>
+
+<p>Everything so far has been static: values in, pixels out. The next lesson is the half that makes
+it an app — <code>@State</code>, <code>@Observable</code> and <code>@Environment</code>, which one
+to reach for, and the rule that decides.</p>

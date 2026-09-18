@@ -1,0 +1,264 @@
+<p>Swift is a big language and you do not need most of it to start. This lesson is the subset a
+SwiftUI app leans on every day, in the order it stops being optional — and every example is a real
+type from the ordering app, not a <code>Person</code> struct with a <code>name</code>.</p>
+
+<p>If you are coming from TypeScript, Kotlin or modern Java, most of this will read as familiar with
+different punctuation. Two things will not: value semantics, and how thoroughly optionals are
+enforced. Those two are where the early bugs are.</p>
+
+<h2>Value types and reference types</h2>
+
+<p>A <code>struct</code> is a value: assigning it copies it. A <code>class</code> is a reference:
+assigning it shares it. Every language has this distinction somewhere; Swift makes it the first
+decision you take about a type, and pushes you hard toward <code>struct</code>.</p>
+
+<p>The reason it matters in a UI app is that SwiftUI compares values to decide what to redraw. A
+model that can be mutated behind the framework's back is a model whose changes it cannot see.</p>
+
+<pre class="language-swift"><code class="language-swift">struct CartItem: Identifiable, Equatable, Hashable {
+    let lineID: UUID
+    let productID: UUIDString
+    let productName: String
+    let productType: ProductType
+    let imageURL: String?
+    let size: SizeName
+    let basePrice: Double
+    let crustID: UUIDString?
+    let crustName: String?
+    let crustPriceDelta: Double
+    let toppings: [Topping]
+    var quantity: Int
+
+    var id: UUID { lineID }
+    // initialiser and configuration helpers omitted
+</code></pre>
+
+<p>One line of a shopping basket. Handing it to another type hands over a copy, so nothing can
+mutate a line the cart still believes it owns. That property is what lets the cart's rules — lesson
+13 — be trivially correct, and it is the single biggest difference from the React version of this
+same app, where immutability is a discipline the author has to maintain by hand.</p>
+
+<p>Note <code>let</code> on everything except <code>quantity</code>. In a struct, <code>let</code>
+means the property cannot change <em>after initialisation</em>, and the compiler enforces it. Reach
+for <code>class</code> when you genuinely need shared identity — the stores in lesson 4 are classes
+for exactly that reason.</p>
+
+<h2>Optionals</h2>
+
+<p>A type either holds a value or it does not, and the type says which. <code>String</code> always
+has a string; <code>String?</code> may be <code>nil</code>. There is no null hiding inside a
+non-optional, which removes an entire category of crash.</p>
+
+<p>The cost is that you have to say what happens when it is missing, every time. Swift gives you
+several ways, and choosing well is most of writing idiomatic Swift:</p>
+
+<pre class="language-swift"><code class="language-swift">    var displayName: String { "\(brand ?? "Card") •••• \(last4 ?? "????")" }
+
+    var expiryLabel: String {
+        guard let expMonth, let expYear else { return "Expiry unknown" }
+        return String(format: "Expires %02d/%d", expMonth, expYear)
+    }
+</code></pre>
+
+<p>Two techniques in six lines. <code>??</code> supplies a default inline, which is right when the
+fallback is obvious and local. <code>guard let</code> unwraps and leaves early when it cannot —
+and the unwrapped values stay in scope for the rest of the function, which <code>if let</code> does
+not give you.</p>
+
+<p><strong>Prefer <code>guard</code> for preconditions.</strong> It keeps the happy path
+unindented and puts the failure next to the condition that caused it, rather than at the bottom of
+a pyramid.</p>
+
+<h3>Optional chaining and map</h3>
+
+<pre class="language-swift"><code class="language-swift">    var singleLine: String {
+        let street = line2.map { "\(line1), \($0)" } ?? line1
+        return "\(street), \(city), \(state) \(postalCode)"
+    }
+</code></pre>
+
+<p><code>line2</code> is an optional second address line. <code>map</code> on an optional runs the
+closure only if there is a value and stays <code>nil</code> otherwise — so this reads as "if there
+is a second line, join it on; otherwise just the first". Written with <code>if let</code> it would
+take four lines and a mutable variable.</p>
+
+<h3>The one to avoid</h3>
+
+<p><code>!</code> force-unwraps: it asserts there is a value and crashes if there is not. It has
+legitimate uses — a resource you ship in your own bundle, a regular expression literal you wrote —
+and it is the single most common cause of crashes in iOS apps. The demo app's linter treats it as an
+error in app code and allows it in tests, where a crash is a clear test failure.</p>
+
+<h2>Enums are not just constants</h2>
+
+<p>A Swift enum is a closed set of cases, and <code>switch</code> over one must be exhaustive.
+That exhaustiveness is the feature: add a case and every place that handles the type stops
+compiling until somebody deals with it.</p>
+
+<pre class="language-swift"><code class="language-swift">enum HTTPMethod: String, Equatable {
+    case get = "GET"
+    case post = "POST"
+    case put = "PUT"
+    case patch = "PATCH"
+    case delete = "DELETE"
+}
+</code></pre>
+
+<p>Backing it with <code>String</code> gives each case a raw value for the wire, and
+<code>HTTPMethod(rawValue:)</code> to parse one back. The gain over a bare <code>String</code> is
+that <code>Endpoint(method: "POTS", …)</code> cannot be written.</p>
+
+<p>Enums can carry behaviour too, which is where they stop resembling constants:</p>
+
+<pre class="language-swift"><code class="language-swift">enum SizeName: String, Codable, CaseIterable, Hashable {
+    case small = "SMALL"
+    case medium = "MEDIUM"
+    case large = "LARGE"
+
+    /// "MEDIUM" reads badly in a button; "Medium" does.
+    var displayName: String { rawValue.prefix(1) + rawValue.dropFirst().lowercased() }
+}
+</code></pre>
+
+<p><code>CaseIterable</code> synthesises <code>allCases</code>, which is how a picker builds its
+options without a second list to keep in sync.</p>
+
+<h3>Associated values</h3>
+
+<p>A case can carry data, and different cases can carry different data. This is the feature that
+replaces a great deal of defensive checking:</p>
+
+<pre class="language-swift"><code class="language-swift">enum ViewState&lt;Value&gt; {
+    case idle
+    case loading
+    case loaded(Value)
+    case empty
+    case failed(message: String, isRetryable: Bool)
+    // accessors and constructors omitted — lesson 11
+</code></pre>
+
+<p>Three booleans — loading, failed, has-data — describe eight combinations, five of which are
+nonsense. This describes five states, all of them real. Lesson 11 makes the argument properly; for
+now, notice that "loading <em>and</em> failed" is not something you can write down.</p>
+
+<h2>Protocols and extensions</h2>
+
+<p>A protocol is a set of requirements a type can declare it meets. Unlike a base class, a
+<code>struct</code> can adopt one and adopt several, which is why Swift leans on protocols where
+other languages reach for inheritance.</p>
+
+<p>Look back at <code>struct CartItem: Identifiable, Equatable, Hashable</code>. Those three are
+not inheritance — they are capabilities. <code>Identifiable</code> means it has an <code>id</code>,
+which is what lets SwiftUI track it in a list. <code>Equatable</code> and <code>Hashable</code> are
+<strong>synthesised</strong>: the compiler writes them for you when every stored property already
+conforms.</p>
+
+<p>Extensions add to an existing type, including one you do not own:</p>
+
+<pre class="language-swift"><code class="language-swift">extension String {
+    /// Used everywhere a field is checked, because " " is not a name and `.isEmpty` says it is.
+    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+}
+</code></pre>
+
+<p>Now every string in the app has <code>.trimmed</code>. Used carelessly this becomes a junk
+drawer, so the rule worth holding is: extend a type with something that genuinely belongs to it,
+not with your feature's logic.</p>
+
+<h2>Closures, and the capture that leaks</h2>
+
+<p>Closures are functions you can pass around, and Swift's trailing-closure syntax is why SwiftUI
+reads the way it does. The part that bites is capture.</p>
+
+<p>A closure holds a strong reference to what it captures. If an object owns a closure that captures
+that same object, neither is ever released:</p>
+
+<pre class="language-swift"><code class="language-swift">        dismissalTasks[toast.id] = Task { [weak self] in
+            try? await Task.sleep(for: self?.visibleDuration ?? .seconds(3))
+            guard !Task.isCancelled else { return }
+            self?.dismiss(toast.id)
+        }
+</code></pre>
+
+<p><code>[weak self]</code> breaks the cycle, and <code>self</code> becomes optional inside. The
+rule of thumb: a closure stored as a property, or one that outlives the call that created it, wants
+<code>[weak self]</code>. One passed to <code>map</code> and used immediately does not.</p>
+
+<h2>Errors</h2>
+
+<p>Swift's error handling is explicit and checked. A function that can fail is marked
+<code>throws</code>, every call to it is marked <code>try</code>, and the compiler will not let you
+forget either.</p>
+
+<pre class="language-swift"><code class="language-swift">enum APIError: LocalizedError, Equatable {
+    case api(status: Int, message: String, body: APIErrorBody?)
+    case unauthorized
+    case network(message: String)
+    case decoding(message: String)
+    // messages, field errors and retryability omitted — lesson 11
+</code></pre>
+
+<p>An error type is usually an enum, because the cases <em>are</em> the outcomes. Note what these
+cases are: not the places the code went wrong, but the decisions a caller can make. Lesson 11 builds
+this one out.</p>
+
+<p><code>try?</code> converts a throwing call into an optional, discarding the error —
+<code>try? await Task.sleep(…)</code> above is doing exactly that, because a cancelled sleep is not
+information anyone needs. <code>try!</code> crashes on failure, and deserves the same suspicion as
+force-unwrapping.</p>
+
+<h2>Generics and Codable</h2>
+
+<p>Generics let a type work over another type without losing track of which one. The paginated
+envelope this app's API returns is the clearest small example:</p>
+
+<pre class="language-swift"><code class="language-swift">struct Page&lt;T: Decodable&gt;: Decodable {
+    let content: [T]
+    let totalElements: Int
+    let totalPages: Int
+    let number: Int
+    let size: Int
+}
+</code></pre>
+
+<p><code>Page&lt;Order&gt;</code> and <code>Page&lt;Product&gt;</code> are one type, and
+<code>page.content</code> is correctly typed in both. The constraint <code>T: Decodable</code> is
+what makes the last line work: <code>Decodable</code> conformance is synthesised for
+<code>Page</code> automatically, as long as whatever <code>T</code> turns out to be is decodable
+too.</p>
+
+<p><code>Codable</code> is <code>Encodable &amp; Decodable</code>, and it is how JSON becomes a
+Swift value. Declare the conformance and the compiler writes the parsing, matching property names to
+JSON keys. Where a name has to differ, the type declares <code>CodingKeys</code> — visible at the
+model, rather than implied by a global setting somewhere.</p>
+
+<p>The failure mode to know about: decoding throws if a required property is missing, and a property
+declared non-optional <em>is</em> required. A server that starts omitting a field breaks your app at
+the parse step, not at the use site. That is usually the behaviour you want — it fails at the
+boundary, loudly, rather than producing a half-built value — but it means the model is a contract
+and changing it is a real decision.</p>
+
+<h2>Access control, briefly</h2>
+
+<p>Folders are not modules in Swift — every file in a target shares one namespace. Visibility is
+per type and per member: <code>private</code> (this declaration), <code>fileprivate</code> (this
+file), <code>internal</code> (the default, the whole target), <code>public</code> and
+<code>open</code> for frameworks.</p>
+
+<p>The one worth knowing is <code>private(set)</code>: readable anywhere, writable only from inside.
+It is how the stores in the next lesson expose their state without letting a view corrupt it.</p>
+
+<h2>What to skip for now</h2>
+
+<p>Swift has a great deal more, and almost none of it is needed to build a screen. Property
+wrappers, result builders, <code>some</code> and <code>any</code>, associated types, operator
+overloading and macros are all worth learning eventually and none of them are worth learning today.
+You use several of them constantly without writing one — <code>@State</code> is a property wrapper
+and a SwiftUI <code>body</code> is a result builder, which is the point: the language features are
+there so the framework can read the way it does.</p>
+
+<h2>Next</h2>
+
+<p>That is enough Swift to read the rest of this track. The next lesson starts SwiftUI proper — why
+a View is a value rather than an object, how layout is negotiated between a parent and its children,
+and why modifier order is not a matter of taste.</p>
