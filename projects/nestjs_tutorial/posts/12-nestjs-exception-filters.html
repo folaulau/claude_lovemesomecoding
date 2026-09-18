@@ -1,0 +1,263 @@
+<p>Nest already has an exception filter. Every application starts with a global one that catches
+whatever your code throws and turns it into a response, which is why a service can throw
+<code>NotFoundException</code> and a client receives a 404 without anyone writing a
+<code>try/catch</code>.</p>
+
+<p>So the question is never "do I need a filter" but "is the built-in one enough". It is, until
+something gets thrown that is not an <code>HttpException</code> — and then every one of those
+becomes a bare 500.</p>
+
+<h2>Throwing from a service</h2>
+
+<pre class="language-typescript"><code class="language-typescript">if (!project || project.homeownerId !== user.id) {
+  throw new NotFoundException('That project no longer exists.')
+}
+if (!QUOTABLE_STATUSES.includes(project.status)) {
+  throw new ConflictException('You have already hired someone for this project.')
+}</code></pre>
+
+<p>Nest ships a subclass per status — <code>BadRequestException</code>,
+<code>UnauthorizedException</code>, <code>ForbiddenException</code>,
+<code>NotFoundException</code>, <code>ConflictException</code>,
+<code>UnprocessableEntityException</code>, <code>PayloadTooLargeException</code>,
+<code>UnsupportedMediaTypeException</code>, <code>InternalServerErrorException</code>, and more.
+All extend <code>HttpException</code>, which pairs a body with a status.</p>
+
+<p>A reasonable objection: is a service throwing HTTP-shaped exceptions not a layering violation?
+In principle yes. In practice these read as named conditions that happen to have obvious status
+codes — "not found" and "conflict" are domain vocabulary, not transport vocabulary. The pragmatic
+version of the rule is that a service may throw them and must never touch a request or a response,
+and this codebase holds that line.</p>
+
+<p>The choice of exception is where the real thinking goes:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const invalid = new UnauthorizedException('That email and password do not match an account.')
+if (!user || user.deleted) {
+  await bcrypt.compare(dto.password, DUMMY_HASH)
+  throw invalid
+}</code></pre>
+
+<p>Three different failures — no such account, a deleted account, a wrong password — deliberately
+produce one exception with one message. Distinguishing them would turn the login form into an
+oracle confirming which addresses are registered. The exception you throw is part of the security
+design, not an afterthought.</p>
+
+<h2>Writing a filter</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly logger = new Logger('Exceptions')
+
+  catch(exception: unknown, host: ArgumentsHost): void {
+    if (host.getType() !== 'http') throw exception
+
+    const http = host.switchToHttp()
+    const response = http.getResponse&lt;Response&gt;()
+    const request = http.getRequest&lt;RequestWithId&gt;()
+
+    const { status, body } = describe(exception)
+    // ...
+    response.status(status).json({
+      ...body,
+      statusCode: status,
+      path: request.originalUrl,
+      timestamp: new Date().toISOString(),
+      requestId: requestIdOf(request),
+    })
+  }
+}</code></pre>
+
+<p><code>@Catch()</code> with <strong>no argument</strong> means every exception, including the ones
+that are not <code>HttpException</code>. That is the entire point of writing this one — Nest's
+built-in filter handles <code>HttpException</code> perfectly well, and what it does with a
+<code>QueryFailedError</code> is turn it into a bare 500.</p>
+
+<p>Give it arguments to narrow it: <code>@Catch(HttpException)</code>, or
+<code>@Catch(QueryFailedError, EntityNotFoundError)</code>. Narrow filters and one catch-all
+compose fine; Nest picks the most specific match.</p>
+
+<p><code>ArgumentsHost</code> is <code>ExecutionContext</code>'s parent — the request and response
+without the route information. A filter can be given an <code>ExecutionContext</code> in some
+positions, but the catch-all signature is the general one.</p>
+
+<h2>The rule that keeps a filter from breaking your API</h2>
+
+<p>The filter <strong>adds to</strong> Nest's body rather than replacing it, and that is not
+politeness — it is what stops this from being a breaking change dressed as a refactor.</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (exception instanceof HttpException) {
+  const payload = exception.getResponse()
+  return {
+    status: exception.getStatus(),
+    body: typeof payload === 'string' ? { message: payload } : { ...(payload as object) },
+  }
+}</code></pre>
+
+<p><code>message</code> keeps the exact shape Nest produced. For most exceptions that is a string.
+For a <code>ValidationPipe</code> rejection it is an <strong>array</strong> of messages, because one
+request can break several rules:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "message": [
+    "firstName must be longer than or equal to 1 characters"
+  ],
+  "error": "Bad Request",
+  "statusCode": 400,
+  "path": "/api/v1/auth/register",
+  "timestamp": "2026-09-05T14:43:09.956Z",
+  "requestId": "ba10c2bc-50bf-4cc6-b634-1bc66e04f8ea"
+}</code></pre>
+
+<p>A filter that "tidies" <code>message</code> into a single string would break every client
+rendering field errors, and it would do it silently — the status code is still 400 and the request
+still fails, so nothing looks wrong from the server side.</p>
+
+<p>The <code>typeof payload === 'string'</code> branch handles the other case:
+<code>getResponse()</code> returns an object for every built-in exception and a plain string when
+somebody constructs <code>new HttpException('nope', 400)</code> by hand.</p>
+
+<h2>The bug this filter fixed</h2>
+
+<p>Accepting a quote must also decline every other pending quote on the project, and a partial
+unique index in the database guarantees at most one accepted quote per project. That index is a
+backstop for a race the application's row lock already prevents.</p>
+
+<p>When a backstop fires, the caller used to get a 500. It is a 409 now:</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (exception instanceof QueryFailedError) {
+  const code = (exception.driverError as { code?: string } | undefined)?.code
+
+  if (code === PG_UNIQUE_VIOLATION) {
+    return {
+      status: HttpStatus.CONFLICT,
+      body: { message: 'That has already been done.', error: 'Conflict' },
+    }
+  }
+  if (code === PG_FOREIGN_KEY_VIOLATION) {
+    return {
+      status: HttpStatus.CONFLICT,
+      body: { message: 'Something this refers to is missing or still in use.', error: 'Conflict' },
+    }
+  }
+
+  return { status: HttpStatus.INTERNAL_SERVER_ERROR, body: GENERIC_500 }
+}</code></pre>
+
+<p>A unique violation means two requests raced and the database settled it. The losing caller did
+nothing wrong and retrying may well work — which is precisely what 409 says and what 500 does
+not.</p>
+
+<p>The messages are deliberately generic. A constraint name is a schema detail, and
+<code>uq_one_accepted_quote_per_project</code> in a response body tells a stranger the table
+layout. Where a specific message is worth having, the service catches the error itself:</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (error instanceof QueryFailedError &amp;&amp; (error.driverError as { code?: string })?.code === PG_UNIQUE_VIOLATION) {
+  throw new ConflictException('You have already quoted on this project.')
+}
+throw error</code></pre>
+
+<p>That is worth reading twice, because it is the correct order rather than a shortcut. Checking
+for an existing quote before inserting loses the race: two requests both see nothing, both insert,
+and the database rejects one with a 500. Letting the constraint <em>be</em> the check and
+translating its error is the only version with no window at all.</p>
+
+<p>So the filter and the service are layered on purpose: the service translates the one constraint
+it knows about into a message a user can act on; the filter catches every constraint nobody thought
+about and makes it a sane status instead of a 500.</p>
+
+<h2>What never goes in a response</h2>
+
+<pre class="language-typescript"><code class="language-typescript">if (status &gt;= HttpStatus.INTERNAL_SERVER_ERROR) {
+  this.logger.error(
+    `${request.method} ${request.originalUrl} -&gt; ${status} req=${requestIdOf(request)}`,
+    exception instanceof Error ? exception.stack : String(exception),
+  )
+}</code></pre>
+
+<p>The stack goes to the log and never into the body. A stack trace in a response names file paths,
+library versions and sometimes the query that failed — a free map of the server for anyone who can
+make it throw.</p>
+
+<p>The same applies to the message. A <code>TypeError</code>'s text is a defect report:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const GENERIC_500 = {
+  message: 'Something went wrong. Try again.',
+  error: 'Internal Server Error',
+} as const</code></pre>
+
+<p><code>Cannot read properties of undefined (reading 'contractorId')</code> tells an attacker
+about your internals and tells an honest user nothing. It belongs in the log line the filter just
+wrote — which is findable, because the response carried the same request id.</p>
+
+<p>That pairing is the reason to bother with a filter at all. A user reports "it said something
+went wrong"; they have a request id; one grep finds the stack.</p>
+
+<h2>Custom exceptions</h2>
+
+<p>When a domain condition recurs, giving it a class beats repeating a constructor call:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class ProjectNotQuotableException extends ConflictException {
+  constructor(status: string) {
+    super(`A ${status} project is not accepting quotes.`)
+  }
+}</code></pre>
+
+<p>Extending a built-in keeps it working with the existing filter, so nothing else has to change.
+The alternative — a plain <code>Error</code> subclass plus a <code>@Catch</code> filter that maps
+it — decouples the service from HTTP more thoroughly and costs a filter per error family. Both are
+defensible; what is not is a service throwing bare <code>Error</code>, because every one of those
+becomes a 500 with the message discarded.</p>
+
+<h2>Async filters and what happens if one throws</h2>
+
+<p><code>catch</code> may return a promise, which is occasionally useful — reporting to an error
+tracker before responding. Be careful about awaiting anything slow: an exception filter is on the
+path of every failure, so a filter that takes a second turns an error spike into an outage.</p>
+
+<p>And a filter that throws is the worst failure mode in this lesson: the exception escapes to
+Express's default handler, the carefully designed body never appears, and what the client sees is
+whatever Express decided. That is the reason the transport check below rethrows rather than trying
+to cope, and the reason the code inside a filter should be dull.</p>
+
+<h2>Errors that never reach a filter</h2>
+
+<p>A filter catches what is thrown inside the request pipeline. Two things are outside it and worth
+knowing about, because they crash the process rather than producing a response.</p>
+
+<p>An unhandled promise rejection in code the request did not await — a fire-and-forget
+<code>this.mailer.send(...)</code> with no <code>catch</code> — is one. So is anything thrown in a
+timer or an event handler that started during a request but outlived it.</p>
+
+<p>Neither has a request to answer, so neither has a filter. The fix is at the source: await it, or
+attach a <code>.catch()</code> that logs. A process-level
+<code>process.on('unhandledRejection')</code> handler is a safety net for finding them, not a way to
+handle them.</p>
+
+<h2>Binding it</h2>
+
+<pre class="language-typescript"><code class="language-typescript">providers: [
+  { provide: APP_FILTER, useClass: AllExceptionsFilter },
+  { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+],</code></pre>
+
+<p>Same reasoning as an interceptor. <code>app.useGlobalFilters()</code> in <code>main.ts</code>
+constructs it outside the container, so it cannot inject anything and a test built from
+<code>AppModule</code> does not get it — meaning the suite would exercise a pipeline the production
+application does not have. As a provider it is part of the module and travels with it.</p>
+
+<p>Filters can also be attached per controller or per method with <code>@UseFilters()</code>, which
+is occasionally right for one endpoint with genuinely unusual error semantics — a webhook that must
+answer 200 whatever happens, say — and is otherwise a good way to end up with error bodies that
+disagree with each other.</p>
+
+<h2>Transport guards</h2>
+
+<pre class="language-typescript"><code class="language-typescript">if (host.getType() !== 'http') throw exception</code></pre>
+
+<p>Same reason as the interceptor's. Bound globally, this filter is handed exceptions from every
+transport, and <code>getResponse()</code> on a WebSocket context is not an Express response.
+Rethrowing hands it back to whatever else can deal with it, rather than crashing in the middle of
+error handling — which is the worst place to have a bug.</p>
+
+<p>Next: <a href="/nestjs/nestjs-request-lifecycle">the request lifecycle</a>, which puts every
+stage from the last eight lessons in order and works through what follows from it.</p>

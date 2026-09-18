@@ -207,6 +207,18 @@ for entry in manifest.POSTS:
     totals["code"] += code
 
     # (1) the reading-time budget
+    #
+    # ⚠️ Asserted on `readingMinutes` — the number the site actually publishes — rather than only
+    # on the word count it is derived from. The word bounds below are the same rule stated in the
+    # units the failure message needs, and they agree with this because they are computed from
+    # TARGET_MINUTES with the rounding included. See manifest.TOTAL_WORDS_MIN.
+    minutes = result["readingMinutes"]
+    if not (manifest.TARGET_MINUTES[0] <= minutes <= manifest.TARGET_MINUTES[1]):
+        failures.append(
+            f"{entry['slug']}: publishes as {minutes} min read, outside the "
+            f"{manifest.TARGET_MINUTES[0]}-{manifest.TARGET_MINUTES[1]} minute budget "
+            f"({words} words, {code} of them code)")
+
     if words > manifest.TOTAL_WORDS_MAX:
         failures.append(
             f"{entry['slug']}: {words} words = {result['readingMinutes']} min, over the "
@@ -257,7 +269,7 @@ for entry in manifest.POSTS:
                         "verify its code")
 
 # Every declared snippet source must exist, or check_snippets silently verifies against nothing.
-app = REPO_ROOT / manifest.DEMO_APP
+app = manifest.app_root()
 for slug, sources in manifest.SNIPPET_SOURCES.items():
     for rel in sources:
         if not (app / rel).exists():

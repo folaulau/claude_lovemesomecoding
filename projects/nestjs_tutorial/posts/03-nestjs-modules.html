@@ -1,0 +1,271 @@
+<p>A module is the unit Nest is organised around. It is a class with a decorator and no body, and
+its entire job is to declare what belongs together and what is visible outside.</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [TypeOrmModule.forFeature([Project, Quote, ServiceCategory])],
+  controllers: [ProjectsController],
+  providers: [ProjectsService],
+  exports: [ProjectsService],
+})
+export class ProjectsModule {}</code></pre>
+
+<p>Four keys, and each answers a different question.</p>
+
+<h2>The four keys</h2>
+
+<p><strong><code>controllers</code></strong> — the classes in this module that handle routes. A
+controller not listed here does not exist as far as Nest is concerned: no error, no warning, just
+a route that 404s and never appears in the startup log. This is the single most common "why
+doesn't my endpoint work" in Nest, and the startup log is where you catch it.</p>
+
+<p><strong><code>providers</code></strong> — the injectable classes this module owns. Services,
+guards, custom providers. Listing a class here makes it constructible <em>inside this module</em>
+and nowhere else.</p>
+
+<p><strong><code>imports</code></strong> — other modules whose exports this module wants to use.
+Importing a module gives you its <code>exports</code>, not its providers.</p>
+
+<p><strong><code>exports</code></strong> — which of this module's providers other modules may
+inject. Everything else stays private.</p>
+
+<h2>Providers are private by default</h2>
+
+<p>This is the rule that surprises people coming from Express, where an import is an import.</p>
+
+<p><code>QuotesService</code> needs to ask whether a project still accepts bids. That logic lives
+in <code>ProjectsService</code>, in a different module. Importing the class directly and calling
+<code>new ProjectsService()</code> would compile — and would produce a second instance with no
+database connection injected into it.</p>
+
+<p>The correct version is two declarations. <code>ProjectsModule</code> exports its service:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [TypeOrmModule.forFeature([Project, Quote, ServiceCategory])],
+  controllers: [ProjectsController],
+  providers: [ProjectsService],
+  exports: [ProjectsService],
+})
+export class ProjectsModule {}</code></pre>
+
+<p>and <code>QuotesModule</code> imports the module:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [TypeOrmModule.forFeature([Quote, ContractorProfile]), ProjectsModule],
+  controllers: [QuotesController],
+  providers: [QuotesService],
+})
+export class QuotesModule {}</code></pre>
+
+<p>Now <code>QuotesService</code> can take a <code>ProjectsService</code> in its constructor and
+receive the same singleton the projects module uses. Remove the <code>exports</code> line and the
+application refuses to start:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Nest can't resolve dependencies of the QuotesService (DataSource, ?).
+Please make sure that the argument ProjectsService at index [1] is
+available in the QuotesModule context.</code></pre>
+
+<p>Read that message carefully once and it becomes easy. <code>?</code> marks the parameter it
+could not resolve, the index tells you which constructor argument, and "available in the
+<em>X</em> context" is the important half — the class exists, it is simply not visible from
+here.</p>
+
+<p>The privacy is worth the ceremony. A module's provider list is a complete statement of what it
+owns, and its exports are a deliberate public interface. In an Express codebase any file can
+import any other, and after two years nothing has a boundary.</p>
+
+<h2>Feature modules and the root</h2>
+
+<p>One module per area of the domain, all assembled by the root:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [loadConfig],
+      envFilePath: ['.env'],
+    }),
+    TypeOrmModule.forRoot(buildDataSourceOptions()),
+    AuthModule,
+    ContractorsModule,
+    ProjectsModule,
+    QuotesModule,
+    ReviewsModule,
+  ],
+  // ...
+})</code></pre>
+
+<p>Notice there is nothing else in the root — no controllers, no services. The root module's job is
+composition. When it starts accumulating providers of its own, that is a sign a feature module is
+missing.</p>
+
+<h2>A module is a singleton, however many times it is imported</h2>
+
+<p><code>ContractorProfile</code>'s repository is registered by three different modules, and
+<code>ProjectsModule</code> is imported by <code>QuotesModule</code> while also being listed in
+the root. None of that creates duplicates.</p>
+
+<p>Nest instantiates each module once per application and caches it. Import the same module from
+five places and all five receive the same instance, with the same provider instances inside it.
+That is what makes it safe for <code>QuotesService</code> and <code>ProjectsController</code> to
+share a <code>ProjectsService</code> that holds a database connection: there is only ever one.</p>
+
+<p>It is also the thing to remember when you put state in a provider. A field on a service is
+application-wide and shared by every concurrent request, because the service is a singleton. Most
+of the time that is what you want — a connection pool, a cache, a compiled configuration object.
+Occasionally it is a bug you will spend an afternoon on, and the fix is either not to hold the
+state or to change the provider's scope, which
+<a href="/nestjs/nestjs-providers-and-dependency-injection">lesson 5</a> covers.</p>
+
+<h2>Dynamic modules: forRoot and forFeature</h2>
+
+<p>Two of those imports are method calls rather than plain classes, and that difference matters.</p>
+
+<p>A plain <code>ProjectsModule</code> is fully described by its own decorator. But
+<code>TypeOrmModule</code> cannot be — it has no idea which database to connect to until you tell
+it. So it exposes a static method that returns a module definition built from arguments. That is a
+<strong>dynamic module</strong>, and the naming convention is consistent across the ecosystem:</p>
+
+<p><code>forRoot(options)</code> configures the thing once, globally. One database connection, one
+config source. Called in the root module.</p>
+
+<p><code>forFeature(entities)</code> registers a slice of an already-configured thing for one
+module. <code>TypeOrmModule.forFeature([Quote, ContractorProfile])</code> does not open a second
+connection — it makes the repositories for those two entities injectable inside
+<code>QuotesModule</code>. It is called once per feature module, listing only the entities that
+module touches.</p>
+
+<p>That per-module list is real documentation. Reading <code>ReviewsModule</code>'s
+<code>forFeature</code> tells you a review write touches four tables before you open the
+service.</p>
+
+<p>There is also <code>forRootAsync</code> / <code>registerAsync</code>, for when the options
+themselves need something injected —
+<a href="/nestjs/nestjs-providers-and-dependency-injection">lesson 5</a> covers it.</p>
+
+<h2>@Global, and why it is used once</h2>
+
+<p>Every feature module in this application uses <code>JwtAuthGuard</code>. A guard is a provider,
+and a provider can only be constructed if its dependencies are available in the module that
+declares it — so every one of the five feature modules would have to import
+<code>AuthModule</code> purely to satisfy the container.</p>
+
+<p><code>@Global()</code> removes that:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Global()
+@Module({
+  imports: [
+    JwtModule.registerAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService&lt;AppConfig&gt;) =&gt; {
+        const jwt = config.getOrThrow&lt;AppConfig['jwt']&gt;('jwt')
+        return {
+          secret: jwt.secret,
+          signOptions: {
+            algorithm: 'HS256',
+            expiresIn: jwt.expiresIn as `${number}${'s' | 'm' | 'h' | 'd'}`,
+          },
+          verifyOptions: { algorithms: ['HS256'] },
+        }
+      },
+    }),
+  ],
+  controllers: [AuthController],
+  providers: [AuthService, JwtAuthGuard, RolesGuard],
+  exports: [AuthService, JwtModule, JwtAuthGuard, RolesGuard],
+})
+export class AuthModule {}</code></pre>
+
+<p>A global module's exports are available everywhere without being imported. It still has to be
+imported once — by the root — to be instantiated at all.</p>
+
+<p>The reason it appears exactly once in this codebase is that <code>@Global</code> destroys the
+property that makes modules useful. A module's imports are a statement of its dependencies, and a
+global provider is a dependency that does not appear in any of them. Use it for a genuinely
+ambient cross-cutting concern, which authentication is, and for nothing else. Two or three global
+modules and the dependency graph has stopped being readable.</p>
+
+<p>Note <code>JwtModule</code> in the exports as well. <code>JwtAuthGuard</code> is exported, but a
+guard constructed in another module still needs <code>JwtService</code> to be resolvable there —
+so the module that provides it gets re-exported too. Re-exporting an imported module is a normal
+and useful thing to do.</p>
+
+<h2>What modules buy you in tests</h2>
+
+<p>The boundary is not only an organising device. It is what makes a Nest application testable
+without a running server, because the testing utilities take a module definition and build the
+same graph:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const moduleRef = await Test.createTestingModule({
+  providers: [RolesGuard, Reflector],
+}).compile()
+
+guard = moduleRef.get(RolesGuard)</code></pre>
+
+<p>That is a two-provider application. It has no controllers, no database and no HTTP server, and
+<code>RolesGuard</code> cannot tell the difference — it is constructed exactly as it would be in
+production, by the same container.</p>
+
+<p>The same mechanism scales the other way. An end-to-end test imports the real root module and
+gets the entire application:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile()
+app = moduleRef.createNestApplication()</code></pre>
+
+<p>Between those two extremes you can import the real module and replace one provider inside it.
+That range — from two classes to the whole system, with the seam anywhere you like — exists
+because every dependency is declared rather than imported.
+<a href="/nestjs/nestjs-testing">Lesson 19</a> is entirely about it.</p>
+
+<h2>Circular imports</h2>
+
+<p>Two modules that need each other will not resolve, and Nest says so at startup. There is an
+escape hatch:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// A deliberate cycle, kept only when the alternative is worse.
+@Module({
+  imports: [forwardRef(() =&gt; QuotesModule)],
+})
+export class ProjectsModule {}</code></pre>
+
+<p>It works, and it is almost always a signal rather than a solution. This application has no
+<code>forwardRef</code> anywhere: <code>QuotesModule</code> imports <code>ProjectsModule</code>
+and not the reverse, because a quote is written against a project and a project knows nothing
+about who might bid on it. When you reach for <code>forwardRef</code>, look first for the shared
+thing both modules actually want, which usually belongs in a third module.</p>
+
+<h2>How big should a module be?</h2>
+
+<p>The useful test is not size but cohesion: a module should own a set of rules that change
+together. This application has one per noun in the domain — projects, quotes, reviews, contractors,
+auth — and each one owns rules that genuinely belong to it. The rule about which trades a
+contractor may bid in lives in <code>QuotesModule</code>, because it constrains a quote. The rule
+about which status transitions are legal lives in <code>ProjectsModule</code>, because it
+constrains a project.</p>
+
+<p>Two shapes suggest the split is wrong. A module that imports six others and exports nothing is
+usually a coordinator that should have been a service inside one of them. And a module that two
+others both reach into for different halves of its behaviour is usually two modules that have not
+been separated yet — the giveaway is an <code>exports</code> array whose entries have no obvious
+relationship to each other.</p>
+
+<p>Resist splitting purely by technical layer. A <code>ServicesModule</code> and a
+<code>ControllersModule</code> would satisfy every rule in this lesson and tell a reader nothing,
+because knowing that something is a service is not knowledge — knowing that it is how a quote gets
+accepted is.</p>
+
+<p>One more shape worth naming: a module that exists only to hold things other modules use — a
+<code>CommonModule</code> or <code>SharedModule</code>. It is fine when its contents genuinely
+belong together, and a warning sign when it becomes the place anything reusable is put, because
+then every module imports it and the dependency graph says nothing. Prefer moving a shared thing
+into the module that owns the concept, and reach for a shared module only when no single owner
+exists.</p>
+
+<h2>What to take away</h2>
+
+<p>A module is a visibility boundary, not a folder. Providers are private until exported, imports
+bring in another module's exports rather than its internals, and the error message when you get it
+wrong names both the missing dependency and the context it was missing from.</p>
+
+<p>Next: <a href="/nestjs/nestjs-controllers">controllers</a>, which are the classes in that
+<code>controllers</code> array and the only place in a well-organised Nest application that knows
+anything about HTTP.</p>

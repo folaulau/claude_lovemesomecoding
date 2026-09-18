@@ -1,0 +1,273 @@
+<p>Dependency injection is the part of Nest that feels like magic until you know what it is doing,
+and then feels like bookkeeping. It is bookkeeping. Nest keeps a registry of things it knows how to
+build, reads each class's constructor to find out what it needs, and builds them in order.</p>
+
+<h2>A provider is anything Nest can construct</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class QuotesService {
+  constructor(
+    @InjectDataSource() private readonly dataSource: DataSource,
+    private readonly projectsService: ProjectsService,
+  ) {}
+  // ...
+}</code></pre>
+
+<p><code>@Injectable()</code> marks the class as something the container manages.
+<code>QuotesService</code> declares that it needs a <code>DataSource</code> and a
+<code>ProjectsService</code>, and never says where either comes from.</p>
+
+<p>That indirection is the entire benefit, and it is worth being concrete about why. The class can
+be constructed with a fake <code>DataSource</code> in a test without changing a line of it. Both
+dependencies are singletons shared with the rest of the application, so there is one connection
+pool rather than one per consumer. And the constructor is an honest, complete list of what this
+class needs — which is a form of documentation that cannot go stale, because it stops compiling
+when it is wrong.</p>
+
+<h2>How Nest knows what to inject</h2>
+
+<p>TypeScript types are erased at compile time, so by the time this code runs there is nothing left
+to say that <code>projectsService</code> is a <code>ProjectsService</code>. Injection works because
+of one <code>tsconfig</code> flag:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "compilerOptions": {
+    "emitDecoratorMetadata": true
+  }
+}</code></pre>
+
+<p>With it on, the compiler emits an extra piece of metadata beside every decorated class, listing
+its constructor parameter types as real runtime values. Nest reads that list and looks each entry
+up in the module's registry.</p>
+
+<p>Two consequences follow. First, the class itself is the lookup key — the <em>token</em> — which
+is why you can write <code>private readonly projectsService: ProjectsService</code> and nothing
+else. Second, this only works for types that survive to runtime. An interface does not:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// The wrong way. `Notifier` is an interface, so nothing is emitted and there is no
+// token to look up. Nest reports it as an unresolvable dependency at index 0.
+constructor(private readonly notifier: Notifier) {}</code></pre>
+
+<p>Injecting an abstraction means using a token that exists at runtime, which is what the
+<code>@Inject</code> forms below are for.</p>
+
+<h2>Registration, and the error when you forget</h2>
+
+<p>Declaring <code>@Injectable()</code> is half of it. The class also has to appear in a module:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [TypeOrmModule.forFeature([Quote, ContractorProfile]), ProjectsModule],
+  controllers: [QuotesController],
+  providers: [QuotesService],
+})
+export class QuotesModule {}</code></pre>
+
+<p>Miss it and the application will not start:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Nest can't resolve dependencies of the QuotesController (?).
+Please make sure that the argument QuotesService at index [0] is
+available in the QuotesModule context.</code></pre>
+
+<p>This failing at startup rather than on the first request is a deliberate and useful property. The
+whole graph is built when the application boots, so a wiring mistake cannot hide behind a rarely
+used endpoint — it stops the deploy instead.</p>
+
+<h2>Providers that are not classes</h2>
+
+<p>The shorthand <code>providers: [QuotesService]</code> expands to a longer form, and seeing it
+written out makes the other kinds obvious:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// These two registrations are identical.
+providers: [QuotesService]
+providers: [{ provide: QuotesService, useClass: QuotesService }]</code></pre>
+
+<p><code>provide</code> is the token to look up; the rest is how to build it. Separating them gives
+you three more shapes.</p>
+
+<p><strong><code>useClass</code></strong> — supply a different implementation for a token. The same
+mechanism that lets a test swap in a stub.</p>
+
+<p><strong><code>useValue</code></strong> — an object you already have. Used constantly in tests,
+where the whole point is to hand a service a collaborator that does nothing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">{ provide: JwtService, useValue: { signAsync: async () =&gt; 'signed.jwt.token' } }</code></pre>
+
+<p><strong><code>useFactory</code></strong> — build it, possibly asynchronously, possibly using
+other providers. This is the important one.</p>
+
+<h2>Async factories</h2>
+
+<p>Some modules cannot be configured with a literal because the values they need come from
+somewhere that is itself injected. The JWT module is the canonical case: its secret lives in
+configuration, and configuration is a provider.</p>
+
+<pre class="language-typescript"><code class="language-typescript">JwtModule.registerAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService&lt;AppConfig&gt;) =&gt; {
+    const jwt = config.getOrThrow&lt;AppConfig['jwt']&gt;('jwt')
+    return {
+      secret: jwt.secret,
+      signOptions: {
+        algorithm: 'HS256',
+        expiresIn: jwt.expiresIn as `${number}${'s' | 'm' | 'h' | 'd'}`,
+      },
+      verifyOptions: { algorithms: ['HS256'] },
+    }
+  },
+}),</code></pre>
+
+<p><code>inject</code> lists the tokens to resolve; they arrive as the factory's arguments in the
+same order. Nest resolves them first, then calls the factory, then registers the result.</p>
+
+<p>The synchronous <code>register()</code> would have to read <code>process.env</code> directly
+here, which would put a second, untyped copy of the configuration next to the parsed one — and
+those two eventually disagree. The suffix is <code>Async</code> by convention across the ecosystem:
+<code>forRootAsync</code> for the root-level version, <code>registerAsync</code> for the
+per-module one.</p>
+
+<h2>Named tokens</h2>
+
+<p>When the thing being injected is not a class, the token is a string or a symbol:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// Providing a value under a name.
+{ provide: 'UPLOAD_LIMITS', useValue: { maxBytes: 5 * 1024 * 1024 } }
+
+// Asking for it.
+constructor(@Inject('UPLOAD_LIMITS') private readonly limits: UploadLimits) {}</code></pre>
+
+<p><code>@Inject</code> is required here because there is no class for the metadata to record.
+Prefer an exported constant over a bare string — a typo in one of two string literals is a runtime
+failure, while a typo in an imported identifier is a compile error.</p>
+
+<p>This is also what the library helpers are doing underneath.
+<code>@InjectDataSource()</code> and <code>@InjectRepository(User)</code> are
+<code>@Inject</code> with a token the library computed. That detail matters the moment you write a
+test:</p>
+
+<pre class="language-typescript"><code class="language-typescript">{
+  provide: getDataSourceToken(),
+  useValue: {
+    getRepository: () =&gt; ({ findOne: async () =&gt; storedUser }),
+  },
+},</code></pre>
+
+<p>Overriding the <code>DataSource</code> class instead would compile, run, and leave the service
+holding the real connection — the mock would simply never be looked up.
+<a href="/nestjs/nestjs-testing">Lesson 19</a> returns to this.</p>
+
+<h2>Swapping an implementation</h2>
+
+<p>The reason tokens and construction are separate is that it lets one be changed without the
+other. Nothing that injects a service can tell what it actually got:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// Production
+{ provide: PaymentGateway, useClass: StripeGateway }
+
+// A staging build with no real card processing
+{ provide: PaymentGateway, useClass: FakeGateway }</code></pre>
+
+<p>Every consumer still declares <code>private readonly payments: PaymentGateway</code> and is
+untouched by the change. This is what people mean when they call DI "inversion of control" — the
+decision about which implementation to use moves out of the class that uses it and into the module
+that assembles the application.</p>
+
+<p>It is worth being honest that this pays off less often than tutorials imply. Most services have
+exactly one implementation and always will. The version of it that earns its keep every day is the
+narrower one: a test replacing a collaborator, which is the same mechanism used for five minutes
+rather than forever.</p>
+
+<h2>Injection scopes</h2>
+
+<p>Every provider is a singleton by default: constructed once, shared by every request. That is the
+right default and it is why Nest's per-request overhead is small — the graph is built at startup
+and never rebuilt.</p>
+
+<p>Two other scopes exist:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable({ scope: Scope.REQUEST })
+export class RequestScopedThing {}</code></pre>
+
+<p><code>Scope.REQUEST</code> constructs a new instance per request, which lets it inject the
+request itself. <code>Scope.TRANSIENT</code> gives every consumer its own copy.</p>
+
+<p>Both are worth avoiding unless you have a specific reason. Request scope is contagious: anything
+that injects a request-scoped provider becomes request-scoped too, and the effect propagates up the
+graph until you are rebuilding a large part of the application on every request. This codebase uses
+default scope everywhere, and the per-request state that would otherwise justify request scope —
+who is signed in — is attached to the request by a guard and read by a parameter decorator instead.
+That is cheaper and easier to follow.</p>
+
+<h2>What this looks like in a service</h2>
+
+<p>Nothing about a service's body announces that it was injected. It just uses what it was
+given:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class ProjectsService {
+  constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
+
+  async create(user: AuthenticatedUser, dto: CreateProjectDto) {
+    if (dto.budgetMax &lt; dto.budgetMin) {
+      throw new BadRequestException('The top of the budget cannot be below the bottom of it.')
+    }
+
+    const category = await this.dataSource
+      .getRepository(ServiceCategory)
+      .findOne({ where: { publicId: dto.categoryId } })
+    if (!category) throw new BadRequestException('Pick a service category.')
+    // ...
+  }
+}</code></pre>
+
+<p>There is no HTTP in it, no <code>req</code>, no response. It throws exceptions with meaningful
+names and lets something further out decide what status code those become. That is what makes it
+callable from a controller, from another service, from a CLI script or from a test — which is the
+practical payoff of the whole arrangement.</p>
+
+<h2>Circularity and lifecycle</h2>
+
+<p>Two providers that inject each other cannot be built, because neither can be first. Nest detects
+it and reports the cycle by name at startup. There is a <code>forwardRef(() =&gt; Other)</code>
+escape hatch, and it is nearly always worth treating a cycle as a design result rather than a
+problem to suppress: two classes that need each other usually contain a third that belongs on its
+own.</p>
+
+<p>Providers also have lifecycle hooks, which are methods Nest calls if they exist:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class SearchIndex implements OnModuleInit, OnApplicationShutdown {
+  async onModuleInit() {
+    // runs once, after this module's providers are constructed
+  }
+
+  async onApplicationShutdown(signal?: string) {
+    // runs on SIGTERM, if shutdown hooks are enabled
+  }
+}</code></pre>
+
+<p>Use <code>onModuleInit</code> for work that has to happen once and cannot go in a constructor —
+anything asynchronous, mainly. Constructors cannot be async, and doing I/O in one means an object
+that exists before it is usable.</p>
+
+<p><code>onApplicationShutdown</code> only fires if you have called
+<code>app.enableShutdownHooks()</code>, which is easy to forget and is the usual reason a cleanup
+handler "does not work". This application does not use either hook: its one connection pool is
+managed by <code>TypeOrmModule</code>, which registers its own.</p>
+
+<p>One practical note on <code>ModuleRef</code>, which you will meet in older codebases:
+<code>moduleRef.get(SomeService)</code> resolves a provider at runtime rather than through a
+constructor. It is occasionally necessary — resolving something whose identity is only known at
+request time — and is mostly a sign that a dependency should have been declared.</p>
+
+<h2>The rules worth remembering</h2>
+
+<p>A class is injectable when it has <code>@Injectable()</code> and appears in a module's
+<code>providers</code>. It is injectable <em>elsewhere</em> only when that module also exports it
+and the other module imports it. The token is normally the class, and when it cannot be — an
+interface, a plain value, a library's connection — you name it explicitly and ask for it with
+<code>@Inject</code>. Everything is a singleton unless you deliberately say otherwise, and you
+usually should not.</p>
+
+<p>Next: <a href="/nestjs/nestjs-dtos-and-validation">DTOs and validation</a> — the classes that
+describe what a request body is allowed to contain, and the one line in
+<code>main.ts</code> without which none of them do anything at all.</p>

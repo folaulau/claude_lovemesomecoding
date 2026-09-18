@@ -44,7 +44,11 @@ sys.path.insert(0, str(HERE))
 import manifest  # noqa: E402
 
 REPO_ROOT = HERE.parent.parent
-APP = REPO_ROOT / manifest.DEMO_APP
+
+# ⚠️ Resolved, not assumed. The contractor app is committed on a branch of the demo repo, so the
+# documented path is an empty directory whenever that repo is on `main`. See manifest.app_root() —
+# it was written after this script cheerfully reported findings about zero files.
+APP = manifest.app_root()
 
 SKIP_DIRS = {"node_modules", "dist", "build", ".git", ".angular", "coverage", ".vite",
              "out-tsc", "__pycache__", ".next", "test-results", "playwright-report",
@@ -281,7 +285,12 @@ def main() -> int:
         raise SystemExit(f"demo app not found: {APP}")
 
     sources = load_sources()
-    print(f"scanned {len(sources)} quotable files under {APP.relative_to(REPO_ROOT)}\n")
+    where = APP.relative_to(REPO_ROOT) if APP.is_relative_to(REPO_ROOT) else APP
+    print(f"scanned {len(sources)} quotable files under {where}\n")
+
+    # An app with no quotable files is not a track with no drift — it is a broken check.
+    if not sources:
+        raise SystemExit(f"no quotable files under {APP} — nothing could be verified")
 
     all_lines: list[str] = []
     for body in sources.values():
@@ -306,12 +315,17 @@ def main() -> int:
         for rel in declared:
             if rel in sources:
                 declared_lines.extend(sources[rel])
-            else:
+            elif Path(rel).suffix in SOURCE_SUFFIXES:
                 # check_content.py fails on this too, from the filesystem side. Kept here so this
                 # script is usable on its own.
                 undeclared.append(
                     f"{entry['slug']}: SNIPPET_SOURCES names {rel!r}, which does not exist "
                     "in the app")
+            # ⚠️ Anything else — `.env.example`, a Dockerfile, a `.yml` — is declared for
+            # check_content.py's benefit and is deliberately NOT loaded here. `load_sources()`
+            # only reads suffixes a code block could plausibly have been lifted from, so reporting
+            # those as "does not exist in the app" was this script complaining that a file it
+            # never intended to read was not read.
 
         post_blocks = post_matched = post_illus = post_anti = 0
 

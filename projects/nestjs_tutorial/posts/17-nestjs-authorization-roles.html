@@ -1,0 +1,254 @@
+<p>Authentication answers who you are. Authorization answers what you may do, and it splits into two
+halves that need different tools.</p>
+
+<p><strong>Role checks</strong> — "only contractors may submit quotes" — depend on the token and the
+route, so they can be declared on the route. <strong>Ownership checks</strong> — "only this
+project's homeowner may cancel it" — depend on a row in the database, so they cannot.</p>
+
+<p>Most tutorials cover the first half. The second is where the bugs are.</p>
+
+<h2>Roles as data</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export const UserRole = {
+  HOMEOWNER: 'homeowner',
+  CONTRACTOR: 'contractor',
+  STAFF: 'staff',
+} as const
+export type UserRole = (typeof UserRole)[keyof typeof UserRole]</code></pre>
+
+<p>A <code>const</code> object with a derived union type, rather than a TypeScript
+<code>enum</code>. The values are plain strings that go straight into a varchar column, the type is
+a union so an invalid role is a compile error, and there is no runtime enum object with a reverse
+mapping to trip over.</p>
+
+<p>The third role is called <code>staff</code> rather than <code>admin</code>, and that is a
+security decision rather than a naming preference. In the GraphQL layer this application uses,
+<code>admin</code> is a built-in superuser role that bypasses every permission rule — so a token
+whose role is the literal string <code>admin</code> would get unrestricted access to every table.
+The general lesson generalises: check whether the systems downstream of you treat any role name as
+special before you use it.</p>
+
+<h2>Declaring and enforcing</h2>
+
+<p>The decorator attaches metadata and nothing else:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const ROLES_KEY = 'contractor:roles'
+
+export const Roles = (...roles: UserRole[]) =&gt; SetMetadata(ROLES_KEY, roles)</code></pre>
+
+<p>The guard reads it back:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const required = this.reflector.getAllAndOverride&lt;UserRole[] | undefined&gt;(ROLES_KEY, [
+  context.getHandler(),
+  context.getClass(),
+])
+
+if (!required || required.length === 0) return true
+
+const request = context.switchToHttp().getRequest&lt;Request &amp; { user?: AuthenticatedUser }&gt;()
+const user = request.user
+
+if (!user || !required.includes(user.role)) {
+  throw new ForbiddenException('Your account cannot do that.')
+}
+return true</code></pre>
+
+<p>And a route declares what it needs:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Post()
+@Roles(UserRole.HOMEOWNER)
+create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateProjectDto) {
+  return this.projectsService.create(user, dto)
+}</code></pre>
+
+<p>Two details decide how the whole scheme behaves.</p>
+
+<p><code>getAllAndOverride</code> checks the handler before the class, so a method-level
+<code>@Roles</code> wins over a class-level one. Plain <code>get</code> would see only one of the
+two, and an override that silently does not override is a bad bug to have in an authorization
+path.</p>
+
+<p>And no decorator means no role requirement. Returning <code>false</code> there would 403 every
+unannotated route — including the one below, which deliberately has none.</p>
+
+<h2>The actor never comes from the body</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const project = repo.create({
+  homeownerId: user.id,
+  categoryId: category.id,
+  title: dto.title.trim(),
+  // ...
+})</code></pre>
+
+<p><code>user.id</code> comes from the verified token. <code>dto</code> never carries a
+<code>homeownerId</code>, and there is no endpoint in this application that accepts one.</p>
+
+<p>A <code>homeownerId</code> field in a request body would let anyone post a project as somebody
+else — and on this application that is enough to then read the quotes it attracts, which are
+commercially sensitive. The global <code>ValidationPipe</code>'s
+<code>forbidNonWhitelisted</code> makes the guarantee structural rather than a convention: a
+request carrying that field is a 400 naming it, not a silently ignored extra.</p>
+
+<h2>Ownership, and 404 rather than 403</h2>
+
+<pre class="language-typescript"><code class="language-typescript">if (!project || project.homeownerId !== user.id) {
+  throw new NotFoundException('That project no longer exists.')
+}</code></pre>
+
+<p>Someone else's project returns 404, not 403. That is deliberate and it is worth internalising: a
+403 <em>confirms the id exists</em>, which on a guessable identifier turns into a slow enumeration
+of every job on the site.</p>
+
+<p>Note the condition covers both cases in one expression. "Does not exist" and "is not yours" reach
+the same throw, so there is no branch where a future edit could make them diverge.</p>
+
+<p>The same idea in a different shape:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const image = await this.dataSource.getRepository(PortfolioImage).findOne({
+  where: { publicId: imagePublicId, contractorId: profile.id },
+})
+if (!image) throw new NotFoundException('That image no longer exists.')</code></pre>
+
+<p>The ownership is <em>in the query</em>. Loading by id and checking afterwards works too — but only
+if you remember to, every time. Scoping the lookup means the check cannot be forgotten, because
+there is no version of this code that finds the row and then decides.</p>
+
+<h2>The endpoint with no decorator</h2>
+
+<p>The route where both roles are legitimate:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Patch(':projectId/status')
+updateStatus(
+  @CurrentUser() user: AuthenticatedUser,
+  @Param('projectId', ParseUUIDPipe) projectId: string,
+  @Body() dto: UpdateProjectStatusDto,
+) {
+  return this.projectsService.updateStatus(user, projectId, dto.status)
+}</code></pre>
+
+<p>A homeowner cancels; the hired contractor starts and completes. Which of them may make a given
+move depends on the project's current status and on whether this contractor is the one who actually
+won the job. A decorator is evaluated at startup and has never seen the row, so it cannot express
+any of that.</p>
+
+<p>The rule lives in the service as a table:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const TRANSITIONS: Array&lt;{
+  from: ProjectStatusType
+  to: ProjectStatusType
+  by: 'homeowner' | 'hired-contractor'
+}&gt; = [
+  { from: ProjectStatus.HIRED, to: ProjectStatus.IN_PROGRESS, by: 'hired-contractor' },
+  { from: ProjectStatus.IN_PROGRESS, to: ProjectStatus.COMPLETED, by: 'hired-contractor' },
+  { from: ProjectStatus.OPEN, to: ProjectStatus.CANCELLED, by: 'homeowner' },
+  { from: ProjectStatus.QUOTED, to: ProjectStatus.CANCELLED, by: 'homeowner' },
+]</code></pre>
+
+<p>An <strong>allowlist</strong>, not a list of forbidden moves. A status added later is closed by
+default and has to be opened deliberately; with a denylist it would be open by accident, and
+nothing would point that out.</p>
+
+<p>Having one table also means the lifecycle is described in exactly one place, which is what makes
+it possible to trust. Three endpoints — <code>/start</code>, <code>/complete</code>,
+<code>/cancel</code> — would read more nicely and would spread the same rules across three
+handlers.</p>
+
+<h2>Defining "the hired contractor"</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const accepted = await manager.findOne(Quote, {
+  where: { projectId: project.id, status: QuoteStatus.ACCEPTED },
+})
+if (!accepted || accepted.contractorId !== user.contractorId) {
+  throw new NotFoundException('That project no longer exists.')
+}</code></pre>
+
+<p>Who is hired is defined by the accepted quote, not by a column on the project. There is no
+<code>hired_contractor_id</code> on purpose — it would be a second copy of a fact the quotes already
+record, and the two would eventually disagree.</p>
+
+<p>That is a data-modelling decision that shows up as an authorization decision, which happens more
+often than it seems. When "who may do this" is derived from data rather than duplicated, there is
+one answer instead of two that can drift.</p>
+
+<h2>Checking the same rule twice</h2>
+
+<p>A rule enforced by one system's read permissions is checked again on the write path:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const worksInTrade = profile.categories.some((category) =&gt; category.id === project.categoryId)
+if (!worksInTrade) {
+  throw new ForbiddenException(
+    `Add ${project.category.name} to your services before quoting on it.`,
+  )
+}</code></pre>
+
+<p>A contractor only <em>sees</em> leads in trades they work in, so in the user interface this
+cannot happen. It is checked anyway, because a permission that hides a row does not stop a request
+that names its id directly.</p>
+
+<p>The general form: <strong>a filtered list is not an access control.</strong> Anything that
+decides what a user can see has to be enforced again wherever they can act, because the second path
+does not go through the first.</p>
+
+<p>This is also the one place a <code>ForbiddenException</code> is right rather than a 404 — the
+project is one the contractor is entitled to know exists, and the message tells them how to fix it.
+The 404-not-403 rule protects resources whose <em>existence</em> is sensitive, not every refusal.</p>
+
+<h2>Deriving what a user may do</h2>
+
+<p>A question that comes up as soon as there is a user interface: the client needs to know whether
+to show a "Cancel" button, and the rules are in the service.</p>
+
+<p>The wrong answers are to reimplement them in the client, where the two copies drift, or to add
+an endpoint that asks "may I?" for each action, which is a round trip per button.</p>
+
+<p>The version that holds up is to return the answer alongside the resource — a project carrying
+the set of transitions this caller may make, computed from the same
+<code>TRANSITIONS</code> table the write path uses. The client renders what it is told, and there is
+still exactly one definition of the rule.</p>
+
+<p>The thing to keep straight is that this is presentation, not enforcement. Whatever the response
+says, the write endpoint checks again — because the response is a hint the client may ignore, and a
+client is not a security boundary.</p>
+
+<h2>Soft deletes and authorization</h2>
+
+<pre class="language-typescript"><code class="language-typescript">if (!user || user.deleted) {
+  await bcrypt.compare(dto.password, DUMMY_HASH)
+  throw invalid
+}</code></pre>
+
+<p>Users here are soft-deleted, because quotes and reviews reference them forever and a hard delete
+would either cascade away a contractor's whole history or fail on a foreign key.</p>
+
+<p>That creates an authorization obligation that is easy to miss: every path that grants access has
+to check the flag. Login does, above. A token issued before the deletion is the harder case — it
+stays valid until it expires, which is the snapshot problem again, and one of the concrete reasons
+short-lived tokens are worth the machinery.</p>
+
+<h2>Testing authorization</h2>
+
+<p>Authorization is the area where a passing test is least likely to mean what you think, because
+both a correct implementation and a broken one produce a rejection.</p>
+
+<p>The habit that helps is testing the <em>positive</em> case alongside every negative one. "Nina
+cannot quote outside her trades" passes just as happily when the guard rejects everybody, so it is
+only meaningful next to "Luis can quote in his".</p>
+
+<p>The second habit is asserting the status code rather than only the failure. A 403 where the design
+says 404 is a real leak, and a test that accepts any 4xx will never notice it.</p>
+
+<h2>Beyond roles</h2>
+
+<p>Roles are coarse. When you find yourself writing <code>@Roles(A, B, C)</code> on most routes, the
+model has outgrown them and permissions are the next step — the same
+<code>SetMetadata</code> plus <code>Reflector</code> mechanism carrying
+<code>@RequirePermissions('project:cancel')</code>, with roles as named bundles of permissions.
+Nest also documents CASL for attribute-based rules where the answer depends on the subject and the
+object together.</p>
+
+<p>What does not change is the split this lesson opened with. Whatever the vocabulary, checks that
+need a row belong in the service, and 404-not-403 stays the rule for anything with a guessable
+id.</p>
+
+<p>Next: <a href="/nestjs/nestjs-file-upload">file upload</a>, where the thing you must not trust is
+the file itself.</p>

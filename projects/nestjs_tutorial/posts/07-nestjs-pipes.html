@@ -1,0 +1,252 @@
+<p>A pipe sits between a request value and your handler's parameter. It gets the value, and it
+returns the value the handler will actually receive — which means it can transform, validate, or
+both.</p>
+
+<pre class="language-typescript"><code class="language-typescript">transform(value: unknown, metadata: ArgumentMetadata): unknown</code></pre>
+
+<p>That is the whole interface. Return something and the handler gets it; throw and the request
+never reaches the handler. Everything else in this lesson follows from those two sentences.</p>
+
+<h2>The built-in pipes</h2>
+
+<p>Nest ships parsing pipes for the common cases — <code>ParseIntPipe</code>,
+<code>ParseBoolPipe</code>, <code>ParseUUIDPipe</code>, <code>ParseArrayPipe</code>,
+<code>ParseEnumPipe</code>, <code>DefaultValuePipe</code> — and you attach one to a single
+parameter as a second argument:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Delete('me/portfolio/:imageId')
+@HttpCode(HttpStatus.NO_CONTENT)
+async removePortfolioImage(
+  @CurrentUser() user: AuthenticatedUser,
+  @Param('imageId', ParseUUIDPipe) imageId: string,
+) {
+  await this.contractorsService.removePortfolioImage(user, imageId)
+}</code></pre>
+
+<p>Two things are happening. The obvious one is a 400 for a malformed id. The one worth
+understanding is what it prevents further down: without the pipe,
+<code>/me/portfolio/banana</code> reaches the database as a perfectly valid string comparison that
+matches nothing — a 404 identical to the one you get for another contractor's image.</p>
+
+<p>That matters because those two 404s mean opposite things. One is "you sent nonsense", the other
+is "this exists and is not yours". Collapsing them makes a real bug much harder to diagnose, and
+the pipe keeps them apart for the cost of one identifier.</p>
+
+<p>Pass the class when the defaults are fine and an instance when they are not —
+<code>new ParseIntPipe({ errorHttpStatusCode: HttpStatus.NOT_ACCEPTABLE })</code>. Nest constructs
+the class form through the DI container, so a pipe with injected dependencies works either way.</p>
+
+<h2>ValidationPipe is a pipe</h2>
+
+<p>The thing doing all the work in
+<a href="/nestjs/nestjs-dtos-and-validation">the previous lesson</a> is not special machinery. It
+is a pipe that happens to be applied globally: it receives the parsed body, builds an instance of
+the DTO class, runs <code>class-validator</code> against it, and either returns the instance or
+throws a <code>BadRequestException</code> carrying the messages.</p>
+
+<p>Knowing that explains a detail people find surprising — the error body's
+<code>message</code> is an <em>array</em>:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "message": [
+    "Enter a valid email address.",
+    "Use a password of at least 8 characters."
+  ],
+  "error": "Bad Request",
+  "statusCode": 400
+}</code></pre>
+
+<p>One request can break several rules, so the pipe collects them all rather than stopping at the
+first. Clients have to handle both shapes, because every other exception in the application
+produces a plain string there.</p>
+
+<h2>Writing your own</h2>
+
+<p>The reason this application has a custom pipe is a real bug, and it is one every DTO in it
+had.</p>
+
+<p><code>RegisterDto</code> says <code>@Length(1, 80) firstName</code>. <code>AuthService</code>
+then stores <code>dto.firstName.trim()</code>. Send three spaces: <code>class-validator</code>
+counts three characters, passes it, and the service writes an empty string.</p>
+
+<p>The validation was real and the trim was real. Between them they let through exactly the value
+both were meant to stop, because they disagreed about what the value <em>was</em>. The same applies
+to <code>@Length(5, 160)</code> on a project title and to every other length rule in the
+codebase.</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class TrimPipe implements PipeTransform {
+  transform(value: unknown, metadata: ArgumentMetadata): unknown {
+    if (metadata.type !== 'body') return value
+    return trim(value, 0)
+  }
+}</code></pre>
+
+<p><code>PipeTransform</code> is the interface; <code>@Injectable()</code> is there so Nest can
+construct it and so it could take dependencies later.</p>
+
+<h2>The metadata argument</h2>
+
+<p>That <code>metadata.type</code> check is the part worth copying. A globally applied pipe is
+handed every parameter of every handler — body, query, param and custom — and
+<code>ArgumentMetadata</code> tells you which:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// metadata.type    'body' | 'query' | 'param' | 'custom'
+// metadata.metatype the declared type, e.g. RegisterDto — how ValidationPipe
+//                   knows which class to validate against
+// metadata.data     the decorator's argument, e.g. 'projectId'</code></pre>
+
+<p>Trimming route params would not be harmless. A route param is part of a URL the client
+constructed, and quietly turning <code>/projects/%20abc/status</code> into
+<code>/projects/abc/status</code> hides a client bug rather than surfacing it as the 400
+<code>ParseUUIDPipe</code> would otherwise give. Restricting to bodies is a decision, not a
+shortcut.</p>
+
+<h2>Validate or transform?</h2>
+
+<p>A pipe returns a value, so the distinction is about what it returns rather than about two
+different mechanisms.</p>
+
+<p>A <strong>transformation</strong> pipe returns something different from what it received.
+<code>ParseIntPipe</code> takes <code>"42"</code> and returns <code>42</code>;
+<code>TrimPipe</code> takes an object and returns a trimmed copy. Its job is to make the value
+correct.</p>
+
+<p>A <strong>validation</strong> pipe returns exactly what it received, or throws. Its job is to
+decide whether the value is acceptable.</p>
+
+<p>Most useful pipes are both, and that is fine — <code>ValidationPipe</code> transforms the body
+into a class instance and validates it. What is worth avoiding is a pipe that transforms in a way
+the caller would not expect. A pipe that silently substitutes a default for an invalid value hides
+a client bug forever; better to throw and let the client find out.</p>
+
+<h2>Order is the entire point</h2>
+
+<pre class="language-typescript"><code class="language-typescript">app.useGlobalPipes(
+  new TrimPipe(),
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: {
+      enableImplicitConversion: false,
+    },
+  }),
+)</code></pre>
+
+<p>Global pipes run left to right, each receiving what the previous one returned. <code>TrimPipe</code>
+hands a trimmed body to <code>ValidationPipe</code>, so <code>@Length(1, 80)</code> now sees the
+empty string it was always meant to reject:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "message": ["firstName must be longer than or equal to 1 characters"],
+  "error": "Bad Request",
+  "statusCode": 400
+}</code></pre>
+
+<p>Reversed, the DTO is validated untrimmed and the pipe trims a value that has already been
+judged — which is the original bug with an extra step. Whenever two pipes both touch a value,
+their order is part of the behaviour.</p>
+
+<h2>Transforming without wrecking things</h2>
+
+<p>The implementation has one detail that is easy to get wrong and hard to notice:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function trim(value: unknown, depth: number): unknown {
+  if (typeof value === 'string') return value.trim()
+  if (depth &gt;= MAX_DEPTH || value === null || typeof value !== 'object') return value
+
+  if (Array.isArray(value)) return value.map((item) =&gt; trim(item, depth + 1))
+
+  const prototype: unknown = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype &amp;&amp; prototype !== null) return value
+
+  const result: Record&lt;string, unknown&gt; = {}
+  for (const [key, item] of Object.entries(value)) {
+    result[key] = trim(item, depth + 1)
+  }
+  return result
+}</code></pre>
+
+<p>The prototype check is the load-bearing line. A <code>Date</code>, a <code>Buffer</code> and a
+class instance are all <code>typeof 'object'</code>, and rebuilding one of them field by field
+turns a Date into a plain object and a Buffer into
+<code>{ 0: 12, 1: 80, ... }</code> — quietly, and only for requests that happen to carry one. An
+earlier draft did exactly that. The depth cap is the other half: a pipe runs on attacker-supplied
+input, so unbounded recursion over a hostile body is a denial of service.</p>
+
+<p>Both are cheap to test, because a pipe is a class with one method and no dependencies:</p>
+
+<pre class="language-typescript"><code class="language-typescript">it('turns a whitespace-only field into the empty string, so @Length can reject it', () =&gt; {
+  expect(pipe.transform({ firstName: '   ' }, body)).toEqual({ firstName: '' })
+})</code></pre>
+
+<h2>Where pipes sit in the request</h2>
+
+<p>Pipes run late: after middleware, after guards, after an interceptor's inbound half, and
+immediately before the handler. That position has two practical consequences worth knowing before
+you debug anything.</p>
+
+<p>First, <strong>a guard never sees validated input.</strong> By the time
+<code>ValidationPipe</code> runs, <code>JwtAuthGuard</code> has already decided the request may
+proceed. A guard that wants to inspect the body gets the raw parsed object, unvalidated and
+untransformed — which is one good reason for guards to base their decisions on the token rather
+than on the payload.</p>
+
+<p>Second, <strong>an interceptor sees the pipe's failure.</strong> A validation error is thrown
+inside the handler's execution path, so an interceptor wrapping it observes the error like any
+other. That is why this application's logging interceptor produces a line for a 400 that never
+reached a controller method:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">WARN [HTTP] POST /api/v1/auth/register 400 2ms AuthController.register req=ba10c2bc user=anon</code></pre>
+
+<p>The handler named there never ran. The interceptor knows which handler <em>would</em> have run,
+because Nest resolved the route before any of this started.
+<a href="/nestjs/nestjs-request-lifecycle">Lesson 13</a> puts the whole order together.</p>
+
+<h2>The four places a pipe can go</h2>
+
+<p>Narrowest to widest: on one parameter, which is where the parsing pipes belong; on a method with
+<code>@UsePipes()</code>; on a controller class, applying to all its routes; or globally.</p>
+
+<p>Global has two forms and the difference matters. <code>app.useGlobalPipes()</code> in
+<code>main.ts</code> constructs the pipe outside the DI container, so it cannot inject anything —
+and, less obviously, a test that builds the application from <code>AppModule</code> does not get
+it. That is why this project's end-to-end suite repeats the pipe configuration by hand, with a
+comment saying so: without it, every DTO decorator is inert and every validation assertion in the
+suite passes vacuously.</p>
+
+<p>The alternative is registering it as a provider under the <code>APP_PIPE</code> token, which
+puts it in the container and makes it part of the module — so tests importing that module pick it
+up. This application binds its exception filter and interceptor that way and its pipes the other,
+which is a real inconsistency with a real reason:
+<code>useGlobalPipes</code> guarantees the left-to-right ordering that <code>TrimPipe</code>
+depends on, and the relative order of <code>APP_PIPE</code> providers is not something to rely
+on.</p>
+
+<p>One more built-in worth remembering: <code>DefaultValuePipe</code>, which supplies a value when
+a parameter is absent. It is most useful in front of a parsing pipe, as
+<code>@Query('page', new DefaultValuePipe(1), ParseIntPipe)</code> — the default applies first, so
+the parser never sees <code>undefined</code>. That ordering is the same left-to-right rule as
+everywhere else.</p>
+
+<h2>When not to write one</h2>
+
+<p>The temptation with a custom pipe is to put business logic in it, because it runs before the
+handler and has access to the value. Two rules keep that in check.</p>
+
+<p><strong>A pipe should not need the database.</strong> "Is this a UUID" is a pipe. "Does this
+project exist" is not — it is a query, it belongs in the service that is about to run one anyway,
+and doing it in a pipe means two round trips for one fact.</p>
+
+<p><strong>A pipe should not need to know who is asking.</strong> A pipe sees a value and its
+metadata, not the caller. A rule like "a contractor may only quote in their own trades" involves
+both the request and the actor, which makes it authorization — and that is either a
+<a href="/nestjs/nestjs-guards">guard</a> or, when it depends on stored data, a service check.</p>
+
+<p>Applied consistently, those two leave pipes doing what they are good at: making sure the value
+handed to your handler is the shape and type it claims to be, so nothing further in has to
+re-check it.</p>
+
+<p>Next: <a href="/nestjs/nestjs-guards">guards</a> — the stage that runs before pipes and answers
+a different question entirely.</p>

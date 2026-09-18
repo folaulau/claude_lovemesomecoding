@@ -1,0 +1,272 @@
+<p>The previous seven lessons each covered one stage of the Nest pipeline. This one puts them in
+order, because the order is where most of the genuinely confusing bugs in a Nest application come
+from — and because knowing it turns "which of these should I use?" into a question with an
+answer.</p>
+
+<h2>The order</h2>
+
+<p>A request arrives and passes through, outermost first:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">  middleware
+    guards
+      interceptors  (the code before next.handle())
+        pipes
+          THE HANDLER
+        interceptors  (the code after, inside tap/map)
+  exception filters  (if anything above threw)
+  response</code></pre>
+
+<p>Two things about that shape are worth fixing in your head. Interceptors appear twice, because
+they wrap the handler — that is the definition of an interceptor. And filters sit outside
+everything, because their job is to catch what any other stage threw.</p>
+
+<h2>Following one real request</h2>
+
+<p>Take <code>PATCH /api/v1/projects/&lt;uuid&gt;/status</code> with a valid token and a body of
+<code>{"status":"in_progress"}</code>.</p>
+
+<p><strong>1. Middleware.</strong> <code>RequestIdMiddleware</code> assigns an id, puts it on the
+request and on the response header, and calls <code>next()</code>. It has no idea which route this
+is; it has not been told.</p>
+
+<p><strong>2. Guards.</strong> <code>JwtAuthGuard</code> verifies the bearer token and attaches
+the caller to the request. <code>RolesGuard</code> then reads the route's
+<code>@Roles</code> metadata with <code>Reflector</code> — this route has none, so it returns
+<code>true</code>. Guards run in the order listed in <code>@UseGuards</code>.</p>
+
+<p><strong>3. Interceptors, inbound half.</strong> <code>LoggingInterceptor</code> records a start
+time and works out the handler name from the <code>ExecutionContext</code>, then calls
+<code>next.handle()</code>.</p>
+
+<p><strong>4. Pipes.</strong> <code>TrimPipe</code> trims the body's strings.
+<code>ValidationPipe</code> builds an <code>UpdateProjectStatusDto</code> and checks
+<code>@IsIn(PROJECT_STATUSES)</code>. Separately, <code>ParseUUIDPipe</code> validates the
+<code>projectId</code> parameter.</p>
+
+<p><strong>5. The handler.</strong> It calls the service, which loads the project with a row lock,
+checks the transition table, and updates.</p>
+
+<p><strong>6. Interceptors, outbound half.</strong> The <code>tap</code> fires, reads
+<code>response.statusCode</code>, and writes one line.</p>
+
+<p><strong>7. The response.</strong> Nest serialises the returned object to JSON.</p>
+
+<p>Had anything thrown, <code>AllExceptionsFilter</code> would have caught it and produced the body
+instead.</p>
+
+<h2>Six consequences of that order</h2>
+
+<p>Everything below follows mechanically, and each one is a bug somebody has spent an afternoon
+on.</p>
+
+<h3>A guard never sees validated input</h3>
+
+<p>Pipes run <em>after</em> guards. By the time <code>ValidationPipe</code> builds your DTO, the
+guards have already decided the request may proceed — so a guard inspecting
+<code>request.body</code> gets the raw parsed object, untransformed and unchecked.</p>
+
+<p>Which is a good argument for guards deciding on the token and the route rather than the payload.
+A guard that reads the body is trusting something nothing has validated yet.</p>
+
+<h3>A guard rejection is invisible to interceptors</h3>
+
+<p>Guards run outside interceptors, so a 401 from <code>JwtAuthGuard</code> never reaches
+one. The logging interceptor writes nothing for it.</p>
+
+<p>That is why the request id is assigned in middleware — one layer further out — and why the
+filter does its own logging for failures. Three stages, each covering what the others structurally
+cannot see:</p>
+
+<pre class="language-bash"><code class="language-bash">$ curl -i http://localhost:3001/api/v1/auth/me
+HTTP/1.1 401 Unauthorized
+x-request-id: 63bed0e4-989f-4a5a-89a6-316c52ef6733</code></pre>
+
+<h3>An interceptor DOES see a pipe's rejection</h3>
+
+<p>The mirror image, and it surprises people. Pipes run <em>inside</em> interceptors, so a
+validation failure is thrown within the interceptor's stream and its <code>tap({ error })</code>
+observes it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">WARN [HTTP] POST /api/v1/auth/register 400 2ms AuthController.register req=ba10c2bc user=anon</code></pre>
+
+<p><code>AuthController.register</code> never ran. The interceptor knows its name because Nest
+resolved the route before any of this began — routing happens first, and every stage after it knows
+where the request was going.</p>
+
+<h3>response.statusCode is wrong on the error path</h3>
+
+<p>When an interceptor's <code>error</code> callback fires, the filter has not run yet, so nothing
+has set the status. It is still 200:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function statusOf(error: unknown): number {
+  const status = (error as { getStatus?: () =&gt; number })?.getStatus
+  return typeof status === 'function' ? status.call(error) : 500
+}</code></pre>
+
+<p>The status has to come off the exception itself. Reading it from the response gives you 200 for
+every failure, and the resulting log is quietly useless.</p>
+
+<h3>@Res() takes you out of the pipeline</h3>
+
+<p>Injecting the raw response and writing to it yourself means Nest is no longer handling the
+response — so interceptors expecting a return value see nothing, and an exception filter may find
+the response already sent. Use <code>@Res({ passthrough: true })</code> when you only need to set a
+header or a cookie and want to keep returning a value normally.</p>
+
+<h3>Middleware runs even where there is no route</h3>
+
+<p><code>forRoutes('*')</code> covers paths no controller claims, including the static file handler.
+That is usually what you want for a request id — a 404 is a request too — and it is worth knowing
+before you put anything expensive there.</p>
+
+<h2>Where each stage is bound</h2>
+
+<p>The four stages have four registration stories, and the differences are not arbitrary.</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestIdMiddleware).forRoutes('*')
+  }
+}</code></pre>
+
+<p>Middleware is the odd one out: there is no <code>APP_MIDDLEWARE</code> token, because middleware
+is handed to the underlying Express application at startup against routes rather than resolved per
+request.</p>
+
+<pre class="language-typescript"><code class="language-typescript">providers: [
+  { provide: APP_FILTER, useClass: AllExceptionsFilter },
+  { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+],</code></pre>
+
+<p>The filter and the interceptor are providers, which gets them two things: they can inject, and
+a test that imports <code>AppModule</code> gets them automatically.</p>
+
+<pre class="language-typescript"><code class="language-typescript">app.useGlobalPipes(
+  new TrimPipe(),
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: {
+      enableImplicitConversion: false,
+    },
+  }),
+)</code></pre>
+
+<p>The pipes are bound on the app instance instead, and that inconsistency is deliberate:
+<code>useGlobalPipes</code> guarantees left-to-right ordering, and <code>TrimPipe</code> must run
+before <code>ValidationPipe</code> or it is trimming a value that has already been judged.</p>
+
+<p>It has a real cost, and the end-to-end suite pays it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">app.useGlobalPipes(
+  new TrimPipe(),
+  new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+)</code></pre>
+
+<p>The same configuration, repeated by hand in the test bootstrap. Without it every DTO decorator
+is inert and every validation assertion in the suite passes vacuously — a test suite that proves
+nothing while looking thorough. The filter and interceptor need no such repetition, because they
+came along with the module.</p>
+
+<h2>Ordering within a stage</h2>
+
+<p>Once you have several of something, the rules are:</p>
+
+<p><strong>Guards</strong> run in the order listed in <code>@UseGuards(A, B)</code>. Global guards
+run before controller-level ones, which run before method-level ones.</p>
+
+<p><strong>Interceptors</strong> nest: the first listed is outermost, so its inbound code runs first
+and its outbound code runs last.</p>
+
+<p><strong>Pipes</strong> run left to right, each receiving what the previous returned.</p>
+
+<p><strong>Filters</strong> are matched most-specific-first, so <code>@Catch(QueryFailedError)</code>
+wins over a bare <code>@Catch()</code>.</p>
+
+<h2>What happens before any of it</h2>
+
+<p>Everything above starts once Nest has decided which handler a request is for. Before that:
+Express's own middleware — the body parsers, the CORS handler,
+anything registered with <code>app.use</code> — then routing.</p>
+
+<p>Two consequences. A CORS preflight <code>OPTIONS</code> request is answered before your
+middleware sees it, so it never appears in a request log. And a request matching no route is
+handled by Nest's 404 path, so guards and interceptors never run for it — though middleware applied
+with <code>forRoutes('*')</code> does.</p>
+
+<p>Routing happening first is also why an interceptor can name the handler for a request that
+failed validation. The route was resolved long before the pipe rejected the body.</p>
+
+<h2>Where a service call fits</h2>
+
+<p>Everything in the diagram is the framework's. Your service call happens inside step 5, and the
+distinction is worth keeping sharp: the pipeline decides whether a request is well-formed and
+permitted, and the service decides whether it makes sense.</p>
+
+<p>That is why the checks in <code>ProjectsService.updateStatus</code> — is this project real, is
+this caller the hired contractor, is this transition legal — are not in a guard even though they
+are plainly authorization. They need a row. And it is why the transaction wrapping them is in the
+service too: the pipeline has no concept of one, and an exception thrown inside a transaction rolls
+it back, which an exception thrown in a guard could not.</p>
+
+<h2>Shutdown</h2>
+
+<p>The mirror image of startup, and easy to forget. <code>app.enableShutdownHooks()</code> makes
+Nest call <code>onModuleDestroy</code> and <code>onApplicationShutdown</code> on
+<code>SIGTERM</code>, so connection pools close and in-flight work can finish.</p>
+
+<p>Without it a container receiving <code>SIGTERM</code> dies immediately, and requests in flight
+are simply dropped. This application does not enable them because
+<code>TypeOrmModule</code> registers its own; if you hold anything that needs closing yourself,
+that call is what makes a deploy not drop requests.</p>
+
+<h2>Debugging with the order in mind</h2>
+
+<p>Knowing the sequence turns most pipeline bugs into a couple of questions.</p>
+
+<p><strong>My decorator has no effect.</strong> Something has to read the metadata. A
+<code>@Roles</code> with no <code>RolesGuard</code> in <code>@UseGuards</code> is inert, and so is
+any library decorator whose guard or interceptor was never registered.</p>
+
+<p><strong>My global does not apply in tests.</strong> It was bound on the app instance rather than
+with an <code>APP_*</code> token, so importing the module does not bring it.</p>
+
+<p><strong>Everything returns 403.</strong> Guard order. <code>RolesGuard</code> is running before
+the guard that attaches the user.</p>
+
+<p><strong>My validation is not running.</strong> No global <code>ValidationPipe</code> — or there is
+one, and the DTO parameter has no type annotation for it to work from.</p>
+
+<h2>Reading the order off a running application</h2>
+
+<p>You do not have to take any of this on trust. Add a <code>console.log</code> to one of each
+stage, call a route, and the sequence prints itself — which is worth doing once, because a rule you
+have watched happen is easier to recall than one you read.</p>
+
+<p>The startup log already tells you part of it. <code>InstanceLoader</code> lines are the module
+graph being built, in dependency order, and <code>RouterExplorer</code> lines are the routing table
+being assembled. Both finish before the first request arrives, which is the concrete meaning of
+"resolution happens once".</p>
+
+<h2>Choosing a stage</h2>
+
+<p>The whole lesson compresses into four questions.</p>
+
+<p><strong>Does it need to run even when a guard rejects the request?</strong> Middleware. That is
+the only thing outside the guards.</p>
+
+<p><strong>Is the answer yes or no?</strong> A guard. Authentication, roles, feature flags,
+anything whose entire output is "may this proceed".</p>
+
+<p><strong>Does it need the outcome — the status, the duration, the returned value?</strong> An
+interceptor. It is the only stage on both sides.</p>
+
+<p><strong>Does it transform or check one parameter?</strong> A pipe.</p>
+
+<p>And if the job needs the database or needs to know who is asking in a way that depends on stored
+data, it is none of them — it belongs in a service, where it can load the row and be tested without
+an HTTP request.</p>
+
+<p>That covers the pipeline. The rest of this track is what a real application does with it:
+<a href="/nestjs/nestjs-configuration">configuration</a> first.</p>

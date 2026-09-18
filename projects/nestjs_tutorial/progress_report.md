@@ -1,6 +1,6 @@
 # NestJS tutorial track — progress report
 
-**Status:** IN PROGRESS — app extended and verified; writing the track
+**Status:** PUBLISHED — live on prod, 2026-09-05
 **Started:** 2026-09-05
 **Where it lands:** https://lovemesomecoding.com/nestjs
 
@@ -203,11 +203,13 @@ much though — a block whose opening lines are in the app but whose body is not
 ## Open items
 
 - [x] Add the five missing primitives to the contractor backend — done, all gates green
-- [ ] Write `manifest.py`, `check_content.py`, `check_snippets.py`
-- [ ] Write the 20 post bodies
-- [ ] Add `nestjs` to the `JavaScript` group in `lovemesomecoding_frontend/src/lib/nav.ts`
-- [ ] Seed `local`, QA on `:3000`
-- [ ] Seed `prod`, deploy, verify on the live site
+- [x] Write `manifest.py`, `check_content.py`, `check_snippets.py`
+- [x] Write the 20 post bodies — every one publishes at **8 min**, both checks clean
+- [x] Add `nestjs` to the `JavaScript` group in `lovemesomecoding_frontend/src/lib/nav.ts`,
+      after `typescript` — Nest is TypeScript applied, so that is the reading order
+- [x] Seed `local` — 814 → 834 posts, category count 20
+- [x] QA on `:3000` — table below
+- [x] Seed `prod`, deploy, verify on the live site — done 2026-09-05
 
 ## Log
 
@@ -221,3 +223,148 @@ length (8–10 min) and the app-extension scope with Folau.
 verified the app still runs (table above). Recorded the new request pipeline in the contractor's
 own `CLAUDE.md`, next to the layer rules, since it is now part of how that app works and not a
 tutorial artefact.
+
+## ⚠️ The demo app lives on a branch
+
+Mid-way through writing this track, on 2026-09-05 at 09:00, `lovemesomecoding_demo_project` was
+committed and switched from `contractor-marketplace` to `main`. Nothing was lost — the commit
+`2139b508` captured all seven files this track added plus the edits to `app.module.ts`,
+`main.ts`, `rules.e2e-spec.ts` and the contractor `CLAUDE.md`. But on `main` the `contractor/`
+directory holds only a committed `dist/` and `node_modules/`, so the app's source vanished from
+its documented path.
+
+**What that broke, and how it presented, is the interesting part.** `check_snippets.py` did not
+say "the app is missing". It reported every post's blocks as *"quoted from an undeclared file"* —
+and had the track been complete it would have failed on a match rate of 0%. A check that reads an
+empty directory and then reports findings about the content is worse than one that stops.
+
+Two fixes came out of it:
+
+- **`manifest.app_root()`** resolves the app rather than assuming it — `$CONTRACTOR_APP`, then the
+  documented path *if it actually contains `contractor-nestjs-backend/src`*, then a git worktree of
+  the `contractor-marketplace` branch. It raises with the fix in the message rather than returning
+  an empty directory.
+- **`check_snippets.py` now exits** if it finds no quotable files at all.
+
+Folau's call, 2026-09-05: use a **git worktree** rather than switching the demo repo's branch, so
+nothing in his working tree moves. The track was written and verified against one at
+`…/scratchpad/contractor-app`.
+
+**That worktree was removed on 2026-09-05, after publishing, at Folau's request.** So the checks do
+not run today — and that is fine, because they stop rather than pretend:
+
+```
+the contractor app is not at …/lovemesomecoding_demo_project/contractor.
+It is committed on the 'contractor-marketplace' branch of …, and that repo is currently on 'main'.
+Either check that branch out, or add a worktree and let this find it:
+    git -C …/lovemesomecoding_demo_project worktree add /tmp/contractor-app contractor-marketplace
+or point $CONTRACTOR_APP at a copy.
+```
+
+To re-run either check, do one of those three. **Merging `contractor-marketplace` into `main` is the
+permanent fix** — the app would then sit at its documented path and `app_root()` would find it with
+no worktree at all.
+
+Also noted and deliberately left alone: on `main` that repo has **26,881 committed files** under
+`contractor/`, all of them `dist/` and `node_modules/`.
+
+## QA on `:3000` (2026-09-05)
+
+Ran the dev server against the seeded `local` tree and checked the things that fail silently.
+
+| Check | Result |
+|---|---|
+| All 20 post URLs | 20/20 return 200 |
+| `/nestjs` archive | 200, 20 post links, h1 "NestJS Tutorials" |
+| Nav | `/nestjs` present, labelled "NestJS", in the JavaScript group |
+| Prism highlighting | 10/10 blocks on `nestjs-guards` carry token markup |
+| Reading time | renders "8 min read" |
+| TOC anchors | 11 `<h2>` anchors on the guards post |
+| **Prev/next pager** | walked lesson 1 → 20; order matches the manifest exactly, lesson 1 has no prev, lesson 20 has no next |
+| **Cross-links** | 20 distinct internal hrefs, every one in this track; 1 outbound link (`/typescript/typescript-get-started`) resolves 200 |
+| Derived indexes | `categories.json` 20 · `by-category/nestjs.json` 20 · `index/posts.json` 20 · `search/index.json` 20 — **all four agree** |
+| Sitemap | 20 `/nestjs/` post URLs plus the archive |
+| Category copy | says "contractor marketplace API", which is what the examples are from |
+
+The pager walk is the one worth keeping: it is the only check that proves the computed dates
+actually produce the intended reading order, and it walks the rendered HTML rather than the
+manifest.
+
+⚠️ The visual check could not be run — the Chrome extension is not connected. Rendering was
+verified through the served HTML instead (Prism token markup, heading anchors, pager markup,
+reading-time text), which covers the failure modes that matter but not layout.
+
+## Two mistakes worth recording
+
+**1. The word floor ignored rounding.** `readingMinutes = round(words / 220)`, so a post starts
+publishing as "8 min read" at 1,650 words, not 1,760. Deriving the floor from
+`TARGET_MINUTES[0] * 220` made it a full half-minute stricter than the requirement — and produced
+fifteen warnings about posts that were already inside the budget Folau asked for. Had those been
+"fixed" by writing more, the extra words would have been pure padding.
+
+`check_content.py` now asserts **`readingMinutes` directly**, which is the actual requirement and
+the number the site publishes; the word bounds are computed from it with the rounding included and
+exist so the failure message can name a word count. Three posts genuinely published as 7 min and
+were extended.
+
+**2. `check_snippets.py` reported drift on an invented example.** Lesson 14 illustrates an async
+`load` entry with a block that opened `ConfigModule.forRoot({ isGlobal: true,` — two lines that
+really are in the app — before diverging into an invented third. The near-miss detector was right
+to flag it: that is exactly the shape of a stale quote. The fix was to stop the illustration
+impersonating a quote rather than to weaken the check.
+
+## Final numbers
+
+| | |
+|---|---|
+| Posts | 20, every one publishing at **8 reading-minutes** |
+| Words | 34,559 counted (prose + code), 85% prose against a 40% floor |
+| Code blocks | 225 — 152 verified line-for-line against the running app, 8 marked as deliberately showing the wrong way, 20 non-source (bash/plaintext), the rest short illustrations |
+| Match rate | **77%**, against a 70% floor for a framework track |
+| Drift | none |
+
+## Log (continued)
+
+**2026-09-05, later still** — Wrote all 20 posts, seeded `local`, and QA'd on `:3000`. Handled the
+demo repo's branch switch with a worktree and made the checkers resolve the app rather than assume
+it. Corrected the reading-time budget after realising the floor ignored rounding. Everything is
+staged; **prod is untouched and awaiting the go-ahead**.
+
+## Published (2026-09-05)
+
+```
+seed.py --env prod --write     895 -> 915 posts, category count 20
+npm run deploy                 915/915 posts served
+                               44/44 category counts agree
+                               1,160 static pages generated, 1,156 html files emitted
+                               2,343 files to s3://lovemesomecoding.com (build ed63902)
+                               cloudfront function republished (104 redirects, 6.8 KB / 10 KB)
+                               invalidation I1NVHABTUE7TB32FZ06K64HGLY complete
+                               edge verified serving build ed63902
+```
+
+Verified against https://lovemesomecoding.com after the invalidation:
+
+| Check | Result |
+|---|---|
+| 20 post URLs | 20/20 return 200 |
+| `/nestjs` | 200, 20 post links, title "NestJS Tutorials" |
+| Nav | `/nestjs` present in the JavaScript dropdown, labelled "NestJS" |
+| Highlighting | 10/10 blocks on the guards post carry Prism tokens |
+| Reading time | "8 min read" |
+| TOC anchors | 11 on the guards post |
+| **Pager on live** | walked lesson 1 → 20, order matches the manifest |
+| Sitemap | 20 `/nestjs/` post URLs plus the archive |
+| Category copy | says "contractor marketplace API" |
+
+⚠️ Python's `urllib` could not verify the certificate from this machine — a local CA-bundle
+problem, not a site one. The live checks above were run through `curl`, which uses the system
+trust store. Worth knowing before anyone concludes the site is broken.
+
+**2026-09-05, published** — Seeded prod (895 → 915) and deployed. `verify-build.mjs` passed all six
+checks including the index cross-check that caught the `/oracle` count bug on a previous track.
+
+**2026-09-05, after publishing** — Removed the `contractor-marketplace` worktree at Folau's request.
+It was clean and its HEAD (`2139b508`) is on the branch, so nothing was lost. Confirmed both check
+scripts now stop with the restore instructions rather than reporting findings about an empty
+directory — which was the whole point of `app_root()`.

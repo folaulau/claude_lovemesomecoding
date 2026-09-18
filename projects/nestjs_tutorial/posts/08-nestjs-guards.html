@@ -1,0 +1,255 @@
+<p>A guard answers one question: may this request proceed? It returns a boolean, or throws. It does
+not transform the request, does not shape the response, and does not decide what happens next
+beyond yes or no.</p>
+
+<p>That narrowness is what makes guards useful. Authentication and authorization are exactly
+yes-or-no questions, and having a stage of the pipeline that can only answer that way keeps them
+from being scattered through handlers.</p>
+
+<h2>CanActivate</h2>
+
+<pre class="language-typescript"><code class="language-typescript">canActivate(context: ExecutionContext): boolean | Promise&lt;boolean&gt; | Observable&lt;boolean&gt;</code></pre>
+
+<p>Return <code>true</code> and the request continues. Return <code>false</code> and Nest throws a
+<code>ForbiddenException</code> for you. Throw yourself and your exception is used instead — which
+is almost always what you want, because you know why you refused and the generic 403 does not.</p>
+
+<p><code>ExecutionContext</code> is the request plus the knowledge of where it is going. It extends
+<code>ArgumentsHost</code> — <code>switchToHttp().getRequest()</code> for the underlying request —
+and adds <code>getHandler()</code> and <code>getClass()</code>, which return the method and the
+controller class about to run. That second half is what makes the metadata pattern in
+<a href="/nestjs/nestjs-custom-decorators">lesson 9</a> possible.</p>
+
+<h2>A real authentication guard</h2>
+
+<p>This is the whole thing — no Passport, no strategy class:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  constructor(private readonly jwtService: JwtService) {}
+
+  async canActivate(context: ExecutionContext): Promise&lt;boolean&gt; {
+    const request = context.switchToHttp().getRequest&lt;Request &amp; { user?: AuthenticatedUser }&gt;()
+    const token = extractBearerToken(request)
+
+    if (!token) {
+      throw new UnauthorizedException('Sign in to do that.')
+    }
+
+    try {
+      const payload = await this.jwtService.verifyAsync&lt;JwtPayload&gt;(token)
+      const claims = payload[HASURA_CLAIMS_NAMESPACE]
+
+      request.user = {
+        id: claims['x-hasura-user-id'],
+        publicId: payload.sub,
+        email: payload.email,
+        role: payload.role,
+        contractorId: claims['x-hasura-contractor-id'],
+      }
+      return true
+    } catch {
+      throw new UnauthorizedException('Your session has expired. Sign in again.')
+    }
+  }
+}</code></pre>
+
+<p>It is a provider like any other, so <code>JwtService</code> arrives through the constructor and
+the secret comes from wherever the module registered it — signer and verifier cannot drift
+apart.</p>
+
+<p>Notice what it does on success: it attaches the caller to the request. A guard is the natural
+place for that, because it is the stage that has just proved who they are, and everything
+downstream can then rely on it.</p>
+
+<h2>verifyAsync, never decode</h2>
+
+<p>The single most consequential line in that guard, and the easiest to get wrong, because both
+methods exist and both return a payload.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// The wrong way. `decode` parses the token WITHOUT checking the signature, so anyone
+// can hand-write {"role":"staff"}, base64 it, and be staff.
+const payload = this.jwtService.decode(token)</code></pre>
+
+<p><code>decode</code> exists for reading a token you have <em>already</em> verified. Used here it
+turns the entire authentication system into a suggestion, and nothing about the code looks wrong —
+the happy path behaves identically, tests pass, and the application is completely open.</p>
+
+<h2>One message for every failure</h2>
+
+<p>The <code>catch</code> block does not distinguish expired from malformed from forged. That is
+deliberate.</p>
+
+<p>Telling a caller which one went wrong hands an attacker a free oracle for probing the token
+format — "malformed" versus "signature invalid" tells them their structure was right and only the
+signing was wrong. It also tells an honest user nothing they can act on beyond "sign in again",
+which is what the message says.</p>
+
+<p>The bearer extraction is similarly small and similarly deliberate:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function extractBearerToken(request: Request): string | null {
+  const header = request.headers.authorization
+  if (!header) return null
+
+  const [scheme, token] = header.split(' ')
+  if (!scheme || !token || scheme.toLowerCase() !== 'bearer') return null
+  return token.trim()
+}</code></pre>
+
+<p>Splitting on whitespace rather than <code>startsWith('Bearer ')</code> is not fussiness: the
+scheme is case-insensitive per RFC 6750, and clients send <code>bearer</code> often enough to
+matter.</p>
+
+<h2>Guard order is load-bearing</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Controller('api/v1/projects')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class ProjectsController {
+  constructor(private readonly projectsService: ProjectsService) {}
+  // ...
+}</code></pre>
+
+<p>Nest runs guards in the order listed. <code>RolesGuard</code> reads the user that
+<code>JwtAuthGuard</code> attached, so reversing them means the second guard runs first, sees no
+user, and rejects every request with a 403.</p>
+
+<p>What makes this worth a warning is the shape of the failure. It is not a crash and not a
+startup error — every endpoint returns a clean, plausible 403, which reads like a permissions
+misconfiguration and sends you looking at roles instead of at the order of two identifiers.</p>
+
+<p>It is worth guarding against in a test, and the guard's own unit test does:</p>
+
+<pre class="language-typescript"><code class="language-typescript">it('rejects when no user is attached, as happens if the guards are ordered wrongly', () =&gt; {
+  const context = contextFor([UserRole.HOMEOWNER], undefined)
+  expect(() =&gt; guard.canActivate(context)).toThrow(ForbiddenException)
+})</code></pre>
+
+<p>The point of that test is not the 403 — it is that a missing user must be a clean 403 rather
+than a <code>TypeError</code> reading <code>.role</code> of undefined, which would be an
+unauthenticated caller crashing the handler.</p>
+
+<h2>Where to attach one</h2>
+
+<p>Four scopes, same as pipes. On a method with <code>@UseGuards()</code>, on a controller class,
+globally with <code>app.useGlobalGuards()</code>, or as a provider under the
+<code>APP_GUARD</code> token.</p>
+
+<p>Class level is the right default for a controller whose routes all need the same protection,
+because stating it once means a route added next month is covered by default. A missing
+authorization check is not a failure anyone notices — the endpoint works perfectly.</p>
+
+<p>Global guards deserve one caution. A global <code>JwtAuthGuard</code> makes the whole
+application authenticated, which sounds appealing until you need the login endpoint to be public
+and have to invent an <code>@Public()</code> decorator plus metadata for the guard to check. That
+is a reasonable design and it is more machinery than it first appears; this application takes the
+other route and puts guards on the controllers that need them.</p>
+
+<h2>What a guard cannot do</h2>
+
+<p>The limit is that a guard runs before pipes and, more importantly, has no natural access to
+your data layer.</p>
+
+<p>It can be given one — it is a provider, so it could inject a repository. Doing so is usually a
+mistake, because a guard that queries has moved a business rule into the pipeline where it is
+harder to test, harder to reuse, and invisible to anything not arriving over HTTP.</p>
+
+<p>This application draws that line explicitly:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Patch(':projectId/status')
+updateStatus(
+  @CurrentUser() user: AuthenticatedUser,
+  @Param('projectId', ParseUUIDPipe) projectId: string,
+  @Body() dto: UpdateProjectStatusDto,
+) {
+  return this.projectsService.updateStatus(user, projectId, dto.status)
+}</code></pre>
+
+<p>No <code>@Roles</code> at all, on the one route where both roles are legitimate. Whether this
+caller may make this move depends on the project's current status and on whether they are the
+contractor who actually won the job — facts that live in the database. So the check is in the
+service, which loads the row anyway:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const accepted = await manager.findOne(Quote, {
+  where: { projectId: project.id, status: QuoteStatus.ACCEPTED },
+})
+if (!accepted || accepted.contractorId !== user.contractorId) {
+  throw new NotFoundException('That project no longer exists.')
+}</code></pre>
+
+<p>The useful test: <strong>can this be decided from the token and the route alone?</strong> If
+yes, it is a guard. If it needs a row, it belongs in the service.</p>
+
+<p>Note the 404 there rather than a 403. A 403 confirms the id exists, which on a guessable
+identifier turns into a slow enumeration of every job on the site — so a resource you do not own
+is indistinguishable from one that is not there.
+<a href="/nestjs/nestjs-authorization-roles">Lesson 17</a> goes further into that.</p>
+
+<h2>Guards are testable in isolation</h2>
+
+<p>Because a guard is a plain class whose only input is an <code>ExecutionContext</code>, it can be
+driven directly — no application, no database, no HTTP:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const moduleRef = await Test.createTestingModule({
+  providers: [RolesGuard, Reflector],
+}).compile()
+
+guard = moduleRef.get(RolesGuard)
+reflector = moduleRef.get(Reflector)</code></pre>
+
+<p>That matters for authorization more than for most code, because end to end a guard's behaviour
+is ambiguous. "Nina gets a 403" is true whether the guard read the metadata correctly, read nothing
+and rejected everyone, or the route has no handler at all. Driven directly, each branch is a
+separate fact.</p>
+
+<p>The branch most worth pinning down is the one that does nothing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">it('allows a route with no @Roles through', () =&gt; {
+  expect(guard.canActivate(contextFor(undefined, homeowner))).toBe(true)
+})</code></pre>
+
+<p>A guard that rejected unannotated routes would 403 every endpoint without a decorator, and the
+symptom — "status transitions are broken" — points nowhere near the cause.
+<a href="/nestjs/nestjs-testing">Lesson 19</a> covers the fake context.</p>
+
+<h2>Async, and what a guard should not do</h2>
+
+<p><code>canActivate</code> may return a promise, and <code>JwtAuthGuard</code> does because
+verification is asynchronous. That makes it tempting to await a query as well — and worth resisting
+for a reason beyond tidiness.</p>
+
+<p>Guards run on every request to the routes they protect. A query in a guard is a query on every
+request, including ones that will immediately run their own, better-scoped version of it. The
+authentication guard here costs nothing: everything it needs is inside the token, so verifying a
+request is a signature check and no I/O at all.</p>
+
+<p>When you genuinely need a database-backed decision on every request — checking a revocation list,
+say — that is a real requirement and worth being deliberate about, including caching it. What it is
+not is the default.</p>
+
+<h2>Returning false versus throwing</h2>
+
+<p>Both stop the request, and they say different things. Returning <code>false</code> produces
+Nest's generic <code>ForbiddenException</code> — a 403 with no explanation, which is right when
+explaining would leak something.</p>
+
+<p>Throwing lets you pick the status and the message, and the choice between them is a design
+decision. <code>JwtAuthGuard</code> throws 401 for a missing token, because 401 means "authenticate
+and try again" while 403 means "authenticated, still not allowed" — a client that retries on 401 and
+gives up on 403 is behaving correctly and needs the distinction.</p>
+
+<p>The one thing to avoid is a message that answers a question the caller should not be able to
+ask. "This project belongs to another homeowner" is helpful and confirms the project exists.</p>
+
+<h2>Passport, and why this project skips it</h2>
+
+<p><code>@nestjs/passport</code> wraps the Passport ecosystem and gives you
+<code>AuthGuard('jwt')</code> plus a strategy class. It is a good choice, especially when you need
+Google or SAML or anything else Passport already has a strategy for.</p>
+
+<p>For plain bearer-token verification it adds a dependency and moves thirty lines of visible code
+into a library. This project keeps them visible, because in a codebase people are reading to learn
+from, a guard you can see is worth more than one you configure.</p>
+
+<p>Next: <a href="/nestjs/nestjs-custom-decorators">custom decorators</a> — how
+<code>@CurrentUser()</code> reads what this guard attached, and how <code>@Roles()</code> tells the
+next guard what to enforce.</p>

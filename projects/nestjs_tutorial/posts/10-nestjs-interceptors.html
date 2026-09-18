@@ -1,0 +1,260 @@
+<p>An interceptor wraps your handler. It runs code before the handler is called and code after it
+returns, and it is the only stage of the Nest pipeline that sees both sides of a request.</p>
+
+<p>That is the whole reason it exists, and it is the answer to "should this be middleware or an
+interceptor?" — if the job needs to know what happened, it is an interceptor.</p>
+
+<h2>NestInterceptor</h2>
+
+<pre class="language-typescript"><code class="language-typescript">intercept(context: ExecutionContext, next: CallHandler): Observable&lt;unknown&gt;</code></pre>
+
+<p><code>context</code> is the same object guards get. <code>next.handle()</code> runs the rest of
+the pipeline — remaining interceptors, the pipes, and the handler — and returns an
+<strong>Observable</strong> of whatever the handler produced.</p>
+
+<p>The Observable is what surprises people. Nest uses RxJS here rather than promises because an
+interceptor genuinely wants a stream: it needs to run code before subscribing, transform values
+passing through, catch errors, and in the case of server-sent events handle more than one value.
+For ordinary use you need three operators and nothing more.</p>
+
+<h2>A logging interceptor</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger('HTTP')
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable&lt;unknown&gt; {
+    if (context.getType() !== 'http') return next.handle()
+
+    const http = context.switchToHttp()
+    const request = http.getRequest&lt;RequestWithId &amp; { user?: AuthenticatedUser }&gt;()
+    const response = http.getResponse&lt;Response&gt;()
+
+    const startedAt = Date.now()
+    const handler = `${context.getClass().name}.${context.getHandler().name}`
+    // ...
+    return next.handle().pipe(
+      tap({
+        next: () =&gt; write(response.statusCode),
+        error: (error: unknown) =&gt; write(statusOf(error), error),
+      }),
+    )
+  }
+}</code></pre>
+
+<p>Everything before <code>return</code> runs on the way in. Everything inside
+<code>tap</code> runs on the way out. Both outcomes are reachable, which is the property no other
+stage has.</p>
+
+<p>It produces one line per request:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">LOG  [HTTP] POST /api/v1/auth/login 200 74ms AuthController.login req=62278f4e user=anon
+WARN [HTTP] POST /api/v1/auth/register 400 2ms AuthController.register req=ba10c2bc user=anon
+LOG  [HTTP] GET /api/v1/auth/me 200 0ms AuthController.me req=eda41572 user=5439eb65</code></pre>
+
+<h2>tap, not map</h2>
+
+<p>The choice of operator is a design decision rather than a detail.</p>
+
+<p><code>tap</code> observes the value and passes it through untouched. <code>map</code> replaces
+it. An interceptor whose job is to write a line to stdout should not be able to change what the
+caller receives, and using <code>tap</code> makes that structural rather than a matter of
+discipline.</p>
+
+<p>Where <code>map</code> genuinely belongs is response shaping:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// Wrapping every successful response in an envelope.
+return next.handle().pipe(map((data) =&gt; ({ data, requestId: requestIdOf(request) })))</code></pre>
+
+<p>That is a legitimate interceptor and a decision worth making deliberately, because it changes
+every endpoint's contract at once. This application does not do it — its responses are the
+resources themselves — but a filter does add fields to <em>error</em> bodies, which is the same
+idea applied where the shape was never part of the resource.</p>
+
+<p>Three other operators cover most of what is left. <code>catchError</code> transforms failures,
+though an <a href="/nestjs/nestjs-exception-filters">exception filter</a> is usually the better
+place. <code>timeout</code> fails a request that takes too long. And
+<code>of(cached)</code> returned <em>instead</em> of calling <code>next.handle()</code> short-circuits
+the handler entirely, which is how a cache interceptor works — the handler simply never runs.</p>
+
+<h2>The status is not on the response yet</h2>
+
+<p>One subtlety worth knowing before it costs you an hour:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function statusOf(error: unknown): number {
+  const status = (error as { getStatus?: () =&gt; number })?.getStatus
+  return typeof status === 'function' ? status.call(error) : 500
+}</code></pre>
+
+<p>On the success path, <code>response.statusCode</code> is correct. On the error path it is still
+200 — the exception filter has not run yet, so nothing has set it. The status has to come off the
+exception itself, which is why the code asks the error for its own status and falls back to 500 for
+anything that is not an <code>HttpException</code>.</p>
+
+<p>Interceptors are <em>inside</em> the filter, and this is the practical consequence.</p>
+
+<h2>Guard the transport</h2>
+
+<pre class="language-typescript"><code class="language-typescript">if (context.getType() !== 'http') return next.handle()</code></pre>
+
+<p>An interceptor bound globally runs for every transport an application has. This one is HTTP-only
+today, and <code>switchToHttp().getRequest()</code> on a future WebSocket or microservice context
+returns something that is not an Express request at all — so the guard is what stops a logging
+interceptor from breaking the day someone adds a gateway.</p>
+
+<p><code>ExecutionContext</code> has <code>switchToRpc()</code> and <code>switchToWs()</code> for
+those cases. Handling all three in one interceptor is possible and usually not worth it; checking
+the type and doing nothing is.</p>
+
+<h2>What an interceptor cannot see</h2>
+
+<p>The important limitation: <strong>interceptors run inside guards.</strong> A request rejected by
+<code>JwtAuthGuard</code> never reaches one, so the interceptor above produces no line at all for a
+401.</p>
+
+<p>That is the right trade for logging outcomes — but it means the requests you most want to
+correlate, the ones that failed, are exactly the ones this cannot see. Which is why the request id
+is assigned by <a href="/nestjs/nestjs-middleware">middleware</a> one layer further out, and why
+the exception filter does its own logging for failures.</p>
+
+<p>Stating the division plainly: middleware runs for everything and knows nothing about the
+outcome. An interceptor knows the outcome and only runs for requests that got past the guards.
+Neither is a substitute for the other.</p>
+
+<h2>Binding one</h2>
+
+<p>Four scopes again — method, controller, <code>app.useGlobalInterceptors()</code>, or a provider
+under the <code>APP_INTERCEPTOR</code> token. The last one is what this application uses:</p>
+
+<pre class="language-typescript"><code class="language-typescript">providers: [
+  { provide: APP_FILTER, useClass: AllExceptionsFilter },
+  { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+],</code></pre>
+
+<p>Two things follow from choosing the token over <code>app.useGlobalInterceptors()</code>, and
+both are worth having.</p>
+
+<p>It becomes an ordinary member of the DI graph, so it can inject <code>ConfigService</code> or
+anything else — something a globally bound instance constructed with <code>new</code> in
+<code>main.ts</code> cannot do.</p>
+
+<p>And a test that builds the application from <code>AppModule</code> picks it up automatically,
+because it is part of the module. Anything registered on the app instance in <code>main.ts</code>
+has to be repeated in every test's bootstrap, and the day somebody forgets, the suite is testing a
+pipeline the production application does not have.</p>
+
+<p>Register the same token more than once and you get more than one interceptor, which is how
+several globals coexist. They run in the order the providers are declared, and outermost-first —
+so an interceptor listed earlier wraps the ones after it.</p>
+
+<h2>The built-in one you already use</h2>
+
+<p>File upload is an interceptor, which is a good reminder that the mechanism is more general than
+"logging and caching":</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Post('me/portfolio')
+@UseInterceptors(
+  FileInterceptor('file', {
+    storage: memoryStorage(),
+    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
+  }),
+)
+addPortfolioImage(
+  @CurrentUser() user: AuthenticatedUser,
+  @UploadedFile() file: Express.Multer.File | undefined,
+  @Body() dto: AddPortfolioImageDto,
+) {
+  return this.contractorsService.addPortfolioImage(user, file, dto.caption)
+}</code></pre>
+
+<p><code>FileInterceptor</code> runs multer on the way in and puts the parsed file on the request,
+where <code>@UploadedFile()</code> — a parameter decorator, as in
+<a href="/nestjs/nestjs-custom-decorators">lesson 9</a> — reads it back. Purely inbound work, and
+an interceptor is simply the stage with the right position and the right access.
+<a href="/nestjs/nestjs-file-upload">Lesson 18</a> covers what those options are protecting
+against.</p>
+
+<p>Nest's <code>ClassSerializerInterceptor</code> is the other one you meet early. It runs
+<code>class-transformer</code> over the returned object so <code>@Exclude()</code> on an entity
+field takes effect — a <code>map</code>-style interceptor, doing exactly what this lesson said such
+an interceptor does.</p>
+
+<h2>Two more things interceptors are good at</h2>
+
+<p><strong>Timeouts.</strong> An operator on the stream, so a slow handler becomes a clean 408
+rather than a request that hangs until the client gives up:</p>
+
+<pre class="language-typescript"><code class="language-typescript">return next.handle().pipe(
+  timeout(5000),
+  catchError((error) =&gt;
+    error instanceof TimeoutError
+      ? throwError(() =&gt; new RequestTimeoutException())
+      : throwError(() =&gt; error),
+  ),
+)</code></pre>
+
+<p>Worth knowing what it does and does not do: the response is abandoned, and the handler keeps
+running. A query that takes thirty seconds still takes thirty seconds and still holds its
+connection. A timeout improves what the client sees; it does not cancel work.</p>
+
+<p><strong>Caching.</strong> The short-circuit mentioned above, written out:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const hit = this.cache.get(key)
+if (hit !== undefined) return of(hit)
+return next.handle().pipe(tap((value) =&gt; this.cache.set(key, value)))</code></pre>
+
+<p>Returning without calling <code>next.handle()</code> means the pipes and the handler never run at
+all. That is genuinely useful and genuinely easy to get wrong — a cache key that omits the caller
+serves one user's data to another, which is why Nest's own <code>CacheInterceptor</code> defaults
+to caching only <code>GET</code> and lets you override the key.</p>
+
+<h2>Errors: interceptor or filter?</h2>
+
+<p>Both can act on a thrown exception, and the division is worth stating.</p>
+
+<p>An interceptor is the right place when the handling is <em>specific to these routes</em> —
+translating one library's error into an HTTP exception for the controller that uses that library,
+or retrying an idempotent upstream call.</p>
+
+<p>An <a href="/nestjs/nestjs-exception-filters">exception filter</a> is the right place for
+anything that should be true of the whole application: the response shape, the status code for a
+database constraint, what gets logged. A filter also catches what guards throw, which an interceptor
+cannot see at all.</p>
+
+<p>The practical consequence of getting this backwards is error handling that applies to most
+endpoints and quietly not to the ones whose author forgot the interceptor.</p>
+
+<h2>One interceptor, many transports</h2>
+
+<p>A last note on why interceptors show up in Nest's WebSocket and microservice documentation as
+well. The <code>ExecutionContext</code> abstraction means the same class can serve all three, which
+is genuinely useful for something like timing.</p>
+
+<p>In practice most interceptors touch transport-specific things — a status code, a header — and
+the honest version is the guard this one uses: check <code>getType()</code>, do the work for the
+transport you understand, and pass everything else straight through.</p>
+
+<h2>Testing one</h2>
+
+<p>An interceptor needs a fake <code>CallHandler</code> as well as a fake context, and both are
+small:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const next = { handle: () =&gt; of({ ok: true }) }
+
+await firstValueFrom(interceptor.intercept(context, next))</code></pre>
+
+<p><code>of(value)</code> stands in for a handler that succeeded;
+<code>throwError(() =&gt; new NotFoundException())</code> stands in for one that threw, which is the
+branch worth covering because it is the one with the status-code subtlety above.</p>
+
+<p>The thing to remember is that an Observable does nothing until it is subscribed. A test that
+calls <code>intercept()</code> and never subscribes will watch every assertion fail, because
+<code>tap</code> never ran — <code>firstValueFrom</code> is what makes it run.</p>
+
+<h2>Choosing the stage</h2>
+
+<p>Ask what the job needs. Needs the outcome? Interceptor. Needs to run even when a guard rejects?
+Middleware. Only ever says yes or no? Guard. Only transforms one parameter? Pipe.</p>
+
+<p>Next: <a href="/nestjs/nestjs-middleware">middleware</a> — the layer outside all of this, and the
+one case where "outside" is exactly what you need.</p>

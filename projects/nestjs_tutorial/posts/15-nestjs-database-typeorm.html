@@ -1,0 +1,275 @@
+<p>TypeORM is the ORM Nest documents first, and <code>@nestjs/typeorm</code> is a thin wrapper that
+makes its connection and repositories injectable. Most of what follows is about the decisions the
+wrapper does not make for you.</p>
+
+<h2>Connecting</h2>
+
+<pre class="language-typescript"><code class="language-typescript">TypeOrmModule.forRoot(buildDataSourceOptions()),</code></pre>
+
+<p>One connection for the application. <code>forRoot</code> in the root module, then
+<code>forFeature</code> in each feature module to register the repositories that module uses:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [TypeOrmModule.forFeature([Project, Quote, ServiceCategory])],
+  controllers: [ProjectsController],
+  providers: [ProjectsService],
+  exports: [ProjectsService],
+})
+export class ProjectsModule {}</code></pre>
+
+<p><code>forFeature</code> does not open a second connection. It makes
+<code>Repository&lt;Project&gt;</code> and the other two injectable inside this module — and the
+list doubles as documentation, telling you which tables a feature touches before you open its
+service.</p>
+
+<h2>Entities</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Entity('users')
+export class User extends BaseEntity {
+  @Index({ unique: true })
+  @Column({ type: 'varchar', length: 255 })
+  email: string
+
+  @Column({ type: 'varchar', length: 72, name: 'password_hash' })
+  passwordHash: string
+
+  @Column({ type: 'varchar', length: 80, name: 'first_name' })
+  firstName: string
+  // ...
+}</code></pre>
+
+<p>Three habits in there are worth adopting wholesale.</p>
+
+<p><strong>Every column has an explicit <code>type</code>.</strong> TypeORM can infer one from the
+TypeScript type, and the inference is a guess — <code>string</code> becomes
+<code>varchar(255)</code> whether you wanted 40 or 5000.</p>
+
+<p><strong>Every multi-word column has an explicit <code>name</code>.</strong> The default is the
+property name verbatim, so <code>publicId</code> becomes a column called
+<code>"publicId"</code> — quoted, case-sensitive, and unpleasant to type in psql. A global
+<code>SnakeNamingStrategy</code> also works and makes the mapping invisible; spelling it out costs
+one option and removes the question.</p>
+
+<p><strong>Shared columns live on a base class.</strong> A plain class with no
+<code>@Entity()</code>, so no table of its own:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export abstract class BaseEntity {
+  @PrimaryGeneratedColumn('increment', { type: 'bigint' })
+  id: string
+
+  @Column({ type: 'uuid', unique: true, name: 'public_id' })
+  @Generated('uuid')
+  publicId: string
+
+  @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
+  createdAt: Date
+
+  @UpdateDateColumn({ type: 'timestamptz', name: 'updated_at' })
+  updatedAt: Date
+}</code></pre>
+
+<p>Defining those once is what stops the sixth entity from quietly getting <code>timestamp</code>
+instead of <code>timestamptz</code>. A bare <code>timestamp</code> stores no zone, so the same
+instant written from a laptop in Austin and a server in UTC comes back as two different times, and
+nothing records which was meant.</p>
+
+<h2>Two ids, and why</h2>
+
+<p><code>id</code> is a <code>bigint</code> for internal foreign keys. <code>publicId</code> is a
+UUID and the only one the API ever serialises.</p>
+
+<p>Exposing the sequential id leaks the row count — a competitor reads how many jobs the site has
+had off a single URL — and makes every record trivially enumerable by counting upward. The UUID
+costs sixteen bytes and closes both.</p>
+
+<p><code>@Generated('uuid')</code> puts the default in Postgres rather than in the application, so a
+row inserted by a seed script, a migration or by hand in psql gets one too.</p>
+
+<h2>The type surprises</h2>
+
+<p>Two of them, and both bite once.</p>
+
+<p><strong><code>bigint</code> comes back as a JavaScript string.</strong> Postgres
+<code>bigint</code> reaches 9.2×10¹⁸ while <code>Number.MAX_SAFE_INTEGER</code> is 9×10¹⁵, so
+returning a number would silently lose precision on large ids. Compare these with
+<code>===</code> on strings and never do arithmetic on them.</p>
+
+<p><strong><code>numeric</code> comes back as a string too</strong>, for the same reason — a
+float cannot represent every decimal exactly, which is why you used <code>numeric</code> for money.
+The fix is a column transformer, so services see numbers and the precision decision stays at the
+boundary.</p>
+
+<p>The same "already the right type" thinking applies to dates:</p>
+
+<pre class="language-typescript"><code class="language-typescript">preferredStartDate: project.preferredStartDate,</code></pre>
+
+<p>No <code>.toISOString()</code> — the column is a <code>date</code> and pg returns those as
+<code>YYYY-MM-DD</code> text. Calling <code>toISOString</code> on it is a TypeError, and wrapping it
+in <code>new Date()</code> first would reintroduce exactly the timezone shift the
+<code>date</code> type exists to avoid.</p>
+
+<h2>Relations, and the ESM cycle</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@OneToOne('ContractorProfile', (profile: ContractorProfile) =&gt; profile.user)
+contractorProfile: ContractorProfile | null
+
+@OneToMany('Project', (project: Project) =&gt; project.homeowner)
+projects: Project[]</code></pre>
+
+<p>The target is a string and a thunk, not a class reference. <code>user.entity.ts</code> and
+<code>contractor-profile.entity.ts</code> import each other, and a direct class reference would be
+evaluated while the other module is still initialising and read as <code>undefined</code>. The
+function defers it until both exist.</p>
+
+<p>The matching <code>import type</code> is the other half — a type-only import is erased at
+compile time, so it cannot create the runtime cycle in the first place.</p>
+
+<h2>Migrations, and the setting that must stay false</h2>
+
+<pre class="language-typescript"><code class="language-typescript">synchronize: false,
+migrationsRun: false,
+logging: ['error', 'warn', 'migration'],</code></pre>
+
+<p><code>synchronize</code> is the most tempting setting in TypeORM: turn it on and the schema
+appears from your entities with no migration to write. It also silently drops columns it believes
+are gone, and it leaves no record of how the schema reached its current state. Migrations
+<em>are</em> that record.</p>
+
+<p><code>migrationsRun: false</code> is the second half. Two application instances booting together
+would both try to migrate, and the loser fails against a half-applied schema. Running migrations is
+a deliberate, single-threaded step:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "scripts": {
+    "migration:run": "npm run build && node ./node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js",
+    "migration:revert": "npm run build && node ./node_modules/typeorm/cli.js migration:revert -d dist/database/data-source.js"
+  }
+}</code></pre>
+
+<p>Two rules go with them. <strong>Never edit an applied migration</strong> — Postgres has already
+run it and the <code>migrations</code> table has recorded it, so an edit only changes what new
+databases get, and the two diverge forever with nothing to detect it. Write another one. And
+<strong>order matters</strong>: TypeORM runs them in the order listed, which is why each class name
+carries a timestamp prefix.</p>
+
+<h2>Repositories and the DataSource</h2>
+
+<p>Two ways to reach the database, and this codebase uses the second:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// One repository per entity, injected.
+constructor(@InjectRepository(Project) private readonly projects: Repository&lt;Project&gt;) {}
+
+// Or the connection, from which any repository is available.
+constructor(@InjectDataSource() private readonly dataSource: DataSource) {}</code></pre>
+
+<p><code>@InjectRepository</code> is tidier when a service touches one or two entities.
+<code>@InjectDataSource</code> wins when a service spans several — <code>ProjectsService</code>
+touches four — and it is the only way to open a transaction.</p>
+
+<h2>Transactions, which is the point</h2>
+
+<p>Accepting a quote must also decline every other pending quote and hire the project. If any part
+fails, none may land: halfway through, the project is <code>hired</code> with two
+<code>pending</code> quotes on it, and a homeowner refreshing at that instant sees two people they
+can both still accept.</p>
+
+<pre class="language-typescript"><code class="language-typescript">await this.dataSource.transaction(async (manager) =&gt; {
+  const project = await manager.findOne(Project, {
+    where: { publicId: projectPublicId },
+    lock: { mode: 'pessimistic_write' },
+  })
+
+  if (!project || project.homeownerId !== user.id) {
+    throw new NotFoundException('That project no longer exists.')
+  }
+  if (!QUOTABLE_STATUSES.includes(project.status)) {
+    throw new ConflictException('You have already hired someone for this project.')
+  }
+  // ...
+  await manager.update(
+    Quote,
+    { projectId: project.id, status: QuoteStatus.PENDING, publicId: Not(winner.publicId) },
+    { status: QuoteStatus.DECLINED },
+  )
+  await manager.update(Quote, { id: winner.id }, { status: QuoteStatus.ACCEPTED })
+  await manager.update(Project, { id: project.id }, { status: ProjectStatus.HIRED })
+})</code></pre>
+
+<p>Two things make this correct rather than merely atomic.</p>
+
+<p><strong>Every operation goes through <code>manager</code>.</strong> The callback's
+<code>EntityManager</code> is bound to the transaction; a stray
+<code>this.dataSource.getRepository(...)</code> inside the callback runs on a different connection,
+outside the transaction, and will not roll back with it. That is the classic way to get a
+transaction that does not do what it says.</p>
+
+<p><strong>The row is locked.</strong> <code>lock: { mode: 'pessimistic_write' }</code> issues
+<code>SELECT … FOR UPDATE</code>. Without it, two accepts arriving together both read a
+<code>quoted</code> project, both pass the status check, and both write — leaving two accepted
+quotes. The lock makes the second transaction wait, then re-read a <code>hired</code> project and
+fail the check properly.</p>
+
+<p>Throwing inside the callback rolls back, which is why the checks are in there rather than
+before.</p>
+
+<h2>Loading relations, and the cost</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const FULL_RELATIONS = {
+  homeowner: true,
+  category: true,
+  review: { homeowner: true },
+  quotes: { contractor: { user: true, categories: true, portfolio: true } },
+} as const</code></pre>
+
+<p>Named once so no route can load half of it. That matters because the serialisers assume what
+they ask for is present — a route that forgets a relation gets a loud <code>undefined</code> in a
+test rather than a quietly incomplete response in production.</p>
+
+<p>It is also where an ORM gets expensive. Relations are not free, and the two failure modes pull in
+opposite directions: loading too little produces N+1 queries as each item fetches its own children;
+loading too much produces one enormous join. TypeORM's <code>relations</code> option uses joins,
+which is right here — one project with its quotes and their contractors — and would be wrong for a
+list of a thousand rows.</p>
+
+<p>When a query gets complicated enough that the options object stops being readable, drop to the
+query builder or to raw SQL. An ORM is a convenience for the common case, not an obligation:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const [category] = await dataSource.query&lt;Array&lt;{ public_id: string }&gt;&gt;(
+  `SELECT public_id FROM service_categories WHERE slug = 'plumbing'`,
+)</code></pre>
+
+<p>Note the type parameter — raw queries return <code>any</code> otherwise, and that
+<code>any</code> spreads. And note the snake_case keys: raw SQL bypasses the entity mapping
+entirely, so you get the column names, not the property names.</p>
+
+<h2>Where transactions belong</h2>
+
+<p>A transaction is a service concern, not a controller one, and it is worth being explicit about
+why: the callback defines the boundary, and a controller has no way to extend one across two service
+calls.</p>
+
+<p>That constrains how services compose. If two services must both write inside one transaction, one
+of them has to accept an <code>EntityManager</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async createWithin(manager: EntityManager, dto: CreateProjectDto) { /* ... */ }</code></pre>
+
+<p>It is not elegant, and the alternatives are worse. Nest's docs describe a request-scoped
+transaction provider using async local storage, which removes the parameter and adds machinery that
+is genuinely hard to reason about. Passing the manager is explicit, and the type makes it obvious
+which methods participate.</p>
+
+<h2>Ordering is not free</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const project = await this.dataSource.getRepository(Project).findOne({
+  where: { publicId },
+  relations: FULL_RELATIONS,
+  order: { quotes: { createdAt: 'ASC' } },
+})</code></pre>
+
+<p>Without that <code>order</code>, the quotes come back in whatever order Postgres felt like —
+which for a small table is usually insertion order, and therefore looks correct in development
+right up until it does not. An <code>ORDER BY</code> is the only thing that makes a list
+ordered.</p>
+
+<p>Next: <a href="/nestjs/nestjs-authentication-jwt">authentication with JWT</a>, which is where the
+<code>users</code> table above starts being useful.</p>

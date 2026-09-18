@@ -1,0 +1,268 @@
+<p>NestJS is not a runtime, a language or a replacement for Node. It is a <em>structure</em> — a set
+of conventions for arranging a server-side TypeScript application, plus a dependency injection
+container that wires the pieces together. Underneath, by default, it is still Express.</p>
+
+<p>That sentence is worth sitting with, because most confusion about Nest comes from expecting it
+to be something else. It does not make your server faster. It does not give you features Express
+lacks. What it gives you is an answer to the question every growing Express codebase eventually
+runs into: <em>where does this code go?</em></p>
+
+<h2>The problem it solves</h2>
+
+<p>Express is deliberately unopinionated. You get routing and middleware, and everything else is
+your decision — folder layout, how a route handler reaches the database, how configuration is
+read, how you test a handler without starting a server. Small projects thrive on that freedom.
+Larger ones discover that six developers make six different decisions, and that the resulting
+codebase has no shape anyone can describe.</p>
+
+<p>Nest takes those decisions off the table. Routes live in controllers. Logic lives in
+providers. Both are grouped into modules. Dependencies arrive through constructors rather than
+being imported directly. None of it is novel — it is the architecture Spring popularised in Java
+and Angular brought to the frontend — and none of it is optional, which is the point.</p>
+
+<p>The payoff is not aesthetic. Because a service is handed to its controller rather than imported
+by it, you can hand it a different one in a test without touching the controller. Because
+validation is declared on a class rather than written at the top of a handler, it happens on every
+route that uses that class rather than on the ones somebody remembered. And because the framework
+owns the request pipeline, cross-cutting concerns — authentication, logging, error shaping — are
+declared once and applied everywhere, instead of being a middleware array that each new route has
+to opt into correctly.</p>
+
+<h2>What it looks like</h2>
+
+<p>Here is a real controller from the application this track is built on:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Controller('api/v1/auth')
+export class AuthController {
+  constructor(private readonly authService: AuthService) {}
+
+  @Post('register')
+  register(@Body() dto: RegisterDto) {
+    return this.authService.register(dto)
+  }
+
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  login(@Body() dto: LoginDto) {
+    return this.authService.login(dto)
+  }
+
+  @Get('me')
+  @UseGuards(JwtAuthGuard)
+  me(@CurrentUser() user: AuthenticatedUser) {
+    return user
+  }
+}</code></pre>
+
+<p>Four things are happening, and they are the four ideas the next few lessons unpack.</p>
+
+<p><strong>Decorators declare intent.</strong> <code>@Controller('api/v1/auth')</code> says these
+routes are prefixed; <code>@Post('register')</code> says this method answers a POST. There is no
+router object and no <code>app.post(...)</code> call. Nest reads these at startup and builds the
+routing table itself.</p>
+
+<p><strong>Parameters are declared, not extracted.</strong> <code>@Body() dto: RegisterDto</code>
+replaces <code>req.body</code>. You never touch the request object, which means the method has no
+opinion about HTTP beyond its decorators — and can be called directly in a test.</p>
+
+<p><strong>Dependencies arrive through the constructor.</strong> <code>AuthController</code> never
+constructs an <code>AuthService</code> and never imports an instance of one. It declares that it
+needs one, and Nest supplies it.</p>
+
+<p><strong>The return value is the response.</strong> No <code>res.json()</code>. Return an object
+and Nest serialises it; return a promise and Nest awaits it. Throw, and an exception filter turns
+it into a status code — which is <a href="/nestjs/nestjs-exception-filters">lesson 12</a>.</p>
+
+<h2>Express is still down there</h2>
+
+<p>Nest is a layer over an HTTP platform, not a replacement for one. By default that platform is
+Express, and you can reach it whenever the abstraction does not cover what you need:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function bootstrap() {
+  const app = await NestFactory.create&lt;NestExpressApplication&gt;(AppModule)
+  const config = app.get(ConfigService&lt;AppConfig&gt;)
+  // ...
+  const port = config.getOrThrow&lt;number&gt;('port')
+  await app.listen(port)
+  // ...
+}</code></pre>
+
+<p>The type parameter on <code>NestFactory.create</code> is the tell. The default
+<code>INestApplication</code> is platform-agnostic; asking for
+<code>NestExpressApplication</code> is what makes Express-specific methods like
+<code>useStaticAssets</code> available. Swap the adapter for Fastify and that line is one of the
+few that has to change — the controllers, services and modules do not, because none of them ever
+touched a request object.</p>
+
+<p>This is also the honest answer to "is Nest slow?" It is Express plus a resolution step that
+happens once at startup, so the per-request overhead is small and mostly comes from features you
+asked for. If Express is fast enough, so is Nest.</p>
+
+<h2>The module is the unit</h2>
+
+<p>Controllers and providers are grouped into modules, and modules compose into one root module:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [loadConfig],
+      envFilePath: ['.env'],
+    }),
+    TypeOrmModule.forRoot(buildDataSourceOptions()),
+    AuthModule,
+    ContractorsModule,
+    ProjectsModule,
+    QuotesModule,
+    ReviewsModule,
+  ],
+  // ...
+})</code></pre>
+
+<p>Five feature modules and two configured library modules. That list is the whole application at
+a glance, and it is the single most useful property of a Nest codebase: you can read the shape of
+an unfamiliar project in about a minute. <a href="/nestjs/nestjs-modules">Lesson 3</a> covers what
+each key in that object means.</p>
+
+<h2>What a request actually goes through</h2>
+
+<p>The other thing Nest gives you is a defined pipeline. A request arriving at
+<code>POST /api/v1/projects</code> passes through, in this order: middleware, then guards, then
+interceptors, then pipes, then your handler — and back out through interceptors, with an exception
+filter catching anything thrown at any point.</p>
+
+<p>Each stage exists for one kind of job, and choosing the wrong one is the most common structural
+mistake in a Nest codebase. Authentication is a guard because a guard's answer is yes or no.
+Validation is a pipe because a pipe transforms a value on its way in. Logging the outcome is an
+interceptor because an interceptor is the only stage that sees both sides. Assigning a request id
+is middleware, because middleware runs before the guards and therefore still runs for the requests
+that get rejected.</p>
+
+<p>Eight lessons in this track are about that pipeline, and
+<a href="/nestjs/nestjs-request-lifecycle">one of them</a> does nothing but put the stages in order
+and work through what follows from it.</p>
+
+<h2>What it costs</h2>
+
+<p>Being honest about this matters more than a feature list.</p>
+
+<p><strong>There is more ceremony.</strong> A single endpoint in Express is four lines. In Nest it
+is a controller, a service, a DTO and a module entry. For an application with three endpoints that
+is a bad trade, and you should use Express.</p>
+
+<p><strong>The magic is real magic until you learn it.</strong> When Nest cannot resolve a
+dependency it says so at startup, in a message that names a token you did not write. Until the
+mental model in <a href="/nestjs/nestjs-providers-and-dependency-injection">lesson 5</a> clicks,
+those errors are opaque.</p>
+
+<p><strong>It leans on decorator metadata.</strong> Injection works because TypeScript emits the
+constructor parameter types into the compiled output, which needs two specific
+<code>tsconfig</code> flags. That is fine, and it is also why some tooling that ignores
+<code>tsconfig</code> breaks in confusing ways. <a href="/nestjs/nestjs-project-setup">Lesson 2</a>
+covers it.</p>
+
+<p><strong>You inherit its opinions about libraries too.</strong> Nest ships wrappers —
+<code>@nestjs/config</code>, <code>@nestjs/typeorm</code>, <code>@nestjs/jwt</code> — and using
+them is much easier than not. They are thin, and you can always drop to the library underneath,
+but the path of least resistance runs through them.</p>
+
+<p>The trade is worth it when there is more than one developer, more than a handful of endpoints,
+or a codebase that has to still make sense in two years. It is not worth it for a webhook receiver.</p>
+
+<h2>The application these examples come from</h2>
+
+<p>Every code sample in this track is lifted from a working contractor marketplace API — homeowners
+post projects, contractors bid on them, one bid is accepted, the job runs to completion and gets
+reviewed. It is a real application with real constraints, not a to-do list.</p>
+
+<p>That matters because the interesting parts of Nest only show up under pressure. A to-do app
+never needs a transaction with a row lock, never has two roles that can see different subsets of
+the same table, and never has to decide whether a foreign resource should answer 403 or 404. This
+one does, and those decisions are where the lessons are.</p>
+
+<p>Seven business rules hold the thing together, and they are worth listing because they are why
+several lessons look the way they do. A contractor may only bid in a trade they actually work in.
+A project stops accepting bids once someone is hired. Accepting one bid must decline every other
+bid in the same breath. Only the hired contractor can mark a job started or finished. Only the
+homeowner can cancel, and only before hiring. A review can only be left on a completed job. A
+contractor's rating is derived from reviews and never written directly.</p>
+
+<p>Rules like those are the reason this application has services at all. Each one spans more than a
+single row, several of them span more than one table, and two of them are only safe inside a
+transaction — which is what <a href="/nestjs/nestjs-database-typeorm">lesson 15</a> is built
+around.</p>
+
+<p>Its domain model is small enough to hold in your head:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const UserRole = {
+  HOMEOWNER: 'homeowner',
+  CONTRACTOR: 'contractor',
+  STAFF: 'staff',
+} as const
+export type UserRole = (typeof UserRole)[keyof typeof UserRole]
+
+export const ProjectStatus = {
+  OPEN: 'open',
+  QUOTED: 'quoted',
+  HIRED: 'hired',
+  IN_PROGRESS: 'in_progress',
+  COMPLETED: 'completed',
+  CANCELLED: 'cancelled',
+} as const
+export type ProjectStatus = (typeof ProjectStatus)[keyof typeof ProjectStatus]</code></pre>
+
+<p>Three roles, six project states. Everything else in the track hangs off those.</p>
+
+<h2>The versions this track is written against</h2>
+
+<p>Read off the machine these posts were written on, not chosen from documentation:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "@nestjs/core": "12.0.1",
+  "@nestjs/common": "12.0.1",
+  "@nestjs/typeorm": "12.0.1",
+  "typeorm": "1.1.1",
+  "class-validator": "0.15.1",
+  "typescript": "6.0.3",
+  "node": "22.23.2",
+  "vitest": "4.1.11"
+}</code></pre>
+
+<p>One detail to flag now rather than have it surprise you: this project is <strong>ESM</strong>.
+Every relative import in every snippet ends in <code>.js</code>, even though the file next to it is
+<code>.ts</code>. That is not a typo and it is not optional —
+<a href="/nestjs/nestjs-project-setup">lesson 2</a> explains why, and it is the single most common
+thing to trip over when copying Nest code between projects.</p>
+
+<h2>The track</h2>
+
+<p><strong>Foundations.</strong> <a href="/nestjs/nestjs-project-setup">Setting up a project</a> ·
+<a href="/nestjs/nestjs-modules">Modules</a> ·
+<a href="/nestjs/nestjs-controllers">Controllers</a> ·
+<a href="/nestjs/nestjs-providers-and-dependency-injection">Providers and dependency
+injection</a>.</p>
+
+<p><strong>The request pipeline</strong>, in the order a request meets it.
+<a href="/nestjs/nestjs-dtos-and-validation">DTOs and validation</a> ·
+<a href="/nestjs/nestjs-pipes">Pipes</a> ·
+<a href="/nestjs/nestjs-guards">Guards</a> ·
+<a href="/nestjs/nestjs-custom-decorators">Custom decorators</a> ·
+<a href="/nestjs/nestjs-interceptors">Interceptors</a> ·
+<a href="/nestjs/nestjs-middleware">Middleware</a> ·
+<a href="/nestjs/nestjs-exception-filters">Exception filters</a> ·
+<a href="/nestjs/nestjs-request-lifecycle">The request lifecycle</a>, which puts them in order and
+explains why the order is the source of most confusing Nest bugs.</p>
+
+<p><strong>Real applications.</strong>
+<a href="/nestjs/nestjs-configuration">Configuration</a> ·
+<a href="/nestjs/nestjs-database-typeorm">Databases with TypeORM</a> ·
+<a href="/nestjs/nestjs-authentication-jwt">Authentication with JWT</a> ·
+<a href="/nestjs/nestjs-authorization-roles">Authorization and roles</a> ·
+<a href="/nestjs/nestjs-file-upload">File upload</a> ·
+<a href="/nestjs/nestjs-testing">Testing</a>. Then
+<a href="/nestjs/nestjs-interview-questions">interview questions</a> drawn from all of it.</p>
+
+<p>You need TypeScript to follow along — if the type annotations above were unfamiliar, the
+<a href="/typescript/typescript-get-started">TypeScript track</a> is the prerequisite. Node and
+some experience of building an HTTP API in anything is assumed. Start with
+<a href="/nestjs/nestjs-project-setup">setting up a project</a>.</p>

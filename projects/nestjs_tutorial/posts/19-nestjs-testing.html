@@ -1,0 +1,265 @@
+<p>Everything in a Nest application arrives through a constructor, which means anything can be
+replaced. That is the whole basis of testing it, and it lets you put the seam anywhere between two
+classes and the entire system.</p>
+
+<h2>Test.createTestingModule</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const moduleRef = await Test.createTestingModule({
+  providers: [RolesGuard, Reflector],
+}).compile()
+
+guard = moduleRef.get(RolesGuard)</code></pre>
+
+<p>That is a two-provider application. No controllers, no database, no HTTP server — and
+<code>RolesGuard</code> cannot tell, because it is constructed by the same container that would
+construct it in production.</p>
+
+<p><code>new RolesGuard(new Reflector())</code> would also work here. The testing module is worth
+preferring because it keeps working when the class grows a second dependency, and because it is the
+only way to substitute something the class does not receive directly.</p>
+
+<h2>Mocking with useValue</h2>
+
+<p>The pattern for testing a service is to supply its collaborators as values:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const moduleRef = await Test.createTestingModule({
+  providers: [
+    AuthService,
+    {
+      provide: getDataSourceToken(),
+      useValue: {
+        getRepository: () =&gt; ({ findOne: async () =&gt; storedUser }),
+      },
+    },
+    { provide: JwtService, useValue: { signAsync: async () =&gt; 'signed.jwt.token' } },
+  ],
+}).compile()
+
+service = moduleRef.get(AuthService)</code></pre>
+
+<p>A mock only needs the methods the code under test calls. <code>AuthService.login</code> uses
+<code>dataSource.getRepository(User).findOne(...)</code> and nothing else, so the mock is two
+nested functions.</p>
+
+<h2>Get the token right</h2>
+
+<p>The single most common mistake, and it fails in a way that looks like something else:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// The wrong way. @InjectDataSource() does not ask for the DataSource class — it asks
+// for a named token. This override compiles, runs, and is never looked up, so the
+// service holds the real connection and the test tries to reach Postgres.
+{ provide: DataSource, useValue: fakeDataSource }</code></pre>
+
+<p>Use the helper the library provides: <code>getDataSourceToken()</code> for the connection,
+<code>getRepositoryToken(User)</code> for a repository. The rule generalises — whenever a dependency
+arrives through an <code>@InjectSomething()</code> decorator rather than by its type, find the
+matching token helper.</p>
+
+<h2>What a unit test is for</h2>
+
+<p>The useful test is not one that repeats what an end-to-end test already covers. It is one that
+pins down something end-to-end cannot reach.</p>
+
+<pre class="language-typescript"><code class="language-typescript">it('gives the same message whether the account is missing, deleted, or the password is wrong', async () =&gt; {
+  const messages: string[] = []
+
+  storedUser = null
+  messages.push(await messageFrom(attempt('anything')))
+
+  storedUser = userRow({ deleted: true })
+  messages.push(await messageFrom(attempt('correct-horse-battery')))
+
+  storedUser = userRow({ deleted: false })
+  messages.push(await messageFrom(attempt('wrong-password')))
+
+  expect(messages).toHaveLength(3)
+  expect(new Set(messages).size).toBe(1)
+  expect(messages[0]).toBe('That email and password do not match an account.')
+})</code></pre>
+
+<p>Three failure paths driven one at a time by setting a variable — which is exactly what a real
+database makes awkward, because putting it into all three states means three fixtures and a lot of
+setup.</p>
+
+<p>And what is being proved is a property rather than a behaviour: the three messages must be
+<em>identical</em>. That is a security requirement, and it is invisible to any test that checks one
+path at a time.</p>
+
+<p>Note what is <strong>not</strong> mocked: bcrypt. Faking the hash comparison would leave the test
+asserting that the code calls a function, rather than that a wrong password is rejected. The rule of
+thumb is to mock what is slow, external or hard to control — not the logic you are testing.</p>
+
+<pre class="language-typescript"><code class="language-typescript">correctHash = await bcrypt.hash('correct-horse-battery', 4)</code></pre>
+
+<p>Cost 4, not the application's 12. The cost is encoded in the hash and <code>compare</code>
+follows it, so this is the same comparison a hundred times faster. The production cost is a
+production decision and has no business slowing a unit test.</p>
+
+<h2>Fakes for the pipeline classes</h2>
+
+<p>Guards, pipes, interceptors and filters are plain classes, and the only awkward part is
+<code>ExecutionContext</code>. Fake the three methods the class actually calls:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function contextFor(roles: string[] | undefined, user: AuthenticatedUser | undefined) {
+  const handler = () =&gt; undefined
+  if (roles !== undefined) Reflect.defineMetadata(ROLES_KEY, roles, handler)
+
+  return {
+    getHandler: () =&gt; handler,
+    getClass: () =&gt; class StubController {},
+    switchToHttp: () =&gt; ({ getRequest: () =&gt; ({ user }) }),
+  } as unknown as ExecutionContext
+}</code></pre>
+
+<p>Implementing the whole interface would be a lot of code asserting nothing. The cast says "this is
+a stub, on purpose" — and unlike <code>any</code>, it still fails to compile if the guard starts
+needing something else.</p>
+
+<p>The metadata is attached with <code>Reflect.defineMetadata</code>, exactly as
+<code>SetMetadata</code> does it, so the <code>Reflector</code> under test does its real work rather
+than a stub's.</p>
+
+<p>A pipe needs even less:</p>
+
+<pre class="language-typescript"><code class="language-typescript">it('turns a whitespace-only field into the empty string, so @Length can reject it', () =&gt; {
+  expect(pipe.transform({ firstName: '   ' }, body)).toEqual({ firstName: '' })
+})</code></pre>
+
+<p><code>new TrimPipe()</code> is the entire setup. Anything that fits in a test this cheap belongs
+in one.</p>
+
+<h2>End-to-end</h2>
+
+<p>The other extreme imports the real root module and gets the whole application:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile()
+app = moduleRef.createNestApplication()</code></pre>
+
+<p>Then supertest drives it over HTTP without binding a port:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function signIn(who: { email: string; password: string }): Promise&lt;string&gt; {
+  const response = await http.post('/api/v1/auth/login').send(who).expect(200)
+  return response.body.token
+}</code></pre>
+
+<p>This is where business rules spanning several classes get tested — the ones that justify the
+architecture. Accepting a quote declines the others; a contractor cannot bid outside their trades;
+a project stops accepting bids once someone is hired. Each involves a controller, a guard, a
+service and a transaction, and only end-to-end proves they cooperate.</p>
+
+<h2>The trap that makes a suite pass vacuously</h2>
+
+<pre class="language-typescript"><code class="language-typescript">app.useGlobalPipes(
+  new TrimPipe(),
+  new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+)</code></pre>
+
+<p>The same configuration as <code>main.ts</code>, repeated by hand — and it has to be, because
+pipes bound with <code>app.useGlobalPipes()</code> live on the application instance rather than in
+the module, so importing <code>AppModule</code> does not bring them.</p>
+
+<p>Leave it out and every DTO decorator is inert. Every validation assertion in the suite then
+passes vacuously: a test suite that proves nothing while looking thorough, and nothing about the
+output says so.</p>
+
+<p>The globals bound with <code>APP_FILTER</code> and <code>APP_INTERCEPTOR</code> need no such
+repetition, because they are providers and travel with the module. That difference is the practical
+argument for the token form.</p>
+
+<h2>Tests that write to a real database</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const PREFIX = `RULETEST-${Date.now().toString().slice(-6)}`</code></pre>
+
+<p>Every row this suite creates carries that prefix, so cleanup can find them all:</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (dataSource?.isInitialized) {
+  await dataSource.query(`DELETE FROM projects WHERE title LIKE $1`, [`${PREFIX}%`])
+  // ...
+}
+await app?.close()</code></pre>
+
+<p>A leftover project from a failed run shows up in the next run's data and in the browser tests,
+and the failure looks like a bug in the application. The optional chaining matters too — if
+<code>beforeAll</code> threw, <code>app</code> is undefined, and a cleanup that crashes replaces a
+useful failure with a confusing one.</p>
+
+<p>Derived values need care beyond deleting rows. A contractor's rating is cached on their profile,
+so deleting a test review must also recompute it, or the next run starts from a polluted
+baseline.</p>
+
+<h2>A trap specific to supertest</h2>
+
+<pre class="language-typescript"><code class="language-typescript">function quote(token: string, projectId: string, amount = 400) {
+  return http
+    .post('/api/v1/quotes')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ projectId, amount, estimatedDays: 1, message: 'A test quote.' })
+}</code></pre>
+
+<p>Deliberately not <code>async</code>. Supertest's request object is thenable <em>and</em> carries
+<code>.expect</code>. Marking the helper <code>async</code> wraps it in a plain promise, so
+<code>quote(...).expect(201)</code> becomes "expect is not a function" — and because the request
+still fires, the failure appears one line later than the mistake.</p>
+
+<h2>overrideProvider</h2>
+
+<p>The two extremes have a middle: import the real module and replace one thing inside it.</p>
+
+<pre class="language-typescript"><code class="language-typescript">const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  .overrideProvider(MailService)
+  .useValue({ send: async () =&gt; undefined })
+  .compile()</code></pre>
+
+<p>Everything else is real — the same modules, guards, filters and interceptors as production — with
+one seam where the test needs it. That is the right shape when an end-to-end test would otherwise
+send email, charge a card, or call an API you do not control.</p>
+
+<p><code>overrideGuard</code>, <code>overrideInterceptor</code>, <code>overridePipe</code> and
+<code>overrideFilter</code> do the same for the pipeline. <code>overrideGuard</code> is the tempting
+one and worth resisting by default: stubbing out authentication to make a test simpler removes the
+guard from the thing being tested, and a suite that never exercises its own guards is how an
+authorization bug ships.</p>
+
+<h2>Keeping tests independent</h2>
+
+<p>Two habits do most of the work.</p>
+
+<p><strong>Build the module in <code>beforeEach</code>, not <code>beforeAll</code></strong>, for
+unit tests. A fresh container per test means no state leaks between them — and it is cheap, because
+there is no application to start.</p>
+
+<p><strong>Close what you open.</strong> <code>await app.close()</code> in <code>afterAll</code>
+shuts down the connection pool. Without it a suite finishes and the process hangs, which in CI is a
+timeout rather than an obvious error.</p>
+
+<h2>Test doubles that stay honest</h2>
+
+<p>The failure mode of mocking is a test that passes while the real thing is broken, and it has one
+common cause: the mock and the real implementation drifting apart.</p>
+
+<pre class="language-typescript"><code class="language-typescript">{ provide: JwtService, useValue: { signAsync: async () =&gt; 'signed.jwt.token' } }</code></pre>
+
+<p>That is fine because nothing under test inspects the token. It stops being fine the moment a test
+asserts something about what was signed — at which point the mock has to be right about a second
+thing, and nothing checks that it is.</p>
+
+<p>Two ways to keep this honest. Prefer mocks so thin they cannot be wrong, as above. And where the
+collaborator's behaviour actually matters, use the real one — the reason bcrypt is not mocked in the
+login tests is that the property being proved is meaningless without it.</p>
+
+<h2>Which test to write</h2>
+
+<p>Unit tests for anything decidable without a database: pipes, guards, filters, pure functions like
+the image sniffer, and service logic whose collaborators can be faked in a couple of lines. They run
+in milliseconds and can drive states a real database makes expensive to reach.</p>
+
+<p>End-to-end for rules that span classes, for anything involving a transaction or a lock, and for
+the pipeline itself — validation, guard ordering, error shapes.</p>
+
+<p>Where this application draws the line is worth copying. Before the unit tests were added,
+<code>npm test</code> found no files at all: nothing could be tested without Docker and a migrated
+Postgres. Both suites now exist, one needs nothing, and they answer different questions rather than
+the same one twice.</p>
+
+<p>Last: <a href="/nestjs/nestjs-interview-questions">interview questions</a>, drawn from the
+nineteen lessons before it.</p>

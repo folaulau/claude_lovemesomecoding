@@ -1,0 +1,279 @@
+<p>A controller is the only place in a well-organised Nest application that knows anything about
+HTTP. It maps a request onto a method call and hands back whatever that call returns. Everything
+about <em>what should happen</em> belongs somewhere else.</p>
+
+<p>That sounds like a platitude until you have a controller with business rules in it, at which
+point it is the difference between a codebase you can test and one you cannot.</p>
+
+<h2>Routing</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Controller('api/v1/auth')
+export class AuthController {
+  constructor(private readonly authService: AuthService) {}
+
+  @Post('register')
+  register(@Body() dto: RegisterDto) {
+    return this.authService.register(dto)
+  }
+
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  login(@Body() dto: LoginDto) {
+    return this.authService.login(dto)
+  }
+
+  @Get('me')
+  @UseGuards(JwtAuthGuard)
+  me(@CurrentUser() user: AuthenticatedUser) {
+    return user
+  }
+}</code></pre>
+
+<p>The argument to <code>@Controller</code> is a path prefix; the argument to each method decorator
+is the rest. <code>@Post('register')</code> inside
+<code>@Controller('api/v1/auth')</code> is <code>POST /api/v1/auth/register</code>. There is one
+decorator per HTTP verb — <code>@Get</code>, <code>@Post</code>, <code>@Put</code>,
+<code>@Patch</code>, <code>@Delete</code>, <code>@Head</code>, <code>@Options</code> — and each
+takes an optional sub-path.</p>
+
+<p>Ordering matters when paths can overlap. Nest matches in declaration order, so a
+<code>@Get(':id')</code> written above a <code>@Get('me')</code> will swallow
+<code>/me</code> and try to look up a project whose id is the string <code>me</code>. Put literal
+segments before parameterised ones.</p>
+
+<h2>Getting at the request</h2>
+
+<p>You almost never touch the request object. Parameter decorators pull out the piece you want:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Patch(':projectId/status')
+updateStatus(
+  @CurrentUser() user: AuthenticatedUser,
+  @Param('projectId', ParseUUIDPipe) projectId: string,
+  @Body() dto: UpdateProjectStatusDto,
+) {
+  return this.projectsService.updateStatus(user, projectId, dto.status)
+}</code></pre>
+
+<p><code>@Body()</code> is the parsed request body, <code>@Param('x')</code> a route parameter,
+<code>@Query('x')</code> a query-string value, <code>@Headers('x')</code> a header. Each also
+works with no argument to give you the whole object.</p>
+
+<p>Two things in that signature are worth noticing. <code>@CurrentUser()</code> is not built in —
+it is a custom decorator this application defines, covered in
+<a href="/nestjs/nestjs-custom-decorators">lesson 9</a>, and it reads the user that a guard put on
+the request. And <code>ParseUUIDPipe</code> is a pipe attached to one parameter: it rejects a
+non-UUID with a 400 before the method body runs.</p>
+
+<p>That last one is a small decision with a real payoff. Without it,
+<code>/api/v1/projects/1/status</code> reaches the database as a perfectly valid string comparison
+that finds nothing — producing a 404 identical to the one you get for somebody else's project.
+With it, a malformed id is a 400 that says so, and a 404 always means what it says.</p>
+
+<p>There are <code>@Req()</code> and <code>@Res()</code> decorators for the underlying Express
+objects. Reaching for them costs you something: take <code>@Res()</code> and Nest stops handling
+the response for you, so you are now responsible for sending it, and interceptors that expected to
+see a return value no longer do. Use them when you genuinely need to stream, and not otherwise.</p>
+
+<h2>Status codes</h2>
+
+<p>Nest answers <code>200</code> for everything except <code>POST</code>, which gets
+<code>201 Created</code>. That default is right often enough to keep and wrong often enough to
+notice:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Post('login')
+@HttpCode(HttpStatus.OK)
+login(@Body() dto: LoginDto) {
+  return this.authService.login(dto)
+}</code></pre>
+
+<p>Logging in creates nothing. A client that branches on the status code — and plenty do — would
+be told a user was just created on every sign-in. One decorator fixes it.</p>
+
+<p>The same reasoning in the other direction gives a delete a <code>204</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Delete('me/portfolio/:imageId')
+@HttpCode(HttpStatus.NO_CONTENT)
+async removePortfolioImage(
+  @CurrentUser() user: AuthenticatedUser,
+  @Param('imageId', ParseUUIDPipe) imageId: string,
+) {
+  await this.contractorsService.removePortfolioImage(user, imageId)
+}</code></pre>
+
+<p>The image is gone and there is nothing meaningful to return. A <code>200</code> with an empty
+body leaves a client wondering whether it should have parsed something; <code>204</code> says
+there is nothing to parse.</p>
+
+<p>For failures you do not set a status at all — you throw, and
+<a href="/nestjs/nestjs-exception-filters">an exception filter</a> turns the exception into a
+response. A service throwing <code>NotFoundException</code> is not reaching into HTTP; it is
+naming a condition that happens to have an obvious status code.</p>
+
+<h2>The return value is the response</h2>
+
+<p>Return an object and Nest serialises it to JSON. Return a promise and Nest awaits it first —
+which is why <code>register</code> above has no <code>async</code> and no <code>await</code>: it
+returns the service's promise directly and Nest does the rest.</p>
+
+<p>Mark a method <code>async</code> when it needs to <code>await</code> something itself. The
+delete above does, because it awaits the service call and then deliberately returns nothing.</p>
+
+<h2>Serialising what goes out</h2>
+
+<p>Returning an entity straight from a controller is the most common way to leak something. This
+application never does it — every write endpoint returns the result of a mapper instead:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function toUserDto(user: User) {
+  return {
+    id: user.publicId,
+    email: user.email,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    phone: user.phone,
+    role: user.role,
+    avatarUrl: user.avatarUrl,
+    createdAt: user.createdAt.toISOString(),
+  }
+}</code></pre>
+
+<p>Three properties fall out of writing it this way. The internal sequential <code>id</code> never
+leaves the process — the API exposes only the UUID, so nobody can count rows or enumerate records
+by adding one. <code>passwordHash</code> is not omitted by a rule that could be forgotten; there is
+simply no path from here that can emit it, because no mapper reads it. And a column added to the
+entity next month does not silently appear in the API.</p>
+
+<p>Nest also offers <code>ClassSerializerInterceptor</code> with <code>@Exclude()</code> on the
+entity, which is less code and inverts the default: fields are public unless someone remembered to
+mark them. For a table with a password hash in it, an explicit allowlist is the safer shape.</p>
+
+<h2>Controllers own HTTP; services own the rules</h2>
+
+<p>This is the line that decides whether a Nest codebase stays workable, and the cleanest way to
+see it is a controller that is almost empty:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Controller('api/v1/quotes')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class QuotesController {
+  constructor(private readonly quotesService: QuotesService) {}
+
+  @Post()
+  @Roles(UserRole.CONTRACTOR)
+  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateQuoteDto) {
+    return this.quotesService.create(user, dto)
+  }
+}</code></pre>
+
+<p>Submitting a quote is the most rule-heavy operation in this application. The contractor must
+work in the project's trade. The project must still be accepting bids. They must not have quoted
+already. The first quote flips the project from <code>open</code> to <code>quoted</code>, and that
+has to happen in the same transaction as the insert.</p>
+
+<p>None of it is here. The controller checks that you are signed in and are a contractor — both
+declaratively — and delegates. Every one of those rules is in the service, where it can be tested
+without an HTTP request and reused by anything else that needs it.</p>
+
+<p>The test for whether a piece of logic belongs in a controller is simple: would it still be true
+if this were a CLI command instead of an endpoint? Status codes and parameter parsing would not.
+"A contractor may only bid in a trade they work in" would.</p>
+
+<h2>Class-level decorators</h2>
+
+<p>Decorators on the class apply to every method in it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Controller('api/v1/contractors')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(UserRole.CONTRACTOR)
+export class ContractorsController {
+  constructor(private readonly contractorsService: ContractorsService) {}
+
+  @Patch('me')
+  updateProfile(@CurrentUser() user: AuthenticatedUser, @Body() dto: UpdateContractorProfileDto) {
+    return this.contractorsService.updateProfile(user, dto)
+  }
+  // ...
+}</code></pre>
+
+<p>Every route in this controller requires a signed-in contractor, stated once. Declaring it per
+method would work identically until the day someone adds a method and forgets — and a missing
+authorization check is not a failure you notice, because the endpoint works perfectly.</p>
+
+<p>Method-level decorators override class-level ones where both apply, which is what lets
+<code>ProjectsController</code> put <code>@UseGuards</code> on the class and a different
+<code>@Roles</code> on each method.</p>
+
+<h2>The route that deliberately has no @Roles</h2>
+
+<p>Worth pausing on, because it marks the edge of what a controller can decide:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Patch(':projectId/status')
+updateStatus(
+  @CurrentUser() user: AuthenticatedUser,
+  @Param('projectId', ParseUUIDPipe) projectId: string,
+  @Body() dto: UpdateProjectStatusDto,
+) {
+  return this.projectsService.updateStatus(user, projectId, dto.status)
+}</code></pre>
+
+<p>Both roles use this endpoint. A homeowner cancels; the hired contractor starts and completes.
+Which of them may make a given move depends on the project's current status and on whether this
+contractor is the one who actually won the job — facts that live in the database.</p>
+
+<p>A decorator cannot express that, because a decorator is evaluated once at startup and has never
+seen the row. So the authorization for this route is in the service, which can load it. Trying to
+force it into <code>@Roles</code> would produce a rule that is either too permissive or wrong.</p>
+
+<h2>Why there are no read endpoints here</h2>
+
+<p><code>ProjectsController</code> has three routes and all three are writes. That is not an
+oversight — reads in this application are served by a GraphQL layer with its own row-level
+permissions, and the controller says so:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Controller('api/v1/projects')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class ProjectsController {
+  constructor(private readonly projectsService: ProjectsService) {}
+
+  @Post()
+  @Roles(UserRole.HOMEOWNER)
+  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateProjectDto) {
+    return this.projectsService.create(user, dto)
+  }
+  // ...
+}</code></pre>
+
+<p>Adding a <code>@Get()</code> would create a second way to read the same rows under a second set
+of rules — and when two sets of rules cover the same data, the one that leaks is the one nobody was
+thinking about. Whether or not you use GraphQL, the principle transfers: one path to a piece of
+data, with the access rules on it, rather than two that have to agree forever.</p>
+
+<h2>Versioning the path</h2>
+
+<p>Every route here starts <code>api/v1</code>, written into each <code>@Controller</code>
+prefix. Nest also has first-class versioning — <code>app.enableVersioning()</code> plus
+<code>@Version('1')</code> — which supports URI, header and media-type versioning and lets two
+versions of one route coexist.</p>
+
+<p>Putting the version in the prefix is the simpler choice and costs a repeated string. It stops
+being simpler the moment you actually need v1 and v2 of the same endpoint alive at once, which is
+the point to switch. There is also <code>app.setGlobalPrefix('api')</code> for the part that never
+varies.</p>
+
+<h2>What a controller should never do</h2>
+
+<p>Three habits are worth naming as the wrong way to build one, because each looks reasonable in
+isolation.</p>
+
+<p><strong>Reading the request object directly.</strong> <code>@Req() req</code> followed by
+<code>req.body.email</code> works, and it opts out of validation, of the typed DTO, and of the
+ability to call the method in a test without constructing a fake request.</p>
+
+<p><strong>Taking the actor from the body.</strong> A <code>homeownerId</code> field in a request
+body is the shortest path to letting anyone act as anyone else. The actor comes from the verified
+token, always — which is what <code>@CurrentUser()</code> guarantees by construction.</p>
+
+<p><strong>Catching exceptions to reshape them.</strong> A <code>try/catch</code> that turns a
+service error into a status code is a filter written badly and in the wrong place. Let it
+propagate.</p>
+
+<p>Next: <a href="/nestjs/nestjs-providers-and-dependency-injection">providers and dependency
+injection</a> — where that <code>authService</code> in the constructor actually comes from.</p>

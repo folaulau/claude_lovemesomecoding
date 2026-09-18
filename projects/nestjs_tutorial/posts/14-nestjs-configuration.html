@@ -1,0 +1,281 @@
+<p>Every application reads values from its environment, and the naive version of that —
+<code>process.env.WHATEVER</code> scattered through the code — has three problems worth naming
+before looking at any library.</p>
+
+<p>A typo in a variable name is <code>undefined</code> rather than a compile error. There is no
+single place to see what the application needs in order to run. And every value is a string until
+somebody remembers to parse it, which they will do inconsistently.</p>
+
+<p><code>@nestjs/config</code> solves the first two on its own. The third takes a small amount of
+deliberate work, and it is the part worth copying.</p>
+
+<h2>Registering it</h2>
+
+<pre class="language-typescript"><code class="language-typescript">ConfigModule.forRoot({
+  isGlobal: true,
+  load: [loadConfig],
+  envFilePath: ['.env'],
+}),</code></pre>
+
+<p><code>isGlobal: true</code> makes <code>ConfigService</code> injectable everywhere without each
+feature module importing <code>ConfigModule</code>. This is the one place a global module is
+uncontroversial: configuration is genuinely ambient, and the alternative is an import in every
+module that exists purely to satisfy the container.</p>
+
+<p><code>envFilePath</code> names the dotenv files to read. It is a list, so
+<code>['.env.local', '.env']</code> gives you an override file that takes precedence.</p>
+
+<p><code>load</code> is the interesting one, and skipping it is the difference between using this
+library and using it well.</p>
+
+<h2>Parse once, into a typed object</h2>
+
+<p>Without <code>load</code>, <code>ConfigService</code> hands out raw strings from
+<code>process.env</code>. With it, you supply a factory that returns a shape:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export interface AppConfig {
+  port: number
+  database: {
+    host: string
+    port: number
+    username: string
+    password: string
+    database: string
+  }
+  jwt: {
+    secret: string
+    expiresIn: string
+  }
+  uploads: {
+    directory: string
+    maxBytes: number
+  }
+  corsOrigins: string[]
+}</code></pre>
+
+<p>That interface is the complete answer to "what does this application need in order to run". It
+is one file, it is checked by the compiler, and it groups related values so a consumer asks for
+<code>jwt</code> rather than for two loose strings.</p>
+
+<p>The factory that builds it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function loadConfig(): AppConfig {
+  return {
+    port: envInt('CONTRACTOR_PORT', 3001),
+
+    database: {
+      host: env('CONTRACTOR_DB_HOST', 'localhost'),
+      port: envInt('CONTRACTOR_DB_PORT', 5434),
+      username: env('CONTRACTOR_DB_USER', 'contractor'),
+      password: env('CONTRACTOR_DB_PASSWORD', 'contractor'),
+      database: env('CONTRACTOR_DB_NAME', 'contractor'),
+    },
+    // ...
+  }
+}</code></pre>
+
+<p>Every value is read, parsed and typed in one place. Nothing else in the application touches
+<code>process.env</code>.</p>
+
+<h2>Blank is not the same as set</h2>
+
+<pre class="language-typescript"><code class="language-typescript">function env(name: string, fallback: string): string {
+  const value = process.env[name]
+  return value === undefined || value.trim() === '' ? fallback : value
+}</code></pre>
+
+<p>An empty line in a <code>.env</code> file — <code>CONTRACTOR_DB_HOST=</code> — should behave like
+not setting the variable, not like setting it to the empty string. Without that check the
+application tries to connect to a database host of <code>""</code>, and the error names neither the
+variable nor the file.</p>
+
+<h2>Fail loudly at startup</h2>
+
+<pre class="language-typescript"><code class="language-typescript">function envInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`${name} must be an integer, got "${raw}"`)
+  }
+  return parsed
+}</code></pre>
+
+<p>A typo'd port that quietly becomes the default is a confusing half hour: the application starts,
+listens on the wrong port, and nothing says why. A startup error naming the variable is thirty
+seconds.</p>
+
+<p>That is the general principle for configuration — <strong>fail at startup, not at first
+use</strong>. A missing database password should stop the deploy, not surface as a 500 on whichever
+endpoint happens to be hit first. Nest supports this with a <code>validationSchema</code> option
+taking a Joi schema, and a hand-written factory like this one gets you the same guarantee with no
+extra dependency and better error messages.</p>
+
+<h2>Reading it back</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const uploads = this.config.getOrThrow&lt;AppConfig['uploads']&gt;('uploads')</code></pre>
+
+<p>Prefer <code>getOrThrow</code> over <code>get</code>. <code>get</code> returns
+<code>undefined</code> for a missing key and the failure surfaces somewhere unrelated;
+<code>getOrThrow</code> fails where the mistake is.</p>
+
+<p>The type parameter is worth using consistently. <code>AppConfig['uploads']</code> derives the
+type from the interface rather than restating it, so a field added there is available immediately
+and a field renamed is a compile error at every call site.</p>
+
+<h2>When a module needs configuration</h2>
+
+<p>Some modules cannot be configured with a literal, because the values come from something that is
+itself injected. That is what the async factory forms are for:</p>
+
+<pre class="language-typescript"><code class="language-typescript">JwtModule.registerAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService&lt;AppConfig&gt;) =&gt; {
+    const jwt = config.getOrThrow&lt;AppConfig['jwt']&gt;('jwt')
+    return {
+      secret: jwt.secret,
+      signOptions: {
+        algorithm: 'HS256',
+        expiresIn: jwt.expiresIn as `${number}${'s' | 'm' | 'h' | 'd'}`,
+      },
+      verifyOptions: { algorithms: ['HS256'] },
+    }
+  },
+}),</code></pre>
+
+<p>The synchronous <code>register()</code> would have to read <code>process.env</code> directly,
+putting a second untyped copy of the configuration beside the parsed one — and two copies of the
+same fact eventually disagree.</p>
+
+<p>The cast on <code>expiresIn</code> is honest rather than lazy, and worth understanding because
+the pattern recurs. <code>jsonwebtoken</code> types that option as a template-literal union of
+every valid duration, and a value read from the environment is a plain <code>string</code> that
+TypeScript cannot narrow to it. The alternative is hand-writing that union in the config interface,
+where it would drift from whatever the library accepts. A bad duration is caught at startup by the
+library itself, loudly — so the cast trades a compile-time check the environment cannot provide for
+a runtime one that actually fires.</p>
+
+<h2>The database is the exception</h2>
+
+<pre class="language-typescript"><code class="language-typescript">TypeOrmModule.forRoot(buildDataSourceOptions()),</code></pre>
+
+<p>A plain synchronous call, not <code>forRootAsync</code>. It works because
+<code>buildDataSourceOptions()</code> calls <code>loadConfig()</code> itself rather than injecting
+<code>ConfigService</code>, and it is that way for a specific reason: the TypeORM CLI needs the
+same options to run migrations, and the CLI has no Nest container to inject from.</p>
+
+<p>Two configurations — one for the running application and one for migrations — is how an
+application ends up running against a schema its migrations never produced. Sharing one function is
+worth losing the injected form for.</p>
+
+<h2>Defaults in code, and what that costs</h2>
+
+<p>Every value in this application has a default, so a fresh clone runs with no <code>.env</code> to
+create first:</p>
+
+<pre class="language-bash"><code class="language-bash">CONTRACTOR_PORT=3001
+CONTRACTOR_DB_HOST=localhost
+CONTRACTOR_DB_PORT=5434
+CONTRACTOR_DB_USER=contractor
+CONTRACTOR_DB_NAME=contractor
+CONTRACTOR_JWT_EXPIRES_IN=7d
+CONTRACTOR_UPLOAD_MAX_BYTES=5242880
+CONTRACTOR_CORS_ORIGINS=http://localhost:5177</code></pre>
+
+<p>That is a real benefit for a demo, and it has a real cost worth being clear-eyed about: a
+production deployment that forgets to set a variable gets the development default rather than a
+loud failure. Most importantly, it means there is a working JWT secret checked into the
+repository.</p>
+
+<p>For anything handling real data, invert it for the values that matter: default the harmless ones
+and throw for the rest.</p>
+
+<pre class="language-typescript"><code class="language-typescript">function required(name: string): string {
+  const value = process.env[name]
+  if (value === undefined || value.trim() === '') {
+    throw new Error(`${name} is required`)
+  }
+  return value
+}</code></pre>
+
+<p>A secret is the clearest case. A development default for a database host is a convenience; a
+development default for a signing key is a key an attacker can read on GitHub.</p>
+
+<h2>Configuration in tests</h2>
+
+<p>A test that boots the application picks up whatever is in the environment, which is how a suite
+ends up writing to a real database because <code>.env</code> was present. Two ways to control
+it.</p>
+
+<p>Override the provider, which is the cleanest for a unit test:</p>
+
+<pre class="language-typescript"><code class="language-typescript">{ provide: ConfigService, useValue: { getOrThrow: () =&gt; ({ maxBytes: 1024 }) } }</code></pre>
+
+<p>Or give <code>ConfigModule.forRoot</code> a different <code>envFilePath</code> in the testing
+module, so the whole application runs against a <code>.env.test</code>. That is the right shape for
+end-to-end tests, where the point is to exercise the real wiring.</p>
+
+<p>What to avoid is a test that mutates <code>process.env</code> partway through. The factory runs
+once at startup, so a variable changed after that has no effect — and the test that appears to work
+is usually one that got the default it wanted for an unrelated reason.</p>
+
+<h2>Secrets do not belong in environment variables either</h2>
+
+<p>Worth saying, because "put it in the environment" is often where the advice stops. An
+environment variable is visible to every process in the container, appears in a crash dump, and is
+frequently printed by a well-meaning debug endpoint.</p>
+
+<p>For anything genuinely sensitive the usual step up is a secrets manager, fetched at startup —
+which is exactly what an async factory is for:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// A second `load` entry, alongside the one above — and it may be async.
+load: [loadConfig, async () =&gt; ({ jwt: await fetchSigningKey() })],</code></pre>
+
+<p>A <code>load</code> entry may be async, so the module waits for it before anything that depends
+on <code>ConfigService</code> is constructed. That ordering is the useful part: a secret fetched
+lazily on first use turns one slow network call into a failure mode on an arbitrary request.</p>
+
+<h2>The same values, in Docker</h2>
+
+<p>One entry in this application's configuration carries a comment longer than the code, and it is
+worth repeating because the shape of the mistake is universal:</p>
+
+<pre class="language-typescript"><code class="language-typescript">host: env('CONTRACTOR_DB_HOST', 'localhost'),
+port: envInt('CONTRACTOR_DB_PORT', 5434),</code></pre>
+
+<p>5434 is the port <em>on the host</em>. Inside the compose network Postgres is on 5432, and the
+difference is a published-port mapping only. Run the application on your laptop and 5434 is right;
+run it in a container on the same network and 5434 refuses the connection, because that mapping
+exists only outside.</p>
+
+<p>The general form: a default that is correct in one environment is wrong in another, and
+connection failures name neither the variable nor the reason. Which is the argument for keeping
+every such value in one file with a comment beside it, rather than scattered through the code where
+the pattern is invisible.</p>
+
+<h2>One more thing to type</h2>
+
+<p><code>ConfigService</code> takes a type parameter, and using it consistently is what turns the
+service from a string bag into something the compiler checks:</p>
+
+<pre class="language-typescript"><code class="language-typescript">constructor(private readonly config: ConfigService&lt;AppConfig&gt;) {}</code></pre>
+
+<p>With it, a call to <code>getOrThrow('uplaods')</code> is a compile error rather than a runtime
+one. Without it every key is a bare string and every return value is effectively
+<code>any</code>, which spreads outward through whatever consumes it.</p>
+
+<p>It costs six characters at each injection site and turns the most common configuration mistake —
+a mistyped key — into something you find while typing rather than on the first request that needed
+that value.</p>
+
+<h2>What belongs in configuration</h2>
+
+<p>Values that differ between environments: hosts, ports, credentials, limits, feature flags,
+allowed origins. Not business rules. The list of valid project statuses is not configuration, and
+putting it there means the application's behaviour is no longer described by its code.</p>
+
+<p>The useful test is whether staging and production could sensibly hold different values. A
+database URL, yes. Whether accepting a quote declines the others, no.</p>
+
+<p>Next: <a href="/nestjs/nestjs-database-typeorm">databases with TypeORM</a> — where those
+connection settings are actually used.</p>

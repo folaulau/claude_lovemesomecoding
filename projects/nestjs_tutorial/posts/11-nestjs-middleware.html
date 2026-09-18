@@ -1,0 +1,255 @@
+<p>Middleware is the outermost layer of a Nest application, and the only part of the pipeline that
+is not really Nest. It is an Express middleware function with a class around it: same
+<code>(req, res, next)</code> signature, same position, same abilities.</p>
+
+<p>That makes it the least interesting stage to describe and the most interesting one to choose
+correctly, because the reason to reach for it is almost always positional.</p>
+
+<h2>NestMiddleware</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class RequestIdMiddleware implements NestMiddleware {
+  use(req: RequestWithId, res: Response, next: NextFunction): void {
+    const id = incomingId(req) ?? randomUUID()
+    req.requestId = id
+    res.setHeader('x-request-id', id)
+    next()
+  }
+}</code></pre>
+
+<p>One method. Call <code>next()</code> and the request continues; do not call it and the request
+stops there, which means you are responsible for answering it.</p>
+
+<p><code>@Injectable()</code> means it is a provider like everything else, so it can take
+dependencies through its constructor. That is the one thing this has over a plain Express
+function.</p>
+
+<h2>Registering it</h2>
+
+<p>Middleware is the only part of the pipeline with no <code>APP_*</code> token. There is no
+<code>APP_MIDDLEWARE</code>, because middleware is not resolved per request out of the container —
+it is handed to the underlying Express application at startup, against routes. So it is configured
+imperatively, by the module:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestIdMiddleware).forRoutes('*')
+  }
+}</code></pre>
+
+<p>The module implements <code>NestModule</code> and Nest calls <code>configure</code> at startup.
+<code>forRoutes</code> takes a path, a controller class, or several:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// every route
+consumer.apply(RequestIdMiddleware).forRoutes('*')
+
+// one controller's routes
+consumer.apply(SomeMiddleware).forRoutes(ProjectsController)
+
+// a path and method, with exclusions
+consumer
+  .apply(SomeMiddleware)
+  .exclude({ path: 'api/v1/auth/login', method: RequestMethod.POST })
+  .forRoutes({ path: 'api/v1/*', method: RequestMethod.ALL })</code></pre>
+
+<p>Multiple middlewares in one <code>apply</code> run left to right. Several
+<code>consumer.apply(...)</code> calls run in the order they are written.</p>
+
+<h2>Why this job is middleware</h2>
+
+<p>Assigning a request id looks like something an interceptor could do. It cannot, and the reason
+is the whole point of this lesson.</p>
+
+<p><strong>Middleware runs before guards.</strong> An interceptor's work happens around the route
+handler, and a request rejected by <code>JwtAuthGuard</code> never reaches a handler — so an
+interceptor doing this job would stamp an id on every 200 and on no 401.</p>
+
+<p>The requests you most want to correlate in a log are exactly the ones that failed. That makes
+"before the guards" not a detail but the requirement.</p>
+
+<p>Here is the difference, on a route that requires authentication, called without a token:</p>
+
+<pre class="language-bash"><code class="language-bash">$ curl -i http://localhost:3001/api/v1/auth/me
+HTTP/1.1 401 Unauthorized
+x-request-id: 63bed0e4-989f-4a5a-89a6-316c52ef6733
+
+{"message":"Sign in to do that.","error":"Unauthorized","statusCode":401,
+ "path":"/api/v1/auth/me","requestId":"9b2bbbc3-e21a-429a-b6bc-64d001a5c4b9"}</code></pre>
+
+<p>The guard threw. No interceptor ran. The header and the body still carry an id, because the
+middleware had already assigned one — and a user reporting "it said sign in again" is now holding
+the key to their own log line.</p>
+
+<h2>What it gives up in exchange</h2>
+
+<p>Middleware pays for that position. It gets the raw Express <code>req</code> and
+<code>res</code> and <strong>no <code>ExecutionContext</code></strong>, so it cannot see which
+handler is about to run, cannot read route metadata with <code>Reflector</code>, and cannot see
+what the handler returned.</p>
+
+<p>That is the trade, and it is the right way round for this job — this needs the response object,
+not the route. It is the wrong way round for logging an outcome, which is why the
+<a href="/nestjs/nestjs-interceptors">logging interceptor</a> is an interceptor and knows the
+handler name, the status and the duration.</p>
+
+<p>The two are complementary rather than alternatives, and this application uses both.</p>
+
+<h2>Trusting a header from a stranger</h2>
+
+<p>Accepting an inbound <code>x-request-id</code> is what makes a trace span a proxy and your API.
+It is also a string from a stranger about to be written to a log file:</p>
+
+<pre class="language-typescript"><code class="language-typescript">function incomingId(req: Request): string | null {
+  const header = req.headers['x-request-id']
+  if (typeof header !== 'string') return null
+
+  const trimmed = header.trim()
+  if (trimmed.length === 0 || trimmed.length &gt; 64) return null
+  return /^[A-Za-z0-9._-]+$/.test(trimmed) ? trimmed : null
+}</code></pre>
+
+<p>An unfiltered value can carry newlines, which forge whole log lines, or a few kilobytes of
+padding on every request. So the charset is restricted and the length is capped.</p>
+
+<p>Note the shape of the failure: anything unacceptable is <em>replaced</em> with a fresh UUID
+rather than rejected. A malformed trace header is not worth failing a request over, and a
+middleware that 400s on a header the client did not know it was sending is a bad neighbour.</p>
+
+<pre class="language-bash"><code class="language-bash">$ curl -i -H 'x-request-id: trace-abc-123' .../auth/me | grep -i x-request-id
+x-request-id: trace-abc-123
+
+$ curl -i -H 'x-request-id: bad id with spaces' .../auth/me | grep -i x-request-id
+x-request-id: 0856db06-70a7-489d-8e9b-ff8d0cbf5b3d</code></pre>
+
+<p>The <code>typeof header !== 'string'</code> check is doing real work too — Express gives an
+array when a header arrives more than once, and two ids are no id.</p>
+
+<h2>Functional middleware</h2>
+
+<p>When there are no dependencies, a plain function works and Nest accepts it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function requestId(req: Request, res: Response, next: NextFunction) {
+  res.setHeader('x-request-id', randomUUID())
+  next()
+}
+
+// consumer.apply(requestId).forRoutes('*')</code></pre>
+
+<p>The class form is worth preferring by default, for the reason that applies to every other part
+of Nest: the day it needs configuration, a class can take
+<code>ConfigService</code> in its constructor and a function cannot without reaching for a global.
+Converting later is a small change, and doing it up front costs three lines.</p>
+
+<p>Third-party Express middleware plugs straight in, and for application-wide concerns the
+conventional place is <code>main.ts</code> rather than <code>configure</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">app.use(helmet())
+app.use(cookieParser())</code></pre>
+
+<p>Both are equivalent. <code>app.use</code> reads better for library middleware that applies to
+everything; <code>configure</code> is for middleware whose routing is part of the decision.</p>
+
+<h2>Middleware and the body</h2>
+
+<p>By the time your middleware runs, Nest has already installed body parsers, so
+<code>req.body</code> is usually parsed. That matters for the one job middleware genuinely owns
+here: webhook signature verification needs the <em>raw</em> bytes, and a parsed body cannot be
+un-parsed.</p>
+
+<pre class="language-typescript"><code class="language-typescript">const app = await NestFactory.create(AppModule, { rawBody: true })</code></pre>
+
+<p>That option keeps the raw buffer on the request alongside the parsed body, which is what lets a
+handler recompute an HMAC over exactly the bytes that were signed. Reserialising the parsed object
+produces different bytes — a reordered key or a changed number format is enough — and the signature
+will not match.</p>
+
+<p>The general shape of the problem is worth recognising: anything that must see a request before it
+is transformed has to run before the transformation, and middleware is the only stage outside all of
+them.</p>
+
+<h2>The one that is easy to get wrong</h2>
+
+<p>Middleware runs before guards, which means it runs for unauthenticated requests. Anything
+expensive there is available to anybody:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// The wrong way. This runs before JwtAuthGuard, so an unauthenticated flood costs a
+// database query per request — and the guard that would have rejected them never runs.
+async use(req: Request, res: Response, next: NextFunction) {
+  const settings = await this.repo.findOne({ where: { host: req.hostname } })
+  next()
+}</code></pre>
+
+<p>Rate limiting is the case where running before the guards is the point — you want to shed load
+before doing work — and it is exactly the case where the middleware itself must be cheap. Keep it to
+in-memory or Redis operations, and put anything that needs a query behind the guards.</p>
+
+<h2>What runs before your middleware</h2>
+
+<p>Middleware is outermost among the things you write, and not outermost overall. Ahead of it sit
+Express's own layers: the body parsers Nest installs, the CORS handler if
+<code>app.enableCors()</code> was called, and anything registered with <code>app.use</code> during
+bootstrap.</p>
+
+<p>That ordering explains a question people hit early: a CORS preflight
+<code>OPTIONS</code> request is answered before your middleware sees it, so a middleware that logs
+every request logs no preflights. It also explains why <code>helmet()</code> belongs in
+<code>main.ts</code> rather than in <code>configure</code> — security headers want to be on
+everything, including responses produced before routing.</p>
+
+<h2>Ordering between middlewares</h2>
+
+<p>Within one <code>configure</code>, a single <code>apply</code> with several classes runs them
+left to right, and separate <code>apply</code> calls run in the order written:</p>
+
+<pre class="language-typescript"><code class="language-typescript">consumer.apply(RequestIdMiddleware, RequestLogMiddleware).forRoutes('*')
+consumer.apply(TenantMiddleware).forRoutes('api/v1/*')</code></pre>
+
+<p>That is worth knowing when one middleware depends on another having run — a logger wanting the
+request id has to come after the middleware that assigns it, and there is no error if it does not,
+only a missing field.</p>
+
+<p>Middleware configured in an imported module runs before middleware configured in the importer,
+which is rarely something to rely on. When order genuinely matters, put both in the same
+<code>apply</code> where it is visible.</p>
+
+<h2>Testing middleware</h2>
+
+<p>Middleware has the simplest test of anything in the pipeline, because its three arguments are
+plain objects:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const req = { headers: {} } as Request
+const res = { setHeader: (k: string, v: string) =&gt; { headers[k] = v } } as unknown as Response
+let called = false
+
+middleware.use(req as RequestWithId, res, () =&gt; { called = true })
+
+expect(called).toBe(true)</code></pre>
+
+<p>Asserting that <code>next()</code> was called is the one that earns its place. A middleware that
+forgets it does not error — the request simply hangs until the client times out, which in a browser
+looks like the server being slow and gives no hint where to look.</p>
+
+<p>The other worthwhile cases are the header-validation branches: a well-formed inbound id is
+echoed, and a hostile one is replaced rather than repeated.</p>
+
+<h2>When to use it</h2>
+
+<p>Middleware is right when the job has to happen for every request including rejected ones, needs
+the raw request or response, and does not need to know anything about the route.</p>
+
+<p>In practice that is a short list: request ids and correlation, security headers, CORS, body
+parsers and raw-body capture for webhook signatures, compression, and third-party integrations that
+were written as Express middleware.</p>
+
+<p>Everything else is better served further in. Authentication is a
+<a href="/nestjs/nestjs-guards">guard</a>, because a guard's answer is yes or no and it has an
+<code>ExecutionContext</code> to work with. Response shaping and outcome logging are
+<a href="/nestjs/nestjs-interceptors">interceptors</a>. Input conversion is a
+<a href="/nestjs/nestjs-pipes">pipe</a>.</p>
+
+<p>The test that settles most cases in one question: <em>does this need to run even when a guard
+rejects the request?</em> If yes, it is middleware. If no, something further in will do the job
+with better information.</p>
+
+<p>Next: <a href="/nestjs/nestjs-exception-filters">exception filters</a> — the stage at the other
+end, which catches whatever anything else threw.</p>

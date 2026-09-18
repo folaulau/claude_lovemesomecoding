@@ -1,0 +1,282 @@
+<p>One fact decides everything about an upload endpoint: <strong>the <code>Content-Type</code> is
+whatever the client typed.</strong> So is the filename, and so is the extension. None of them are
+evidence about the bytes that arrived.</p>
+
+<p>Nest handles multipart uploads through multer, wrapped in an interceptor. The wiring is four
+lines. The rest of this lesson is about what to do with the file once you have it, because that is
+the part with consequences.</p>
+
+<h2>The wiring</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Post('me/portfolio')
+@UseInterceptors(
+  FileInterceptor('file', {
+    storage: memoryStorage(),
+    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
+  }),
+)
+addPortfolioImage(
+  @CurrentUser() user: AuthenticatedUser,
+  @UploadedFile() file: Express.Multer.File | undefined,
+  @Body() dto: AddPortfolioImageDto,
+) {
+  return this.contractorsService.addPortfolioImage(user, file, dto.caption)
+}</code></pre>
+
+<p><code>FileInterceptor('file', options)</code> runs multer on the way in; the string is the
+multipart field name. <code>@UploadedFile()</code> is a parameter decorator that reads back what the
+interceptor put on the request — the same two-part pattern as
+<a href="/nestjs/nestjs-custom-decorators">lesson 9</a>, applied by a library.</p>
+
+<p>The siblings are <code>FilesInterceptor</code> for many files under one field name,
+<code>FileFieldsInterceptor</code> for several named fields, and
+<code>AnyFilesInterceptor</code>, which accepts whatever turns up and is rarely what you want.</p>
+
+<p>Other fields in the same multipart body still reach <code>@Body()</code> — but note they arrive
+as strings, because multipart has no types. A DTO with a numeric field needs
+<code>@Type(() =&gt; Number)</code> to survive.</p>
+
+<p>The parameter is typed <code>| undefined</code> on purpose. A request with no file at all is
+perfectly legal multipart, so the handler has to cope with it rather than assume.</p>
+
+<h2>memoryStorage is a security choice</h2>
+
+<p>Multer's default writes uploads to a temporary directory before any of your code runs. That is
+efficient, and it means a rejected upload <em>has already landed on disk</em>.</p>
+
+<p>With <code>memoryStorage()</code>, nothing touches the disk until the bytes have been inspected
+and a filename generated. The trade is real — the whole file sits in RAM, which is fine at 5 MB per
+request and would not be for video.</p>
+
+<p>Above roughly tens of megabytes the calculation flips, and the answer is usually neither: stream
+to object storage and keep the application out of the path entirely.</p>
+
+<h2>The limit that actually protects you</h2>
+
+<pre class="language-typescript"><code class="language-typescript">limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 }</code></pre>
+
+<p>This is the one that matters, because multer stops <em>reading</em> at the limit and errors. A
+2 GB upload costs 5 MB of memory rather than 2 GB.</p>
+
+<p>The service checks the size again:</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (file.buffer.length &gt; uploads.maxBytes) {
+  const mb = Math.round(uploads.maxBytes / (1024 * 1024))
+  throw new PayloadTooLargeException(`Images must be ${mb} MB or smaller.`)
+}</code></pre>
+
+<p>That second check runs after the bytes are already in memory, so it is the belt to multer's
+braces — worth having, and no substitute. Checking <code>buffer.length</code> rather than the
+<code>Content-Length</code> header is the same principle as the rest of this lesson: the header is
+client-supplied, the buffer is what is about to be written.</p>
+
+<p><code>files: 1</code> matters too. Without it, a hundred files of 5 MB each is a legal request.</p>
+
+<h2>Sniffing the bytes</h2>
+
+<p>The heart of it. Every real image format begins with a fixed byte sequence, and checking it
+takes twelve bytes:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const SIGNATURES: Signature[] = [
+  { type: 'image/jpeg', extension: 'jpg', magic: [0xff, 0xd8, 0xff], offset: 0 },
+  {
+    type: 'image/png',
+    extension: 'png',
+    magic: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    offset: 0,
+  },
+  {
+    type: 'image/webp',
+    extension: 'webp',
+    magic: [0x52, 0x49, 0x46, 0x46, null, null, null, null, 0x57, 0x45, 0x42, 0x50],
+    offset: 0,
+  },
+]</code></pre>
+
+<p>WebP is a RIFF container — <code>"RIFF"</code>, four bytes of length, then
+<code>"WEBP"</code> — which is why the signature has to allow gaps rather than being one contiguous
+run. <code>null</code> means "anything here".</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function sniffImageType(buffer: Buffer): SniffResult | null {
+  for (const signature of SIGNATURES) {
+    const end = signature.offset + signature.magic.length
+    if (buffer.length &lt; end) continue
+
+    const matches = signature.magic.every((byte, index) =&gt; {
+      if (byte === null) return true
+      return buffer[signature.offset + index] === byte
+    })
+
+    if (matches) return { type: signature.type, extension: signature.extension }
+  }
+  return null
+}</code></pre>
+
+<p>The length check before comparing is not defensive padding — a four-byte upload would otherwise
+read past the end of the buffer.</p>
+
+<p>Compare the version this replaces:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// The wrong way. `mimetype` is the Content-Type the CLIENT wrote in the multipart
+// part header. `curl -F "file=@shell.php;type=image/png"` sets it, and costs nothing.
+if (!file.mimetype.startsWith('image/')) {
+  throw new UnsupportedMediaTypeException('Upload an image.')
+}</code></pre>
+
+<p>It is not that this is weak. It is that it checks a value the attacker chose.</p>
+
+<h2>Generate the filename</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const filename = `${randomUUID()}.${sniffed.extension}`
+const directory = resolve(process.cwd(), uploads.directory)
+await mkdir(directory, { recursive: true })
+await writeFile(join(directory, filename), file.buffer)</code></pre>
+
+<p>The extension comes from what the bytes turned out to be, not from what the client called the
+file. And the name is generated, so a <code>file.originalname</code> of
+<code>../../etc/passwd</code> has nowhere to go — there is no path to traverse because no part of
+the path came from the request.</p>
+
+<p>Sanitising <code>originalname</code> instead is the common approach and a worse one: it is a
+denylist, and denylists for path traversal have a long history of being incomplete. Generating the
+name is not a filter that could miss a case.</p>
+
+<p>If the original name matters to users, store it in a column and serve it as a
+<code>Content-Disposition</code> header. The name on disk and the name a user sees do not have to be
+the same string.</p>
+
+<h2>Serving them back</h2>
+
+<pre class="language-typescript"><code class="language-typescript">const uploads = config.getOrThrow&lt;AppConfig['uploads']&gt;('uploads')
+app.useStaticAssets(resolve(process.cwd(), uploads.directory), { prefix: '/uploads/' })</code></pre>
+
+<p>Served as static files from a directory that now contains nothing but generated filenames with
+known-good extensions. Express's static handler does not execute anything, so even a file that lied
+about its type is only ever sent, never run.</p>
+
+<p>That is the third defence, and all three are needed. Sniffing keeps out what is not an image;
+generated names keep the path under control; static serving means execution is not on the table
+even if the first two were bypassed.</p>
+
+<p>The database stores a relative path:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const url = `/uploads/${filename}`</code></pre>
+
+<p>Storing <code>http://localhost:3001/uploads/…</code> bakes today's host into every row, and the
+day this moves behind a domain, every image 404s.</p>
+
+<h2>Deleting, and which order</h2>
+
+<pre class="language-typescript"><code class="language-typescript">await this.dataSource.getRepository(PortfolioImage).remove(image)
+// ...
+if (filename) {
+  await unlink(join(resolve(process.cwd(), uploads.directory), filename)).catch(() =&gt; {
+    // Already gone, or never written. Either way the row is what mattered.
+  })
+}</code></pre>
+
+<p>Row first, file second, and a failed unlink does not fail the request.</p>
+
+<p>The other order leaves a row pointing at a file that is gone, which renders as a broken image
+forever. This order leaves an unreferenced file on disk, which costs a few kilobytes and is
+invisible. When a cleanup has two failure modes, pick the one nobody has to look at.</p>
+
+<h2>Nest's built-in validators</h2>
+
+<p>There is a declarative option worth knowing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@UploadedFile(
+  new ParseFilePipe({
+    validators: [
+      new MaxFileSizeValidator({ maxSize: 5 * 1024 * 1024 }),
+      new FileTypeValidator({ fileType: 'image/png' }),
+    ],
+  }),
+)
+file: Express.Multer.File</code></pre>
+
+<p>It is a pipe, so it fits the pipeline properly and a missing file is a clean 400 rather than a
+check you wrote. <code>MaxFileSizeValidator</code> is genuinely useful.</p>
+
+<p>Read <code>FileTypeValidator</code>'s documentation before relying on it, though — by default it
+matches against the client-supplied mime type, which is the value this whole lesson has been about
+not trusting. Recent versions can inspect the buffer instead. When in doubt, sniff.</p>
+
+<h2>Authorizing the upload</h2>
+
+<p>Easy to overlook while concentrating on the bytes: an upload endpoint is also a write endpoint,
+and it needs the same rules as any other.</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Controller('api/v1/contractors')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(UserRole.CONTRACTOR)
+export class ContractorsController {
+  constructor(private readonly contractorsService: ContractorsService) {}
+  // ...
+}</code></pre>
+
+<p>Every route here is <code>me</code>, never <code>:contractorId</code>. The profile being edited is
+always the one in the caller's token, so there is no id to check ownership of and therefore no
+ownership check to forget — a <code>POST /contractors/:id/portfolio</code> would need that check on
+every handler, and the one that omits it is the bug.</p>
+
+<p>Worth noting where the guards sit relative to the upload. Guards run before interceptors, so an
+unauthenticated request is rejected before multer reads a single byte. Had authentication been done
+inside the handler instead, every anonymous request would cost a full 5 MB read first.</p>
+
+<h2>Testing one</h2>
+
+<p>You do not need a real image. Supertest attaches a buffer, and a valid PNG header is eight
+bytes:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+await http
+  .post('/api/v1/contractors/me/portfolio')
+  .set('Authorization', `Bearer ${luisToken}`)
+  .attach('file', png, 'photo.png')
+  .expect(201)</code></pre>
+
+<p>The interesting tests are the refusals, and they are cheap to write once you can hand over
+arbitrary bytes. A buffer of plain text named <code>photo.png</code> with a
+<code>Content-Type</code> of <code>image/png</code> must still be rejected — which is the only test
+that actually proves the sniffing is doing the work rather than the header.</p>
+
+<h2>Beyond images</h2>
+
+<p>Magic-byte sniffing works because image formats have fixed headers. Two categories do not fit
+that comfortably, and both are worth naming.</p>
+
+<p><strong>Documents that are archives.</strong> A <code>.docx</code> or <code>.xlsx</code> is a ZIP
+file, so its magic bytes say ZIP — which means sniffing tells you rather little, and the contents
+can include almost anything. Accepting them safely means never opening them in the application
+process.</p>
+
+<p><strong>SVG.</strong> It is XML, so there are no magic bytes at all, and it can contain script
+that runs when the file is viewed. An SVG served from your own domain is a stored XSS. Serve
+user-supplied SVG from a separate origin, or convert it to a raster format, or do not accept it.</p>
+
+<h2>Where the files should actually live</h2>
+
+<p>Writing to local disk is right for a demo and wrong for most deployments, and the reason is not
+capacity. A container's filesystem is ephemeral, so a redeploy loses every upload; and with more
+than one instance behind a load balancer, a file written by one is a 404 from the others.</p>
+
+<p>The usual answer is object storage — S3 or equivalent — with the application storing a key rather
+than a path. Everything in this lesson still applies: the size cap, the sniffing and the generated
+name all happen before the upload, and "served in a way that cannot execute" becomes a property of
+the bucket.</p>
+
+<p>What changes is that the bytes stop passing through your process at all, once you move to
+pre-signed URLs. That is a significant win and it moves the validation problem rather than solving
+it — a client uploading straight to a bucket is a client you have not checked, so the sniffing has
+to happen somewhere after the fact.</p>
+
+<h2>The four rules</h2>
+
+<p>Cap the size where the bytes are read, not after. Decide what the file is from its bytes, never
+from a header or an extension. Generate the stored filename rather than sanitising the supplied
+one. And serve the directory in a way that cannot execute anything.</p>
+
+<p>Next: <a href="/nestjs/nestjs-testing">testing</a> — including how to test an upload endpoint
+without a real image.</p>

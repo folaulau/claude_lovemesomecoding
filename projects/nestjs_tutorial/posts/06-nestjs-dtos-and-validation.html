@@ -1,0 +1,257 @@
+<p>A DTO is a class that describes what a request body is allowed to contain. In Nest it does two
+jobs at once: it is the TypeScript type your handler receives, and — through decorators — it is the
+validation rule set applied before your handler runs.</p>
+
+<p>It only does the second job if one line exists in <code>main.ts</code>. An application with
+beautifully annotated DTOs and no global pipe is completely unvalidated, and nothing about it looks
+wrong. That is the most important sentence in this lesson.</p>
+
+<h2>A DTO</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export class RegisterDto {
+  @IsEmail({}, { message: 'Enter a valid email address.' })
+  @MaxLength(255)
+  email: string
+
+  @IsString()
+  @MinLength(8, { message: 'Use a password of at least 8 characters.' })
+  @MaxLength(72, { message: 'Passwords are limited to 72 characters.' })
+  password: string
+
+  @IsString()
+  @Length(1, 80)
+  firstName: string
+
+  @IsString()
+  @Length(1, 80)
+  lastName: string
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  phone?: string
+
+  @IsIn([UserRole.HOMEOWNER, UserRole.CONTRACTOR], {
+    message: 'Pick whether you are a homeowner or a contractor.',
+  })
+  role: typeof UserRole.HOMEOWNER | typeof UserRole.CONTRACTOR
+}</code></pre>
+
+<p>The decorators come from <code>class-validator</code>. Each attaches a rule to a property, and
+the optional second argument replaces the library's default message with one you would show a
+user.</p>
+
+<p>Two of those rules are doing more than they appear to.</p>
+
+<p><code>@MaxLength(72)</code> on the password is not an arbitrary round number. bcrypt truncates
+its input at 72 <em>bytes</em>, so without a cap two different long passwords sharing a 72-byte
+prefix are the same password as far as the hash is concerned. Some bcrypt builds now throw on
+longer input instead, which turns a silly password into a 500. Rejecting it here makes it a clean
+400.</p>
+
+<p><code>@IsIn</code> on the role is the security boundary of the whole sign-up flow. The role is
+the one field in this body that grants power, so it is the one field an attacker will try — and the
+list deliberately omits the staff role. There is no code path anywhere in this application that
+creates a privileged account from a request.</p>
+
+<h2>The line that makes it work</h2>
+
+<pre class="language-typescript"><code class="language-typescript">app.useGlobalPipes(
+  new TrimPipe(),
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: {
+      enableImplicitConversion: false,
+    },
+  }),
+)</code></pre>
+
+<p>Those decorators are metadata. They do not run on their own; <code>ValidationPipe</code> is what
+reads them. Remove this call and every DTO in the application becomes documentation — the handler
+still receives <code>dto.email</code>, it is simply whatever the client sent.</p>
+
+<p>The failure is silent in both directions, which is what makes it dangerous. Nothing logs a
+warning, no test fails unless a test specifically posts something invalid, and the endpoints all
+work.</p>
+
+<h2>The options are the interesting part</h2>
+
+<p><strong><code>whitelist: true</code></strong> strips properties with no validation decorator. A
+request carrying <code>{"role":"staff"}</code> at a DTO with no <code>role</code> field arrives at
+the service without it. This is the option that turns your DTO into a genuine allowlist rather than
+a suggestion.</p>
+
+<p><strong><code>forbidNonWhitelisted: true</code></strong> goes further and rejects the request
+outright instead of quietly dropping the field. Louder, and it converts "why was my field ignored"
+into an error that names the field. Its value is visible in this application's own test suite,
+which asserts that posting a <code>homeownerId</code> is a 400 mentioning that property — proof
+that the actor cannot be set from the body.</p>
+
+<p><strong><code>transform: true</code></strong> runs <code>class-transformer</code>, which turns
+the plain parsed object into an actual instance of the DTO class. Without it your handler receives
+an object shaped like a <code>RegisterDto</code> that is not one — and, more practically, any
+<code>@Type()</code> decorator does nothing.</p>
+
+<p><strong><code>enableImplicitConversion: false</code></strong> keeps that conversion explicit.
+With it on, class-transformer coerces values to match the declared property types everywhere, which
+means <code>"abc"</code> quietly becoming <code>NaN</code> for a number field. Off, conversion
+happens only where a <code>@Type</code> decorator asks for it.</p>
+
+<h2>@Type, and when you need it</h2>
+
+<pre class="language-typescript"><code class="language-typescript">@Type(() =&gt; Number)
+@IsNumber({}, { message: 'Enter a budget in whole dollars.' })
+@Min(0)
+budgetMin: number</code></pre>
+
+<p>A JSON body already carries numbers, so for a JSON API this looks redundant. It stops being
+redundant the moment a request arrives form-encoded or the value comes from a query string, where
+everything is a string — <code>@IsNumber()</code> would reject <code>"1800"</code>.
+<code>@Type</code> converts before validation runs.</p>
+
+<p>The opposite decision is worth seeing too:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@IsISO8601({ strict: true }, { message: 'Pick a start date.' })
+preferredStartDate: string</code></pre>
+
+<p>Validated as a date <em>string</em> and kept as one. Declaring it <code>Date</code> would have
+class-transformer parse <code>"2026-09-10"</code> as UTC midnight, and Postgres would then store
+whatever local day that lands on — reintroducing exactly the timezone bug the <code>date</code>
+column type exists to avoid. The rule of thumb: convert when the wire format is lossy, and not when
+the string is already the value you want.</p>
+
+<h2>Nested objects and arrays</h2>
+
+<p>Validation does not recurse by default, and the failure is quiet. A DTO with an object property
+validates that the property exists and nothing about what is inside it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">class CreateThingDto {
+  // The wrong way: `address` is checked for being an object and no further.
+  // Every rule inside AddressDto is skipped, silently.
+  @IsObject()
+  address: AddressDto
+}</code></pre>
+
+<p>Making it recurse takes two decorators, and both are required:
+<code>@ValidateNested()</code> tells class-validator to descend, and <code>@Type()</code> tells
+class-transformer which class to build — without it there is no instance carrying the metadata to
+validate against.</p>
+
+<pre class="language-typescript"><code class="language-typescript">@ValidateNested()
+@Type(() =&gt; AddressDto)
+address: AddressDto
+
+@ValidateNested({ each: true })
+@Type(() =&gt; LineItemDto)
+items: LineItemDto[]</code></pre>
+
+<p>Arrays of primitives have a simpler form — <code>@IsUUID('4', { each: true })</code> applies the
+rule to every element. This application uses that for the list of trades on a contractor profile,
+and then checks in the service that the ids resolve to real categories, because "is a UUID" and
+"exists" are different questions and only one of them is answerable here.</p>
+
+<h2>Reusing DTOs without repeating them</h2>
+
+<p>An update DTO is usually a create DTO with everything optional, and copying the class to add
+<code>@IsOptional()</code> everywhere leaves two definitions that drift. Nest ships mapped types
+for this:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class UpdateProjectDto extends PartialType(CreateProjectDto) {}
+
+// also: PickType, OmitType, IntersectionType
+export class ProjectSummaryDto extends PickType(CreateProjectDto, ['title', 'city'] as const) {}</code></pre>
+
+<p><code>PartialType</code> copies every property and its validation rules, then adds
+<code>@IsOptional()</code> to each. A rule added to the parent appears in the child automatically,
+which is the point.</p>
+
+<p>Use them where the relationship is genuinely "the same fields, weaker requirements". Where an
+update legitimately accepts a different set of fields from a create — as it does in this
+application, because a contractor profile is created by the system and only ever updated by its
+owner — two explicit classes say more than a derived one.</p>
+
+<h2>What validation cannot express</h2>
+
+<p>The limit is easy to state: a decorator sees one property, and knows nothing about the other
+properties, the database, or who is asking.</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (dto.budgetMax &lt; dto.budgetMin) {
+  throw new BadRequestException('The top of the budget cannot be below the bottom of it.')
+}</code></pre>
+
+<p>That comparison needs two fields, so it lives in the service. So does every rule that needs a
+query — that the category exists, that the project still accepts bids, that this contractor works
+in that trade. The DTO's job is to guarantee the shape; the service's job is to decide whether the
+request makes sense.</p>
+
+<p>Drawing that line consistently is what keeps DTOs readable. When a validation decorator starts
+needing context, it has stopped being validation.</p>
+
+<h2>Response DTOs are a separate idea</h2>
+
+<p>A request DTO says what may come in. Nothing about it says what goes out, and using an entity
+for that is how a password hash ends up in a response.</p>
+
+<p>This application maps explicitly on the way out:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function toUserSummaryDto(user: User) {
+  return {
+    id: user.publicId,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    avatarUrl: user.avatarUrl,
+  }
+}</code></pre>
+
+<p>Nothing that renders a byline needs an email address, so nothing that renders one is given it.
+The mappers are plain functions rather than classes because they have no dependencies — and being
+plain functions, the compiler checks them.</p>
+
+<p>The alternative Nest offers is <code>ClassSerializerInterceptor</code> plus
+<code>@Exclude()</code> on entity fields, which is less code. It also inverts the default: every
+column is public unless someone remembered to mark it. Both are defensible; for a table with a
+password hash in it, the allowlist is the safer default.</p>
+
+<h2>Error messages are user interface</h2>
+
+<p>Every rule in <code>RegisterDto</code> carries a custom message, and that is deliberate rather
+than decorative. The library's defaults are accurate and unusable:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">role must be one of the following values: homeowner, contractor
+password must be longer than or equal to 8 characters</code></pre>
+
+<p>versus what this application says:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Pick whether you are a homeowner or a contractor.
+Use a password of at least 8 characters.</code></pre>
+
+<p>The first pair leaks the property names and the enum values to whoever is probing; the second
+tells a person what to do. Since the messages arrive as an array in the response body, a form can
+show them directly — so writing them badly means either shipping developer text to users, or
+maintaining a second copy of every message in the client.</p>
+
+<p>Not every rule needs one. The DTOs here leave <code>@Length(1, 80)</code> on a first name with
+its default, because that field's failure mode is obvious and the message is only ever seen by
+someone hand-crafting a request. Spend the effort on the rules a real user will hit.</p>
+
+<p>One more option worth knowing: <code>disableErrorMessages: true</code> strips the messages from
+responses entirely. It is sometimes recommended for production on the grounds that messages leak
+property names. Weigh it against the cost — a client that can no longer tell a user which field is
+wrong — and prefer writing messages that are safe to show over hiding all of them.</p>
+
+<h2>Validation as a spec</h2>
+
+<p>The habit worth forming is treating the DTO as the definition of the endpoint's contract. Read
+<code>RegisterDto</code> and you know exactly what a sign-up accepts, what it rejects, and what a
+user sees when they get it wrong — without reading the service, the controller or the tests.</p>
+
+<p>That only holds if the rules are complete. A field with a type annotation and no decorator is
+worse than useless under <code>whitelist: true</code>: it is silently stripped, so the handler
+receives <code>undefined</code> and the reason is invisible. Every property in a DTO wants at
+least one decorator, and <code>@IsOptional()</code> is how you say a property may be absent
+without giving up the rules that apply when it is present.</p>
+
+<p>Next: <a href="/nestjs/nestjs-pipes">pipes</a> — what <code>ValidationPipe</code> actually is,
+the built-in ones worth knowing, and a custom pipe written to fix a real bug in the DTOs above.</p>

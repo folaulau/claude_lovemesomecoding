@@ -1,0 +1,271 @@
+<p>Two kinds of custom decorator are worth writing, and they solve different problems. One pulls a
+value out of the request so your handler can declare it as a parameter. The other attaches data to
+a route so something else in the pipeline can read it back.</p>
+
+<p>Both are small. Both remove a category of repetition that otherwise accumulates in every
+controller.</p>
+
+<h2>Parameter decorators</h2>
+
+<p>Every handler in this application that needs to know who is calling declares it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Get('me')
+@UseGuards(JwtAuthGuard)
+me(@CurrentUser() user: AuthenticatedUser) {
+  return user
+}</code></pre>
+
+<p><code>@CurrentUser()</code> is not built in. It is nine lines:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const CurrentUser = createParamDecorator(
+  (_data: unknown, context: ExecutionContext): AuthenticatedUser =&gt; {
+    const request = context.switchToHttp().getRequest&lt;Request &amp; { user?: AuthenticatedUser }&gt;()
+    return request.user as AuthenticatedUser
+  },
+)</code></pre>
+
+<p><code>createParamDecorator</code> takes a function and returns a decorator. The function
+receives whatever was passed at the call site as <code>data</code>, plus the
+<code>ExecutionContext</code>, and whatever it returns becomes the parameter's value.</p>
+
+<p>Compare the alternative, written out in every handler that needs the caller:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// The wrong way, repeated in a dozen controllers.
+create(@Req() req: Request &amp; { user?: AuthenticatedUser }, @Body() dto: CreateProjectDto) {
+  const user = req.user as AuthenticatedUser
+  return this.projectsService.create(user, dto)
+}</code></pre>
+
+<p>Three costs, and the third is the one that matters. The handler now takes a request object, so
+calling it from a test means constructing one. The cast is repeated everywhere, so the day the
+shape changes there are a dozen places to fix. And the handler's signature no longer says what it
+depends on — <code>@CurrentUser() user: AuthenticatedUser</code> is a statement about the method's
+inputs; <code>@Req() req</code> is a statement that it might use anything.</p>
+
+<h2>Using the data argument</h2>
+
+<p>The first parameter is whatever the decorator was called with, which lets one decorator serve
+several uses:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const CurrentUserField = createParamDecorator(
+  (field: keyof AuthenticatedUser | undefined, context: ExecutionContext) =&gt; {
+    const request = context.switchToHttp().getRequest&lt;Request &amp; { user?: AuthenticatedUser }&gt;()
+    const user = request.user as AuthenticatedUser
+    return field ? user[field] : user
+  },
+)
+
+// @CurrentUserField() user: AuthenticatedUser
+// @CurrentUserField('id') userId: string</code></pre>
+
+<p>This is exactly how Nest's own <code>@Body()</code> works: <code>@Body()</code> gives the whole
+body, <code>@Body('email')</code> gives one property.</p>
+
+<p>Whether it is an improvement depends on the codebase. This application deliberately does not do
+it — every handler takes the whole <code>AuthenticatedUser</code> and passes it to a service,
+because the services want more than one field and a handler that destructures the caller into
+three parameters is harder to read, not easier.</p>
+
+<h2>The rule that comes with it</h2>
+
+<p><code>@CurrentUser()</code> reads what <code>JwtAuthGuard</code> put on the request. On a route
+with no guard, <code>request.user</code> is <code>undefined</code>, and the cast means nothing
+complains until the first property access.</p>
+
+<p>That failure is a <code>TypeError</code> — a 500, not an authentication bypass, because there is
+no user to impersonate. But it is a confusing 500, so the rule is simple and worth stating in the
+code: this decorator and <code>@UseGuards(JwtAuthGuard)</code> always appear together.</p>
+
+<p>You could make the decorator throw when the user is missing, which turns a confusing 500 into a
+clear one. What you cannot do is make it safe — a decorator cannot enforce that a guard ran, and
+pretending otherwise would be worse than the honest cast.</p>
+
+<h2>Metadata decorators</h2>
+
+<p>The second kind attaches data to a route rather than extracting it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const ROLES_KEY = 'contractor:roles'
+
+export const Roles = (...roles: UserRole[]) =&gt; SetMetadata(ROLES_KEY, roles)</code></pre>
+
+<p>One line of behaviour. <code>SetMetadata</code> attaches a value to the handler under a key, and
+that is all — it enforces nothing. Applied to a route it looks like this:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Post()
+@Roles(UserRole.HOMEOWNER)
+create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateProjectDto) {
+  return this.projectsService.create(user, dto)
+}</code></pre>
+
+<p>Nothing has happened yet. The metadata sits on the method waiting for something to read it.</p>
+
+<h2>Reading it back with Reflector</h2>
+
+<p>The other half is a guard:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const required = this.reflector.getAllAndOverride&lt;UserRole[] | undefined&gt;(ROLES_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ])
+
+    if (!required || required.length === 0) return true
+
+    const request = context.switchToHttp().getRequest&lt;Request &amp; { user?: AuthenticatedUser }&gt;()
+    const user = request.user
+
+    if (!user || !required.includes(user.role)) {
+      throw new ForbiddenException('Your account cannot do that.')
+    }
+    return true
+  }
+}</code></pre>
+
+<p><code>Reflector</code> is a provider Nest supplies for reading metadata.
+<code>getAllAndOverride</code> looks in the targets in order and returns the first value it finds,
+so a method-level <code>@Roles</code> wins over a class-level one. Plain <code>get</code> would only
+ever look at one of the two, which is exactly the bug that makes an override silently not
+override.</p>
+
+<p>Its sibling <code>getAllAndMerge</code> combines them instead — the right choice when the
+metadata is additive, like a list of required permissions rather than a replacement set.</p>
+
+<p>The line that decides how the whole scheme behaves is the third one:</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (!required || required.length === 0) return true</code></pre>
+
+<p>No decorator means no role requirement, so the route is open to any signed-in user. Returning
+<code>false</code> there would 403 every unannotated endpoint — including
+<code>PATCH /projects/:id/status</code>, which deliberately has no <code>@Roles</code> because its
+rules depend on the row. That would present as "status transitions are broken" and send you
+looking in entirely the wrong place.</p>
+
+<h2>Why this indirection is worth it</h2>
+
+<p>The alternative is a role check written inline in each handler. It works, and it goes wrong in a
+specific way: a check written twelve times is a check that eventually disagrees with itself. One
+handler compares against a string literal that has drifted, another was added without a check at
+all, and none of it is visible from outside the method body.</p>
+
+<p>With the decorator, every route's requirement is declared where the route is declared, one guard
+enforces all of them, and adding a role means changing an enum and one decorator — not auditing a
+dozen conditionals.</p>
+
+<p>It also makes the requirement testable in isolation, because the metadata and the enforcement
+are separate objects. That is what lets the guard's own tests set up a handler carrying arbitrary
+metadata without any of the application present.</p>
+
+<h2>Composing decorators</h2>
+
+<p>When several decorators always travel together, <code>applyDecorators</code> makes one out of
+them:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export function ContractorOnly() {
+  return applyDecorators(
+    UseGuards(JwtAuthGuard, RolesGuard),
+    Roles(UserRole.CONTRACTOR),
+  )
+}
+
+// @ContractorOnly()
+// @Post()
+// create(...) {}</code></pre>
+
+<p>The gain is that the guard order — which is load-bearing, as
+<a href="/nestjs/nestjs-guards">lesson 8</a> covers — is written once and cannot be got wrong at a
+call site.</p>
+
+<p>The cost is a layer of indirection: a reader now has to open <code>ContractorOnly</code> to find
+out what protects the route. This application does not use it, because with two guards and one
+decorator the explicit version is short enough to read at a glance. It earns its place when the
+combination is four or five decorators, or when it also carries OpenAPI annotations.</p>
+
+<h2>Decorators are evaluated once</h2>
+
+<p>The thing that catches people is when the code inside a decorator runs.</p>
+
+<p>A decorator's arguments are evaluated at <strong>class definition time</strong> — once, at
+startup, as the module is loaded. The function you pass to
+<code>createParamDecorator</code> runs per request; everything outside it does not.</p>
+
+<pre class="language-typescript"><code class="language-typescript">// The wrong way. `Date.now()` is evaluated once when the class is defined, so every
+// request gets the timestamp of application startup.
+export const RequestTime = createParamDecorator(
+  (_data: unknown, _context: ExecutionContext) =&gt; startedAt,
+)
+const startedAt = Date.now()</code></pre>
+
+<p>The same reasoning explains why <code>@Roles(UserRole.CONTRACTOR)</code> cannot consult the
+database: it is a value computed at startup and attached to a method. Anything that varies per
+request has to be read inside the guard, or inside the parameter decorator's callback.</p>
+
+<h2>Testing them</h2>
+
+<p>A parameter decorator's factory is a plain function, but <code>createParamDecorator</code> wraps
+it and does not hand it back. In practice you test the two kinds differently.</p>
+
+<p>For a metadata decorator, assert the metadata is attached — using the same
+<code>Reflector</code> that will read it:</p>
+
+<pre class="language-typescript"><code class="language-typescript">it('reads the metadata from the handler and the class, so a method-level @Roles can win', () =&gt; {
+  const spy: Array&lt;unknown[]&gt; = []
+  const original = reflector.getAllAndOverride.bind(reflector)
+  reflector.getAllAndOverride = ((key: string, targets: unknown[]) =&gt; {
+    spy.push([key, targets])
+    return original(key, targets as never)
+  }) as typeof reflector.getAllAndOverride
+
+  guard.canActivate(contextFor([UserRole.HOMEOWNER], homeowner))
+
+  expect(spy).toHaveLength(1)
+  expect(spy[0][0]).toBe(ROLES_KEY)
+  expect(spy[0][1]).toHaveLength(2)
+})</code></pre>
+
+<p>That the guard asks for <em>two</em> targets is the assertion doing real work: it is what makes a
+method-level decorator override a class-level one, and dropping to a single target would be a
+silent behaviour change.</p>
+
+<p>For a parameter decorator, the practical route is an end-to-end test of a route that uses it,
+since what you actually care about is that it and its guard cooperate.</p>
+
+<h2>Naming the metadata key</h2>
+
+<pre class="language-typescript"><code class="language-typescript">export const ROLES_KEY = 'contractor:roles'</code></pre>
+
+<p>Namespaced, and exported rather than repeated as a literal. Metadata keys share one global space
+per target, so a bare <code>'roles'</code> can collide with a library using the same word — and the
+collision is silent, because whoever writes last wins and both sides look correct.</p>
+
+<p>Exporting the constant means the decorator and the guard cannot drift: a typo in one of two
+string literals is a runtime failure that presents as "the decorator does nothing", while a typo in
+an imported identifier does not compile.</p>
+
+<h2>Decorators the ecosystem gives you</h2>
+
+<p>Once you recognise the metadata pattern you start seeing it everywhere, and that is the practical
+payoff of this lesson. <code>@CacheKey</code> and <code>@CacheTTL</code> attach values a caching
+interceptor reads. <code>@Throttle</code> attaches limits a rate-limiting guard reads.
+<code>@ApiProperty</code> attaches documentation a Swagger module reads at startup.</p>
+
+<p>All of them are <code>SetMetadata</code> under a namespaced key, plus something in the pipeline
+holding a <code>Reflector</code>. None of them do anything on their own — which is why a
+<code>@Throttle</code> with no <code>ThrottlerGuard</code> registered silently has no effect, and
+why that is a confusing bug until you know the shape.</p>
+
+<h2>The distinction to keep</h2>
+
+<p><code>createParamDecorator</code> is for reading something out of the request into a parameter.
+<code>SetMetadata</code> plus <code>Reflector</code> is for describing a route so that a guard,
+interceptor or filter can act on it.</p>
+
+<p>The second one is worth recognising in the wild, because it is the mechanism behind most of the
+declarative behaviour in Nest and in libraries built on it — including caching TTLs, rate limits,
+API documentation and role checks. Once you have written one, all of them read the same way.</p>
+
+<p>Next: <a href="/nestjs/nestjs-interceptors">interceptors</a> — the only stage that sees a request
+on the way in and the response on the way out.</p>

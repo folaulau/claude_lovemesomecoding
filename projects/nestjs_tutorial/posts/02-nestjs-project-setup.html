@@ -1,0 +1,305 @@
+<p>Starting a Nest project takes one command. Understanding what that command produced — and which
+of the settings it wrote are load-bearing rather than taste — takes a little longer, and it is the
+difference between a project that works and one that fails at startup with an error nobody can
+read.</p>
+
+<h2>Creating the project</h2>
+
+<pre class="language-bash"><code class="language-bash">npm i -g @nestjs/cli
+nest new contractor-nestjs-backend</code></pre>
+
+<p>The CLI asks for a package manager and then scaffolds a working application: a module, a
+controller, a service, a bootstrap file, TypeScript configuration, and a test setup. Run it:</p>
+
+<pre class="language-bash"><code class="language-bash">npm run start:dev</code></pre>
+
+<p>Nest starts on port 3000 in watch mode. The startup log is worth reading rather than scrolling
+past, because it is a live description of what the framework found:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">[NestFactory] Starting Nest application...
+[InstanceLoader] AppModule dependencies initialized
+[InstanceLoader] TypeOrmCoreModule dependencies initialized
+[RoutesResolver] AuthController {/api/v1/auth}:
+[RouterExplorer] Mapped {/api/v1/auth/register, POST} route
+[RouterExplorer] Mapped {/api/v1/auth/login, POST} route
+[RouterExplorer] Mapped {/api/v1/auth/me, GET} route
+[NestApplication] Nest application successfully started</code></pre>
+
+<p>Every route Nest believes exists is listed. When a route 404s that you are sure you wrote, this
+log settles it in two seconds — either it is not there, in which case the controller is not in a
+module, or it is there at a path you did not expect.</p>
+
+<h2>What is in the folder</h2>
+
+<p>The scaffold is deliberately small. What matters is the shape it suggests, because it is the
+shape every Nest codebase ends up with:</p>
+
+<pre class="language-bash"><code class="language-bash">src/
+  main.ts              bootstrap: create the app, apply globals, listen
+  app.module.ts        the root module - composition only
+  common/              guards, pipes, interceptors, filters, decorators
+  config/              every environment variable, parsed once
+  database/            entities, migrations, the DataSource
+  auth/                one folder per area of the domain
+  projects/            controller + service + dto/ + module
+  quotes/
+test/
+  rules.e2e-spec.ts    tests that boot the whole application</code></pre>
+
+<p>Two conventions in there are worth adopting on purpose. <code>common/</code> holds the pieces
+of the request pipeline that are not specific to any one feature — everything the middle third of
+this track is about. And each domain folder is self-contained: controller, service, DTOs and the
+module that binds them, so a feature is one directory rather than four parallel trees you have to
+navigate in step.</p>
+
+<p>Nest does not enforce any of this. The CLI generates into it, which is a strong enough nudge
+that most projects look alike — and that sameness is a real benefit when you join one.</p>
+
+<h2>What the CLI gives you afterwards</h2>
+
+<p>The scaffolding command is a small part of it. The generator is the part you keep using:</p>
+
+<pre class="language-bash"><code class="language-bash">nest g module projects
+nest g controller projects
+nest g service projects
+
+# or all three plus a DTO folder, wired together
+nest g resource projects</code></pre>
+
+<p>These are not just file templates. <code>nest g controller projects</code> also edits
+<code>projects.module.ts</code> to add the controller to its <code>controllers</code> array —
+which is the step people forget when creating files by hand, and the reason their new route does
+not appear in the startup log.</p>
+
+<h2>The generated configuration</h2>
+
+<p><code>nest-cli.json</code> is small and rarely needs changing:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "src",
+  "compilerOptions": {
+    "deleteOutDir": true
+  }
+}</code></pre>
+
+<p><code>deleteOutDir</code> earns its place. Without it, a file you delete from
+<code>src/</code> leaves its compiled output in <code>dist/</code> forever, and since the running
+app loads <code>dist/</code>, a module you deleted keeps running.</p>
+
+<h2>main.ts is where the application is assembled</h2>
+
+<p>Everything that applies to the whole application, rather than to one route, is applied in the
+bootstrap function:</p>
+
+<pre class="language-typescript"><code class="language-typescript">async function bootstrap() {
+  const app = await NestFactory.create&lt;NestExpressApplication&gt;(AppModule)
+  const config = app.get(ConfigService&lt;AppConfig&gt;)
+  // ...
+  const port = config.getOrThrow&lt;number&gt;('port')
+  await app.listen(port)
+  // ...
+}
+
+await bootstrap()</code></pre>
+
+<p><code>NestFactory.create</code> does the expensive work: it walks the module graph from the
+root, instantiates every provider in dependency order, and builds the routing table. All of that
+happens once, at startup — which is why a dependency that cannot be resolved is a startup failure
+rather than a runtime one, and why the per-request cost of injection is close to nothing.</p>
+
+<p><code>app.get(...)</code> is the escape hatch for reaching into the container from outside it.
+It is the right tool here, in bootstrap code that is not itself a provider, and the wrong tool
+almost everywhere else — reaching for it inside a service means doing by hand what the constructor
+would have done for you.</p>
+
+<h2>The tsconfig flags that are not optional</h2>
+
+<p>Most of a generated <code>tsconfig.json</code> is preference. Two entries are not:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
+  }
+}</code></pre>
+
+<p><code>experimentalDecorators</code> is what makes <code>@Controller</code> and
+<code>@Injectable</code> legal syntax. <code>emitDecoratorMetadata</code> is the one worth
+understanding, because it is why dependency injection works at all.</p>
+
+<p>TypeScript types are erased at compile time. So when Nest sees this constructor, there is
+nothing left at runtime to say what <code>authService</code> is:</p>
+
+<pre class="language-typescript"><code class="language-typescript">constructor(private readonly authService: AuthService) {}</code></pre>
+
+<p>With <code>emitDecoratorMetadata</code> on, the compiler emits an extra call alongside the
+class recording the constructor's parameter types as real runtime values. Nest reads that list and
+resolves each entry against its container. Turn the flag off and every injection fails with a
+message about being unable to resolve a dependency at index 0 — the type information the
+container needed was never emitted.</p>
+
+<p>The full configuration this project uses is worth reading once:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "resolvePackageJsonExports": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "ES2023",
+    "sourceMap": true,
+    "outDir": "./dist",
+    "incremental": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "types": ["vitest/globals", "node"]
+  }
+}</code></pre>
+
+<p><code>strictPropertyInitialization: false</code> deserves a note, because turning off a strict
+check normally deserves suspicion. An entity or DTO class declares
+<code>email: string</code> with no initialiser, because the value is assigned by TypeORM or
+class-transformer rather than by a constructor. With the check on, every one of those properties
+needs a <code>!</code> suffix, on every field of every entity, to assert something the framework
+guarantees. This is the rare case where the check is measuring the wrong thing.</p>
+
+<h2>The ESM trap</h2>
+
+<p>This project sets <code>"type": "module"</code> in <code>package.json</code> and
+<code>moduleResolution: nodenext</code> above. That combination is increasingly the default, and
+it has one consequence that catches everybody exactly once:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { AppModule } from './app.module.js'
+import { TrimPipe } from './common/pipes/trim.pipe.js'
+import type { AppConfig } from './config/configuration.js'</code></pre>
+
+<p>Every relative import ends in <code>.js</code>, even though the file sitting next to it is
+<code>app.module.ts</code>. That is correct, and it is not a workaround.</p>
+
+<p>Node's ESM resolver does not guess extensions the way CommonJS did. An import specifier has to
+name the file that will exist <em>at runtime</em> — and at runtime you are running compiled
+JavaScript out of <code>dist/</code>, so the file is <code>app.module.js</code>. TypeScript
+understands this and resolves the <code>.js</code> specifier back to the <code>.ts</code> source
+when type-checking.</p>
+
+<p>Leave the extension off and nothing complains. It type-checks. It builds. Then it dies on
+startup:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Error [ERR_MODULE_NOT_FOUND]: Cannot find module
+'/app/dist/app.module' imported from /app/dist/main.js
+Did you mean to import "./app.module.js"?</code></pre>
+
+<p>The message is unusually helpful. The confusion is that it appears after a clean build, in a
+file you did not touch, and only when you run the compiled output — so it never shows up while you
+are editing.</p>
+
+<h2>Two more ESM consequences</h2>
+
+<p>The same choice shapes two things you will meet later in this track. First, TypeORM entities and
+migrations are listed as imported classes rather than glob patterns:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const ENTITIES = [
+  User,
+  ContractorProfile,
+  ServiceCategory,
+  PortfolioImage,
+  Project,
+  Quote,
+  Review,
+]</code></pre>
+
+<p>Every TypeORM tutorial shows a glob like <code>dist/**/*.entity.js</code>. Globs do not resolve
+reliably under ESM, and the failure is not an error — it is an empty entity list, which surfaces
+much later as <em>"No metadata for User was found"</em>. Explicit imports also mean a renamed file
+breaks the build rather than the app.</p>
+
+<p>Second, the TypeORM CLI runs against <code>dist/</code>:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "scripts": {
+    "build": "nest build",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main",
+    "migration:run": "npm run build && node ./node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js",
+    "test": "vitest run",
+    "test:e2e": "vitest run --config ./vitest.config.e2e.ts"
+  }
+}</code></pre>
+
+<p>Note <code>npm run build &amp;&amp;</code> at the front of the migration script. There is no
+working <code>ts-node</code> loader for ESM plus decorators plus
+<code>emitDecoratorMetadata</code>, and without that metadata TypeORM cannot read the entities at
+all. Building first is the price. It is also why <code>npm run migration:run</code> feels slow.</p>
+
+<h2>Which build runs when</h2>
+
+<p>There are two <code>tsconfig</code> files, and the split is not decoration:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./src"
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
+}</code></pre>
+
+<p><code>tsconfig.build.json</code> is what <code>nest build</code> uses, and it excludes the
+tests. Without that exclusion <code>rootDir</code> would have to widen to cover
+<code>test/</code>, every compiled path would shift down a directory, and
+<code>node dist/main</code> would stop finding anything. Your editor and
+<code>tsc --noEmit</code> keep using the wider <code>tsconfig.json</code>, so test files are still
+type-checked — they are simply not shipped.</p>
+
+<h2>Three startup errors and what they mean</h2>
+
+<p>Almost every failure in a fresh Nest project is one of these, and each has a single cause.</p>
+
+<p><strong><code>ERR_MODULE_NOT_FOUND</code>, naming a file that plainly exists.</strong> A
+relative import is missing its <code>.js</code> extension. The message usually suggests the fix
+itself.</p>
+
+<p><strong><code>Nest can't resolve dependencies of the X (?)</code>.</strong> Either the provider
+is not in any module's <code>providers</code> array, or it is in one that has not exported it. The
+message names the context it looked in, which tells you which of the two it is.</p>
+
+<p><strong>A route that 404s and is absent from the startup log.</strong> The controller is not in
+a module's <code>controllers</code> array — creating the file is not enough. This is what
+<code>nest g controller</code> does for you and doing it by hand does not.</p>
+
+<h2>Configuration lives in the environment</h2>
+
+<p>The last piece of a working setup is an <code>.env.example</code> that documents every variable
+the app reads:</p>
+
+<pre class="language-bash"><code class="language-bash">CONTRACTOR_PORT=3001
+CONTRACTOR_DB_HOST=localhost
+CONTRACTOR_DB_PORT=5434
+CONTRACTOR_DB_USER=contractor
+CONTRACTOR_DB_NAME=contractor
+CONTRACTOR_JWT_EXPIRES_IN=7d
+CONTRACTOR_UPLOAD_MAX_BYTES=5242880
+CONTRACTOR_CORS_ORIGINS=http://localhost:5177</code></pre>
+
+<p>In this project every one of those values is also a default in code, so a fresh clone runs with
+no <code>.env</code> file to create first. That is a deliberate choice and
+<a href="/nestjs/nestjs-configuration">lesson 14</a> covers what it costs and what it buys.</p>
+
+<p>One habit worth forming now: keep <code>npm run start:dev</code> running in a terminal you can
+see. Nest's watch mode restarts on every save and reprints the route table, so a controller that
+stops being registered, a provider that stops resolving, or a path you typed wrong shows up within
+a second of the save that caused it — rather than the next time you happen to call the endpoint.
+Almost every error in this lesson is one you find immediately or half an hour later, and the
+difference is whether that log is on screen.</p>
+
+<p>With a project that starts, the next thing to understand is how its pieces are grouped —
+which is <a href="/nestjs/nestjs-modules">modules</a>.</p>

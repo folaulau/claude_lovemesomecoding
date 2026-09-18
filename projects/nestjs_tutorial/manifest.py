@@ -13,7 +13,13 @@ Dates are COMPUTED from START_DATE + STEP_DAYS rather than hand-written, so re-b
 track is one edit.
 """
 
+import os
+import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parent.parent
 
 CATEGORY = {
     "slug": "nestjs",
@@ -52,6 +58,92 @@ NAV_GROUP = "JavaScript"
 # 14. `git status` calling it untracked was never evidence of anything.)
 DEMO_APP = "lovemesomecoding_demo_project/contractor"
 BE = "contractor-nestjs-backend"
+
+# The repo the demo apps live in. ⚠️ It is a SEPARATE git repository nested inside this one, which
+# is why the outer `.gitignore` line 14 ignores the whole directory.
+DEMO_REPO = _REPO_ROOT / "lovemesomecoding_demo_project"
+
+# The branch the contractor app is committed on.
+DEMO_BRANCH = "contractor-marketplace"
+
+
+def app_root() -> Path:
+    """Where the contractor app's files actually are right now.
+
+    ⚠️ This is not the pedantry it looks like. The contractor app is committed on a BRANCH of the
+    demo repo — `contractor-marketplace` — and `main` carries only the built `dist/` and a
+    committed `node_modules/`. So on 2026-09-05, mid-way through writing this track, that repo was
+    committed and switched to `main`, and the documented path went from 102 quotable files to
+    zero in between two runs of check_snippets.py.
+
+    Nothing was lost and nothing was broken. What was alarming is what the checkers DID about it:
+    `check_snippets.py` reported every post's blocks as "quoted from an undeclared file" — a
+    confusing way to say "I could not find the app at all" — and had the track been complete it
+    would have failed on a match rate of 0%. A check that reads an empty directory and reports
+    findings about the content is worse than one that stops.
+
+    Resolution order:
+      1. $CONTRACTOR_APP — an explicit override, for a copy anywhere.
+      2. The documented path, but only if it really holds the backend source.
+      3. A git worktree of DEMO_BRANCH, which is how to read the app without disturbing whatever
+         branch the demo repo is on.
+
+    Raises if none of them work, naming the fix.
+    """
+    override = os.environ.get("CONTRACTOR_APP")
+    if override:
+        candidate = Path(override).expanduser().resolve()
+        if _has_backend(candidate):
+            return candidate
+        raise SystemExit(f"CONTRACTOR_APP={override!r} does not contain {BE}/src")
+
+    documented = _REPO_ROOT / DEMO_APP
+    if _has_backend(documented):
+        return documented
+
+    worktree = _branch_worktree()
+    if worktree is not None:
+        return worktree
+
+    raise SystemExit(
+        f"the contractor app is not at {documented}.\n"
+        f"It is committed on the {DEMO_BRANCH!r} branch of {DEMO_REPO}, and that repo is "
+        f"currently on {_current_branch() or 'an unknown branch'!r}.\n"
+        "Either check that branch out, or add a worktree and let this find it:\n"
+        f"    git -C {DEMO_REPO} worktree add /tmp/contractor-app {DEMO_BRANCH}\n"
+        "or point $CONTRACTOR_APP at a copy."
+    )
+
+
+def _has_backend(path: Path) -> bool:
+    """A directory only counts if the backend source is in it — an empty `contractor/` holding
+    nothing but a gitignored `dist/` is exactly the trap this whole function exists for."""
+    return (path / BE / "src").is_dir()
+
+
+def _git(*args: str) -> str:
+    try:
+        return subprocess.run(("git", "-C", str(DEMO_REPO), *args),
+                              capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _current_branch() -> str:
+    return _git("branch", "--show-current").strip()
+
+
+def _branch_worktree() -> Path | None:
+    """A checked-out worktree of DEMO_BRANCH, if one exists."""
+    path = None
+    for line in _git("worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):])
+        elif line.strip() == f"branch refs/heads/{DEMO_BRANCH}" and path is not None:
+            candidate = path / "contractor"
+            if _has_backend(candidate):
+                return candidate
+    return None
 
 # ---------------------------------------------------------------------------
 # What this track ADDED to the app
@@ -118,8 +210,20 @@ ESM_NOTE = True
 # Folau asked for 8-10 reading-minutes (2026-09-05), the same budget as the TypeScript track.
 WORDS_PER_MINUTE = 220
 TARGET_MINUTES = (8, 10)
-TOTAL_WORDS_MIN = TARGET_MINUTES[0] * WORDS_PER_MINUTE   # 1,760
-TOTAL_WORDS_MAX = TARGET_MINUTES[1] * WORDS_PER_MINUTE   # 2,200
+
+# ⚠️ The published reading time ROUNDS: `readingMinutes = max(1, round(words / 220))`. So the
+# word count at which a post starts publishing as "8 min read" is 7.5 * 220, not 8 * 220.
+#
+# This was got wrong first time round, and the mistake is worth recording because it produced
+# fifteen warnings about posts that were already inside the budget Folau asked for. Deriving a
+# word floor from the target minutes and forgetting the rounding makes the floor a whole
+# half-minute stricter than the requirement — and then the fix looks like padding, because that
+# is exactly what it would have been.
+#
+# The requirement is the PUBLISHED reading time, and check_content.py now asserts that directly.
+# These bounds are the word counts that produce it.
+TOTAL_WORDS_MIN = round((TARGET_MINUTES[0] - 0.5) * WORDS_PER_MINUTE)   # 1,650 -> rounds to 8
+TOTAL_WORDS_MAX = round((TARGET_MINUTES[1] + 0.5) * WORDS_PER_MINUTE)   # 2,310 -> rounds to 10
 
 # ⚠️ 40%, LOWER than the TypeScript track's 45%, and the difference is not sloppiness.
 #
@@ -159,42 +263,52 @@ FROZEN_SLUGS: set[str] = set()
 # drifted in from an unrelated module is a finding, not a pass.
 SNIPPET_SOURCES = {
     "nestjs-get-started": [
-        f"{BE}/package.json", f"{BE}/src/app.module.ts",
+        f"{BE}/package.json", f"{BE}/src/app.module.ts", f"{BE}/src/main.ts",
         f"{BE}/src/auth/auth.controller.ts", f"{BE}/src/common/enums.ts",
     ],
     "nestjs-project-setup": [
         f"{BE}/package.json", f"{BE}/tsconfig.json", f"{BE}/tsconfig.build.json",
         f"{BE}/nest-cli.json", f"{BE}/src/main.ts", f"{BE}/.env.example",
+        f"{BE}/src/database/data-source.ts",
         f"{BE}/src/database/entities/user.entity.ts",
+        f"{BE}/src/auth/auth.controller.ts",
     ],
     "nestjs-modules": [
+        f"{BE}/src/common/guards/roles.guard.spec.ts", f"{BE}/test/rules.e2e-spec.ts",
         f"{BE}/src/app.module.ts", f"{BE}/src/auth/auth.module.ts",
         f"{BE}/src/projects/projects.module.ts", f"{BE}/src/quotes/quotes.module.ts",
     ],
     "nestjs-controllers": [
+        f"{BE}/src/common/serializers.ts",
         f"{BE}/src/auth/auth.controller.ts", f"{BE}/src/projects/projects.controller.ts",
         f"{BE}/src/contractors/contractors.controller.ts",
         f"{BE}/src/quotes/quotes.controller.ts",
     ],
     "nestjs-providers-and-dependency-injection": [
+        f"{BE}/src/quotes/quotes.module.ts", f"{BE}/src/projects/projects.service.ts", f"{BE}/src/auth/auth.service.spec.ts",
         f"{BE}/src/auth/auth.service.ts", f"{BE}/src/auth/auth.module.ts",
         f"{BE}/src/projects/projects.module.ts", f"{BE}/src/quotes/quotes.service.ts",
         f"{BE}/src/app.module.ts",
     ],
     "nestjs-dtos-and-validation": [
+        f"{BE}/src/projects/projects.service.ts",
         f"{BE}/src/auth/dto/auth.dto.ts", f"{BE}/src/projects/dto/project.dto.ts",
         f"{BE}/src/main.ts", f"{BE}/src/common/serializers.ts",
     ],
     "nestjs-pipes": [
+        f"{BE}/src/contractors/contractors.controller.ts", f"{BE}/src/common/pipes/trim.pipe.spec.ts",
         f"{BE}/src/common/pipes/trim.pipe.ts", f"{BE}/src/main.ts",
         f"{BE}/src/projects/projects.controller.ts", f"{BE}/src/projects/dto/project.dto.ts",
     ],
     "nestjs-guards": [
+        f"{BE}/src/common/guards/roles.guard.spec.ts", f"{BE}/src/projects/projects.service.ts",
         f"{BE}/src/common/guards/jwt-auth.guard.ts", f"{BE}/src/common/guards/roles.guard.ts",
         f"{BE}/src/projects/projects.controller.ts",
         f"{BE}/src/contractors/contractors.controller.ts",
     ],
     "nestjs-custom-decorators": [
+        f"{BE}/src/common/guards/roles.guard.spec.ts",
+        f"{BE}/src/projects/projects.controller.ts",
         f"{BE}/src/common/decorators/current-user.decorator.ts",
         f"{BE}/src/common/decorators/roles.decorator.ts",
         f"{BE}/src/common/guards/roles.guard.ts", f"{BE}/src/auth/auth.controller.ts",
@@ -208,10 +322,12 @@ SNIPPET_SOURCES = {
         f"{BE}/src/common/interceptors/logging.interceptor.ts",
     ],
     "nestjs-exception-filters": [
+        f"{BE}/src/auth/auth.service.ts",
         f"{BE}/src/common/filters/all-exceptions.filter.ts", f"{BE}/src/app.module.ts",
         f"{BE}/src/quotes/quotes.service.ts", f"{BE}/src/projects/projects.service.ts",
     ],
     "nestjs-request-lifecycle": [
+        f"{BE}/test/rules.e2e-spec.ts",
         f"{BE}/src/app.module.ts", f"{BE}/src/main.ts",
         f"{BE}/src/common/middleware/request-id.middleware.ts",
         f"{BE}/src/common/interceptors/logging.interceptor.ts",
@@ -221,10 +337,13 @@ SNIPPET_SOURCES = {
         f"{BE}/src/projects/projects.controller.ts",
     ],
     "nestjs-configuration": [
+        f"{BE}/src/contractors/contractors.service.ts",
         f"{BE}/src/config/configuration.ts", f"{BE}/src/app.module.ts",
         f"{BE}/src/auth/auth.module.ts", f"{BE}/src/main.ts", f"{BE}/.env.example",
     ],
     "nestjs-database-typeorm": [
+        f"{BE}/test/rules.e2e-spec.ts",
+        f"{BE}/src/common/serializers.ts",
         f"{BE}/src/database/entities/base.entity.ts",
         f"{BE}/src/database/entities/user.entity.ts",
         f"{BE}/src/database/data-source.ts", f"{BE}/src/app.module.ts",
@@ -237,6 +356,8 @@ SNIPPET_SOURCES = {
         f"{BE}/src/auth/auth.controller.ts",
     ],
     "nestjs-authorization-roles": [
+        f"{BE}/src/auth/auth.service.ts",
+        f"{BE}/src/contractors/contractors.service.ts", f"{BE}/src/quotes/quotes.service.ts",
         f"{BE}/src/common/decorators/roles.decorator.ts",
         f"{BE}/src/common/guards/roles.guard.ts", f"{BE}/src/common/enums.ts",
         f"{BE}/src/projects/projects.controller.ts", f"{BE}/src/projects/projects.service.ts",
@@ -253,6 +374,8 @@ SNIPPET_SOURCES = {
         f"{BE}/vitest.config.ts", f"{BE}/package.json",
     ],
     "nestjs-interview-questions": [
+        f"{BE}/src/projects/projects.module.ts", f"{BE}/src/common/decorators/roles.decorator.ts",
+        f"{BE}/src/common/filters/all-exceptions.filter.ts", f"{BE}/src/auth/auth.service.spec.ts",
         f"{BE}/src/app.module.ts", f"{BE}/src/common/guards/roles.guard.ts",
         f"{BE}/src/common/middleware/request-id.middleware.ts",
         f"{BE}/src/common/interceptors/logging.interceptor.ts",

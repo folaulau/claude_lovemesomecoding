@@ -1,0 +1,260 @@
+<p>The questions that actually come up, with answers drawn from the nineteen lessons before this
+one. Most of them are really one question — do you understand where each piece of the framework
+sits, and why — so the answers say <em>why</em> rather than reciting an API.</p>
+
+<h2>What is NestJS, and what is it not?</h2>
+
+<p>A structure for a server-side TypeScript application, plus a dependency injection container.
+Underneath, by default, it is Express — so it is not a runtime, not faster than Express, and gives
+you no capability Express lacks.</p>
+
+<p>What it gives you is an answer to "where does this code go", and a defined request pipeline where
+cross-cutting concerns are declared once instead of being a middleware array each route opts into
+correctly. Worth being able to say when it is not worth it: an application with three endpoints.</p>
+
+<h2>Why is my provider not found?</h2>
+
+<p>Because providers are private to their module. Two declarations are needed — the owning module
+exports it, the consuming module imports the owner:</p>
+
+<pre class="language-typescript"><code class="language-typescript">@Module({
+  imports: [TypeOrmModule.forFeature([Project, Quote, ServiceCategory])],
+  controllers: [ProjectsController],
+  providers: [ProjectsService],
+  exports: [ProjectsService],
+})
+export class ProjectsModule {}</code></pre>
+
+<p>Read the error rather than guessing: <code>?</code> marks the unresolvable parameter, the index
+says which constructor argument, and "available in the <em>X</em> context" is the important half —
+the class exists, it is just not visible from there.</p>
+
+<h2>How does Nest know what to inject?</h2>
+
+<p><code>emitDecoratorMetadata</code> in <code>tsconfig.json</code>. TypeScript types are erased, so
+the compiler emits the constructor's parameter types as runtime values beside the class, and Nest
+looks each one up. The class is the token.</p>
+
+<p>The follow-up: <em>so why can you not inject an interface?</em> Because an interface leaves
+nothing behind at runtime. Use a named token and <code>@Inject</code>.</p>
+
+<h2>Guards, interceptors, middleware, pipes — which and why?</h2>
+
+<p>The order they run in settles it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">middleware -&gt; guards -&gt; interceptors -&gt; pipes -&gt; handler -&gt; interceptors -&gt; filters</code></pre>
+
+<p><strong>Middleware</strong> is outermost and the only stage that runs even when a guard rejects
+the request. It gets the raw request and response and no <code>ExecutionContext</code>.</p>
+
+<p><strong>Guards</strong> answer yes or no, and nothing else.</p>
+
+<p><strong>Interceptors</strong> wrap the handler, so they are the only stage that sees both the
+request and the outcome.</p>
+
+<p><strong>Pipes</strong> transform or validate one parameter, immediately before the handler.</p>
+
+<p>Four questions choose between them: does it need to run for rejected requests (middleware), is
+the answer yes/no (guard), does it need the outcome (interceptor), does it transform a value
+(pipe)?</p>
+
+<h2>Why is my request id on 200s but not 401s?</h2>
+
+<p>Because it was assigned by an interceptor. A request rejected by a guard never reaches an
+interceptor, so the requests you most want to correlate — the failures — are exactly the ones with
+no id. Assign it in middleware, which runs before the guards:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestIdMiddleware).forRoutes('*')
+  }
+}</code></pre>
+
+<h2>Why does my validation not run?</h2>
+
+<p>Because <code>class-validator</code> decorators are metadata and something has to read them. That
+something is the global <code>ValidationPipe</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">app.useGlobalPipes(
+  new TrimPipe(),
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: {
+      enableImplicitConversion: false,
+    },
+  }),
+)</code></pre>
+
+<p>Without it the DTOs are documentation and every field arrives unchecked — an application that
+looks validated and is not, with nothing about it looking wrong.</p>
+
+<p>Know what the options do. <code>whitelist</code> strips undecorated properties, making the DTO a
+real allowlist. <code>forbidNonWhitelisted</code> rejects instead of stripping.
+<code>transform</code> builds an actual DTO instance and is what makes <code>@Type()</code>
+work.</p>
+
+<h2>Why is @UseGuards(RolesGuard, JwtAuthGuard) broken?</h2>
+
+<p>Guards run in the order listed, and <code>RolesGuard</code> reads the user
+<code>JwtAuthGuard</code> attaches. Reversed, it sees no user and 403s everything — which reads like
+a permissions misconfiguration and sends you looking at roles.</p>
+
+<h2>How does @Roles() actually work?</h2>
+
+<p>Two halves. <code>SetMetadata</code> attaches the list to the route and enforces nothing:</p>
+
+<pre class="language-typescript"><code class="language-typescript">export const Roles = (...roles: UserRole[]) =&gt; SetMetadata(ROLES_KEY, roles)</code></pre>
+
+<p>A guard reads it back with <code>Reflector</code>:</p>
+
+<pre class="language-typescript"><code class="language-typescript">const required = this.reflector.getAllAndOverride&lt;UserRole[] | undefined&gt;(ROLES_KEY, [
+  context.getHandler(),
+  context.getClass(),
+])</code></pre>
+
+<p><code>getAllAndOverride</code> rather than <code>get</code>, so a method-level decorator beats a
+class-level one. The follow-up worth having ready: <em>what if there is no decorator?</em> No
+requirement — return <code>true</code>. Returning <code>false</code> would 403 every unannotated
+route.</p>
+
+<h2>Should an authorization check be a guard?</h2>
+
+<p>Only if it can be decided from the token and the route. "Only contractors may quote" can.
+"Only the hired contractor may mark this project complete" cannot — it depends on a row — so it
+belongs in the service, which is loading that row anyway.</p>
+
+<p>A strong answer mentions the status code: a resource you do not own returns 404, not 403,
+because a 403 confirms the id exists and on a guessable identifier that is a slow enumeration of
+the whole table.</p>
+
+<h2>What happens to an exception on its way out?</h2>
+
+<p>An exception filter catches it. Nest has a global one already, which is why a service can throw
+<code>NotFoundException</code> and the client gets a 404 with no <code>try/catch</code>
+anywhere.</p>
+
+<p>You write your own when something that is not an <code>HttpException</code> gets thrown, because
+the built-in filter makes all of those a bare 500:</p>
+
+<pre class="language-typescript"><code class="language-typescript">if (code === PG_UNIQUE_VIOLATION) {
+  return {
+    status: HttpStatus.CONFLICT,
+    body: { message: 'That has already been done.', error: 'Conflict' },
+  }
+}</code></pre>
+
+<p>Two things to say about writing one. Keep <code>message</code>'s shape — a string normally, an
+array for validation errors — or you have made a breaking change. And never put a stack trace or a
+raw error message in the body; log it against the request id instead.</p>
+
+<h2>APP_FILTER or app.useGlobalFilters()?</h2>
+
+<pre class="language-typescript"><code class="language-typescript">providers: [
+  { provide: APP_FILTER, useClass: AllExceptionsFilter },
+  { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+],</code></pre>
+
+<p>The token puts it in the DI container, so it can inject — and a test that imports
+<code>AppModule</code> picks it up automatically. Bound on the app instance it must be repeated in
+every test bootstrap, and the day somebody forgets, the suite exercises a pipeline production does
+not have.</p>
+
+<h2>How do you test a service without a database?</h2>
+
+<p>Supply its collaborators as <code>useValue</code> mocks. The trap is the token:</p>
+
+<pre class="language-typescript"><code class="language-typescript">{
+  provide: getDataSourceToken(),
+  useValue: {
+    getRepository: () =&gt; ({ findOne: async () =&gt; storedUser }),
+  },
+},</code></pre>
+
+<p><code>@InjectDataSource()</code> asks for a named token, not the class — so overriding
+<code>DataSource</code> compiles, runs, and leaves the service holding the real connection. Same for
+<code>getRepositoryToken(User)</code>.</p>
+
+<h2>What is @Global() for, and when should you use it?</h2>
+
+<p>It makes a module's exports available without being imported. Legitimate for a genuinely ambient
+concern — this application uses it once, for auth, because every feature module needs
+<code>JwtAuthGuard</code> and the alternative is five imports that exist only to satisfy the
+container.</p>
+
+<p>The cost is what makes this a good question: a module's imports are a statement of its
+dependencies, and a global provider is a dependency that appears in none of them. Two or three
+global modules and the graph has stopped being readable.</p>
+
+<h2>forRoot versus forFeature?</h2>
+
+<p><code>forRoot</code> configures something once, globally — one database connection. It is called
+in the root module. <code>forFeature</code> registers a slice for one module and opens no second
+connection; it lists the entities that module touches, which doubles as documentation.</p>
+
+<p>The <code>Async</code> variants exist for when the options need something injected, which is
+almost always configuration.</p>
+
+<h2>Why must synchronize stay false?</h2>
+
+<p>It derives the schema from the entities with no migration to write, silently drops columns it
+believes are gone, and leaves no record of how the schema got where it is. Migrations are that
+record. Related: never edit an applied migration — Postgres has already run it, so the edit only
+changes what new databases get and the two diverge forever.</p>
+
+<h2>Are providers singletons?</h2>
+
+<p>Yes, by default: constructed once and shared by every request, which is why per-request overhead
+is small. <code>Scope.REQUEST</code> and <code>Scope.TRANSIENT</code> exist, and request scope is
+contagious — anything injecting a request-scoped provider becomes request-scoped, propagating up
+the graph until a large part of the application is rebuilt per request.</p>
+
+<p>The good follow-up is what to do instead: attach per-request state to the request in a guard and
+read it with a parameter decorator, which is what <code>@CurrentUser()</code> does.</p>
+
+<h2>Why does a relative import end in .js?</h2>
+
+<p>Because the project is ESM. Node's resolver does not guess extensions, and the specifier must
+name the file that exists at runtime — which is the compiled <code>.js</code>. Leave it off and it
+type-checks, builds, and dies at startup with <code>ERR_MODULE_NOT_FOUND</code>.</p>
+
+<h2>Why is my whitespace-only field passing validation?</h2>
+
+<p>Because <code>@Length(1, 80)</code> counts characters and the trim happens later, in the service.
+Three spaces pass the validator and are stored as the empty string — the validator and the service
+disagreed about what the value was.</p>
+
+<p>The fix is a pipe that runs before validation, and the reason it is a good interview question is
+that it tests whether someone knows global pipes run in the order they are listed:</p>
+
+<pre class="language-typescript"><code class="language-typescript">app.useGlobalPipes(new TrimPipe(), new ValidationPipe({ whitelist: true }))</code></pre>
+
+<h2>What does @Injectable() actually do?</h2>
+
+<p>Less than people assume. It marks the class so the metadata about its constructor parameters is
+emitted — that is all. It does not register the class, which is what the module's
+<code>providers</code> array is for.</p>
+
+<p>The neat follow-up: a class with no dependencies works as a provider without
+<code>@Injectable()</code>, because there is no metadata to emit. Add a constructor parameter and it
+breaks. Which is why the decorator goes on every provider regardless.</p>
+
+<h2>Why does main.ts end with await bootstrap()?</h2>
+
+<p>Top-level <code>await</code>, which is legal in an ES module and not in CommonJS. It is a small
+question that reveals whether someone has noticed the project is ESM — which is the same fact behind
+the <code>.js</code> extensions, the imported-class entity list, and the migration scripts that
+build first.</p>
+
+<h2>Two questions to ask them</h2>
+
+<p>Where do they draw the line between controller and service? The answer tells you whether their
+code is testable.</p>
+
+<p>And what happens when a database constraint fires in production? Whether that is a 500 or a 409
+says a lot about how much of the framework they have actually used.</p>
+
+<p>That is the track. Start at <a href="/nestjs/nestjs-get-started">the beginning</a> if you skipped
+here, or go back to <a href="/nestjs/nestjs-request-lifecycle">the request lifecycle</a>, which is
+the lesson most of these answers come from.</p>
