@@ -376,11 +376,27 @@ POSTS = [
             "recompile Bootstrap itself with your own colours."
         ),
     },
+    # ---------------------------------------------------------- architecture
+    {
+        "slug": "react-project-structure",
+        "title": "React – Project Structure for a Large App",
+        "file": "27-react-project-structure.html",
+        "date": "2026-08-19T09:00:00",
+        "tags": ["react", "architecture", "typescript"],
+        "excerpt": (
+            "Type folders — components/, pages/, lib/ — are right until they are not. The pizza "
+            "app shows exactly where they break: one feature spread across five folders, 99 "
+            "relative imports, and a currency formatter that makes the admin reports screen "
+            "depend on the delivery fee. Then the feature-based layout that fixes it, the three "
+            "rules that keep it fixed, path aliases, and the lint config that turns the "
+            "architecture into a build error instead of a code-review argument."
+        ),
+    },
     # ------------------------------------------------------------- interview
     {
         "slug": "react-interview-questions",
         "title": "React – Interview Questions",
-        "file": "27-react-interview-questions.html",
+        "file": "28-react-interview-questions.html",
         "date": "2026-08-20T09:00:00",
         "tags": ["react", "interview"],
         "excerpt": (

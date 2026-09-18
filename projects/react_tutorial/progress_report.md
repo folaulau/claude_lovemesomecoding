@@ -1,6 +1,7 @@
 # React tutorial track — progress report
 
-**Status:** PUBLISHED — live on prod, 2026-08-17
+**Status:** PUBLISHED — live on prod, 2026-08-17.
+Lesson 27 (`react-project-structure`) added 2026-09-17, **seeded to local only — not yet on prod.**
 **Started:** 2026-08-17
 **Where it lands:** https://lovemesomecoding.com/react
 
@@ -16,14 +17,14 @@ This project rewrites all 17 **in place** — same slugs, so no URL is lost — 
 (function components, hooks, TypeScript) and adds 8 new posts for the topics that hooks-era React
 needs and no existing slug covers.
 
-**Result: a 27-post track** — a `react-get-started` landing page at the front and a `react-interview-questions` page at the end.
+**Result: a 28-post track** — a `react-get-started` landing page at the front and a `react-interview-questions` page at the end.
 
 ## Decisions
 
 | Decision | Choice | Why |
 |---|---|---|
 | Existing 17 posts | Rewrite in place, keep every slug | They are indexed URLs. Rewriting keeps the ranking and kills the stale content in one move. |
-| Track size | 27 posts (17 rewritten + 10 new) | Comparable to the Oracle track's 14; deep enough to be a real tutorial, finite enough to maintain. |
+| Track size | 28 posts (17 rewritten + 11 new) | Comparable to the Oracle track's 14; deep enough to be a real tutorial, finite enough to maintain. |
 | Dates | Restamped to 2026-06-03 … 2026-08-17, 3 days apart | The old posts carried 2019 dates, which `upsert_post` never overwrites — hence `seed.py --force-dates`. Without it the pager reads in the wrong order. |
 | Redux example | Redux Toolkit for the admin area only | Folau built it: four slices, `<Provider>` inside `AdminLayout`. Storefront keeps its four contexts, so `pizza/CLAUDE.md` still holds — and Redux lands in the lazy admin chunk. |
 | Sass example | `theme.css` converted to `theme.scss` + `_tokens.scss` | Compiled output diffed against the original: identical bar Sass normalising `rgb()`, a computed `--pizza-red-dark`, and `prefers-reduced-motion` inverted to `no-preference`. |
@@ -91,12 +92,53 @@ lesson 1 → lesson 27 (see `projects/oracle/README.md` for why).
 | 24 | `react-css` | Styling | rewrite | `theme.scss`, utility classes |
 | 25 | `react-with-bootstrap` | Bootstrap | rewrite | `CartDrawer`, `PizzaBuilderModal`, `AppNavbar` |
 | 26 | `react-sass` | Sass | rewrite | `_tokens.scss`, `theme.scss` |
+| 27 | `react-project-structure` | Project Structure for a Large App | **new** | the whole `src/` tree, measured — see below |
 
 ### Part 7 — Interview prep
 
 | # | Slug | Title | State | Source in the demo app |
 |---|------|-------|-------|------------------------|
-| 27 | `react-interview-questions` | Interview Questions — 24 senior Q&A in 7 sections | **new** | draws on the whole app + the real build output |
+| 28 | `react-interview-questions` | Interview Questions — 24 senior Q&A in 7 sections | **new** | draws on the whole app + the real build output |
+
+## Lesson 27 — decisions
+
+Added 2026-09-17 because `/react` had no post on how to organise a React codebase, which is the
+question that dominates once an app is past a few dozen files.
+
+| Decision | Choice | Why |
+|---|---|---|
+| Refactor the pizza app to feature folders? | **No** | It is a working app with Playwright suites, and 26 other posts cite its current file paths. Moving 43 files to illustrate one lesson would stale every one of them. |
+| So how are the snippets real? | The pizza app is the honest **"before"** | Its type-based layout is shown exactly as it is, and the strain is *measured* rather than asserted. The feature-based layout is presented as a target with a file-by-file mapping table, clearly labelled as such. |
+| Placement | Lesson **27**, dated `2026-08-19` | Between Sass (08-17) and Interview Questions (08-20), so architecture closes "Going to production" and interview prep stays last. Only the new post gets a date, so **no `--force-dates` was needed**. |
+| Track wrap-up | Moved from `react-sass` to lesson 27 | Sass had the "That is the track" ending and is no longer the last content lesson. `26-react-sass.html` now ends with a plain Next link. |
+| ESLint config in the post | Verified by running it | Built a throwaway project, wrote deliberate violations, confirmed all three rules fire. Two real bugs were caught this way — see below. |
+
+### The measured evidence (re-derive with these, they are all in the post)
+
+```bash
+cd lovemesomecoding_demo_project/pizza/pizza-react-frontend
+grep -rho "from '\(\.\./\)\+[^']*'" src | wc -l        # 99 parent-relative imports
+grep -rho "from '\(\.\./\)\{2,\}[^']*'" src | wc -l    # 36 of them two or more levels
+grep -rl "from '.*types'" src | wc -l                    # 23 of 43 files import types/index.ts
+grep -rn "from '.*money'" src                            # 14 importers; 9 want only formatMoney
+```
+
+The `lib/money.ts` finding is the post's strongest argument and is a genuine structural bug in the
+demo app: one module mixes `formatMoney` (generic) with `TAX_RATE` / `DELIVERY_FEE` /
+`calculateTotals` (cart domain), so **all five admin screens depend on the delivery fee** purely
+because they wanted a currency formatter. Left in place deliberately — it is the lesson.
+
+### Two bugs the verification caught
+
+Both were in the post's own ESLint snippet, and both would have shipped as advice that does not work:
+
+1. The config imported `eslint-plugin-import` but never registered it in `plugins`, so
+   `import/no-restricted-paths` fails with *"Definition not found"*.
+2. **`import/no-restricted-paths` silently does nothing for aliased imports** unless
+   `eslint-import-resolver-typescript` is configured. The rule works on *resolved* paths, and an
+   unresolvable specifier is skipped rather than reported. Since the post recommends `@/` aliases two
+   sections earlier, the rule as first written was a no-op against exactly the import style being
+   taught. Proven both ways in a scratch project. This now has its own section in the post.
 
 ## Demo-app changes this required
 
@@ -153,11 +195,20 @@ projects/react_tutorial/
 | 2026-08-17 | Add `react-interview-questions` — 20 senior questions, 3,842 words | Claude | done |
 | 2026-08-17 | Add a dedicated **Context** section — 4 new questions + the perf one moved in; 24 total, 4,852 words | Claude | done |
 | 2026-08-17 | Re-seed prod + deploy — 569/569 posts, 27 in `/react` | Claude | done |
+| 2026-09-17 | Add lesson 27 `react-project-structure`; renumber interview questions to 28 | Claude | done |
+| 2026-09-17 | Move the track wrap-up out of `react-sass` and onto lesson 27 | Claude | done |
+| 2026-09-17 | Verify the post's ESLint boundary config actually fires, in a throwaway project | Claude | done |
+| 2026-09-17 | Seed local, screenshot, review | Claude | done |
+| | Seed prod + `npm run deploy` for lesson 27 | Folau | **outstanding** |
 | | Redeploy the backend Lambda so `/admin` edits keep `tsx` highlighting | Folau | **outstanding** |
 | | Run the pizza Playwright suite against the Sass + Redux + `/interview-questions` changes | Folau | **outstanding** |
 
 ## Outstanding
 
+0. **Lesson 27 is on local only.** `react-project-structure` is seeded to the `local` tree and
+   reviewed at `:3000`. Prod still shows 27 posts. To publish:
+   `seed.py --env prod --write` (no `--force-dates` — it is a new slug, nothing is being reordered),
+   then `cd lovemesomecoding_frontend && AWS_PROFILE=folau npm run deploy`.
 1. **Backend Lambda not redeployed.** Seeding ran the local service layer, so what is in S3 is
    correct — but until `lovemesomecoding_backend/scripts/deploy.sh` runs, editing one of these 27
    posts through `/admin` would normalise its `tsx` blocks down to `plaintext` and silently lose the

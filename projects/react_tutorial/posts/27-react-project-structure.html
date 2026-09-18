@@ -1,0 +1,536 @@
+<p>Where files go is the one decision in a React app that nobody makes on purpose. You scaffold with
+Vite, you get a <code>src/</code> with <code>App.tsx</code> in it, you add a
+<code>components/</code> folder because you have a component, and eighteen months later forty people
+are arguing about it in a pull request.</p>
+
+<p>This lesson is about the version of that decision that matters: a codebase big enough that no one
+person has read all of it. React itself has no opinion here — it ships a component model and nothing
+else — so the structure is entirely yours, and it is the part of the app that is hardest to change
+later.</p>
+
+<h2>Start with what the pizza app actually does</h2>
+
+<p>Every other lesson in this track takes its snippets from one working application. Here is its
+whole <code>src/</code>:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">src/
+  App.tsx
+  main.tsx
+  components/     AppNavbar  CartDrawer  ErrorBoundary  Footer
+                  PizzaBuilderModal  ProductCard  ProtectedRoute  StripePaymentForm
+  context/        AuthContext  CartContext  MenuContext  ToastContext
+  pages/          Home  Menu  Checkout  OrderConfirmation  Login  Register
+                  Orders  Profile  InterviewQuestions
+  pages/admin/    AdminLayout  AdminReports  AdminProducts  AdminToppings
+                  AdminCrusts  AdminOrders  AdminUsers
+  lib/            api.ts  adminApi.ts  money.ts  profileApi.ts  stripe.ts
+  store/          index.ts  catalogSlice  ordersSlice  reportsSlice  usersSlice  apiFailure
+  types/          index.ts
+  data/           interviewQuestions.ts
+  styles/         theme.scss  _tokens.scss
+  assets/         hero.png  vite.svg</code></pre>
+
+<p>That is <strong>43 TypeScript files and about 6,850 lines</strong>, organised <strong>by what
+each file is</strong>: components with components, pages with pages, types with types. Call it the type-based
+layout. It is what every tutorial shows you, including the early lessons of this one.</p>
+
+<p><strong>And at this size it is the right answer.</strong> You can hold 43 files in your head. When
+someone says "the cart drawer", you know it is in <code>components/</code> without looking. There is
+no ceremony, no indirection, and a new developer is productive in an afternoon.</p>
+
+<p>Do not let the rest of this lesson talk you out of that. The question is not whether type folders
+are bad — it is what specifically breaks when the app is ten times bigger, because that tells you
+what the replacement has to fix.</p>
+
+<h2>Where type folders start to hurt</h2>
+
+<p>Four things go wrong, and all four are visible in the pizza app already, in miniature.</p>
+
+<h3>One feature is spread across five folders</h3>
+
+<p>"The cart" is a single idea a product manager can describe in one sentence. Here is where it
+lives:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">context/CartContext.tsx        the state, the reducer, the server sync   383 lines
+components/CartDrawer.tsx      the slide-out UI                          140 lines
+components/PizzaBuilderModal.tsx  the thing that adds items to it        263 lines
+pages/CheckoutPage.tsx         where the cart is turned into an order    526 lines
+lib/money.ts                   subtotal, tax, delivery fee, line totals   57 lines
+types/index.ts                 CartItem, ServerCart, CartWriteRequest    (buried in 337)</code></pre>
+
+<p>Five folders, six files, and not one of them sits next to another. Now imagine the request
+"remove the cart and go to single-item instant checkout". You cannot answer "which files?" by looking
+— you have to grep, and grep will miss the type definitions that no longer have a reader.</p>
+
+<p>This is the cost that scales. The number of folders you visit to change one feature stays roughly
+constant as the app grows, but the number of <em>unrelated</em> files you have to scroll past inside
+each folder does not. A <code>components/</code> directory with 300 files in it is a directory you
+navigate with a fuzzy finder, which means the folder structure has stopped carrying information.</p>
+
+<h3>lib/ is where feature logic goes to hide</h3>
+
+<p>This is the interesting one, because it is a real bug in the pizza app's structure and it is
+measurable.</p>
+
+<p><code>lib/money.ts</code> is imported by <strong>14 of those 43 files</strong>. That sounds like a
+well-used shared utility. Look at what each file actually asks for:</p>
+
+<pre class="language-typescript"><code class="language-typescript">context/CartContext.tsx           { calculateTotals, type CartTotals }
+components/CartDrawer.tsx         { formatMoney, lineTotal, unitPrice }
+components/PizzaBuilderModal.tsx  { formatMoney, round2 }
+pages/CheckoutPage.tsx            { formatMoney, lineTotal }
+
+components/ProductCard.tsx        { formatMoney }
+components/StripePaymentForm.tsx  { formatMoney }
+pages/HomePage.tsx                { formatMoney }
+pages/OrdersPage.tsx              { formatMoney }
+pages/OrderConfirmationPage.tsx   { formatMoney }
+pages/admin/AdminOrdersPage.tsx   { formatMoney }
+pages/admin/AdminProductsPage.tsx { formatMoney }
+pages/admin/AdminCrustsPage.tsx   { formatMoney }
+pages/admin/AdminToppingsPage.tsx { formatMoney }
+pages/admin/AdminReportsPage.tsx  { formatMoney }</code></pre>
+
+<p><strong>Nine of the fourteen want one function</strong> — <code>formatMoney</code>, a three-line
+wrapper around <code>Intl.NumberFormat</code> that has nothing to do with pizza. The other five want
+the pricing rules. But they are the same module, so they are the same dependency:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// lib/money.ts — one module, two completely different jobs.
+
+export function formatMoney(amount: number): string {   // genuinely shared: any app, any domain
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
+}
+
+export const TAX_RATE = 0.085;                          // cart + checkout business rules
+export const DELIVERY_FEE = 3.99;
+export function calculateTotals(items: CartItem[], orderType: OrderType): CartTotals { /* … */ }</code></pre>
+
+<p>The result: <strong>the admin reports screen depends on the delivery fee.</strong> Not because it
+uses it — it does not — but because it needed a currency formatter and that is the module the
+formatter was in. Change how delivery is priced and the blast radius, as far as any tool can tell,
+includes five admin screens.</p>
+
+<p>Nothing about type folders forces this. What they do is make it the path of least resistance:
+<code>lib/</code> has no stated admission criteria, so anything vaguely reusable lands there, and
+each arrival quietly widens what the rest of the app depends on.</p>
+
+<h3>Ninety-nine relative imports</h3>
+
+<pre class="language-bash"><code class="language-bash">$ grep -rho "from '\(\.\./\)\+[^']*'" src | wc -l
+99
+$ grep -rho "from '\(\.\./\)\{2,\}[^']*'" src | wc -l
+36</code></pre>
+
+<p>Ninety-nine imports reach out of their own folder, thirty-six of them by two or more levels, and
+the deepest are the honest ones — <code>../../store</code>, <code>../../types</code>,
+<code>../../lib/money</code>, <code>../../context/ToastContext</code>.</p>
+
+<p>Counting dots is a small daily tax. The real cost is that <code>../../</code> encodes the
+<em>current</em> folder depth into every file, so moving a file breaks imports that had no opinion
+about where it lived. In a codebase where reorganising is normal, that friction is enough to stop
+people reorganising.</p>
+
+<h3>Nothing stops the wrong import</h3>
+
+<p>The pizza app is careful about one boundary in particular. Redux and the six admin screens are
+lazily loaded, and <code>&lt;Provider store={store}&gt;</code> is deliberately mounted inside
+<code>AdminLayout</code> rather than <code>main.tsx</code>, so Redux lands in the admin chunk and
+costs customers nothing — <a href="/react/react-lazy-suspense">Code Splitting</a> shows the 430 kB
+that saves.</p>
+
+<p>That boundary is held up by a comment and by whoever reviews the pull request. Add
+<code>import { store } from '../store'</code> to <code>HomePage.tsx</code> and everything still
+compiles, the tests still pass, the lint still passes — and 37 kB of Redux moves into the bundle
+every customer downloads. You find out from a bundle-size graph, weeks later, if you are watching
+one.</p>
+
+<p>An architecture that only exists in people's heads is not an architecture. It is an agreement,
+and agreements decay at exactly the rate your team changes.</p>
+
+<h2>The shape that scales: organise by feature</h2>
+
+<p>The fix is to make the folder structure say what the app <em>does</em> rather than what its files
+<em>are</em>. Three top-level directories:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">src/
+  app/            wiring: entry point, router, providers, global styles
+  features/       one folder per thing the product does
+  shared/         genuinely generic code, owned by nobody in particular</code></pre>
+
+<p>And inside a feature, the type folders come back — scoped to that feature, where they are useful
+again because there are eight files in them and not three hundred:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">src/features/cart/
+  components/       CartDrawer.tsx  PizzaBuilderModal.tsx  CartSummary.tsx
+  hooks/            useCart.ts
+  api/              cartApi.ts
+  model/            cartReducer.ts  CartProvider.tsx  pricing.ts
+  types.ts          CartItem  ServerCart  CartWriteRequest  CartTotals
+  index.ts          the feature's public API — see below
+</code></pre>
+
+<p>That is the whole idea: <strong>a feature is a vertical slice.</strong> Its UI, its state, its
+network calls, its types and its business rules are one directory, because they change together. The
+"remove the cart" request becomes <code>rm -r src/features/cart</code> plus whatever the compiler
+then complains about — and the compiler complaining is the point.</p>
+
+<p>A feature is not a route and it is not a component. <code>checkout</code> is a feature;
+<code>Button</code> is not; <code>/order-confirmation/:orderId</code> is a route that the
+<code>orders</code> feature happens to own. The test is whether a non-engineer would name it when
+describing the product.</p>
+
+<h2>The three rules that make it work</h2>
+
+<p>The folders are the easy half. Enterprise codebases that fail at this usually did the folders and
+skipped the rules, and ended up with the same tangle in prettier packaging.</p>
+
+<h3>1. A feature owns its whole vertical slice</h3>
+
+<p>If a type, a fetch call or a pricing rule is used by one feature, it lives in that feature — not in
+a global <code>types/</code> or <code>lib/</code>. The pizza app's <code>types/index.ts</code> is 337
+lines imported by 23 files; split by owner, <code>CartItem</code> and <code>ServerCart</code> go to
+<code>features/cart/types.ts</code>, <code>Order</code> and <code>OrderStatus</code> to
+<code>features/orders/</code>, and only the handful that genuinely cross features — <code>UUID</code>,
+<code>Page&lt;T&gt;</code>, <code>ApiErrorBody</code> — stay shared.</p>
+
+<p><strong>Duplication is cheaper than the wrong abstraction here.</strong> Two features with a
+similar-looking <code>Address</code> type are usually two types that are about to diverge. Wait for
+the third use before promoting anything to <code>shared/</code>.</p>
+
+<h3>2. Features do not reach into each other</h3>
+
+<p>Every feature exports a public API from its <code>index.ts</code>, and that is the only thing
+other features may import:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// features/cart/index.ts — the contract. Everything not listed here is private.
+export { CartProvider, useCart } from './model/CartProvider';
+export { CartDrawer } from './components/CartDrawer';
+export type { CartItem, CartTotals } from './types';
+
+// Deliberately NOT exported: cartReducer, pricing.ts, cartApi.ts, CartSummary.
+// They are implementation. Nobody outside the cart should be able to depend on them.</code></pre>
+
+<pre class="language-typescript"><code class="language-typescript">// features/checkout/CheckoutPage.tsx
+import { useCart } from '@/features/cart';              // ✅ the public API
+import { useCart } from '@/features/cart/model/CartProvider';  // ❌ reaching inside</code></pre>
+
+<p>Two features that need the same thing is a signal, not a problem to route around: either it belongs
+in <code>shared/</code>, or one of them should be asking the other through its public API, or — most
+often — they are actually one feature that has been split along the wrong line.</p>
+
+<h3>3. Dependencies point one way</h3>
+
+<pre class="language-plaintext"><code class="language-plaintext">app/  ───────►  features/  ───────►  shared/
+
+app      may import anything.                 It is the wiring; that is its job.
+features may import shared, never app,
+         and never another feature's internals.
+shared   may import NOTHING from features.    This is the rule that decays first.</code></pre>
+
+<p>That last line is where <code>lib/money.ts</code> went wrong. It is nominally shared and it
+imports <code>CartItem</code>, which points backwards. Under the one-way rule the fix is forced and
+obvious:</p>
+
+<pre class="language-typescript"><code class="language-typescript">shared/lib/currency.ts     formatMoney, round2          // no domain types, importable by anyone
+features/cart/model/pricing.ts  TAX_RATE, DELIVERY_FEE, unitPrice, lineTotal, calculateTotals</code></pre>
+
+<p>The nine files that only wanted a formatter now depend only on a formatter, and the admin reports
+screen stops depending on the delivery fee.</p>
+
+<h2>Mapping the pizza app onto it</h2>
+
+<p>Concretely, for the files above:</p>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>Absorbs</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>features/menu/</code></td><td>MenuContext, MenuPage, ProductCard, the catalogue types</td></tr>
+    <tr><td><code>features/cart/</code></td><td>CartContext, CartDrawer, PizzaBuilderModal, the pricing half of money.ts, the cart types</td></tr>
+    <tr><td><code>features/checkout/</code></td><td>CheckoutPage, StripePaymentForm, lib/stripe.ts</td></tr>
+    <tr><td><code>features/auth/</code></td><td>AuthContext, LoginPage, RegisterPage, ProtectedRoute, tokenStore</td></tr>
+    <tr><td><code>features/orders/</code></td><td>OrdersPage, OrderConfirmationPage, the order types</td></tr>
+    <tr><td><code>features/profile/</code></td><td>ProfilePage, lib/profileApi.ts, Address and PaymentMethod</td></tr>
+    <tr><td><code>features/admin/</code></td><td>all seven admin pages, all four Redux slices, store/, lib/adminApi.ts</td></tr>
+    <tr><td><code>shared/</code></td><td>the <code>api</code> client, ErrorBoundary, ToastContext, formatMoney, <code>UUID</code>, <code>Page&lt;T&gt;</code>, <code>ApiErrorBody</code></td></tr>
+    <tr><td><code>app/</code></td><td>main.tsx, App.tsx, AppNavbar, Footer, styles/</td></tr>
+  </tbody>
+</table>
+
+<p>Three things in that table are worth arguing about, and the arguments are the useful part.</p>
+
+<p><strong><code>features/admin/</code> is one feature, not six.</strong> The six CRUD screens share
+the Redux store, the admin API client and the layout, and they are always changed together. Splitting
+them would create six folders that all reach into each other — rule 2 violated by construction.</p>
+
+<p><strong><code>AppNavbar</code> lives in <code>app/</code>, not <code>shared/</code>.</strong> It
+reads <code>useAuth</code>, <code>useCart</code> and <code>useMenu</code> — it is downstream of three
+features at once, which is exactly what <code>app/</code> is for. Putting it in <code>shared/</code>
+would break the one-way rule on day one.</p>
+
+<p><strong><code>ToastContext</code> is shared, <code>CartContext</code> is not.</strong> Toasts are
+a generic notification mechanism with no domain knowledge; the cart is the domain. Same file
+extension, same <code>context/</code> folder today, opposite sides of the boundary.</p>
+
+<h2>Path aliases</h2>
+
+<p>Feature folders are deeper than type folders, so they make <code>../../</code> worse before they
+make it better. Fix that first — it is two small edits:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { fileURLToPath, URL } from 'node:url';
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': fileURLToPath(new URL('./src', import.meta.url)),
+    },
+  },
+});</code></pre>
+
+<pre class="language-json"><code class="language-json">// tsconfig.app.json — the bundler and the typechecker are separate resolvers.
+// Configure one and the app runs but the editor shows red; configure the other
+// and the types are fine but the build fails. Both, always.
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}</code></pre>
+
+<p>Now an import says where something is rather than how far away it is:</p>
+
+<pre class="language-typescript"><code class="language-typescript">import { formatMoney } from '../../lib/money';     // before
+import { formatMoney } from '@/shared/lib/currency'; // after — same from any depth</code></pre>
+
+<p><strong>One alias, not six.</strong> Teams that add <code>@features</code>,
+<code>@components</code>, <code>@hooks</code>, <code>@utils</code> end up needing a lookup table to
+read an import statement. A single <code>@/</code> root keeps the path readable and keeps
+<code>vite.config.ts</code>, <code>tsconfig.json</code>, the test runner and Storybook in step.</p>
+
+<h2>Make the boundary a build error</h2>
+
+<p>This is the step that separates an architecture from a convention, and it is the one most teams
+skip. Rules 2 and 3 are mechanical — a linter can check them, so a linter should.</p>
+
+<pre class="language-javascript"><code class="language-javascript">// eslint.config.js  —  flat config, with eslint-plugin-import installed.
+import importPlugin from 'eslint-plugin-import';
+
+export default [
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    // The plugin has to be REGISTERED here, or the `import/` rule below
+    // fails to resolve and ESLint exits with "Definition not found".
+    plugins: { import: importPlugin },
+
+    // ⚠️ Without this the rule below silently does nothing for aliased
+    // imports. See the note after this block — it is not optional.
+    settings: { 'import/resolver': { typescript: { project: './tsconfig.json' } } },
+
+    rules: {
+      'import/no-restricted-paths': ['error', {
+        zones: [
+          {
+            // shared/ must not know that features exist.
+            target: './src/shared',
+            from: './src/features',
+            message: 'shared/ cannot import from features/.',
+          },
+          {
+            // features/ must not reach back into the app wiring.
+            target: './src/features',
+            from: './src/app',
+            message: 'features/ cannot import from app/.',
+          },
+        ],
+      }],
+
+      // A feature may import another feature's index.ts, and nothing deeper.
+      // (Core ESLint rule — no plugin needed for this one.)
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          group: ['@/features/*/*'],
+          message: 'Import the feature root, not its internals.',
+        }],
+      }],
+    },
+  },
+];</code></pre>
+
+<h3>The resolver line is load-bearing</h3>
+
+<p>That <code>settings</code> line is the one to get right, because leaving it out fails in the worst
+possible way: <strong>quietly, and only for the imports you care about.</strong></p>
+
+<p><code>import/no-restricted-paths</code> works on <em>resolved</em> paths. It has to turn the
+import string into a file on disk before it can decide which zone that file is in. Relative imports
+resolve out of the box, so the rule fires. An aliased import does not — and an unresolvable import is
+not an error to this rule, it is simply skipped:</p>
+
+<pre class="language-bash"><code class="language-bash"># src/shared/lib/currency.ts — both lines break the same rule.
+
+import { useCart } from '../../features/cart';   # caught
+import { useCart } from '@/features/cart';       # NOT caught, no resolver configured
+$ npx eslint src
+✖ 1 problem</code></pre>
+
+<p>So you adopt <code>@/</code> aliases in one section, add the boundary rule in the next, watch it
+catch a violation in the test you wrote, and ship an enforcement rule that is a no-op against every
+import written in the style you just standardised on. Install
+<code>eslint-import-resolver-typescript</code>, point it at the tsconfig that defines
+<code>paths</code>, and both lines report:</p>
+
+<pre class="language-bash"><code class="language-bash">$ npx eslint src
+  1:25  error  Unexpected path "@/features/cart" imported in restricted zone.
+               shared/ cannot import from features/   import/no-restricted-paths
+✖ 2 problems</code></pre>
+
+<p><strong>Test the rule by writing a violation on purpose</strong> and confirming the error, every
+time you add a zone. A boundary rule that has never failed is indistinguishable from one that cannot
+fail.</p>
+
+<p>Cross-feature imports need one more turn of the screw to be airtight — the pattern above stops
+deep imports but still lets any feature import any other feature's public API. Teams that want the
+stricter version generate a per-feature override, or reach for
+<code>eslint-plugin-boundaries</code>, which is built for exactly this and lets you declare element
+types and an allowed-dependency matrix.</p>
+
+<p><strong>The pizza app does not have this.</strong> It lints with <code>oxlint</code>, which is
+fast and catches real bugs but is not configured with any import-boundary rule, so every boundary
+described above is currently held up by review alone. That is fine for 43 files and one author. It is
+not fine for 400 files and twenty authors, and the day it stops being fine is not announced.</p>
+
+<p>One more option worth knowing at the top end: <strong>TypeScript project references</strong>, or a
+real monorepo with each feature as a workspace package. Then the boundary is enforced by the module
+resolver rather than a lint rule, a feature's <code>package.json</code> lists what it may depend on,
+and a violation is not lintable-away. It is heavier than most apps need — but if your "enterprise
+app" is genuinely several teams shipping on independent cadences, this is the line past which folder
+conventions stop being enough.</p>
+
+<h2>Where state goes once you have features</h2>
+
+<p>Structure answers a question that <a href="/react/react-context">Context</a> and
+<a href="/react/react-redux">Redux</a> leave open: not "which state tool", but "where does this state
+live". Feature folders make the answer mostly mechanical.</p>
+
+<table>
+  <thead>
+    <tr><th>Scope</th><th>Where it goes</th><th>In the pizza app</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>One component</td><td><code>useState</code>, in the component</td><td><code>cartOpen</code> in App.tsx</td></tr>
+    <tr><td>One feature</td><td>a provider inside that feature, exported via its hook</td><td><code>CartProvider</code> + <code>useCart</code></td></tr>
+    <tr><td>Several features</td><td><code>shared/</code>, mounted in <code>app/</code></td><td><code>AuthProvider</code>, <code>ToastProvider</code></td></tr>
+    <tr><td>One big subsystem</td><td>a store inside that feature, provided by its layout</td><td>Redux inside <code>AdminLayout</code></td></tr>
+    <tr><td>Server data</td><td>a query cache, not a store</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<p>Two of those rows carry most of the weight.</p>
+
+<p><strong>The Redux row is a structural decision, not a state-management one.</strong> Keeping the
+store inside <code>features/admin/</code> rather than at the root is what makes it possible for it to
+be lazily loaded, and what stops a customer-facing component from dispatching into it. Where a
+provider is mounted decides both the bundle and the boundary.</p>
+
+<p><strong>The last row is the one people get wrong.</strong> Most of what ends up in a global store
+is not application state — it is a cached copy of the server, with loading flags and refetch logic
+hand-written around it. That is what TanStack Query or RTK Query are for, and adopting one typically
+deletes more code than it adds. The pizza app hand-rolls it in <code>MenuContext</code> and the admin
+slices, which is instructive to read and not what a new enterprise app should do.</p>
+
+<h2>Tests and stories next to the code</h2>
+
+<p>A vertical slice should be vertical all the way down:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">features/cart/components/
+  CartDrawer.tsx
+  CartDrawer.test.tsx
+  CartDrawer.stories.tsx</code></pre>
+
+<p>A parallel <code>tests/</code> tree that mirrors <code>src/</code> guarantees two things: the
+mirror drifts, and moving a file means editing two paths. Colocated tests move with the code, and a
+feature folder you can delete in one command is one where the tests go with it.</p>
+
+<p>End-to-end tests are the exception and belong at the root — the pizza app keeps them in
+<code>e2e/</code>, because a checkout journey crosses menu, cart, auth and orders and is owned by
+none of them.</p>
+
+<h2>What not to do</h2>
+
+<p><strong>Atomic design as a folder structure.</strong> <code>atoms/</code>,
+<code>molecules/</code>, <code>organisms/</code> is a vocabulary for designers that becomes an
+unwinnable argument for engineers — every code review acquires a debate about whether a thing is a
+molecule. It is the type-based layout with worse names.</p>
+
+<p><strong>A folder per component.</strong> <code>Button/Button.tsx</code>,
+<code>Button/Button.test.tsx</code>, <code>Button/Button.module.css</code>,
+<code>Button/index.ts</code> — four files and two levels for something that is sometimes twenty
+lines. Do it when a component genuinely has several files; do not do it by policy.</p>
+
+<p><strong>A <code>utils/</code> folder.</strong> Same failure mode as <code>lib/</code>, one step
+further along: a module named for what it is not. Name modules for what they do —
+<code>currency.ts</code>, <code>dates.ts</code>, <code>pricing.ts</code> — and it stays obvious when
+something does not belong.</p>
+
+<p><strong>Structuring for a scale you do not have.</strong> Seven feature folders each containing
+one component, wrapped in barrels, behind five aliases, is not enterprise-ready — it is a small app
+with a large tax on it.</p>
+
+<h3>And a note on barrel files</h3>
+
+<p>Rule 2 needs an <code>index.ts</code> per feature, and that is the right number of barrels. Do not
+extend the habit downwards. An <code>index.ts</code> in every sub-folder re-exporting everything
+beneath it creates import cycles that are miserable to unpick, and makes it easy to pull a whole
+feature into a chunk that wanted one function from it — precisely the code splitting you worked for.
+Keep barrels at the feature boundary, where they are a contract, and nowhere else, where they are
+just indirection.</p>
+
+<h2>When to actually move</h2>
+
+<p>Not on day one. A new app should start as the pizza app is today — flat, type-based, obvious — and
+restructure when the symptoms show up:</p>
+
+<ul>
+  <li>A <code>components/</code> or <code>pages/</code> folder you scroll to navigate.</li>
+  <li>More than one team shipping in the same repo.</li>
+  <li>Changes that routinely touch four folders to do one thing.</li>
+  <li>A <code>lib/</code> or <code>utils/</code> module that half the app imports for different
+      reasons — the <code>money.ts</code> symptom.</li>
+  <li>A code review where somebody has to explain, again, why a given import is not allowed.</li>
+</ul>
+
+<p>The last one is the real trigger. It means the architecture exists only in the heads of the people
+who happen to be reviewing, and the cost of writing it down as a lint rule is now lower than the cost
+of not.</p>
+
+<p><strong>Migrate one feature at a time.</strong> Add the alias, create <code>src/features/</code>,
+move the most self-contained feature into it with its types and its API calls, give it an
+<code>index.ts</code>, add the lint rule for that feature alone, and ship. A big-bang reorganisation
+is a pull request nobody can review and a merge conflict with everything in flight.</p>
+
+<h2>That is the track</h2>
+
+<p>Twenty-seven lessons, from <a href="/react/react-get-started">creating a project</a> to shipping
+one and organising it for a team. Along the way: components, JSX, props and state; effects, refs and
+error boundaries; context, reducers, custom hooks and Redux; routing, memoisation, code splitting,
+styling, and the folder structure that holds it together.</p>
+
+<p>Every example came from the same working application, which is also the best next step available —
+build something with a cart, a form, a list and a route in it, and the parts that felt abstract stop
+being abstract.</p>
+
+<p>For reference beyond this track, <a href="https://react.dev" rel="nofollow">react.dev</a> is
+genuinely excellent and worth reading rather than only searching.</p>
+
+<h2>Next</h2>
+
+<p><a href="/react/react-interview-questions">Interview Questions</a> — twenty-four senior-level
+questions covering the whole track, including a section on Context, with the five that matter most
+flagged.</p>

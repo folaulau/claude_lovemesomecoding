@@ -1,6 +1,6 @@
 # React tutorial track
 
-A 27-post React tutorial published under **`/react`** on lovemesomecoding.com.
+A 28-post React tutorial published under **`/react`** on lovemesomecoding.com.
 
 ```
 projects/react_tutorial/
@@ -16,10 +16,10 @@ projects/react_tutorial/
 `/react` held **17 posts published in 2019**: copied from w3schools, class components and
 `this.setState`, 13–957 words each, still carrying WordPress `boldgrid-section` wrapper divs.
 
-All 17 were **rewritten in place — same slugs, so no URL was lost** — and 10 new posts added for the
+All 17 were **rewritten in place — same slugs, so no URL was lost** — and 11 new posts added for the
 topics hooks-era React needs and no existing slug covered, including a `react-get-started` landing
-page at the front and `react-interview-questions` at the end. See `progress_report.md` for the topic
-table and which is which.
+page at the front, `react-project-structure` at lesson 27 and `react-interview-questions` at the
+end. See `progress_report.md` for the topic table and which is which.
 
 ## Original requirements
 
@@ -30,7 +30,8 @@ table and which is which.
 - Keep the topic list explicit, so the next revision is an update-and-add rather than a rewrite.
 
 Both gaps were closed rather than faked: Redux Toolkit was added to the admin area, and the
-stylesheet was converted to Sass. Every snippet in the track is running code.
+stylesheet was converted to Sass. Every snippet in the track is running code — with one deliberate,
+labelled exception, the target layout in lesson 27 (see the gotchas below).
 
 ## Versions the track is written against
 
@@ -99,3 +100,11 @@ want the rest of the time.
   `&lt;` is invisible until it renders. `check_content.py` compares authored source against the
   normaliser's output byte-for-byte and is the only thing that catches it.
 - **Slugs are frozen.** 17 of these are indexed URLs from 2019.
+- **Lesson 27 does not refactor the demo app, on purpose.** `react-project-structure` argues for
+  feature folders while the pizza app is type-based. That is not an oversight: the app is shown as
+  the honest "before", every strain it describes is *measured* from the real tree, and the target
+  layout is a labelled mapping table rather than a claim about running code. Reorganising 43 files
+  would stale the file paths cited by the other 26 posts. See `progress_report.md`.
+- **Verify a lint rule by writing a violation.** The ESLint boundary config in lesson 27 shipped two
+  bugs on the first pass — an unregistered plugin, and `import/no-restricted-paths` silently
+  skipping aliased imports with no resolver configured. Both were only found by running it.
