@@ -1,0 +1,275 @@
+<p>Error handling is the part of an app that gets written last and shows first. The failure mode is
+always the same shape: a spinner that never stops, or an alert saying "Error" with a message meant
+for a developer.</p>
+
+<p>This lesson is a model that makes both hard to write. A typed error whose cases are decisions, a
+presenter that decides what a customer sees, and a state enum that makes the eternal spinner
+literally unrepresentable.</p>
+
+<h2>An error type whose cases are decisions</h2>
+
+<p>The instinct is to model errors after the places things go wrong: <code>badURL</code>,
+<code>serverError</code>, <code>parseFailed</code>. That produces a long enum and a
+<code>switch</code> in every caller that maps most of it onto the same behaviour.</p>
+
+<p>Model the <em>decisions a caller can make</em> instead:</p>
+
+<pre class="language-swift"><code class="language-swift">enum APIError: LocalizedError, Equatable {
+    case api(status: Int, message: String, body: APIErrorBody?)
+    case unauthorized
+    case network(message: String)
+    case decoding(message: String)
+</code></pre>
+
+<p>Four cases and each one leads somewhere different. <code>.api</code> means the server answered
+and said no, carrying field-level messages a form can render. <code>.unauthorized</code> is split
+out because it is the one status that means "sign in again" rather than "show this message" — giving
+it its own case means a caller cannot forget it by accident. <code>.network</code> means the request
+never arrived, which on a phone usually means a lost signal. And <code>.decoding</code> means we
+reached the server and could not understand it, which is <em>our</em> bug and should be logged as
+one.</p>
+
+<h3>LocalizedError</h3>
+
+<pre class="language-swift"><code class="language-swift">    var errorDescription: String? {
+        switch self {
+        case let .api(_, message, _): message
+        case .unauthorized: "Your session has expired. Please sign in again."
+        case let .network(message): message
+        case .decoding: "The server returned a response this app could not read."
+        }
+    }
+</code></pre>
+
+<p>Conforming to <code>LocalizedError</code> rather than bare <code>Error</code> is what makes
+<code>error.localizedDescription</code> return the message above instead of "The operation couldn't
+be completed. (Pizza.APIError error 3.)" — which is the string customers actually report seeing in
+apps that skip this.</p>
+
+<p>Notice <code>.decoding</code> does not surface its detail. The customer cannot act on a type
+mismatch, and the detail is already in the log.</p>
+
+<h3>Field errors, without the ceremony</h3>
+
+<pre class="language-swift"><code class="language-swift">    var fieldErrors: [String: String] {
+        guard case let .api(_, _, body) = self, let subErrors = body?.errors else { return [:] }
+        return subErrors.reduce(into: [:]) { result, subError in
+            if let field = subError.field { result[field] = subError.message }
+        }
+    }
+</code></pre>
+
+<p>Two decisions in six lines. Sub-errors with no field are dropped, because a message with nowhere
+to render must not become a phantom key. And it returns an empty dictionary rather than an optional
+for every non-API case, so a view can write <code>errors[field]</code> without first asking which
+kind of failure it is dealing with.</p>
+
+<h3>Retryability belongs on the error</h3>
+
+<pre class="language-swift"><code class="language-swift">    var isRetryable: Bool {
+        switch self {
+        case .network: true
+        case let .api(status, _, _): status &gt;= 500
+        case .unauthorized, .decoding: false
+        }
+    }
+</code></pre>
+
+<p>A 400 will fail again with exactly the same body, so offering "Try again" is a lie. A dropped
+connection might not. Putting the judgement on the error means every screen's retry button is gated
+on the same rule instead of each one guessing.</p>
+
+<h2>Deciding what the customer sees</h2>
+
+<p>Every screen needs the same ladder — is this an API error, a network error, something else — and
+writing it in each one guarantees they diverge:</p>
+
+<pre class="language-swift"><code class="language-swift">enum ErrorPresenter {
+    static func message(for error: Error, fallback: String = "Something went wrong.") -&gt; String? {
+        if error is CancellationError { return nil }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return nil }
+        if let apiError = error as? APIError { return apiError.errorDescription ?? fallback }
+        return error.localizedDescription.isEmpty ? fallback : error.localizedDescription
+    }
+</code></pre>
+
+<p>The return type is <strong>optional</strong>, and that is the interesting part. A cancelled
+request means the view went away — the customer dismissed a screen, or a search superseded itself.
+There is nothing to tell them, so the presenter returns <code>nil</code> and every caller's "show a
+message" path is skipped by construction.</p>
+
+<p>Getting that wrong produces one of the more baffling bugs in an async app: an error toast that
+appears <em>after</em> you have already left the screen that caused it.</p>
+
+<h2>The state of a screen, as one value</h2>
+
+<p>Here is the piece that does the most work. Three properties — <code>isLoading</code>,
+<code>error</code>, <code>items</code> — describe eight combinations, and five of them are nonsense:
+loading and failed, loaded and failed, empty and loading. Every one is a bug somebody can write, and
+the most common one ships constantly.</p>
+
+<pre class="language-swift"><code class="language-swift">enum ViewState&lt;Value&gt; {
+    case idle
+    case loading
+    case loaded(Value)
+    case empty
+    case failed(message: String, isRetryable: Bool)
+    // accessors and the two constructors below follow
+</code></pre>
+
+<p>Five states, all of them real. A view <code>switch</code>es over it, the compiler insists every
+case is handled, and "what does this screen show right now?" has exactly one answer at all times.</p>
+
+<p><code>.empty</code> is separate from <code>.loaded([])</code> deliberately: an empty result is a
+<em>destination</em>, not a degenerate success. It wants different copy and usually a call to
+action, and treating it as a list of zero rows gives you a blank screen that looks broken.</p>
+
+<h3>Two constructors that remove the mistakes</h3>
+
+<pre class="language-swift"><code class="language-swift">    static func resolved(_ collection: Value) -&gt; ViewState where Value: Collection {
+        collection.isEmpty ? .empty : .loaded(collection)
+    }
+
+    static func failure(_ error: Error, fallback: String = "Something went wrong.") -&gt; ViewState {
+        ViewState.failed(
+            message: ErrorPresenter.message(for: error, fallback: fallback) ?? fallback,
+            isRetryable: (error as? APIError)?.isRetryable ?? true
+        )
+    }
+</code></pre>
+
+<p><code>resolved</code> means no caller has to remember the <code>isEmpty</code> ternary — and more
+usefully, none of them can forget it. <code>failure</code> carries the retryability through, so the
+"Try again" button appears exactly when retrying could work.</p>
+
+<h3>What a store does with it</h3>
+
+<pre class="language-swift"><code class="language-swift">            guard !Task.isCancelled else { return }
+            state = catalogue.products.isEmpty ? .empty : .loaded(catalogue)
+        } catch {
+            // A cancellation is not a failure — it means a reload superseded this load.
+            guard !Task.isCancelled, !ErrorPresenter.isCancellation(error) else { return }
+            state = .failure(error, fallback: "Could not load the menu.")
+        }
+</code></pre>
+
+<p>The <code>fallback</code> is the screen-specific part. "Could not load the menu" is what appears
+when the error has no message of its own — which is better than "Something went wrong" because it at
+least tells the customer which thing failed.</p>
+
+<h3>And what a view does</h3>
+
+<pre class="language-swift"><code class="language-swift">        switch menu.state {
+        case .idle, .loading:
+            LoadingStateView(label: "Loading the menu…")
+
+        case let .failed(message, isRetryable):
+            ErrorStateView(message: message, retry: isRetryable ? { menu.load() } : nil)
+
+        case .empty:
+            EmptyStateView(title: "Nothing on the menu", message: "The kitchen has not published anything yet.")
+</code></pre>
+
+<p>Exhaustive. You cannot ship this screen having forgotten the failure branch, because it would not
+compile.</p>
+
+<h2>Three states, three components</h2>
+
+<p>The three views live in one file because they are one decision, not three. A screen that renders a
+spinner but forgets the error branch is the single most common bug in a fetch-and-render app, and
+keeping them together makes the omission visible.</p>
+
+<pre class="language-swift"><code class="language-swift">            VStack(alignment: .leading, spacing: Spacing.xs) {
+                Text("Something went wrong").textStyle(.bodyStrong, tone: .danger)
+                Text(message).textStyle(.caption, tone: .muted)
+            }
+            .accessibilityElement(children: .combine)
+</code></pre>
+
+<p>Combining the two lines means VoiceOver announces "Something went wrong, could not load the menu"
+as one stop rather than two unrelated fragments. The retry button is deliberately <em>outside</em>
+that group — combining children hides them from the accessibility tree, so a button nested inside
+becomes unreachable. That is the classic way this pattern goes wrong, and it makes the screen worse
+for exactly the people the effort was for.</p>
+
+<h2>Writes are a different shape</h2>
+
+<p>A read has five states. A write has three outcomes, and one of them is neither success nor
+failure:</p>
+
+<pre class="language-swift"><code class="language-swift">enum ActionOutcome: Equatable {
+    case succeeded(String)
+    case failed(String)
+    case cancelled
+</code></pre>
+
+<p>Why not <code>Result&lt;String, String&gt;</code>? Because it does not compile —
+<code>Result</code>'s failure type must conform to <code>Error</code>, and a message is a
+<code>String</code>. The deeper reason is that this is not a <code>Result</code>: both cases carry
+the same thing, a sentence to show the customer.</p>
+
+<p><code>.cancelled</code> is the case a <code>Result</code> has nowhere to put. The customer backed
+out of a payment sheet or dismissed a confirmation — nothing should be shown at all. Modelling that
+as <code>.failed("")</code> that every caller remembers to special-case is how an empty toast
+eventually reaches production.</p>
+
+<pre class="language-swift"><code class="language-swift">    private func report(_ outcome: ActionOutcome) {
+        guard let message = outcome.message else { return }
+        toasts.show(message, style: outcome.isSuccess ? .success : .danger)
+    }
+</code></pre>
+
+<p>One place turns an outcome into a toast, so no call site can forget the failure case and none of
+them can show an empty one.</p>
+
+<h2>Not every failure is worth reporting</h2>
+
+<p>Two in the demo app are deliberately swallowed, and both are worth the judgement call.</p>
+
+<p>A failed cart save is logged, not surfaced. The cart still works for this session; it simply will
+not survive a relaunch. A toast on every tap would be a worse experience than the failure it
+reports.</p>
+
+<p>And saved addresses that will not load do not block checkout — the screen falls back to typing
+one. Failing the whole flow because an optional convenience is unavailable turns a minor outage into
+a lost order.</p>
+
+<p>The rule underneath both: report a failure when the customer can do something about it, or when
+not reporting it would leave them confused about what happened.</p>
+
+<h2>Testing the model</h2>
+
+<p>All of this is plain values, so the tests need nothing:</p>
+
+<pre class="language-swift"><code class="language-swift">    func testRetryabilityReflectsWhetherRetryingCouldWork() {
+        XCTAssertTrue(APIError.network(message: "offline").isRetryable)
+        XCTAssertTrue(APIError.api(status: 503, message: "", body: nil).isRetryable)
+        XCTAssertFalse(APIError.api(status: 400, message: "", body: nil).isRetryable)
+        XCTAssertFalse(APIError.unauthorized.isRetryable)
+        XCTAssertFalse(APIError.decoding(message: "").isRetryable)
+    }
+</code></pre>
+
+<p>Five assertions, no simulator, no server. The cancellation cases are worth testing explicitly too
+— that <code>ErrorPresenter.message(for: CancellationError())</code> is <code>nil</code> is a claim
+the rest of the app depends on, and it is one line to prove.</p>
+
+<h2>What about crashes?</h2>
+
+<p>Everything above is about <em>expected</em> failure — a server saying no, a network dropping. A
+crash is different: force-unwrapping a nil, an array index out of range, a precondition failing.
+Those are not errors to handle, they are bugs to fix, and trying to recover from them generally
+makes them harder to find.</p>
+
+<p>The two practical rules are worth stating. Do not force-unwrap in app code — the demo app's linter
+treats it as an error and allows it in tests, where a crash is a clear failure. And when a
+programming error genuinely is unrecoverable, crash <em>deliberately</em> with a message that names
+the fix. The app does this exactly once, for a release build with no API host configured: shipping a
+binary that silently talks to localhost is worse than one that refuses to launch on the machine of
+the person who can still correct it.</p>
+
+<h2>Next</h2>
+
+<p>Several snippets here have checked <code>Task.isCancelled</code> without explanation. The next
+lesson is Swift concurrency properly — <code>async let</code>, <code>.task</code>, cancellation you
+get for free, <code>@MainActor</code>, and an actor for state several callers touch at once.</p>

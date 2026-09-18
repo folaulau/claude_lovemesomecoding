@@ -1,0 +1,307 @@
+<p>Every app acquires a design system. The only question is whether it is written down or scattered
+across ninety files as slightly different greys. This lesson builds one in three tiers, and makes the
+case for the middle tier — which is the one people skip and the one that makes a retune possible.</p>
+
+<h2>The three tiers</h2>
+
+<p><strong>Tokens</strong> are raw values: this red, this spacing step, this radius. They have no
+opinion about where they are used.</p>
+
+<p><strong>The semantic layer</strong> names roles: "muted text", "the surface a card sits on",
+"the colour of a destructive action". Each role points at a token.</p>
+
+<p><strong>Components</strong> consume roles, never raw tokens.</p>
+
+<p>Skip the middle tier and every component references <code>grey600</code> directly. Changing what
+muted text looks like then means a find-and-replace that also hits the borders which merely happened
+to share the value. The indirection is the entire point: it lets you change one meaning without
+changing the others.</p>
+
+<h2>Tokens</h2>
+
+<pre class="language-swift"><code class="language-swift">enum Palette {
+    static let red = Color(hex: 0xD8102A)
+    /// `color.adjust($pizza-red, $lightness: -10%)` in Sass, precomputed — as in the RN app.
+    static let redDark = Color(hex: 0xAB0D21)
+    static let redSoft = Color(hex: 0xFDEAEC)
+    static let black = Color(hex: 0x231F20)
+    static let cream = Color(hex: 0xFFF8F0)
+    static let white = Color(hex: 0xFFFFFF)
+</code></pre>
+
+<p>A caseless <code>enum</code> rather than a <code>struct</code>, and that is a small idiom worth
+knowing: an enum with no cases cannot be instantiated, which is exactly right for a namespace. A
+struct would silently allow <code>Palette()</code>.</p>
+
+<p>SwiftUI ships no hex initialiser, and the usual workaround parses a <code>String</code> at
+runtime. Taking an integer literal instead means a typo is a compile error rather than a colour that
+falls back to black:</p>
+
+<pre class="language-swift"><code class="language-swift">extension Color {
+    init(hex: UInt32) {
+        self.init(
+            .sRGB,
+            red: Double((hex &gt;&gt; 16) &amp; 0xFF) / 255,
+            green: Double((hex &gt;&gt; 8) &amp; 0xFF) / 255,
+            blue: Double(hex &amp; 0xFF) / 255,
+            opacity: 1
+        )
+    }
+}
+</code></pre>
+
+<h3>Spacing and radius</h3>
+
+<pre class="language-swift"><code class="language-swift">enum Spacing {
+    static let xs: CGFloat = 4
+    static let sm: CGFloat = 8
+    static let md: CGFloat = 12
+    static let lg: CGFloat = 16
+    static let xl: CGFloat = 24
+    static let xxl: CGFloat = 32
+    static let xxxl: CGFloat = 48
+}
+</code></pre>
+
+<p>A 4-point scale. The value is not the numbers — it is that naming the steps stops
+<code>padding(13)</code> appearing next to <code>padding(12)</code> and quietly breaking the
+rhythm. Once a scale exists, an off-scale value becomes visible in review as
+<code>.padding(13)</code> standing out among named constants.</p>
+
+<h3>Shadows, and the one place SwiftUI is simplest</h3>
+
+<pre class="language-swift"><code class="language-swift">enum Elevation {
+    struct Shadow {
+        let color: Color
+        let radius: CGFloat
+        let x: CGFloat
+        let y: CGFloat
+    }
+
+    static let card = Shadow(color: Palette.black.opacity(0.08), radius: 4, x: 0, y: 2)
+</code></pre>
+
+<p>Worth a comparison. React Native has to set <code>shadowColor</code>/<code>shadowOffset</code>/
+<code>shadowOpacity</code>/<code>shadowRadius</code> for iOS <em>and</em> <code>elevation</code> for
+Android, and forgetting the second gives you cards that are flat on half your devices. The web sets a
+<code>box-shadow</code> string. Here there is one <code>.shadow(color:radius:x:y:)</code> and no
+platform split at all.</p>
+
+<p>One conversion trap: SwiftUI's <code>radius</code> is a Gaussian blur radius while CSS and React
+Native's is roughly a diameter. Porting a design directly gives you shadows about twice as soft as
+intended — the token above halves the web's value deliberately.</p>
+
+<h2>The semantic layer</h2>
+
+<pre class="language-swift"><code class="language-swift">enum Theme {
+    enum colors {
+        /// Brand
+        static let primary = Palette.red
+        static let primaryDark = Palette.redDark
+        static let primarySoft = Palette.redSoft
+        static let onPrimary = Palette.white
+
+        /// Surfaces
+        static let background = Palette.cream
+        static let surface = Palette.white
+        static let surfaceAlt = Palette.grey100
+</code></pre>
+
+<p>Views reach for <code>Theme.colors.textMuted</code>, never <code>Palette.grey600</code>. Note
+the <code>onPrimary</code> naming convention — it means "the colour of content placed
+<em>on</em> the primary colour", which keeps a foreground and its background paired rather than
+independently chosen.</p>
+
+<h2>Typography as a modifier</h2>
+
+<p>The instinct is a <code>PizzaText</code> wrapper view. SwiftUI makes the modifier better,
+because <code>.font()</code> and <code>.foregroundStyle()</code> already inherit down the view tree
+— so a modifier composes with a <code>Label</code>, a <code>TextField</code> or a whole stack, where
+a wrapper only works with text it renders itself.</p>
+
+<pre class="language-swift"><code class="language-swift">enum TextStyle {
+    case display
+    case title
+    case heading
+    case subheading
+    case body
+    case bodyStrong
+    /// Small, uppercase section headers — the web app's `.text-uppercase.text-muted.h6`.
+    case label
+    case caption
+    case mono
+
+    var font: Font {
+        switch self {
+        case .display: .system(size: FontSize.display, weight: .heavy)
+        case .title: .system(size: FontSize.xxl, weight: .heavy)
+        case .heading: .system(size: FontSize.lg, weight: .bold)
+</code></pre>
+
+<p>Applied through a <code>ViewModifier</code>:</p>
+
+<pre class="language-swift"><code class="language-swift">    func body(content: Content) -&gt; some View {
+        content
+            .font(style.font)
+            .tracking(style.tracking)
+            .foregroundStyle(tone.color)
+            .textCase(style.isUppercased ? .uppercase : nil)
+    }
+</code></pre>
+
+<p><code>.textCase</code> rather than uppercasing the string is an accessibility decision: it
+changes the rendering and leaves the underlying value alone, so VoiceOver reads the real text rather
+than spelling out what it takes for an acronym.</p>
+
+<p>The extension that hides all of it:</p>
+
+<pre class="language-swift"><code class="language-swift">extension View {
+    func textStyle(_ style: TextStyle, tone: TextTone = .standard) -&gt; some View {
+        modifier(TextStyleModifier(style: style, tone: tone))
+    }
+}
+</code></pre>
+
+<h2>Buttons: restyle, do not rebuild</h2>
+
+<p>A custom <code>PizzaButton</code> view would have to re-implement everything
+<code>Button</code> already does: the tap gesture, press-and-drag-away cancellation, the
+accessibility trait, Dynamic Type, keyboard activation and the <code>.disabled()</code> environment.
+A <code>ButtonStyle</code> restyles the real thing and inherits all of it.</p>
+
+<pre class="language-swift"><code class="language-swift">    func makeBody(configuration: Configuration) -&gt; some View {
+        configuration.label
+            .textStyle(size.textStyle)
+            .foregroundStyle(variant.foreground)
+            .padding(.vertical, size.verticalPadding)
+            .padding(.horizontal, size.horizontalPadding)
+            .frame(maxWidth: isFullWidth ? .infinity : nil)
+            .frame(minHeight: 44)
+            .background(
+                RoundedRectangle(cornerRadius: Radius.md)
+                    .fill(configuration.isPressed ? variant.pressedBackground : variant.background)
+            )
+</code></pre>
+
+<p><code>configuration.isPressed</code> is the native answer to CSS <code>:active</code>, and it
+arrives for free. <code>minHeight: 44</code> is Apple's touch-target guidance, applied to the
+<em>tappable</em> frame so a small button stays pressable without padding the design out of shape.</p>
+
+<p>One detail that is easy to get wrong:</p>
+
+<pre class="language-swift"><code class="language-swift">    @Environment(\.isEnabled) private var isEnabled
+</code></pre>
+
+<p>Read from the environment rather than passed in, so <code>.disabled(true)</code> on the button —
+or on any ancestor — is what dims it. A separate <code>isDisabled</code> property would let the two
+disagree, giving you a button that looks enabled and does nothing.</p>
+
+<p>Registering it as a static keeps call sites short — <code>.buttonStyle(.pizzaPrimary)</code>
+rather than naming the type, which is how SwiftUI's own styles read.</p>
+
+<h3>The loading state belongs in the component</h3>
+
+<p>A button that shows a spinner but still accepts taps is how a customer ends up with two orders.
+Tying the two together means no call site can express one without the other:</p>
+
+<pre class="language-swift"><code class="language-swift">struct AsyncButton&lt;Label: View&gt;: View {
+    let title: String
+    var isLoading = false
+    var isDisabled = false
+    let action: () -&gt; Void
+    @ViewBuilder var label: () -&gt; Label
+</code></pre>
+
+<p>Inside, the label stays in the layout while hidden and the spinner is drawn over it, so the button
+does not resize as work starts — a button that jumps is a button people miss. This is the general
+pattern: when two properties must always change together, the component is the place to enforce it,
+not a convention in a code review checklist.</p>
+
+<h2>Status colours, and exhaustiveness</h2>
+
+<p>Badges are where a design system quietly rots, because a new status arrives and nobody updates the
+colour map. A <code>switch</code> prevents it:</p>
+
+<pre class="language-swift"><code class="language-swift">    private var tone: StatusBadge.Tone {
+        switch status {
+        case .pendingPayment: .warning
+        case .paid: .primary
+        case .preparing: .info
+        case .completed: .success
+        case .cancelled: .neutral
+        }
+    }
+</code></pre>
+
+<p>Add a case to <code>OrderStatus</code> and this stops compiling until it is handled. A dictionary
+lookup with a <code>?? .neutral</code> fallback would compile happily and render every new status
+grey — which is the kind of bug that ships, because grey is not obviously wrong.</p>
+
+<h2>When SwiftUI ships nothing</h2>
+
+<p>A row of topping chips has to wrap onto a second line. <code>HStack</code> never wraps, and
+<code>LazyVGrid</code> needs columns of known width, which is wrong for chips sized by their text.
+This is the one place in the app where SwiftUI asks for <em>more</em> code than
+<code>flex-wrap: wrap</code>.</p>
+
+<p>The <code>Layout</code> protocol lets you take part in the layout pass directly, with two
+methods:</p>
+
+<pre class="language-swift"><code class="language-swift">    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache _: inout ()) -&gt; CGSize {
+        let maxWidth = proposal.replacingUnspecifiedDimensions().width
+        let rows = layout(subviews: subviews, maxWidth: maxWidth)
+
+        let height = rows.reduce(0) { $0 + $1.height } + lineSpacing * CGFloat(max(rows.count - 1, 0))
+        let width = rows.map(\.width).max() ?? 0
+
+        return CGSize(width: max(width, 0), height: max(height, 0))
+    }
+</code></pre>
+
+<p><code>replacingUnspecifiedDimensions()</code> is the line that matters. A
+<code>ProposedViewSize</code>'s dimensions are <strong>optional</strong>: <code>nil</code> means "I
+am not proposing anything, tell me what you want", which is what a <code>ScrollView</code> does along
+its scroll axis. Treating <code>nil</code> as zero is the classic mistake and it collapses the layout
+to nothing.</p>
+
+<p>Both methods share one line-breaking function, so measurement and placement cannot disagree —
+computing the rows twice with slightly different code is how a layout reports one height and draws
+another.</p>
+
+<h2>What about dark mode?</h2>
+
+<p>This app is pinned to light, matching its three web siblings, and the README says so rather than
+leaving it as an apparent oversight. The reason is worth stating because it follows from the
+structure above: the semantic layer declares one value per role, and supporting both schemes means
+declaring two and resolving between them.</p>
+
+<p>Doing that properly is not hard — an asset-catalogue colour carries both appearances and SwiftUI
+picks the right one automatically, which is why colours defined in the catalogue rather than in code
+are the usual recommendation for an app that needs it. The mistake is reading
+<code>@Environment(\.colorScheme)</code> in a view and branching on it, which spreads the decision
+across every component instead of keeping it in the one file that owns colour.</p>
+
+<h2>What this buys</h2>
+
+<p>Three things, and the third is the one that justifies the effort. A visual change happens in one
+file. A new component starts from roles that already exist rather than from a colour picker. And a
+review can tell the difference between a deliberate exception and a mistake, because an off-token
+value stands out among named ones.</p>
+
+<h2>Dynamic Type, briefly</h2>
+
+<p>One caveat about everything above. <code>.system(size:)</code> pins a point size, which means it
+does not grow when a customer increases text size in Settings — and a meaningful number of people
+run their phone at larger sizes.</p>
+
+<p>The alternative is <code>.system(.body)</code> and friends, which scale, or
+<code>@ScaledMetric</code> for a custom size that scales with them. The demo app takes the fixed
+route deliberately, for consistency with the three web frontends it is compared against, and that is
+a trade-off rather than a recommendation. If you are building something real, start from the
+scaling styles — retrofitting them later means revisiting every fixed frame that was sized around a
+fixed font.</p>
+
+<h2>Next</h2>
+
+<p>That is the presentation layer complete. The next lesson goes to the other end of the app: talking
+to a server, with one type that performs requests and everything else describing them.</p>

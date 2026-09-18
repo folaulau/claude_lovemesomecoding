@@ -1,0 +1,320 @@
+<p>Nearly every iOS app talks to a server, and nearly every one grows the same problem: a dozen
+places that build a <code>URLRequest</code>, each with its own idea about headers, timeouts and what
+a failure means.</p>
+
+<p>This lesson builds the alternative — one type that performs requests, and everything else
+describing them as data. Third-party clients exist and are fine; doing it once by hand is worth it,
+because what they give you for free is exactly what is below.</p>
+
+<h2>A request as a value</h2>
+
+<p>The key move is that building a request performs no I/O:</p>
+
+<pre class="language-swift"><code class="language-swift">struct Endpoint {
+    let path: String
+    let method: HTTPMethod
+    let queryItems: [URLQueryItem]
+    /// Whether to attach the bearer token. Public endpoints (the menu, guest checkout) do not need it.
+    let requiresAuthentication: Bool
+    let encodeBody: (@Sendable () throws -&gt; Data)?
+</code></pre>
+
+<p>An <code>Endpoint</code> is inert. That makes the whole routing layer testable without a server,
+a mock protocol or a single byte crossing the network — "does this produce
+<code>/api/orders/mine?page=2&amp;size=20</code>?" is a plain assertion.</p>
+
+<p>The body is a closure rather than <code>some Encodable</code> because a protocol with
+<code>Self</code> requirements cannot be stored in a property. Encoding lazily has a second benefit:
+a body is only serialised if the request is actually sent.</p>
+
+<p>A convenience initialiser hides that from every call site:</p>
+
+<pre class="language-swift"><code class="language-swift">    init(
+        path: String,
+        method: HTTPMethod,
+        queryItems: [URLQueryItem] = [],
+        requiresAuthentication: Bool = false,
+        body: some Encodable &amp; Sendable
+    ) {
+        self.init(
+            path: path,
+            method: method,
+            queryItems: queryItems,
+            requiresAuthentication: requiresAuthentication,
+            encodeBody: { try JSONCoding.encoder.encode(body) }
+        )
+    }
+</code></pre>
+
+<h3>Build URLs with URLComponents</h3>
+
+<pre class="language-swift"><code class="language-swift">    func url(relativeTo baseURL: URL) -&gt; URL? {
+        guard var components = URLComponents(
+            url: baseURL.appendingPathComponent(path),
+            resolvingAgainstBaseURL: false
+        ) else { return nil }
+
+        if !queryItems.isEmpty { components.queryItems = queryItems }
+        return components.url
+    }
+</code></pre>
+
+<p>Never by concatenating strings. A search term containing a space or an ampersand has to be
+percent-encoded, and <code>"\(base)\(path)?q=\(value)"</code> is exactly how that becomes a
+malformed URL nobody notices until a customer types an apostrophe.</p>
+
+<h2>Every route in one file</h2>
+
+<pre class="language-swift"><code class="language-swift">enum CatalogEndpoints {
+    static let products = Endpoint(path: "/api/products")
+    static let toppings = Endpoint(path: "/api/toppings")
+    static let crusts = Endpoint(path: "/api/crusts")
+}
+</code></pre>
+
+<p>Grouped by resource, one caseless enum each. Two things fall out of writing them this way. The
+app's entire API surface is answered by reading one file rather than grepping for string literals.
+And the one security-relevant flag in the whole layer sits next to the path:</p>
+
+<pre class="language-swift"><code class="language-swift">    static func myOrders(page: Int, size: Int) -&gt; Endpoint {
+        Endpoint(
+            path: "/api/orders/mine",
+            queryItems: [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "size", value: String(size)),
+            ],
+            requiresAuthentication: true
+        )
+    }
+</code></pre>
+
+<p>Declaring <code>requiresAuthentication</code> at the endpoint rather than at the call site is what
+stops <code>/api/me/addresses</code> ever being sent without a token by accident. It is also
+directly testable — the demo app has a test that walks every profile endpoint and asserts both that
+it is authenticated and that its path carries no user id.</p>
+
+<h2>The client, behind a protocol</h2>
+
+<pre class="language-swift"><code class="language-swift">protocol HTTPClient: Sendable {
+    func send&lt;Response: Decodable&gt;(_ endpoint: Endpoint, as type: Response.Type) async throws -&gt; Response
+}
+</code></pre>
+
+<p>Everything above this — repositories, stores, views — depends on the protocol rather than on
+<code>URLSession</code>. That is what makes the whole app testable without a server: a test injects
+a client returning canned values, and no feature code knows the difference.</p>
+
+<p>Two extensions make it pleasant to use:</p>
+
+<pre class="language-swift"><code class="language-swift">extension HTTPClient {
+    func send&lt;Response: Decodable&gt;(_ endpoint: Endpoint) async throws -&gt; Response {
+        try await send(endpoint, as: Response.self)
+    }
+
+    func send(_ endpoint: Endpoint) async throws {
+        _ = try await send(endpoint, as: EmptyResponse.self)
+    }
+}
+</code></pre>
+
+<p>The first lets type inference do the work — <code>let user: User = try await client.send(…)</code>.
+The second is for a <code>DELETE</code> whose response nobody reads.</p>
+
+<h2>What replaced AbortController</h2>
+
+<p>The implementation is where Swift's concurrency model earns its keep. The React Native version of
+this same client threads an <code>AbortSignal</code> through every call and wires it to a timeout by
+hand, because <code>fetch</code> has no other way to be interrupted.</p>
+
+<p>Swift needs none of that. Cancelling a <code>Task</code> cancels every <code>await</code> inside
+it, so a view that disappears cancels its own requests simply by its task going away. The timeout is
+a session property:</p>
+
+<pre class="language-swift"><code class="language-swift">            let sessionConfiguration = URLSessionConfiguration.default
+            sessionConfiguration.timeoutIntervalForRequest = configuration.requestTimeout
+            sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            self.session = URLSession(configuration: sessionConfiguration)
+</code></pre>
+
+<p>The cache policy is deliberate: nobody wants a cached menu served as fresh, because prices change
+and a stale cart line is a support ticket. Opting out here rather than per request means a new
+endpoint cannot forget to.</p>
+
+<h3>The request</h3>
+
+<pre class="language-swift"><code class="language-swift">        var request = URLRequest(url: url)
+        request.httpMethod = endpoint.method.rawValue
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        if let encodeBody = endpoint.encodeBody {
+            do {
+                request.httpBody = try encodeBody()
+            } catch {
+                throw APIError.decoding(message: "Could not encode the request body: \(error).")
+            }
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+
+        if endpoint.requiresAuthentication, let token = await tokenProvider?.currentToken() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+</code></pre>
+
+<p>One place decides where the API lives, how the token is attached, how long to wait, and how an
+error response becomes a thrown Swift error. Calling <code>URLSession</code> from a view model would
+scatter all four, and they would drift.</p>
+
+<h3>Cancellation is not a failure</h3>
+
+<pre class="language-swift"><code class="language-swift">        } catch let error as URLError {
+            if error.code == .cancelled { throw CancellationError() }
+</code></pre>
+
+<p>A cancelled request means the caller went away — a screen dismissed, a search superseded.
+Rethrowing it as <code>CancellationError</code> keeps <code>Task.isCancelled</code> checks upstream
+working, and lets every <code>catch</code> in the app distinguish "this failed" from "nobody is
+waiting any more".</p>
+
+<h2>Decoding, and the failures that only happen in production</h2>
+
+<pre class="language-swift"><code class="language-swift">        // 204 No Content, or a 200 with an empty body, has nothing to decode.
+        if data.isEmpty || response.statusCode == 204 {
+            guard let empty = EmptyResponse() as? Response else {
+                throw APIError.decoding(message: "Expected a body from \(endpoint.path) but got none.")
+            }
+            return empty
+        }
+</code></pre>
+
+<p><code>JSONDecoder</code> throws on empty input rather than returning "nothing", so without this
+short circuit every <code>DELETE</code> in the app would need its own non-generic overload.</p>
+
+<p>When decoding does fail, the detail belongs in the log and not on screen:</p>
+
+<pre class="language-swift"><code class="language-swift">            logger.error("Decoding \(String(describing: type)) from \(endpoint.path, privacy: .public) failed: \(String(describing: error), privacy: .private)")
+            throw APIError.decoding(message: "The server returned a response this app could not read.")
+</code></pre>
+
+<p>A decoding failure is <em>our</em> bug, not the customer's connection. The mismatch details are
+exactly what is needed to fix it and exactly what must not leak into the UI — or, given
+<code>privacy: .private</code>, into a diagnostic file somebody emails around. That privacy
+annotation is the reason to use <code>Logger</code> over <code>print</code>: interpolated values are
+redacted by default in logs collected from a customer's phone.</p>
+
+<h3>Not everything that fails is JSON</h3>
+
+<pre class="language-swift"><code class="language-swift">        guard let body = try? JSONCoding.decoder.decode(APIErrorBody.self, from: data) else {
+            logger.error("HTTP \(statusCode) from \(endpoint.path, privacy: .public) with an unreadable body")
+            return .api(
+                status: statusCode,
+                message: "Request failed with \(statusCode).",
+                body: nil
+            )
+        }
+</code></pre>
+
+<p>A proxy or a crashed server returns an HTML error page. Letting the decoder throw there would
+surface "Unexpected character '&lt;'" over the top of the real problem, which is a 502.</p>
+
+<h2>Codable, and one decision about keys</h2>
+
+<p>The response side is <code>Codable</code>, which for most models means declaring the conformance
+and nothing else — the compiler matches property names to JSON keys and writes the parsing.</p>
+
+<pre class="language-swift"><code class="language-swift">enum JSONCoding {
+    static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        return encoder
+    }()
+
+    static let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        return decoder
+    }()
+}
+</code></pre>
+
+<p>One encoder and one decoder, shared. Constructing them per call is cheap but not free, and more
+importantly a decoder built at each call site is a decoder whose <em>configuration</em> can drift.
+The day a date strategy is needed, it needs to be needed in one place.</p>
+
+<p>Note what is <strong>not</strong> set: <code>keyDecodingStrategy</code>. This API already speaks
+lowerCamelCase, so <code>.convertFromSnakeCase</code> would be a no-op that quietly mangles any
+field that ever arrives with an underscore in it. Where a Swift name must differ from the wire name,
+the model declares its own <code>CodingKeys</code> — visible at the model rather than implied
+globally.</p>
+
+<h2>Transport errors worth reading</h2>
+
+<pre class="language-swift"><code class="language-swift">    private static func transportMessage(for error: URLError, baseURL: URL) -&gt; String {
+        switch error.code {
+        case .timedOut:
+            "The server took too long to respond. Check your connection."
+        case .notConnectedToInternet, .networkConnectionLost:
+            "You appear to be offline. Check your connection and try again."
+        default:
+            "Could not reach the server at \(baseURL.absoluteString). Is the backend running?"
+        }
+    }
+</code></pre>
+
+<p><code>URLError.localizedDescription</code> says "A server with the specified hostname could not be
+found", which tells a customer nothing and a developer almost nothing. Naming the host we actually
+tried turns the two failures that happen daily in development into self-answering questions — and
+the offline case is the one that matters in production, because on a phone a lost signal is far more
+likely than a backend that is down.</p>
+
+<h2>Where the server is</h2>
+
+<p>The last piece is configuration, and it is the one thing a mobile app cannot hard-code. The
+simulator shares your Mac's network stack, so <code>localhost</code> works. A real device is a
+different machine on the Wi-Fi, where <code>localhost</code> is the phone. And a release build talks
+to a real host over HTTPS.</p>
+
+<pre class="language-swift"><code class="language-swift">struct APIConfiguration: Equatable, Sendable {
+    let baseURL: URL
+    let requestTimeout: TimeInterval
+    let stripePublishableKey: String?
+</code></pre>
+
+<p>A struct, not a singleton. A <code>static let shared</code> would make every test that touches
+networking depend on the app's real configuration; passing an instance means a test can construct
+one pointing nowhere and be certain of it.</p>
+
+<p>The values come from the build rather than the source, and the fallback is deliberately
+asymmetric: a debug build with nothing configured defaults to localhost, and a release build with
+nothing configured traps. Shipping a binary that silently talks to <code>localhost</code> is far
+worse than one that refuses to launch on the machine of the person who can still fix it.</p>
+
+<h2>Repositories on top</h2>
+
+<p>Features do not call the client directly. A thin repository sits between them, and the thinness is
+the point:</p>
+
+<pre class="language-swift"><code class="language-swift">struct RemoteCatalogRepository: CatalogRepository {
+    private let client: HTTPClient
+
+    init(client: HTTPClient) { self.client = client }
+
+    func products() async throws -&gt; [Product] { try await client.send(CatalogEndpoints.products) }
+    func toppings() async throws -&gt; [Topping] { try await client.send(CatalogEndpoints.toppings) }
+    func crusts() async throws -&gt; [Crust] { try await client.send(CatalogEndpoints.crusts) }
+}
+</code></pre>
+
+<p>An endpoint in, a decoded model out. A repository that also cached, retried or mapped errors would
+be a place for logic to accumulate where no test would look for it. Lesson 13 makes the architectural
+case for the protocol these implement.</p>
+
+<h2>What this does not do</h2>
+
+<p>Deliberately: no retry policy, no request deduplication, no caching layer, no reachability
+monitoring. Each is a real requirement for some apps and none of them belongs in the client —
+retrying is a decision only a caller can make, because only it knows whether the request is safe to
+repeat.</p>
+
+<h2>Next</h2>
+
+<p>This layer throws a typed error, and so far nothing has said what a caller should do with it. The
+next lesson is error handling that reaches the user: an error type whose cases are decisions, field
+messages from a server, and a state model that makes the eternal spinner impossible to write.</p>

@@ -189,6 +189,8 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Core/DesignSystem/Typography.swift",
         f"{A}/Pizza/Core/DesignSystem/Components/PizzaButton.swift",
         f"{A}/Pizza/Core/DesignSystem/Components/FlowLayout.swift",
+        # The exhaustive-switch argument is made with the order-status badge.
+        f"{A}/Pizza/Core/DesignSystem/Components/StatusBadge.swift",
     ],
     "ios-networking": [
         f"{A}/Pizza/Core/Networking/Endpoint.swift",
@@ -196,12 +198,21 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Core/Networking/URLSessionHTTPClient.swift",
         f"{A}/Pizza/Core/Networking/APIConfiguration.swift",
         f"{A}/Pizza/Data/Endpoints/APIEndpoints.swift",
+        # The shared coder, and the repository that sits on top of the client.
+        f"{A}/Pizza/Core/Networking/JSONCoding.swift",
+        f"{A}/Pizza/Data/Repositories/RemoteRepositories.swift",
     ],
     "ios-error-handling": [
         f"{A}/Pizza/Core/Networking/APIError.swift",
         f"{A}/Pizza/Core/Utilities/ViewState.swift",
         f"{A}/Pizza/Core/Utilities/ActionOutcome.swift",
         f"{A}/Pizza/Core/DesignSystem/Components/StateViews.swift",
+        # The store that produces a ViewState, the view that switches over one, the profile
+        # screen's toast reporter, and the tests that prove the retryability rule.
+        f"{A}/Pizza/Features/Menu/MenuStore.swift",
+        f"{A}/Pizza/Features/Menu/MenuView.swift",
+        f"{A}/Pizza/Features/Profile/ProfileView.swift",
+        f"{A}/PizzaTests/SupportTypeTests.swift",
     ],
     "ios-concurrency": [
         f"{A}/Pizza/Features/Menu/MenuStore.swift",
@@ -209,6 +220,8 @@ SNIPPET_SOURCES = {
         f"{A}/Pizza/Features/Orders/OrderConfirmationViewModel.swift",
         f"{A}/Pizza/Features/Cart/CartStore.swift",
         f"{A}/Pizza/Features/Profile/ProfileViewModel.swift",
+        # The startup sequence, which is where `.task` and the ordering rule are shown.
+        f"{A}/Pizza/App/RootView.swift",
     ],
     "ios-app-architecture": [
         f"{A}/Pizza/Domain/Repositories/Repositories.swift",

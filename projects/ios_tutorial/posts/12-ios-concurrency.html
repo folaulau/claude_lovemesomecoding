@@ -1,0 +1,284 @@
+<p>Swift concurrency is the biggest single improvement to iOS development in a decade, and it is the
+part of the language most likely to produce compiler errors you have to think about rather than
+just fix.</p>
+
+<p>This lesson is the shape you will actually use it in — requests that should overlap, work tied to
+a view's lifetime, cancellation you get for free — then <code>@MainActor</code>, actors, and the
+three rules the compiler will enforce whether you have read them or not.</p>
+
+<h2>async/await, briefly</h2>
+
+<p>A function marked <code>async</code> can suspend. <code>await</code> marks the point where it
+might. While suspended the thread is free to do something else, which is the whole trick: you write
+straight-line code and get non-blocking behaviour.</p>
+
+<p>What this replaced is worth remembering, because it is why the API looks the way it does. The
+completion-handler version of a two-request flow nests, and every error path has to be handled in
+every closure, and forgetting to call the completion in one branch hangs the caller silently. Under
+<code>async</code> the same flow is four lines with one <code>catch</code>.</p>
+
+<h2>Requests that should overlap</h2>
+
+<p>The menu needs products, toppings and crusts. Written with three <code>await</code>s in a row
+they run one after another, tripling the wait for no reason — on a phone that is the difference
+between a menu that opens and one that appears to hang.</p>
+
+<pre class="language-swift"><code class="language-swift">            async let products = repository.products()
+            async let toppings = repository.toppings()
+            async let crusts = repository.crusts()
+
+            let catalogue = try await Catalogue(products: products, toppings: toppings, crusts: crusts)
+</code></pre>
+
+<p><code>async let</code> starts the work immediately and binds a promise. Nothing suspends until
+the <code>await</code> on the last line, so all three are in flight together. The single
+<code>try await</code> covers all of them — if any throws, that is the error you catch.</p>
+
+<p>For a variable number of concurrent operations the equivalent is a task group, which is the same
+idea with a loop. Reach for <code>async let</code> when you know the operations at compile time,
+which is most of the time.</p>
+
+<h2>Tying work to a view</h2>
+
+<pre class="language-swift"><code class="language-swift">        .task {
+            await auth.restoreSession()
+            await menu.reload()
+            await cart.hydrate()
+        }
+</code></pre>
+
+<p><code>.task</code> runs when the view appears and <strong>cancels automatically</strong> when it
+goes away. That is the modifier to reach for, not <code>.onAppear { Task { … } }</code> — the
+latter starts work nobody cancels, so a customer who opens a screen and immediately leaves has left
+a request running and a closure holding a reference to a view that is gone.</p>
+
+<p>The ordering above is load-bearing rather than tidy: the session is restored first because an
+authenticated request needs the token, and the cart hydrates last because a saved line holds only
+identifiers and needs the catalogue to re-price it.</p>
+
+<h3>Cancellation is cooperative</h3>
+
+<p>Cancelling a task does not stop it. It sets a flag, and the task is expected to notice.</p>
+
+<pre class="language-swift"><code class="language-swift">    func load() {
+        loadTask?.cancel()
+        loadTask = Task { await performLoad() }
+    }
+</code></pre>
+
+<p>Cancelling the previous load before starting a new one is what stops a slow first response landing
+<em>after</em> a fast retry and overwriting fresher data. It is the structured-concurrency
+equivalent of an <code>AbortController</code> in a React effect cleanup, and it is one line instead
+of six.</p>
+
+<p>Noticing comes in two forms. <code>Task.isCancelled</code> is a check you make before doing
+something expensive or writing state. And several built-ins throw <code>CancellationError</code> on
+their own — <code>Task.sleep</code> is the one you will meet most.</p>
+
+<h2>Cancellation as a feature: the debounce</h2>
+
+<p>The cart writes itself to the server, and three taps on "+" should be one request rather than
+three:</p>
+
+<pre class="language-swift"><code class="language-swift">        persistTask?.cancel()
+        persistTask = Task { [persistDebounce] in
+            try? await Task.sleep(for: persistDebounce)
+            guard !Task.isCancelled else { return }
+            await self.persist()
+        }
+</code></pre>
+
+<p>Cancelling and re-scheduling is the entire debounce. <code>Task.sleep</code> throws on
+cancellation, so a superseded write simply never reaches <code>persist()</code> — there is no flag
+to check and no timer handle to clear. Compare that with the timer-plus-cleanup version in any
+JavaScript codebase and the difference is not subtle.</p>
+
+<h2>Polling, without a timer</h2>
+
+<pre class="language-swift"><code class="language-swift">        for attempt in 0 ..&lt; maxAttempts {
+            do {
+                let order = try await repository.paymentStatus(orderID: orderID)
+                state = .loaded(order)
+
+                guard order.status.isSettling else { return }
+
+                guard attempt &lt; maxAttempts - 1 else { break }
+                try await Task.sleep(for: pollInterval)
+            } catch is CancellationError {
+                return
+            // a second catch handles a real failure, keeping any order already on screen
+</code></pre>
+
+<p>A <code>while</code> loop with an <code>await</code> in it. Called from <code>.task</code>, it is
+cancelled automatically when the view disappears: the sleep throws, the loop unwinds, and there is
+nothing to remember to clean up.</p>
+
+<p>The alternative — scheduling a <code>setTimeout</code> from inside a success handler and clearing
+it on unmount — is what the React Native version of this screen does, and forgetting the cleanup
+means the loop fires requests forever. On a phone that is battery and data, not just wasted work.</p>
+
+<h2>@MainActor</h2>
+
+<p>UI work must happen on the main thread. The old way was to remember; the new way is to declare it
+and let the compiler check:</p>
+
+<pre class="language-swift"><code class="language-swift">@MainActor
+@Observable
+final class MenuStore {
+</code></pre>
+
+<p>Everything on this type is now main-actor isolated. Calling into it from a background context is a
+compile error rather than a runtime surprise, which is what prevents the classic "publishing changes
+from background threads is not allowed" crash.</p>
+
+<p>What it does <em>not</em> mean is that everything runs on the main thread. An
+<code>async</code> method on a main-actor type suspends at each <code>await</code> and the work it
+awaits — a network request — happens elsewhere. Only the parts between suspensions are on the main
+actor.</p>
+
+<h3>Three rules Swift 5.10 will enforce on you</h3>
+
+<p>All three produce errors that look like the compiler being difficult, and all three are pointing
+at something real.</p>
+
+<p><strong>A View's <code>body</code> is main-actor isolated; its helper properties are not.</strong>
+This <strong>does not compile</strong>:</p>
+
+<pre class="language-swift"><code class="language-swift">struct MenuView: View {
+    @Environment(MenuStore.self) private var menu
+
+    // error: main actor-isolated property 'state' can not be referenced
+    //        from a non-isolated context
+    private var content: some View {
+        switch menu.state { ... }
+    }
+}
+</code></pre>
+
+<p>The fix is to annotate the view type itself with <code>@MainActor</code>. Every screen in the demo
+app carries it for this reason, and it is honest rather than a workaround — a SwiftUI view only ever
+runs on the main thread anyway.</p>
+
+<p><strong><code>deinit</code> is never actor-isolated.</strong> It runs on whichever thread releases
+the last reference, so it cannot touch isolated state. This <strong>does not compile</strong>
+either:</p>
+
+<pre class="language-swift"><code class="language-swift">@MainActor
+final class CartStore {
+    private var persistTask: Task&lt;Void, Never&gt;?
+
+    // error: main actor-isolated property 'persistTask' can not be
+    //        referenced from a non-isolated context
+    deinit { persistTask?.cancel() }
+}
+</code></pre>
+
+<p>Reaching for <code>MainActor.assumeIsolated</code> to silence it would be asserting something
+untrue. The right answer is usually that the cleanup was not needed: tasks that capture
+<code>self</code> weakly keep nothing alive, and cancellation that genuinely matters belongs in a
+method the owner calls while the object is still alive.</p>
+
+<p><strong>A default argument is evaluated in a nonisolated context.</strong> Even inside a
+<code>@MainActor</code> function, which makes this <strong>does not compile</strong> territory:</p>
+
+<pre class="language-swift"><code class="language-swift">    @MainActor
+    private func makeModel(
+        // error: call to main actor-isolated initializer in a
+        //        synchronous nonisolated context
+        gateway: StubPaymentGateway = StubPaymentGateway(isReady: true)
+    ) -&gt; CheckoutViewModel { ... }
+</code></pre>
+
+<p>Default to <code>nil</code> and construct in the body. Swift 6 changes this to use the caller's
+isolation; until then it is a spelling you simply have to know.</p>
+
+<h2>Actors</h2>
+
+<p>An actor protects its own state by serialising access to it. No locks to remember, no data races
+to reason about, and the compiler enforces it — every access from outside is <code>await</code>ed.</p>
+
+<pre class="language-swift"><code class="language-swift">actor TokenStore: AuthTokenProviding {
+    private let secureStore: SecureStore
+    private var cachedToken: String?
+    private var hasLoaded = false
+</code></pre>
+
+<p>The session token is the right thing to protect this way, because it is genuinely touched from
+several places at once: the HTTP client reads it on every authenticated request, sign-in writes it,
+sign-out clears it — and a customer can tap "Sign out" while a menu refresh is in flight.</p>
+
+<pre class="language-swift"><code class="language-swift">    func currentToken() async -&gt; String? {
+        if hasLoaded { return cachedToken }
+        cachedToken = try? secureStore.string(for: .authToken)
+        hasLoaded = true
+        return cachedToken
+    }
+</code></pre>
+
+<p>"Load once, then reuse" is a pattern that is unsafe to write in a shared object without a lock.
+Inside an actor it is just code.</p>
+
+<h3>Reentrancy, the part that catches people</h3>
+
+<p>An actor guarantees that only one task is executing its code at a time. It does <strong>not</strong>
+guarantee that a method runs to completion before another starts. At every <code>await</code> inside
+an actor method, the actor can service someone else.</p>
+
+<p>So state read before an <code>await</code> may be stale after it. The rule that follows is
+simple: <strong>re-check anything you depend on after awaiting</strong>, and do not assume an
+invariant holds across a suspension point. This is the actor equivalent of the check-then-act race,
+and it is the one thing about actors worth being careful with.</p>
+
+<h2>Sendable</h2>
+
+<p><code>Sendable</code> marks a type as safe to pass between concurrency domains. Value types of
+value types get it automatically; a class has to earn it. When you know a type is thread-safe but
+the compiler cannot, <code>@unchecked Sendable</code> is the escape hatch — and it should never
+appear without a comment saying who is making the promise and why it holds. The demo app uses it
+once, for a wrapper around <code>UserDefaults</code>, which Apple documents as thread-safe but never
+annotated.</p>
+
+<h2>Parallel work in a view model</h2>
+
+<p>One more use of <code>async let</code>, because the shape recurs: two independent reads that a
+screen needs together.</p>
+
+<pre class="language-swift"><code class="language-swift">        do {
+            // Independent requests, so they go in parallel rather than one after the other.
+            async let addresses = repository.addresses()
+            async let paymentMethods = repository.paymentMethods()
+
+            state = try await .loaded(Content(addresses: addresses, paymentMethods: paymentMethods))
+        } catch {
+            guard !ErrorPresenter.isCancellation(error) else { return }
+            state = .failure(error, fallback: "Could not load your profile.")
+        }
+</code></pre>
+
+<p>The <code>catch</code> is the part worth copying. Checking for cancellation first means a screen
+that was dismissed mid-load does not flash an error on its way out — and since the state assignment
+is skipped entirely, there is nothing left behind for the next appearance to render.</p>
+
+<h2>What to avoid</h2>
+
+<p>Three habits that look reasonable.</p>
+
+<p><strong>Do not use <code>Task { }</code> where <code>.task</code> would do.</strong> A bare task
+in <code>onAppear</code> outlives the view, and the work it is doing is usually work nobody wants
+any more.</p>
+
+<p><strong>Do not use <code>DispatchQueue.main.async</code> in new code.</strong> It is the thing
+<code>@MainActor</code> replaced, and mixing the two means the compiler can no longer check what it
+was meant to be checking.</p>
+
+<p><strong>Do not reach for <code>Task.detached</code> to "get off the main thread".</strong> It
+drops the current context — priority, task-local values and cancellation — so a detached task is one
+nothing can stop. The everyday way to move work off the main actor is to call an
+<code>async</code> function that is not main-actor isolated, which is what the HTTP client already
+is.</p>
+
+<h2>Next</h2>
+
+<p>Stores, repositories, view models and a client have all appeared without anyone drawing the
+picture. The next lesson does: the layering underneath, what MVVM actually covers, and the one piece
+of state worth being strict about.</p>
