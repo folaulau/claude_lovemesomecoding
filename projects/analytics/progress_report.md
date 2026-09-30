@@ -1,6 +1,6 @@
 # Analytics — progress report
 
-**Status:** built and verified locally — **not deployed, not committed.** Measurement ID `G-ETM6754MYL`.
+**Status:** **LIVE** since 2026-09-29 (build `8548437`) — not committed. Measurement ID `G-ETM6754MYL`.
 
 ## Findings (2026-09-29)
 - Live homepage: no `gtag`, `googletagmanager`, `G-`/`UA-`/`GTM-` id, or any other analytics script.
@@ -74,10 +74,10 @@ Playwright script in this folder asserts both.
   clipboard for the local run only.
 
 ## Remaining
-- [ ] **Deploy** — blocked on a decision: the frontend working tree also holds unrelated
-      uncommitted edits (`cloudfront-function.js`, `postbuild.mjs`, `globals.css`, `pages.ts`)
-      that `npm run deploy` would ship too.
-- [ ] After deploy: GA Realtime shows a visit; run the script with `BASE=` against live.
+- [x] Deployed 2026-09-29, build `8548437`, together with the pending brainteaser retirement
+      and mobile-nav CSS fix (Folau: "deploy all"). `/brainteaser` → 301 `/` confirmed live.
+- [x] `BASE=https://lovemesomecoding.com node projects/analytics/verify_analytics.mjs` — 8/8 pass on live.
+- [ ] Folau: confirm a visit in GA Realtime.
 - [ ] Folau: in GA, register `language` and `page_path` as **custom dimensions** (Admin → Custom
       definitions, event scope) or the `code_copy` params will not be reportable.
 - [ ] Folau: link Search Console to the GA4 property.
@@ -92,4 +92,5 @@ Playwright script in this folder asserts both.
 
 ## Log
 - 2026-09-29 — Confirmed GA absent; wrote this plan.
-- 2026-09-29 — Got id `G-ETM6754MYL`; built, build check + Playwright 9/9 green. Not deployed.
+- 2026-09-29 — Got id `G-ETM6754MYL`; built, build check + Playwright 9/9 green. 
+- 2026-09-29 — Deployed build `8548437`; live checks 8/8 green.
