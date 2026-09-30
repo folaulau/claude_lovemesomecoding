@@ -25,11 +25,15 @@ Next.js 14 static export ──> S3 (lovemesomecoding.com) ──> CloudFront �
                                       ▲
 content DB (JSON in S3) ──────────────┘ read at BUILD time only
         ▲
-FastAPI on Lambda (admin writes) ──> GitHub repository_dispatch ──> rebuild
+FastAPI on Lambda (admin writes) ──> CodeBuild (Publish) ──> rebuild
+                                          ▲
+              frontend source zip in S3 ──┘ uploaded by every deploy
 ```
 
 Nothing is fetched at runtime. Saving a post writes JSON to S3 and changes nothing a visitor sees
-until **Publish** triggers a rebuild (~3–5 min).
+until **Publish** runs the CodeBuild project `lovemesomecoding-site-build-prod` (~4–6 min). It
+builds from `s3://…-db-…/build/frontend-source.zip`, which `deploy.sh` uploads on every deploy, so
+Publish rebuilds exactly the live code. No GitHub involvement — see the backend CLAUDE.md.
 
 ### ⚠️ DreamHost — do not cancel before ~2026-09-03
 It is the cutover rollback target and Search Console needs 30 days to confirm index coverage.
@@ -37,16 +41,12 @@ Rollback = point the apex/www ALIAS records back to `69.163.227.84` (60s TTL).
 
 ### Outstanding
 
-- [ ] ⚠️ **Deploy the backend, or do not edit `/ios` posts in `/admin`.** The `swift` entry in
-      `SUPPORTED_LANGUAGES` (`app/services/content.py`) exists only in the local working copy — the
-      deployed Lambda does not have it, so saving an iOS post through the admin console re-normalises
-      every Swift block to `plaintext` and the next build ships the track unhighlighted. The live
-      site is correct today because `seed.py` runs the local service layer.
-      ⚠️ That file also carries ~50 lines of uncommitted work from earlier tracks, and a deploy
-      would carry `schemas.py`, `posts.py` and `test_posts.py` too — review before deploying.
+- [x] Backend deployed 2026-09-29 from the committed tree (which includes `swift` in
+      `SUPPORTED_LANGUAGES`) plus the new `/pages` API — `/ios` posts are safe to edit in `/admin`.
+      Static pages (About Me etc.) are editable under **Pages**; see `projects/admin_pages/`.
 - [ ] Commit the Oracle track — three repos have uncommitted changes
       (`projects/oracle/progress_report.md` lists them). The content itself is live.
-- [ ] Store GitHub PAT so **Publish** works: `aws ssm put-parameter --name /lovemesomecoding/prod/github-token --type SecureString --value ghp_xxx --region us-west-2 --profile folau`
+- [x] **Publish** works without GitHub (2026-09-29): moved to AWS CodeBuild. No token needed.
 - [ ] Submit `https://lovemesomecoding.com/sitemap.xml` to Search Console
 - [ ] `lovemesomecoding_backend` repo does not exist on GitHub yet — its CI cannot run until created
 - [ ] Rotate the admin password: `python scripts/create_admin.py --username folauk --write`
@@ -139,6 +139,8 @@ all (`scripts/verify-build.mjs`). That guard is the point — do not weaken it.
   custom domain does not, so one of the two URLs always 404s.
 - An empty `API_CERT_ARN` makes CloudFormation **delete** the api custom domain. `deploy.sh` guards
   against this.
+- **`deploy.sh` needs the domain vars exported** or `sam deploy` rejects `DomainName=`:
+  `API_DOMAIN=api.lovemesomecoding.com HOSTED_ZONE_ID=Z000531818AC6P1IJ8LJL API_CERT_ARN=$(aws cloudformation describe-stacks --stack-name lovemesomecoding-admin-api-prod --query "Stacks[0].Parameters[?ParameterKey=='CertificateArn'].ParameterValue" --output text --profile folau --region us-west-2)`
 - Stop `next dev` before `next build` — they share `.next` and the build fails.
 - A local DNS cache can make it look like a change did not take. Check with
   `dig +short A <host> @8.8.8.8`, not just `curl`.
@@ -163,7 +165,8 @@ in **us-east-1**).
 | SAM stack | `lovemesomecoding-admin-api-prod` |
 | Route 53 zone | `Z000531818AC6P1IJ8LJL` |
 | Certs | apex+www in us-east-1; `api.` in us-west-2 |
-| Secrets | SSM `/lovemesomecoding/prod/jwt-secret`, `/lovemesomecoding/prod/github-token` |
+| Secrets | SSM `/lovemesomecoding/prod/jwt-secret` |
+| Site rebuild | CodeBuild `lovemesomecoding-site-build-prod` (source `build/frontend-source.zip` in the content DB bucket) |
 
 Content DB layout (`lovemesomecoding/{prod|local}/`): `posts/{slug}.json`, `index/posts.json`,
 `index/drafts.json`, `index/by-category/{cat}.json`, `index/categories.json`, `search/index.json`,

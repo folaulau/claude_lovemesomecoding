@@ -1,6 +1,6 @@
 # Admin pages — progress report
 
-**Status:** built and verified locally — **not deployed, not committed** (2026-09-29).
+**Status:** **LIVE** 2026-09-29 — backend Lambda + frontend build `b1eac33`. Not committed.
 
 ## Decision
 Folau chose a Pages tab covering all 12 live pages over About-Me-only or a one-off edit.
@@ -46,8 +46,11 @@ them — it shows the warning, and the first keystroke there flattens the layout
 **HTML**, check **Preview**, then Save.
 
 ## Remaining
-- [ ] Deploy backend and frontend. Order does not matter: a failed `/pages` call yields an empty
-      Pages list instead of breaking the post list (`listPages().catch(() => [])`).
+- [x] Backend deployed (only `ApiFunction` changed; custom domain untouched). Live API: `/pages`
+      401 without a token, lists 12 pages with one, About Me loads (5685 chars).
+- [x] Frontend deployed, build `b1eac33`, verify-build green. Live admin checked read-only in
+      Playwright: Pages tab lists 12, About Me opens, HTML tab holds the body, no page errors
+      (`screenshots/06-live-about-me-html.png`).
 - [ ] After deploy: edit About Me in `/admin`, Save, **Publish site** (needs the GitHub PAT in
       SSM — still outstanding per root CLAUDE.md; otherwise run `npm run deploy`).
 - [ ] Commit both repos when asked.
