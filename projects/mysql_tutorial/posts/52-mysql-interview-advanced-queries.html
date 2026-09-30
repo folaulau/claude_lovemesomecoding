@@ -171,6 +171,178 @@ outside because a window function cannot appear in <code>WHERE</code>. Note the 
 tiebreaker — without it, rows with equal <code>line_total</code> are ordered arbitrarily and the
 query returns different rows on different runs.</p>
 
+<h2>10. “This query is slow. Find out why.”</h2>
+
+<p>The other half of the advanced round. You are handed a query and a complaint, not a blank page.
+Nothing is slow at 18 rows, so this one question runs against <code>pizza_lab</code> — the same
+pizza schema loaded to <strong>400,000 orders</strong> and <strong>1,000,000 line items</strong>.
+The report is the top ten customers by revenue for one month:</p>
+
+<pre class="language-sql"><code class="language-sql">-- lab: pizza_lab, 400,000 orders
+SELECT u.id, u.full_name,
+       COUNT(DISTINCT o.id) AS orders,
+       ROUND(SUM(i.line_total), 2) AS revenue
+FROM   app_user u
+JOIN   customer_order o ON o.user_id = u.id
+JOIN   order_item   i ON i.order_id = o.id
+WHERE  o.status = 'COMPLETED'
+  AND  DATE_FORMAT(o.created_at, '%Y-%m') = '2024-06'
+GROUP  BY u.id, u.full_name
+ORDER  BY revenue DESC, u.id
+LIMIT  10;</code></pre>
+
+<p>Three tables, a <code>COUNT(DISTINCT)</code>, a <code>GROUP BY</code> and a sort on a computed
+column. It is correct, it is readable, and it takes about a second and a half to return ten rows.
+The wrong move is to start guessing — rewrite it as a CTE, add an index, try
+<code>STRAIGHT_JOIN</code>. Ask the optimizer what it is doing.</p>
+
+<h3>Step 1 — EXPLAIN, and read the driving table</h3>
+
+<pre class="language-sql"><code class="language-sql">-- lab
+EXPLAIN SELECT u.id, u.full_name,
+       COUNT(DISTINCT o.id) AS orders,
+       ROUND(SUM(i.line_total), 2) AS revenue
+FROM   app_user u
+JOIN   customer_order o ON o.user_id = u.id
+JOIN   order_item   i ON i.order_id = o.id
+WHERE  o.status = 'COMPLETED'
+  AND  DATE_FORMAT(o.created_at, '%Y-%m') = '2024-06'
+GROUP  BY u.id, u.full_name
+ORDER  BY revenue DESC, u.id
+LIMIT  10;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+-------+------------+--------+-----------------------------------------------------------+---------------------------+---------+---------------------+--------+----------+----------------------------------------------+
+| id | select_type | table | partitions | type   | possible_keys                                             | key                       | key_len | ref                 | rows   | filtered | Extra                                        |
++----+-------------+-------+------------+--------+-----------------------------------------------------------+---------------------------+---------+---------------------+--------+----------+----------------------------------------------+
+|  1 | SIMPLE      | o     | NULL       | ref    | PRIMARY,idx_customer_order_status,idx_customer_order_user | idx_customer_order_status | 122     | const               | 198875 |   100.00 | Using where; Using temporary; Using filesort |
+|  1 | SIMPLE      | u     | NULL       | eq_ref | PRIMARY                                                   | PRIMARY                   | 8       | pizza_lab.o.user_id |      1 |   100.00 | NULL                                         |
+|  1 | SIMPLE      | i     | NULL       | ref    | idx_order_item_order                                      | idx_order_item_order      | 8       | pizza_lab.o.id      |      2 |   100.00 | NULL                                         |
++----+-------------+-------+------------+--------+-----------------------------------------------------------+---------------------------+---------+---------------------+--------+----------+----------------------------------------------+</code></pre>
+
+<p>Rows are listed in join order, so row one is the table everything else hangs off. Rows two and
+three are already as good as they get — <code>eq_ref</code> into a primary key, then about two line
+items per order. Row one is the entire problem.</p>
+
+<p>The tell is not <code>type</code> and not <code>rows</code>. It is <code>possible_keys</code>.
+There <em>is</em> an index on <code>created_at</code>, the query <em>does</em> filter on
+<code>created_at</code>, and it is not in the list — so it was never a candidate, let alone a
+choice. An index missing from <code>possible_keys</code> is the plan telling you the predicate is
+unusable. <a href="/sql/sql-explain">Reading a plan in full</a></p>
+
+<h3>Step 2 — measure the suspect step on its own</h3>
+
+<p><code>rows</code> is a sampled estimate, so do not build a theory on it. Pull the driving
+table's access out into a query of its own and let <code>EXPLAIN ANALYZE</code> run it for real
+numbers. It prints a tree, read inside-out; end the statement with <code>\G</code> rather than a
+semicolon, or the client draws the whole thing inside a box and wraps it into soup:</p>
+
+<pre class="language-sql"><code class="language-sql">-- lab
+EXPLAIN ANALYZE SELECT COUNT(*) FROM customer_order
+WHERE  status = 'COMPLETED' AND DATE_FORMAT(created_at, '%Y-%m') = '2024-06'\G</code></pre>
+
+<p>Two of its lines carry the whole diagnosis. The index lookup on
+<code>idx_customer_order_status</code> reports <code>rows=340000</code>; the filter sitting
+directly above it reports <code>rows=13976</code>. <strong>Find the step that reads far
+more rows than it returns</strong> — this one reads twenty-four for every one it keeps, and spends
+almost all of the query's time doing it. Both figures are exact:</p>
+
+<pre class="language-sql"><code class="language-sql">-- lab
+SELECT (SELECT COUNT(*) FROM customer_order WHERE status = 'COMPLETED')     AS rows_read,
+       (SELECT COUNT(*) FROM customer_order WHERE status = 'COMPLETED'
+          AND created_at &gt;= '2024-06-01' AND created_at &lt; '2024-07-01') AS rows_kept;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+-----------+-----------+
+| rows_read | rows_kept |
++-----------+-----------+
+|    340000 |     13976 |
++-----------+-----------+</code></pre>
+
+<p>Every completed order in two years is read off the status index and then discarded one row at a
+time so that one month survives. The month filter is doing no work at all.</p>
+
+<h3>Step 3 — why the date index was ignored</h3>
+
+<p><code>DATE_FORMAT(o.created_at, '%Y-%m') = '2024-06'</code>. The column is wrapped in a
+function, and the index stores <code>created_at</code>, not <code>DATE_FORMAT(created_at)</code>.
+MySQL cannot turn the function inside out to work out which range of the index would satisfy it, so
+it computes the expression per row — which means reading every row first. The same applies to
+<code>YEAR(created_at) = 2024</code>, <code>DATE(created_at) = …</code> and
+<code>LOWER(email) = …</code>. A predicate that leaves the column bare on one side is
+<em>sargable</em>; one that does not is not, and no amount of indexing rescues it.</p>
+
+<p>Rewrite it as a half-open range: <code>&gt;=</code> the first of the month,
+<code>&lt;</code> the first of the next. Half-open rather than <code>BETWEEN</code>, because
+<code>BETWEEN '2024-06-01' AND '2024-06-30'</code> silently drops everything after midnight on the
+30th.</p>
+
+<pre class="language-sql"><code class="language-sql">-- lab
+EXPLAIN SELECT u.id, u.full_name,
+       COUNT(DISTINCT o.id) AS orders,
+       ROUND(SUM(i.line_total), 2) AS revenue
+FROM   app_user u
+JOIN   customer_order o ON o.user_id = u.id
+JOIN   order_item   i ON i.order_id = o.id
+WHERE  o.status = 'COMPLETED'
+  AND  o.created_at &gt;= '2024-06-01' AND o.created_at &lt; '2024-07-01'
+GROUP  BY u.id, u.full_name
+ORDER  BY revenue DESC, u.id
+LIMIT  10;</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+-------+------------+--------+-----------------------------------------------------------------------------------------+-------------------------------+---------+---------------------+-------+----------+---------------------------------------------------------------------+
+| id | select_type | table | partitions | type   | possible_keys                                                                           | key                           | key_len | ref                 | rows  | filtered | Extra                                                               |
++----+-------------+-------+------------+--------+-----------------------------------------------------------------------------------------+-------------------------------+---------+---------------------+-------+----------+---------------------------------------------------------------------+
+|  1 | SIMPLE      | o     | NULL       | range  | PRIMARY,idx_customer_order_created_at,idx_customer_order_status,idx_customer_order_user | idx_customer_order_created_at | 8       | NULL                | 33296 |    50.00 | Using index condition; Using where; Using temporary; Using filesort |
+|  1 | SIMPLE      | u     | NULL       | eq_ref | PRIMARY                                                                                 | PRIMARY                       | 8       | pizza_lab.o.user_id |     1 |   100.00 | NULL                                                                |
+|  1 | SIMPLE      | i     | NULL       | ref    | idx_order_item_order                                                                    | idx_order_item_order          | 8       | pizza_lab.o.id      |     2 |   100.00 | NULL                                                                |
++----+-------------+-------+------------+--------+-----------------------------------------------------------------------------------------+-------------------------------+---------+---------------------+-------+----------+---------------------------------------------------------------------+</code></pre>
+
+<p><code>idx_customer_order_created_at</code> has appeared in <code>possible_keys</code> and been
+chosen. <code>type</code> is <code>range</code> instead of <code>ref</code>, and the estimate falls
+from about 199,000 to about 33,000. Same answer, about 0.3 s. <strong>No index was created</strong>
+— the query was rewritten so an index that already existed could be used, which is the cheaper fix
+and the one an interviewer is hoping you reach for first.</p>
+
+<h3>Step 4 — and only then, a new index</h3>
+
+<p>Look at <code>filtered</code> in that plan: 50%. The date index finds June, and half of what it
+hands back is thrown away for not being <code>COMPLETED</code>. One composite index covering both
+predicates — the equality first, the range second — closes the gap. Isolating the driving table
+again keeps the change visible:</p>
+
+<pre class="language-sql"><code class="language-sql">-- lab
+CREATE INDEX idx_order_status_created ON customer_order (status, created_at);
+
+EXPLAIN SELECT COUNT(*) FROM customer_order
+WHERE  status = 'COMPLETED'
+  AND  created_at &gt;= '2024-06-01' AND created_at &lt; '2024-07-01';</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">+----+-------------+----------------+------------+-------+----------------------------------------------------------------------------------+--------------------------+---------+------+-------+----------+--------------------------+
+| id | select_type | table          | partitions | type  | possible_keys                                                                    | key                      | key_len | ref  | rows  | filtered | Extra                    |
++----+-------------+----------------+------------+-------+----------------------------------------------------------------------------------+--------------------------+---------+------+-------+----------+--------------------------+
+|  1 | SIMPLE      | customer_order | NULL       | range | idx_customer_order_created_at,idx_customer_order_status,idx_order_status_created | idx_order_status_created | 130     | NULL | 27138 |   100.00 | Using where; Using index |
++----+-------------+----------------+------------+-------+----------------------------------------------------------------------------------+--------------------------+---------+------+-------+----------+--------------------------+</code></pre>
+
+<p><code>key_len</code> is the proof that it is being used properly: 130 bytes against the date
+index's 8, so both columns are contributing rather than just the first. <code>filtered</code> is
+100% — the index does all the filtering now and nothing is discarded after the read — and
+<code>Using index</code> means the count never touched the table at all. The full report comes back
+in about 0.1 s, more than ten times faster than where it started.
+<a href="/sql/mysql-index">Indexes</a></p>
+
+<p>Column order matters, and not in the obvious way. <code>(created_at, status)</code> does get
+chosen for this query, with the same <code>key_len</code> of 130 — but <code>filtered</code> goes
+back to 50%. A range on the first column ends the seekable prefix, so <code>status</code> can only
+be <em>tested</em> against rows the range already returned, never used to narrow it. Equality
+columns first, the range last.</p>
+
+<h3>What does not go away</h3>
+
+<p><code>Using temporary; Using filesort</code> appears in both full plans, before the fix and
+after it. That is not a failure to chase. The query groups by user and then sorts on
+<code>SUM(line_total)</code>, and no index can pre-sort a value that does not exist until the rows
+have been aggregated. Saying so out loud — “that part is irreducible, and here is why” — counts for
+more than another round of index guessing. Knowing when to stop is part of the answer.</p>
+
 <h2>What they are really testing</h2>
 
 <ul>
@@ -184,7 +356,8 @@ query returns different rows on different runs.</p>
       and reaching for a correlated subquery where a window function is natural reads as out of
       date.</li>
   <li><strong>Would this survive production?</strong> Saying "I would <code>EXPLAIN</code> this
-      before running it on a large table" is usually worth more than the query.</li>
+      before running it on a large table" is usually worth more than the query — and being able to
+      read the plan afterwards, as in question 10, is worth more still.</li>
 </ul>
 
 <p>Say your assumptions out loud, and ask what should happen on ties, on NULLs and on empty groups.

@@ -47,6 +47,7 @@ sys.path.insert(0, str(BACKEND))
 sys.path.insert(0, str(HERE))
 
 import manifest  # noqa: E402
+from check_sql import MARK_LAB  # noqa: E402  — one definition of the `-- lab` marker
 from app.services import content as content_service  # noqa: E402
 
 SOURCE_PRE = re.compile(r"<pre\b([^>]*)>(.*?)</pre>", re.S | re.I)
@@ -191,6 +192,15 @@ for entry in manifest.POSTS:
 
     plain = [lang for lang in langs if lang == "plaintext"]
 
+    # Which blocks check_sql.py runs against `pizza_lab`: every block of a LAB_POST, plus
+    # any single block marked `-- lab` in a post that is otherwise on the demo database.
+    # Rules 6 and 7 below gate on this rather than on LAB_POSTS, because what makes a lab
+    # figure trustworthy is that something re-derives it, not which list the post is on.
+    on_lab = [entry["slug"] in manifest.LAB_POSTS
+              or (lang in ("sql", "mysql") and MARK_LAB.search(html.unescape(b)))
+              for lang, b in pairs]
+    runs_on_lab = any(on_lab)
+
     if [t for t in result["toc"] if not t.get("id")]:
         failures.append(f"{entry['slug']}: heading(s) with no anchor")
 
@@ -270,7 +280,7 @@ for entry in manifest.POSTS:
             "That is a listing with commentary, not a lesson.")
 
     # (6) quoted lab figures have to be real
-    if entry["slug"] in manifest.LAB_POSTS:
+    if runs_on_lab:
         for number in set(BIG_NUMBER.findall(TAGS.sub(" ", prose_html))):
             if number not in LAB_NUMBERS:
                 warnings.append(
@@ -300,7 +310,12 @@ for entry in manifest.POSTS:
     #
     # What must not happen is a NON-lab post quoting a LAB-SIZED plan, since it cannot have
     # come from the small demo database and therefore was not produced by running the post.
-    quoted_output = "\n".join(b for lang, b in pairs if lang == "plaintext")
+    # A plaintext block inherits the lab flag of the sql block it follows — that block is
+    # what produced it. So a `-- lab` plan is exempt here while every other quoted plan in
+    # the same post is still held to the demo database's 18 orders.
+    quoted_output = "\n".join(
+        b for i, (lang, b) in enumerate(pairs)
+        if lang == "plaintext" and not (i and on_lab[i - 1]))
     if SHOWS_A_PLAN.search(quoted_output) and entry["slug"] not in manifest.LAB_POSTS:
         big = [int(n) for n in re.findall(r"\|\s*(\d{4,})\s*\|", quoted_output)]
         if any(n > 1000 for n in big):

@@ -120,6 +120,12 @@ LAB_ROWS = {
     # because it is wrong: the true count is 8,000. Recorded here so the figure is
     # declared rather than looking invented, and NOT a row count -- it drifts.
     "estimated_rows_status_paid": 14_398,
+    # COMPLETED orders in June 2024 -- the slice the slow-query walkthrough in
+    # mysql-interview-advanced-queries filters down to. Declared here for the same
+    # reason as the estimate above: the post quotes it, so it has to be a real figure
+    # rather than one that looks plausible. check_sql.py re-derives it from a `-- lab`
+    # block in that post.
+    "completed_orders_june_2024": 13_976,
 }
 
 # Only these posts may quote a query plan or a lab row count. EXPLAIN output is
@@ -139,6 +145,12 @@ LAB_POSTS = {
 # demo database, where a reader can check every answer by eye. It was in this set once
 # and its examples were then measured against 400,000 orders instead — the numbers were
 # unrecognisable, and its dedupe DELETE mutated the shared fixture.
+#
+# Its EXPLAIN walkthrough does need the lab, because nothing is slow at 18 rows. Those
+# blocks carry the per-block `-- lab` marker instead, so they run against `pizza_lab`
+# with the full snapshot/restore/fingerprint guard while the rest of the post stays on
+# its scratch clone of `pizza`. See MARK_LAB in check_sql.py. Do not "fix" this by
+# adding the slug here — that is the arrangement that broke it the first time.
 
 # Lesson 1 is stamped START_DATE and each following lesson is STEP_DAYS later,
 # so the pager reads lesson 1 -> lesson 52. Re-base the whole track by editing
@@ -885,9 +897,10 @@ _TRACK = [
         "excerpt": (
             "The whiteboard questions that separate people who have written SQL from people who "
             "have read about it. Second-highest value, top N per group, finding and deleting "
-            "duplicates, a running total, gaps in a sequence, a pivot with conditional "
-            "aggregation, rows in one table with no match in another, and month-over-month "
-            "growth — each one solved, then explained, then checked against a real database."
+            "duplicates, a running total, gaps in a sequence, a pivot, an anti-join and "
+            "month-over-month growth — each one solved and checked against a real database. "
+            "Then the other half of the round: a slow three-table report, and EXPLAIN used to "
+            "find where the time actually goes."
         ),
     },
 ]
@@ -985,10 +998,16 @@ TARGET_MINUTES = (4, 9)
 # A wider band for a post that is a reference page rather than a lesson.
 #
 # The two interview posts were here while `sql-interview-fundamentals` was still the
-# 5,944-word / 27-minute original. The rewrites are 1,200 words each and read as tight
-# reference pages, so they are held to the normal band like everything else. The
-# mechanism stays for the next post that genuinely needs it.
-LONG_POSTS: set[str] = set()
+# 5,944-word / 27-minute original. The rewrites came in at 1,200 words each and read as
+# tight reference pages, so they went back to the normal band like everything else.
+#
+# `mysql-interview-advanced-queries` is back, because it is now two reference pages in
+# one: nine query-writing answers, and then a worked EXPLAIN debugging walkthrough on
+# the 400,000-order lab. The walkthrough is mostly its own weight in quoted plans --
+# four of them, and an EXPLAIN table is 200-odd characters wide. Cutting it to fit nine
+# minutes would mean dropping either the before plan or the after plan, and the whole
+# point is the comparison.
+LONG_POSTS: set[str] = {"mysql-interview-advanced-queries"}
 TARGET_MINUTES_LONG = (6, 15)
 
 # Posts that are ONE IDEA and are allowed to be short.

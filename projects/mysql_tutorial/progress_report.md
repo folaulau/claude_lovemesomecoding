@@ -2,6 +2,8 @@
 
 **Status:** ✅ **PUBLISHED AND LIVE.** All 52 posts on https://lovemesomecoding.com/sql, all 52 URLs verified at the edge.
 **Started:** 2026-08-24
+**Last change:** 2026-09-21 — `mysql-interview-advanced-queries` gained a worked EXPLAIN
+debugging walkthrough. Seeded to `local`, **not yet seeded to prod or deployed.**
 **Where it lands:** https://lovemesomecoding.com/sql
 
 ---
@@ -326,6 +328,68 @@ The "only declared posts may show a query plan" rule searched the whole post bod
 `sql-order-by` failed for using the words *Using filesort* in a sentence. A quoted plan is by
 definition output, and output lives in a `plaintext` block — the rule now searches those only.
 A rule that fires on correct work is a rule that gets switched off.
+
+---
+
+## 2026-09-21 — the EXPLAIN debugging walkthrough, and `-- lab`
+
+`mysql-interview-advanced-queries` answered nine query-writing questions and then ended by saying
+that "I would `EXPLAIN` this first" is worth more than the query — without ever showing one. It now
+has a tenth question that does: a three-table report with `COUNT(DISTINCT)`, `GROUP BY` and a sort
+on an aggregate, taking ~1.5 s, debugged down to ~0.1 s in four steps.
+
+The walkthrough is built so the *diagnosis* is the content, not the fix:
+
+| step | what the plan says | what it means |
+|---|---|---|
+| 1 | `possible_keys` omits `idx_customer_order_created_at` | the date predicate is unusable — this is the finding, not `type` or `rows` |
+| 2 | `EXPLAIN ANALYZE`: `rows=340000` in, `rows=13976` out | the step that reads 24× what it returns |
+| 3 | rewrite to a half-open range -> `type=range`, est. 33,296 | **no index created** — the existing one became usable |
+| 4 | add `(status, created_at)` -> `key_len` 130, `filtered` 100% | both columns contributing, nothing discarded after the read |
+
+It also says what *cannot* be fixed: `Using temporary; Using filesort` survives every version,
+because no index can pre-sort a `SUM` that does not exist until the rows are aggregated.
+
+### The problem this had to solve: one post, two databases
+
+Nothing is slow at 18 rows, so the walkthrough needs `pizza_lab`. But this post is deliberately
+**not** a `LAB_POST` — it was one once, and its nine hand-checkable answers were then re-measured
+against 400,000 orders and came out unrecognisable. `LAB_POSTS` is all-or-nothing per post, and
+that is too coarse here.
+
+So `check_sql.py` grew a **per-block `-- lab` marker**. A marked block runs against `pizza_lab` in
+its own session while the rest of the post keeps running against its scratch clone of `pizza`.
+`run_post` now groups runnable blocks by target database and runs one session per target; sentinels
+are block indexes, which are unique across the post, so the transcripts merge without colliding.
+A post with any `-- lab` block gets the full lab guard it would have got as a `LAB_POST` — object
+snapshot and restore (the walkthrough's `CREATE INDEX` is dropped afterwards) and the data
+fingerprint that turns a stray committed write into a loud failure.
+
+`check_content.py` rules 6 and 7 followed, because both gated on `LAB_POSTS`:
+
+* rule 6 (quoted lab figures must be in `LAB_ROWS`) now applies to any post that runs on the lab,
+  which is what makes the figure trustworthy — not which list the post is on;
+* rule 7 (a non-lab post may not quote a lab-sized plan) now exempts only the plaintext blocks that
+  **follow a `-- lab` block**, so every other quoted plan in the same post is still held to 18 rows.
+
+`13,976` — COMPLETED orders in June 2024 — was added to `manifest.LAB_ROWS`, alongside the
+`estimated_rows_status_paid` precedent, and is re-derived by a `-- lab` block in the post.
+
+### Two smaller things
+
+* **The post is now in `LONG_POSTS`.** 2,605 words / 12 minutes. The set was empty, with a comment
+  saying the mechanism stays for the next post that genuinely needs it; this is that post. Four
+  quoted plans at 200-odd characters wide are most of the weight, and cutting to nine minutes would
+  mean dropping either a before plan or an after plan, which is the whole comparison.
+* **A claim that measurement corrected.** The draft said `(created_at, status)` would be "close to
+  useless". It is not: MySQL still picks it, with the same `key_len` of 130, because it covers both
+  columns — but `filtered` drops back to 50%, since a range on the first column ends the seekable
+  prefix and `status` can then only be tested, not sought. Running it is what turned a wrong
+  sentence into the better teaching point.
+
+**Checks:** all 52 posts pass `check_content.py`; `check_sql.py` runs 284 statement blocks and
+re-derives 164 quoted results, up from 278/160. The lab's fingerprint is unchanged and no scratch
+database or index is left behind.
 
 ---
 

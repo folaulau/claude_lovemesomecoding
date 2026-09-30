@@ -60,6 +60,8 @@ Blocks are classified automatically so a post cannot quietly opt out of being ch
 |                 | show syntax. Not run, and it may not have an output block.                 |
 | `multi-session` | carries `-- session 2`: half of a two-terminal locking demo. Reported.     |
 | `unavailable`   | carries `-- unavailable: <reason>`. Reported with the reason.              |
+| `-- lab`        | not a kind but a flag: run this ONE block against `pizza_lab` rather than |
+|                 | the post's own database, with the same snapshot/restore/fingerprint guard |
 | `output-varies` | mentions NOW(), RAND(), UUID(), CONNECTION_ID()... — run, output NOT       |
 |                 | compared, because it cannot be stable                                     |
 | `bash`/other    | not SQL. Not run.                                                         |
@@ -128,6 +130,19 @@ MARK_ERROR = re.compile(r"^\s*--\s*ERROR\b", re.I | re.M)
 MARK_SESSION2 = re.compile(r"^\s*--\s*session\s*\d+\b", re.I | re.M)
 MARK_UNAVAILABLE = re.compile(r"^\s*--\s*unavailable:\s*(.+)$", re.I | re.M)
 MARK_NOCHECK = re.compile(r"^\s*--\s*output-varies\b", re.I | re.M)
+# `-- lab` routes ONE block to `pizza_lab` instead of the post's own database.
+#
+# ⚠️ WHY A PER-BLOCK MARKER AND NOT JUST manifest.LAB_POSTS. A post is either wholly a lab
+# post or wholly not, and that was too coarse for one real case:
+# mysql-interview-advanced-queries answers its query-writing questions on the 18-order demo
+# database, where a reader can check them by eye, and then debugs a slow query -- which needs
+# 400,000 orders, because nothing is slow at 18 rows. Promoting the whole post to a LAB_POST
+# re-measured all the earlier answers against the lab and made them unrecognisable.
+#
+# A marked block gets the same protection a LAB_POST does: the lab's objects are snapshotted
+# and anything the block creates is dropped afterwards, and its data is fingerprinted, so a
+# stray committed write is a loud failure rather than silent fixture corruption.
+MARK_LAB = re.compile(r"^\s*--\s*lab\b", re.I | re.M)
 
 SENTINEL = "@@@LMSC_BLOCK_{}@@@"
 SENTINEL_ANY = re.compile(r"@@@LMSC_BLOCK_(\d+)@@@")
@@ -177,6 +192,7 @@ def blocks_of(path: Path) -> list[dict]:
 
     for i, b in enumerate(out):
         b["kind"] = classify(b, out[i - 1] if i else None)
+        b["lab"] = bool(b["lang"] == "sql" and MARK_LAB.search(b["sql"]))
     return out
 
 
@@ -370,43 +386,63 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
     if not runnable:
         return [], stats
 
-    if is_lab:
-        database = manifest.LAB_DB["database"]
-        before = object_snapshot(database)
-        fingerprint_before = data_fingerprint(database)
-        scratch = None
-    else:
+    lab_db = manifest.LAB_DB["database"]
+
+    # Every runnable block has a target database. A LAB_POST sends all of them to the lab;
+    # any other post sends its own to a scratch clone of `pizza`, except the blocks marked
+    # `-- lab`, which need the 400,000-order fixture to say anything about performance.
+    # Each target is one session, so session state still carries across a post's blocks.
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    for i, b in runnable:
+        target = lab_db if (is_lab or b["lab"]) else "scratch"
+        groups.setdefault(target, []).append((i, b))
+
+    scratch = None
+    if "scratch" in groups:
         scratch = f"pzcheck_{re.sub(r'[^a-z0-9]', '_', slug)}"[:60]
         clone_pizza(scratch)
-        database = scratch
-        before = None
-        fingerprint_before = None
+        groups[scratch] = groups.pop("scratch")
 
-    # One session, all blocks, sentinels between them. --force so an expect-error block
-    # does not abort the rest of the post.
-    script = []
-    for i, b in runnable:
-        script.append(f"SELECT '{SENTINEL.format(i)}' AS marker;")
-        body = b["sql"].strip()
-        if not body.endswith(";") and not body.rstrip().endswith("END"):
-            body += ";"
-        script.append(body)
-    script.append(f"SELECT '{SENTINEL.format(999999)}' AS marker;")
-    script_text = "\n".join(script)
+    before = fingerprint_before = None
+    if lab_db in groups:
+        before = object_snapshot(lab_db)
+        fingerprint_before = data_fingerprint(lab_db)
 
-    _rc, out = my(["-t", "--force"], stdin=script_text, database=database)
+    # One session per database, all of its blocks, sentinels between them. --force so an
+    # expect-error block does not abort the rest of the post.
+    def script_for(items: list[tuple[int, dict]]) -> str:
+        script = []
+        for i, b in items:
+            script.append(f"SELECT '{SENTINEL.format(i)}' AS marker;")
+            body = b["sql"].strip()
+            if not body.endswith(";") and not body.rstrip().endswith("END"):
+                body += ";"
+            script.append(body)
+        script.append(f"SELECT '{SENTINEL.format(999999)}' AS marker;")
+        return "\n".join(script)
+
+    def run_all() -> dict[int, str]:
+        """Block index -> its output, across every target database.
+
+        Sentinels are block indexes, which are unique across the whole post, so the
+        per-database transcripts merge without colliding.
+        """
+        merged: dict[int, str] = {}
+        for db, items in groups.items():
+            _rc, out = my(["-t", "--force"], stdin=script_for(items), database=db)
+            merged.update(split_chunks(out))
+        return merged
+
+    chunks = run_all()
 
     # Second pass from a rebuilt state, to catch output that is not deterministic.
     second: dict[int, str] | None = None
     if twice:
         if scratch:
             clone_pizza(scratch)
-        else:
-            restore(database, before)
-        _rc2, out2 = my(["-t", "--force"], stdin=script_text, database=database)
-        second = split_chunks(out2)
-
-    chunks = split_chunks(out)
+        if before is not None:
+            restore(lab_db, before)
+        second = run_all()
 
     failures = []
     for i, b in runnable:
@@ -456,7 +492,7 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
         # runs against a scratch clone whose name is not `pizza`, so both the header text
         # AND the table's column width differ — it can never match, and the diff looks like
         # a content bug rather than a structural one. Say what it is.
-        if "Tables_in_" in expected and scratch:
+        if "Tables_in_" in expected and scratch and not (is_lab or b["lab"]):
             failures.append(
                 f"{slug} block {i}: quotes `SHOW TABLES` output, which embeds the database "
                 f"name in its header (`Tables_in_pizza`). This post runs against the scratch "
@@ -476,14 +512,14 @@ def run_post(entry: dict, verbose: bool, twice: bool = True) -> tuple[list[str],
 
     if scratch:
         drop_db(scratch)
-    elif before is not None:
-        undone = restore(database, before)
+    if before is not None:
+        undone = restore(lab_db, before)
         if undone and verbose:
-            print(f"    restored {database}: dropped {', '.join(undone)}")
-        if fingerprint_before and data_fingerprint(database) != fingerprint_before:
+            print(f"    restored {lab_db}: dropped {', '.join(undone)}")
+        if fingerprint_before and data_fingerprint(lab_db) != fingerprint_before:
             failures.append(
                 f"{slug}: THIS POST CHANGED THE LAB'S DATA, and the change is committed.\n"
-                f"    `{database}` is a shared fixture -- every later post is measured against "
+                f"    `{lab_db}` is a shared fixture -- every later post is measured against "
                 f"it, so a stray write makes their quoted results wrong with no other symptom.\n"
                 f"    Mark the offending block `-- session 1` so it is shown but not run, or have "
                 f"it work on a table the post creates itself.\n"
@@ -618,7 +654,9 @@ def main() -> int:
         print("the `pizza` database is not there. Start the app once so Liquibase runs.")
         return 2
 
-    needs_lab = [e for e in present if e["slug"] in manifest.LAB_POSTS]
+    needs_lab = [e for e in present
+                 if e["slug"] in manifest.LAB_POSTS
+                 or any(b["lab"] for b in blocks_of(HERE / "posts" / e["file"]))]
     if needs_lab and not database_exists(manifest.LAB_DB["database"]):
         print(f"{len(needs_lab)} post(s) need `{manifest.LAB_DB['database']}`, which does not "
               "exist.\nbuild it with:  projects/mysql_tutorial/lab/setup.sh")

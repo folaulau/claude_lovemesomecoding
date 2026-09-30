@@ -47,6 +47,25 @@ The rewritten posts contain **no `<img>` and no `<figure>`**, enforced by `check
 The 99 images in the live posts are almost all screenshots of query output; those become real
 `plaintext` blocks that `check_sql.py` re-derives. A screenshot cannot be verified.
 
+## Two databases, one post
+
+`check_sql.py` runs a post against a throwaway clone of `pizza` (18 orders, hand-checkable) unless
+the post is in `manifest.LAB_POSTS`, in which case the whole post runs against `pizza_lab`
+(400,000 orders).
+
+A single block can opt into the lab on its own with a `-- lab` comment on its first line:
+
+```sql
+-- lab
+EXPLAIN SELECT ...
+```
+
+That block runs against `pizza_lab` while the rest of the post stays on its clone. Use it for the
+one question that needs a table big enough to be slow — `mysql-interview-advanced-queries` is the
+case it was built for. Marked blocks get the same guard a `LAB_POST` gets: anything they create is
+dropped afterwards, and the lab's data is fingerprinted before and after, so a committed write
+fails loudly instead of corrupting the fixture every later post is measured against.
+
 ## Prerequisites
 
 ```bash
