@@ -1,0 +1,117 @@
+<p>A plan is the cheapest place to be wrong. Changing a sentence in a plan costs seconds; changing the
+same decision after three commits costs an afternoon and a rebase. With an AI assistant the gap is
+wider, because code is now so cheap to produce that it is tempting to skip the plan and "just see
+what it writes". This post argues for the opposite: the plan is the contract every later diff is
+reviewed against, so it deserves more of your attention than any single line of code.</p>
+
+<h2>Plan mode, and what to ask for</h2>
+
+<p>Planning ran in Claude Code's plan mode, which is read-only: the session can read the codebase and
+think, but cannot edit anything. It resumed the same conversation as the analysis and requirements
+steps, so it already had the code, the product owner's answers, and the edge cases. The prompt asked
+for a specific shape:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Write the implementation plan. Requirements for the plan:
+- Split into numbered steps, each small enough to be ONE reviewable commit,
+  backend before frontend.
+- For each step: the files it touches, what changes, and how we verify it
+  before moving on (which test, which command).
+- Follow the rules in CLAUDE.md (DAO rule, service interface + impl, 404 not
+  403, spotless, never edit an applied changeset).
+- List explicitly what is OUT of scope, so I can hold every later diff against
+  this plan.
+Don't write any code yet.
+</code></pre>
+
+<p>Each requirement is there for the review that comes later. "One reviewable commit" per step keeps
+every diff small enough to read. "Files it touches" gives you a list to compare <code>git
+status</code> against. "How we verify it" means each step ends with evidence, not a feeling. And the
+out-of-scope list is what makes drift detectable at all.</p>
+
+<h2>What came back</h2>
+
+<p>The plan opened with the design in two paragraphs, then flagged the decisions a reviewer should
+check rather than burying them:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Two decisions to check in review:
+- The update call has no idempotency key, on purpose. A key per order and card
+  would make a later switch from card A to B and back to A return Stripe's
+  saved result from the first A request without changing anything. Setting the
+  same values twice is already safe.
+- The card is chosen on the payment step, as the PO asked. That's why this
+  updates the PaymentIntent rather than adding a field to the order request.
+</code></pre>
+
+<p>The idempotency point is subtle and correct, and it is exactly the kind of thing that gets
+"fixed" later by someone who sees a payment call without a key and adds one. Writing the reason into
+the plan, and later into a code comment, protects it.</p>
+
+<p>Then seven steps, one commit each: data access and the expiry rule; the service method and Stripe
+update; the endpoint and security rule; frontend helpers with no visible change; the card chooser;
+Playwright tests; and docs. Each listed its files and its checks. Step 3's checks, for example, named
+every status code the new endpoint should return and the test that would assert each one. It closed
+with ten out-of-scope items and two named risks to test first.</p>
+
+<h2>Review the plan like code</h2>
+
+<p>Read the plan with the same suspicion you would bring to a diff, because every mistake in it will
+be faithfully implemented. Questions worth asking of any plan:</p>
+
+<ul>
+  <li><strong>Is each step independently verifiable?</strong> Step 4, "helpers, no visible change",
+  existed so the risky UI step 5 would start from tested building blocks.</li>
+  <li><strong>Is the order right?</strong> Backend first meant the frontend was built against an
+  endpoint that already had passing tests.</li>
+  <li><strong>Do the checks prove anything?</strong> "Run the tests" is not a check. "This test
+  asserts a deleted card returns 404" is.</li>
+  <li><strong>Are the risks real and testable early?</strong> The plan admitted it had not confirmed
+  that <code>confirmCardPayment</code> would work with how the PaymentIntent was created, and named a
+  fallback. Step 5 confirmed it worked; no fallback was needed.</li>
+</ul>
+
+<p>The plan also contained one expectation that turned out to be wrong: it said a request with no
+token should get 401. The app returns 403 for every protected endpoint, and step 3 had to deviate.
+That is fine. A plan is a contract, not a prophecy. What matters is that the deviation was visible
+because the plan had been specific. A vague plan ("secure the endpoint") would have hidden it.</p>
+
+<h2>When to re-plan</h2>
+
+<p>A deviation in one step can invalidate assumptions in a later one. The 403 surprise did: the step
+3 summary pointed out that "the frontend can't tell 'signed out' from 'forbidden' by status code on
+this endpoint", which mattered for the error handling planned in step 5. When that happens, update
+the plan before continuing, even by one line. Otherwise later steps are reviewed against a contract
+nobody believes any more, and review quietly turns back into scrolling. Ten seconds spent editing
+the plan prevents that drift entirely.</p>
+
+<h2>Keep the plan where the work can see it</h2>
+
+<p>A plan that only lives in a chat scrollback is lost when the session ends. Plan mode saved this
+one to a file automatically, and the important decisions went into the project's progress report as
+the work went along. When implementation started, each step's prompt was short because the plan
+carried the detail:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">The plan is approved. Implement STEP 1 ONLY (backend: data access and expiry
+rule), exactly as planned. Run the verification for step 1 (spotless:apply,
+then the tests). Do not start step 2 and do not commit; I'll review the diff
+and commit it myself.
+</code></pre>
+
+<p>"Step 1 only" and "do not commit" are doing real work there. One step at a time keeps each diff
+reviewable. Committing yourself means nothing lands until you have read it.</p>
+
+<p>The planning session also noticed something outside the code entirely: the user's global
+instruction file required a co-author trailer on commits and the project file forbade it. It asked
+which to follow instead of guessing. A good plan surfaces conflicts like that before seven commits
+inherit the wrong answer.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Is every step small enough to be one commit you will actually read?</li>
+  <li>Does every step name its files, so you can compare them to the diff?</li>
+  <li>Does every step end with a check that would fail if the step were wrong?</li>
+  <li>Is there an explicit out-of-scope list?</li>
+  <li>Are the non-obvious decisions written down with their reasons, so nobody "fixes" them later?</li>
+  <li>Are the risks named, with a step that tests them early?</li>
+  <li>Is the plan saved somewhere the next session will read it?</li>
+</ul>

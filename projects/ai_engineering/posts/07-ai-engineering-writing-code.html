@@ -1,0 +1,130 @@
+<p>With an analysis, agreed requirements and a written plan, writing the code is the easy part, and
+that is the point. The hard decisions are already made, so each implementation step is small, its
+scope is known, and the diff can be read against the plan. This post covers the loop that worked on
+the series' feature: one step, verify, read, decide, commit, then the next.</p>
+
+<h2>One step per prompt</h2>
+
+<p>Every implementation prompt had the same three constraints: implement exactly one plan step, run
+that step's checks, and do not commit. Here is step 2's:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">I reviewed and committed step 1 as 1b0549a0. Two notes from review: I removed
+the unused JdbcTemplate from UserPaymentMethodDAOImp (add it when a query needs
+it), and I confirmed the 4 failing tests fail on main without your change, so
+ignore them.
+
+Now implement STEP 2 ONLY (service method + Stripe update), exactly as planned.
+Run spotless and the step-2 tests. Don't start step 3, don't commit. Summarise
+what changed, the test result, and anything you did that the plan didn't say.
+</code></pre>
+
+<p>The first paragraph is easy to skip and should not be. It tells the session what changed since
+its last step: a reviewer edited its code, and a question it raised was answered. Without that, the
+next step may quietly re-add the field you removed, or keep worrying about failures you already
+explained.</p>
+
+<p>The last sentence, "anything you did that the plan didn't say", is the most useful line in the
+prompt. It asks the assistant to list its own drift, which turns the first part of your review into
+reading a short list instead of hunting for it.</p>
+
+<h2>What "anything the plan didn't say" produced</h2>
+
+<p>Step 2 came back with fifteen passing tests and six disclosed additions. Three of them:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">1. No signed-in user -> 401, checked before the order. After step 3 the
+   endpoint can't be reached without a token, so this is defensive.
+4. Generic error messages. Stripe's own error text is logged, not returned.
+   That differs from createOrder, which echoes it. The plan said "a safe
+   message"; I'm pointing out that the two paths now behave differently.
+5. @Transactional(readOnly = true) on the new method ... The Stripe call happens
+   inside that transaction, so one database connection is held for the
+   duration of the call.
+</code></pre>
+
+<p>Each is a judgement call, and each was surfaced rather than buried. The engineer's job is to
+decide, not to rubber-stamp: all six were accepted, the inconsistency in item 4 was logged as a
+follow-up, and item 5 was written into the pull request as a known trade-off. The point is not that
+the additions were good. It is that you knew they were there.</p>
+
+<h2>Read the diff, then cut</h2>
+
+<p>Step 1 added a small data-access class. Reading it showed a dependency injected and never used:</p>
+
+<pre class="language-diff"><code class="language-diff"> @Repository
+ public class UserPaymentMethodDAOImp implements UserPaymentMethodDAO {
+
+     @Autowired
+     private UserPaymentMethodRepository paymentMethodRepository;
+-
+-    @Autowired
+-    private NamedParameterJdbcTemplate jdbcTemplate;
+</code></pre>
+
+<p>The session's reasoning was that the project rules describe DAOs as wiring a repository and a
+<code>JdbcTemplate</code>. That is a fair reading of an ambiguous rule, but speculative code has a
+cost: the next reader wonders what uses it, and nothing does. It was removed before the commit, along
+with an unused logger annotation. Later, when an independent reviewer flagged the class as breaking
+that rule, the right fix turned out to be the rule's wording, not the code.</p>
+
+<p>Small cuts like this are most of what reading a good assistant's diff produces. It is rarely
+dramatic. It is consistently the difference between code you are happy to own and code you
+tolerate.</p>
+
+<h2>Naming and house style</h2>
+
+<p>The plan named a frontend helper <code>useSavedCard</code>. In step 4 the session renamed it
+without being asked, and said why:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">I named the API helper selectSavedCard, not useSavedCard. In React, a name
+starting with use is read as a hook, both by people and by lint rules, and this
+function is called from a click handler.
+</code></pre>
+
+<p>That is a deviation from the plan in the right direction, and it shows why "follow the plan" does
+not mean "follow it blindly". A good change of course, explained, is fine to accept. An unexplained
+one is not, however good it looks.</p>
+
+<p>House style is where a <code>CLAUDE.md</code> earns its keep. The pizza app's rules (service as
+interface plus implementation, ownership failures as 404, every endpoint documented, run
+<code>spotless:apply</code> before committing Java) were followed in every step without being
+repeated in a prompt.</p>
+
+<h2>Verify each step before the next</h2>
+
+<p>Each step ran its own checks before handing back: the step's new tests, the full suite, the
+formatter, and on the frontend the type checker, linter and build. When something did not fit, the
+session said so. Step 1 reported four failing tests it believed were not its own, and asked for
+permission to prove it. Proving it took one command:</p>
+
+<pre class="language-bash"><code class="language-bash">git stash push -u -q -- . &amp;&amp; ./mvnw -q test \
+  -Dtest='CustomerOrderDAOIntegrationTest,ReportServiceImplTest'
+# Tests run: 12, Failures: 4   -> the same 4 fail without the change
+git stash pop -q
+</code></pre>
+
+<p>Never move to the next step on "probably not mine". A failure you carry forward unexplained
+becomes indistinguishable from the next one you cause.</p>
+
+<p>How big should a step be? The largest one here, the card chooser, was one new component of about
+two hundred lines plus a fifty-line change to the checkout page. That was near the limit of what
+could be read properly in one sitting. If a step's diff is longer than you are willing to read
+carefully, the step is too big: ask for it to be split rather than reviewing it in a hurry. Two small reviews beat one skimmed one.</p>
+
+<h2>Commit like a human will read it</h2>
+
+<p>The engineer commits, not the assistant, and each commit message records what the diff cannot:
+why. Step 2's message explained the missing idempotency key; step 1's recorded that the four failures
+predated the branch. Those messages became most of the pull request description later.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Did the prompt cover one plan step only, and tell the session what changed since its last
+  step?</li>
+  <li>Did you read the list of things it did that the plan did not say, and decide on each one?</li>
+  <li>Does <code>git status</code> match the files the plan named for this step?</li>
+  <li>Is there anything in the diff that nothing uses yet? Cut it.</li>
+  <li>Did every deviation from the plan come with a reason you agree with?</li>
+  <li>Do the step's checks pass, and is every failure explained and proven, not assumed?</li>
+  <li>Does the commit message say why?</li>
+</ul>

@@ -1,0 +1,132 @@
+<p>Ask an assistant for tests and you will get tests, and they will pass. That is the problem. A
+passing test tells you nothing until you know it would fail if the code were wrong. AI-written tests
+are especially prone to proving the code does what the code does: they are written by something that
+has just read the implementation, and they tend to mirror it. This post is about getting tests that
+actually guard behaviour, using the tests written for the series' saved-card feature.</p>
+
+<h2>Ask for behaviour, and for proof</h2>
+
+<p>The Playwright step's prompt did not say "add tests" or "get coverage to 90%". It said what each
+test must do, and demanded evidence:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Implement STEP 6 ONLY (e2e/saved-card-checkout.spec.ts + add it to test:e2e),
+as planned. Requirements beyond the plan:
+- Each test must fail if the behaviour it names is broken. For at least two
+  tests, prove it: temporarily break the code they cover, show me the failure,
+  and restore it.
+- Clean up everything the tests create (saved cards; note any orders you can't
+  remove).
+</code></pre>
+
+<p>"Temporarily break the code and show me the failure" is mutation testing done by hand, and it is
+the single most effective instruction for test quality. A test that survives its code being broken is
+decoration.</p>
+
+<h2>What proof looks like</h2>
+
+<p>The session broke three things, one at a time, and reported each result:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">| Temporary break                                | Test          | Failure
+| isCardExpired always returns false             | expired card  | toBeDisabled failed: the
+|                                                |               | expired card was enabled
+|                                                |               | and even preselected
+| A Stripe decline calls onSuccess()             | declined card | the decline message never
+|                                                |               | appeared
+| Card load runs for guests (CheckoutPage.tsx)   | guest         | the plain card form never
+|                                                |               | appeared; the chooser
+|                                                |               | showed instead
+</code></pre>
+
+<p>Then it confirmed the source matched the last commit exactly. That last part is not optional. A
+mutation left behind by accident is the worst possible outcome of this technique, so check it
+yourself: <code>git diff &lt;commit&gt; -- src</code> should print nothing.</p>
+
+<p>You can do the same for tests you did not ask about. For the backend data-access step, I broke the
+ownership check by hand, swapping the query that filters by owner for one that does not:</p>
+
+<pre class="language-diff"><code class="language-diff">-        return paymentMethodRepository.findByPublicIdAndUserId(publicId, userId);
++        return paymentMethodRepository.findByPublicId(publicId);
+</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">[ERROR] UserPaymentMethodDAOIntegrationTest.ignoresSomeoneElsesCard <<< FAILURE!
+Expecting an empty Optional but was containing value: UserPaymentMethod(id=6,
+  ... stripePaymentMethodId=pm_test_admin, ...)
+</code></pre>
+
+<p>One test failed, and it was the right one. Thirty seconds, and that test is now worth trusting.</p>
+
+<h2>Tests designed to catch the obvious wrong answer</h2>
+
+<p>Good tests set up data where a plausible-but-wrong implementation gives a different answer from the
+right one. Two of the stubbed Playwright tests did this deliberately:</p>
+
+<ul>
+  <li>"The primary card is preselected": the primary is <em>not</em> first in the list, so an
+  implementation that picks the first card fails.</li>
+  <li>"An expired card is never preselected": the expired card <em>is</em> the primary, so an
+  implementation that blindly picks the primary fails.</li>
+</ul>
+
+<p>The review round produced another good example. A fix made the server answer 409 when a payment
+had already succeeded at Stripe. Along with two tests proving the fix, the session added a third that
+passes both with and without it: an ordinary Stripe refusal must still be a 400. That test guards
+against the fix being too broad. Asking "what is the wrong way to make this pass?" and writing a test
+against it is a habit worth stealing.</p>
+
+<h2>Watch for tests that cannot reach the code</h2>
+
+<p>The analysis step had flagged a trap: the existing order tests stub Stripe's
+<code>isConfigured()</code> to <code>false</code>, which makes the service skip Stripe entirely. A
+saved-card test written in that class without noticing would pass while never touching the code under
+test. The new service test got it right, and it is worth checking for in any test that uses mocks:</p>
+
+<pre class="language-java"><code class="language-java">@BeforeEach
+void setUp() {
+    when(stripeService.isConfigured()).thenReturn(true);
+</code></pre>
+
+<p>Every refusal test then also asserted that Stripe was <em>never</em> called, which proves the
+checks happen before the payment call rather than after it.</p>
+
+<h2>The test changes you should never accept blindly</h2>
+
+<p>Be most suspicious of edits to existing tests. In step 3 the plan said a missing token should get
+401; the code returned 403, and the session wrote the test to expect 403. It flagged this, gave a
+reason, and pointed to an existing test asserting 403 for admin endpoints. I opened that test before
+accepting. The reason held, so the change stayed. Had it not, a test would have been bent to fit a bug.</p>
+
+<p>The rule: a test expectation may change only when you can say why the old expectation was wrong.
+"Because the code does something else" is never that reason by itself.</p>
+
+<h2>Say what the tests do not cover</h2>
+
+<p>The plan had marked 3D Secure as a manual check, assuming Stripe's challenge page could not be
+driven by an automated browser. The session tried anyway, found it could (with a retry, because
+Stripe's test page ignores a click that arrives too early), and added the test, while noting that it
+depends on Stripe's test page and can be dropped. It was equally clear about the opposite case: a
+decline followed by a newly <em>typed</em> card could not be automated, because the project had already found
+that Stripe's card form will not accept typing from an automated browser here (its notes blame
+hCaptcha). That gap went into the pull request in so many words.</p>
+
+<p>A suite with an honest list of what it does not test is worth more than a bigger suite that implies
+it tests everything. Ask for that list every time.</p>
+
+<h2>Tests have side effects</h2>
+
+<p>Live tests against a shared database leave things behind. These delete every card they save, and
+fail if a delete does not return 204. Orders cannot be deleted through the API, so each run leaves
+seven. The session said so plainly, and later a different investigation showed that leftover test
+orders were part of why unrelated report tests behaved differently from one run to the next. Ask
+where test data goes, and write down what stays.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>For the tests that matter most, did someone break the code and watch them fail?</li>
+  <li>After any mutation check, does the source match the last commit exactly?</li>
+  <li>Is the test data arranged so the obvious wrong implementation would fail?</li>
+  <li>Do mocks let the test reach the code it claims to cover?</li>
+  <li>Did any existing test's expectation change? Do you know why the old one was wrong?</li>
+  <li>Did you run the new tests yourself, rather than trusting "7/7"?</li>
+  <li>What do the tests leave behind, and is that written down?</li>
+</ul>

@@ -1,6 +1,6 @@
 # Homepage "Most viewed" section — progress report
 
-**Status:** built and verified locally (2026-10-02). Not deployed, not committed.
+**Status:** code LIVE 2026-10-02 (build `b9e7604-dirty`), not committed. Section hidden until posts are tagged `most-view`.
 
 ## Requirement
 The homepage led with "Latest tutorials". Lead instead with a hand-picked list that grabs
@@ -34,3 +34,10 @@ attention: every post tagged `most-view` appears in that section.
 1. `/admin` → edit each post you want featured → add `most-view` to Tags → Save.
 2. Deploy the frontend code (`AWS_PROFILE=folau npm run deploy`) — Publish alone rebuilds from the
    source zip the last deploy uploaded, so the code change must be deployed once first.
+
+## Bug: tags could not be typed in /admin (fixed 2026-10-02, build `646aa6c`)
+The Tags input re-slugified on every keystroke (`split(',') → slugify → join`), which strips a
+trailing `-`, `,` or space the instant it is typed — so `most-view` was impossible to enter on
+any post. `PostEditor.tsx` now keeps the raw text (`tagsText`) and parses it with `parseTags()`
+only on save. Backend `_validate_slug` accepts hyphens, so nothing else changed.
+Not browser-tested (the editor needs a login); verified by typecheck and a clean build.

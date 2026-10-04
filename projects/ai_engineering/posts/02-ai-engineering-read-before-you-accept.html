@@ -1,0 +1,148 @@
+<p>The most important skill in AI-assisted engineering is not prompting. It is reading. An assistant
+can produce a working-looking change in two minutes, and the only thing standing between that
+change and production is whether a person actually read it. Clicking <em>Accept</em> is not a
+review. It is a decision to skip one.</p>
+
+<p>This post is the habit the rest of the series depends on: how to read an AI-written diff quickly,
+how to hold the assistant to an agreed plan, and what it looked like, on a real feature, when
+reading caught something that a summary said was fine.</p>
+
+<h2>Why the job moved from writing to reading</h2>
+
+<p>When you wrote every line yourself, review happened twice: once as you typed, and once when a
+colleague looked at the pull request. With an assistant, the first review disappears. Nobody
+thought through each line as it was written, because nobody wrote it line by line. If you do not
+read the diff, the first human to think about that code is the reviewer on your pull request, or
+worse, the person debugging it in production.</p>
+
+<p>There is a second, subtler reason. The assistant's summary of its own work is written by the
+same process that wrote the code. When the code is wrong in a way the model did not notice, the
+summary is wrong in the same way, and it reads just as confidently. In the feature this series
+follows, every session ended with a clear, well-organised summary. Most were accurate. The ones
+that were not looked exactly like the ones that were.</p>
+
+<h2>The plan is the contract</h2>
+
+<p>You cannot judge a diff without knowing what it was supposed to do. That is why the series puts
+a written plan before any code (the <a href="/ai-engineering/ai-engineering-planning">planning
+post</a> covers how). The plan for this feature split the work into seven steps, listed the files
+each would touch, and ended with an explicit list of what was out of scope:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Out of scope — reject in review if it appears
+- Saving a card at checkout (separate ticket).
+- Angular, React Native and iOS.
+- Any change to order creation, the order request, how the PaymentIntent is
+  created, the webhook, ... or the confirmation page.
+- Any database migration, and any edit to changesets 001–009.
+  (six more items)
+</code></pre>
+
+<p>With that list, reviewing becomes concrete. A diff that touches the webhook is wrong before you
+read a single line of it. A step that adds a migration is drift, however sensible the migration
+looks. Without a plan, every change is plausible, and plausible is the failure mode.</p>
+
+<h2>How to read an AI-written diff quickly</h2>
+
+<p>Reading everything with equal attention is slow, and slow reviews get skipped. Read in an order
+that finds the expensive problems first:</p>
+
+<ol>
+  <li><strong>The file list.</strong> Run <code>git status</code> and <code>git diff --stat</code>
+  before opening anything. Compare it to the plan's file list for this step. Extra files are the
+  cheapest drift to catch and the most common.</li>
+  <li><strong>Changed tests.</strong> Any edit to an existing test's expectation is a red flag until
+  you know why. An assistant asked to make tests pass can do it by changing either side.</li>
+  <li><strong>The core logic.</strong> The condition, the query, the state change. This is where you
+  slow down.</li>
+  <li><strong>Error paths.</strong> What happens on failure, on a null, on a retry. Generated code is
+  usually strongest on the happy path.</li>
+  <li><strong>Comments and docs.</strong> Check that each comment is true. A confident comment that
+  describes something the code does not do is worse than no comment.</li>
+</ol>
+
+<p>Then check at least one claim from the summary against reality yourself. Not all of them, but one
+you would be embarrassed to have got wrong.</p>
+
+<h2>What drift looked like on a real feature</h2>
+
+<p>The feature was "pay with a saved card at checkout". Here is a sample of what reading caught,
+across seven steps that each ended with a passing test suite.</p>
+
+<p><strong>An unused dependency "for later".</strong> Step 1 added a data-access class that injected
+a <code>JdbcTemplate</code> nothing used. The assistant even said so: "It's wired only to keep the
+documented DAO shape; drop it if you'd rather not have an unused field." Harmless, but it is how a
+codebase fills up with speculative code. It came out before the commit.</p>
+
+<p><strong>A test expectation that differed from the plan.</strong> The plan said a request without
+a token should get 401. The code returned 403, and the session wrote the test to assert 403. It
+flagged this rather than hiding it, and the reason held up: every protected endpoint in the app
+already returns 403, and an existing test asserts exactly that. But "the test expects what the code
+does" is precisely the shape of a test bent to pass, so it was checked before it was accepted.</p>
+
+<p><strong>A wrong fix in the documentation.</strong> Step 7 updated the project's notes and
+explained four failing tests: the seeded orders had aged out of a 30-day report window, so the
+seed dates should be made "relative to today". It read well. Opening the seed file showed:</p>
+
+<pre class="language-sql"><code class="language-sql">-- 003-seed-orders.sql
+(1, 2, NULL, 'Demo Customer', ..., 'pi_demo_0001',
+    DATE_SUB(NOW(), INTERVAL 28 DAY), DATE_SUB(NOW(), INTERVAL 28 DAY)),
+</code></pre>
+
+<p>They already were relative. <code>NOW()</code> ran once, when the changeset was applied, and the
+dates froze. The recommended fix would have changed nothing. A follow-up debugging session found the
+real cause (the <a href="/ai-engineering/ai-engineering-debugging">debugging post</a> walks through
+it), and the note was corrected before it was committed.</p>
+
+<h2>The one that would have shipped</h2>
+
+<p>The most valuable catch came from a reviewer that had not written the code: a fresh session asked
+to review the finished pull request. It found that if a customer paid in one browser tab and tried
+again in another before Stripe's webhook arrived, the order still looked unpaid, Stripe refused to
+change the card, and the server turned that refusal into this:</p>
+
+<pre class="language-java"><code class="language-java">} catch (StripeException ex) {
+    log.error("Stripe refused saved card {} for order {}", paymentMethodId, orderId, ex);
+    throw ApiException.badRequest("That card could not be used for this order. Please choose another card.");
+}
+</code></pre>
+
+<p>"Please choose another card", on an order that was already paid. The session that wrote this
+code missed it. Its tests passed. The human reviewing every step (me) missed it too. It was fixed
+to answer 409 "already been paid" after asking Stripe for the payment's real status. The lesson is
+not that the assistant is careless; it is that the author of a change, human or not, is the worst
+person to find its gaps, which is why a second reader matters.</p>
+
+<h2>Reviewers can be wrong too</h2>
+
+<p>Reading carefully cuts both ways. While checking screenshots of the new card chooser, I noticed
+its radio buttons were blue while the address chooser above them was green, and started to file it
+as an inconsistency. Before sending it, I checked how the address chooser got its colour. It was
+Bootstrap's validation styling: the screenshot had been taken after a failed form submission, which
+turns every valid field green. There was no inconsistency. Had I sent it, the assistant would
+probably have "fixed" it by adding green styling that did not belong.</p>
+
+<p>That is the same discipline pointed the other way. A finding is a claim, and claims get checked,
+whoever makes them.</p>
+
+<h2>When to stop and say no</h2>
+
+<p>Reading only helps if you act on what you find. Stop the work and go back a step when:</p>
+
+<ul>
+  <li>the diff touches something the plan put out of scope;</li>
+  <li>you cannot explain why a test's expectation changed;</li>
+  <li>the summary and the diff disagree about what was done;</li>
+  <li>the step is too big to read properly. Ask for it to be split, rather than skimming it;</li>
+  <li>you notice you have stopped reading and started scrolling.</li>
+</ul>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Did you compare the changed-file list against the plan for this step?</li>
+  <li>Did you find every changed test expectation, and know why each one changed?</li>
+  <li>Did you read the core logic and its error paths, not only the happy path?</li>
+  <li>Did you check at least one claim from the summary against the code or the data?</li>
+  <li>Is every comment in the diff true?</li>
+  <li>Would a second reader who did not write it, human or a fresh session, look at it before merge?</li>
+</ul>

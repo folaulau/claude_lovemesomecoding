@@ -187,8 +187,16 @@ Stay on `.com` — checked 2026-08-04, no cheaper TLD (.dev $17, .app $20, .co $
 Don't re-run that comparison.
 
 pocsoft.com is NOT in this account (Unstoppable Domains, DNS at Vercel, expires 2027-03-22). Its
-orphaned hosted zone was deleted 2026-08-04. Two resources it used may still bill and are
-unverified: API Gateway `d-slp5iqnci4.execute-api.us-west-2`, CloudFront `d1zmyros44lee`.
+orphaned hosted zone was deleted 2026-08-04. Leftovers, verified read-only 2026-10-04 (cost ≈ $0,
+no DNS points at any of them; see `projects/ai_engineering/sessions/10-aws.md`):
+- ⚠️ REST API `anwkjt5ckf` (custom domain `backend.pocsoft.com` = `d-slp5iqnci4`) → Lambda
+  `backend-pocsoft-prod`. Every route is **unauthenticated** and the default execute-api URL is live,
+  including `POST /sushi/turnon-servers`. Its target, ECS cluster `pocsoft` (3 Fargate services, all
+  at 0), was **deleted 2026-10-04**, so the endpoints now fail harmlessly — but the API, Lambda and
+  three orphaned target groups (`ecs-pocsof-sushi-api`, `ecs-pocsof-sushi-api-flask`,
+  `ecs-sushi-graphql-service`, no load balancer, $0) remain. 0 Lambda invocations in 90 days.
+- CloudFront `E1ECW7IDDZUUCG` (`d1zmyros44lee`, sushi.pocsoft.com) and `E3KFWG5MPNJ9CK`
+  (server.pocsoft.com), both enabled, expired certs. Cleanup commands, in order: the session file.
 
 ---
 

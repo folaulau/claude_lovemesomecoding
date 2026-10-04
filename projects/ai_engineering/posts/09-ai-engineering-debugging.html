@@ -1,0 +1,136 @@
+<p>Debugging is where an AI assistant can save you hours, and also where it can waste them most
+convincingly. It reads stack traces and code paths faster than you do. It also produces plausible
+explanations with no effort at all, and a plausible wrong explanation is worse than none, because you
+stop looking. This post follows a real failure from the series' project, from a confident wrong
+theory to a verified root cause.</p>
+
+<h2>The symptom, and the first theory</h2>
+
+<p>While the saved-card feature was being built, four backend tests kept failing. Stashing the
+feature's changes showed they failed without them too, so they were not caused by the branch. Three
+were report tests that work over "the last 30 days". During the feature work, a session explained
+them in the project notes:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">The seeded orders are dated August 2026, so every "last 30 days" test now
+fails ... Needs seed dates relative to today (or a fixed clock in the tests).
+</code></pre>
+
+<p>It is a good theory. It fits the symptom, it names a cause, and it proposes a fix. It is also
+wrong in a way that one look at the seed file shows: the dates are already relative, written as
+<code>DATE_SUB(NOW(), INTERVAL 28 DAY)</code>. They froze because <code>NOW()</code> ran once, when
+the database changeset was applied. "Make them relative" would have changed nothing. The note was
+corrected, and the failure got a proper investigation.</p>
+
+<h2>Give it evidence, not your theory</h2>
+
+<p>The debugging session started fresh, without the earlier conversation, so it would not inherit
+the earlier theory. The prompt gave it the raw evidence and some rules:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ReportServiceImplTest in pizza-springboot-backend is failing. This is the
+evidence; I don't have a theory I trust yet.
+
+  ReportServiceImplTest.softDeletedOrdersAreExcluded -- FAILURE
+    expected: 19L  but was: 20L   (ReportServiceImplTest.java:94)
+  ReportServiceImplTest.softDeletedOrdersLeaveTheStatusBreakdown -- FAILURE
+    expected: -1L  but was: 0L    (ReportServiceImplTest.java:114)
+
+Two hours earlier the same class had THREE failures ...
+
+Find the ROOT CAUSE. Rules:
+- Do not change any files and do not propose a fix until you have the root cause.
+- Separate what you verified (with the command or file:line) from what you are
+  inferring.
+- Explain why the failure set changed between the two runs, and why the numbers
+  are what they are.
+</code></pre>
+
+<p>Three things in that prompt do most of the work. "I don't have a theory I trust" stops the
+assistant anchoring on yours. "No fix until root cause" stops the most common failure, a patch that
+makes the symptom go away. And asking it to explain the exact numbers, and why the failure set
+changed, sets a bar that a vague theory cannot clear.</p>
+
+<p>Starting fresh was deliberate. The implementation steps resumed one long conversation because
+continuity helped there: each step built on the last. Debugging is the opposite. A session that has
+already "explained" a failure will tend to defend that explanation, the same way a person does. A new
+session sees only the evidence, so the only story it can tell is one the evidence supports. When an
+earlier explanation has failed, change the context, not just the question you ask. A new session costs
+almost nothing, and a wrong theory costs a lot.</p>
+
+<h2>The root cause</h2>
+
+<p>It took 135 seconds:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">The test picks its victim from all orders, but the report only counts the last
+30 days. The seeded orders have aged out of that window, so the test
+soft-deletes an order the report never counted, and the count doesn't move.
+
+- ReportServiceImplTest.java:83 and :102 pick the victim with
+  orderRepository.findAll().stream().filter(EARNING).findFirst(). There is no
+  date filter and no ordering.
+- ReportServiceImpl.java:39 limits every query to
+  created_at >= LocalDate.now().minusDays(29).atStartOfDay()
+</code></pre>
+
+<p>Then it worked the numbers. "Expected −1, was 0" means the deleted order's status had a count of
+zero in the window before the delete, so the victim cannot have been in the window. That single
+deduction rules out the other suspect, a soft-delete the query failed to see. It also explained why
+three failures became two: test runs had since added twenty recent paid orders, so the summary test
+found data again, while the delete tests still picked the oldest seed order.</p>
+
+<p>It explicitly ruled out the regression the test was written to catch, citing the
+<code>deleted = 0</code> filter on every report query by line number.</p>
+
+<h2>Verified versus inferred</h2>
+
+<p>The session separated its claims, as asked. It could not run SQL in that session, so it marked
+these as inference and handed over the queries that would settle them:</p>
+
+<pre class="language-sql"><code class="language-sql">SELECT id, status, created_at FROM customer_order ORDER BY id LIMIT 1;
+SELECT status, COUNT(*) FROM customer_order
+ WHERE deleted = 0 AND created_at >= '2026-09-05' GROUP BY status;
+</code></pre>
+
+<p>Running them took seconds:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">id  status     created_at
+1   COMPLETED  2026-07-20 14:15:48
+
+status           COUNT(*)
+PENDING_PAYMENT  42
+PAID             20
+</code></pre>
+
+<p>Order 1, the victim, is completed and dated July, well outside the window. The window holds twenty
+paid orders and no completed ones. Both failures are now explained to the digit. That is what a root
+cause looks like: not a story that fits, but one that predicts the exact numbers.</p>
+
+<h2>The surprise it found on the way</h2>
+
+<p>While gathering evidence, the session read the test report's recorded configuration and found the
+tests connect to a MySQL on port 3306, not the Docker container on 3308 that I had told it about. I
+had the setup wrong. The project's own notes document both databases; I had not read that part. A
+debugging session that checks your premises instead of accepting them is worth a lot, and it is one
+more reason to give evidence rather than conclusions.</p>
+
+<h2>Fix it, or not, deliberately</h2>
+
+<p>Its proposed fix: each test creates its own recent order inside its transaction and asserts the
+report counted it before deleting it. It also listed what that would <em>not</em> fix, including two
+browser tests with the same aging problem and leftover test orders breaking a different test.</p>
+
+<p>The fix was not applied. The feature's plan put existing test problems out of scope, and a test-data
+refactor does not belong in a payments pull request. It became a follow-up with the root cause
+attached. Knowing why something fails is often the deliverable. Fixing it is a separate decision.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Did you give the assistant the evidence (exact output, versions, what changed), not your
+  theory?</li>
+  <li>Does the explanation account for the exact values in the failure, not just its general
+  shape?</li>
+  <li>Are verified claims separated from inferences, and did you check the inferences?</li>
+  <li>Did it rule out alternatives, or just pick the first fit?</li>
+  <li>Did it check your premises? Were any wrong?</li>
+  <li>Is the proposed fix in scope for the work you are doing, or a follow-up?</li>
+</ul>

@@ -1,0 +1,123 @@
+<p>Code review has two sides, and an AI assistant helps on both. As a reviewer, a fresh session reads
+a whole pull request carefully in a few minutes, with none of the author's blind spots. As an author,
+it helps you work through the comments you receive. On both sides the same rule from the rest of this
+series holds: a review comment is a claim, and the decisions about it are yours.</p>
+
+<h2>Use a reviewer that did not write it</h2>
+
+<p>The session that built the series' saved-card feature knew everything about it, which is exactly
+why it was the wrong reviewer. The author of a change, human or model, reads it through the
+assumptions that produced it. So the first review came from a brand-new session in read-only plan
+mode, given only the branch and the description:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">You are reviewing a pull request you did not write. Branch
+feature/checkout-saved-cards against main in this repo ...
+
+Review for correctness and security first: payment logic, authorization, race
+conditions, error handling, and whether the tests would catch a regression.
+Then anything that contradicts the project's CLAUDE.md rules.
+
+Rules:
+- Report only findings you are confident are real. For each: file:line, what
+  is wrong, a concrete scenario where it breaks, and severity (blocker /
+  should-fix / nit).
+- Say explicitly if you looked for a class of bug and found nothing.
+- Do not change any files.
+</code></pre>
+
+<p>"A concrete scenario where it breaks" filters out vague style opinions. "Say if you looked and
+found nothing" turns silence into information: a review that lists the areas it checked and found
+clean is far more useful than one that only lists complaints.</p>
+
+<h2>What it found</h2>
+
+<p>No blockers, one should-fix and four nits, plus seven areas it checked and found clean (ownership
+and 404s, the security rule's ordering, double charging, token exposure, expiry, error handling, the
+idempotency reasoning). The should-fix was real, and it had been missed by the session that wrote the
+code, by its tests, and by the human reviewing every step:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Scenario B: the order is paid in tab 1 and the webhook hasn't arrived yet, so
+it is still PENDING_PAYMENT. Tab 2's PUT passes the 409 check, and Stripe
+refuses to update a payment that already succeeded.
+CustomerOrderServiceImpl.java:262 turns that into "That card could not be
+used… Please choose another card", which invites the customer to try paying
+again for an order that is already paid.
+</code></pre>
+
+<p>The same finding had a second half, scenario A: two tabs choosing different cards, where the confirm
+in one tab charges whichever card was set last. It assessed the impact precisely, too: only the
+customer's own cards are involved, nothing is charged twice, and the confirmation page shows the card
+that actually paid.</p>
+
+<p>The whole review took a little over three minutes and cost about a dollar and thirty cents in
+usage. Against the cost of the bug it caught reaching a customer, that is the easiest trade in this
+series. Run a fresh-session review before you ask a colleague for theirs, every time; it means the
+human reviewer spends their attention on design and judgement rather than on the problems a careful
+read would have found anyway. Everyone's time goes further.</p>
+
+<h2>Decide on each comment</h2>
+
+<p>Receiving review is where the author's judgement matters. Each finding got an explicit decision,
+and the declined ones got a reason:</p>
+
+<ul>
+  <li><strong>Already paid → "choose another card": accept, fix now.</strong> Small, and a customer
+  should never be invited to pay twice.</li>
+  <li><strong>Two tabs, different cards: decline for this PR, record a follow-up.</strong> Real, but
+  the fix changes the protocol, and the impact is bounded.</li>
+  <li><strong>Payment form swaps if the card list loads late; failed reload hides a message: decline,
+  record.</strong> Unlikely, and one path was already listed as untested.</li>
+  <li><strong>Stripe called inside a read-only transaction: decline.</strong> A known, documented
+  trade-off.</li>
+  <li><strong>New DAO breaks the project's "repository and JdbcTemplate" rule: accept, but fix the
+  rule.</strong> The field had been removed on purpose; the documentation was what was out of date.</li>
+</ul>
+
+<p>The last one shows why you cannot accept review comments wholesale. The reviewer was right that the
+code contradicted the written rule. Adding an unused field to satisfy the rule would have been the
+wrong fix.</p>
+
+<h2>Fix each accepted comment separately</h2>
+
+<p>The decisions went back to the authoring session with clear limits: fix these two, each as its own
+change; record these four in one line each; nothing else. For the payment fix it was also told how
+to fix it well:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Detect it properly (don't string-match Stripe's message if there's a better
+signal), add a service test and an API test that would fail without the fix.
+</code></pre>
+
+<p>It asked Stripe for the payment's real status after a refused update, and answered 409:</p>
+
+<pre class="language-diff"><code class="language-diff">         } catch (StripeException ex) {
++            if (paymentAlreadySucceeded(order.getStripePaymentIntentId())) {
++                log.info("Order {} is already paid at Stripe; refusing to change its card", orderId);
++                throw ApiException.conflict("Order " + orderId + " has already been paid");
++            }
+             log.error("Stripe refused saved card {} for order {}", paymentMethodId, orderId, ex);
+</code></pre>
+
+<p>Two new tests failed with the fix disabled and passed with it. A third, an ordinary refusal that
+must stay a 400, passed both ways, which guards against the fix catching too much. It also declined
+to extend the fix to a rarer Stripe status nobody had asked about, and said so. Each change became
+its own commit, so the reviewer can see exactly what each comment produced.</p>
+
+<h2>When the reviewer is a person</h2>
+
+<p>Everything above applies to human comments too, and the assistant is useful for them: ask it to
+check whether a comment is correct against the code before you reply, to draft a reply to one you
+disagree with, or to make a requested change in isolation. Two cautions. Do not let it reply to
+reviewers on your behalf; the conversation is between people, and the commitments are yours. And do
+not let "the AI reviewed it" replace a human review. The AI review here was a first pass that made the
+human review cheaper, not a substitute for it.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Was the first review done by a session that did not write the code?</li>
+  <li>Does every finding have a concrete scenario, and did you check the important ones yourself?</li>
+  <li>Did you make an explicit decision on each comment, with a reason for each decline?</li>
+  <li>Are declined comments recorded as follow-ups, not lost?</li>
+  <li>Is each accepted fix a separate, small change with a test that fails without it?</li>
+  <li>When a comment says the code breaks a rule, did you check whether the rule is what is wrong?</li>
+</ul>

@@ -1,0 +1,132 @@
+<p>Every earlier post in this series ends with what to check before accepting a step. This one is
+about the risks that cut across all of them: secrets, destructive commands, production access,
+confident wrong answers, and side effects nobody asked for. Each has a setting or a habit that
+contains it. And some tasks are still better done yourself.</p>
+
+<h2>Secrets</h2>
+
+<p>An assistant reads whatever is in the files you let it read, and anything it reads can end up in a
+prompt, a log, a commit or a pull request. The pizza app keeps its Stripe secret key in a git-ignored
+properties file now. Its own instruction file records why the rule is so emphatic:</p>
+
+<pre class="language-markdown"><code class="language-markdown">The **secret key lives only in `application-local.properties`** (gitignored) or an env var — never
+in this file, never in a commit. ⚠️ It was previously pasted into this file and committed, so treat
+the current one as burned and **roll it in the Stripe dashboard**.
+</code></pre>
+
+<p>Read that again: the key was pasted into <code>CLAUDE.md</code>, the very file every assistant
+session loads as context, and committed. That is the realistic failure. Not malice, just a key put
+somewhere convenient, which then travelled into every session and into the repository's history,
+where deleting the line does not remove it. A test-mode key limits the damage, which is one more
+reason development should never run on live credentials.</p>
+
+<p>Three habits contain it. Keep secrets out of the repository entirely, in ignored files or a secret
+manager. Deny the assistant read access to the files that hold them. And scan every branch before it
+goes anywhere public, as the pull request in this series was:</p>
+
+<pre class="language-bash"><code class="language-bash">git diff main...HEAD \
+  | grep -nE "sk_(test|live)_[A-Za-z0-9]{10}|whsec_|AKIA[0-9A-Z]{16}|password\s*="
+</code></pre>
+
+<p>If a secret does leak into a session, treat it as leaked. Rotate it; do not argue about whether
+anyone saw it.</p>
+
+<h2>Destructive commands and production</h2>
+
+<p>The safest destructive command is one the assistant cannot run. Claude Code's settings can deny
+whole classes of command for a project, and the AWS investigation in this series went further with
+an allowlist of read verbs only. A project-level deny list might look like this:</p>
+
+<pre class="language-json"><code class="language-json">{
+  "permissions": {
+    "deny": [
+      "Read(./**/application-local.properties)",
+      "Read(./**/.env*)",
+      "Bash(git push:*)",
+      "Bash(aws * delete-*)",
+      "Bash(aws * terminate-*)"
+    ]
+  }
+}
+</code></pre>
+
+<p>Pattern matching is a guardrail, not a wall, so pair it with credentials that cannot do damage: a
+read-only IAM role for investigation, a local database for development, test-mode payment keys. When
+something destructive is actually needed, a person decides and a person watches. In this series the
+only deletion, an abandoned ECS cluster, happened on the account owner's explicit instruction, and
+even then the first step was to list what existed: there were three clusters, not one, and only one
+was in scope.</p>
+
+<p>Permission prompts are a guardrail only if you read them. After the twentieth harmless
+"allow this command?" it is tempting to approve without looking, or to switch to a mode that stops
+asking. Approval fatigue is how a destructive command slips through a careful setup. Keep prompts
+rare by allowlisting the safe, repetitive commands, so the ones that still ask are the ones worth
+reading.</p>
+
+<h2>Confident wrong answers</h2>
+
+<p>The hardest risk to guard against is the one that looks like success. A sample from this series,
+all delivered fluently:</p>
+
+<ul>
+  <li>An explanation of four failing tests with a recommended fix ("make the seed dates relative")
+  that would have changed nothing, because they already were.</li>
+  <li>A checkout change that told a customer whose order was already paid to "choose another card".
+  The tests passed.</li>
+  <li>A pull request description with numbers that had been true an hour earlier.</li>
+</ul>
+
+<p>None was a hallucination in the dramatic sense. Each was a reasonable conclusion from incomplete
+information, stated with full confidence. The containment is the habit this series keeps repeating:
+claims cite a file and line, you check the ones you rely on, a second reader who did not write the
+code reviews it, and verified facts are kept separate from inference. Ask for that separation
+explicitly. When a session marks something as "inferred, could not verify", it is telling you exactly
+where to look.</p>
+
+<p>Be most careful with claims about things outside your codebase: a provider's API behaviour, a
+library version's defaults, a cloud service's pricing. A model's knowledge of those has a date on it,
+and invented or outdated API details look identical to real ones. Check them against the provider's
+current documentation.</p>
+
+<p>And apply the same standard to yourself. During this series I nearly filed a visual bug that was
+really a validation style in my own screenshot, and I briefed a debugging session with the wrong
+database port. Verification is not about distrusting the machine. It is about distrusting
+unverified claims, whoever made them.</p>
+
+<h2>Side effects</h2>
+
+<p>An assistant that runs things changes things. The sessions in this series created dozens of test
+orders in a shared database, created a test-mode Stripe customer for the demo account, and left the
+local data different from how they found it. They said so each time, which is the minimum. Better is
+to expect it: point sessions at disposable data, ask up front what a task will create and how it will
+be cleaned up, and read the summary for "left behind". The report tests that kept changing behaviour
+were partly a casualty of exactly this.</p>
+
+<h2>When not to use it</h2>
+
+<p>Some work is still faster or safer by hand:</p>
+
+<ul>
+  <li><strong>Changes smaller than their explanation.</strong> If describing the edit takes longer than
+  making it, make it.</li>
+  <li><strong>Things you are learning.</strong> If the goal is to understand recursion or SQL joins,
+  having them written for you defeats the point. Use the assistant to explain and check, not to do.</li>
+  <li><strong>Work you cannot verify.</strong> If you could not tell a right answer from a wrong one,
+  you cannot review it, and an unreviewable change should not be generated.</li>
+  <li><strong>Data you are not allowed to share.</strong> Customer records, credentials and anything
+  under a confidentiality obligation stay out, whatever the convenience.</li>
+  <li><strong>Irreversible actions.</strong> Deleting production data, sending messages to customers,
+  publishing. The assistant can prepare them; a person does them.</li>
+</ul>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Are secrets out of the repository, unreadable by the assistant, and scanned for before every
+  push?</li>
+  <li>Are destructive commands denied by configuration, and are the credentials themselves limited?</li>
+  <li>For every claim you are relying on, do you know whether it was verified or inferred?</li>
+  <li>Did you check claims about third-party services against their current documentation?</li>
+  <li>Do you know what the session created or changed outside the code, and is it cleaned up?</li>
+  <li>Is this a task you can actually verify? If not, should you be generating it?</li>
+</ul>

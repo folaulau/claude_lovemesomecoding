@@ -1,0 +1,121 @@
+<p>The first thing to do with a ticket is not to plan it, and certainly not to code it. It is to
+understand the code it lands in. This is where an AI assistant is at its most useful and least
+risky: it reads quickly and widely, it does not get lost in a twelve-file call chain, and in
+read-only mode it cannot break anything. The catch is that its explanation is a claim, and claims
+need checking.</p>
+
+<p>This post uses the analysis session for the series' feature, "pay with a saved card at checkout",
+run against a Spring Boot and React pizza app the session had never seen.</p>
+
+<h2>Ask for a trace, not a tour</h2>
+
+<p>"Explain this codebase" gets you a tour: a pleasant, generic summary of folders. What you need
+before changing something is narrower: how the specific flow you are about to touch works today, and
+what it would constrain. The prompt asked four focused questions and set two rules:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">I've been asked to add 'pay with a saved card' to checkout in this pizza app
+(backend + pizza-react-frontend only for now). Before I plan anything I want to
+understand what's there today. Don't change any files.
+
+1. Trace checkout end to end: from the Checkout page's pay button in
+   pizza-react-frontend through the API to Stripe and back to an order being
+   marked paid. Name the files and methods at each hop.
+2. How are cards saved today on the profile page, and what is stored in our
+   database vs in Stripe?
+3. What existing rules or invariants in the code would a saved-card checkout
+   have to respect?
+4. Roughly how big is this change: which files would likely need to change?
+
+Cite file paths and line numbers for every claim so I can check them.
+</code></pre>
+
+<p>Two parts of that do most of the work. "Don't change any files", plus running in plan mode,
+makes the session safe to let loose. And "cite file paths and line numbers for every claim" turns
+the answer from prose you have to trust into a list of things you can check in seconds.</p>
+
+<h2>What came back</h2>
+
+<p>The session took 101 seconds. It returned an eleven-hop trace from the "Continue to payment"
+button to the order being marked paid, with a file and line range for each hop. A few rows give the
+flavour:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">| 5 | It then calls StripeService.createPaymentIntent(total, publicId, email),
+|   | stores the intent id on the order and returns the clientSecret
+|   | CustomerOrderServiceImpl.java:87-108
+| 8 | The "Pay $X" button calls stripe.confirmPayment(...). On success it only
+|   | calls onSuccess; the browser never marks the order paid
+|   | StripePaymentForm.tsx:28-68
+| 10b | Webhook: StripeWebhookController.handle checks Stripe-Signature, and on
+|   | payment_intent.succeeded calls markPaid(intentId)
+</code></pre>
+
+<p>More useful than the trace was the headline it led with, the one fact that shapes the whole
+feature:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">The main finding: the PaymentIntent is created without a Stripe Customer
+(StripeService.java:82-90). A saved card is attached to the user's Customer, and
+Stripe won't charge an attached card from a PaymentIntent that has no customer.
+</code></pre>
+
+<p>It also listed eleven rules a saved-card checkout must respect, several of which are easy to miss:
+the idempotency key <code>order-&lt;uuid&gt;</code> means a second create with different parameters
+fails, so the card must be attached with an <em>update</em>; ownership failures must be 404, not 403,
+matching an existing private helper; and guest checkout must keep working. Its size estimate was
+"small to medium, no schema change", about eight files across both apps.</p>
+
+<h2>Check it, cheaply</h2>
+
+<p>An analysis you do not verify is a guess with line numbers. The good news is that line numbers
+make verification fast. I picked the claims the plan would depend on most and opened each one:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Claim                                                   Result
+PaymentIntent created with no customer (:82-90)         true
+Idempotency key "order-<uuid>" (:100-101)               true
+Ownership helper is private, 404 not 403                true
+@SQLRestriction hides deleted cards (line 42)           true, line 42 exactly
+progress_report says checkout lacks saved cards         true
+OrderCreateRequest at types/index.ts:146                true
+Pay button at CheckoutPage.tsx:494-512                  true
+OrderApiIntegrationTest mocks StripeService             true, BUT it stubs
+                                                        isConfigured() -> false
+</code></pre>
+
+<p>Eight for eight. And the last line is the reason to check even when the first seven pass. The
+session suggested adding a test asserting that "the customer and card reach Stripe", in that test
+class. But the class stubs <code>isConfigured()</code> to <code>false</code>, which makes the service
+skip Stripe entirely. A test written as suggested would never reach the code it claims to cover. The
+analysis was not wrong; it was incomplete in a way that would have produced a useless test later.
+That note went into the project file and was checked again when the tests were written.</p>
+
+<p>Also worth checking: the claims that sound like domain knowledge rather than code. "Stripe won't
+charge an attached card from a PaymentIntent that has no customer" is about Stripe, not this
+repository. It is correct, but that is the category of claim where a model is most likely to be
+confidently out of date, so confirm it against the provider's documentation.</p>
+
+<p>When a claim is vague ("the order is validated somewhere in the service"), do not fill the gap
+yourself. Ask for the line. Either a precise answer comes back, or you learn the session was
+summarising rather than reading, which tells you how much of the rest to trust.</p>
+
+<h2>Use it to size the work, not to decide it</h2>
+
+<p>The analysis ended with a choice: let the customer pick the card on the details step (simplest,
+the card is fixed when the order is created) or on the payment step (needs a PaymentIntent update
+endpoint). It did not make that choice, and it should not. Where the card is chosen is a product
+decision, and it went to the product owner in the next step. The analysis's job was to make the
+cost of each option visible.</p>
+
+<p>The same goes for the estimate. "About eight files" was useful for deciding whether this was one
+pull request or several. The real change touched twenty-five, mostly tests and docs. Treat an
+estimate as a shape, not a quote.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Did the answer cite a file and line for every claim you will rely on?</li>
+  <li>Did you open the lines behind the claims your plan depends on, not just the easy ones?</li>
+  <li>Are any claims about a third-party service rather than your code? Check those against its
+  documentation.</li>
+  <li>Did anything it suggested (a test, a fix) rest on an assumption you have now disproved?</li>
+  <li>Did it make a product decision that belongs to someone else? Send it back as a question.</li>
+  <li>Did it stay read-only? Plan mode should have changed nothing in the repository.</li>
+</ul>

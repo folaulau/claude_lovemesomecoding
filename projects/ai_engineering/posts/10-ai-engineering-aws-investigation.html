@@ -1,0 +1,132 @@
+<p>Cloud consoles are slow to search and easy to misread, and the AWS CLI has thousands of commands
+nobody remembers. An assistant that drives the CLI for you can answer "what is this, what is it
+attached to, and what does it cost?" in a couple of minutes. It can also delete a production
+database in one. This post covers how to get the first without risking the second, using a real
+investigation of this site's own AWS account.</p>
+
+<h2>The question</h2>
+
+<p>The project notes for this site carried a line nobody had followed up: two resources left over from
+an old domain, pocsoft.com, "may still bill and are unverified". An API Gateway custom domain and a
+CloudFront distribution, identified only by their generated hostnames. A perfect job to delegate,
+provided the assistant could look at everything and change nothing.</p>
+
+<h2>Read-only, enforced, not requested</h2>
+
+<p>Asking an assistant to "only read" is a request. Restricting which commands it can run is a
+guarantee. The session ran with an allowlist of read verbs and nothing else:</p>
+
+<pre class="language-bash"><code class="language-bash">claude -p "..." --permission-mode default --allowedTools \
+  "Bash(aws apigateway get-*)" "Bash(aws apigatewayv2 get-*)" \
+  "Bash(aws cloudfront get-*)" "Bash(aws cloudfront list-*)" \
+  "Bash(aws route53 list-*)" "Bash(aws acm list-*)" "Bash(aws acm describe-*)" \
+  "Bash(aws ce get-cost-and-usage *)" "Bash(aws sts get-caller-identity*)" \
+  "Bash(dig *)" "Read" "Grep"
+</code></pre>
+
+<p>Anything not on that list, such as <code>delete-*</code>, <code>update-*</code>, or even other read
+commands, would need an approval the headless session could not get. The prompt said read-only as
+well, and set a budget, because Cost Explorer calls are not free:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">READ-ONLY. Only describe/list/get commands. Do not create, update, disable or
+delete anything, even if it is clearly orphaned; tell me instead. Cost Explorer
+calls cost $0.01 each, so use at most 3.
+...
+4. Your recommendation, with the exact commands I would run to clean up, in the
+   order I should run them, and what to check before each one. Do NOT run them.
+Separate verified facts (with the command that showed them) from inference.
+</code></pre>
+
+<p>Better still, use an IAM role or profile that is read-only at the AWS level. The allowlist
+protects you from the assistant. A read-only role also protects you from a typo in the allowlist.</p>
+
+<h2>What it found</h2>
+
+<p>In about two minutes and one Cost Explorer call, it established that both resources still existed,
+that no DNS pointed at either, and that together with everything else in the account they cost a
+fraction of a cent a month. Then it found the part that mattered:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">The API itself: get-resources --embed methods shows every route goes to
+Lambda backend-pocsoft-prod, all with authorizationType: NONE:
+  - GET /, GET /latest-activity, GET /sushi/servers-status
+  - POST /sushi/turnon-servers, POST /sushi/turnoff-servers, ...
+Default endpoint: get-rest-api shows disableExecuteApiEndpoint: false, so the
+default anwkjt5ckf.execute-api.../prod/... URL is still switched on.
+</code></pre>
+
+<p>An abandoned, unauthenticated API whose endpoints are named "turn on servers". It also found a
+third leftover distribution that the project notes had never listed, by following an expired
+certificate's <code>InUseBy</code> field. Cost was never the real story; exposure was.</p>
+
+<p>It was just as clear about what it could not see. CloudWatch metrics, the Lambda's configuration
+and the S3 buckets were all outside the allowlist, so it said so, marked the traffic question as
+unverified, and listed the commands that would settle it.</p>
+
+<h2>How it reasoned about cost</h2>
+
+<p>The cost answer is a good model of careful reasoning with limited data. Cost Explorer cannot price a
+single distribution, so the session pulled three months of API Gateway and CloudFront spend for the
+whole account:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">| Month   | API Gateway | CloudFront |
+| 2026-07 | $0.000707   | $0.000105  |
+| 2026-08 | $0.002872   | $0.000374  |
+| 2026-09 | $0.004892   | $0.000480  |
+</code></pre>
+
+<p>Those totals include the site's own live API and CDN, so they are an upper bound on what the
+leftovers could cost. It said exactly that, rather than presenting the totals as the leftovers' cost,
+and flagged the one gap it could not close (the S3 buckets). Bounding an answer you cannot measure
+directly is a skill worth recognising and asking for.</p>
+
+<h2>Verify the finding that matters</h2>
+
+<p>A security claim is the one to check yourself before acting. The checks were read-only and took a
+minute: every route did have <code>authorizationType: NONE</code>, and the Lambda's configuration
+named the resources it controlled:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">cluster=pocsoft db=pocsoft-db
+[ { "name": "pocsoft", "status": "ACTIVE", "services": 3, "running": 0 } ]
+An error occurred (DBInstanceNotFound) ... DBInstance pocsoft-db not found.
+</code></pre>
+
+<p>The database was long gone, but the ECS cluster was still active with three services. Anyone who
+found the URL could have started tasks billed to this account. One thing worth noticing: I did
+<em>not</em> call the endpoints to "test" them. A POST to <code>turnon-servers</code> is not a
+read, whatever it returns. Verifying a risk must never trigger it.</p>
+
+<h2>Recommend, then let a human act</h2>
+
+<p>The session's recommendation came as an ordered runbook, each destructive command preceded by
+the check to run first, ending with the step that cannot be undone:</p>
+
+<pre class="language-bash"><code class="language-bash"># A3. Check first: InUseBy is now empty (it can take a few minutes after A1).
+aws acm describe-certificate --region us-west-2 --certificate-arn ... --query Certificate.InUseBy
+aws acm delete-certificate   --region us-west-2 --certificate-arn ...
+...
+# C3. Buckets: last step, and it can't be undone. Check first: your Step 0 backup finished.
+aws s3 rb s3://sushi.pocsoft.com --force
+</code></pre>
+
+<p>Nothing in it ran. The account owner read the findings and gave one instruction: clean up the ECS
+cluster. Even then, the first move was to look rather than delete. Listing clusters showed three, not
+one, so only <code>pocsoft</code> was in scope. Each service was confirmed at zero tasks, and the
+load-balancer target groups it referenced were checked for an attached load balancer (none, so no
+hidden cost). Only then were the three services and the cluster deleted, and the result
+listed again to confirm the other two clusters were untouched.</p>
+
+<p>The rest of the runbook, the API, the Lambda, two distributions and two certificates, is still
+waiting for a decision. That is fine. The assistant's job was to make the decision easy and safe. The
+decision itself belongs to whoever owns the account.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Was the session restricted to read commands by configuration, not just by instruction?</li>
+  <li>Better: was it using credentials that cannot write at all?</li>
+  <li>Are verified facts separated from inferences, with the command behind each fact?</li>
+  <li>Did you re-check the finding you are about to act on, using reads only?</li>
+  <li>Does every destructive step in the runbook have a check before it, and is the irreversible
+  step last?</li>
+  <li>Before deleting, did you list what exists and confirm the scope with the person who owns it?</li>
+</ul>

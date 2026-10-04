@@ -1,0 +1,121 @@
+<p>Every Claude Code session starts with no memory of your codebase. It does not know your naming
+conventions, which tests are flaky, which database the app really uses, or the bug that cost your
+team a week last spring. Whatever it knows at the start comes from what you set up for it. This post
+covers that setup: the files and settings that turn a capable stranger into a useful colleague,
+using the configuration the pizza app's sessions actually ran with.</p>
+
+<p>The mechanics of each feature are in the older <a href="/claude/claude-project-configuration">project
+configuration</a> and <a href="/claude/claude-mcp-servers">MCP servers</a> posts. This one is about
+what to put in them, and why.</p>
+
+<h2>CLAUDE.md: standing instructions</h2>
+
+<p>A <code>CLAUDE.md</code> at the root of a project is read at the start of every session. It is
+the place for rules that do not change from task to task. The pizza app's version is long, and the
+most valuable parts are not descriptions of the code (the assistant can read the code). They are the
+rules and the reasons that the code alone does not reveal:</p>
+
+<pre class="language-markdown"><code class="language-markdown">⚠️ **Hand-written SQL must filter `deleted = 0` itself.** The entities carry
+`@SQLRestriction("deleted = false")`, but Hibernate only applies that when it builds a query from
+the entity model — SQL written by hand never goes near it. Forgetting this silently counted deleted
+orders as revenue once; the reports stayed plausible, just wrong.
+</code></pre>
+
+<p>That paragraph paid for itself during the feature. When the analysis session listed the rules a
+saved-card checkout had to respect, it cited the project's 404-not-403 ownership rule, the
+interface-plus-implementation service rule, and "never edit an applied changeset", all straight from
+this file. The plan it wrote followed every one.</p>
+
+<p>Good entries share a shape: the rule, then the reason, ideally with the incident that taught it.
+The reason matters because the assistant will meet cases the rule did not anticipate, and the reason
+is what lets it (and the next human) decide well.</p>
+
+<p>What to leave out: anything the code already says, long architecture tours, and instructions that
+contradict each other. The last one is real. This setup had a global instruction file requiring a
+<code>Co-Authored-By</code> trailer on every commit, and a project file saying never to add one. The
+planning session noticed and asked which to follow. Conflicting rules are not ignored; they are
+resolved by guesswork, so resolve them yourself.</p>
+
+<h2>A progress report: shared state</h2>
+
+<p><code>CLAUDE.md</code> holds what is always true. A separate <code>progress_report.md</code> holds
+what is true <em>now</em>: what has been done, what was decided and why, and what is still open. The
+pizza app's report runs to fifteen hundred lines of history, and its last section was the reason this
+feature exists:</p>
+
+<pre class="language-markdown"><code class="language-markdown">- Checkout still does not offer saved cards, in ANY of the four frontends. Cards can be saved and managed on
+  the profile page; wiring "pay with a saved card" remains the natural next step.
+</code></pre>
+
+<p>The report is also where a session's conclusions outlive the session. When the feature was done,
+the final step updated that entry, recorded the product owner's decisions, and listed the follow-ups.
+The next session, next week, starts from there instead of from scratch.</p>
+
+<h2>Permission modes: how much it may do alone</h2>
+
+<p>Claude Code asks before it edits files or runs commands, unless you tell it otherwise. Choosing the
+mode per task is one of the main levers you have:</p>
+
+<ul>
+  <li><strong>Plan mode</strong> is read-only. The analysis, requirements, planning and code-review
+  sessions for this feature all ran in it. When the task is "understand" or "decide", there is no
+  reason to allow writes.</li>
+  <li><strong>Accept edits</strong> lets it change files without asking, but still asks before running
+  commands. The implementation steps ran this way.</li>
+  <li><strong>An allowlist</strong> pre-approves specific commands. Each implementation step allowed
+  exactly the build and test commands it needed, and nothing else.</li>
+</ul>
+
+<p>A headless run of one implementation step looked like this:</p>
+
+<pre class="language-bash"><code class="language-bash">claude -p "Implement STEP 1 ONLY ..." \
+  --permission-mode acceptEdits \
+  --allowedTools "Bash(./mvnw:*)" "Bash(git diff:*)" "Bash(git status:*)"
+</code></pre>
+
+<p>Tight permissions have a visible cost, and it is worth seeing. In step 1 the session found four
+failing tests it believed were not its fault, and could not prove it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">The two checks that needed your approval:
+1. A temporary git worktree of HEAD in /tmp, to run the same 4 tests without my change.
+2. A read-only SELECT on customer_order to confirm the dates and counts.
+</code></pre>
+
+<p>That is the right behaviour: it stopped and said what it could not verify, instead of asserting.
+The proof took one command by hand (stash the change, rerun the tests). Later, a session drafting the
+pull request could not save its file because the target folder was outside its working directory, and
+a support session could not reproduce a bug in a browser because it was not allowed to write a script
+to <code>/tmp</code>. Each time it reported the gap plainly. Read for those lines in a summary; they
+tell you exactly what still needs a human.</p>
+
+<h2>MCP servers: reach beyond the repo</h2>
+
+<p>MCP servers connect the assistant to systems outside the codebase: GitHub, a browser, a payments
+provider, an issue tracker. They are powerful, and they are also the widest door you can open, so add
+them for a task rather than by default.</p>
+
+<p>Two lessons from this feature. First, a connection that is installed but not authorised just fails;
+the review session noted "The Stripe plugin's MCP server isn't authorized in this session" and carried
+on without it. Second, for many tasks the plain CLI is enough and easier to restrict. The AWS
+investigation in this series used no MCP server at all, only the AWS CLI with an allowlist of
+<code>describe</code>, <code>list</code> and <code>get</code> commands.</p>
+
+<h2>Memory</h2>
+
+<p>Claude Code can also keep a memory across sessions: small notes about you and your preferences. It
+suits personal facts ("prefers small commits", "uses the folau AWS profile"). It does not replace
+project files, because only you see it. Anything a teammate's session also needs belongs in
+<code>CLAUDE.md</code> or the progress report, where it is versioned and reviewable. And review those files like code: a stale rule in
+<code>CLAUDE.md</code> misleads every future session at once.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Does <code>CLAUDE.md</code> state the rules the code cannot show, with the reasons?</li>
+  <li>Are there conflicting instructions anywhere in the files the session will read?</li>
+  <li>Is the permission mode the smallest one that fits the task?</li>
+  <li>Did you read the summary for "couldn't", "needed approval" and "not verified", and do those
+  checks yourself?</li>
+  <li>Is every MCP connection there for a reason this task needs?</li>
+  <li>Did the session update the progress report, so the next one starts where this one ended?</li>
+</ul>

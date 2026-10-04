@@ -1,0 +1,114 @@
+<p>A green test suite proves that the assertions you wrote hold. It does not prove the screen works,
+looks right, or makes sense to a person. For anything a user touches, someone has to actually walk
+through it. An AI assistant can do a surprising amount of that walking for you, by driving a real
+browser against the running app. This post covers what that caught on the series' saved-card
+feature, and the part it still could not do.</p>
+
+<h2>Let the assistant drive the running app</h2>
+
+<p>For the card chooser step, the backend and frontend were running locally with Stripe in test mode,
+and the prompt said so. That changed what the session could verify. Instead of stopping at "typecheck
+and build pass", it wrote a temporary Playwright script, drove the real checkout, made real test-mode
+payments, and reported against the plan's manual checks:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">| Plan check                                         | Result
+| Primary card preselected                           | ✅
+| Button reads "Pay $X with Visa ••4242"             | ✅
+| Success → confirmation page shows PAID and the card| ✅ PAID, "visa ending 4242"
+| Decline, then another saved card pays the same order| ✅ same order id
+| 3D Secure card brings up the challenge             | ✅ Stripe's challenge appeared
+| Expired card shown, disabled, labelled             | ✅ (with the card list faked)
+</code></pre>
+
+<p>It also settled the plan's main technical risk, whether <code>confirmCardPayment</code> would work
+with how the existing PaymentIntent was created, by simply doing it. A risk retired by running the
+real thing is worth more than one argued away.</p>
+
+<h2>Read what it did not check</h2>
+
+<p>The same report ended with two lines that matter more than the table:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">Manual checks I could NOT do
+1. Decline, then a NEW card on the same order. This needs typing a card into
+   Stripe's card form, which an automated browser can't do ...
+2. Looking at it in a real browser. Everything I checked was by assertion;
+   nobody has looked at the chooser's layout or spacing, or at a narrow screen.
+</code></pre>
+
+<p>That second point is the whole reason this post exists. Assertions check what you thought to
+check. Nobody had looked at the page. So I wrote a small screenshot script: sign in, add a pizza, go
+to checkout, continue to payment, and capture the screen at 1280 and 390 pixels wide.</p>
+
+<h2>Writing the walkthrough found a bug</h2>
+
+<p>The script failed three times, and each failure was informative. The first two were about the
+script: on a phone-width screen the cart button is inside the collapsed menu, and the cart is saved to
+the server a moment after "Add to cart", so leaving the page too quickly lost it. Both were fixed in
+the script.</p>
+
+<p>The third failure was about the app. The script signed in, then loaded <code>/checkout</code>
+directly, and the payment step never appeared. The debug screenshot showed why: the Name and Email
+fields were empty and outlined in red, with "Please tell us who the order is for", even though the
+navigation bar showed the customer signed in. Going through the cart button worked. Loading the page
+directly did not.</p>
+
+<p>That is a real bug, and it predates the feature: the checkout page copies the signed-in user into
+its form once, on first render, and after a full page load the user has not arrived yet. No test
+caught it, because every checkout test reached the page through the cart. It became a support ticket
+later in this series. Walking through the app as a user would, rather than as the tests do, is what
+found it.</p>
+
+<h2>Look at the screenshots yourself</h2>
+
+<p>With the script working, the screenshots showed the chooser as designed: "Pay with", the primary
+Visa preselected with its badge, a second card, "Use a new card", and a full-width "Pay $19.17 with
+Visa ••4242" button beside the order summary. At phone width the layout stacked cleanly. (The
+navigation bar appeared mid-page in the full-page phone capture. That is an artefact of capturing a
+sticky header in a scrolled screenshot, not a layout bug, and worth knowing before you report it.)</p>
+
+<p>Reading the component's code alongside the screenshots found one real problem the pictures could
+not show: the radio buttons had a visual "Pay with" label but no accessible name for the group, so a
+screen reader would not announce it. The fix (a <code>fieldset</code> with a <code>legend</code>) went
+back to the session, and the walkthrough script gained a check that the group is now announced:</p>
+
+<pre class="language-javascript"><code class="language-javascript">// The radios must be one group with an accessible name, or a screen reader never says "Pay with".
+console.log(`${name}: group "Pay with" accessible name ->`,
+  await page.getByRole('group', { name: 'Pay with' }).count());
+</code></pre>
+
+<pre class="language-plaintext"><code class="language-plaintext">desktop: group "Pay with" accessible name -> 1
+mobile: group "Pay with" accessible name -> 1
+</code></pre>
+
+<p>Then the screenshots were taken again to confirm the fix had not changed the look. It had not,
+beyond the button sitting two pixels lower.</p>
+
+<h2>Clean up after the walk</h2>
+
+<p>A walkthrough against a real backend changes real data. The screenshot script saves two test cards
+to the demo customer through the app's own API, one that pays and one that declines, and deletes them
+in a <code>finally</code> block so they go even when the script fails. The first version did not do
+that, crashed half-way, and left a card behind that had to be removed by hand. Orders cannot be
+deleted through the API, so every run still leaves one unpaid order per screen size. That is written
+down, because unexplained leftover data is exactly what confused the report tests elsewhere in this
+series.</p>
+
+<h2>Screenshots for the pull request</h2>
+
+<p>The same script produces the images a reviewer wants to see, and keeps producing them as the code
+changes. That makes it worth keeping in the repository rather than throwing away. Playwright can also
+record video of a run, and Claude in Chrome can drive your own browser session if you would rather
+watch it happen. Whichever you use, the rule is the same: the walkthrough is evidence for a human,
+so a human has to look at it.</p>
+
+<h2>Before you accept</h2>
+
+<ul>
+  <li>Was the app actually running when the assistant claimed the UI works?</li>
+  <li>Did you read the list of checks it could not do, and do them yourself?</li>
+  <li>Did a person look at the screen, at desktop and phone widths?</li>
+  <li>Did the walkthrough reach the page the way a real user would, including a direct load and a
+  refresh?</li>
+  <li>Is there an accessibility check, even a basic one like accessible names?</li>
+  <li>After a fix, did you re-capture to confirm nothing else moved?</li>
+</ul>
