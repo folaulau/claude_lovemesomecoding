@@ -1,16 +1,10 @@
 # AI-Assisted Engineering track: progress report
 
-**Status (2026-10-04):** all 16 posts WRITTEN, `check_content.py` passes 16/16, **seeded to `local`**
-and previewed on :3000 (archive, nav, diff highlighting all render). NOT on prod. PR #1 open on the
-demo repo. pocsoft ECS cluster deleted on Folau's instruction.
-
-To publish (Folau's go-ahead needed):
-1. Deploy the BACKEND first — `"diff"` added to `SUPPORTED_LANGUAGES` (uncommitted). Without it, the
-   first /admin save of any of these posts normalises its diff blocks to plaintext.
-2. Seed prod: `AWS_PROFILE=folau python projects/ai_engineering/seed.py --env prod --write`
-   (dates re-based? START_DATE puts the capstone on 2026-10-04).
-3. Deploy the FRONTEND — `prism-diff` import + `ai-engineering` in the AI nav group (uncommitted).
-   verify-build must pass.
+**Status (2026-10-04): ✅ LIVE.** All 16 posts at https://lovemesomecoding.com/ai-engineering, under
+the AI nav group. Backend with `diff` deployed by CI (Folau's push, run 37237508552); frontend nav +
+prism-diff deployed by CI (run 37237503439); prod seeded (938 → 954 posts); CodeBuild Publish
+`484eec7f…` succeeded. Verified live: 16/16 post URLs 200, archive lists 16, diff highlighting
+renders, sitemap has the category + 16 posts. PR #1 open on the demo repo.
 Uncommitted in this repo: projects/ai_engineering/, CLAUDE.md (pocsoft note). Session `.jsonl` raw
 transcripts are logs — keep out of git; the `.md` transcripts are the record.
 
@@ -27,22 +21,22 @@ transcripts are logs — keep out of git; the `.md` transcripts are the record.
 ## Proposed outline (category `ai-engineering`)
 | # | Slug | Topic | Status |
 |---|---|---|---|
-| 1 | ai-engineering-mindset | Working with AI as an engineer: you own the output | written, seeded local |
-| 2 | ai-engineering-read-before-you-accept | Read the code, follow the plan: why "Accept" is not a review. The job moves from writing to reviewing; how to read a diff fast; spotting drift from the plan; what blind accepting costs (real pizza-app example); when to stop and say no | written, seeded local |
-| 3 | ai-engineering-setup | Setting Claude up for a real codebase: CLAUDE.md, memory, permissions, MCP | written, seeded local |
-| 4 | ai-engineering-codebase-analysis | Analysis: learning an unfamiliar codebase, tracing a flow, sizing a change | written, seeded local |
-| 5 | ai-engineering-requirements | Turning a ticket into requirements: clarifying questions, edge cases | written, seeded local |
-| 6 | ai-engineering-planning | Planning: plan mode, progress report, splitting the work. The plan is the contract you review against | written, seeded local |
-| 7 | ai-engineering-writing-code | Writing code: small diffs, house style, verify each step | written, seeded local |
-| 8 | ai-engineering-writing-tests | Writing tests that prove behaviour | written, seeded local |
-| 9 | ai-engineering-debugging | Debugging and production incidents | written, seeded local |
-| 10 | ai-engineering-aws-investigation | Investigating AWS: CloudWatch, costs, config, read-only guardrails | written, seeded local |
-| 11 | ai-engineering-ui-walkthrough | UI feature walkthroughs with Playwright / Claude in Chrome | written, seeded local |
-| 12 | ai-engineering-pull-requests | Creating PRs: commits that explain why, PR descriptions | written, seeded local |
-| 13 | ai-engineering-pr-review | Responding to PR review | written, seeded local |
-| 14 | ai-engineering-customer-support | Customer support: triage, reproduce, draft the reply | written, seeded local |
-| 15 | ai-engineering-guardrails | Guardrails: secrets, destructive actions, hallucinations, when not to use it | written, seeded local |
-| 16 | ai-engineering-capstone | Capstone: one pizza feature from ticket to merged PR | written, seeded local |
+| 1 | ai-engineering-mindset | Working with AI as an engineer: you own the output | live |
+| 2 | ai-engineering-read-before-you-accept | Read the code, follow the plan: why "Accept" is not a review. The job moves from writing to reviewing; how to read a diff fast; spotting drift from the plan; what blind accepting costs (real pizza-app example); when to stop and say no | live |
+| 3 | ai-engineering-setup | Setting Claude up for a real codebase: CLAUDE.md, memory, permissions, MCP | live |
+| 4 | ai-engineering-codebase-analysis | Analysis: learning an unfamiliar codebase, tracing a flow, sizing a change | live |
+| 5 | ai-engineering-requirements | Turning a ticket into requirements: clarifying questions, edge cases | live |
+| 6 | ai-engineering-planning | Planning: plan mode, progress report, splitting the work. The plan is the contract you review against | live |
+| 7 | ai-engineering-writing-code | Writing code: small diffs, house style, verify each step | live |
+| 8 | ai-engineering-writing-tests | Writing tests that prove behaviour | live |
+| 9 | ai-engineering-debugging | Debugging and production incidents | live |
+| 10 | ai-engineering-aws-investigation | Investigating AWS: CloudWatch, costs, config, read-only guardrails | live |
+| 11 | ai-engineering-ui-walkthrough | UI feature walkthroughs with Playwright / Claude in Chrome | live |
+| 12 | ai-engineering-pull-requests | Creating PRs: commits that explain why, PR descriptions | live |
+| 13 | ai-engineering-pr-review | Responding to PR review | live |
+| 14 | ai-engineering-customer-support | Customer support: triage, reproduce, draft the reply | live |
+| 15 | ai-engineering-guardrails | Guardrails: secrets, destructive actions, hallucinations, when not to use it | live |
+| 16 | ai-engineering-capstone | Capstone: one pizza feature from ticket to merged PR | live |
 
 Every post closes with **"Before you accept"**: what to read and check for that workflow (e.g. tests:
 does the assertion actually fail without the fix? PRs: does the description match the diff?).

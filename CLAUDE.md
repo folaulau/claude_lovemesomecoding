@@ -16,7 +16,7 @@ WordPress is no longer in the request path.
 | Site | https://lovemesomecoding.com (also `www`) |
 | Admin console | https://lovemesomecoding.com/admin — user `folauk` |
 | Admin API | https://api.lovemesomecoding.com |
-| Content | **938 posts**, 45 categories, 12 static pages, 336 images  <br>(posts/categories per `verify-build` on the 2026-09-18 iOS-track deploy; pages/images not re-counted) |
+| Content | **954 posts**, 46 categories, 12 static pages, 336 images  <br>(posts/categories after the 2026-10-04 AI-Assisted Engineering seed; pages/images not re-counted) |
 | Cost | ≈ **$0.60/month** + $16/yr domain (was $25/mo on DreamHost) |
 
 ### Architecture
