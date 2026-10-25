@@ -1,0 +1,557 @@
+<p>Every post in this track so far has started from a system that already has a problem: too many
+reads, two guests after one room, a petabyte of video. This one starts from nothing. You have been
+hired as the first engineer at a company with an idea, a little funding and no code, and someone
+asks the question that sounds like a hiring-panel warm-up and is actually the most consequential
+design decision the company will make for two years:</p>
+
+<p><strong>What would you build it with &mdash; frontend and backend separate or combined &mdash;
+and where would you host it? And why not the alternatives?</strong></p>
+
+<p>It is a system design question, and it should be answered like one: scope, estimate, then
+design. The difference is which resource is scarce. Everywhere else in this track the scarce
+resource has been the machine &mdash; CPU, connections, bandwidth, a lock. Here it is <strong>the
+engineer</strong>. There is one of you. The risk that kills a company at this stage is not that
+the system falls over under load; it is that the product takes nine months to ship and turns out
+to be the wrong product. Every choice below is judged against that.</p>
+
+<p>The answer this post defends is short enough to say in one breath: <strong>one language, one
+deployable application, one database, and managed everything else</strong>. The rest of the post
+is why, where each piece earns or loses its place, and &mdash; just as important &mdash; the exact
+symptoms that tell you it is time to add the parts the earlier posts in this track describe.</p>
+
+<h2>Step 1 &mdash; Scope the real requirements</h2>
+
+<p>An interviewer who asks this question is not looking for a list of fashionable tools. They want
+to see whether you ask what the company actually needs before choosing anything. These are the
+questions worth asking, and the answers you will usually get:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASK                                         TYPICAL ANSWER AT DAY ONE
+  what is the product?                        a web app; a mobile app "later"
+  who are the first users?                    hundreds, maybe a few thousand
+  how fast must we ship?                      a usable version in 6-10 weeks
+  who else is engineering?                    you, then 2-4 hires this year
+  regulated data? (health, payments, kids)    usually no; ask anyway
+  AI / data-heavy core?                       increasingly often, yes
+  what does the team already know well?       the most important answer here
+
+NON-FUNCTIONAL, HONESTLY STATED
+  availability   a few minutes down a month is survivable; data loss is not
+  scale          small, unknown, and probably wrong if guessed
+  cost           low, but engineer-hours cost far more than servers
+  change rate    the schema changes weekly; the product pivots at least once</code></pre>
+
+<p>Two lines on that list decide more than all the others. <strong>&ldquo;What does the team
+already know well&rdquo;</strong> outranks every technical argument in this post: a team fluent in
+Rails or Django or Spring will ship faster in it than in anything recommended here, and shipping
+speed is the requirement. <strong>&ldquo;The schema changes weekly&rdquo;</strong> is the other
+one, because it rules out anything that makes changing your data model expensive &mdash; which is
+the strongest argument against several of the popular wrong answers further down.</p>
+
+<h2>Step 2 &mdash; Estimate, so the scale argument ends early</h2>
+
+<p>The <a href="/system-design/system-design-back-of-envelope-estimation">estimation post</a>
+exists for exactly this moment. Somebody will say &ldquo;but will it scale?&rdquo; and the
+arithmetic is the answer, not a promise:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">ASSUME  an optimistic first year: 10,000 daily active users
+        50 requests per user per day (page loads, API calls, polling)
+
+        10,000 x 50            = 500,000 requests/day
+        500,000 / 86,400 s     ~ 6 requests/second average
+        peak at 5x average     ~ 30 requests/second
+
+STORAGE 10,000 users x 5,000 rows each x 1 KB  ~ 50 GB in the first year
+        (generous; most products are well under this)
+
+VERDICT one application server handles this with room to spare
+        one Postgres instance holds this without partitioning anything
+        nothing in the database-scaling post is needed this year</code></pre>
+
+<p>Thirty requests a second is stage two of the build-up in <a
+href="/system-design/system-design-basics">System Design Basics</a> &mdash; one application,
+one database, maybe a second instance for safety. Saying that out loud, with the arithmetic, is a
+stronger answer than a diagram with a message bus and three service meshes, because it shows you
+know which problems you do not have.</p>
+
+<p>Ten times higher is still a load balancer and a few stateless app servers. Traffic that big, if
+it arrives, arrives with the revenue to pay for a rebuild.</p>
+
+<h2>Step 3 &mdash; Sort the decisions by how hard they are to undo</h2>
+
+<p>Not every stack decision deserves the same amount of thought. The useful question is not
+&ldquo;what is best&rdquo; but <strong>&ldquo;what does it cost to change my mind?&rdquo;</strong>
+Spend the thinking where reversal is expensive and move quickly everywhere else:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">EXPENSIVE TO REVERSE  (think hard, decide once)
+  primary language          rewrite the whole codebase to change it
+  primary database          migrate every row, rewrite every query
+  data model fundamentals   tenant isolation, ids, money as integers
+
+MODERATE  (decide carefully, migration is weeks not months)
+  monolith vs services      merging services back is painful
+  auth provider             every user's credentials live there
+  frontend framework        a page-by-page rewrite
+
+CHEAP TO REVERSE  (pick something good and move on)
+  hosting provider          a container or a build command is portable
+  email / SMS vendor        one module wraps it
+  CSS framework, ORM        local to the code that uses them
+  observability tooling     swap the SDK, keep the habits</code></pre>
+
+<p>This table is the most useful thing to say in an interview, because it reframes the whole
+question. Hosting, which people argue about the most, is near the bottom: moving a containerised
+application or a framework build from one host to another is a routine week of work. The language
+and the database are at the top, and they are what most of the rest of this post is about.</p>
+
+<h2>Step 4 &mdash; The stack</h2>
+
+<p>Here is the recommendation for a typical web product, with the reason each line is there:</p>
+
+<table>
+  <thead>
+    <tr><th>Layer</th><th>Choice</th><th>Why this, at this stage</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Language</td><td><strong>TypeScript</strong>, end to end</td>
+        <td>One language for the UI, the server and the scripts. Every hire can work anywhere,
+        and the types describing an API response are the same types the page consumes.</td></tr>
+    <tr><td>Application</td><td><strong>Next.js</strong> &mdash; frontend and backend in one</td>
+        <td>Pages, server-side rendering and API routes ship as a single deploy. One repository,
+        one pipeline, one thing to roll back.</td></tr>
+    <tr><td>Database</td><td><strong>Postgres</strong>, managed</td>
+        <td>Relational integrity, transactions, constraints, JSONB for the parts of the schema that
+        have not settled, full-text search, and a job queue &mdash; one engine doing five
+        jobs.</td></tr>
+    <tr><td>Data access</td><td>Drizzle or Prisma</td>
+        <td>Typed queries and versioned migrations. The migrations matter more than the query
+        builder.</td></tr>
+    <tr><td>Authentication</td><td>A hosted provider (Clerk, Auth0) or Auth.js</td>
+        <td>Password reset, email verification, OAuth, MFA and session revocation are a month of
+        work you should not do first.</td></tr>
+    <tr><td>Payments</td><td>Stripe</td>
+        <td>Buy it. The webhook-as-source-of-truth pattern in the <a
+        href="/system-design/system-design-airbnb">Airbnb post</a> applies unchanged.</td></tr>
+    <tr><td>Background work</td><td>A Postgres-backed queue (pg-boss), or a hosted one (Inngest)</td>
+        <td>No broker to run until volume demands one.</td></tr>
+    <tr><td>Email</td><td>A transactional provider (Postmark, Resend, SES)</td>
+        <td>Deliverability is a full-time job somebody else already does.</td></tr>
+    <tr><td>Observability</td><td>Sentry plus the host's logs</td>
+        <td>Errors with stack traces and a searchable log are enough until there is real
+        traffic.</td></tr>
+  </tbody>
+</table>
+
+<p>Notice what is <em>not</em> there: no Redis, no Elasticsearch, no Kafka, no separate API
+service, no container orchestrator. Each of those has a post in this track explaining exactly what
+it is for &mdash; and the honest summary of all of them is that none is needed until a symptom
+appears that it cures. The last section of this post lists those symptoms.</p>
+
+<h3>Why TypeScript rather than the alternatives</h3>
+
+<p>The argument for TypeScript is not that it is the best language. It is that it is the only
+language that runs natively in the browser <em>and</em> is a first-class server language, so
+choosing it for the backend removes a boundary instead of adding one. With a Python or Go backend
+behind a React frontend you have two languages, two package ecosystems, two sets of linting rules,
+and an API contract that has to be kept in sync by hand or by code generation. With one language
+the contract is a type, and breaking it is a compile error.</p>
+
+<h3>When the answer is Python instead</h3>
+
+<p>If the product's core is AI or data &mdash; model calls with retrieval, document processing,
+evaluation pipelines, anything that leans on the scientific Python stack &mdash; the libraries live
+in Python, and fighting that costs more than a second language does. Then the recommendation
+becomes <strong>a React or Next.js frontend plus a FastAPI backend</strong>, still one database,
+still managed hosting. That is precisely the shape of the StayHub application this track quotes
+from, which is useful: it means the trade can be shown rather than described, further down.</p>
+
+<p>The same logic says: if the team already knows Rails, Django, Laravel or Spring Boot deeply,
+<strong>use it</strong>. Those frameworks are batteries-included monoliths with two decades of
+answers to every boring problem. The principle is &ldquo;one boring, productive stack the team
+knows&rdquo;; TypeScript is just the best default when nobody has a stronger preference.</p>
+
+<h2>Step 5 &mdash; Combined, but with a seam</h2>
+
+<p>The &ldquo;frontend and backend separate or combined?&rdquo; question has a clear answer at
+this stage: <strong>combined</strong>. A separate single-page app and a separate API means two
+repositories or a monorepo to manage, two deploy pipelines, CORS configuration, a versioning story
+for the API, and duplicated validation &mdash; all cost, paid daily, for a benefit you only collect
+once a second client exists.</p>
+
+<p>But combined does not mean tangled. The mistake that makes a monolith hard to split later is
+putting business logic inside route handlers and page components. Keep it in a plain module that
+knows nothing about HTTP or React, and the web layer becomes a thin adapter over it:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">app/                       Next.js: pages, layouts, route handlers  (thin)
+  (marketing)/page.tsx
+  dashboard/page.tsx
+  api/
+    orders/route.ts          parses the request, calls domain, shapes the response
+    webhooks/stripe/route.ts
+domain/                    the actual product. No HTTP, no React, no framework imports
+  orders/
+    create-order.ts
+    order-rules.ts
+  billing/
+db/
+  schema.ts                  tables, in one place
+  migrations/
+jobs/                      background handlers, called by the queue
+lib/                       config, logging, the email and payment wrappers</code></pre>
+
+<p>A sketch of what &ldquo;thin&rdquo; means in practice &mdash; illustrative, not lifted from a
+running application:</p>
+
+<pre class="language-typescript"><code class="language-typescript">// domain/orders/create-order.ts — knows nothing about HTTP
+export async function createOrder(db: Db, input: NewOrder): Promise&lt;Order&gt; {
+  assertValidItems(input.items);
+  return db.transaction(async (tx) =&gt; {
+    const order = await tx.insert(orders).values(toRow(input)).returning();
+    await enqueue(tx, "order.created", { orderId: order.id });
+    return order;
+  });
+}
+
+// app/api/orders/route.ts — parse, call, shape. Nothing else.
+export async function POST(req: Request) {
+  const user = await requireUser(req);
+  const input = NewOrderSchema.parse(await req.json());
+  const order = await createOrder(db, { ...input, userId: user.id });
+  return Response.json(toOrderResponse(order), { status: 201 });
+}</code></pre>
+
+<p>The test for whether the seam is real: could a mobile app's API, a CLI or a background job call
+<code>createOrder</code> without importing anything from <code>app/</code>? If yes, then the day a
+mobile client arrives, extracting a standalone API is a matter of moving the thin layer &mdash;
+days, not a rewrite. That is the whole reason to defer the split: the option stays open and you
+do not pay for it until you exercise it.</p>
+
+<p>Notice the <code>enqueue(tx, ...)</code> inside the transaction. That is the transactional
+outbox from the <a href="/system-design/system-design-message-queues">message queues post</a>,
+and it is worth having from the first week: the order and the &ldquo;send a confirmation&rdquo;
+job commit together or not at all, with no broker involved.</p>
+
+<h2>Step 6 &mdash; One database doing five jobs</h2>
+
+<p>Postgres is the least controversial line in the stack and the one doing the most work. At this
+stage it can credibly be:</p>
+
+<ul>
+  <li><strong>The system of record</strong> &mdash; foreign keys, transactions and constraints. The
+      <a href="/system-design/system-design-concurrency-and-locking">concurrency post</a> showed a
+      constraint making a double booking impossible rather than unlikely; that guarantee is free
+      here and very expensive to rebuild anywhere else.</li>
+  <li><strong>A document store</strong> &mdash; a <code>jsonb</code> column for the settings blob,
+      the integration payload, the part of the model you have not understood yet. Promote fields to
+      real columns as they settle.</li>
+  <li><strong>A search engine</strong> &mdash; built-in full-text search with a GIN index covers
+      &ldquo;search my own records&rdquo; for a long time.</li>
+  <li><strong>A vector store</strong> &mdash; the <code>pgvector</code> extension, if the product
+      does retrieval, keeps embeddings next to the rows they describe and inside the same
+      transactions and backups.</li>
+  <li><strong>A job queue</strong> &mdash; a table, polled with row locks.</li>
+</ul>
+
+<p>The last one sounds like a hack and is not. StayHub's outbox is exactly that, and the claim step
+is a single query:</p>
+
+<pre class="language-python"><code class="language-python">    stmt = (
+        select(OutboxMessage)
+        .where(
+            OutboxMessage.status == OutboxStatus.PENDING,
+            OutboxMessage.available_at &lt;= datetime.now(UTC),
+        )
+        .order_by(OutboxMessage.available_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list(db.execute(stmt).scalars().all())</code></pre>
+
+<p><code>FOR UPDATE SKIP LOCKED</code> lets any number of workers pull from the same table without
+ever taking the same row twice, and the queue gets your database's durability, backups and
+transactional semantics for nothing. Libraries such as pg-boss package exactly this pattern in
+TypeScript. It stops being the right answer at sustained high throughput or when many independent
+consumers need the same event stream &mdash; which is when the queue-versus-log discussion in the
+message queues post becomes relevant, and not before.</p>
+
+<p>Every additional datastore is another thing to provision, secure, back up, monitor and keep
+consistent with the others. The <a
+href="/system-design/system-design-consistency-and-availability">consistency post</a> spent most
+of its length on the dual-write problem that appears the moment a second datastore holds a copy
+of the first one's data. One database is not a compromise at this stage; it is the design that
+does not have that problem.</p>
+
+<h2>Step 7 &mdash; Where it runs</h2>
+
+<p>The hosting answer follows from the shape. A single Next.js application and a managed Postgres
+want a platform that turns a git push into a deploy and requires no infrastructure work at all:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">                git push
+                   │
+                   ▼
+   ┌──────────────────────────────────┐     preview URL per pull request
+   │  PLATFORM (Vercel / Render /     │ ──> production on merge to main
+   │  Railway / Fly)                  │     rollback = redeploy previous build
+   │                                  │
+   │   CDN ── static assets, pages    │
+   │   app ── server rendering, API   │
+   │   cron / worker ── jobs          │
+   └───────────────┬──────────────────┘
+                   │  pooled connections
+                   ▼
+   ┌──────────────────────────────────┐
+   │  MANAGED POSTGRES                │     automated backups, point-in-time
+   │  (Neon / Supabase / RDS)         │     restore, branch per preview env
+   └──────────────────────────────────┘
+
+   + Stripe, auth provider, email provider, Sentry — all SaaS, all one SDK each</code></pre>
+
+<p><strong>Vercel plus Neon</strong> is the lowest-effort version of this for a Next.js app:
+deploys on push, a preview environment per pull request, and database branches that give each
+preview its own copy of the schema. <strong>Render, Railway or Fly</strong> are the better fit if
+the application is a long-running server &mdash; a FastAPI backend, a WebSocket service, a worker
+that runs continuously &mdash; because they run ordinary containers and processes rather than
+functions. Either way the monthly bill at this stage is in free tiers or tens of dollars, which is
+noise against a single engineer's salary.</p>
+
+<p>Three things to check before committing to any platform, because these are the ones that bite
+later:</p>
+
+<ul>
+  <li><strong>Connection limits.</strong> Serverless functions open database connections per
+      instance, and a traffic spike can open hundreds. Use the provider's pooled connection string
+      from the start, not the direct one.</li>
+  <li><strong>Backups you have restored.</strong> &ldquo;Automated backups&rdquo; is a claim until
+      you have restored one into a scratch database and run the app against it. Do it in the first
+      month.</li>
+  <li><strong>Region.</strong> Put the application and the database in the same region. An app in
+      one region querying a database in another pays a cross-region round trip on every query, and
+      a page that runs twenty queries pays it twenty times.</li>
+</ul>
+
+<h3>And when AWS is the right answer</h3>
+
+<p>AWS, Google Cloud and Azure are not wrong; they are the usual <em>destination</em>. The time to
+move is when a concrete need appears: a compliance regime that needs controls you can document, a
+bill at a volume where reserved capacity matters, a service only the cloud provides, or a security
+review that asks for private networking. Because hosting sits in the cheap-to-reverse row of the
+Step 3 table, waiting costs little. A container that ran on Render runs on ECS; a database dump
+from Neon restores into RDS.</p>
+
+<p>Starting there costs weeks: VPC, subnets, IAM, a load balancer, a container service, secrets and
+infrastructure-as-code, all before the first customer, none of it visible to one.</p>
+
+<h2>Step 8 &mdash; Build the seams for what you will add later</h2>
+
+<p>Deferring a component is only safe if adding it later is cheap. Two habits make that true, and
+StayHub shows both.</p>
+
+<p><strong>All configuration in one typed place.</strong> When Redis or a search cluster arrives,
+it should arrive as one new setting, not as <code>process.env</code> lookups scattered through the
+code. StayHub's settings module is where every external dependency is declared:</p>
+
+<pre class="language-python"><code class="language-python">class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="STAYHUB_",
+        extra="ignore",
+    )
+...
+    database_url: str = "postgresql+psycopg://stayhub:stayhub@localhost:5433/stayhub"
+...
+    elasticsearch_url: str = "http://localhost:9200"
+...
+    redis_url: str = "redis://localhost:6380/0"</code></pre>
+
+<p>A typo in a variable name becomes a startup failure instead of a <code>None</code> discovered
+three layers down at request time. The TypeScript equivalent is a schema-validated
+<code>env.ts</code> that every module imports instead of reading the environment itself.</p>
+
+<p><strong>Optional dependencies that are genuinely optional.</strong> When a cache is added, it
+should be added as an optimisation that the application survives without. StayHub's cache client
+treats a missing library and a missing server exactly like a cache miss:</p>
+
+<pre class="language-python"><code class="language-python">    try:
+        import redis
+    except ImportError:
+        logger.info("redis-py is not installed — the listing cache is disabled")
+        return None</code></pre>
+
+<p>That pattern &mdash; covered properly in the <a href="/system-design/system-design-caching">caching
+post</a> &mdash; is what makes &ldquo;add Redis later&rdquo; a safe sentence. The cache arrives
+behind an interface that already tolerates its absence, so adding it cannot take the site down, and
+removing it again is a configuration change.</p>
+
+<h2>What the year-two system looks like &mdash; StayHub, honestly</h2>
+
+<p>It would be dishonest to recommend one database and one application while quoting code from an
+application that has neither, so here is StayHub's actual shape:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">STAYHUB TODAY                              DAY ONE, THE SAME PRODUCT
+  guest frontend   React + Vite (SPA)        one Next.js app, or one React SPA
+  admin frontend   React + Vite (SPA)          with the admin as a route group
+  API              FastAPI                   the same FastAPI, or API routes
+  system of record Postgres                  Postgres
+  search           Elasticsearch             Postgres full-text + filters
+  cache, limiter   Redis                     nothing; add when a read is hot
+  GraphQL          Hasura                    nothing; REST is enough
+  async work       Postgres outbox           Postgres outbox  (keep this)
+  payments         Stripe                    Stripe
+
+  datastores: 4                              datastores: 1</code></pre>
+
+<p>Every line on the left was added to demonstrate a mechanism this track teaches, and each one
+corresponds to a real pressure a growing product meets: search over a denormalised index once
+filters and ranking outgrow SQL, a cache once one listing page is read thousands of times between
+edits, a rate limiter once someone points a script at the login endpoint. They are the right
+components for the problems they solve. They are the wrong components for a company that does not
+yet have those problems.</p>
+
+<p>The one line that is identical in both columns is worth noticing: <strong>the outbox</strong>.
+Reliable asynchronous work is needed from the first email you send, and building it on the
+database you already have costs nothing.</p>
+
+<h2>Why the other choices lose at this stage</h2>
+
+<p>None of these is a bad technology. Each is a good answer to a problem a founding engineer does
+not have yet, paid for with the one resource that is actually scarce.</p>
+
+<h3>Microservices</h3>
+
+<p>Splitting a product into services before it has users turns every function call into a network
+call that can time out, fail, retry and arrive twice; turns every cross-service change into a
+coordinated deploy; and replaces a database transaction with a saga. The reasons to split &mdash;
+independent scaling axes, teams blocking each other's releases, genuinely different runtimes
+&mdash; are all organisational or load-driven, and a team of one has none of them.  And boundaries drawn before the domain is understood are drawn in the wrong places.</p>
+
+<h3>Kubernetes, or raw cloud infrastructure on day one</h3>
+
+<p>Kubernetes solves the problem of running many services across many machines with many teams.
+With one application it is a large, fast-moving system you must now operate, upgrade and secure in
+exchange for capabilities a platform gives you for free. Raw AWS has the same cost in a different
+form: the networking, identity and pipeline work described in Step 7, done before the first
+customer, by the only person who could have been building the product.</p>
+
+<h3>A NoSQL database as the primary store</h3>
+
+<p>MongoDB and DynamoDB are excellent at what they are for. But nearly every product's data turns
+out to be relational &mdash; users belong to organisations, organisations have subscriptions,
+subscriptions have invoices, permissions cross all of them &mdash; and you discover that on the
+first report someone asks for. DynamoDB is the sharper case: its single-table design requires
+knowing your access patterns up front, and in the first year the access patterns change every
+week. Postgres's <code>jsonb</code> gives you schemaless storage where you want it without giving
+up joins, constraints and ad-hoc queries everywhere else.</p>
+
+<h3>A separate SPA and API from the start</h3>
+
+<p>Two codebases, two deploys, CORS, API versioning, and validation written twice, for a benefit
+&mdash; an API usable by other clients &mdash; that only pays once those clients exist. The seam
+from Step 5 preserves the option at almost no cost. When the mobile app arrives, split; until then,
+the split is overhead.</p>
+
+<h3>Go or Rust for a CRUD product</h3>
+
+<p>Superb runtimes, slower to iterate in for what a young product is mostly made of: forms,
+validation, permissions, endpoints over rows. Their throughput is not the bottleneck at thirty
+requests a second. Reach for them later, for the one component where performance is the
+product.</p>
+
+<h3>Serverless everything</h3>
+
+<p>Functions for the API, queues between functions, a step-function workflow for the checkout
+&mdash; each piece is cheap and scales to zero, and the system as a whole is hard to run locally,
+hard to trace, and spread across dozens of resources. Serverless <em>hosting</em> of one
+application, as in Step 7, is fine; decomposing the application into cloud primitives is
+microservices again with more vendor lock-in.</p>
+
+<h3>GraphQL</h3>
+
+<p>GraphQL earns its complexity when many clients with different data needs share one backend, or
+when many teams contribute to one API surface. With one client written by the same person who
+writes the server, it adds a schema layer, a caching problem and an authorisation surface for no
+gain. StayHub runs Hasura alongside its REST API precisely to teach it; a founding engineer would
+not start there.</p>
+
+<h2>When to graduate &mdash; the symptoms that justify each part</h2>
+
+<p>The discipline that makes the minimal stack safe is being specific about what would change your
+mind. Every component left out above comes back the moment one of these symptoms appears, and not
+before:</p>
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>What you add</th><th>Where this track covers it</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>The same expensive read dominates database load</td>
+        <td>A cache (Redis), cache-aside</td>
+        <td><a href="/system-design/system-design-caching">Caching</a></td></tr>
+    <tr><td>Search needs ranking, typo tolerance, facets across millions of rows</td>
+        <td>A search index fed by the outbox</td>
+        <td><a href="/system-design/system-design-consistency-and-availability">Consistency</a></td></tr>
+    <tr><td>Reads far outnumber writes and the primary is busy</td>
+        <td>Read replicas, then partitioning</td>
+        <td><a href="/system-design/system-design-database-scaling">Database scaling</a></td></tr>
+    <tr><td>Job volume or fan-out outgrows a polled table</td>
+        <td>A real broker or log</td>
+        <td><a href="/system-design/system-design-message-queues">Message queues</a></td></tr>
+    <tr><td>Abuse, scraping or one customer starving the others</td>
+        <td>Rate limiting</td>
+        <td><a href="/system-design/system-design-rate-limiting">Rate limiting</a></td></tr>
+    <tr><td>A mobile app or public API needs the backend</td>
+        <td>Extract the API from the seam</td>
+        <td>Step 5 above</td></tr>
+    <tr><td>Teams block each other's releases; one part scales differently</td>
+        <td>Split that part into a service</td>
+        <td><a href="/system-design/system-design-basics">Basics</a></td></tr>
+    <tr><td>Compliance, cost at volume, or private networking</td>
+        <td>Move to a major cloud provider</td>
+        <td>Step 7 above</td></tr>
+  </tbody>
+</table>
+
+<p>Each addition is triggered by an observation about the running system, never by a forecast.
+Write the trigger down when you defer a component &mdash; &ldquo;add a cache when the listing query
+exceeds a fifth of database time&rdquo; &mdash; and the metrics settle it, not taste.</p>
+
+<h2>Things that break, even with the boring stack</h2>
+
+<ul>
+  <li><strong>No staging data, no restore drill.</strong> The first serious incident at a young
+      company is usually data, not load: a bad migration, a deleted table. Point-in-time restore
+      only helps if somebody has practised it.</li>
+  <li><strong>Migrations run by hand.</strong> If production schema changes are typed into a
+      console, environments drift within a month. Migrations run in the deploy pipeline, every
+      time.</li>
+  <li><strong>Multi-tenancy bolted on later.</strong> If the product is B2B, put an organisation id
+      on every tenant-owned table on day one. Retrofitting tenant isolation onto a live schema is
+      one of the most expensive migrations there is.</li>
+</ul>
+
+<h2>What an interviewer will push on</h2>
+
+<ul>
+  <li><strong>&ldquo;Won't a monolith fail to scale?&rdquo;</strong> &mdash; a stateless monolith
+      scales horizontally behind a load balancer like any service. What it cannot do is scale one
+      part independently of another, and that only matters once one part's load is different in
+      kind, which the estimate says is not this year.</li>
+  <li><strong>&ldquo;Why not microservices so teams can work independently?&rdquo;</strong>
+      &mdash; there is one team. Modules give independent ownership of code without the network
+      in between; services come when release coordination is the bottleneck.</li>
+  <li><strong>&ldquo;Isn't Vercel or Render lock-in?&rdquo;</strong> &mdash; for hosting, very
+      little: the artefact is a framework build or a container. The lock-in to avoid is in the data
+      layer, which is why the database is plain Postgres.</li>
+  <li><strong>&ldquo;What would make you change this plan?&rdquo;</strong> &mdash; the graduation
+      table. Naming the triggers before you are asked is the strongest signal in the whole
+      answer.</li>
+</ul>
+
+<p>The thread running through this post is the same one that ran through the case studies, turned
+around. There, the lesson was to add each part at the point it stops being optional. Here, at the
+very start, the lesson is the converse: <strong>every part you add before it is needed is
+complexity paid for in the one currency a new company cannot spare</strong>. Choose a boring,
+productive stack, keep the seams clean, write down what would change your mind, and spend
+everything else on the product.</p>
+
+<p>Next, and last: <a href="/system-design/system-design-interview-questions">the interview
+questions</a> &mdash; everything in this track, condensed into answers short enough to say out
+loud.</p>

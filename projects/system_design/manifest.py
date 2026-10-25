@@ -31,7 +31,8 @@ CATEGORY = {
         "System design from the parts list to the whiteboard — estimation, load balancing, "
         "caching, database scaling, consistency, queues, concurrency and rate limiting, then "
         "full walkthroughs of Airbnb, Amazon, an airline booking system, YouTube, a URL "
-        "shortener, chat and notifications. Every mechanism is shown working in a real booking application "
+        "shortener, chat and notifications — and the stack a founding engineer should start "
+        "with. Every mechanism is shown working in a real booking application "
         "rather than described, and every number quoted was measured on the machine that wrote "
         "it."
     ),
@@ -274,6 +275,11 @@ SNIPPET_SOURCES = {
     # Not StayHub either. Nothing in a booking application transcodes video or runs an ad auction,
     # so this post is schema, JSON contracts and diagrams — Amazon and Delta's footing again.
     "system-design-youtube": [],
+    # The stack post is mostly diagrams, tables and one TypeScript sketch, but its StayHub quotes
+    # are real: the settings module, the optional cache client, and the outbox claim.
+    "system-design-founding-engineer-tech-stack": [
+        "app/core/config.py", "app/core/cache.py", "app/services/outbox_service.py",
+    ],
     "system-design-interview-questions": [],
 }
 
@@ -552,6 +558,24 @@ _TRACK = [
         ),
     },
     {
+        "slug": "system-design-founding-engineer-tech-stack",
+        "title": "The Founding Engineer's Tech Stack",
+        "state": "new",
+        # ⚠️ The THIRD explicit date, same reason as YouTube: written after the track was live, and
+        # the interview post has to stay last. 2025-10-24 sits between youtube (2025-10-08) and
+        # interview-questions (2025-11-12) and moves no published date.
+        "date": "2025-10-24T09:00:00",
+        "tags": ["system-design", "architecture", "startup"],
+        "excerpt": (
+            "You are the first engineer and there is no code yet. What do you build it with, "
+            "frontend and backend together or apart, and where does it run? Scope and estimate "
+            "first, sort the decisions by how hard they are to undo, then one language, one "
+            "deployable app, one Postgres and managed hosting, and why microservices, "
+            "Kubernetes, NoSQL and GraphQL lose at this stage. Ends with the symptoms that "
+            "justify adding each part back."
+        ),
+    },
+    {
         "slug": "system-design-interview-questions",
         "title": "System Design Interview Questions",
         "state": "rewrite",
@@ -626,7 +650,7 @@ assert FROZEN_SLUGS == set(EXISTING), (
     "the frozen slugs and the measured baseline must describe the same seven posts: "
     f"{FROZEN_SLUGS ^ set(EXISTING)}"
 )
-assert len(POSTS) == 20, f"the track is 20 posts, got {len(POSTS)}"
+assert len(POSTS) == 21, f"the track is 21 posts, got {len(POSTS)}"
 
 # Checked against the dates POSTS actually carries, not against the computed endpoints, because
 # an explicitly dated entry never passes through _date() and the endpoint arithmetic cannot see it.

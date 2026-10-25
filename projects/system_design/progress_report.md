@@ -615,6 +615,64 @@ At 19 minutes it is the longest post in the track, and the only one above 18 —
 marketing sections are the extra four minutes. It is inside the 15-20 budget with 160 words of
 headroom under the cap.
 
+## Lesson 20 added: The Founding Engineer's Tech Stack (2026-10-24)
+
+Folau asked for a post on: *"You are hired as a founding engineer. What would be your tech stack,
+frontend and backend or combined? Where would you host it? Why are other choices not good?"* No
+existing post covered it; the nearest was the "Monolith or services?" section of `basics`.
+
+**Status: LIVE 2026-10-24.** Seeded to prod (978 posts in the tree, indexes verified), deployed build `c0ff134`, verify-build 978/978 posts and 47/47 categories. Live page returns 200 with "October 24, 2025", YouTube's next link points here, and it is in the archive and the sitemap.
+
+### Where it goes and why
+Position **20**, between `youtube` (2025-10-08) and `interview-questions` (2025-11-12), explicit
+date `2025-10-24`, the third hand-dated entry. Chat had suggested placing it right after `basics`,
+but that was dropped for two reasons:
+- teaching order: the post's "when to graduate" table points forward to caching, queues, scaling
+  and rate limiting. As a capstone those links point *back* at posts already read.
+- dating: a slot after `basics` must carry a 2022 date, and the recommended stack (Next.js API
+  routes, Neon, Resend, pgvector) would then be anachronistic on the page.
+
+`interview-questions` was `git mv`d 20 → 21. Its slug and URL are unchanged.
+
+### Cross-references moved with it (the standing hazard from lesson 19)
+- `youtube` ended "Next, and last: the interview questions". It now points at this post.
+- `interview-questions` said "the other nineteen", now "twenty".
+- `introduction` said "**Eighteen** posts" (stale since lesson 14) and listed case studies without
+  CDP or YouTube. It now says twenty-one and lists all of them plus this post.
+- `CATEGORY["description"]` mentions the stack post.
+
+### Content decisions
+- Recommendation: TypeScript + Next.js (combined, with a `domain/` seam), Postgres doing five jobs,
+  managed hosting (Vercel+Neon, or Render/Railway/Fly for long-running servers). Python/FastAPI is
+  the named exception for AI/data-heavy products, and "use what the team knows" outranks it all.
+- Framed as a system design answer: scope → estimate (~6 req/s average, ~30 peak) → a
+  reversibility table (language/database expensive, hosting cheap) → stack → seams → hosting.
+- **StayHub is used honestly as the year-two counterexample**: four datastores and two SPAs, set
+  side by side with the one-datastore day-one shape. The outbox is the one line common to both.
+- `SNIPPET_SOURCES`: `config.py`, `cache.py`, `outbox_service.py`. All three python quotes are
+  verbatim (3/3 checked). The TypeScript block is labelled in the prose as an illustrative sketch.
+- No `ms` figures, no "measured". Every number is arithmetic the reader can check. Prices are
+  deliberately vague ("free tiers or tens of dollars") because vendor pricing drifts.
+
+### Verification
+```
+check_content.py    all 21 pass. Stack post 4,348 words / 20 min / 84% prose / 6 plaintext
+                    (first draft was 4,714 and over the cap; trimmed)
+check_snippets.py   no drift; 51/95 checked blocks quoted from running code
+seed.py --env local --republish --force-dates --write
+                    21 posts, indexes verified. --force-dates was needed because the LOCAL
+                    tree had never been re-dated (it still carried the 2026-08/09 dates)
+:3000               200, title + "October 24, 2025", python/typescript highlighted, 2 tables,
+                    youtube → stack → interview pager and next-links correct
+```
+
+### To publish
+```
+AWS_PROFILE=folau python projects/system_design/seed.py --env prod --republish --write
+cd lovemesomecoding_frontend && AWS_PROFILE=folau npm run deploy
+```
+Prod already has the right dates, so `--force-dates` is NOT needed there.
+
 ## Still to do
 
 1. **Submit the sitemap to Search Console** if the eleven new URLs should be indexed promptly.
