@@ -1,0 +1,178 @@
+<p>&ldquo;Tell me about a time you failed&rdquo; is the question candidates dread most, and it is
+one of the easiest to answer well, because the bar most candidates set is so low. The typical
+answer is a disguised boast &mdash; &ldquo;I care too much&rdquo;, &ldquo;I worked so hard on it
+that I burned out&rdquo; &mdash; or a failure that was somebody else's fault. Both tell the
+interviewer that you either cannot see your own mistakes or will not admit them, and neither is
+someone they want on call.</p>
+
+<p>A real failure, owned plainly, with a specific change you made afterwards, is rare enough to
+stand out. This post covers what the question is testing, how to choose the failure, two worked
+answers from bugs that actually shipped, and the related &ldquo;biggest weakness&rdquo;
+question.</p>
+
+<h2>What the question is testing</h2>
+
+<p>Not whether you have failed. Everyone has. The interviewer is scoring three things:</p>
+
+<ul>
+  <li><strong>Self-awareness</strong> &mdash; can you see your own part in it, without being
+      prompted?</li>
+  <li><strong>Ownership</strong> &mdash; do you say &ldquo;I&rdquo; for the mistake as readily as
+      you say it for the successes?</li>
+  <li><strong>Growth</strong> &mdash; did anything change afterwards? Not &ldquo;I learned to be
+      more careful&rdquo;, which is a feeling, but a concrete change in how you or your system
+      works.</li>
+</ul>
+
+<p>The third one is where nearly all the points are, and it is the part most answers skip or
+compress into one vague sentence at the end.</p>
+
+<h2>Choosing the failure</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">A GOOD FAILURE STORY                        AVOID
+  a real mistake, clearly yours               a strength in disguise
+  real but contained consequences             a catastrophe that ended a project
+  you noticed it, or responded well           a failure blamed on others
+  a specific change came out of it            "I learned to be more careful"
+  not in the core skill of the job            a lapse in the exact thing they hire for</code></pre>
+
+<p>The last row needs care. A failure in your core competence is fine if the change you made is
+strong, but do not lead with &ldquo;I didn't understand how databases work&rdquo; when applying
+for a database role. A failure of process, verification or assumption &mdash; the kind every
+experienced engineer has &mdash; is the sweet spot.</p>
+
+<h2>Worked answer 1: the bug that shipped because the file size didn't change</h2>
+
+<blockquote>
+<p><strong>Situation.</strong> My tutorial site is built from a content database in S3: one
+file per post, plus small index files that hold things like the number of posts in each
+category. The build downloads those files and generates the pages.</p>
+
+<p><strong>Task.</strong> I'd just published a thirteenth tutorial in the Oracle series and
+deployed the site.</p>
+
+<p><strong>Action &mdash; what went wrong.</strong> The live page read &ldquo;12
+tutorials&rdquo; above a list of thirteen. It wasn't a cache: the built page itself was wrong,
+because the index file on my machine still said 12 while S3 said 13. The download step used
+<code>aws s3 sync</code>, which skips a file that is the same size unless the local copy is
+<em>older</em>. Changing &ldquo;12&rdquo; to &ldquo;13&rdquo; doesn't change the file's length
+&mdash; it was 4101 bytes either way &mdash; and because S3 timestamps are UTC, my freshly
+downloaded local copy looked <em>newer</em>. So the one file that decides every category count
+was silently skipped.</p>
+
+<p>The mistake was mine: I'd relied on a sync tool's default behaviour without checking what it
+compared, and I had no check that would notice the counts disagreeing.</p>
+
+<p><strong>Action &mdash; what I changed.</strong> Two things. I added
+<code>--exact-timestamps</code> to the sync, so it only skips on an exact match, and confirmed
+the old command left the file at 12 while the fixed one corrected it. Then I added a check to the
+build that cross-checks the index files against each other &mdash; every category count against
+the actual list of posts. And I proved the new check would have caught it by reverting the
+count to 12 and watching the build get rejected.</p>
+
+<p><strong>Result.</strong> The page was corrected on the next deploy, and the build has refused
+to ship inconsistent counts since.</p>
+
+<p><strong>Learning.</strong> Every URL still worked, so nothing I had would ever have flagged
+it. Since then, when something goes wrong I ask &ldquo;what check would have caught this?&rdquo;
+and add it before I call the fix done.</p>
+</blockquote>
+
+<h3>Why it works</h3>
+
+<p>The failure is <strong>real, small and specific</strong>: a wrong number on a live page, not a
+catastrophe. The candidate <strong>owns it in one sentence</strong> &mdash; &ldquo;the mistake was
+mine&rdquo; &mdash; and names exactly what the mistake was: trusting a default without checking it.
+No self-flagellation, no excuses.</p>
+
+<p>Most of the answer is spent on <strong>the change</strong>, and there are two levels of it: the
+immediate fix (the flag) and the systemic one (a check that catches the whole class of problem).
+The proof step &mdash; reverting the count to show the check fails the bad build &mdash; is the
+detail that marks someone who verifies their own fixes, and interviewers notice it.</p>
+
+<h2>Worked answer 2: the commit that should never have been pushed</h2>
+
+<p>The second story is a different kind of failure &mdash; not a bug in the product, but a mistake
+in process, and one whose consequences cannot be fully undone. That makes it a strong answer to
+&ldquo;tell me about a mistake you made&rdquo; in its own right.</p>
+
+<blockquote>
+<p><strong>Situation.</strong> Early in this site's move from WordPress to AWS, I was moving fast and committing
+often.</p>
+
+<p><strong>Action &mdash; what went wrong.</strong> I pushed two commits to GitHub that included
+<code>node_modules</code> &mdash; 176 files of browser-testing bundles &mdash; and about 72 MB of
+regenerable migration output and images that already lived in S3. The <code>.gitignore</code>
+entry arrived a commit later, and an ignore rule doesn't untrack files that are already in the
+repository, so they stayed.</p>
+
+<p><strong>Action &mdash; what I did.</strong> I removed all 1137 files from the index with
+<code>git rm --cached</code>, which keeps them on disk and leaves the history alone, and extended
+the <code>.gitignore</code> so it can't recur. What I deliberately did <em>not</em> do was
+rewrite the history to purge them. That needs a force-push, which is destructive and can't be
+taken back, and I wasn't willing to do that as a reflex to tidy up a mistake.</p>
+
+<p><strong>Result.</strong> Nothing new gets tracked, but the old files are still in the pushed
+history, so the repository is larger than it should be. That's the honest cost.</p>
+
+<p><strong>Learning.</strong> The ignore file goes in before the first commit, not after the
+first mistake. And when cleaning up, I separate what's reversible from what isn't, and don't let
+embarrassment push me into the irreversible one.</p>
+</blockquote>
+
+<h3>Why it works</h3>
+
+<p>It has a <strong>cost that remains</strong>, and says so. Many candidates feel a failure story
+must end with everything fixed; a story that admits a lasting consequence is more believable and
+shows maturity. It also contains a <strong>judgement call inside the failure</strong>: choosing
+not to force-push. That turns a story about carelessness into one about knowing when to stop,
+which is a quality every team wants.</p>
+
+<h2>A skeleton for your own</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">SITUATION   just enough to understand what broke (2-3 sentences)
+WHAT WENT   the failure, concretely: what a user/colleague saw
+  WRONG     the cause, at the level a smart outsider can follow
+OWNERSHIP   ONE plain sentence: "the mistake was mine: I..."
+WHAT I      the immediate fix
+  CHANGED   the systemic fix: the check, process or habit that prevents the class
+            how you proved the systemic fix works
+RESULT      the outcome, including any cost that remains
+LEARNING    the question you now ask / the thing you now always do</code></pre>
+
+<p>Spend at least half the answer below the ownership line. If your story is mostly
+&ldquo;what went wrong&rdquo;, it is a confession; if it is mostly &ldquo;what I changed&rdquo;,
+it is evidence of growth, and that is what is being scored.</p>
+
+<h2>&ldquo;What is your biggest weakness?&rdquo;</h2>
+
+<p>This is the failure question's cousin, and it fails for the same reason: candidates offer a
+strength in disguise. The answer that works has the same shape as a good failure story, compressed:
+a <strong>real weakness</strong>, a <strong>moment it cost you</strong>, and <strong>what you do
+about it now</strong>.</p>
+
+<p>For example, drawn from the two stories above: <em>&ldquo;When I'm moving fast I trust tools'
+defaults without reading what they actually do &mdash; a sync tool, a git ignore rule. It has cost
+me a wrong number on a live page and a repository that's bigger than it should be. What I do now
+is treat any step that moves data as needing a check that would notice if it did the wrong thing,
+and I add the check before calling the work done.&rdquo;</em></p>
+
+<p>That is real, it is not disqualifying, it has evidence, and it ends with a behaviour rather
+than a promise.</p>
+
+<h2>What to take from this</h2>
+
+<ul>
+  <li>The question scores <strong>self-awareness, ownership and growth</strong>, and almost all
+      the points are in growth.</li>
+  <li>Pick a <strong>real, contained</strong> failure that was clearly yours. Never a strength in
+      disguise.</li>
+  <li>Own it in <strong>one plain sentence</strong>, then spend most of the answer on what you
+      changed.</li>
+  <li>The strongest change is <strong>systemic</strong>: a check or process that prevents the whole
+      class of mistake, ideally one you proved works.</li>
+  <li>It is fine, even good, to admit a cost that could not be undone.</li>
+</ul>
+
+<p>Next: <a href="/behavioral-questions/behavioral-conflict-and-disagreement">conflict,
+disagreement, and disagreeing with your manager</a>.</p>

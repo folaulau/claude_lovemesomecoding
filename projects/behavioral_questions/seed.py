@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Write the Behavioral Questions category and its posts into a content tree.
+
+Adapted from projects/system_design/seed.py. Runs the backend's own service layer rather than
+touching S3 directly, so the post objects, the post index, the category archive, the category
+counts and the search index are all maintained by the same code the admin API uses.
+
+    # dry run against the local tree (default)
+    python projects/behavioral_questions/seed.py
+    python projects/behavioral_questions/seed.py --env local --write
+    python projects/behavioral_questions/seed.py --env prod  --write
+
+Idempotent: re-running updates the posts in place. `date` is only applied when a post is new, so a
+re-run never reshuffles the archive (--force-dates overrides that).
+
+Every slug in this track is new, so there are no frozen legacy URLs to guard. The `new`-slug
+collision guard still runs: post slugs are global, and a typo'd slug must not eat another post.
+"""
+
+import argparse
+import importlib
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent.parent
+BACKEND = REPO_ROOT / "lovemesomecoding_backend"
+
+sys.path.insert(0, str(HERE))
+import manifest  # noqa: E402
+
+
+def load_backend(data_env: str):
+    """Import the backend services with the target tree selected.
+
+    app/config.py reads os.environ at import time, so the environment has to be set before the
+    first import — and re-selecting a tree means reloading the modules that captured the prefix.
+    """
+    os.environ["env"] = "local"  # use the named AWS profile, not a Lambda role
+    os.environ["data_env"] = data_env
+    os.environ.setdefault("aws_profile", os.environ.get("AWS_PROFILE", "folau"))
+    sys.path.insert(0, str(BACKEND))
+
+    from app import config
+
+    importlib.reload(config)
+    from app.services import categories, posts, s3
+
+    importlib.reload(s3)
+    importlib.reload(posts)
+    importlib.reload(categories)
+    s3.reset_repo()
+    return config, posts, categories
+
+
+def read_post_html(entry: dict) -> str:
+    path = HERE / "posts" / entry["file"]
+    if not path.exists():
+        raise SystemExit(
+            f"missing content file: {path}\n"
+            "Run check_content.py before seeding — see progress_report.md."
+        )
+    return path.read_text(encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", choices=("local", "prod"), default="local")
+    parser.add_argument("--write", action="store_true",
+                        help="actually write. Without it, only report what would happen.")
+    parser.add_argument("--force-dates", action="store_true",
+                        help="stamp the manifest date onto posts that already exist. "
+                             "Needed once, to reorder the seven rewritten legacy posts.")
+    parser.add_argument("--republish", action="store_true",
+                        help="the track is ALREADY live in this tree, so `new` slugs existing is "
+                             "expected rather than a collision. Only for re-seeding a published "
+                             "track — see the guard below.")
+    parser.add_argument("--only", default=None,
+                        help="comma-separated slugs to seed, instead of the whole track. "
+                             "For previewing a post while the rest are still unwritten — the "
+                             "track is not publishable until every file exists.")
+    parser.add_argument("--author", default="folauk")
+    args = parser.parse_args()
+
+    posts = manifest.POSTS
+    if args.only:
+        wanted = [slug.strip() for slug in args.only.split(",") if slug.strip()]
+        known = {entry["slug"] for entry in manifest.POSTS}
+        unknown = [slug for slug in wanted if slug not in known]
+        if unknown:
+            raise SystemExit(f"not in the manifest: {', '.join(unknown)}")
+        posts = [entry for entry in manifest.POSTS if entry["slug"] in wanted]
+
+    config, post_service, category_service = load_backend(args.env)
+    prefix = config.db_prefix()
+    print(f"target  s3://{config.DB_BUCKET}/{prefix}/")
+    print(f"posts   {len(posts)}" + (f" of {len(manifest.POSTS)} (--only)" if args.only else ""))
+    print(f"mode    {'WRITE' if args.write else 'dry run'}\n")
+
+    index_before = len(post_service.list_posts())
+    print(f"published posts in this tree before: {index_before}")
+
+    # A frozen slug that is missing from the target tree means the URL this rewrite is meant to
+    # land on does not exist there. Harmless on `local`, which is seeded from a copy — but on
+    # `prod` it means the slug is wrong, and upserting would mint a NEW url rather than rewrite
+    # the indexed one.
+    #
+    # ⚠️ This runs BEFORE the post bodies are read, deliberately. While the track is being
+    # authored every file is missing, and a guard placed after the file check is one that never
+    # runs until the day it finally matters.
+    if not args.only:
+        absent = [slug for slug in sorted(manifest.FROZEN_SLUGS)
+                  if not post_service.get_post(slug)]
+        if absent:
+            message = "frozen slugs not present in this tree: " + ", ".join(absent)
+            if args.env == "prod":
+                raise SystemExit(
+                    message + "\nThese are supposed to be the indexed legacy URLs being rewritten "
+                    "in place. Seeding would create new pages instead. Check the slugs before "
+                    "writing to prod.")
+            print(f"note: {message}")
+        else:
+            print(f"all {len(manifest.FROZEN_SLUGS)} frozen slugs present — "
+                  "every rewrite lands on its existing URL")
+
+        # ⚠️ And the reverse: a NEW slug that already exists is not a new post, it is an
+        # accidental overwrite of somebody else's page. Post slugs are global across categories.
+        #
+        # ⚠️ That guard is a PRE-PUBLISH one, and it expires the moment the track ships: once the
+        # eleven new posts are live, they exist in the tree on every subsequent run and the guard
+        # fires on a correct re-seed. --republish is the acknowledgement that they are ours now.
+        # It is not the default, because the day the guard is genuinely right is the day a typo'd
+        # slug would silently eat an unrelated post, and that has to stay loud.
+        collisions = [slug for slug in sorted(manifest.NEW_SLUGS)
+                      if post_service.get_post(slug)]
+        if collisions and not args.republish:
+            raise SystemExit(
+                "slugs marked `new` already exist in this tree: " + ", ".join(collisions) +
+                "\nSeeding would overwrite them. Either they are not new, or the slug is wrong."
+                "\nIf this track is already published and you are re-seeding it, pass "
+                "--republish.")
+        if collisions and args.republish:
+            print(f"--republish: {len(collisions)} `new` slug(s) already live, updating in place")
+
+    # Fail early rather than half-seeding: every file must exist and no slug may already belong to
+    # a different category.
+    bodies = {}
+    for entry in posts:
+        bodies[entry["slug"]] = read_post_html(entry)
+        existing = post_service.get_post(entry["slug"])
+        if existing and existing.get("category") != manifest.CATEGORY["slug"]:
+            raise SystemExit(
+                f"slug collision: {entry['slug']} already exists in category "
+                f"'{existing['category']}'. Post slugs are global."
+            )
+
+    if not args.write:
+        for entry in posts:
+            existing = post_service.get_post(entry["slug"])
+            state = "update" if existing else "create"
+            note = ""
+            if existing and existing.get("date") != entry["date"]:
+                note = (f"  date {existing.get('date')[:10]} -> {entry['date'][:10]}"
+                        if args.force_dates
+                        else f"  date stays {existing.get('date')[:10]} (use --force-dates)")
+            print(f"  {state:6}  /{manifest.CATEGORY['slug']}/{entry['slug']}"
+                  f"  ({len(bodies[entry['slug']]):,} bytes){note}")
+        print("\nnothing written. Re-run with --write.")
+        return 0
+
+    category = category_service.upsert_category(manifest.CATEGORY)
+    print(f"category {category['slug']} -> {category['url']}  name={category['name']!r}")
+
+    for entry in posts:
+        if args.force_dates:
+            # upsert_post keeps `existing["date"]`, so the only way to move a published post's
+            # date is to change it on the stored object first. The upsert below then re-sorts
+            # every index that mentions it.
+            existing = post_service.get_post(entry["slug"])
+            if existing and existing.get("date") != entry["date"]:
+                existing["date"] = entry["date"]
+                post_service.repo().put_json(post_service.post_key(entry["slug"]), existing)
+
+        record = post_service.upsert_post(
+            {
+                "slug": entry["slug"],
+                "title": entry["title"],
+                "category": manifest.CATEGORY["slug"],
+                "contentHtml": bodies[entry["slug"]],
+                "tags": entry.get("tags", []),
+                "excerpt": entry.get("excerpt"),
+                "status": "published",
+                "date": entry["date"],
+            },
+            author=args.author,
+        )
+        flag = ""
+        if record["readingMinutes"] > manifest.TARGET_MINUTES[1]:
+            flag = f"  ⚠️ over {manifest.TARGET_MINUTES[1]} min"
+        print(f"  {record['url']:52} {record['date'][:10]}  "
+              f"{record['wordCount']:>5} words  {record['readingMinutes']:>2} min  "
+              f"{len(record['toc'])} headings{flag}")
+
+    # Report the state the static build will actually see.
+    archive = post_service.list_posts(category=manifest.CATEGORY["slug"])
+    total = len(post_service.list_posts())
+    counts = {c["slug"]: c["count"] for c in category_service.list_categories()}
+    print(f"\narchive /{manifest.CATEGORY['slug']} holds {len(archive)} posts, "
+          f"newest first: {archive[0]['slug']}")
+    print(f"category count recorded: {counts.get(manifest.CATEGORY['slug'])}")
+    print(f"published posts in this tree now: {total} (was {index_before})")
+
+    if len(archive) != len(manifest.POSTS) and not args.only:
+        print(f"\n⚠️  archive holds {len(archive)} but the manifest has "
+              f"{len(manifest.POSTS)} — something else is in this category.")
+
+    return verify_indexes(post_service, posts)
+
+
+def verify_indexes(post_service, posts: list[dict]) -> int:
+    """Re-read the indexes from S3 and confirm they agree with the post objects.
+
+    ⚠️ This is not paranoia, it caught a live bug. `_reindex` is a read-modify-write of ONE file
+    holding every published post — 778 of them — repeated once per post in the loop. On the run
+    that re-dated this track, six of the eighteen index entries came back carrying their previous
+    date while the post objects themselves were all correct. Re-running converged it.
+
+    The reason it needs an explicit check is that the drift is invisible to everything downstream.
+    The category index was right, so the category count still agreed, every URL still resolved,
+    and `verify-build.mjs` passed — the only symptom would have been six posts sorted to the wrong
+    place in the site-wide archive and the sitemap, which no automated check looks at.
+
+    So: verify, repair once, verify again, and fail loudly rather than build on a bad index.
+    """
+    wanted = {entry["slug"]: entry["date"] for entry in posts}
+    category = manifest.CATEGORY["slug"]
+
+    def drifted() -> list[tuple[str, str, str, str]]:
+        main = {p["slug"]: p.get("date") for p in post_service.list_posts()}
+        cat = {p["slug"]: p.get("date") for p in post_service.list_posts(category=category)}
+        out = []
+        for slug, date in wanted.items():
+            for name, index in (("index/posts.json", main), (f"by-category/{category}", cat)):
+                if index.get(slug) != date:
+                    out.append((slug, name, index.get(slug) or "ABSENT", date))
+        return out
+
+    bad = drifted()
+    if not bad:
+        print(f"\nindexes verified: all {len(wanted)} posts agree with index/posts.json and "
+              f"index/by-category/{category}.json")
+        return 0
+
+    print(f"\n⚠️  {len(bad)} index entr(ies) disagree with the post objects — repairing:")
+    for slug, name, got, want in bad:
+        print(f"     {slug}  {name}  has {got[:10]}, expected {want[:10]}")
+
+    for slug in sorted({slug for slug, _, _, _ in bad}):
+        record = post_service.get_post(slug)
+        if record:
+            post_service.upsert_post({**record, "contentHtml": record["contentHtml"]},
+                                     author=record.get("updatedBy", "seed"))
+
+    still = drifted()
+    if still:
+        print(f"\n❌ {len(still)} entr(ies) STILL wrong after a repair pass. Do not build on "
+              "this — the site-wide archive and the sitemap would sort these posts wrongly.")
+        for slug, name, got, want in still:
+            print(f"     {slug}  {name}  has {got[:10]}, expected {want[:10]}")
+        return 1
+
+    print("repaired — indexes now agree with the post objects")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
