@@ -275,10 +275,10 @@ SNIPPET_SOURCES = {
     # Not StayHub either. Nothing in a booking application transcodes video or runs an ad auction,
     # so this post is schema, JSON contracts and diagrams — Amazon and Delta's footing again.
     "system-design-youtube": [],
-    # The stack post is mostly diagrams, tables and one TypeScript sketch, but its StayHub quotes
-    # are real: the settings module, the optional cache client, and the outbox claim.
+    # The stack post is mostly diagrams, tables, a TypeScript sketch and a GitHub Actions sketch,
+    # but its two StayHub quotes are real: the optional cache client and the outbox claim.
     "system-design-founding-engineer-tech-stack": [
-        "app/core/config.py", "app/core/cache.py", "app/services/outbox_service.py",
+        "app/core/cache.py", "app/services/outbox_service.py",
     ],
     "system-design-interview-questions": [],
 }
@@ -567,12 +567,12 @@ _TRACK = [
         "date": "2025-10-24T09:00:00",
         "tags": ["system-design", "architecture", "startup"],
         "excerpt": (
-            "You are the first engineer and there is no code yet. What do you build it with, "
-            "frontend and backend together or apart, and where does it run? Scope and estimate "
-            "first, sort the decisions by how hard they are to undo, then one language, one "
-            "deployable app, one Postgres and managed hosting, and why microservices, "
-            "Kubernetes, NoSQL and GraphQL lose at this stage. Ends with the symptoms that "
-            "justify adding each part back."
+            "You are the first engineer and there is no code yet. With a coding assistant "
+            "writing most of it, code is cheap and understanding is not, so: the stack you "
+            "already know (Spring Boot and React, worked through), one deployable app, one "
+            "Postgres, managed hosting, and a CI/CD pipeline from day one. What I would do this "
+            "week, why microservices, Kubernetes and NoSQL lose, and the symptoms that justify "
+            "adding each part back."
         ),
     },
     {

@@ -673,6 +673,34 @@ cd lovemesomecoding_frontend && AWS_PROFILE=folau npm run deploy
 ```
 Prod already has the right dates, so `--force-dates` is NOT needed there.
 
+### Revision: "code is cheap now" (2026-10-24, same day)
+Folau: *"now coding assistant is doing most of the coding, I would change this to using what
+developer is familiar with. code is cheap now."* The thesis changed from "one language
+(TypeScript)" to **"the stack the developer already knows"**:
+- New Step 4 subsection, "Code is cheap now; understanding it is not". Assistants removed the
+  arguments about writing code. They did not remove reviewing, debugging and operating it, and
+  those depend on fluency. Two qualifications: keep it mainstream (assistants are weaker on niche
+  stacks), and cheap code is not cheap complexity (operations cost did not fall).
+- Step 3: "code got cheaper to redo; data and production state did not". Language moved below
+  database in the expensive row.
+- TypeScript is now the *default when there is no preference*. "Go or Rust" became "Learning a new
+  stack for the job". New interviewer Q: "Doesn't AI make the stack choice irrelevant?"
+- Trimmed elsewhere to stay under the cap: 4,386 words / 20 min, all 21 pass, no snippet drift.
+- Folau, mid-revision: *"my start up stack would be java and springboot on the backend and react
+  for frontend because that is what I am used to"*. Added as a worked example ("What the rule looks
+  like for a Java engineer"), with a plaintext stack table. React builds into the Spring Boot jar,
+  so "combined" still holds with two languages. It links to the CDP post, which uses that stack.
+- *"add a section to what I would do today with coding assistant"*. New h2 written in the author's
+  voice: decide in an hour, write a project instructions file first, review the skeleton line by
+  line, tests as the contract, delegate volume and keep judgement, small diffs, don't build year two.
+- *"use a CI/CD pipeline with github action so there is no manual deployment even for the dev
+  environment"*. Added as a step in that list, a CI/CD row in the stack table, and a short GitHub
+  Actions sketch (push to main → build, test, deploy dev; prod gated by an `environment` approval).
+- To fit the cap, cut: the StayHub `config.py` quote (dropped from `SNIPPET_SOURCES`), "Things
+  that break", the separate-SPA h3 (Step 5 covers it), and trims throughout. Final: 4,396 words /
+  20 min / 81% prose, all 21 pass, no drift (2/2 python verbatim; the yaml block is illustrative).
+- **Live 2026-10-24**: prod republished (`--only`), deployed build `c0ff134`, 978/978 posts; all new sections confirmed at the edge.
+
 ## Still to do
 
 1. **Submit the sitemap to Search Console** if the eleven new URLs should be indexed promptly.
