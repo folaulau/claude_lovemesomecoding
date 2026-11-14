@@ -1,0 +1,306 @@
+<p>Kotlin is a large language, and an Android app uses a fairly small, fairly predictable part of it
+every day. This lesson is that part — not a language reference, but the features this app leans on
+in nearly every file, shown in the files where it leans on them.</p>
+
+<p>If you know Java, most of this will feel like Java with the boilerplate removed and the
+<code>NullPointerException</code> designed out. If you know Swift, you will recognise almost
+everything; the differences are noted as they come up.</p>
+
+<h2>val, var, and data classes</h2>
+
+<p><code>val</code> declares a read-only reference; <code>var</code> a reassignable one. The habit
+worth forming on day one is <strong><code>val</code> until proven otherwise</strong>. A value that
+cannot change is a value nobody has to track.</p>
+
+<p>Most of an app's model is plain data, and Kotlin has a construct for exactly that:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">data class Topping(
+    val id: UuidString,
+    val name: String,
+    val price: Double,
+    val category: ToppingCategory,
+    val active: Boolean,
+)
+</code></pre>
+
+<p>One line of declaration buys a constructor, read-only properties, <code>equals</code> and
+<code>hashCode</code> that compare every field, a readable <code>toString</code>, and
+<code>copy</code>. In Java that is fifty lines or a Lombok annotation.</p>
+
+<p><code>copy</code> is the one that changes how you write code. A cart line is immutable — every
+property a <code>val</code> — so changing its quantity means building a new one:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">is CartAction.SetQuantity -&gt;
+    if (action.quantity &lt;= 0) {
+        // Dropping to zero removes the line — it is what a customer expects from a "−"
+        // button, and a line with quantity 0 is a state nothing downstream should handle.
+        state.copy(items = state.items.filterNot { it.lineId == action.lineId })
+    } else {
+        state.copy(
+            items = state.items.map {
+                if (it.lineId == action.lineId) it.copy(quantity = action.quantity) else it
+            },
+        )
+    }
+</code></pre>
+
+<p><code>it.copy(quantity = action.quantity)</code> returns a new line identical to the old one
+except for the named field. Nothing that held a reference to the old line sees it change underneath
+it, which is what makes the cart's rules trivially safe. (Swift gets the same effect from
+<code>struct</code> value semantics; Kotlin gets it from immutability plus <code>copy</code>.)</p>
+
+<h3>Named and default arguments</h3>
+
+<p>That call also shows a feature you will use constantly: arguments by name. Constructors with many
+parameters stay readable, and with defaults most of them can be left out:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">data class CartItem(
+    val lineId: String = UUID.randomUUID().toString(),
+    val productId: UuidString,
+    val productName: String,
+    val productType: ProductType,
+    val imageUrl: String? = null,
+    val size: SizeName,
+    val basePrice: Double,
+    val crustId: UuidString? = null,
+    val crustName: String? = null,
+    val crustPriceDelta: Double = 0.0,
+    val toppings: List&lt;Topping&gt; = emptyList(),
+    val quantity: Int,
+) {
+    // …
+</code></pre>
+
+<p>A drink has no crust and no toppings, so building one names the four or five fields that matter
+and the defaults cover the rest. Default parameters also replace most of Java's overloaded
+constructors.</p>
+
+<h2>Null safety</h2>
+
+<p>This is the feature that justifies Kotlin on its own. A type is either nullable or it is not, and
+the compiler enforces the difference: <code>String</code> can never hold <code>null</code>;
+<code>String?</code> can, and you cannot call a method on it until you have dealt with that.</p>
+
+<p>The tools for dealing with it are short:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val formattedAddress: String?
+    get() {
+        if (addressLine1 == null || city == null || state == null || postalCode == null) return null
+        val street = addressLine2?.let { "$addressLine1, $it" } ?: addressLine1
+        return "$street\n$city, $state $postalCode"
+    }
+</code></pre>
+
+<ul>
+<li><strong>Smart casts.</strong> After the <code>if (… == null) return null</code> line, the
+compiler knows all four properties are non-null and lets you use them as plain
+<code>String</code>s. No casting, no assertions.</li>
+<li><strong><code>?.</code></strong> — the safe call. <code>addressLine2?.let { … }</code> runs the
+block only when there is a value, and is <code>null</code> otherwise.</li>
+<li><strong><code>?:</code></strong> — the "Elvis" operator. Use the left side if it is non-null,
+otherwise the right.</li>
+</ul>
+
+<p>The standard library is designed around this. Asking a list for its minimum returns
+<code>null</code> for an empty list instead of throwing, and the model passes that honesty on:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val cheapestPrice: Double?
+    get() = sizes.minOfOrNull { it.price }
+</code></pre>
+
+<p>A product with no sizes is a valid response from the API. Returning <code>0.0</code> would show
+"From $0.00", which is a lie; returning <code>null</code> forces every caller to decide what to show
+instead. The product card shows "Unavailable".</p>
+
+<h3>The wrong way: !!</h3>
+
+<p><code>!!</code> converts a nullable value to non-null by throwing if it is null. It is the
+"trust me" operator, and in app code it is almost always the wrong way to get rid of a compiler
+error:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">// ✗ crashes the app on the first product with no sizes
+val price = product.cheapestPrice!!
+</code></pre>
+
+<p>The compiler was pointing at a real case you had not handled. <code>!!</code> silences it by
+turning a type error into a crash on a customer's phone. In this whole app it appears once — in a
+test, where a crash <em>is</em> the failure report.</p>
+
+<h2>Enums, sealed types and when</h2>
+
+<p>An enum can carry behaviour, which keeps knowledge about a value next to the value:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">enum class OrderStatus {
+    @SerialName("PENDING_PAYMENT") PENDING_PAYMENT,
+    @SerialName("PAID") PAID,
+    @SerialName("PREPARING") PREPARING,
+    @SerialName("COMPLETED") COMPLETED,
+    @SerialName("CANCELLED") CANCELLED,
+    ;
+
+    /** "pending payment" — what the badge shows. */
+    val displayName: String
+        get() = name.replace('_', ' ').lowercase()
+
+    /** The confirmation screen keeps polling while this is true. */
+    val isSettling: Boolean
+        get() = this == PENDING_PAYMENT
+}
+</code></pre>
+
+<p>The <code>@SerialName</code> annotations map each constant to the exact spelling on the wire —
+the JSON says <code>"PENDING_PAYMENT"</code>, and that is all the decoder needs.</p>
+
+<p>Enums cover "one of a fixed set of values". When each case carries <em>different data</em>, Kotlin
+has sealed types. This is how every screen in the app describes what it is showing:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">sealed interface UiState&lt;out T&gt; {
+    data object Idle : UiState&lt;Nothing&gt;
+    data object Loading : UiState&lt;Nothing&gt;
+    data class Loaded&lt;T&gt;(val value: T) : UiState&lt;T&gt;
+    data object Empty : UiState&lt;Nothing&gt;
+    data class Failed(val message: String, val isRetryable: Boolean) : UiState&lt;Nothing&gt;
+    // …
+</code></pre>
+
+<p>A <code>sealed</code> interface can only be implemented in its own package and module, so the
+compiler knows the complete list of cases. That makes <code>when</code> <em>exhaustive</em>:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">when (state) {
+    UiState.Idle, UiState.Loading -&gt; LoadingState("Loading the menu", modifier)
+    is UiState.Failed -&gt; ErrorState(state.message, state.isRetryable, onRetry, modifier)
+    UiState.Empty -&gt; EmptyState("🍕", "The menu is empty", modifier, "Check back soon.")
+        // …
+</code></pre>
+
+<p>There is no <code>else</code> branch, and that is the point. Add a sixth case to
+<code>UiState</code> and every screen that switches on it stops compiling until someone decides what
+it should show. The bug where a screen spins forever because nobody wrote the failure branch cannot
+be written.</p>
+
+<p>Two kinds of case appear in it. <code>data class Loaded&lt;T&gt;(val value: T)</code> carries data;
+<code>data object Loading</code> carries none, so there is exactly one instance of it and comparing
+against it is free. (Swift spells this an <code>enum</code> with associated values; Kotlin splits it
+into enums for plain constants and sealed types for everything else.)</p>
+
+<h2>Extension functions</h2>
+
+<p>You can add a function to a type you did not write. The cart needs to turn a line into the shape
+the server wants, and the cleanest place to say so is on the line itself:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun CartItem.toLineItemRequest(): LineItemRequest = LineItemRequest(
+    productId = productId,
+    size = size,
+    crustId = crustId,
+    toppingIds = toppings.map { it.id },
+    quantity = quantity,
+)
+</code></pre>
+
+<p>Call sites then read <code>cart.items.map { it.toLineItemRequest() }</code>. It is compiled to an
+ordinary static function — no inheritance, no wrapper, no access to private members — so it is
+purely a readability tool, and a good one. Kotlin's own standard library is mostly extension
+functions on Java's collections.</p>
+
+<h2>Lambdas and the collection functions</h2>
+
+<p>Kotlin functions take functions as parameters, and when the last parameter is a function it can
+move outside the parentheses. Together with the collection library, that replaces almost every
+<code>for</code> loop you would write in Java:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun unitPrice(item: CartItem): Double =
+    Money.rounded(item.basePrice + item.crustPriceDelta + item.toppings.sumOf { it.price })
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">val fieldErrors: Map&lt;String, String&gt;
+    get() {
+        val subErrors = (this as? Api)?.body?.errors ?: return emptyMap()
+        return subErrors.mapNotNull { sub -&gt; sub.field?.let { it to sub.message } }.toMap()
+    }
+</code></pre>
+
+<p><code>it</code> is the implicit name of a single-parameter lambda. <code>mapNotNull</code> maps
+and drops the nulls in one pass, <code>to</code> builds a pair, and <code>toMap</code> turns pairs
+into a map. Read left to right, the second example says exactly what it does: "the sub-errors that
+have a field, as field → message".</p>
+
+<h3>The scope functions</h3>
+
+<p>Five small functions — <code>let</code>, <code>apply</code>, <code>also</code>, <code>run</code>,
+<code>with</code> — that run a block with an object in scope. Two cover nearly every real use:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">apiConfig.stripePublishableKey?.let { PaymentConfiguration.init(this, it) }
+</code></pre>
+
+<p><strong><code>?.let</code></strong> is "if this is not null, do something with it". Here: only
+configure Stripe if a key was supplied.</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+</code></pre>
+
+<p><strong><code>apply</code></strong> configures an object and returns it — Kotlin's answer to a
+builder for APIs that were not written with one. The rule of thumb: <code>let</code> to
+<em>transform or use</em> a value, <code>apply</code> to <em>set up</em> one. Chains of three scope
+functions in a row are a sign to use a plain local variable instead.</p>
+
+<h2>object, companion object, typealias</h2>
+
+<p>Kotlin has no <code>static</code>. A singleton is an <code>object</code>, which is the natural home
+for stateless helpers:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">object Money {
+    /**
+     * Rounds to cents, half up.
+     *
+     * Binary floating point cannot represent 13.99, so 13.99 + 1.5 + 1.75 lands on
+     * 17.240000000000002. Rounding at each boundary keeps displayed totals sane.
+     *
+     * ⚠️ `Math.round`, not `kotlin.math.round`. They look interchangeable and are not:
+     * `kotlin.math.round` rounds half to EVEN (banker's rounding), so 0.125 becomes 0.12.
+     * `Math.round` rounds half up, which is what a customer expects from a price.
+     */
+    fun rounded(value: Double): Double = Math.round(value * 100) / 100.0
+    // …
+</code></pre>
+
+<p>Functions that belong to a <em>type</em> rather than an instance live in a
+<code>companion object</code>, which is how <code>UiState.resolved(list)</code> and
+<code>CartTotals.EMPTY</code> are written. And a <code>typealias</code> names an existing type
+without creating a new one:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">typealias UuidString = String
+</code></pre>
+
+<p>Every id the API returns is a UUID string. The alias documents that at every use site, at no cost
+— and deliberately without the strictness of <code>java.util.UUID</code>, whose parser would turn
+one oddly-formatted id into an order history that fails to load.</p>
+
+<h2>Errors are exceptions</h2>
+
+<p>Kotlin has no checked exceptions: nothing forces a caller to catch anything. Error handling in this
+app is therefore a design, not a compiler feature — one sealed class whose cases are the decisions a
+caller can make:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">sealed class ApiError(override val message: String) : Exception(message) {
+    class Api(val status: Int, message: String, val body: ApiErrorBody?) : ApiError(message)
+    data object Unauthorized : ApiError("Your session has expired. Please sign in again.")
+    class Network(message: String) : ApiError(message)
+    class Decoding(message: String) : ApiError(message)
+    // …
+</code></pre>
+
+<p>It extends <code>Exception</code> so it can be thrown from a <code>suspend</code> function and
+caught with an ordinary <code>try</code>. The error-handling lesson builds this out; the point here is
+the shape — a sealed hierarchy, so a <code>when</code> over it is exhaustive just like
+<code>UiState</code>.</p>
+
+<p>Two more things to know before the first <code>suspend</code> function appears. Coroutines report
+cancellation by throwing <code>CancellationException</code>, which a careless
+<code>catch (e: Exception)</code> swallows. And <code>runCatching { }</code> exists, but wrapping a
+coroutine call in it has the same problem. Both come back in the coroutines lesson.</p>
+
+<h2>Next</h2>
+
+<p>With the language in hand, the UI. The next lesson is Jetpack Compose: what a composable is,
+how Column, Row and Box lay things out, and why the order of modifiers is not decoration but the
+layout itself.</p>

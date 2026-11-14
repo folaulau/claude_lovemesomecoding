@@ -110,3 +110,21 @@ with "Why it works" and "What would make it stronger" (front-end stack, features
 bug, whether the seed round closed; the "was that sustainable?" probe). Company: Sidecar Health,
 confirmed by Folau after first publish and updated the same day. Bank: story 10, OWNER ## / LEARN #. Post 01 and 02 wording, manifest
 excerpt updated. LIVE 2026-10-27 (posts 01, 02, 07 re-seeded to prod, frontend deployed).
+
+## Revision 2026-10-27: new lesson 7, competing priorities (Datapraise story)
+
+Folau supplied a "juggling multiple projects" story from Datapraise (led backend for two
+overlapping client projects). No existing post covered the priorities/workload family, so it is a
+new post, `behavioral-competing-priorities`, inserted as lesson 7 after ambiguity. Track is now 11.
+
+- Story saved verbatim in `stories/datapraise-two-projects.md`.
+- Files 07-10 `git mv`'d to 08-11; dates of lessons 8-11 move one day later (now ending
+  2026-10-25), so prod needs `--force-dates`. DATE_RANGE end moved to 2026-10-25.
+- Post 01: new PRIORITIES AND WORKLOAD family (-> post 7), later post numbers bumped, "nine
+  families". Post 02: PRIOR column added to the bank grid, story 11. Post 06 next-link -> post 7.
+- The post's main teaching is the story's own gap: the action is five habits and no decision; the
+  strongest version adds one real collision between the projects. Not invented: the projects, team
+  size, overlap length, the collision, what was deprioritized.
+- First draft was 1,291 words (floor 1,320); added a real section ("how do you prioritize?" as a
+  general question) rather than padding.
+- LIVE 2026-10-27: all 11 seeded to prod with --force-dates (989 posts), frontend deployed (build `740b460`).

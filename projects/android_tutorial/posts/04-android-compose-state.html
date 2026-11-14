@@ -1,0 +1,260 @@
+<p>The last lesson's composables drew fixed content. Real screens change: a size is selected, a
+quantity goes up, the menu finishes loading. In Compose you never reach into the UI to change it —
+you change <em>state</em>, and the composables that read that state run again.</p>
+
+<p>This lesson is about which kind of state to use and where it should live. There are five tools,
+and one rule that decides between them.</p>
+
+<h2>What recomposition actually is</h2>
+
+<p>Compose tracks which composables <em>read</em> which pieces of observable state. When a piece of
+state changes, Compose schedules every composable that read it to run again, and skips the ones that
+did not. That re-run is recomposition.</p>
+
+<p>Two consequences follow, and both trip people up:</p>
+
+<ul>
+<li><strong>Only observable state triggers it.</strong> Changing an ordinary <code>var</code>
+changes nothing on screen. The value must be a Compose <code>State</code> — or a flow converted into
+one.</li>
+<li><strong>A recomposition re-runs the function from the top.</strong> Any local variable is
+recreated. That is why state that must persist across recompositions needs
+<code>remember</code>.</li>
+</ul>
+
+<h2>remember and mutableStateOf</h2>
+
+<p><code>mutableStateOf(x)</code> creates an observable box. <code>remember { … }</code> stores a value
+in the composition so the next recomposition gets the same instance back instead of a fresh one.
+Together they are local, private state for one composable:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">var password by remember { mutableStateOf("") }
+</code></pre>
+
+<p>The <code>by</code> keyword is a Kotlin <em>property delegate</em>: reading <code>password</code>
+reads the box's value, assigning to it writes the value — and writing is what schedules the
+recomposition. Without <code>by</code> you would write <code>password.value</code> everywhere.</p>
+
+<p><code>remember</code> survives recomposition. It does <strong>not</strong> survive the Activity
+being destroyed — which on Android happens every time the phone rotates. For a password field that is
+exactly right, and the source says why in a comment: a password has no business being written to
+disk.</p>
+
+<h2>rememberSaveable</h2>
+
+<p>For everything else the customer would be annoyed to lose, there is
+<code>rememberSaveable</code>. It stores the value in the Activity's saved-instance
+<code>Bundle</code>, which the system keeps across rotation <em>and</em> across the process being
+killed in the background:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">var section by rememberSaveable { mutableStateOf(ProductType.PIZZA) }
+</code></pre>
+
+<p>The menu remembers whether you were looking at pizzas or drinks when you turn the phone. The cost
+of <code>rememberSaveable</code> is a constraint: the value must fit in a <code>Bundle</code> —
+primitives, strings, enums, <code>Parcelable</code>s. That is why the open builder sheet is tracked by
+the product's <em>id</em>, not the product:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">var openProductId by rememberSaveable { mutableStateOf&lt;UuidString?&gt;(null) }
+</code></pre>
+
+<p>The full story of rotation and process death is the next lesson; the rule for now is
+<strong>use <code>rememberSaveable</code> for anything the user chose, and <code>remember</code> for
+anything you can recompute</strong>.</p>
+
+<h2>State hoisting</h2>
+
+<p>The quantity stepper is used in two places — the builder, where the quantity is a local choice,
+and the cart, where it belongs to a cart line in a store. If the stepper owned its number, it could
+serve neither. So it owns nothing:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun QuantityStepper(
+    value: Int,
+    onValueChange: (Int) -&gt; Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+    range: IntRange = 1..20,
+) {
+</code></pre>
+
+<p>The value comes in; changes go out through a callback. The caller decides where the number lives.
+This is <strong>state hoisting</strong> — moving state up to the lowest common owner and passing it
+down — and it is the pattern behind every Material component: a <code>TextField</code> does not
+remember what you typed, it takes <code>value</code> and <code>onValueChange</code>.</p>
+
+<p>The same idea scales up to whole screens. Every screen in this app is a pair: a thin
+<em>route</em> composable that gets the ViewModel and collects its flows, and a stateless
+<em>content</em> composable that takes plain values and lambdas:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun MenuContent(
+    state: UiState&lt;Catalogue&gt;,
+    isRefreshing: Boolean,
+    onRefresh: () -&gt; Unit,
+    onRetry: () -&gt; Unit,
+    onProductClick: (Product) -&gt; Unit,
+    modifier: Modifier = Modifier,
+) {
+</code></pre>
+
+<p><code>MenuContent</code> has no idea a ViewModel exists. It can be previewed with a hand-built
+<code>UiState</code>, and UI-tested without Hilt or a network — both of which later lessons do.</p>
+
+<p>A stateless composable is easier to reuse, to preview (pass any value) and to test (assert on the
+callback). The general shape, sometimes called <em>unidirectional data flow</em>, is <strong>state
+flows down, events flow up</strong>, and every screen in this app is built that way.</p>
+
+<h2>State holder classes</h2>
+
+<p>The pizza builder has a size, a crust, a set of toppings and a quantity, plus rules: medium by
+default, drinks have no crust, the price follows every tap. Five <code>remember</code> calls inside
+the sheet would work, and would put the rules where no test can reach them. Instead the state lives in
+a plain class:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Stable
+class PizzaBuilderState(
+    val product: Product,
+    private val catalogue: Catalogue,
+) {
+    val isPizza: Boolean = product.type == ProductType.PIZZA
+
+    var selectedSize: SizeName by mutableStateOf(
+        product.sizes.map { it.size }.let { sizes -&gt;
+            if (SizeName.MEDIUM in sizes) SizeName.MEDIUM else sizes.firstOrNull() ?: SizeName.MEDIUM
+        },
+    )
+
+    var selectedCrustId: UuidString? by mutableStateOf(if (isPizza) catalogue.crusts.firstOrNull()?.id else null)
+
+    var quantity: Int by mutableIntStateOf(1)
+
+    private var selectedToppingIds: Set&lt;UuidString&gt; by mutableStateOf(emptySet())
+    // …
+</code></pre>
+
+<p>Its properties are backed by <code>mutableStateOf</code>, so a composable reading
+<code>state.selectedSize</code> recomposes when it changes, exactly as if the box were local. Because
+it is an ordinary class, its rules are tested on the JVM with no UI at all — the testing lesson shows
+that suite.</p>
+
+<p>It is created with <code>remember</code>, keyed on the product:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun rememberPizzaBuilderState(product: Product, catalogue: Catalogue): PizzaBuilderState =
+    remember(product, catalogue) { PizzaBuilderState(product, catalogue) }
+</code></pre>
+
+<p>The keys matter. <code>remember(product)</code> discards the stored value and runs the block again
+whenever the key changes, so opening the builder for a different pizza starts fresh instead of
+showing the last pizza's toppings. A new sheet for a new product, with no "reset" code to forget.</p>
+
+<p>Why not a ViewModel? A ViewModel outlives its screen — that is its entire purpose. The builder's
+state is meaningless once the sheet closes, and should die with it. A state holder created with
+<code>remember</code> has exactly the sheet's lifetime.</p>
+
+<h3>derivedStateOf</h3>
+
+<p>The price depends on four selections. Computing it in the composable would work; it would also
+re-run on every recomposition, and invalidate everything that shows the price whenever
+<em>any</em> input changes:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val unitPrice: Double by derivedStateOf {
+    val base = product.priceFor(selectedSize) ?: 0.0
+    Money.rounded(base + (selectedCrust?.priceDelta ?: 0.0) + selectedToppings.sumOf { it.price })
+}
+// ...
+val totalPrice: Double by derivedStateOf { Money.rounded(unitPrice * quantity) }
+</code></pre>
+
+<p><code>derivedStateOf</code> is a cached computation over other state. It re-runs only when a state
+it read changes, and it notifies its own readers only when its <em>result</em> changes. Toggling a
+free topping changes an input but not the price, and the button showing the price does not
+recompose. Reach for it when a value is derived from state that changes more often than the value
+does.</p>
+
+<h3>Replace collections, never mutate them</h3>
+
+<p>The selected toppings are a <code>Set</code> inside a <code>mutableStateOf</code>, and toggling one
+is written in a way that looks wasteful at first:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun toggle(topping: Topping) {
+    selectedToppingIds = if (topping.id in selectedToppingIds) {
+        selectedToppingIds - topping.id
+    } else {
+        selectedToppingIds + topping.id
+    }
+}
+</code></pre>
+
+<p>Every toggle builds a brand-new set and assigns it. That is not style — it is the only version that
+works. The state box notices <em>assignments</em>. Here is the wrong way, which compiles, runs, and
+does nothing visible:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">// ✗ the set changes; the box still holds the same instance, so nothing recomposes
+var selected by mutableStateOf(mutableSetOf&lt;String&gt;())
+selected.add(topping.id)
+</code></pre>
+
+<p>The chip does not tick. Tap it again and it still does not, though the set now holds the id. The
+next unrelated recomposition — a rotation, a price change — suddenly shows both taps at once. It is
+one of the most reported Compose "bugs", and it is always this.</p>
+
+<p>The rule that prevents it: <strong>hold immutable values in state and replace them</strong>. When a
+list is large and genuinely needs in-place edits, Compose provides <code>mutableStateListOf</code> and
+<code>mutableStateMapOf</code>, which are observable themselves. A <code>Set</code> of a few ids is not
+that case.</p>
+
+<h2>State the whole app owns</h2>
+
+<p>Some state belongs to no screen. The menu is needed by the home screen, the menu tab, the builder
+and the cart's rehydration; it is fetched once and shared. That state lives in a singleton store, and
+it is exposed as a <code>StateFlow</code>:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">private val _state = MutableStateFlow&lt;UiState&lt;Catalogue&gt;&gt;(UiState.Idle)
+val state: StateFlow&lt;UiState&lt;Catalogue&gt;&gt; = _state.asStateFlow()
+</code></pre>
+
+<p>The <em>backing property</em> pattern: a private, mutable flow that only the store can write, and a
+public, read-only view of it. A screen can observe the menu; it cannot assign to it. A
+<code>StateFlow</code> always has a current value and emits every change, which makes it the
+coroutine world's equivalent of an observable property.</p>
+
+<p>A screen reaches the store through a ViewModel, and turns the flow into Compose state at the
+top of the screen:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val catalogue by viewModel.catalogue.collectAsStateWithLifecycle()
+val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
+</code></pre>
+
+<p><code>collectAsStateWithLifecycle</code> subscribes while the screen is visible and stops when the
+app goes to the background, then delivers each value as Compose <code>State</code>. Use it rather than
+the older <code>collectAsState</code>, which keeps collecting for a screen nobody can see.</p>
+
+<h2>The rule</h2>
+
+<p>Five tools, one question: <strong>who needs this value, and for how long?</strong></p>
+
+<ul>
+<li><strong>One composable, and it can be lost on rotation</strong> → <code>remember</code>.</li>
+<li><strong>One composable, and the user would notice it being lost</strong> →
+<code>rememberSaveable</code>.</li>
+<li><strong>A parent and its children</strong> → hoist it to the parent and pass it down.</li>
+<li><strong>A screen, with rules worth testing, for as long as the UI is up</strong> → a state holder
+class created with <code>remember</code>.</li>
+<li><strong>A screen, across rotation, with work that must not restart</strong> → a ViewModel.</li>
+<li><strong>Several screens</strong> → an app-wide store exposing <code>StateFlow</code>.</li>
+</ul>
+
+<p>The most common mistake is the opposite of what you might expect: not too little shared state, but
+too much. A form's half-typed values in a global store means every screen recomposes when a letter is
+typed, and the form's lifetime becomes the app's. This app has exactly four app-wide stores — auth,
+menu, cart and toasts — and everything else is owned by the screen that uses it.</p>
+
+<p>(The iOS version of this app makes the same split with different words: <code>@State</code> where
+this uses <code>remember</code>, and <code>@Observable</code> stores where this uses
+<code>StateFlow</code>. The decision about <em>where</em> state lives is identical, which is the part
+worth learning.)</p>
+
+<h2>Next</h2>
+
+<p>"Survives rotation" has come up three times now, and it deserves more than a footnote. The next
+lesson is the one with no iOS equivalent: what a ViewModel survives, why rotation destroys your
+Activity, and what happens when Android kills your process while the customer is in another app.</p>

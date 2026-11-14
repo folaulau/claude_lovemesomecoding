@@ -1,0 +1,211 @@
+<p>Checkout is the screen where an ordering app makes or loses its money, and on a phone it is almost
+entirely typing. Every field the customer fights with — the keyboard with no @ key, the Next button
+that does nothing, the Pay button hidden behind the keyboard — is a reason to give up.</p>
+
+<p>This lesson is the input side of Compose: text fields, the keyboard as part of the UI, focus,
+autofill, and a validation model that keeps the rules out of the composable.</p>
+
+<h2>A text field owns nothing</h2>
+
+<p>A Compose <code>TextField</code> does not remember what you typed. It takes <code>value</code> and
+reports <code>onValueChange</code>, and if you do not feed the new value back in, the field simply does
+not change. It is state hoisting applied to input, and it is what lets the form's state live wherever
+it should — which in this app is three different places:</p>
+
+<ul>
+<li><strong>Checkout</strong> keeps its form in the ViewModel's <code>SavedStateHandle</code>, because
+the ViewModel validates and submits it and it must survive process death.</li>
+<li><strong>The address sheet</strong> keeps its fields in <code>rememberSaveable</code> inside the
+sheet, because nothing outside the sheet needs them until Save.</li>
+<li><strong>Password fields</strong> use plain <code>remember</code>, because saved state is written to
+disk.</li>
+</ul>
+
+<p>Every one of them renders through the same component.</p>
+
+<h2>One field component</h2>
+
+@@kotlin
+<<K/core/designsystem/components/LabeledTextField.kt | fun LabeledTextField( | ^\) \{$>>
+@@
+
+<p>It wraps Material's <code>OutlinedTextField</code> with the app's colours and three behaviours
+every field needs. The label floats above the text once there is some. The error, when present,
+turns the outline red and appears underneath as <code>supportingText</code>. And
+<code>singleLine</code> is on, because a single-line field's Enter key is an IME action rather than a
+newline — which matters in a moment.</p>
+
+<p>The error is also written into the field's semantics, so TalkBack reads it when the field is
+focused:</p>
+
+@@kotlin
+<<K/core/designsystem/components/LabeledTextField.kt | modifier = modifier | ^            },$>>
+@@
+
+<p>Red text alone tells a blind customer nothing. The accessibility lesson returns to this.</p>
+
+<h2>The keyboard is part of the UI</h2>
+
+<p><code>KeyboardOptions</code> tells the system which keyboard to show and what its action key does.
+Getting it right per field is the cheapest usability improvement there is:</p>
+
+@@kotlin
+<<K/feature/checkout/CheckoutScreen.kt | value = form.email, | keyboardActions = next,>>
+@@
+
+<ul>
+<li><strong><code>KeyboardType.Email</code></strong> puts @ and .com on the first page and turns off
+autocorrect, which otherwise "fixes" addresses into words.</li>
+<li><strong><code>KeyboardType.Number</code></strong> on the ZIP, <code>Phone</code> on the phone
+number, <code>Password</code> on passwords (which also disables learning and suggestions).</li>
+<li><strong><code>KeyboardCapitalization.Words</code></strong> on names and cities,
+<code>Characters</code> on the two-letter state. The default for a plain field is no capitalisation,
+which leaves every customer's name in lowercase.</li>
+<li><strong><code>ImeAction.Next</code></strong> turns the return key into a forward arrow;
+<code>Done</code> into a check mark.</li>
+</ul>
+
+<h3>Moving focus</h3>
+
+<p>An IME action only labels the key. What happens when it is pressed is
+<code>KeyboardActions</code>, and the useful action for <code>Next</code> is "move focus to the next
+field":</p>
+
+@@kotlin
+<<K/feature/checkout/CheckoutScreen.kt | val focus = LocalFocusManager.current | val next = >>
+@@
+
+<p><code>moveFocus(FocusDirection.Down)</code> moves to the next focusable element below, in layout
+order, so a whole form can be filled without touching the screen between fields. On the last field,
+<code>Done</code> clears focus — which closes the keyboard — and on the sign-in sheet it submits:</p>
+
+@@kotlin
+<<K/feature/auth/AuthSheets.kt | keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done), | keyboardActions = KeyboardActions(onDone = { viewModel.signIn>>
+@@
+
+<p>For a layout where "down" is ambiguous, <code>FocusRequester</code>s let you name exactly which
+field comes next; for a simple column, the focus manager is enough.</p>
+
+<h2>Autofill</h2>
+
+<p>The fastest field is the one the customer never types. Android's autofill framework — Google's own,
+or a password manager — can fill an email, a password or a whole address, but only if it knows what
+each field <em>is</em>. A label saying "Email" means nothing to it; a semantics content type does:</p>
+
+@@kotlin
+<<K/feature/auth/AuthSheets.kt | label = "Email", | autofill = ContentType.EmailAddress + ContentType.Username,>>
+@@
+
+@@kotlin
+<<K/feature/auth/AuthSheets.kt | label = "Password (8+ characters)", | autofill = ContentType.NewPassword,>>
+@@
+
+<p>Note the difference between the two password types. <code>Password</code> on sign-in offers a saved
+password; <code>NewPassword</code> on registration offers to <em>generate</em> a strong one and save it
+— which is the only way most people will ever use a strong password on your service. Checkout and the
+address form tag every address field too, so a saved home address fills five fields with one tap.</p>
+
+<h2>Filtering input</h2>
+
+<p>Some fields have a shape, and the cheapest validation is not letting a wrong value in:</p>
+
+@@kotlin
+<<K/feature/checkout/CheckoutScreen.kt | value = form.postalCode, | onValueChange = >>
+@@
+
+<p><code>filter(Char::isDigit).take(5)</code> drops anything that is not a digit and anything past the
+fifth, including a pasted "97201-1234". The state field does the same with <code>take(2)</code>. This
+is a convenience, not a guarantee: the value is still validated on submit, and the server validates it
+again.</p>
+
+<h2>Keeping the button above the keyboard</h2>
+
+<p>When the keyboard opens, it covers the bottom half of the screen — usually including the submit
+button. Two pieces make the layout move out of the way. The manifest asks for the window to be resized
+(<code>windowSoftInputMode="adjustResize"</code>), and because the app draws edge to edge, the content
+pads itself by the keyboard's height:</p>
+
+@@kotlin
+<<K/feature/auth/AuthSheets.kt | modifier = Modifier | .padding(bottom = Spacing.lg),>>
+@@
+
+<p><code>imePadding()</code> adds bottom padding equal to the keyboard's current height, animated as
+it slides in. Combined with <code>verticalScroll</code>, the button is always reachable by scrolling
+rather than hidden behind the keyboard with no way to dismiss it. Forget it, and a customer on a small
+phone cannot finish signing in.</p>
+
+<h2>Choices that are not text</h2>
+
+<p>A signed-in customer with saved addresses picks one instead of typing. That is a radio group, and
+the detail that matters is the size of the tap target. A bare <code>RadioButton</code> is a 20dp
+circle; the customer is aiming at the address text next to it. So the whole row is the control:</p>
+
+@@kotlin
+<<K/feature/checkout/CheckoutScreen.kt | private fun AddressOption( | ^}$>>
+@@
+
+<p><code>Modifier.selectable</code> on the row makes the entire row tappable and gives it the radio
+button role and selected state for TalkBack. <code>onClick = null</code> on the
+<code>RadioButton</code> makes the circle purely visual, so it is not a second, separate focus stop
+announcing the same choice twice. And the parent column carries <code>Modifier.selectableGroup()</code>,
+so the options are announced as one group — "1 of 3".</p>
+
+<p>Choosing "A new address" reveals the typed fields; choosing a saved one hides them and tells the
+validator not to require them. The selection itself lives in the <code>SavedStateHandle</code> beside
+the form, so it survives process death with everything else the customer chose.</p>
+
+<h2>Validation lives outside the composable</h2>
+
+<p>The checkout rules are a pure function: a form and a context in, a map of errors out. No Compose,
+no Android:</p>
+
+@@kotlin
+<<K/feature/checkout/CheckoutForm.kt | fun validate(form: CheckoutForm | ^    }$>>
+@@
+
+<p>Because it is plain Kotlin, it is tested on the JVM in milliseconds — a postal code test runs four
+bad inputs through it without rendering a single field. The <code>Context</code> carries the two facts
+that change the rules: pickup orders need no address, and a customer who picked a saved address does
+not need to type one.</p>
+
+<p>Email validation is deliberately loose — one @, something before it, a dotted domain after it. The
+only real test of an email address is sending to it; a strict regular expression mostly rejects real
+addresses with plus signs and long top-level domains.</p>
+
+<h3>When to show errors</h3>
+
+<p>Red text under a field the customer has not reached yet is nagging, not help. So errors appear
+only after the first attempt to submit — and from then on, they update as the customer types:</p>
+
+@@kotlin
+<<K/feature/checkout/CheckoutViewModel.kt | fun updateForm(transform: | ^    }$>>
+@@
+
+@@kotlin
+<<K/feature/checkout/CheckoutViewModel.kt | fun placeOrder() { | if (errors.isNotEmpty()>>
+        // …
+@@
+
+<p>The submit guard also checks <code>isSubmitting</code>, so a second tap on a slow network does
+nothing — the button is disabled while loading too, but the ViewModel does not trust the UI to have
+done it.</p>
+
+<h3>Server errors land on fields too</h3>
+
+<p>Client-side validation is a courtesy. The server is the authority, and it reports problems per
+field — "email: already registered". The API client turns those into a map
+(<code>ApiError.fieldErrors</code>, in the error-handling lesson), and the sign-in sheet passes them to
+the same <code>error</code> parameter:</p>
+
+@@kotlin
+<<K/feature/auth/AuthSheets.kt | label = "Full name", | error = state.fieldErrors["fullName"],>>
+@@
+
+<p>One parameter, two sources, one rendering. The customer sees the server's message exactly where a
+local one would have appeared.</p>
+
+<h2>Next</h2>
+
+<p>Sign-in, registration, the address form and the builder are all sheets. The next lesson is how
+Compose presents them — a sheet that appears by being composed and closes by leaving composition —
+and the one piece of state that stops two from opening at once.</p>

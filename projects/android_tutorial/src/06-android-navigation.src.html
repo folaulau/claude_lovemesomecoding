@@ -1,0 +1,235 @@
+<p>An app with one Activity still has many screens, and something has to know which one is showing,
+what is underneath it, and what Back does. In Compose that is the Navigation library: a
+<code>NavHost</code> that maps routes to composables, and a <code>NavController</code> that holds the
+back stack.</p>
+
+<p>This lesson is the modern shape of it — routes as types, a graph per tab, and the handful of
+navigation calls that decide whether Back does what a customer expects.</p>
+
+<h2>Routes are types</h2>
+
+<p>For years a route was a string like <code>"order/{orderId}"</code>, and an argument was parsed back
+out of it. A typo, a missing argument or a renamed screen was a crash at runtime. Since Navigation 2.8
+a route is any <code>@Serializable</code> class:</p>
+
+@@kotlin
+<<K/app/AppRoutes.kt | // Tab roots | ^@Serializable data object ProfileGraph$>>
+@@
+
+<p>A <code>data object</code> is a route with no arguments. A <code>data class</code> is a route with
+arguments, and navigating to it is a constructor call the compiler checks:
+<code>navController.navigate(OrderRoute(orderId))</code>. The library serialises the properties into
+the back stack and the destination reads them back as the same type.</p>
+
+<p>Note what <code>OrderRoute</code> carries: an id, not an <code>Order</code>. The back stack is saved
+into a <code>Bundle</code> when the process is killed in the background (the previous lesson), and an
+id survives that where a whole order would not fit — and would be stale by the time it was restored
+anyway. The screen fetches the order it needs.</p>
+
+<h2>The graph</h2>
+
+<p>A <code>NavHost</code> declares every destination, starting from a start destination:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | NavHost(navController = navController | navigation<OrdersGraph> >>
+        // …
+@@
+
+<p><code>composable&lt;MenuRoute&gt; { … }</code> registers a screen for a route type.
+<code>navigation&lt;MenuGraph&gt;(startDestination = MenuRoute)</code> groups screens into a
+<em>nested graph</em> with its own start. Each tab is one nested graph, and the reason is the next
+section.</p>
+
+<p>Checkout and the receipt are registered at the top level, outside any tab:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | composable<CheckoutRoute> { | composable<OrderRoute> >>
+@@
+
+<p>They can be reached from any tab, and are pushed onto whichever tab the customer is in.</p>
+
+<h3>Screens do not navigate</h3>
+
+<p>Look at what the screens receive: <code>onOrderPlaced</code>, <code>onBrowseMenu</code>,
+<code>onSignIn</code>. Never the <code>NavController</code>. A screen reports what happened; the graph
+decides where that leads. That keeps <code>CheckoutScreen</code> previewable and testable without a
+navigation graph, and it means a change to the app's flow is an edit to one file, not a hunt through
+every screen that might navigate.</p>
+
+<h2>Tabs that remember where they were</h2>
+
+<p>A bottom bar is a row of <code>NavigationBarItem</code>s. Selecting one navigates to that tab's
+graph — and the options on that call are the difference between tabs that behave and tabs that do
+not:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | private fun NavHostController.navigateToTab | ^}$>>
+@@
+
+<ul>
+<li><strong><code>popUpTo(start) { saveState = true }</code></strong> pops the current tab's screens
+off the stack — but <em>saves</em> them, including every screen's <code>rememberSaveable</code>
+state, keyed by the tab.</li>
+<li><strong><code>restoreState = true</code></strong> brings back whatever was saved for the tab being
+opened.</li>
+<li><strong><code>launchSingleTop</code></strong> stops a second tap on the current tab from stacking
+a duplicate copy of it.</li>
+</ul>
+
+<p>Together: open an order on the Orders tab, switch to Menu, switch back, and the order is still
+open. Leave out either state flag and every tab switch silently resets the tab. This is what the
+per-tab graphs are for — they are the unit that gets saved and restored. (The iOS app keeps four
+separate <code>NavigationPath</code>s for the same reason; Navigation Compose does the bookkeeping
+for you, if you ask.)</p>
+
+<h3>Which tab is selected</h3>
+
+<p>Highlighting the right tab is subtler than it looks, because checkout is pushed on top of
+<em>whichever</em> tab the customer was in — so the destination alone cannot say which tab to
+highlight. The app keeps the selection as its own saved state, and lets the back stack override it
+when the destination does belong to a tab:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | var selectedTab by rememberSaveable | ^    }$>>
+@@
+
+<p><code>NavDestination.hierarchy</code> walks from a screen up through its parent graphs, so "is this
+destination inside <code>MenuGraph</code>?" is one line:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | private fun NavDestination?.isIn | hasRoute(tab.graph::class)>>
+@@
+
+<p>Pressing Back from a tab's root returns to the Home tab — the start destination of the whole
+graph — and the <code>LaunchedEffect</code> moves the highlight with it.</p>
+
+<h2>Reading the current destination</h2>
+
+<p>The top bar's title and back arrow depend on where the customer is.
+<code>currentBackStackEntryAsState()</code> turns the controller's back stack into Compose state, so
+the bar recomposes when the destination changes:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | val backStackEntry by navController | val destination = >>
+@@
+
+@@kotlin
+<<K/app/PizzaApp.kt | private fun titleFor( | ^}$>>
+@@
+
+<p><code>hasRoute(OrderRoute::class)</code> compares route <em>types</em>, which is how a typed route
+with an argument is recognised without caring which order it is.</p>
+
+<h2>Arguments, on the other side</h2>
+
+<p>The receipt screen's ViewModel needs the order id. It does not get it as a parameter — Hilt builds
+the ViewModel, and Hilt knows nothing about navigation. Navigation puts the route's properties into
+the ViewModel's <code>SavedStateHandle</code>, and <code>toRoute</code> reads them back as the typed
+route:</p>
+
+@@kotlin
+<<K/feature/orders/OrderConfirmationViewModel.kt | val orderId: String = savedStateHandle | toRoute>>
+@@
+
+<p>Because it comes from saved state, it survives process death with no extra work: the restored back
+stack hands the new ViewModel the same route.</p>
+
+<h2>Replacing a screen</h2>
+
+<p>After a successful payment the app shows the receipt. Pushing it on top of checkout would leave
+checkout underneath, and Back would return the customer to a checkout for an order they have already
+paid for. So the receipt <em>replaces</em> checkout:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | navController.navigate(OrderRoute(orderId)) { | ^                    }$>>
+@@
+
+<p><code>popUpTo&lt;CheckoutRoute&gt; { inclusive = true }</code> pops everything above checkout
+<em>and</em> checkout itself, then pushes the receipt. Back from the receipt goes to wherever the
+customer was before checkout — the menu, typically. The same tool handles "sign out and return to the
+start" and "finish onboarding and never show it again".</p>
+
+<h2>Navigating from a sheet</h2>
+
+<p>The cart is a bottom sheet over whatever screen the customer was on, and its button goes to
+checkout. The sheet is not a destination in the graph — it is state in the root — so the root
+handles both halves:</p>
+
+@@kotlin
+<<K/app/PizzaApp.kt | AppSheet.CART -> CartSheet( | ^        \)$>>
+@@
+
+<p>Dismiss first, then navigate. And <code>launchSingleTop = true</code> on the navigation: a
+customer who taps the button twice on a slow phone gets one checkout on the stack, not two, with the
+second Back press revealing a duplicate. It is the navigation equivalent of disabling a submit button
+while it is submitting.</p>
+
+<h2>The wrong way: navigating during composition</h2>
+
+<p>The most common navigation bug in Compose looks completely reasonable:</p>
+
+@@kotlin
+// ✗ runs on EVERY recomposition while completedOrderId is set
+if (state.completedOrderId != null) {
+    navController.navigate(OrderRoute(state.completedOrderId))
+}
+@@
+
+<p>A composable's body runs whenever Compose decides to run it — once, twice, ten times. Navigating
+from the body pushes the receipt as many times as the screen recomposes before it leaves, and the
+customer has to press Back five times to escape. Navigation is a side effect, so it belongs in an event
+handler (an <code>onClick</code>) or in an effect keyed on the value that triggers it — with the
+trigger cleared once acted on. This app's checkout does exactly that, and the payments lesson walks
+through it.</p>
+
+<h2>Smaller mistakes worth avoiding</h2>
+
+<ul>
+<li><strong>Creating the <code>NavController</code> anywhere but the root.</strong>
+<code>rememberNavController()</code> belongs next to the <code>NavHost</code>; a second one inside a
+screen is a second, unrelated back stack.</li>
+<li><strong>Passing objects through routes.</strong> Even when they serialise, they bloat the saved
+state and go stale. Pass the id.</li>
+<li><strong>Sharing one ViewModel between destinations by accident.</strong>
+<code>hiltViewModel()</code> called inside a destination is scoped to that destination. To share one
+deliberately across a flow, scope it to the parent graph's back-stack entry instead.</li>
+<li><strong>Hiding the bottom bar by checking routes in every screen.</strong> If some screens should
+not show it, decide that once in the root, from the current destination — exactly as the title
+is.</li>
+</ul>
+
+<h2>Back</h2>
+
+<p>The system Back gesture pops the <code>NavHost</code>'s back stack automatically; you write nothing.
+The top bar's arrow calls <code>navController.navigateUp()</code>, which does the same for an
+in-app back button.</p>
+
+<p>Two things worth knowing. When the back stack is at a tab's root, Back leaves the app — Android's
+convention, unlike iOS where a tab root has nowhere to go. And Android 14+ shows a <em>predictive</em>
+back animation, previewing the screen underneath as the gesture progresses; Navigation Compose
+supports it out of the box, which is one more reason to let the library own Back rather than
+intercepting it with your own <code>BackHandler</code> unless a screen really must (an unsaved-changes
+prompt, say).</p>
+
+<h2>Deep links</h2>
+
+<p>Because routes are types, a deep link is a mapping from a URL pattern to a route:
+<code>composable&lt;OrderRoute&gt;(deepLinks = listOf(navDeepLink&lt;OrderRoute&gt;(basePath =
+"https://pizza.example.com/order")))</code> plus an intent filter in the manifest. This app does not
+expose one yet; the design — ids in routes, screens that fetch their own data — means adding it is a
+line per screen, not a refactor.</p>
+
+<h2>Testing it</h2>
+
+<p>Because screens take lambdas instead of a controller, most navigation never needs a navigation test:
+a screen test asserts that tapping "Browse the menu" called <code>onBrowseMenu</code>, and that is the
+screen's whole responsibility. The graph itself — which lambda leads where — can be tested with a
+<code>TestNavHostController</code> from <code>navigation-testing</code>, asserting on
+<code>currentBackStackEntry</code> after a tap. Keeping all of it in one root file is what makes that
+one test enough.</p>
+
+<h2>Next</h2>
+
+<p>Most navigation starts from a list. The next lesson is <code>LazyColumn</code>: why a plain
+scrolling <code>Column</code> is the wrong tool for a menu, what keys are for, and how Compose decides
+which rows it can skip.</p>

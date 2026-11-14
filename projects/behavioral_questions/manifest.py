@@ -21,7 +21,8 @@ CATEGORY = {
         "The non-technical half of a software engineering interview. What behavioral questions "
         "actually score, the STAR structure, building a story bank, and worked answers to the "
         "questions every company asks: the project you are proudest of, a failure, a conflict, "
-        "ambiguity, ownership, learning fast, leadership and feedback, and why this company. "
+        "ambiguity, competing priorities, ownership, learning fast, leadership and feedback, "
+        "and why this company. "
         "The sample answers come from real projects, not invented ones."
     ),
 }
@@ -122,6 +123,17 @@ _TRACK = [
         ),
     },
     {
+        "slug": "behavioral-competing-priorities",
+        "title": "Juggling Multiple Projects and Competing Priorities",
+        "tags": ["interview", "behavioral", "career"],
+        "excerpt": (
+            "Describe a time you juggled several projects at once, or had two priorities that "
+            "could not both win. What the interviewer is really scoring, a worked answer from "
+            "leading the backend of two overlapping client projects at Datapraise, and the one "
+            "thing almost every answer to this question is missing."
+        ),
+    },
+    {
         "slug": "behavioral-ownership-and-initiative",
         "title": "Ownership – Going Beyond the Ticket",
         "tags": ["interview", "behavioral", "career"],
@@ -170,12 +182,13 @@ _TRACK = [
 # ---------------------------------------------------------------------------
 # Dates
 # ---------------------------------------------------------------------------
-# One lesson a day, ending the day before the track was written (2026-10-25). The stories inside
+# One lesson a day. The track was written 2026-10-25 and ended the day before; competing-priorities
+# was inserted as lesson 7 on 2026-10-27, which pushed lessons 8-11 one day later, to 2026-10-25. The stories inside
 # the posts are dated August to October 2026, so a 2026 date is the only honest one here, unlike
 # the System Design track, whose posts carry no dated events.
 START_DATE = datetime(2026, 10, 15, 9, 0, 0)
 STEP_DAYS = 1
-DATE_RANGE = (datetime(2026, 10, 1), datetime(2026, 10, 24, 23, 59, 59))
+DATE_RANGE = (datetime(2026, 10, 1), datetime(2026, 10, 25, 23, 59, 59))
 
 
 def _date(index: int) -> str:
@@ -198,7 +211,7 @@ POSTS = [
 FROZEN_SLUGS: set[str] = set()
 NEW_SLUGS = {p["slug"] for p in POSTS}
 
-assert len(POSTS) == 10, f"the track is 10 posts, got {len(POSTS)}"
+assert len(POSTS) == 11, f"the track is 11 posts, got {len(POSTS)}"
 _dates = [datetime.strptime(p["date"], "%Y-%m-%dT%H:%M:%S") for p in POSTS]
 _out = [p["slug"] for p, d in zip(POSTS, _dates) if not DATE_RANGE[0] <= d <= DATE_RANGE[1]]
 assert not _out, f"post dates must stay inside DATE_RANGE: {_out}"

@@ -1,0 +1,282 @@
+<p>Every interesting thing this app does waits for something: a network response, a disk read, a
+debounce, a payment to settle. Kotlin coroutines are how it waits without blocking the main thread,
+and Flow is how values that change over time get from where they are produced to the screen.</p>
+
+<p>Coroutines are easy to start and easy to get subtly wrong. Almost every mistake is about one
+question — <em>who owns this coroutine, and when does it stop?</em> — so this lesson is organised
+around ownership.</p>
+
+<h2>Structured concurrency</h2>
+
+<p>A <code>suspend</code> function can pause without blocking a thread, and resume later. You can only
+call one from another suspend function or from a coroutine, and every coroutine is launched in a
+<strong>scope</strong>. The scope is the owner: cancel it, and every coroutine launched in it is
+cancelled; a coroutine that fails reports its failure to its scope. Nothing is left running that
+nobody can stop.</p>
+
+<p>That rule is what makes coroutines manageable, and this app uses exactly three scopes.</p>
+
+<h3>viewModelScope</h3>
+
+<p>Work that belongs to one screen is launched in its ViewModel's scope, which is cancelled when the
+screen is gone for good:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun load(showsLoadingState: Boolean = true) {
+    loadJob?.cancel()
+    loadJob = viewModelScope.launch {
+        // A quiet refresh keeps showing the list it has; only a first load shows a spinner.
+        if (showsLoadingState || _state.value.valueOrNull == null) _state.value = UiState.Loading
+        try {
+            _state.value = UiState.resolved(repository.myOrders(page = 0, size = PAGE_SIZE).content)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            _state.value = UiState.failure(e, "Could not load your orders.")
+        }
+    }
+}
+</code></pre>
+
+<p>Leave the Orders tab and the request in flight is cancelled with it. Rotate the phone and it is
+not, because the ViewModel survives. No manual cancellation anywhere.</p>
+
+<h3>An application scope, for work that must outlive a screen</h3>
+
+<p>Some work must <em>not</em> be cancelled when a screen goes. A customer who adds a pizza and closes
+the sheet has not asked for the cart save to be abandoned. That work is launched in a scope that lives
+as long as the process, provided once by Hilt:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun provideApplicationScope(): CoroutineScope =
+    // SupervisorJob: one failed child (a cart save) must not cancel its siblings (a toast
+    // timer) — with a plain Job, the first exception would take the whole scope down with it.
+    // Main.immediate: the stores' state is driven from the UI, as a `@MainActor` type is in
+    // Swift. Real I/O moves off the main thread inside OkHttp and DataStore, not here.
+    CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+</code></pre>
+
+<p>Two choices in one line. <code>SupervisorJob</code>: with a plain <code>Job</code>, the first child
+to fail cancels the whole scope — one failed cart save would silently kill every toast timer and every
+later save for the rest of the session. A supervisor lets children fail independently. And
+<code>Dispatchers.Main.immediate</code>: the stores drive UI state, so they run on the main thread,
+much as Swift's stores are <code>@MainActor</code>.</p>
+
+<p>It is injected with a qualifier rather than reached for as <code>GlobalScope</code>, for one reason:
+a test can hand the store its own scope and control time. <code>GlobalScope</code> cannot be
+replaced, and a test that cannot control when a debounced save fires is a test that sleeps.</p>
+
+<h3>The caller's scope</h3>
+
+<p>The third "scope" is the caller's. A <code>suspend</code> function that launches nothing just runs
+inside whoever called it, and is cancelled with them. Most of the app's code is this kind, which is why
+most of it never mentions a scope at all.</p>
+
+<h2>Threads: main-safety</h2>
+
+<p>Coroutines launched on the main dispatcher run on the main thread — so a coroutine that does slow
+blocking work freezes the UI as surely as a plain function would. The Android convention that avoids
+it is <strong>main-safety</strong>: every suspend function must be safe to call from the main thread,
+moving its own blocking work elsewhere.</p>
+
+<p>Retrofit, OkHttp, Room and DataStore are already main-safe; they switch threads internally. So most
+of this app never thinks about threads. The exception is code that calls a blocking API itself — the
+Keystore encryption:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">override suspend fun string(key: StorageKey): String? {
+    val stored = store.string(key) ?: return null
+    return withContext(Dispatchers.IO) { decrypt(stored) }
+}
+</code></pre>
+
+<p><code>withContext(Dispatchers.IO)</code> runs the block on a thread pool sized for blocking I/O and
+returns to the caller's dispatcher with the result. The caller — a ViewModel on the main thread —
+never knows.</p>
+
+<h2>Parallel requests</h2>
+
+<p>The menu needs products, toppings and crusts: three independent requests. Awaiting them one after
+another would triple the wait. <code>async</code> starts each in parallel and <code>await</code>
+collects the results:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val catalogue = coroutineScope {
+    val products = async { repository.products() }
+    val toppings = async { repository.toppings() }
+    val crusts = async { repository.crusts() }
+    Catalogue(products.await(), toppings.await(), crusts.await())
+}
+</code></pre>
+
+<p>The <code>coroutineScope { }</code> around them is what makes this safe. It is a scope that waits
+for all its children, and if any one fails, it cancels the others and rethrows. Without it, a failed
+products request would leave the toppings and crusts requests running into nowhere. The profile loads
+addresses and cards the same way.</p>
+
+<h2>Cancel and replace</h2>
+
+<p>Starting a new job and cancelling the previous one is a pattern you will write constantly. The menu
+uses it so a slow first response cannot land after a fast retry and overwrite fresher data:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun load() {
+    loadJob?.cancel()
+    loadJob = scope.launch { performLoad() }
+}
+</code></pre>
+
+<p>The cart uses the same three lines as a <strong>debounce</strong>. Three taps on "+" should be one
+network write, not three:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">persistJob?.cancel()
+persistJob = scope.launch {
+    delay(persistDebounce)
+    persist()
+}
+</code></pre>
+
+<p>Each change cancels the pending write and schedules a new one 300ms out. <code>delay</code> is
+cancellable — it throws <code>CancellationException</code> when its job is cancelled — so a superseded
+write never reaches <code>persist()</code>. There is no timer handle to clear and no "is this still
+current?" flag. Cancellation <em>is</em> the debounce.</p>
+
+<h2>A loop that stops itself</h2>
+
+<p>After a payment, the receipt asks the server whether the order is paid, every two seconds, up to ten
+times:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">private suspend fun poll() {
+    _state.value = UiState.Loading
+
+    repeat(maxAttempts) { attempt -&gt;
+        try {
+            val order = repository.paymentStatus(orderId)
+            _state.value = UiState.Loaded(order)
+            if (!order.status.isSettling) return
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Keep showing the last good receipt if there is one; a blip mid-poll is not news.
+            if (_state.value.valueOrNull == null) _state.value = UiState.failure(e, "Could not load the order.")
+            return
+        }
+        // No sleep after the final attempt — it would delay the "still processing" message.
+        if (attempt &lt; maxAttempts - 1) delay(pollInterval)
+    }
+
+    _hasStoppedPolling.value = true
+}
+</code></pre>
+
+<p>An ordinary loop with an ordinary <code>delay</code>. It is launched from <code>init</code> in
+<code>viewModelScope</code>, so leaving the screen cancels the scope, the <code>delay</code> throws,
+and the loop ends. Compare that with a <code>Handler</code> and <code>postDelayed</code>, or a
+<code>Timer</code>, each of which keeps firing until someone remembers to stop it. Notice also that
+the loop does not sleep after its last attempt: that would delay the "still processing" message by two
+seconds for nothing.</p>
+
+<h2>Shared state without locks</h2>
+
+<p>The auth token is read by the network interceptor, written by sign-in and cleared by sign-out —
+possibly at the same moment. Where Java would use <code>synchronized</code>, coroutine code uses a
+<code>Mutex</code>:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">override suspend fun currentToken(): String? = mutex.withLock {
+    if (!hasLoaded) {
+        cachedToken = try {
+            secureStore.string(StorageKey.AUTH_TOKEN)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Stored token could not be read; treating it as signed out.", e)
+            null
+        }
+        hasLoaded = true
+    }
+    cachedToken
+}
+</code></pre>
+
+<p>The difference matters. <code>synchronized</code> blocks the waiting <em>thread</em>; if that thread
+is the main thread and the lock holder is reading from disk, the UI freezes. <code>withLock</code>
+<em>suspends</em> the waiting coroutine instead, and the thread is free to draw frames. (The iOS app
+uses an <code>actor</code> for the same job.)</p>
+
+<h2>Flow: values over time</h2>
+
+<p>A suspend function returns one value. A <code>Flow</code> emits many, over time. The kind this app
+uses everywhere is <code>StateFlow</code>: it always holds a current value, emits each new one to its
+collectors, and skips emitting a value equal to the last.</p>
+
+<h3>Updating state atomically</h3>
+
+<pre class="language-kotlin"><code class="language-kotlin">private fun dispatch(action: CartAction) {
+    _state.update { CartReducer.reduce(it, action) }
+    schedulePersist()
+}
+</code></pre>
+
+<p><code>update { }</code> reads the current value, applies the function and writes the result —
+retrying if another thread changed the value in between. Writing
+<code>_state.value = reduce(_state.value, action)</code> instead has a gap between the read and the
+write, and two quick taps from two coroutines can lose one.</p>
+
+<h3>Derived flows</h3>
+
+<p>The cart's totals are computed from the cart, so they are a flow derived from it:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val totals: StateFlow&lt;CartTotals&gt; = _state
+    .map { CartPricing.totals(it.items, it.orderType) }
+    .stateIn(scope, SharingStarted.Eagerly, CartTotals.EMPTY)
+</code></pre>
+
+<p><code>map</code> transforms each emission; <code>stateIn</code> turns the result back into a
+<code>StateFlow</code>, started in a scope, with an initial value. The started policy is a real
+choice:</p>
+
+<ul>
+<li><strong><code>Eagerly</code></strong> — compute from the moment the store exists. Right for the
+cart's totals, which other code reads synchronously via <code>.value</code>.</li>
+<li><strong><code>WhileSubscribed(5_000)</code></strong> — compute only while someone collects, and
+keep going for five seconds after the last collector leaves. Right for a screen's derived value:</li>
+</ul>
+
+<pre class="language-kotlin"><code class="language-kotlin">val cartCount: StateFlow&lt;Int&gt; = cartStore.totals
+    .map { it.itemCount }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+</code></pre>
+
+<p>The five seconds is not arbitrary: it is longer than a rotation, so turning the phone does not stop
+and restart the upstream work, and short enough that a backgrounded app stops computing promptly.</p>
+
+<h3>Reacting to changes</h3>
+
+<p>The Orders tab should reload when the signed-in account changes — and only then:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">viewModelScope.launch {
+    authStore.state.map { it.user?.id }.distinctUntilChanged().collect { userId -&gt;
+        if (userId == null) _state.value = UiState.Idle else load()
+    }
+}
+</code></pre>
+
+<p><code>map { it.user?.id }</code> narrows the auth state to the one thing this screen cares about;
+<code>distinctUntilChanged</code> stops an unrelated change — a spinner flag, an error message — from
+triggering a reload; <code>collect</code> runs for every distinct account, including "nobody". The
+collection lives as long as the ViewModel.</p>
+
+<h3>Into Compose</h3>
+
+<p>The last step is the one from the state lesson: <code>collectAsStateWithLifecycle()</code> at the
+top of a screen, which collects while the screen is at least started and pauses in the background. A
+<code>StateFlow</code> is <em>hot</em> — it holds its value whether anyone is listening — so pausing
+collection loses nothing; the screen gets the current value the moment it resumes.</p>
+
+<h3>What about one-off events?</h3>
+
+<p>You will see <code>SharedFlow</code> and <code>Channel</code> used to send a ViewModel's one-off
+events — "navigate now", "show the payment sheet" — to the screen. This app deliberately does not.
+An event emitted while the screen is between Activities (mid-rotation) can be lost or delivered twice.
+Instead the ViewModel puts the event in its state, and the screen clears it once handled — the
+payments lesson shows the pattern end to end.</p>
+
+<h2>Next</h2>
+
+<p>Stores, ViewModels, repositories, reducers — the pieces are all on the table now. The next lesson
+puts them in order: the layers of this app, which way the dependencies point, and why.</p>

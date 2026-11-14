@@ -16,7 +16,7 @@ WordPress is no longer in the request path.
 | Site | https://lovemesomecoding.com (also `www`) |
 | Admin console | https://lovemesomecoding.com/admin — user `folauk` |
 | Admin API | https://api.lovemesomecoding.com |
-| Content | **954 posts**, 46 categories, 12 static pages, 336 images  <br>(posts/categories after the 2026-10-04 AI-Assisted Engineering seed; pages/images not re-counted) |
+| Content | **977 posts**, 47 categories, 12 static pages, 336 images  <br>(posts/categories after the 2026-10-10 Android seed; pages/images not re-counted) |
 | Cost | ≈ **$0.60/month** + $16/yr domain (was $25/mo on DreamHost) |
 
 ### Architecture
@@ -44,6 +44,9 @@ Rollback = point the apex/www ALIAS records back to `69.163.227.84` (60s TTL).
 - [x] Backend deployed 2026-09-29 from the committed tree (which includes `swift` in
       `SUPPORTED_LANGUAGES`) plus the new `/pages` API — `/ios` posts are safe to edit in `/admin`.
       Static pages (About Me etc.) are editable under **Pages**; see `projects/admin_pages/`.
+- [ ] **Android track** (`projects/android_tutorial/`): **live 2026-10-10** — 23 posts seeded to prod,
+      frontend deployed (build `c0ff134-dirty`). Still uncommitted: frontend `nav.ts` (commit it before
+      the next push to `main`, or CI redeploys without the Android nav link), demo project, this repo.
 - [ ] Commit the Oracle track — three repos have uncommitted changes
       (`projects/oracle/progress_report.md` lists them). The content itself is live.
 - [x] **Publish** works without GitHub (2026-09-29): moved to AWS CodeBuild. No token needed.
@@ -55,10 +58,11 @@ Rollback = point the apex/www ALIAS records back to `69.163.227.84` (60s TTL).
 
 ## Repos
 
-Three separate git repos. Only `claude_lovemesomecoding` (this one) holds project docs.
+Four separate git repos. Only `claude_lovemesomecoding` (this one) holds project docs.
 
 - `lovemesomecoding_frontend` — Next.js 14 static export. **Public repo.**
 - `lovemesomecoding_backend` — FastAPI + Mangum on Lambda. Remote not yet created.
+- `ai_repo_lovemesomecoding.com` — RAG tutorial code (`projects/rag_tutorial/`). **Public repo.**
 - `claude_lovemesomecoding` — parent; `projects/rewrite/` holds the migration scripts and
   `progress_report.md` (full history and decisions live there, not here).
 

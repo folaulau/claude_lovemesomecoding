@@ -1,0 +1,240 @@
+<p>Writing an Android app is mostly a loop: change something, see it, check it. The tools in this
+lesson shorten each part of that loop — previews so you see a component without building and running
+the app, lint so mistakes are caught before review, formatting so nobody argues about whitespace, and
+the profilers for when something is slow.</p>
+
+<h2>Compose previews</h2>
+
+<p>A preview is a composable annotated <code>@Preview</code>. Android Studio renders it in the editor,
+without an emulator, and re-renders as you type:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Preview(showBackground = true, backgroundColor = 0xFFFFF8F0)
+@Composable
+private fun ProductCardPreview() {
+    PizzaTheme {
+        Column(Modifier.padding(Spacing.lg), verticalArrangement = Arrangement.spacedBy(Spacing.md)) {
+            ProductCard(SampleData.pepperoni, onClick = {})
+            ProductCard(SampleData.cola, onClick = {})
+        }
+    }
+}
+</code></pre>
+
+<p>Three habits make previews useful rather than decorative. Wrap the content in the app's theme, so the
+preview looks like the app. Set <code>showBackground</code> and the background colour, or the component
+is drawn on transparent white and hides its own edges. And preview the <em>variants</em> together — a
+pizza and a drink, side by side — because the bug is usually in the case you did not look at.</p>
+
+<h3>Why previews need stateless screens</h3>
+
+<p>A preview runs inside Android Studio's layout renderer, which has no Hilt container, no network, no
+DataStore and no Activity. A composable that calls <code>hiltViewModel()</code> cannot render there at
+all. That is the practical reason every screen in this app is split in two (the state lesson): the
+route composable talks to Hilt, the content composable takes plain values — and only the content is
+previewed:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Preview(showBackground = true, backgroundColor = 0xFFFFF8F0)
+@Composable
+private fun OrdersPreview() {
+    PizzaTheme {
+        OrdersContent(
+            UiState.Loaded(
+                listOf(
+                    SampleData.order(OrderStatus.PREPARING, id = "a1b2c3d4-0000"),
+                    SampleData.order(OrderStatus.COMPLETED, id = "e5f6a7b8-0000"),
+                ),
+            ),
+            onOpenOrder = {},
+            onRetry = {},
+            onBrowseMenu = {},
+        )
+    }
+}
+</code></pre>
+
+<p>The values come from one object of fixed sample data, shared by previews and tests:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">object SampleData {
+    private const val NOW = "2026-10-10T12:00:00Z"
+
+    val pepperoni = Product(
+        id = "p-pepperoni", name = "Pepperoni", description = "Classic pepperoni and mozzarella.",
+        type = ProductType.PIZZA, active = true, displayOrder = 1,
+        sizes = listOf(
+            ProductSize("s1", SizeName.SMALL, 9.99),
+            ProductSize("s2", SizeName.MEDIUM, 12.99),
+            ProductSize("s3", SizeName.LARGE, 15.99),
+        ),
+        createdAt = NOW, updatedAt = NOW,
+    )
+    // …
+</code></pre>
+
+<p>It ships in the APK — previews live next to the code they show — and R8 removes it from a release
+build, because nothing reachable at runtime refers to it. The iOS version of this app has the same
+split for the same reason: a SwiftUI preview cannot reach a backend either.</p>
+
+<h3>Preview the states, not just the happy one</h3>
+
+<p>Because the content composable takes a <code>UiState</code>, previewing the awkward states costs one
+line each: <code>MenuContent(UiState.Loading, …)</code>, <code>MenuContent(UiState.Failed("You appear to
+be offline.", isRetryable = true), …)</code>, <code>MenuContent(UiState.Empty, …)</code>. Those are the
+screens nobody sees during development, because the local backend is always up and always has data — and
+they are exactly the screens customers see on a train. A preview per state is the cheapest way to make
+sure each one looks deliberate.</p>
+
+<h3>More than one preview</h3>
+
+<p><code>@Preview</code> takes parameters that turn one composable into a checklist:
+<code>fontScale = 2f</code> renders at double text size, which is the fastest way to find a layout that
+clips; <code>uiMode = Configuration.UI_MODE_NIGHT_YES</code> renders dark; <code>device</code> renders
+at a tablet or foldable size. Several annotations on one function show several renderings at once, and
+<code>@PreviewParameter</code> feeds a list of sample values through the same preview. Interactive mode
+lets you tap a preview, and Live Edit pushes literal changes — a colour, a padding — to a running
+emulator without a rebuild.</p>
+
+<h2>Android Lint as a build gate</h2>
+
+<p>Lint is Android's static analyser: several hundred checks for correctness, security, accessibility,
+performance and API usage, aware of things the compiler is not — the manifest, resources, target SDK
+behaviour. It is most useful when it cannot be ignored:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">lint {
+    warningsAsErrors = true
+    abortOnError = true
+    ignoreTestSources = true
+}
+</code></pre>
+
+<p><code>warningsAsErrors</code> plus <code>abortOnError</code> make every finding fail the build, which
+keeps the report at "No issues found" instead of letting it drift into forty warnings nobody reads. On
+this app lint found four real things worth knowing, all fixed: a target SDK one version behind, an
+adaptive icon without a monochrome layer for Android 13's themed icons, a manifest with backup rules for
+old Android but not Android 12's new mechanism, and a debug network config that permits cleartext — that
+last one deliberate, and suppressed with a comment saying so.</p>
+
+<p><code>ignoreTestSources</code> has a story. With it off, lint's analysis of the unit tests failed on
+the first build after any test change — "Unexpected failure during lint analysis … No such file or
+directory" — and passed on a rerun. The missing file was a Hilt factory that KSP had just regenerated;
+lint had read the file list before regeneration. Its own error message called it a bug in lint. A check
+that fails one build in two trains everyone to rerun until green, which is worse than not having the
+check, so test sources are excluded and tests are checked by running them.</p>
+
+<p>Run it with <code>./gradlew lintDebug</code>; the HTML report in <code>app/build/reports/</code>
+explains each finding with a link to the guidance behind it, and Android Studio shows the same checks
+inline as you type, so most findings are fixed before a build ever runs them. The build gate is the backstop, not the first
+line.</p>
+
+<p>For a large existing project, <code>lint { baseline = file("lint-baseline.xml") }</code> records
+today's findings so only <em>new</em> ones fail the build — the realistic way to adopt a strict gate
+without fixing three hundred issues first.</p>
+
+<h2>Formatting</h2>
+
+<p>Formatting is a solved problem, as long as nobody has to think about it. The rules live in an
+<code>.editorconfig</code> that Android Studio, ktlint and most editors read:</p>
+
+<pre class="language-ini"><code class="language-ini">[*.{kt,kts}]
+indent_size = 4
+max_line_length = 120
+# Compose functions are PascalCase by convention; ktlint's function-naming rule would flag every one.
+ktlint_function_naming_ignore_when_annotated_with = Composable
+ktlint_code_style = android_studio
+</code></pre>
+
+<p>The one non-obvious line: ktlint's naming rule wants functions in camelCase, and every composable is
+PascalCase by convention — so it is told to ignore functions annotated <code>@Composable</code>. The
+ktlint and Spotless Gradle plugins can enforce the same file in CI. This project stops at the
+<code>.editorconfig</code> — Android Studio's reformat applies it — and the place to add enforcement is
+the CI workflow, next to lint. <strong>detekt</strong> is the other common tool, closer to lint than to a
+formatter: complexity, long methods, code smells.</p>
+
+<h2>Logging without leaking</h2>
+
+<p>Android's <code>Log</code> writes to Logcat, which on an old or rooted device other apps can read,
+and which ends up in bug reports customers attach to emails. So the rule is simple: never log a token, a
+password, an email address or a card detail, in any build. The app's HTTP logging is restricted to debug
+builds and to the request line:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">if (BuildConfig.DEBUG) {
+    addInterceptor(
+        HttpLoggingInterceptor().setLevel(HttpLoggingInterceptor.Level.BASIC),
+    )
+}
+</code></pre>
+
+<p>…and a decoding failure is logged in full — the exception names the field that did not match, which
+is what a developer needs — while the customer sees a generic sentence. A tag constant per class
+(<code>private const val TAG = "ApiCaller"</code>) makes Logcat filterable by component. Libraries like
+Timber add a release-build switch; R8's <code>-assumenosideeffects</code> rule can strip
+<code>Log.d</code> calls from release entirely.</p>
+
+<h2>Looking inside a running app</h2>
+
+<p>Android Studio's <strong>App Inspection</strong> window attaches to a debug build on a device:
+the <strong>Network Inspector</strong> shows every OkHttp request with headers and bodies and a timeline,
+the <strong>Background Task Inspector</strong> shows WorkManager jobs, and the Database Inspector queries
+a Room database live. For everything else there is <code>adb</code>, and a handful of commands cover most
+of what this project needed:</p>
+
+<pre class="language-bash"><code class="language-bash">adb devices                                          # which devices and emulators are attached
+adb -s emulator-5556 install -r app-debug.apk        # target one device when several are running
+adb shell am start -W -n &lt;package&gt;/&lt;activity&gt;        # launch and report the start time
+adb shell am kill &lt;package&gt;                          # simulate process death (app in background)
+adb logcat --pid=$(adb shell pidof &lt;package&gt;)        # this app's log only
+adb exec-out screencap -p &gt; screen.png               # screenshot
+</code></pre>
+
+<p>The <code>-s</code> flag matters more than it looks: with a second emulator running, every
+<code>adb</code> command without it fails with "more than one device".</p>
+
+<h2>Gradle settings that matter</h2>
+
+<pre class="language-properties"><code class="language-properties">org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+org.gradle.caching=true
+org.gradle.configuration-cache=true
+android.useAndroidX=true
+# Each library's R class holds only its own resources, so changing one string does not recompile
+# every module that depends on it.
+android.nonTransitiveRClass=true
+</code></pre>
+
+<ul>
+<li><strong><code>jvmargs</code></strong> — the Gradle daemon's heap. A Compose and Hilt build needs
+more than the default, and when it runs out it reports "GC overhead limit exceeded", which names the
+symptom, not the fix.</li>
+<li><strong><code>caching</code></strong> — reuse task outputs across builds and branches. Switching
+back to a branch you built yesterday is nearly instant.</li>
+<li><strong><code>configuration-cache</code></strong> — skip re-evaluating the build scripts when they
+have not changed. It is the single biggest speed-up for small edits.</li>
+<li><strong><code>nonTransitiveRClass</code></strong> — each module's <code>R</code> class holds only
+its own resources, so changing a string does not recompile everything downstream.</li>
+</ul>
+
+<h2>When the app is slow</h2>
+
+<p>Three tools, in the order to reach for them, and one rule: <strong>measure a release build</strong>.
+A debug build runs with Compose's debugging aids on and R8 off, and can be several times slower than what
+customers run.</p>
+
+<ul>
+<li><strong>Layout Inspector</strong> shows the live composition with recomposition and skip counts per
+composable. A list row whose recompose count climbs while its skip count stays at zero is the one
+recomposing for nothing.</li>
+<li><strong>The Profiler</strong> records CPU, memory and frame timing. A janky scroll shows up as frames
+over 16ms; the trace shows which function was on the main thread at the time.</li>
+<li><strong>Macrobenchmark</strong> measures startup and scrolling on a real device, repeatably, and
+generates a <strong>baseline profile</strong> — a list of the hot code paths shipped with the app so
+they are compiled ahead of time instead of interpreted on first use. For a Compose app it is commonly the
+largest single improvement to cold start and first scroll.</li>
+</ul>
+
+<p>Day to day, the humbler tools do most of the work. <strong>Logcat</strong> filtered to the app's
+package (<code>package:mine</code> in Android Studio) shows the HTTP logging interceptor's one line per
+request and every <code>Log.w</code> the stores write. <strong>StrictMode</strong>, enabled in a debug
+build, flags disk or network access on the main thread the moment it happens.</p>
+
+<h2>Next</h2>
+
+<p>The last practical lesson: getting from a debug build on an emulator to an app on the Play Store —
+build types, R8, signing, App Bundles, CI, and what review actually asks of you.</p>

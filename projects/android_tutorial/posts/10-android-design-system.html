@@ -1,0 +1,335 @@
+<p>Nine lessons in, every screen has used the same red, the same rounded cards, the same 16dp gaps
+and the same button. None of those values appear in a screen's code. They come from a design system —
+a small set of files that every screen draws from, so that changing the brand is a change in one
+place rather than a search across forty.</p>
+
+<p>Material 3, Android's design language, provides much of a design system out of the box. This lesson
+is how to build on it rather than around it: where Material's colour scheme fits, where it runs out,
+and how to fill the gap without fighting the framework.</p>
+
+<h2>Three layers</h2>
+
+<p>The structure is the same one the iOS version of this app uses, and most mature design systems
+converge on it:</p>
+
+<ol>
+<li><strong>Tokens</strong> — raw values with no meaning: this red, this grey, 16dp.</li>
+<li><strong>Semantic roles</strong> — what each value is <em>for</em>: the primary colour, the text
+colour, the colour of a successful order.</li>
+<li><strong>Components</strong> — the button, the card, the badge, built only from semantic
+roles.</li>
+</ol>
+
+<p>The point of the middle layer is that features never name a token. A screen asks for "the primary
+colour", not "red", and the day the brand red changes — or a dark palette arrives — the change happens
+in the semantic layer and nowhere else.</p>
+
+<h2>Layer 1: tokens</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">object Palette {
+    // `Red` and `Black` are lifted straight from the web tokens so all five apps match.
+    val Red = Color(0xFFD8102A)
+    val RedDark = Color(0xFFAB0D21)
+    val RedSoft = Color(0xFFFDEAEC)
+    val Black = Color(0xFF231F20)
+    val Cream = Color(0xFFFFF8F0)
+    val White = Color(0xFFFFFFFF)
+
+    val Grey900 = Color(0xFF231F20)
+    val Grey700 = Color(0xFF4A4746)
+    val Grey600 = Color(0xFF6C6A68)
+    val Grey400 = Color(0xFFA9A5A1)
+    val Grey300 = Color(0xFFD5D1CD)
+    val Grey200 = Color(0xFFECEAE7)
+    val Grey100 = Color(0xFFF5F3F0)
+    // …
+</code></pre>
+
+<p>The red and black are copied from the web app's token file, so all five apps against this backend
+match. Colours are written as <code>0xAARRGGBB</code> — the leading <code>FF</code> is full
+opacity.</p>
+
+<p>Spacing and shape are tokens too:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">object Spacing {
+    val xs = 4.dp
+    val sm = 8.dp
+    val md = 12.dp
+    val lg = 16.dp
+    val xl = 24.dp
+    val xxl = 32.dp
+    val xxxl = 48.dp
+}
+</code></pre>
+
+<p>A 4dp grid. Every gap in the app is one of these, never a literal <code>13.dp</code>. That sounds
+like bureaucracy until you look at a screen built without it: thirteen slightly different paddings,
+none of them chosen, all of them visible as a vague sense that the layout is off.</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val MinTouchTarget = 48.dp
+</code></pre>
+
+<p>The minimum touch target is a token rather than a magic number in each component, because it is a
+rule — 48dp, from Material's accessibility guidance — that every tappable thing must honour.</p>
+
+<h2>Layer 2: semantic roles, and where Material fits</h2>
+
+<p>Material 3 already has a semantic layer: the <code>ColorScheme</code>, with roles like
+<code>primary</code>, <code>onPrimary</code> (text drawn <em>on</em> primary), <code>surface</code>,
+<code>onSurfaceVariant</code>, <code>outline</code> and <code>error</code>. Every Material
+component reads its colours from those roles. Fill them with your brand and every stock button,
+text field, chip and navigation bar picks it up with no further work:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val scheme = lightColorScheme(
+    primary = colors.primary,
+    onPrimary = colors.onPrimary,
+    primaryContainer = colors.primarySoft,
+    onPrimaryContainer = colors.primaryDark,
+    secondary = colors.surfaceInverse,
+    onSecondary = colors.onSurfaceInverse,
+    background = colors.background,
+    onBackground = colors.text,
+    surface = colors.surface,
+    onSurface = colors.text,
+    surfaceVariant = colors.surfaceAlt,
+    onSurfaceVariant = colors.textMuted,
+    surfaceContainerLow = colors.background,
+    outline = colors.border,
+    outlineVariant = colors.borderSubtle,
+    error = colors.danger,
+)
+</code></pre>
+
+<p>This is the part people skip, and then spend weeks overriding colours component by component.
+Map the scheme first; override only what the scheme cannot express.</p>
+
+<h3>Where Material runs out</h3>
+
+<p>The <code>ColorScheme</code> has no role for "success" or "warning". An order badge needs both —
+green for completed, amber for awaiting payment. Inventing meanings for unused Material roles
+(<code>tertiary</code> as success?) works until someone else reads the code. Instead the app defines
+its own semantic set:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Immutable
+data class PizzaColors(
+    val primary: Color = Palette.Red,
+    val primaryDark: Color = Palette.RedDark,
+    val primarySoft: Color = Palette.RedSoft,
+    // …
+</code></pre>
+
+<p>…and makes it available the same way Material makes its own:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">private val LocalPizzaColors = staticCompositionLocalOf { PizzaColors() }
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">object PizzaTheme {
+    val colors: PizzaColors
+        @Composable @ReadOnlyComposable
+        get() = LocalPizzaColors.current
+}
+</code></pre>
+
+<p>A <code>CompositionLocal</code> is a value provided by an ancestor and readable by any descendant,
+without being passed through every function in between. <code>MaterialTheme.colorScheme</code> is
+itself a CompositionLocal read through an object; <code>PizzaTheme.colors</code> copies the pattern
+exactly, so a screen reads <code>PizzaTheme.colors.success</code> the way it reads
+<code>MaterialTheme.colorScheme.primary</code>.</p>
+
+<p>Two details. <code>staticCompositionLocalOf</code> rather than <code>compositionLocalOf</code>: the
+static variant does not track who read it, so changing it recomposes everything beneath the provider —
+expensive if it changed often, cheaper for a theme that changes approximately never. And
+<code>@ReadOnlyComposable</code> on the getter tells the compiler it only reads, which lets it skip some
+bookkeeping on every call.</p>
+
+<p>CompositionLocals are easy to overuse. They are right for ambient, app-wide values — theme, locale,
+density — and wrong for a screen's data, which should be passed explicitly so a reader can see where
+it comes from.</p>
+
+<h2>The theme composable</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun PizzaTheme(content: @Composable () -&gt; Unit) {
+    val colors = PizzaColors()
+    val scheme = lightColorScheme(
+        primary = colors.primary,
+        onPrimary = colors.onPrimary,
+        primaryContainer = colors.primarySoft,
+        onPrimaryContainer = colors.primaryDark,
+        secondary = colors.surfaceInverse,
+        onSecondary = colors.onSurfaceInverse,
+        background = colors.background,
+        onBackground = colors.text,
+        surface = colors.surface,
+        onSurface = colors.text,
+        surfaceVariant = colors.surfaceAlt,
+        onSurfaceVariant = colors.textMuted,
+        surfaceContainerLow = colors.background,
+        outline = colors.border,
+        outlineVariant = colors.borderSubtle,
+        error = colors.danger,
+    )
+
+    CompositionLocalProvider(LocalPizzaColors provides colors) {
+        MaterialTheme(colorScheme = scheme, typography = PizzaTypography, content = content)
+    }
+}
+    // …
+</code></pre>
+
+<p>One composable provides both layers. <code>MainActivity</code> wraps the whole app in it, and every
+<code>@Preview</code> wraps its content in it too — which is why a preview looks exactly like the app.
+Typography is mapped the same way as colour: Material's type scale (<code>titleMedium</code>,
+<code>bodySmall</code>) filled with the app's sizes and weights, in <code>sp</code> so the customer's
+font-size setting scales all of it.</p>
+
+<h3>Dynamic colour and dark mode</h3>
+
+<p>Android 12 can derive a whole colour scheme from the user's wallpaper —
+<code>dynamicLightColorScheme(context)</code>. It is lovely for a utility app and wrong for a brand: a
+pizza brand is red whatever the wallpaper is, so this app does not use it.</p>
+
+<p>The app is also light-only, matching the three web frontends and the iOS app. That is a scope
+decision, and the structure makes undoing it cheap: a second <code>PizzaColors</code> and a second
+<code>lightColorScheme</code> mapping (a <code>darkColorScheme</code>), chosen with
+<code>isSystemInDarkTheme()</code> inside <code>PizzaTheme</code>. No screen changes, because no screen
+names a colour.</p>
+
+<h2>Two themes: the window and Compose</h2>
+
+<p>There is a second, older theme that Compose does not replace: the XML theme the
+<em>window</em> uses before Compose draws its first frame.</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;style name="Theme.Pizza" parent="android:Theme.Material.Light.NoActionBar"&gt;
+    &lt;item name="android:windowBackground"&gt;@color/pizza_background&lt;/item&gt;
+&lt;/style&gt;
+</code></pre>
+
+<p>Its only job is the window background. Without it, the app flashes white between the splash
+screen and the first Compose frame — a visible stutter on every launch. Everything else the customer
+sees is styled by <code>PizzaTheme</code>. (The same file also defines the splash screen theme; that
+is the lifecycle lesson.)</p>
+
+<h2>Layer 3: components</h2>
+
+<p>A component is built from semantic roles only, and encodes behaviour that every use of it would
+otherwise have to remember. The button is the clearest example:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun PizzaButton(
+    text: String,
+    onClick: () -&gt; Unit,
+    modifier: Modifier = Modifier,
+    style: PizzaButtonStyle = PizzaButtonStyle.PRIMARY,
+    enabled: Boolean = true,
+    isLoading: Boolean = false,
+    fullWidth: Boolean = true,
+) {
+    val sizing = modifier
+        .then(if (fullWidth) Modifier.fillMaxWidth() else Modifier)
+        .heightIn(min = MinTouchTarget)
+        // TalkBack hears "Place order, busy" rather than an unlabelled spinner.
+        .semantics { if (isLoading) stateDescription = "Busy" }
+    val shape = RoundedCornerShape(Radius.md)
+    val isEnabled = enabled &amp;&amp; !isLoading
+    val content: @Composable () -&gt; Unit = { ButtonContent(text, isLoading) }
+        // …
+</code></pre>
+
+<p>Three decisions are built in:</p>
+
+<ul>
+<li><strong>A <code>style</code>, not a colour.</strong> Callers say what the button <em>is</em> —
+the primary action, a secondary one, a quiet text link — and the component maps that onto Material's
+three button types and the brand colours.</li>
+<li><strong>A loading state that does not move the layout.</strong> The label stays in place at zero
+alpha with a spinner on top, so the button keeps its size instead of shrinking to the width of a
+spinner and shoving the screen around mid-tap.</li>
+<li><strong>A loading button is disabled.</strong> The classic double-submitted order — a customer
+tapping "Place order" twice on a slow network — is prevented here, once, instead of in every screen
+that has a submit button.</li>
+</ul>
+
+<pre class="language-kotlin"><code class="language-kotlin">private fun ButtonContent(text: String, isLoading: Boolean) {
+    Box(contentAlignment = Alignment.Center) {
+        Text(text, modifier = Modifier.alpha(if (isLoading) 0f else 1f))
+        if (isLoading) {
+            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+        }
+    }
+}
+</code></pre>
+
+<h3>Components that encode a rule</h3>
+
+<p>The order badge maps every status to a pair of semantic colours, with an exhaustive
+<code>when</code>:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val (foreground, background) = when (status) {
+    OrderStatus.PENDING_PAYMENT -&gt; colors.warning to colors.warningSoft
+    OrderStatus.PAID -&gt; colors.info to colors.infoSoft
+    OrderStatus.PREPARING -&gt; colors.info to colors.infoSoft
+    OrderStatus.COMPLETED -&gt; colors.success to colors.successSoft
+    OrderStatus.CANCELLED -&gt; colors.danger to colors.dangerSoft
+}
+</code></pre>
+
+<p>Add a sixth order status to the domain and this file stops compiling until the new status has a
+colour. A design system that is checked by the compiler does not drift.</p>
+
+<p>The segmented picker is generic over what it picks, so the same component chooses a size in the
+builder and delivery-or-pickup in the cart, with the compiler checking that each callback gets the
+right type:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">data class Option&lt;T&gt;(val value: T, val label: String, val subtitle: String? = null)
+// ...
+fun &lt;T&gt; OptionPicker(
+    options: List&lt;Option&lt;T&gt;&gt;,
+    selected: T,
+    onSelect: (T) -&gt; Unit,
+    modifier: Modifier = Modifier,
+) {
+</code></pre>
+
+<p>And the shared state views make a rule impossible to forget: an error screen offers "Try again"
+only when retrying could work, because the button is part of the component, not of each screen:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun ErrorState(
+    message: String,
+    isRetryable: Boolean,
+    onRetry: () -&gt; Unit,
+    modifier: Modifier = Modifier,
+) {
+    EmptyState(
+        emoji = "😕",
+        title = "Something went wrong",
+        message = message,
+        modifier = modifier,
+        // A 400 will fail identically on retry, so offering the button would be a lie.
+        action = if (isRetryable) {
+            { PizzaButton(text = "Try again", onClick = onRetry, style = PizzaButtonStyle.SECONDARY) }
+        } else {
+            null
+        },
+    )
+}
+</code></pre>
+
+<h2>The rules that keep it a system</h2>
+
+<ul>
+<li><strong>Features never import <code>Palette</code>.</strong> If a screen needs a colour the
+semantic layer does not have, add the role; do not reach past it.</li>
+<li><strong>No literal dp in features.</strong> Spacing comes from <code>Spacing</code>; sizes that are
+genuinely one-off (a 64dp product tile) stay in the component that owns them.</li>
+<li><strong>Components know nothing about pizza.</strong> <code>CardContainer</code>,
+<code>PizzaButton</code> and <code>OptionPicker</code> would work unchanged in a different app. The
+moment a component takes a <code>Product</code>, it has become a feature.</li>
+<li><strong>Wrap Material; do not replace it.</strong> Every component here is a thin layer over a
+Material one, so it inherits Material's accessibility, ripple, focus handling and state layers for
+free.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>The menu, the cart and the orders have all come from somewhere. The next lesson is that somewhere:
+Retrofit and OkHttp, an interceptor that attaches the token, kotlinx.serialization and its three
+dangerous defaults, and why your first request to a dev server fails with a cleartext error.</p>

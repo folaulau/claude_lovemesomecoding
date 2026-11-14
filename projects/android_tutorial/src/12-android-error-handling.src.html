@@ -1,0 +1,196 @@
+<p>A network call on a phone fails constantly: in a lift, on a train, when the backend is redeploying,
+when the customer's session expired overnight. An app that handles errors well is not one where
+errors are rare. It is one where every failure turns into something the customer can act on — retry,
+sign in again, fix a field — and where the failures that need no action are not shown at all.</p>
+
+<p>This lesson builds that in three layers: one error type whose cases are decisions, one place that
+produces it, and two small types that carry it to the screen.</p>
+
+<h2>Errors as decisions</h2>
+
+<p>Retrofit throws <code>HttpException</code>. OkHttp throws <code>IOException</code> subclasses.
+The serialiser throws <code>SerializationException</code>. Letting those leak into the UI means every
+screen re-learns three libraries' exception hierarchies. Instead, everything is mapped onto one
+type:</p>
+
+@@kotlin
+<<K/core/network/ApiError.kt | sealed class ApiError | data object Unauthorized>>
+    class Network(message: String) : ApiError(message)
+    class Decoding(message: String) : ApiError(message)
+@@
+
+<p>The cases are not "kinds of exception". They are <em>what a caller should do</em>:</p>
+
+<ul>
+<li><strong><code>Api</code></strong> — the server answered and said no. Show its message, and render
+any field-level errors next to the fields.</li>
+<li><strong><code>Unauthorized</code></strong> — split out of <code>Api</code> on purpose. A 401 does
+not mean "show this message", it means "sign in again", and a separate case means no screen can
+handle it by accident as a generic error.</li>
+<li><strong><code>Network</code></strong> — the request never arrived. On a phone that is usually a
+lost signal, and the copy should say so.</li>
+<li><strong><code>Decoding</code></strong> — we reached the server and could not read its answer.
+That is <em>our</em> bug, not the customer's connection, and it is logged as one.</li>
+</ul>
+
+<p>Because the class is sealed, the properties that summarise it are exhaustive <code>when</code>s.
+The most useful one decides whether a "Try again" button should exist at all:</p>
+
+@@kotlin
+<<K/core/network/ApiError.kt | val isRetryable: Boolean | ^        }$>>
+@@
+
+<p>A 400 will fail again with exactly the same body, so offering to retry it is a lie. A dropped
+connection or a 503 might well succeed in a second.</p>
+
+<h2>One place that maps</h2>
+
+<p>Every repository call goes through <code>ApiCaller</code>, which runs the call and translates
+whatever it throws:</p>
+
+@@kotlin
+<<K/core/network/ApiCall.kt | suspend operator fun <T> invoke | ^    }$ | nc>>
+@@
+
+<p><code>operator fun invoke</code> lets the instance be called like a function, so a repository reads
+almost like the bare Retrofit call:</p>
+
+@@kotlin
+<<K/data/repository/RemoteRepositories.kt | class RemoteCatalogRepository | ^}$>>
+@@
+
+<p>Look at the order of the <code>catch</code> blocks, because it is the most important line in the
+file. <strong><code>CancellationException</code> is caught first and rethrown untouched.</strong></p>
+
+<h3>The wrong way: swallowing cancellation</h3>
+
+<p>Coroutines are cancelled by throwing <code>CancellationException</code> at their next suspension
+point. When a screen leaves, its <code>viewModelScope</code> is cancelled, and every request in flight
+receives one. It is an <code>Exception</code>, so a broad catch catches it:</p>
+
+@@kotlin
+// ✗ the coroutine was told to stop — and carries on, showing an error for a screen that is gone
+try {
+    _state.value = UiState.Loaded(repository.products())
+} catch (e: Exception) {
+    _state.value = UiState.failure(e)
+}
+@@
+
+<p>Two bugs at once. The coroutine keeps running after it was cancelled, because the signal was
+swallowed. And it reports the cancellation as a failure — to a customer who simply navigated away. The
+fix is a rule applied everywhere in this app: catch <code>CancellationException</code> first and
+rethrow it, then handle the rest.</p>
+
+@@kotlin
+<<K/feature/menu/MenuStore.kt | } catch (e: CancellationException) { | ^        }$>>
+@@
+
+<p>The same trap hides in <code>runCatching { }</code>, which catches <code>Throwable</code> —
+cancellation included. It is fine around code that cannot suspend; around a suspending call it has
+the same problem as the broad catch.</p>
+
+<h3>When the error body is not JSON</h3>
+
+@@kotlin
+<<K/core/network/ApiCall.kt | private fun fromHttp( | ^    }$ | nc>>
+@@
+
+<p>A proxy, a load balancer or a crashed server answers with an HTML error page. Parsing that as JSON
+would throw a parse error over the top of the real problem, and the customer would be told "Unexpected
+token &lt;". So a body that cannot be read falls back to the status code, and a body that can be read
+contributes its message and its field errors.</p>
+
+<h3>Messages a person can use</h3>
+
+@@kotlin
+<<K/core/network/ApiCall.kt | private fun transportMessage( | ^    }$>>
+@@
+
+<p>OkHttp's own message — "failed to connect to /10.0.2.2 (port 8085) after 15000ms" — is useless to a
+customer and only half useful to a developer. The mapped version names the likely cause. The fallback
+includes the URL it tried, which turns the most common development failure — the backend is not
+running — into a self-answering question.</p>
+
+<p>Every branch of this mapping is pinned down by a test against a real local HTTP server: a 401 must
+become <code>Unauthorized</code>, an HTML 502 must produce "Request failed with 502." and be
+retryable, a malformed success body must be a decoding error rather than a network one, and a
+cancelled call must arrive as a cancellation. Error handling that is not tested tends to be discovered
+by customers; the testing lesson shows the suite.</p>
+
+<h2>Errors on screen: UiState</h2>
+
+<p>A screen that loads something is in one of five states, and the error is one of them — not a
+separate <code>error</code> property that can be set at the same time as <code>isLoading</code>:</p>
+
+@@kotlin
+<<K/core/util/UiState.kt | fun failure(error: Throwable | ^            \)$>>
+@@
+
+<p><code>UiState.failure</code> carries the message <em>and</em> whether retrying makes sense, read off
+the <code>ApiError</code>. An unknown exception is assumed retryable, because "try again" is a better
+default than a dead end. The screen renders it with the shared component, which shows the retry button
+only when it could help:</p>
+
+@@kotlin
+<<K/feature/menu/MenuScreen.kt | is UiState.Failed -> ErrorState | is UiState.Failed -> ErrorState>>
+@@
+
+<p>Because <code>UiState</code> is sealed and the screen's <code>when</code> has no <code>else</code>,
+a screen that forgot the failure branch would not compile. The eternal spinner — the most common error
+"handling" in mobile apps — cannot be written.</p>
+
+<h2>Errors from writes: ActionOutcome</h2>
+
+<p>Loading has a screen to show its error on. A write — delete an address, save a card — does not; it
+reports with a toast. Its result is a small sealed type of its own:</p>
+
+@@kotlin
+<<K/core/util/ActionOutcome.kt | sealed interface ActionOutcome | val message: String?>>
+        get() = null
+}
+@@
+
+<p>Why not Kotlin's <code>Result</code>? Because <code>Result</code> carries a value or a
+<code>Throwable</code>, and both cases here carry the same thing: a sentence. And because of the third
+case. A customer who opens the card sheet and backs out has neither succeeded nor failed — nothing
+should be shown at all. Modelling that as <code>Failed("")</code>, which every caller must remember to
+special-case, is how an empty red toast eventually reaches production.</p>
+
+<p>The profile's writes all share one shape — do it, reload quietly, report — written once:</p>
+
+@@kotlin
+<<K/feature/profile/ProfileViewModel.kt | private fun perform( | ^    }$>>
+@@
+
+@@kotlin
+<<K/app/ToastCenter.kt | fun ToastCenter.show(outcome: ActionOutcome) | ^}$>>
+@@
+
+<p>The extension function maps each case to a style, and <code>Cancelled</code> to nothing. Callers
+never decide colours.</p>
+
+<h2>Failures you should not show</h2>
+
+<p>Not every failure deserves a message. The cart is saved to the server, debounced, after every
+change. If a save fails, the cart still works for this session; it just will not survive a relaunch.
+A red toast on every tap while the signal is weak would be worse than the failure, so it is logged
+and nothing else:</p>
+
+@@kotlin
+<<K/feature/cart/CartStore.kt | private suspend fun persist() { | ^    }$ | nc>>
+@@
+
+<p>Likewise, checkout loads the customer's saved addresses; if that fails, checkout falls back to a
+typed address without a word. Before surfacing an error, ask whether the customer can do anything
+about it. If not, log it.</p>
+
+<p>And <code>Unauthorized</code> during launch is handled by doing the obvious thing silently: the
+stored token is invalid, so it is discarded and the app starts signed out. Telling a customer "your
+session has expired" on launch, before they have tried to do anything, is noise.</p>
+
+<h2>Next</h2>
+
+<p>Cancellation keeps coming up. The next lesson is coroutines and Flow properly: scopes and who owns
+them, <code>async</code> for parallel requests, cancellation as a debounce, a polling loop that stops
+itself, and <code>StateFlow</code> from store to screen.</p>

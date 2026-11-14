@@ -1,0 +1,225 @@
+<p>These are the questions Android interviews actually ask, answered briefly and against the app this
+track built. A good interview answer is short, says <em>why</em>, and can point at real code — so each
+answer here names the lesson where the full reasoning lives.</p>
+
+<h2>Lifecycle and state</h2>
+
+<h3>What happens to an Activity when the phone rotates?</h3>
+
+<p>It is destroyed and recreated with the new configuration. Everything held by the Activity or in plain
+<code>remember</code> is lost. A <code>ViewModel</code> survives, because it lives in a store that
+outlives the Activity instance; <code>rememberSaveable</code> and <code>SavedStateHandle</code> values
+survive because they are written to the saved-instance <code>Bundle</code>. (Lesson 5.)</p>
+
+<h3>What is process death, and how do you handle it?</h3>
+
+<p>When the app is in the background, Android may kill its process to reclaim memory, then restore the
+task — same screen, same back stack, same saved state — in a new process when the user returns. Every
+ViewModel and singleton is new and empty. You handle it by saving what the user typed or chose in
+<code>SavedStateHandle</code> or <code>rememberSaveable</code>, saving ids rather than objects, and
+re-fetching data. You test it with <code>adb shell am kill</code> on a backgrounded app. The app's checkout
+keeps its form in the handle for exactly this reason. (Lesson 5.)</p>
+
+<h3>What does a ViewModel survive, and what must it never hold?</h3>
+
+<p>It survives configuration changes and lives as long as its owner — a navigation destination or an
+Activity — is alive; its scope is cancelled when it is cleared. It must never hold an Activity, a View or
+an Activity <code>Context</code>, because it outlives them and would leak a destroyed Activity. That rule
+is why the app's ViewModel cannot own Stripe's payment sheet. (Lessons 5 and 18.)</p>
+
+<h3>remember versus rememberSaveable versus a ViewModel?</h3>
+
+<p><code>remember</code> survives recomposition only. <code>rememberSaveable</code> also survives rotation
+and process death but must fit in a <code>Bundle</code>. A ViewModel survives rotation, holds work that
+must not restart, and is reachable from business logic. Choose by who owns the value and how long it must
+live. (Lesson 4.)</p>
+
+<h2>Compose</h2>
+
+<h3>What is recomposition, and what triggers it?</h3>
+
+<p>Re-running a composable function because observable state it read has changed. Only Compose
+<code>State</code> — or a flow collected into one — triggers it; mutating a plain variable or mutating a
+collection in place does not. Compose skips any composable whose inputs are unchanged. (Lesson 4.)</p>
+
+<h3>Why would a list item not update when you add to a list in state?</h3>
+
+<p>Because the list was mutated in place, so the state box still holds the same instance and nothing was
+notified. Hold immutable values and replace them; the app's builder rebuilds its topping set on every
+toggle for this reason:</p>
+
+@@kotlin
+<<K/feature/menu/PizzaBuilderState.kt | fun toggle(topping: Topping) | ^    }$>>
+@@
+
+<h3>What are stability and strong skipping?</h3>
+
+<p>Compose skips a composable whose parameters have not changed. Historically it could only trust
+<em>stable</em> types, so a <code>List</code> parameter meant the composable never skipped. Since Kotlin
+2.0.20, strong skipping is the default: unstable parameters are compared by instance and lambdas are
+remembered automatically. <code>@Immutable</code> and <code>@Stable</code> are still promises you can make,
+and a broken promise causes missed updates. (Lesson 7.)</p>
+
+<h3>What is state hoisting?</h3>
+
+<p>Moving state up to the lowest common owner and passing it down as a value plus a callback, so the
+component is stateless. The app's quantity stepper takes <code>value</code> and
+<code>onValueChange</code>, which is what lets it drive both a local builder quantity and a cart line in a
+store. (Lesson 4.)</p>
+
+<h3>Why does a LazyColumn need keys?</h3>
+
+<p>Without keys, items are identified by position, so state follows the slot rather than the item when the
+list changes. Keys keep each item's state with the item, enable <code>animateItem</code>, and anchor the
+scroll position — which can hide an item inserted above the first visible one. (Lesson 7.)</p>
+
+<h3>How do you trigger a one-off action, like navigation, from a ViewModel?</h3>
+
+<p>Not from the composable's body, which may run many times. The app models the event as state — a
+nullable request — which the screen handles in a <code>LaunchedEffect</code> keyed on it, then reports
+back so the ViewModel clears it:</p>
+
+@@kotlin
+<<K/feature/checkout/CheckoutViewModel.kt | fun onPaymentSheetPresented() { | ^    }$>>
+@@
+
+<p>Clearing it at handling time means a rotation cannot repeat it. (Lessons 6 and 18.)</p>
+
+<h2>Coroutines and Flow</h2>
+
+<h3>What is structured concurrency?</h3>
+
+<p>Every coroutine runs in a scope that owns it: cancelling the scope cancels its children, and a child's
+failure reaches its parent. Nothing is left running that nobody can stop. The app uses
+<code>viewModelScope</code> for screen work, an injected application scope for work that must outlive a
+screen, and <code>coroutineScope { }</code> for parallel requests that should fail together. (Lesson
+13.)</p>
+
+<h3>Why must you rethrow CancellationException?</h3>
+
+<p>Cancellation is delivered as that exception. Swallowing it in a broad <code>catch</code> keeps a
+cancelled coroutine running and reports the cancellation as an error to a user who simply left the
+screen. Every <code>catch (e: Exception)</code> in the app is preceded by one that rethrows cancellation.
+(Lesson 12.)</p>
+
+<h3>StateFlow or LiveData?</h3>
+
+<p><code>StateFlow</code> in new code. It is Kotlin rather than Android, so it works in pure domain code
+and tests without Android; it has operators (<code>map</code>, <code>stateIn</code>,
+<code>distinctUntilChanged</code>); and Compose collects it lifecycle-aware with
+<code>collectAsStateWithLifecycle</code>. LiveData remains in older codebases and is fine to read.</p>
+
+<h3>How would you debounce saves?</h3>
+
+<p>Cancel the pending job and launch a new one that delays first. Cancellation is the debounce:</p>
+
+@@kotlin
+<<K/feature/cart/CartStore.kt | persistJob?.cancel() | ^        }$>>
+@@
+
+<p>And on a phone, flush immediately when the app leaves the screen, because the process may be killed
+before the delay ends. (Lessons 13 and 17.)</p>
+
+<h3>Mutex or synchronized?</h3>
+
+<p>A <code>Mutex</code> in coroutine code. <code>synchronized</code> blocks the waiting thread — possibly
+the main thread — while <code>withLock</code> suspends the coroutine and frees the thread. (Lesson 13.)</p>
+
+<h2>Architecture</h2>
+
+<h3>Describe your app's architecture.</h3>
+
+<p>Layers with dependencies pointing inwards: features depend on the domain; the domain depends on
+nothing; the data layer implements repository interfaces the domain declares. Rules live in pure functions
+— the cart reducer — and effects in stores. State flows down as <code>StateFlow</code>, events flow up as
+callbacks. (Lesson 14.)</p>
+
+<h3>Why put the cart's rules in a reducer?</h3>
+
+<p>Because a reducer is a pure function from state and action to state: testable with no app, every
+mutation named, and a sealed action type the compiler checks for exhaustiveness. It earns its place where
+state is shared and the rules are real; for local form state it would be ceremony.</p>
+
+@@kotlin
+<<K/domain/cart/CartReducer.kt | is CartAction.SetOrderType | CartAction.Clear ->>>
+@@
+
+<h3>How do you model loading, success, empty and error?</h3>
+
+<p>As one sealed type, not three booleans, so impossible combinations cannot be represented and a screen's
+exhaustive <code>when</code> cannot forget the failure branch:</p>
+
+@@kotlin
+<<K/core/util/UiState.kt | sealed interface UiState | data class Failed>>
+    // …
+@@
+
+<h2>Dependency injection</h2>
+
+<h3>What does Hilt give you over manual DI?</h3>
+
+<p>A generated, compile-time-checked graph: you declare what each class needs and how to build what Hilt
+cannot work out, and it builds everything in the right order, scoped to Android lifetimes, failing the
+build on a missing binding. Manual DI — the iOS version of this app's composition root — is perfectly
+viable for small apps and needs no framework. (Lesson 15.)</p>
+
+<h3>@Provides or @Binds?</h3>
+
+<p><code>@Binds</code> to map an interface to an implementation that already has an <code>@Inject</code>
+constructor; <code>@Provides</code> to build something Hilt cannot construct itself — a third-party type,
+or a class that needs a value Hilt cannot choose, like the cart's debounce.</p>
+
+<h3>How do you swap dependencies in a test?</h3>
+
+<p>For unit tests, pass fakes to constructors — no Hilt involved. For a test of the real graph,
+<code>@TestInstallIn(replaces = …)</code> swaps one module for a fake one. (Lessons 15 and 20.)</p>
+
+<h2>Platform</h2>
+
+<h3>compileSdk, minSdk, targetSdk?</h3>
+
+<p><code>compileSdk</code> is the API you compile against — what you may call; it changes nothing at
+runtime. <code>minSdk</code> is the oldest version the app installs on. <code>targetSdk</code> is the
+version whose behaviour you have tested against; raising it opts out of compatibility shims, and Play
+requires it to stay recent. (Lesson 1.)</p>
+
+<h3>Which Context should you use?</h3>
+
+<p>The application <code>Context</code> for anything that outlives a screen — DataStore, the Keystore,
+Stripe's API client — because it lives as long as the process. An Activity <code>Context</code> only for
+things tied to that Activity, such as showing UI, and never stored in a ViewModel or singleton. Hilt's
+<code>@ApplicationContext</code> qualifier makes the safe choice explicit.</p>
+
+<h3>What is an ANR?</h3>
+
+<p>"Application Not Responding": the main thread was blocked for about five seconds, so the system offers
+to close the app. The cause is blocking work on the main thread — disk, network, a lock. Main-safe suspend
+functions, DataStore instead of SharedPreferences, and <code>Mutex</code> instead of
+<code>synchronized</code> are all ways this track avoids it. (Lessons 13 and 16.)</p>
+
+<h3>Where would you store an auth token?</h3>
+
+<p>Encrypted at rest with a key in the Android Keystore, which never leaves the device, and excluded from
+backup. Not in plain SharedPreferences or DataStore, and not via the deprecated
+EncryptedSharedPreferences. (Lesson 16.)</p>
+
+<h3>Why does a release build crash when debug works?</h3>
+
+<p>Most often R8: something reached only through reflection was removed or renamed. Libraries ship
+consumer keep rules; avoid reflection where you can (kotlinx.serialization generates serialisers at
+compile time); and run a minified build against a real backend before shipping. (Lesson 22.)</p>
+
+<h3>How would you make a screen testable?</h3>
+
+<p>Split it into a route that talks to Hilt and a stateless content composable that takes a
+<code>UiState</code> and lambdas; keep rules in plain classes; depend on interfaces at the network
+boundary; inject scopes and dispatchers. Then the rules test on the JVM, the network against
+MockWebServer, the ViewModel with a test dispatcher, and the UI through the semantics tree. (Lesson
+20.)</p>
+
+<h2>How to use these</h2>
+
+<p>Do not memorise the answers. Every one of them is a claim about code, and the strongest interview answer
+is "here is a case where it mattered" — the order that would not appear in a list, the rotation that would
+have opened a second payment sheet, the lint check that failed one build in two. Build something, break
+it on purpose, and you will have those stories of your own.</p>

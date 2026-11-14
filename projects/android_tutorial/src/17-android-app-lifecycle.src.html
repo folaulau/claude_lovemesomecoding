@@ -1,0 +1,203 @@
+<p>A web page lives until its tab is closed. An Android app does not get that courtesy. It is
+started, stopped, put in the background, and — when the phone needs memory — killed without a word,
+then recreated later as though nothing happened. Two moments in that cycle cause most of the bugs:
+the first few hundred milliseconds after launch, and the moment the app leaves the screen.</p>
+
+<p>This lesson is both, and what this app does at each.</p>
+
+<h2>Two lifecycles</h2>
+
+<p>An <strong>Activity</strong> moves through created, started (visible) and resumed (in front, taking
+input), and back down through paused, stopped and destroyed. Rotation destroys it and creates a new
+one; pressing Home stops it; pressing Back from the root finishes and destroys it.</p>
+
+<p>The <strong>process</strong> has a lifecycle too, and it is the one that matters for saving work.
+Android ranks processes: the foreground app, then visible ones, then those running a service, then
+<em>cached</em> ones — apps in the background, kept in memory only in case the user comes back. When
+memory runs short, cached processes are killed first, oldest first. Your app spends most of its life
+as a cached process that might be killed at any moment.</p>
+
+<p>Compose ties into the Activity's lifecycle quietly. <code>collectAsStateWithLifecycle</code> stops
+collecting when the Activity is stopped and resumes when it starts; a <code>LaunchedEffect</code> is
+cancelled when its composable leaves the composition. Most code never has to look at the lifecycle
+directly. Two pieces of this app do.</p>
+
+<h2>Leaving the screen: the mobile-only problem</h2>
+
+<p>The cart is saved to the server, debounced by 300 milliseconds so that three taps on "+" become one
+write. In a browser that is safe: the debounce always gets to fire. On a phone, a customer can add a
+pizza and switch to their messages within those 300 milliseconds — and the process may then be
+killed before the write ever happens. The pizza is gone the next time they open the app.</p>
+
+<p>The fix is to write immediately, skipping the debounce, the moment the app leaves the
+screen:</p>
+
+@@kotlin
+<<K/feature/cart/CartStore.kt | fun flushPendingWrites() { | ^    }$>>
+@@
+
+<p>The question is what "leaves the screen" means, and the obvious answer is wrong.</p>
+
+<h3>Why not Activity.onStop</h3>
+
+<p>An Activity's <code>onStop</code> fires when the app goes to the background — and also on every
+rotation, because rotation stops and destroys the Activity before creating the new one. Hooking the
+flush there would write the cart on every turn of the phone. What the app wants is the lifecycle of
+the whole <em>application</em>:</p>
+
+@@kotlin
+<<K/PizzaApplication.kt | ProcessLifecycleOwner.get() | ^        \)$>>
+@@
+
+<p><code>ProcessLifecycleOwner</code> (from <code>lifecycle-process</code>) reports the app as a
+whole: <code>ON_START</code> when the first Activity becomes visible, <code>ON_STOP</code> when the
+last one leaves the screen — with a short delay that rides out a rotation, so turning the phone does
+not count. It is registered once, in <code>Application.onCreate</code>, and lives as long as the
+process.</p>
+
+<p>The flush is launched, not awaited. <code>onStop</code> cannot block, and the system gives a short,
+unguaranteed window after it before the process may be frozen or killed. The write races to use that
+window, in the application scope, so it is not cancelled when any screen goes away.</p>
+
+<h3>Best effort, and what guaranteed looks like</h3>
+
+<p>Honesty about that window: a flush in <code>onStop</code> is <em>best effort</em>. In practice it
+completes nearly always — it is one small request — but nothing promises it will. Work that
+<em>must</em> eventually happen, even if the app is killed or the phone restarts, belongs in
+<strong>WorkManager</strong>, which persists the task and runs it when constraints (like a network
+connection) are met. Uploading a photo the customer took is WorkManager work. Saving a cart that is
+also being saved on every change, and that the customer will see on screen if it failed, is not worth
+the machinery.</p>
+
+<p>(The iOS app does the same thing with <code>scenePhase</code>, flushing on <code>.inactive</code>
+as well as <code>.background</code> because it arrives first. The problem is identical; only the
+callback's name differs.)</p>
+
+<h3>Lifecycle hooks for one screen</h3>
+
+<p>Sometimes a <em>screen</em>, not the app, cares about the lifecycle. The Orders tab is the example
+here, and it was found the honest way — by a bug. Its ViewModel survives a tab switch, because the tab's
+back-stack entry is saved rather than destroyed. So an order placed from the Menu tab did not appear in
+the history when the customer switched to Orders; the list was the one loaded before. Compose has an
+effect for exactly this:</p>
+
+@@kotlin
+<<K/feature/orders/OrdersScreen.kt | LifecycleResumeEffect(Unit) { | ^    }$>>
+@@
+
+<p><code>LifecycleResumeEffect</code> runs its block each time the screen's lifecycle reaches
+<em>resumed</em> — when the tab is shown again, and when the customer returns from another app — and
+<code>onPauseOrDispose</code> is where anything it started would be cleaned up. It is scoped to the
+screen, so it stops when the customer navigates away; that is the difference from an app-wide observer
+like the cart flush. The load is quiet (<code>showsLoadingState = false</code>), so returning to the tab
+keeps showing the old list for the few hundred milliseconds until the new one arrives, instead of
+flashing a spinner. <code>LifecycleEventEffect(Lifecycle.Event.ON_STOP) { … }</code> is the
+single-event version.</p>
+
+<h2>Launch: the first few hundred milliseconds</h2>
+
+<p>When the app starts, it does not know who is signed in. The token is encrypted on disk, and reading
+it is asynchronous. Then the token must be checked against the server, because a token that exists may
+have expired. For that window — usually well under a second — the honest answer to "is anyone signed
+in?" is "not yet known".</p>
+
+<p>Drawing the app during that window is how you get the classic launch flicker: the Profile tab shows
+"Sign in", then swaps to the customer's name; the Orders tab briefly shows its signed-out prompt to a
+signed-in customer. So the app does not draw until it knows.</p>
+
+<h3>The splash screen as the launch gate</h3>
+
+<p>Android 12 gave every app a system splash screen, drawn by the OS from the app's theme before any of
+the app's code runs. The <code>core-splashscreen</code> library backports it to older versions and adds
+the useful part: keeping it up until the app is ready. It starts in the theme:</p>
+
+@@markup
+<<RES/values/themes.xml | <style name="Theme.Pizza.Starting" | </style>>>
+@@
+
+<p>The launch Activity uses that theme in the manifest; <code>postSplashScreenTheme</code> names the
+theme to switch to once the splash is dismissed. Then, in the Activity:</p>
+
+@@kotlin
+<<K/MainActivity.kt | installSplashScreen() | installSplashScreen()>>
+@@
+
+<p><code>setKeepOnScreenCondition</code> is polled before each frame; while it returns true, the splash
+stays. It reads the session state from the root ViewModel, so the splash stays up exactly until the
+session is restored. And <code>installSplashScreen()</code> must run <em>before</em>
+<code>super.onCreate</code>, or the theme switch happens too late and the splash flashes.</p>
+
+<p>Using the system splash as the gate, rather than a spinner of your own, means the customer sees one
+continuous launch — the OS's splash, then the app — instead of a splash, then a loading screen, then
+the app.</p>
+
+<h3>Restoring the session</h3>
+
+@@kotlin
+<<K/feature/auth/AuthStore.kt | suspend fun restoreSession() { | ^    }$>>
+@@
+
+<p>The <code>finally</code> is the most important line: whatever happens — no token, a valid one, an
+expired one, no network — <code>isRestoringSession</code> becomes false, and the splash goes away. A
+launch gate that can get stuck is worse than the flicker it prevents.</p>
+
+<h3>A launch sequence whose order is load-bearing</h3>
+
+@@kotlin
+<<K/app/AppViewModel.kt | if (authStore.state.value.isRestoringSession) { | ^        }$>>
+@@
+
+<p>The order is not arbitrary. The session comes first, because an authenticated request needs the
+token. The menu comes next. The cart hydrates <em>last</em>, because a saved cart line holds only ids —
+its prices come from the menu, so hydrating first would produce a basket of zero-priced lines. Each
+step is a suspend function, so "in this order" is simply three lines in a row.</p>
+
+<h3>Never write before you have read</h3>
+
+<p>One more launch rule protects the cart. Until the saved cart has been loaded, any write would replace
+the server's copy with an empty one — the single worst bug the cart could have. So the store refuses to
+persist before hydration:</p>
+
+@@kotlin
+<<K/feature/cart/CartStore.kt | private fun schedulePersist() { | if (!_isHydrated.value) return>>
+        // …
+@@
+
+<p>The flush has the same guard. A test pins it down: add an item before hydration, advance the clock
+a full second, assert that nothing was written.</p>
+
+<h2>Keeping launch fast</h2>
+
+<p>Everything in <code>Application.onCreate</code> runs before the first frame, on every cold start —
+including when Android starts the process just to deliver a notification. This app's is short on
+purpose: Hilt's container, Stripe's one-line configuration, the lifecycle observer. Nothing touches the
+network or the disk there; the slow work happens in the launch sequence, behind the splash, on a
+coroutine. If <code>onCreate</code> starts growing, App Startup and lazy initialisation are the tools,
+and a <em>baseline profile</em> (the build lesson) speeds up the code that remains.</p>
+
+<p>There are three kinds of start worth distinguishing when you measure: <strong>cold</strong> (no
+process — everything above runs), <strong>warm</strong> (process alive, Activity recreated) and
+<strong>hot</strong> (Activity merely brought to the front). Android Studio and
+<code>adb shell am start -W</code> report the time for each; the cold start is the one to optimise.</p>
+
+<h2>Watching it happen</h2>
+
+<p>Lifecycle code is the hardest to test by using the app normally, because a developer's phone rarely
+kills anything. Make it happen deliberately. With the app in the background:</p>
+
+@@bash
+adb shell am kill com.lovemesomecoding.pizza.android.debug          # kill as the OS would
+adb shell am start -W -n com.lovemesomecoding.pizza.android.debug/com.lovemesomecoding.pizza.MainActivity
+@@
+
+<p>The second command relaunches and prints <code>LaunchState: COLD</code> and the time to first frame.
+This app was checked exactly so: a drink added, the app sent home, the process killed. The cold start
+took about one and a half seconds on the emulator; the splash stayed up while the session was restored;
+the cart came back with the drink in it, fetched from the server by the id the flush had saved. Developer
+options' "Background process limit" set to "No background processes" makes the same thing happen to
+every app you leave, which is a brutal and useful week-long test.</p>
+
+<h2>Next</h2>
+
+<p>The launch sequence configured Stripe. The next lesson uses it: create the order, then pay, with
+Stripe's PaymentSheet — and why, on Android, the ViewModel is not allowed to hold the sheet.</p>

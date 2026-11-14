@@ -1,0 +1,302 @@
+<p>This app has 104 tests, and every one of them runs on an ordinary JVM in about twenty seconds —
+no emulator, no backend, no network. That is not an accident of a small app. It is the result of
+decisions made in every earlier lesson: pure functions for rules, interfaces at the network boundary,
+injected scopes, stateless screens. This lesson shows the payoff, one kind of test at a time.</p>
+
+<h2>Where tests run</h2>
+
+<p>Android has two places a test can run:</p>
+
+<ul>
+<li><strong>Local tests</strong>, in <code>src/test/</code>, on your machine's JVM. Fast — milliseconds
+each — and what CI runs on every push.</li>
+<li><strong>Instrumented tests</strong>, in <code>src/androidTest/</code>, on a device or emulator.
+Real Android, real everything, and minutes of overhead per run.</li>
+</ul>
+
+<p>The default should be local, and the architecture decides how much can be. Code that imports
+nothing from Android tests on the JVM directly. Code that needs a little Android — a
+<code>Bundle</code>, a composition — can often still run locally under <strong>Robolectric</strong>,
+which simulates the Android framework on the JVM. Instrumented tests are for what genuinely needs a
+device: the real Keystore, a real camera, an end-to-end flow. This app has none; its device-level checks
+were run by hand against the live backend and are recorded as such.</p>
+
+<h2>Pure rules: the cheapest tests there are</h2>
+
+<p>The cart reducer is a function from a value to a value. Its tests build a state, apply an action, and
+assert:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `adding the same configuration bumps the quantity`() {
+    val once = reduce(CartState(), CartAction.Add(line(quantity = 1)))
+    val twice = reduce(once, CartAction.Add(line(quantity = 2)))
+
+    assertEquals(1, twice.items.size)
+    assertEquals(3, twice.items.single().quantity)
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `topping order does not make a different configuration`() {
+    val state = reduce(CartState(), CartAction.Add(line(toppings = listOf(bacon, mushroom))))
+    val result = reduce(state, CartAction.Add(line(toppings = listOf(mushroom, bacon))))
+    assertEquals(1, result.items.size)
+    assertEquals(2, result.items.single().quantity)
+}
+</code></pre>
+
+<p>Kotlin allows backtick-quoted function names, so a test is named with the sentence it proves, and a
+failure report reads like a broken rule. The suite of eleven runs in a few milliseconds.</p>
+
+<p>Even the pizza builder's state holder — built on Compose's <code>mutableStateOf</code> — tests on the
+plain JVM. Snapshot state is ordinary Kotlin; only <em>observing</em> it needs a composition:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `the price follows every selection`() {
+    val state = builder()
+    assertEquals(12.99, state.unitPrice, 0.0)
+
+    state.selectedSize = SizeName.LARGE
+    state.selectedCrustId = "c-stuffed"
+    state.toggle(SampleData.toppings[0])
+    state.quantity = 2
+
+    assertEquals(19.74, state.unitPrice, 0.0) // 15.99 + 2.00 + 1.75
+    assertEquals(39.48, state.totalPrice, 0.0)
+}
+</code></pre>
+
+<h2>Fakes, not mocks</h2>
+
+<p>Everything above the network depends on repository interfaces, so tests hand in fakes —
+hand-written classes that implement the interface, answer from a field, and record what they were
+asked:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">class FakeOrderRepository : OrderRepository {
+    var createResponse: OrderCreateResponse = OrderCreateResponse(SampleData.order(), clientSecret = "pi_secret")
+    var createError: Exception? = null
+    var statuses: MutableList&lt;Order&gt; = mutableListOf(SampleData.order())
+    var ordersError: Exception? = null
+    val createdRequests = mutableListOf&lt;OrderCreateRequest&gt;()
+    var statusCalls = 0
+
+    override suspend fun createOrder(request: OrderCreateRequest): OrderCreateResponse {
+        // …
+</code></pre>
+
+<p>No mocking library. A fake is a few lines that read naturally in a failing test, and because it
+<em>implements</em> the interface, it cannot drift from it — add a method to
+<code>OrderRepository</code> and every fake stops compiling. Mocking libraries earn their place for
+third-party types you cannot implement; for your own interfaces, a fake is usually clearer.</p>
+
+<h2>The network, for real</h2>
+
+<p>The repositories, Retrofit, OkHttp, the auth interceptor, the serialiser and the error mapper are
+tested together against <strong>MockWebServer</strong> — which, despite the name, is not a mock. It is a
+small HTTP server on localhost. Requests go over a real socket:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun setUp() {
+    server = MockWebServer()
+    server.start()
+
+    val config = ApiConfig(baseUrl = server.url("/").toString())
+    val client = OkHttpClient.Builder()
+        .readTimeout(2, TimeUnit.SECONDS)
+        .addInterceptor(AuthInterceptor { token })
+        .build()
+    val api = Retrofit.Builder()
+        .baseUrl(config.baseUrl)
+        .client(client)
+        .addConverterFactory(PizzaJson.asConverterFactory("application/json".toMediaType()))
+        .build()
+        .create(PizzaApi::class.java)
+    val caller = ApiCaller(PizzaJson, config)
+
+    catalog = RemoteCatalogRepository(api, caller)
+    orders = RemoteOrderRepository(api, caller)
+    profile = RemoteProfileRepository(api, caller)
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `authenticated routes carry the bearer token and the paging`() = runTest {
+    respond(body = """{"content":[],"totalElements":0,"totalPages":0,"number":2,"size":10}""")
+    orders.myOrders(page = 2, size = 10)
+
+    val request = server.takeRequest()
+    assertEquals("/api/orders/mine?page=2&amp;size=10", request.target)
+    assertEquals("Bearer jwt-abc", request.headers["Authorization"])
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `an html error page does not produce a json parsing message`() = runTest {
+    server.enqueue(MockResponse.Builder().code(502).body("&lt;html&gt;Bad gateway&lt;/html&gt;").build())
+
+    val error = runCatching { catalog.products() }.exceptionOrNull() as ApiError.Api
+    assertEquals("Request failed with 502.", error.message)
+    assertTrue(error.isRetryable)
+}
+</code></pre>
+
+<p>These catch what a mocked <code>PizzaApi</code> never could: a wrong path, a missing header, an
+annotation without <code>RUNTIME</code> retention, a body that does not serialise, a status mapped to the
+wrong error. The interceptor's token provider is a lambda — <code>AuthInterceptor { token }</code> — which
+is the payoff of the one-method interface from the networking lesson.</p>
+
+<h2>Time, without waiting</h2>
+
+<p>The cart writes 300 milliseconds after the last change. A test that waited 300 real milliseconds
+would be slow, and a test that waited "about" 300 would be flaky. <code>runTest</code> runs on a
+scheduler whose clock moves only when the test moves it:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `changes are persisted once, after the debounce`() = runTest {
+    val cart = store()
+    cart.hydrate()
+
+    cart.addPepperoni()
+    cart.addPepperoni()
+    cart.addPepperoni()
+    advanceTimeBy(299)
+    runCurrent()
+    assertTrue("written before the debounce elapsed", repository.writes.isEmpty())
+
+    advanceTimeBy(2)
+    runCurrent()
+    assertEquals(1, repository.writes.size)
+    assertEquals(3, repository.writes.single().second.items.single().quantity)
+    assertEquals("cart-new", keyValues.string(StorageKey.CART_ID))
+}
+</code></pre>
+
+<p>Advance 299 virtual milliseconds and assert nothing was written; advance two more and assert exactly
+one write, carrying the merged quantity. The test runs in microseconds. The store is constructed with
+<code>backgroundScope</code> — a scope that belongs to the test and is cancelled when it ends — which is
+only possible because the store takes its scope as a parameter instead of reaching for a global one.</p>
+
+<h2>ViewModels and the Main dispatcher</h2>
+
+<p><code>viewModelScope</code> runs on <code>Dispatchers.Main</code>, and the JVM has no Android main
+thread. Without help, the first ViewModel test fails with "Module with the Main dispatcher had failed
+to initialize". A JUnit rule swaps in a test dispatcher for the length of each test:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">class MainDispatcherRule(
+    val dispatcher: TestDispatcher = UnconfinedTestDispatcher(),
+) : TestWatcher() {
+    override fun starting(description: Description) = Dispatchers.setMain(dispatcher)
+    override fun finished(description: Description) = Dispatchers.resetMain()
+}
+</code></pre>
+
+<p>With it, a ViewModel test is ordinary code. This one covers the events-as-state rule from the
+payments lesson — including that a rotation must not open a second sheet:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `paying opens the sheet once, and success empties the cart and reports the order`() = runTest {
+    val vm = viewModel()
+    vm.updateForm { validForm }
+    vm.placeOrder()
+    assertTrue(vm.state.value.step is CheckoutStep.AwaitingPayment)
+
+    vm.pay()
+    assertEquals("pi_secret", vm.state.value.paymentRequest?.clientSecret)
+    vm.onPaymentSheetPresented()
+    assertNull("a rotation must not open a second sheet", vm.state.value.paymentRequest)
+
+    vm.onPaymentOutcome(PaymentOutcome.Succeeded)
+    assertEquals(SampleData.order().id, vm.state.value.completedOrderId)
+    assertTrue(cart.state.value.isEmpty)
+}
+</code></pre>
+
+<p>The default <code>UnconfinedTestDispatcher</code> runs launched coroutines eagerly, which suits most
+ViewModel tests. The polling test needs the opposite — a loop that waits for the clock — so it uses a
+<code>StandardTestDispatcher</code> and asserts on virtual time itself:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `polling gives up after the attempt limit`() = runTest(main.dispatcher) {
+    repository.statuses = mutableListOf(SampleData.order(OrderStatus.PENDING_PAYMENT))
+    val vm = viewModel(maxAttempts = 4)
+    advanceUntilIdle()
+
+    assertEquals(4, repository.statusCalls)
+    assertTrue(vm.hasStoppedPolling.value)
+    // 3 sleeps between 4 attempts — none after the last.
+    assertEquals(6_000, testScheduler.currentTime)
+}
+</code></pre>
+
+<p>Four attempts, three two-second sleeps between them, none after the last: six seconds of virtual time,
+exactly. A sleep added after the final attempt would make it eight, and the test would say so.</p>
+
+<h2>Robolectric, when Android is genuinely needed</h2>
+
+<p>The receipt's ViewModel reads its order id with <code>toRoute()</code>, which decodes from a real
+Android <code>Bundle</code>. On the plain JVM, Android classes are stubs — and this project sets
+<code>isReturnDefaultValues</code> so that stray <code>Log</code> calls are harmless:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">testOptions {
+    // Robolectric needs the merged resources to inflate anything Android-shaped on the JVM.
+    unitTests.isIncludeAndroidResources = true
+    // `android.util.Log` is a stub on the JVM that throws "not mocked". Returning defaults
+    // turns every Log call in a plain unit test into a no-op instead of a failure.
+    unitTests.isReturnDefaultValues = true
+}
+</code></pre>
+
+<p>That setting has a sharp edge, found the hard way: the stubbed <code>Bundle</code> silently returned
+<code>null</code>, so the id read as null and the test passed for the wrong reasons until an assertion on
+the id exposed it. Running that one class under Robolectric gives it a working framework:
+<code>@RunWith(AndroidJUnit4::class)</code>. Robolectric lags new SDKs, so the project pins its runtime
+in <code>src/test/resources/robolectric.properties</code> (<code>sdk=35</code>), with a comment saying
+when to raise it.</p>
+
+<h2>Compose UI tests on the JVM</h2>
+
+<p>Robolectric also hosts Compose. <code>createComposeRule()</code> renders a real composition, and the
+test finds nodes through the semantics tree — the same tree TalkBack reads:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `a loaded menu lists pizzas and switches to drinks`() {
+    compose.setContent {
+        PizzaTheme {
+            MenuContent(UiState.Loaded(SampleData.catalogue), isRefreshing = false, onRefresh = {}, onRetry = {}, onProductClick = {})
+        }
+    }
+
+    compose.onNodeWithText("Pepperoni").assertIsDisplayed()
+    compose.onNodeWithText("Drinks").performClick()
+    compose.onNodeWithText("Cola").assertIsDisplayed()
+}
+</code></pre>
+
+<p>It tests <code>MenuContent</code>, not <code>MenuScreen</code>: the stateless half takes a
+<code>UiState</code> and lambdas, so the test needs no Hilt, no ViewModel and no network. That split, made
+back in the state lesson, is what makes a UI test this short.</p>
+
+<h2>One test for the whole graph</h2>
+
+<p>Every test so far builds its subject by hand, with fakes passed to constructors — no Hilt. One test
+does the opposite: it asks Hilt to build the real graph, with only the repository module replaced, and
+checks that the singletons really are single and the fakes really are in place. The DI lesson walks
+through it. It is the test that catches a missing binding or a scope mistake, which no unit test
+can.</p>
+
+<h2>Running them</h2>
+
+<p><code>./gradlew testDebugUnitTest</code> runs all 104; reports land in
+<code>app/build/reports/tests/</code>. CI runs the same command, with lint and a minified release build,
+on every push — and uploads the reports when anything fails, so the failure can be read without
+reproducing it. Because nothing needs a device, a cheap Linux runner does all of it in a few
+minutes.</p>
+
+<h2>Proving the tests test something</h2>
+
+<p>A suite that has never failed has not proven anything. So three rules were broken on purpose — the
+"never write before hydrating" guard removed, half-up rounding swapped for banker's rounding, the token
+attached to every route — and the suite was run. Each break was caught by exactly the test written for
+it, and nothing else failed. Then the code was restored and the suite was green again. It takes ten minutes, and it is the only
+evidence that a green suite means what it says.</p>
+
+<h2>What not to test</h2>
+
+<p>Not Compose itself — whether <code>Column</code> stacks children is Google's problem. Not Retrofit's
+annotation parsing. Not one-line forwarding ViewModels. Test the rules, the boundaries where data changes
+shape, and the behaviour a customer would notice breaking. Everything in this suite is one of those.</p>
+
+<h2>Next</h2>
+
+<p>Tests are one kind of tooling. The next lesson is the rest: Compose previews that render without a
+backend, Android Lint as a build gate, formatting, and where to look when the app is slow.</p>

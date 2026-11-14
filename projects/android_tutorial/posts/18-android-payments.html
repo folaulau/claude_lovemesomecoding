@@ -1,0 +1,299 @@
+<p>Taking money is the one feature where a bug costs real money, so it is worth being precise about
+who decides what. This lesson walks the app's checkout from "Place order" to a receipt that says PAID,
+using Stripe's PaymentSheet — and shows the one place the Android design has to differ from the iOS
+one, because of the lifecycle rules from lesson 5.</p>
+
+<h2>Rule one: the device never decides the price</h2>
+
+<p>The app shows totals everywhere: the builder, the cart, checkout. Every one of them is a
+<em>preview</em>. The order request the app sends contains no money at all:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">data class OrderCreateRequest(
+    val orderType: OrderType,
+    val customerName: String,
+    /** Ignored by the server when a token is present — the account's email wins. */
+    val guestEmail: String?,
+    val phone: String?,
+    val addressLine1: String?,
+    val addressLine2: String?,
+    val city: String?,
+    val state: String?,
+    val postalCode: String?,
+    val items: List&lt;LineItemRequest&gt;,
+)
+</code></pre>
+
+<p>Identifiers and quantities. The server looks up every price in its own database, computes the
+total, and creates a Stripe <em>PaymentIntent</em> for exactly that amount. A patched APK that sends
+<code>"total": 0.01</code> changes nothing, because there is no total field to send. That is why the
+app can use <code>Double</code> for money (lesson 2): it is never the authority.</p>
+
+<h2>Rule two: order first, then pay</h2>
+
+<p>Checkout is two steps, and the second exists only once the server says so:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">sealed interface CheckoutStep {
+    data object CollectingDetails : CheckoutStep
+
+    /** The order exists server-side and is reserved; only the payment remains. */
+    data class AwaitingPayment(val created: OrderCreateResponse) : CheckoutStep
+}
+</code></pre>
+
+<p>"Place order" validates the form and creates the order. The response carries the order — priced by
+the server — and a <em>client secret</em>: a token that lets this device confirm that one
+PaymentIntent and nothing else. From then on, the screen shows the server's figures, not its own
+preview, because they are the ones being charged.</p>
+
+<h2>Setting Stripe up</h2>
+
+<p>The Stripe SDK needs the account's <em>publishable</em> key, once, at startup:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">apiConfig.stripePublishableKey?.let { PaymentConfiguration.init(this, it) }
+</code></pre>
+
+<p>A publishable key is public by design: it identifies the account and can only create and confirm
+intents, never charge on its own. It lives in <code>local.properties</code> and reaches the app through
+<code>BuildConfig</code>. The <em>secret</em> key never comes near the app — it is on the server. If a
+key starting <code>sk_</code> ever appears in an Android project, something has gone badly wrong.</p>
+
+<h2>Why the ViewModel cannot hold the sheet</h2>
+
+<p>The iOS version of this app hides Stripe behind a protocol its view model calls directly:</p>
+
+<pre class="language-swift"><code class="language-swift">protocol PaymentGateway {
+    /// Opens the payment sheet and returns once the customer is done with it.
+    func pay(_ request: PaymentRequest) async -&gt; PaymentOutcome
+    /// Collects a card against a SetupIntent WITHOUT charging it, for the profile screen.
+    func saveCard(setupIntentClientSecret: String) async -&gt; CardSetupOutcome
+    /// False when no publishable key is configured — the UI then explains, rather than failing at
+    /// the moment of tapping "Pay".
+    var isReady: Bool { get }
+}
+</code></pre>
+
+<p>The view model awaits <code>pay()</code> and gets an outcome. It is a clean design, and on Android
+it is a memory leak. Stripe's <code>PaymentSheet</code> opens its own Activity and registers for that
+Activity's result <em>with the current Activity</em>. A ViewModel outlives that Activity — that is its
+whole purpose. After the first rotation, a ViewModel holding a <code>PaymentSheet</code> holds a
+destroyed Activity, which can never be garbage-collected, and a result that would be delivered to it
+goes nowhere.</p>
+
+<p>So the responsibilities split along lifetimes. The <strong>ViewModel</strong>, which survives
+rotation, decides <em>that</em> a payment should start and handles the outcome. The
+<strong>screen</strong>, which lives exactly as long as the Activity, owns the sheet.</p>
+
+<h3>The screen's half</h3>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun rememberPaymentLauncher(onOutcome: (PaymentOutcome) -&gt; Unit): PaymentLauncher {
+    // The sheet is registered once; this keeps it calling the LATEST lambda, not the first one.
+    val currentOnOutcome by rememberUpdatedState(onOutcome)
+
+    /*
+     * `build()` here is the COMPOSABLE overload: it registers the sheet's activity-result
+     * launcher with the current Activity and remembers it across recompositions — and, because
+     * it is part of composition, registers again on the new Activity after a rotation.
+     */
+    val sheet = PaymentSheet.Builder { result -&gt;
+        currentOnOutcome(
+            when (result) {
+                is PaymentSheetResult.Completed -&gt; PaymentOutcome.Succeeded
+                is PaymentSheetResult.Canceled -&gt; PaymentOutcome.Cancelled
+                is PaymentSheetResult.Failed -&gt;
+                    PaymentOutcome.Failed(result.error.localizedMessage ?: "The payment did not go through.")
+            },
+        )
+    }.build()
+    return remember(sheet) { PaymentLauncher(sheet) }
+}
+</code></pre>
+
+<p><code>PaymentSheet.Builder(…).build()</code> is a <em>composable</em> overload: it registers the
+sheet's result launcher with the current Activity and remembers it, and because it is part of
+composition, it registers again with the new Activity after a rotation. (The older
+<code>rememberPaymentSheet</code> does the same and is deprecated in Stripe 23.) Stripe's three results
+become the app's own <code>PaymentOutcome</code>, so nothing above this file imports Stripe.</p>
+
+<p><code>rememberUpdatedState</code> handles a subtle problem: the sheet is registered once, but the
+<code>onOutcome</code> lambda might change between recompositions. Reading it through
+<code>rememberUpdatedState</code> means the result always goes to the <em>latest</em> lambda rather than
+the one captured at registration.</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun present(request: PaymentSheetRequest) {
+    val configuration = PaymentSheet.Configuration.Builder(merchantDisplayName = "StayHub Pizza")
+        .defaultBillingDetails(
+            PaymentSheet.BillingDetails(name = request.customerName, email = request.customerEmail),
+        )
+        .allowsDelayedPaymentMethods(false)
+        .build()
+
+    if (request.isSetup) {
+        sheet.presentWithSetupIntent(request.clientSecret, configuration)
+    } else {
+        sheet.presentWithPaymentIntent(request.clientSecret, configuration)
+    }
+}
+</code></pre>
+
+<p>Card only — <code>allowsDelayedPaymentMethods(false)</code> — because a bank debit that settles in
+three days would leave a pizza order "paid" long after it went cold.</p>
+
+<h3>The ViewModel's half: events as state</h3>
+
+<p>The ViewModel asks for the sheet the only way a ViewModel should talk to a screen — by changing its
+state:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun pay() {
+    val step = _state.value.step as? CheckoutStep.AwaitingPayment ?: return
+    val clientSecret = step.created.clientSecret ?: return
+
+    _state.update {
+        it.copy(
+            isPaying = true,
+            errorMessage = null,
+            paymentRequest = PaymentSheetRequest(
+                clientSecret = clientSecret,
+                customerName = form.value.customerName.trim(),
+                customerEmail = form.value.email.trim(),
+            ),
+        )
+    }
+}
+</code></pre>
+
+<p>The screen reacts, and reports back that it did:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">LaunchedEffect(state.paymentRequest) {
+    val request = state.paymentRequest ?: return@LaunchedEffect
+    payment.present(request)
+    viewModel.onPaymentSheetPresented()
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun onPaymentSheetPresented() {
+    _state.update { it.copy(paymentRequest = null) }
+}
+</code></pre>
+
+<p>The timing of that last call is the detail that makes it correct. The request is consumed
+<em>when the sheet is presented</em>, not when the result arrives. If it waited for the result, a
+rotation while the sheet was up would recompose the screen, find a request still pending, and open a
+second sheet on top of the first. Clearing it immediately means the request is handled exactly once,
+however many times the screen is recreated.</p>
+
+<p>This "events as state" pattern — the ViewModel sets a value, the screen acts and clears it — is
+Google's recommended alternative to firing one-off events through a <code>Channel</code>, which can
+drop or duplicate an event that arrives while the screen is between Activities.</p>
+
+<h2>The outcome</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun onPaymentOutcome(outcome: PaymentOutcome) {
+    val step = _state.value.step as? CheckoutStep.AwaitingPayment
+    _state.update { it.copy(isPaying = false) }
+
+    when (outcome) {
+        PaymentOutcome.Succeeded -&gt; {
+            // The server — not this result — decides the order is paid; the receipt screen
+            // polls for that. Emptying the cart here is the device's half of the bargain.
+            cartStore.clear()
+            _state.update { it.copy(completedOrderId = step?.created?.order?.id) }
+        }
+        // Not an error. The order is still reserved and they can try again.
+        PaymentOutcome.Cancelled -&gt; Unit
+        is PaymentOutcome.Failed -&gt; _state.update { it.copy(errorMessage = outcome.message) }
+    }
+}
+</code></pre>
+
+<p>Three outcomes, three different responses. <strong>Cancelled</strong> is not an error — the customer
+closed the sheet; the order is still reserved and the Pay button is still there. <strong>Failed</strong>
+shows Stripe's message ("Your card was declined"), on the same order, so a second card can be tried
+without creating a second order. <strong>Succeeded</strong> empties the cart and asks the screen to
+show the receipt — through state again, then the receipt <em>replaces</em> checkout on the back stack
+so Back cannot return to a paid order.</p>
+
+<h2>Rule three: ask the server whether it is paid</h2>
+
+<p>The sheet reporting "completed" means Stripe accepted the card. It does not mean the order is paid.
+The order becomes PAID when Stripe's <em>webhook</em> reaches the backend — a separate, signed
+server-to-server call that can lag by seconds. The device is never the authority on money, so it never
+marks anything paid. The receipt screen asks:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">repeat(maxAttempts) { attempt -&gt;
+    try {
+        val order = repository.paymentStatus(orderId)
+        _state.value = UiState.Loaded(order)
+        if (!order.status.isSettling) return
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        // Keep showing the last good receipt if there is one; a blip mid-poll is not news.
+        if (_state.value.valueOrNull == null) _state.value = UiState.failure(e, "Could not load the order.")
+        return
+    }
+    // No sleep after the final attempt — it would delay the "still processing" message.
+    if (attempt &lt; maxAttempts - 1) delay(pollInterval)
+}
+</code></pre>
+
+<p>Every two seconds, up to ten times, until the server says the order has settled. If it still has
+not, the screen says the payment is being confirmed and an email will follow — honest, and true.</p>
+
+<h2>Saving a card</h2>
+
+<p>Signed-in customers can save cards on their profile. The flow is the same sheet with a different
+intent: a <em>SetupIntent</em>, which collects and verifies a card without charging it.</p>
+
+<p>The wrinkle is that the sheet reports only "completed". The backend needs the id of the payment
+method Stripe created — a <code>pm_…</code> token — which lives on the SetupIntent. So after the sheet
+completes, the app reads it back from Stripe with the publishable key:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">class StripeSetupIntentReader @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val config: ApiConfig,
+) : SetupIntentReader {
+    override suspend fun paymentMethodId(clientSecret: String): String? {
+        val key = config.stripePublishableKey ?: return null
+        return Stripe(context, key).retrieveSetupIntent(clientSecret).paymentMethodId
+    }
+}
+</code></pre>
+
+<p>…and sends <em>only that token</em> to its own backend, which attaches it to the customer at Stripe.
+The card number went from the customer's keyboard straight into Stripe's sheet and never touched this
+app's code, its memory, its logs or its server. That is the whole security model: the app handles
+nothing that would make it a target.</p>
+
+<h2>When it is not configured</h2>
+
+<p>A developer cloning the app without keys should not see a Pay button that does nothing. The
+ViewModel explains, specifically, what is missing:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun paymentUnavailableMessage(created: OrderCreateResponse): String? = when {
+    created.clientSecret == null -&gt;
+        "The server created this order but returned no Stripe client secret, which means no " +
+            "Stripe key is configured on the backend. Run it with the local profile."
+    !config.isStripeConfigured -&gt;
+        "Card payment is unavailable because this build has no Stripe publishable key. Set " +
+            "pizza.stripePublishableKey in local.properties and rebuild."
+    else -&gt; null
+}
+</code></pre>
+
+<h2>Testing payments</h2>
+
+<p>The ViewModel never sees Stripe, so its tests do not either. They create an order, call
+<code>pay()</code>, assert a request was published, call <code>onPaymentSheetPresented()</code>, then
+feed <code>onPaymentOutcome</code> each of the three outcomes directly — including the one that matters
+most: a rotation must not open a second sheet.</p>
+
+<p>The real sheet was exercised by hand against Stripe's test mode: test card
+<code>4242 4242 4242 4242</code>, any future expiry, any CVC. That order reached PAID, which was
+confirmed in the database rather than on the screen — and the cart row on the server was empty
+afterwards, as it should be.</p>
+
+<h2>Next</h2>
+
+<p>The payment sheet is fully accessible because Stripe made it so. The rest of the app is accessible
+only if we did. The next lesson is accessibility in Compose: the semantics tree that TalkBack reads, and
+that the UI tests read too.</p>

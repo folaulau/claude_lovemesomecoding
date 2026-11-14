@@ -1,0 +1,292 @@
+<p>A blind customer orders pizza with TalkBack, Android's screen reader: they swipe from element to
+element and hear each one read aloud, then double-tap to activate. A customer with a tremor needs
+targets big enough to hit. A customer with low vision sets the font to 200%. None of them is an edge
+case — together they are a large share of any app's users — and a Compose app serves them through
+one mechanism.</p>
+
+<h2>The semantics tree</h2>
+
+<p>Alongside the UI it draws, Compose builds a <strong>semantics tree</strong>: a parallel description
+of what is on screen — this is a button labelled "Checkout", this is a heading, this checkbox is
+checked. TalkBack reads that tree, not the pixels. So do Compose UI tests: a test that finds a button by
+its label is using the same tree TalkBack uses, which is why accessibility work and testability turn
+out to be the same work.</p>
+
+<p>Material components populate the tree for you. A <code>Button</code> is announced as a button with its
+text; a <code>Checkbox</code> reports checked or not; a segmented button reports "selected, 1 of 2".
+Most of the work is in custom layouts — rows you made clickable, icons, numbers, things that change. This
+lesson goes through each, in the order a TalkBack user would meet them.</p>
+
+<h2>Labels</h2>
+
+<p>An icon has no text, so it needs a <code>contentDescription</code>. The good ones describe the
+<em>purpose</em>, and include state when the state matters:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">private fun CartButton(count: Int, onClick: () -&gt; Unit) {
+    IconButton(
+        onClick = onClick,
+        // One label that includes the count, rather than "Cart" followed by an unlabelled "3".
+        modifier = Modifier.semantics { contentDescription = if (count == 0) "Cart, empty" else "Cart, $count items" },
+    ) {
+        BadgedBox(badge = { if (count &gt; 0) Badge { Text("$count") } }) {
+            Icon(Icons.Filled.ShoppingCart, contentDescription = null)
+        }
+    }
+}
+</code></pre>
+
+<p>"Cart, 3 items" — one label that carries the count, instead of "Cart" followed by an unlabelled "3"
+that the listener has to pair up. The icon itself is given <code>contentDescription = null</code>
+because the button around it already says everything.</p>
+
+<p><code>null</code> is also right for decoration. The product cards use emoji as artwork; read aloud,
+"slice of pizza" before every product name is noise. <code>clearAndSetSemantics { }</code> removes an
+element from the tree entirely:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">// Decorative: TalkBack reads the title, not "pizza emoji".
+Text(emoji, fontSize = 48.sp, modifier = Modifier.clearAndSetSemantics { })
+</code></pre>
+
+<h2>Merging: one stop, not five</h2>
+
+<p>A product card contains an emoji, a name, a description and a price. Without intervention TalkBack
+stops on each text separately, and the customer has to assemble "Pepperoni… Classic pepperoni… From
+$10.99" in their head before deciding whether to double-tap — and double-tapping a <em>text</em> does
+nothing, because the clickable thing is the card around it. Merging makes the card one element:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">CardContainer(
+    modifier = modifier
+        .fillMaxWidth()
+        .clip(RoundedCornerShape(Radius.md))
+        .clickable(enabled = price != null, role = Role.Button, onClick = onClick)
+        // One TalkBack stop with one sentence, instead of four fragments.
+        .semantics(mergeDescendants = true) {
+            contentDescription = "${product.name}. ${product.description}. $priceLabel"
+        },
+</code></pre>
+
+<p><code>mergeDescendants = true</code> folds the children's semantics into this node, and the explicit
+description gives it one sentence, in the order a person would say it. Combined with
+<code>clickable(role = Role.Button)</code>, TalkBack says "Pepperoni. Classic pepperoni over mozzarella.
+From $10.99. Button. Double-tap to activate." One swipe, one sentence, one action.</p>
+
+<p>The same idea, smaller: a price row is a label and an amount that only make sense together.</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun PriceRow(label: String, amount: Double, modifier: Modifier = Modifier, emphasized: Boolean = false) {
+    val style = if (emphasized) MaterialTheme.typography.titleMedium else MaterialTheme.typography.bodyMedium
+    val color = if (emphasized) PizzaTheme.colors.text else PizzaTheme.colors.textMuted
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = Spacing.xs / 2)
+            .semantics(mergeDescendants = true) {},
+        // …
+</code></pre>
+
+<h3>The merge trap</h3>
+
+<p>Merging has one trap, and it is easy to fall into: <strong>never merge a container that holds its own
+buttons</strong>. A cart line has a name, a price, a quantity stepper and a delete button. Merge the row
+and the stepper and the delete button collapse into one node, and a TalkBack user can no longer reach
+them separately — they cannot remove the item at all. The cart row is deliberately not merged; its
+controls stay individual stops, each with a label naming the product:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">Icon(Icons.Outlined.Delete, contentDescription = "Remove ${item.productName}", tint = PizzaTheme.colors.textMuted)
+</code></pre>
+
+<p>"Remove Pepperoni Pizza", not "Delete" — because with three lines in the cart, three buttons all
+called "Delete" leave the listener guessing which is which.</p>
+
+<h2>Roles and states</h2>
+
+<p>A clickable row is not a button unless you say so. <code>role = Role.Button</code>,
+<code>Role.RadioButton</code>, <code>Role.Checkbox</code> tell TalkBack what kind of control it is and
+how to announce it. The address picker at checkout makes each row a radio button with a selected state
+(the forms lesson). State that has no standard property goes in <code>stateDescription</code>:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">// TalkBack hears "Place order, busy" rather than an unlabelled spinner.
+.semantics { if (isLoading) stateDescription = "Busy" }
+</code></pre>
+
+<p>While submitting, the button is announced as "Place order, busy, disabled" rather than as a silent
+spinner.</p>
+
+<h2>One adjustable control instead of three</h2>
+
+<p>The quantity stepper is drawn as three things: −, a number, +. Read naively, that is three stops:
+"Decrease, button", "2", "Increase, button". A sighted user sees one control; a TalkBack user should hear
+one:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">modifier = modifier.semantics(mergeDescendants = true) {
+    contentDescription = label
+    stateDescription = "$value"
+    progressBarRangeInfo = ProgressBarRangeInfo(
+        current = value.toFloat(),
+        range = range.first.toFloat()..range.last.toFloat(),
+        steps = range.last - range.first - 1,
+    )
+    setProgress { target -&gt;
+        val next = target.toInt().coerceIn(range)
+        if (next != value) onValueChange(next)
+        true
+    }
+},
+</code></pre>
+
+<p>It is described as a range — like a slider — with a current value and an action to set it.
+TalkBack then announces "Quantity, 2" and lets the user swipe up or down to change it, the standard
+gesture for adjustable controls. The number in the middle is removed from the tree so it is not read
+twice. This is the Compose spelling of what iOS calls an <em>adjustable</em> element.</p>
+
+<p>Note the comparison with the cart row: there, merging would have hidden actions. Here, merging
+<em>and</em> exposing <code>setProgress</code> keeps the action reachable through the gesture.</p>
+
+<h2>Errors, headings and changes</h2>
+
+<p><strong>Errors</strong> are written into the field's semantics, so TalkBack reads "Error: Five
+digits, please" when the field is focused:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">if (error != null) error(error)
+</code></pre>
+
+<p><strong>Headings</strong> let a TalkBack user jump between sections instead of swiping through every
+element. Any text that titles a section gets <code>Modifier.semantics { heading() }</code> — every
+section title in this app has it.</p>
+
+<p><strong>Changes</strong> that happen without the user's action — a toast appearing, a receipt
+changing from "Confirming your payment" to "Thank you" — are invisible to someone who is not looking at
+them. A <em>live region</em> announces them:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">Text(
+    text = toast.message,
+    color = colors.onPrimary,
+    style = MaterialTheme.typography.bodyMedium,
+    modifier = Modifier
+        .fillMaxWidth()
+        .shadow(6.dp, RoundedCornerShape(Radius.md))
+        .background(background, RoundedCornerShape(Radius.md))
+        .clickable(onClickLabel = "Dismiss", onClick = onClick)
+        .padding(Spacing.lg)
+        .semantics { liveRegion = LiveRegionMode.Polite },
+)
+</code></pre>
+
+<p><code>Polite</code> waits for TalkBack to finish what it is reading; <code>Assertive</code>
+interrupts. Use assertive only for something genuinely urgent — an error that blocks the task — or it
+becomes noise.</p>
+
+<h2>Colour is never the only signal</h2>
+
+<p>About one man in twelve has some form of colour blindness, and a screen reader does not see colour
+at all. Anything that colour communicates must also be communicated another way. Two places in this app
+where that is easy to get wrong:</p>
+
+<p>The builder's topping chips turn red when selected. That alone would make "selected" invisible to a
+colour-blind customer, so a selected chip also gains a tick:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">private fun ChoiceChip(label: String, selected: Boolean, onClick: () -&gt; Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label) },
+        leadingIcon = if (selected) {
+            { Icon(Icons.Filled.Check, contentDescription = null) }
+        } else {
+            null
+        },
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = PizzaTheme.colors.primarySoft,
+            selectedLabelColor = PizzaTheme.colors.primaryDark,
+            selectedLeadingIconColor = PizzaTheme.colors.primaryDark,
+        ),
+    )
+}
+</code></pre>
+
+<p><code>FilterChip</code> also reports its selected state in semantics, so TalkBack says "Bacon, selected"
+— the tick is for eyes, the state is for the screen reader, and the colour is decoration on top.</p>
+
+<p>The order status badge is green, amber or red, but it also <em>says</em> the status in words, and
+gives TalkBack a sentence rather than shouted capitals:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">// Read as words, not shouted capitals.
+.semantics { contentDescription = "Status: ${status.displayName}" },
+</code></pre>
+
+<p>Contrast is the other half. WCAG asks for at least 4.5:1 between body text and its background.
+Measured for this lesson, the muted grey used for secondary text is 5.1:1 against the cream background
+and the brand red 4.95:1 — both pass. The palette's lighter "subtle" grey is only 2.3:1, and measuring
+found it in exactly one place: the "Unavailable" label on a product with no sizes. That label is
+information, so it now uses the muted grey, and the subtle one is documented as unfit for text:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">// textMuted, not textSubtle: "Unavailable" is information, and the subtle grey
+// is only 2.3:1 against the card — below WCAG's 4.5:1 for text.
+color = if (price != null) PizzaTheme.colors.primary else PizzaTheme.colors.textMuted,
+</code></pre>
+
+<p>Accessibility Scanner flags exactly this kind of problem on a running screen, which is faster than
+computing ratios by hand.</p>
+
+<h2>Touch targets and text size</h2>
+
+<p>Every tappable element is at least 48dp in both directions, which is Material's guidance and a
+design-system token in this app:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val MinTouchTarget = 48.dp
+</code></pre>
+
+<p>Material components already enforce it — an <code>IconButton</code> is 48dp even though its icon is
+24 — so the work is in custom controls: the stepper uses <code>IconButton</code>s, the address rows make
+the whole row selectable rather than the 20dp circle, and the button component sets
+<code>heightIn(min = MinTouchTarget)</code>.</p>
+
+<p>Text uses <code>sp</code> throughout, so it scales with the customer's font setting; layouts use
+<code>heightIn(min = …)</code> rather than fixed heights, so scaled text grows its container instead of
+being clipped. Try the app at the largest font size before shipping; it is the fastest accessibility test
+there is.</p>
+
+<h2>Testing it</h2>
+
+<p>Because UI tests read the semantics tree, they double as accessibility checks. This test finds the
+product card by the merged description a TalkBack user would hear — so it would fail if the description
+went missing:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `tapping a product reports which one`() {
+    var tapped: Product? = null
+    compose.setContent {
+        PizzaTheme {
+            MenuContent(UiState.Loaded(SampleData.catalogue), false, {}, {}, onProductClick = { tapped = it })
+        }
+    }
+
+    // The card's merged description, exactly as TalkBack would announce it.
+    compose.onNodeWithContentDescription("Pepperoni", substring = true).performClick()
+    assertEquals("p-pepperoni", tapped?.id)
+}
+</code></pre>
+
+<p>…and this one asserts the stepper exposes its value as a state description, the property TalkBack
+announces:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `the quantity stepper is one adjustable control for accessibility`() {
+    var value = 2
+    compose.setContent {
+        PizzaTheme { QuantityStepper(value = value, onValueChange = { value = it }, label = "Quantity") }
+    }
+
+    compose.onNode(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "2"))
+        .assertIsDisplayed()
+    compose.onNodeWithContentDescription("Increase").performClick()
+    assertEquals(3, value)
+}
+</code></pre>
+
+<p>Beyond tests: Google's <strong>Accessibility Scanner</strong> app flags small targets and low
+contrast on any screen, and nothing replaces turning TalkBack on and ordering a pizza with your eyes
+closed. Do that once and most of this lesson will feel obvious.</p>
+
+<h2>Next</h2>
+
+<p>Those were two of the app's tests. The next lesson is all of them: what is worth testing in an
+Android app, where each kind of test runs, and how to test code that waits for time to pass.</p>

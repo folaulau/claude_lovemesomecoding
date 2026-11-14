@@ -1,0 +1,321 @@
+<p>Every class in this app gets what it needs through its constructor. <code>CartStore</code> takes a
+repository, an identifier store, the menu store and a scope; the repository takes the Retrofit API and
+the error mapper; the API takes a configured Retrofit, which takes an OkHttp client, which takes an
+interceptor, which takes the token store. Something has to build that graph, in the right order, once.</p>
+
+<p>That something is dependency injection. This lesson shows Hilt, the standard way to do it on
+Android, against the alternative the iOS version of this app uses: building the graph by hand.</p>
+
+<h2>The hand-written version</h2>
+
+<p>The SwiftUI app has no DI framework. It has one function that constructs everything:</p>
+
+<pre class="language-swift"><code class="language-swift">static func live() -&gt; AppEnvironment {
+    let configuration = APIConfiguration.fromBundle()
+    let tokenStore = TokenStore(secureStore: KeychainSecureStore())
+    let client = URLSessionHTTPClient(configuration: configuration, tokenProvider: tokenStore)
+
+    return AppEnvironment(
+        configuration: configuration,
+        tokenStore: tokenStore,
+        authRepository: RemoteAuthRepository(client: client),
+        catalogRepository: RemoteCatalogRepository(client: client),
+        cartRepository: RemoteCartRepository(client: client),
+        orderRepository: RemoteOrderRepository(client: client),
+        profileRepository: RemoteProfileRepository(client: client),
+        cartIdentifierStore: CartIdentifierStore(store: UserDefaultsKeyValueStore()),
+        paymentGateway: StripePaymentGateway(
+            publishableKey: configuration.stripePublishableKey
+        )
+    )
+}
+</code></pre>
+
+<p>It is completely readable — the whole app's wiring in twenty lines — and the order is the
+dependency graph made literal: the token store exists before the client that needs it. Its costs show
+as the app grows: every new dependency is threaded through that function and through the initialiser
+it calls, and there is a second hand-written graph for previews.</p>
+
+<p>Hilt keeps the idea — constructor parameters, no singletons reached for globally — and generates the
+wiring. You declare what each class needs and how to make the things it cannot work out; it writes the
+equivalent of <code>live()</code> at compile time and checks it.</p>
+
+<h2>Setup</h2>
+
+<p>Hilt is Dagger, Google's compile-time DI library, with Android-specific conventions on top. Its code
+generator runs through KSP:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">implementation(libs.hilt.android)
+ksp(libs.hilt.compiler)
+implementation(libs.androidx.hilt.lifecycle.viewmodel.compose)
+</code></pre>
+
+<p>Then two entry points. The <code>Application</code> class is where the app-wide container is
+generated:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@HiltAndroidApp
+class PizzaApplication : Application() {
+
+    // Field injection: Android constructs Application itself, so there is no constructor to inject.
+    @Inject lateinit var cartStore: CartStore
+    @Inject lateinit var apiConfig: ApiConfig
+    // …
+</code></pre>
+
+<p>…and every Activity that wants injection is marked too — in a Compose app, there is one:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+</code></pre>
+
+<p>Note the <code>lateinit var</code> fields in the Application. Android constructs
+<code>Application</code> and <code>Activity</code> objects itself, so there is no constructor to inject
+into; Hilt sets annotated fields instead, just after creation. Everywhere else, prefer constructor
+injection.</p>
+
+<h2>@Inject constructor</h2>
+
+<p>For a class you wrote, one annotation tells Hilt how to build it:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">class RemoteCatalogRepository @Inject constructor(
+    private val api: PizzaApi,
+    private val call: ApiCaller,
+) : CatalogRepository {
+    // …
+</code></pre>
+
+<p>Hilt reads the parameter types, finds how to make each one, and generates a factory. Add a parameter
+and every place that builds this class is updated — because there are no such places in your code.</p>
+
+<h3>Scopes are lifetimes</h3>
+
+<p>By default Hilt builds a new instance every time one is needed. The menu must be fetched once and
+shared, so the store is scoped:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Singleton
+class MenuStore @Inject constructor(
+    private val repository: CatalogRepository,
+    @ApplicationScope private val scope: CoroutineScope,
+) {
+    // …
+</code></pre>
+
+<p><code>@Singleton</code> means one instance per <code>SingletonComponent</code>, which lives as long
+as the application. Hilt has a component per Android lifetime, and choosing the scope is choosing how
+long the object lives:</p>
+
+<ul>
+<li><code>@Singleton</code> — the process. Stores, OkHttp, Retrofit, DataStore.</li>
+<li><code>@ActivityRetainedScoped</code> — survives rotation, dies when the Activity finishes.</li>
+<li><code>@ViewModelScoped</code> — one per ViewModel.</li>
+<li><code>@ActivityScoped</code> — one per Activity instance, recreated on rotation.</li>
+</ul>
+
+<p>A scoped object may depend on longer-lived objects, never on shorter ones: a singleton that captured
+an Activity-scoped object would hold a destroyed Activity after the first rotation. Hilt rejects that
+graph at compile time.</p>
+
+<h2>Modules: what Hilt cannot work out</h2>
+
+<p>Two kinds of dependency need telling. Classes you did not write — OkHttp, Retrofit, DataStore — have
+no <code>@Inject</code> constructor, and interfaces have no constructor at all.</p>
+
+<h3>@Provides, for building things</h3>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Module
+@InstallIn(SingletonComponent::class)
+object AppModule {
+// ...
+fun provideRetrofit(config: ApiConfig, client: OkHttpClient, json: Json): Retrofit =
+    Retrofit.Builder()
+        // Must end in "/": Retrofit resolves "api/products" against it like a browser
+        // resolves a relative link, and without the slash the last path segment is replaced.
+        .baseUrl(config.baseUrl)
+        .client(client)
+        .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+        .build()
+
+@Provides
+@Singleton
+fun providePizzaApi(retrofit: Retrofit): PizzaApi = retrofit.create(PizzaApi::class.java)
+</code></pre>
+
+<p>A <code>@Provides</code> function is a recipe: its parameters are its dependencies (Hilt supplies
+them), its return value is what it provides. <code>@InstallIn(SingletonComponent::class)</code> puts
+the recipes in the application-wide container. This file, read top to bottom, is the Android
+equivalent of the iOS <code>live()</code> — except that the <em>order</em> is no longer written down.
+Hilt works it out from the types, and fails the build if something is missing or circular.</p>
+
+<p>Split modules along the lines a test will want to replace. This app has three: <code>AppModule</code>
+for infrastructure, <code>RepositoryModule</code> for the network-backed repositories, and
+<code>PaymentModule</code> for Stripe. The repositories have a module of their own precisely because
+that is the seam tests swap; as <code>AppModule</code> grows, network and storage would be the next
+split.</p>
+
+<h3>@Binds, for choosing an implementation</h3>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Module
+@InstallIn(SingletonComponent::class)
+abstract class RepositoryModule {
+    @Binds abstract fun bindAuthRepository(impl: RemoteAuthRepository): AuthRepository
+    @Binds abstract fun bindCatalogRepository(impl: RemoteCatalogRepository): CatalogRepository
+    @Binds abstract fun bindCartRepository(impl: RemoteCartRepository): CartRepository
+    @Binds abstract fun bindOrderRepository(impl: RemoteOrderRepository): OrderRepository
+    @Binds abstract fun bindProfileRepository(impl: RemoteProfileRepository): ProfileRepository
+}
+</code></pre>
+
+<p>The implementations already have <code>@Inject</code> constructors, so all Hilt needs is "when someone
+asks for <code>CatalogRepository</code>, give them a <code>RemoteCatalogRepository</code>". An abstract
+function with no body says exactly that, and generates less code than a <code>@Provides</code> that
+calls a constructor.</p>
+
+<h3>When Hilt cannot choose a value</h3>
+
+<p><code>CartStore</code> takes a debounce duration. Hilt has no way to know it should be 300
+milliseconds, so the store is built by a <code>@Provides</code> function rather than an
+<code>@Inject</code> constructor:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun provideCartStore(
+    repository: CartRepository,
+    identifierStore: CartIdentifierStore,
+    menuStore: MenuStore,
+    @ApplicationScope scope: CoroutineScope,
+): CartStore = CartStore(
+    repository = repository,
+    identifierStore = identifierStore,
+    menuStore = menuStore,
+    scope = scope,
+    persistDebounce = 300.milliseconds,
+)
+</code></pre>
+
+<p>The benefit shows in the tests: they construct <code>CartStore</code> directly with a debounce and a
+test scope of their own, with no Hilt involved.</p>
+
+<h3>Qualifiers: two of the same type</h3>
+
+<p>The app needs a <code>CoroutineScope</code> that lives as long as the process. A bare
+<code>CoroutineScope</code> parameter would be ambiguous — which scope? A qualifier names it:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Qualifier
+@Retention(AnnotationRetention.BINARY)
+annotation class ApplicationScope
+</code></pre>
+
+<p>The provider is annotated <code>@ApplicationScope</code>, and so is every parameter that wants it:
+<code>@ApplicationScope private val scope: CoroutineScope</code>. A typo is a compile error, not a
+wrong scope.</p>
+
+<h2>ViewModels</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">@HiltViewModel
+class MenuViewModel @Inject constructor(
+    private val menuStore: MenuStore,
+    private val cartStore: CartStore,
+    private val toasts: ToastCenter,
+) : ViewModel() {
+    // …
+</code></pre>
+
+<p><code>@HiltViewModel</code> plus <code>@Inject constructor</code>, and a screen gets one with
+<code>hiltViewModel()</code>, scoped to its navigation destination. A <code>SavedStateHandle</code>
+parameter is supplied for free, already populated with the route's arguments — which is how the receipt
+screen gets its order id. When a ViewModel needs a value only known at runtime that is <em>not</em> in
+the route, Hilt's assisted injection covers it; this app never needs it.</p>
+
+<h2>Swapping the graph in a test</h2>
+
+<p>The real payoff of declaring the graph rather than writing it: a test can replace one module and
+keep everything else. This test removes the network-backed repositories and installs fakes:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Module
+@TestInstallIn(components = [SingletonComponent::class], replaces = [RepositoryModule::class])
+object FakeRepositoryModule {
+    @Provides @Singleton fun catalog(): CatalogRepository = FakeCatalogRepository()
+    @Provides @Singleton fun auth(): AuthRepository = FakeAuthRepository()
+    @Provides @Singleton fun cart(): CartRepository = FakeCartRepository()
+    @Provides @Singleton fun orders(): OrderRepository = FakeOrderRepository()
+    @Provides @Singleton fun profile(): ProfileRepository = FakeProfileRepository()
+}
+</code></pre>
+
+<p>Every store, every ViewModel, the whole graph is then built by Hilt exactly as in the app, with fakes
+at the one seam that touches the network:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@HiltAndroidTest
+@Config(application = HiltTestApplication::class)
+@RunWith(AndroidJUnit4::class)
+class HiltGraphTest {
+    @get:Rule val hilt = HiltAndroidRule(this)
+
+    @Inject lateinit var menuStore: MenuStore
+    @Inject lateinit var secondMenuStore: MenuStore
+    @Inject lateinit var cartStore: CartStore
+    @Inject lateinit var catalog: CatalogRepository
+
+    @Before
+    fun inject() = hilt.inject()
+
+    @Test
+    fun `the graph is built with the fake repositories`() = runTest {
+        assertEquals(FakeCatalogRepository::class, catalog::class)
+
+        menuStore.reload()
+        assertEquals(3, (menuStore.state.value as UiState.Loaded).value.products.size)
+    }
+
+    @Test
+    fun `a singleton is one instance however many times it is injected`() {
+        // …
+</code></pre>
+
+<p>It catches what unit tests cannot: a missing binding, a scope mistake that hands two screens two
+different carts. Unit tests, meanwhile, skip Hilt entirely and pass fakes to constructors — the same
+fakes, no framework. That is the best argument for constructor injection: Hilt is how the app is
+assembled, not something the classes depend on.</p>
+
+<h2>Common errors, decoded</h2>
+
+<p>Three Hilt failures account for most of the time people lose to it, and each has a one-line
+cause.</p>
+
+<p><strong>"cannot be provided without an @Inject constructor or an @Provides-annotated method".</strong>
+Something asks for a type nobody provides. Usually an interface with no <code>@Binds</code>, or a
+third-party class with no <code>@Provides</code>. The error's last lines name the type and the chain of
+classes that needed it.</p>
+
+<p><strong>"is bound multiple times".</strong> Two modules provide the same type. Either one is
+redundant, or they are genuinely different things that need a qualifier to tell them apart — exactly
+the <code>@ApplicationScope</code> situation.</p>
+
+<p><strong>"scoped with @Singleton may not reference bindings with different scopes".</strong> A
+long-lived object depends on a short-lived one. The fix is never to widen the short-lived object's
+scope until the error goes away; it is to ask whether the long-lived object should be holding it at
+all. Usually it should take the value as a function parameter instead.</p>
+
+<p>A fourth is a runtime one: forgetting <code>@AndroidEntryPoint</code> on an Activity crashes the
+first time it asks for a <code>hiltViewModel()</code>, with a message that says so. In a single-Activity
+app you meet it once.</p>
+
+<h2>The costs</h2>
+
+<ul>
+<li><strong>Build time.</strong> Code generation runs on every build that touches an annotated class.
+KSP is much faster than the older kapt, but it is not free.</li>
+<li><strong>Indirection.</strong> "Where does this come from?" is answered by a module somewhere, not
+by reading a constructor call. Android Studio's gutter icons navigate between a dependency and its
+provider, which helps.</li>
+<li><strong>Error messages.</strong> A missing binding produces a long Dagger error. Read the last
+lines first: they name the type nobody provides and the chain of classes that needed it.</li>
+</ul>
+
+<p>For a small app, the hand-written composition root is a perfectly good choice, and the iOS version
+proves it. Hilt pays for itself when the graph is large, when lifetimes are varied, and when tests
+want to replace part of it — which, for an Android app of any size, is soon.</p>
+
+<h2>Next</h2>
+
+<p>The graph includes two stores that write to disk: the token store and the cart id store. The next
+lesson is persistence — DataStore, why it replaced SharedPreferences, and encrypting the token with a
+Keystore key that never leaves the device.</p>

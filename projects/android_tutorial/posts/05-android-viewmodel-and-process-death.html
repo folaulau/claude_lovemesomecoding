@@ -1,0 +1,236 @@
+<p>This is the lesson with no counterpart in the iOS track, because it is about a problem iOS does
+not have in the same form. On Android, two things routinely happen to a running screen that every
+app has to survive:</p>
+
+<ol>
+<li><strong>A configuration change</strong> — the phone rotates, dark mode switches on, the language
+changes, a foldable opens. The Activity is destroyed and created again from scratch.</li>
+<li><strong>Process death</strong> — the app goes to the background, the system needs memory, and
+your whole process is killed. When the customer comes back, Android recreates the screen they left
+as if nothing happened — in a brand-new process with none of your objects in it.</li>
+</ol>
+
+<p>The first is easy to notice, because you rotate a phone. The second is the one that ships broken,
+because it never happens on a developer's phone with plenty of free memory. This lesson covers both,
+and what this app does about each.</p>
+
+<h2>Why rotation destroys your Activity</h2>
+
+<p>An Activity was designed in an era of XML layouts, and a rotated screen might need a completely
+different layout file — a <code>layout-land</code> folder. The simplest way to guarantee the right
+resources was to throw the Activity away and build a new one with the new configuration. Compose
+has no layout files, but the behaviour remains: every configuration change destroys and recreates
+the Activity, and with it every composable and everything in <code>remember</code>.</p>
+
+<p>Three things survive it:</p>
+
+<ul>
+<li><strong>A <code>ViewModel</code></strong>, which is kept in a store that outlives the
+Activity instance.</li>
+<li><strong><code>rememberSaveable</code></strong> and the Activity's saved-instance state, which are
+written to a <code>Bundle</code>.</li>
+<li><strong>Anything outside the Activity</strong> — the <code>Application</code> and singletons —
+because the process is still alive.</li>
+</ul>
+
+<p>It is tempting to treat rotation as an edge case and lock the app to portrait. On modern devices
+that does not make the problem go away. Foldables change configuration when opened, tablets and
+Chromebooks resize windows freely, split-screen resizes on every drag of the divider, and from Android
+16 large screens ignore an app's orientation lock entirely. Recreation is a normal event several
+times a session, and an app has to be built for it.</p>
+
+<h2>What a ViewModel is for</h2>
+
+<p>A ViewModel holds a screen's state and the work that produces it, in an object whose lifetime is
+the <em>screen's</em> — not the Activity instance's. Rotate the phone and the new Activity is handed
+the same ViewModel, with its loaded data and its in-flight requests untouched.</p>
+
+<p>Its lifetime is precise. A ViewModel obtained with <code>hiltViewModel()</code> inside a navigation
+destination belongs to that destination's back-stack entry: it lives while the screen is on the back
+stack, and is cleared when the screen is popped. Clearing cancels <code>viewModelScope</code>, so
+every coroutine launched in it stops by itself. The receipt screen's polling loop relies on exactly
+this:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">init {
+    viewModelScope.launch { poll() }
+}
+</code></pre>
+
+<p>Leave the receipt and the ViewModel is cleared, its scope cancelled, and the loop's
+<code>delay</code> throws <code>CancellationException</code> — it stops itself. Rotate the phone while
+it polls and nothing happens to it at all.</p>
+
+<h3>Run-once work, and why it needs a guard</h3>
+
+<p>Work started in a ViewModel's <code>init</code> runs once per ViewModel, which is once per screen —
+not once per rotation. The root ViewModel starts the app's launch sequence that way:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">if (authStore.state.value.isRestoringSession) {
+    viewModelScope.launch {
+        authStore.restoreSession()
+        menuStore.reload()
+        cartStore.hydrate()
+    }
+}
+</code></pre>
+
+<p>The guard is there for the one case where "once per ViewModel" is not "once per process". The
+stores are singletons and outlive the Activity. If the customer presses Back out of the app, the
+Activity <em>finishes</em> and its ViewModel is cleared — but the process often stays alive. Reopen the
+app and a new Activity gets a new ViewModel whose <code>init</code> would run the whole sequence again.
+Checking whether the session is still being restored makes the work happen once per process.</p>
+
+<h3>What a ViewModel must never hold</h3>
+
+<p>Because it outlives the Activity, a ViewModel must not hold anything tied to one: an
+<code>Activity</code>, a <code>View</code>, a <code>Context</code> other than the application's, or an
+object that keeps one alive. After the first rotation it would be holding a destroyed Activity, which
+can never be garbage-collected — a memory leak per rotation. The payments lesson is shaped by this
+rule: Stripe's payment sheet is registered with the Activity, so the ViewModel cannot own it.</p>
+
+<h2>Process death</h2>
+
+<p>Now the hard one. When your app is in the background, Android may kill its process to reclaim
+memory, with no callback and no warning. When the customer switches back, the system does not start
+your app fresh — it restores the <em>task</em> they left: same Activity, same back stack, same screen,
+with the saved-instance state it kept for you. What it does <strong>not</strong> restore:</p>
+
+<ul>
+<li>Any ViewModel. They lived in the dead process. You get new ones.</li>
+<li>Any singleton, any field in your <code>Application</code>, any static. All fresh.</li>
+<li>Anything in plain <code>remember</code>.</li>
+</ul>
+
+<p>So a screen that kept its data only in a ViewModel comes back <em>empty</em>, on the right screen,
+looking broken. A checkout that kept its form only in a ViewModel comes back blank — after the
+customer left to find their card in a banking app, which is precisely when process death is most
+likely.</p>
+
+<h3>SavedStateHandle</h3>
+
+<p>A ViewModel can opt part of its state into the saved-instance <code>Bundle</code> through a
+<code>SavedStateHandle</code>, which Hilt injects for free. Checkout keeps its form there:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val form: StateFlow&lt;CheckoutForm&gt; = savedStateHandle.getStateFlow(KEY_FORM, CheckoutForm())
+val selectedAddressId: StateFlow&lt;UuidString&gt; =
+    savedStateHandle.getStateFlow(KEY_ADDRESS, NEW_ADDRESS_ID)
+</code></pre>
+
+<p><code>getStateFlow</code> returns a <code>StateFlow</code> backed by the handle: it starts from the
+saved value if there is one, and from the default if not. Writing goes through the handle too, so
+every keystroke is recorded:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun updateForm(transform: (CheckoutForm) -&gt; CheckoutForm) {
+    val updated = transform(form.value)
+    savedStateHandle[KEY_FORM] = updated
+    // Re-validate as they type, but only once they have tried to submit — red text under a
+    // field the customer has not reached yet is nagging, not help.
+    if (hasAttemptedSubmit) _state.update { it.copy(fieldErrors = validate(updated)) }
+}
+</code></pre>
+
+<p>For a whole form to fit in a <code>Bundle</code> it must be <code>Parcelable</code>. Writing that
+by hand is forty lines of serialisation code; the Kotlin parcelize plugin generates it from one
+annotation:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Parcelize
+data class CheckoutForm(
+    val customerName: String = "",
+    val email: String = "",
+    val phone: String = "",
+    val addressLine1: String = "",
+    val city: String = "",
+    val state: String = "",
+    val postalCode: String = "",
+) : Parcelable {
+</code></pre>
+
+<p>The rest of the ViewModel — whether the order was created, whether payment is in progress — stays
+in an ordinary <code>MutableStateFlow</code>, and is lost on process death. That is deliberate.</p>
+
+<h3>SavedStateHandle or rememberSaveable?</h3>
+
+<p>Both write to the same <code>Bundle</code>; the difference is who owns the value. If the
+<em>composable</em> owns it — which section of the menu is showing, which sheet is open — use
+<code>rememberSaveable</code> next to the UI that reads it. If the <em>ViewModel</em> owns it, because
+business logic reads it (checkout validates and submits the form), use the handle, so the ViewModel
+never has to ask the UI what the customer typed. One owner per value, as always.</p>
+
+<h3>What deserves to be saved</h3>
+
+<p>The <code>Bundle</code> is small — the whole saved state of a task should stay well under a few
+hundred kilobytes, and exceeding the limit crashes with <code>TransactionTooLargeException</code>. So
+saved state is a short list of decisions, not a cache:</p>
+
+<ul>
+<li><strong>Save what the user typed or chose</strong>: form fields, a selected tab, which sheet was
+open, a scroll position. Losing these is what they notice.</li>
+<li><strong>Save ids, not objects.</strong> The open builder is saved as a product id; the receipt as
+an order id. The object can be fetched again; a stale copy would be wrong anyway.</li>
+<li><strong>Do not save what the server owns.</strong> Checkout does not save the created order. After
+process death the honest recovery is to place it again, not to resume a payment for an object the
+app can no longer vouch for.</li>
+<li><strong>Do not save secrets.</strong> The sign-in sheet keeps the password in plain
+<code>remember</code>, because the saved state is written to disk.</li>
+</ul>
+
+<h3>Navigation arguments survive too</h3>
+
+<p>The back stack is part of the saved state, including each destination's arguments. That is why the
+receipt screen reads its order id from its <code>SavedStateHandle</code> rather than from a
+constructor parameter:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val orderId: String = savedStateHandle.toRoute&lt;OrderRoute&gt;().orderId
+</code></pre>
+
+<p>After process death, the restored back stack hands the new ViewModel the same route, and the
+polling simply starts again. No extra code — which is the payoff for putting ids in routes.</p>
+
+<h2>Proving it works</h2>
+
+<p>Process death has to be tested deliberately, because it will not happen to you by accident. Three
+ways, from quickest to most faithful:</p>
+
+<p><strong>A unit test.</strong> Build a ViewModel, write through it, then build a second ViewModel over
+the <em>same</em> handle — which is exactly what Android does after recreating the process:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun `the form survives process death through the saved state handle`() = runTest {
+    val handle = SavedStateHandle()
+    viewModel(handle).updateForm { validForm }
+
+    // A new ViewModel over the same handle is what Android builds after process death.
+    val restored = viewModel(handle)
+    assertEquals(validForm, restored.form.value)
+    assertNotNull(handle.get&lt;CheckoutForm&gt;("checkout.form"))
+}
+</code></pre>
+
+<p><strong>"Don't keep activities"</strong> in Developer options destroys every Activity as soon as it
+leaves the screen. It tests saved state, but the process survives, so singletons do not reset — it is
+a partial simulation.</p>
+
+<p><strong>Kill the process for real.</strong> Put the app in the background, then:</p>
+
+<pre class="language-bash"><code class="language-bash">adb shell am kill com.lovemesomecoding.pizza.android.debug   # only kills a BACKGROUND app
+# now reopen it from the recents screen
+</code></pre>
+
+<p>This app was tested exactly that way against the live backend: a drink added to the cart, the app
+sent home, the process killed, then reopened. It came back on the Menu tab with the Drinks section
+still selected (<code>rememberSaveable</code>), the cart badge showing one item (re-fetched from the
+server by id), and the customer still signed in (the token read back from encrypted storage).
+Everything that was supposed to survive did; everything else was rebuilt.</p>
+
+<h2>Configuration changes you can opt out of — and should not</h2>
+
+<p>You will find advice to add <code>android:configChanges="orientation|screenSize"</code> to the
+manifest so the Activity is not recreated on rotation. It works, for rotation. It does nothing for the
+other configuration changes, and nothing at all for process death — so it hides the class of bug in
+the case you test and leaves it in the case you do not. Handle recreation properly once, with
+ViewModels and saved state, and every one of these cases is covered by the same code.</p>
+
+<h2>Next</h2>
+
+<p>The back stack has come up twice. The next lesson is Navigation Compose: routes as
+<code>@Serializable</code> classes, a graph per tab, and replacing checkout with the receipt so Back
+cannot return to a paid order.</p>

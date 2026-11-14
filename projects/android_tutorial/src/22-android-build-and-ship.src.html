@@ -1,0 +1,202 @@
+<p>Twenty-one lessons have been about the debug build: installed from Android Studio onto an emulator,
+talking to a server on your laptop. What customers install is a different artefact — minified,
+optimised, signed with a key you must never lose, uploaded as a bundle Google turns into per-device
+APKs, and reviewed before anyone sees it. This lesson is that path, and the decisions on it that cannot
+be undone.</p>
+
+<h2>Build types</h2>
+
+<p>Every Android module has at least two <em>build types</em>, and the differences between them are
+declared in one block:</p>
+
+@@kotlin
+<<A/app/build.gradle.kts | buildTypes { | ^    }$ | nc>>
+@@
+
+<p>A build type can change almost anything. Here the two differ in four ways:</p>
+
+<ul>
+<li><strong>Which server.</strong> <code>buildConfigField</code> writes a constant into the generated
+<code>BuildConfig</code> class per build type, so debug talks to <code>10.0.2.2</code> and release to the
+production HTTPS host, from the same source. Nothing in the app's code changes between them.</li>
+<li><strong>Identity.</strong> <code>applicationIdSuffix = ".debug"</code> makes the debug build a
+different app as far as the phone is concerned, so a developer can have the store version and their
+work-in-progress installed side by side.</li>
+<li><strong>Signing</strong>, below.</li>
+<li><strong>R8</strong>, below.</li>
+</ul>
+
+<p>Build types combine with optional <em>product flavours</em> — <code>free</code> and
+<code>paid</code>, or <code>staging</code> and <code>production</code> — into <em>variants</em>, each
+with its own source set (<code>src/debug/</code>, <code>src/release/</code>, …) merged over
+<code>main</code>. The debug-only network security config from the networking lesson is exactly that: a
+file in <code>src/debug/</code> that release builds never see.</p>
+
+<p>One honest caveat about this app: the release URL is a placeholder, <code>api.pizza.example.com</code>.
+The demo backend is not deployed anywhere, so a release build of this app installs, launches and shows
+"Could not reach the server" — correctly. The release <em>build</em> is real and verified; the release
+<em>environment</em> is not, and the code says so rather than pretending.</p>
+
+<h3>Versions</h3>
+
+<p><code>versionCode</code> is an integer Google Play uses to order builds; every upload must be higher
+than the last, and a build with a lower one cannot be installed over a higher one. <code>versionName</code>
+is the string customers see. CI usually derives <code>versionCode</code> from the build number so it can
+never be forgotten.</p>
+
+<h2>R8: shrinking, optimising, obfuscating</h2>
+
+<p><code>isMinifyEnabled = true</code> runs R8 over the release build. It removes every class and method
+nothing reachable uses, inlines and optimises what remains, and renames everything to short meaningless
+names. <code>isShrinkResources</code> then drops unused images and strings. On this app the effect is
+dramatic: the debug APK is 35 MB, the release APK 6.7 MB.</p>
+
+<p>The danger is reflection. R8 decides what is "used" by following code; anything reached only by name
+at runtime — a class instantiated reflectively, an annotation read through reflection, a JSON field
+matched by name — can be removed or renamed, and the release build crashes where debug worked. The fix
+is a <em>keep rule</em>. This app's rules file is nearly empty, and says why:</p>
+
+@@properties
+<<A/app/proguard-rules.pro | # kotlinx.serialization | # Nothing is needed>>
+@@
+
+<p>Modern libraries ship their own <em>consumer rules</em> inside their artefacts, applied
+automatically. The choices made earlier in this track also helped: kotlinx.serialization generates
+serialisers at compile time rather than using reflection, and the one reflective read the app does —
+the <code>@Authenticated</code> annotation — is on a Retrofit interface method, which Retrofit's rules
+already keep.</p>
+
+<p>"Should be fine" is not evidence, so this app was checked the honest way: R8 was switched on for a
+debug build, which can reach the local backend, and the minified app was driven on the emulator. The
+menu decoded, the generic <code>Page&lt;Order&gt;</code> envelope decoded, the token was attached to
+authenticated routes, and the session came back from the Keystore. A release-only crash would have
+shown there. Do this before your first store upload.</p>
+
+<p>Keep the <strong>mapping file</strong> R8 writes to <code>build/outputs/mapping/</code>, and upload it
+to Play Console with each release: a crash report from an obfuscated build reads
+<code>a.b.c(Unknown Source)</code> until it is de-obfuscated with the matching mapping.</p>
+
+<h2>Signing</h2>
+
+<p>Android will only install a signed APK, and an update only if it is signed with the <em>same</em> key
+as the installed version. Debug builds are signed automatically with a debug key Android Studio
+generates. Release builds need a real one, and its handling is the most consequential decision in this
+lesson.</p>
+
+<p>With <strong>Play App Signing</strong> — the default for new apps — there are two keys. Google holds
+the <em>app signing key</em> that signs what customers install. You hold an <em>upload key</em> that
+proves an upload came from you. Lose the upload key and Google can reset it; that safety net is the main
+reason to use Play App Signing.</p>
+
+<p>The upload key's passwords must never be in the repository. The build reads them from the
+environment on CI, or from <code>local.properties</code> on a developer's machine:</p>
+
+@@kotlin
+<<A/app/build.gradle.kts | fun secret(name: String) | val uploadKeystore>>
+@@
+
+@@kotlin
+<<A/app/build.gradle.kts | signingConfigs { | ^    }$>>
+@@
+
+<p>When no keystore is configured the release build is produced <em>unsigned</em> — still enough to prove
+R8 works, which is what CI checks on every pull request. The signed path was verified with a throwaway
+key: build, then <code>jarsigner -verify</code> on the bundle reported "jar verified", signed by the
+throwaway certificate. Then the key was deleted.</p>
+
+<h2>App Bundles</h2>
+
+<p>The Play Store does not take an APK. It takes an <strong>Android App Bundle</strong>
+(<code>.aab</code>) — <code>./gradlew bundleRelease</code> — and generates optimised APKs for each device
+configuration from it: only the screen density, CPU architecture and languages that device needs. The
+customer downloads less than the universal APK you would otherwise ship.</p>
+
+<p>The launcher icon is part of that: an <em>adaptive icon</em> with separate foreground and background
+layers, which each launcher masks into its own shape, and a monochrome layer for Android 13's themed
+icons:</p>
+
+@@markup
+<<RES/mipmap-anydpi/ic_launcher.xml | <adaptive-icon | </adaptive-icon>>>
+@@
+
+<h3>Looking inside what you ship</h3>
+
+<p>Android Studio's <strong>APK Analyzer</strong> (Build → Analyze APK) opens any APK or bundle and shows
+what takes the space: DEX by package, resources, native libraries. It is the quickest way to find the
+dependency that doubled the download size, and to confirm that what R8 removed is what you expected it
+to remove — including that <code>SampleData</code> and the previews are gone from release.</p>
+
+<h3>Baseline profiles</h3>
+
+<p>The largest single improvement to how a Compose app <em>feels</em> on first launch is a
+<strong>baseline profile</strong>: a list of the classes and methods on the startup and first-scroll paths,
+shipped inside the app so Android compiles them ahead of time at install instead of interpreting them on
+first use. It is generated by a Macrobenchmark test that drives the real app — launch, open the menu,
+scroll — on a device, through the <code>androidx.baselineprofile</code> Gradle plugin. Compose and the other
+AndroidX libraries already ship profiles for <em>their</em> code, and the release build merges them in —
+that is the <code>baselineProfiles</code> folder that appears next to the release APK. What this app lacks
+is a profile for its own startup path. That is the next step for a production version, and the benchmark
+that generates it doubles as the startup-time regression test.</p>
+
+<h2>CI</h2>
+
+<p>A workflow beside the app runs on every push and pull request that touches it:</p>
+
+@@yaml
+<<P/.github/workflows/android.yml | - name: Test, lint and build release | run: ./gradlew>>
+@@
+
+<p>Tests, lint and a minified release build, on a cheap Linux runner, because nothing needs a device. A
+second job, only on <code>main</code>, restores the upload keystore from repository secrets and builds
+the signed bundle:</p>
+
+@@yaml
+<<P/.github/workflows/android.yml | - name: Restore the upload keystore | run: ./gradlew bundleRelease>>
+@@
+
+<p>Only on <code>main</code>, never on a pull request: a pull request from a fork must not be able to read
+signing secrets. The workflow file says plainly that it has never run — the demo repository has no
+remote yet — and that each command in it was run locally instead. A CI file that claims to be proven
+when it is not is a small lie that costs someone a day later.</p>
+
+<h2>Google Play</h2>
+
+<p>Uploading the bundle is the start, not the end. What Play Console asks of you, roughly in order:</p>
+
+<ul>
+<li><strong>A developer account</strong>, with identity verification. New personal accounts must run a
+closed test with a minimum number of testers over a minimum period before they can publish to production
+— check the current figures when you register, as Google has changed them.</li>
+<li><strong>Testing tracks.</strong> Internal (up to a hundred testers, available in minutes), closed,
+open, then production. Use internal for every build; it is the fastest way to install a real release
+build on real phones.</li>
+<li><strong>A target SDK requirement.</strong> New apps and updates must target a recent API level —
+within about a year of the newest. This is why <code>targetSdk</code> is a number you keep raising.</li>
+<li><strong>The Data safety form</strong>: what data the app collects, why, whether it is encrypted in
+transit, whether users can delete it. This app collects an email, a name, addresses and order history,
+sends all of it over HTTPS, and never sees card numbers — the form should say exactly that.</li>
+<li><strong>A privacy policy URL</strong>, a content rating questionnaire, and store listing assets:
+icon, feature graphic, screenshots.</li>
+<li><strong>Review.</strong> Usually hours to a few days. Rejections commonly cite a permission without
+a clear use, a missing policy, or a Data safety form that does not match behaviour.</li>
+</ul>
+
+<p>Once live, ship with a <strong>staged rollout</strong> — 5% of users, then 20%, then everyone —
+watching the crash rate in Android vitals between steps. It is the difference between a bad build
+reaching a few hundred people and reaching all of them.</p>
+
+<h2>Before every release</h2>
+
+<ol>
+<li>Tests, lint and a minified release build pass in CI.</li>
+<li>The minified build has been run against a real backend at least once since the last dependency
+upgrade.</li>
+<li><code>versionCode</code> went up.</li>
+<li>The mapping file is uploaded with the bundle.</li>
+<li>Internal testers have installed it from Play, not from Android Studio.</li>
+</ol>
+
+<h2>Next</h2>
+
+<p>One lesson left: the questions an Android interview actually asks, answered against everything in
+this track.</p>

@@ -1,0 +1,299 @@
+<p>Everything this app shows comes from a Spring Boot API: the menu, the cart, orders, addresses,
+cards. This lesson is the layer that talks to it — Retrofit for describing the API, OkHttp for sending
+requests, kotlinx.serialization for turning JSON into Kotlin — and the configuration that decides which
+server a build talks to.</p>
+
+<p>The standard Android networking stack has not changed shape in years, and it is worth learning
+properly once. The defaults are where the trouble is: three of them will bite you, and they are
+called out as they come up.</p>
+
+<h2>The API as an interface</h2>
+
+<p>Retrofit's idea is that an HTTP API is described by a Kotlin interface. Each method is an endpoint,
+its annotations are the request, and Retrofit generates the implementation at runtime:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">interface PizzaApi {
+    // Authentication
+
+    @POST("api/auth/login")
+    suspend fun login(@Body body: LoginBody): AuthenticationResponse
+
+    @POST("api/auth/register")
+    suspend fun register(@Body body: RegisterBody): AuthenticationResponse
+
+    @Authenticated
+    @GET("api/auth/me")
+    suspend fun currentUser(): User
+
+    // Catalogue
+
+    @GET("api/products")
+    suspend fun products(): List&lt;Product&gt;
+
+    @GET("api/toppings")
+    suspend fun toppings(): List&lt;Topping&gt;
+
+    @GET("api/crusts")
+    suspend fun crusts(): List&lt;Crust&gt;
+    // …
+</code></pre>
+
+<p>Every route the app calls lives in this one file, which makes "what does this app talk to?" a
+question answered by reading it. The annotations cover the shape of a request:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@GET("api/carts/{id}")
+suspend fun cart(@Path("id") id: String): ServerCart
+
+@PUT("api/carts/{id}")
+suspend fun replaceCart(@Path("id") id: String, @Body body: CartWriteRequest): ServerCart
+</code></pre>
+
+<ul>
+<li><strong><code>@GET</code>, <code>@POST</code>, <code>@PUT</code>, <code>@PATCH</code>,
+<code>@DELETE</code></strong> with a path relative to the base URL.</li>
+<li><strong><code>@Path("id")</code></strong> fills <code>{id}</code>, URL-encoded.</li>
+<li><strong><code>@Query("page")</code></strong> adds <code>?page=…</code>, also encoded — never
+concatenate query strings by hand; a topping called "Mac &amp; Cheese" will find the bug for you.</li>
+<li><strong><code>@Body</code></strong> serialises the parameter as the JSON request body.</li>
+</ul>
+
+<p>Every function is <code>suspend</code>. Retrofit then runs the call on OkHttp's own threads and
+resumes the caller with the decoded body, so calling it from a coroutine on the main thread is safe —
+there is no <code>withContext(Dispatchers.IO)</code> to remember. A non-2xx response throws
+<code>HttpException</code>; the next lesson turns that into something the app can act on.</p>
+
+<p>For a request with no response body — a <code>DELETE</code> that returns 204 — the return type is
+<code>Unit</code>, and Retrofit does not try to decode anything:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@DELETE("api/me/addresses/{id}")
+suspend fun deleteAddress(@Path("id") id: String)
+</code></pre>
+
+<h3>Wire-only types stay in the data layer</h3>
+
+<p>Some request and response shapes exist only on the wire — a login body, a one-field envelope around
+a client secret. They are declared next to the interface, not in the domain models:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">data class LoginBody(val email: String, val password: String)
+
+@Serializable
+data class RegisterBody(val email: String, val password: String, val fullName: String)
+
+@Serializable
+data class SetupIntentResponse(val clientSecret: String)
+
+@Serializable
+data class PaymentMethodBody(val stripePaymentMethodId: String)
+</code></pre>
+
+<p>The repository interface the rest of the app sees takes two strings and returns a client secret.
+Nothing above the data layer knows these envelopes exist, so the API can change its envelope without
+a single screen noticing.</p>
+
+<h2>Building the client</h2>
+
+<p>The pieces are assembled once, in a Hilt module, and shared by every repository:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun provideOkHttpClient(config: ApiConfig, tokenProvider: AuthTokenProvider): OkHttpClient =
+    OkHttpClient.Builder()
+        .connectTimeout(config.requestTimeoutSeconds, TimeUnit.SECONDS)
+        .readTimeout(config.requestTimeoutSeconds, TimeUnit.SECONDS)
+        .addInterceptor(AuthInterceptor(tokenProvider))
+        .apply {
+            /*
+             * Logging is added only to debug builds, and at BASIC — method, URL, status and
+             * timing. BODY would print every password and token to Logcat, which any app with
+             * READ_LOGS on an old or rooted device can read.
+             */
+            if (BuildConfig.DEBUG) {
+                addInterceptor(
+                    HttpLoggingInterceptor().setLevel(HttpLoggingInterceptor.Level.BASIC),
+                )
+            }
+        }
+        .build()
+</code></pre>
+
+<p><strong>Timeouts</strong> come first because the default is wrong for a phone. A phone on a weak
+signal does not fail fast — without a deadline a request can sit for minutes while the customer
+watches a spinner. Fifteen seconds is long enough for a cold Spring Boot start and short enough that a
+dead network is obvious.</p>
+
+<p><strong>Interceptors</strong> see every request and response, in order. The auth interceptor is
+below. The logging interceptor is added only to debug builds, and only at <code>BASIC</code> — method,
+URL, status, timing. <code>BODY</code> would print every password and token to Logcat, which is
+exactly where you do not want them, even in development.</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun provideRetrofit(config: ApiConfig, client: OkHttpClient, json: Json): Retrofit =
+    Retrofit.Builder()
+        // Must end in "/": Retrofit resolves "api/products" against it like a browser
+        // resolves a relative link, and without the slash the last path segment is replaced.
+        .baseUrl(config.baseUrl)
+        .client(client)
+        .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+        .build()
+</code></pre>
+
+<p>⚠️ The base URL <strong>must end in <code>/</code></strong>. Retrofit resolves a method's path
+against it the way a browser resolves a relative link, so <code>http://host/v1</code> plus
+<code>api/products</code> becomes <code>http://host/api/products</code> — the <code>v1</code> silently
+replaced. With the trailing slash it is appended, as you meant. Retrofit throws at startup for a base
+URL with a path and no trailing slash, which is the friendliest possible failure; the trap is mostly in
+copying a URL without one into configuration.</p>
+
+<h2>Attaching the token</h2>
+
+<p>Some routes need the customer's token and some do not; the menu is public, an address book is not.
+That decision belongs next to the route, not to whoever happens to call it. So the app marks
+authenticated routes with its own annotation:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Authenticated
+@GET("api/auth/me")
+suspend fun currentUser(): User
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">@Target(AnnotationTarget.FUNCTION)
+@Retention(AnnotationRetention.RUNTIME)
+annotation class Authenticated
+</code></pre>
+
+<p>⚠️ <strong><code>RUNTIME</code> retention is not optional.</strong> An annotation's default
+retention keeps it in the class file but hides it from reflection, so the interceptor would find
+nothing and every request would go out without a token — and the first symptom would be a 403 from a
+screen that looks correct.</p>
+
+<p>The interceptor reads the annotation back from the request. Retrofit tags every request it builds
+with an <code>Invocation</code> — the interface method being called — which is how an OkHttp
+interceptor can know which Retrofit method a request came from:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">override fun intercept(chain: Interceptor.Chain): Response {
+    val request = chain.request()
+    val method = request.tag(Invocation::class.java)?.method()
+    if (method?.isAnnotationPresent(Authenticated::class.java) != true) {
+        return chain.proceed(request)
+    }
+
+    val token = runBlocking { tokenProvider.currentToken() } ?: return chain.proceed(request)
+
+    return chain.proceed(
+        request.newBuilder().header("Authorization", "Bearer $token").build(),
+    )
+}
+</code></pre>
+
+<p>One interceptor, so there is exactly one place that knows how a token is attached. A
+<code>@Header("Authorization")</code> parameter on each method would put that knowledge in every call
+site, and the first one to forget it would ship.</p>
+
+<p><code>runBlocking</code> usually means something has gone wrong, and the source carries a comment
+saying why it is correct here: an OkHttp interceptor is synchronous by contract and always runs on
+OkHttp's background threads, never the main thread, and the token is cached in memory after the first
+read. Blocking one worker thread for a memory read costs nothing.</p>
+
+<p>Finally, the interceptor does not depend on the session store directly. It depends on a one-method
+interface:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun interface AuthTokenProvider {
+    suspend fun currentToken(): String?
+}
+</code></pre>
+
+<p>The HTTP stack needs the token; the token lives with the session; the session is restored by
+calling the HTTP stack. Concrete types in both directions would be a dependency cycle that Hilt refuses
+to build. An interface the stack owns breaks it — and is also exactly what a test stubs with a lambda:
+<code>AuthInterceptor { "jwt-abc" }</code>.</p>
+
+<h2>JSON, and the three defaults that bite</h2>
+
+<p>Models are <code>@Serializable</code> data classes. The kotlinx.serialization compiler plugin
+generates their serialisers at compile time — no reflection, which means nothing for R8 to strip out
+of a release build and no surprises about Kotlin's nullability. The app has one <code>Json</code>
+instance, and its configuration is three lines that each prevent a real bug:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val PizzaJson: Json = Json {
+    ignoreUnknownKeys = true
+
+    encodeDefaults = true
+
+    explicitNulls = false
+}
+</code></pre>
+
+<ol>
+<li><strong><code>ignoreUnknownKeys</code>.</strong> By default kotlinx.serialization <em>throws</em>
+when the JSON has a field the class does not declare. The backend adds a field, ships first, and every
+installed copy of your app stops decoding that response. This is the opposite of Gson, Moshi and
+Swift's <code>Codable</code>, and the first thing to break in production.</li>
+<li><strong><code>encodeDefaults</code>.</strong> By default a property holding its default value is
+<em>not written</em>. A request class with <code>quantity: Int = 1</code> would send no quantity at all,
+and the server would reject — or worse, assume — it.</li>
+<li><strong><code>explicitNulls = false</code>.</strong> Leave a null out of the body rather than
+sending <code>"phone": null</code>. Spring treats both the same; an omitted key is what every other
+client of this API sends.</li>
+</ol>
+
+<p>Enums map to the wire with <code>@SerialName</code>, so a Kotlin constant can be named for Kotlin
+and the JSON spelled however the server spells it. A test in the suite decodes a product with an extra
+<code>"calories"</code> field, so removing the first setting fails the build rather than the app.</p>
+
+<h2>Which server: configuration, not code</h2>
+
+<p>"The backend" is a different machine for the emulator, a physical phone and a release build. So the
+address is a build setting, written into a generated <code>BuildConfig</code> class per build
+type:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">companion object {
+    fun fromBuildConfig(): ApiConfig = ApiConfig(
+        baseUrl = BuildConfig.API_BASE_URL,
+        stripePublishableKey = BuildConfig.STRIPE_PUBLISHABLE_KEY.takeIf { it.isNotBlank() },
+    )
+}
+</code></pre>
+
+<p>The debug value is <code>http://10.0.2.2:8085/</code> unless <code>local.properties</code> says
+otherwise (the getting-started lesson); release is the production HTTPS host. Changing environments
+is a build change, so the same source ships everywhere. And <code>ApiConfig</code> is a class rather
+than an <code>object</code>, so a test constructs one pointing at a local mock server and is certain
+nothing reaches a real host.</p>
+
+<h2>Why the first request fails: cleartext</h2>
+
+<p>Point a debug build at a local server and the first request fails with:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">java.net.UnknownServiceException: CLEARTEXT communication to 10.0.2.2 not permitted by network security policy
+</code></pre>
+
+<p>Since Android 9, plain HTTP is blocked by default. The fix is a network security config — and the
+detail that matters is <em>where</em> it lives. Release gets a strict one:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;network-security-config&gt;
+    &lt;base-config cleartextTrafficPermitted="false" /&gt;
+&lt;/network-security-config&gt;
+</code></pre>
+
+<p>Debug gets a permissive one, in <code>src/debug/res/</code>:</p>
+
+<pre class="language-markup"><code class="language-markup">&lt;domain-config cleartextTrafficPermitted="true"&gt;
+    &lt;!-- The emulator's alias for the host machine's loopback. --&gt;
+    &lt;domain includeSubdomains="false"&gt;10.0.2.2&lt;/domain&gt;
+    &lt;domain includeSubdomains="false"&gt;localhost&lt;/domain&gt;
+&lt;/domain-config&gt;
+</code></pre>
+
+<p>Gradle merges the <code>debug</code> source set over <code>main</code> only for debug builds, so a
+release build never sees the permissive file. Putting <code>cleartextTrafficPermitted="true"</code> in
+<code>main</code> "just for development" is how apps ship to the store accepting unencrypted traffic.</p>
+
+<h2>Compared with the iOS version</h2>
+
+<p>The SwiftUI app describes each request as an <code>Endpoint</code> value — path, method, whether it
+needs a token — and sends it through one hand-written <code>HTTPClient</code>. Retrofit is the same idea
+with the boilerplate generated: the interface method is the endpoint, the annotation is the flag, OkHttp
+is the client. On both platforms the security-relevant decision — does this route carry the token? —
+is declared next to the path, which is the property worth copying whichever library you use.</p>
+
+<h2>Next</h2>
+
+<p>A request can fail in four meaningfully different ways, and a coroutine can be cancelled mid-flight.
+The next lesson turns Retrofit's, OkHttp's and the serialiser's exceptions into one error type whose
+cases are decisions, and shows the <code>CancellationException</code> you must never swallow.</p>

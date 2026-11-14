@@ -1,0 +1,251 @@
+<p>Thirteen lessons have each looked at one part of this app. This one steps back and looks at the
+shape: which code lives where, which way the dependencies point, and what each layer is allowed to
+know. Architecture is not a diagram you draw first — it is the set of rules that keeps the hundredth
+feature as easy to add as the tenth.</p>
+
+<p>Google publishes an official guide to Android app architecture, and this app follows most of it.
+Where it deliberately does not, this lesson says so and why.</p>
+
+<h2>The layers</h2>
+
+<pre class="language-plaintext"><code class="language-plaintext">feature/   screens, ViewModels, state holders        ─┐
+app/       root composable, routes, sheets, toasts    │ depend on ↓
+data/      Retrofit API + repository implementations  │
+           ↓ implements                               │
+domain/    models, cart rules, repository INTERFACES ◄┘  depends on nothing
+core/      networking, storage, design system — knows nothing about pizza
+</code></pre>
+
+<p>The rule fits on one line: <strong>dependencies point inwards, toward the domain</strong>. A
+feature may use the domain; the domain uses nothing. And the one arrow that looks backwards — the data
+layer pointing <em>up</em> at the domain — is the most important line on the diagram.</p>
+
+<h3>The domain knows nothing</h3>
+
+<p>The <code>domain</code> package has no Android imports: no <code>Context</code>, no Compose, no
+Retrofit, no coroutine dispatchers. Models are plain data classes. The rules are plain functions. That
+is not purity for its own sake — it is what makes the most important code in the app runnable on the
+JVM in milliseconds, and readable by someone who has never touched Android.</p>
+
+<h2>Repositories, and the arrow that points up</h2>
+
+<p>A feature needs the menu. It should not know that the menu comes over HTTP, from which URL, through
+which library. So the domain declares what it needs as an interface:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">interface CatalogRepository {
+    suspend fun products(): List&lt;Product&gt;
+    suspend fun toppings(): List&lt;Topping&gt;
+    suspend fun crusts(): List&lt;Crust&gt;
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">interface OrderRepository {
+    /**
+     * Serves guests and signed-in customers alike. With a token the order is attached to the
+     * account; without one, `guestEmail` is how the customer gets their receipt.
+     */
+    suspend fun createOrder(request: OrderCreateRequest): OrderCreateResponse
+
+    /**
+     * Asks the SERVER whether the payment settled. Deliberately not "mark this order paid" — the
+     * device is never the authority on money, and anyone can call our API.
+     */
+    suspend fun paymentStatus(orderId: UuidString): Order
+    suspend fun myOrders(page: Int, size: Int): Page&lt;Order&gt;
+}
+</code></pre>
+
+<p>…and the data layer implements it:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">class RemoteOrderRepository @Inject constructor(
+    private val api: PizzaApi,
+    private val call: ApiCaller,
+) : OrderRepository {
+    override suspend fun createOrder(request: OrderCreateRequest) = call { api.createOrder(request) }
+    override suspend fun paymentStatus(orderId: UuidString) = call { api.paymentStatus(orderId) }
+    override suspend fun myOrders(page: Int, size: Int) = call { api.myOrders(page, size) }
+}
+</code></pre>
+
+<p>This is <em>dependency inversion</em>. The obvious design has the feature depending on the network
+code. Here both depend on an interface the domain owns, so the network code is the one that conforms.
+The payoff is that nothing under <code>feature/</code> imports Retrofit or OkHttp. Swapping the
+transport for GraphQL, adding a Room cache, or handing a test three pizzas from a list touches
+<code>data/</code> and nothing else.</p>
+
+<h3>Thin on purpose</h3>
+
+<p>The implementations are one line per method: a call in, a model out, through the error mapper.
+That thinness is a decision. A repository that also cached, retried and transformed would be a place
+for logic to accumulate where no test would look for it. Caching belongs in a store that owns state;
+retrying belongs to the caller who knows whether a retry is safe; error mapping already happened once,
+in <code>ApiCaller</code>.</p>
+
+<h2>Rules as a pure function</h2>
+
+<p>The cart is the most rule-dense part of the app — merging identical lines, removing a line at zero,
+keeping the order type when emptied — and four screens read it. Its rules live in a reducer: a function
+from the current state and an action to the next state.</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">data class CartState(
+    val items: List&lt;CartItem&gt; = emptyList(),
+    val orderType: OrderType = OrderType.DELIVERY,
+) {
+    val isEmpty: Boolean
+        get() = items.isEmpty()
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">sealed interface CartAction {
+    data class Add(val item: CartItem) : CartAction
+    data class Remove(val lineId: String) : CartAction
+    data class SetQuantity(val lineId: String, val quantity: Int) : CartAction
+    data class SetOrderType(val orderType: OrderType) : CartAction
+
+    /** Replace everything with what the server had saved. */
+    data class Hydrate(val state: CartState) : CartAction
+    data object Clear : CartAction
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun reduce(state: CartState, action: CartAction): CartState = when (action) {
+    is CartAction.Add -&gt; {
+        val index = state.items.indexOfFirst { it.hasSameConfigurationAs(action.item) }
+        if (index &gt;= 0) {
+            // Same configuration already in the cart: bump the quantity instead of adding a
+            // second identical line, which is what a customer means by tapping "Add" twice.
+            val existing = state.items[index]
+            state.copy(
+                items = state.items.toMutableList().apply {
+                    set(index, existing.copy(quantity = existing.quantity + action.item.quantity))
+                },
+            )
+        } else {
+            state.copy(items = state.items + action.item)
+        }
+    }
+
+    is CartAction.Remove -&gt;
+        // …
+</code></pre>
+
+<p>Three things follow from writing it this way. The rules are testable with no app at all — build a
+state, apply an action, assert on the result; the suite runs in milliseconds. Every mutation has a name,
+so when a cart ends up in an unexpected state there is a finite list of things that could have done it.
+And because <code>CartAction</code> is sealed, adding an action breaks the build until the reducer
+handles it.</p>
+
+<p>The cost is indirection, and the source says so plainly: for four fields of form state a reducer
+would be ceremony. It earns its place where the state is shared and the rules are real. Pricing is the
+same idea without the actions — a pure <code>object</code> that turns lines into totals:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun totals(items: List&lt;CartItem&gt;, orderType: OrderType): CartTotals {
+    val subtotal = Money.rounded(items.sumOf(::lineTotal))
+
+    // Pickup has no delivery fee, and neither does an empty cart — a $3.99 "total" for nothing
+    // would be absurd, and it is the state the cart is in every time the app is first opened.
+    val deliveryFee = if (orderType == OrderType.DELIVERY &amp;&amp; subtotal &gt; 0) DELIVERY_FEE else 0.0
+    val tax = Money.rounded(subtotal * TAX_RATE)
+
+    return CartTotals(
+        subtotal = subtotal,
+        tax = tax,
+        deliveryFee = deliveryFee,
+        total = Money.rounded(subtotal + tax + deliveryFee),
+        itemCount = items.sumOf { it.quantity },
+    )
+}
+</code></pre>
+
+<p>A practical test for whether a new rule belongs here: if you can state it without mentioning a
+screen, a network or a thread, it is domain logic, and it goes in the domain.</p>
+
+<h2>Stores own effects</h2>
+
+<p>If the reducer owns <em>what a change means</em>, something has to own <em>what a change
+causes</em>: saving to the server, loading the saved cart at launch, flushing when the app is
+backgrounded. That is <code>CartStore</code>, and it is the only place the reducer is called:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">fun setQuantity(lineId: String, quantity: Int) = dispatch(CartAction.SetQuantity(lineId, quantity))
+
+fun setOrderType(orderType: OrderType) = dispatch(CartAction.SetOrderType(orderType))
+
+/** Emptied after a successful payment. The order type survives, deliberately. */
+fun clear() = dispatch(CartAction.Clear)
+</code></pre>
+
+<p>Every command funnels through one <code>dispatch</code>, which applies the reducer and schedules the
+save. A new command cannot forget to persist, because persisting is not something commands do.</p>
+
+<h3>ViewModels are doors</h3>
+
+<p>A composable cannot ask Hilt for a singleton store. A ViewModel can, and the screen gets the
+ViewModel — so for app-wide state, the ViewModel is a door and nothing more:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">@HiltViewModel
+class CartViewModel @Inject constructor(private val store: CartStore) : ViewModel() {
+    val cart: StateFlow&lt;CartState&gt; = store.state
+    val totals: StateFlow&lt;CartTotals&gt; = store.totals
+
+    fun setQuantity(lineId: String, quantity: Int) = store.setQuantity(lineId, quantity)
+    fun remove(lineId: String) = store.remove(lineId)
+    fun setOrderType(orderType: OrderType) = store.setOrderType(orderType)
+}
+</code></pre>
+
+<p>Where a screen has state and rules of its own — checkout's two steps, the receipt's polling, the
+profile's writes — the ViewModel holds them. Where it has none, it forwards. Both are fine; what is not
+fine is business rules in a composable, where only a UI test can reach them.</p>
+
+<h2>Unidirectional data flow</h2>
+
+<p>Put together, every interaction in the app travels the same loop:</p>
+
+<pre class="language-plaintext"><code class="language-plaintext">tap "+"  →  CartSheet calls onQuantityChange(lineId, 3)
+         →  CartViewModel.setQuantity  →  CartStore.dispatch(SetQuantity)
+         →  CartReducer.reduce  →  _state.update(new CartState)
+         →  StateFlow emits  →  collectAsStateWithLifecycle  →  CartSheet recomposes
+</code></pre>
+
+<p>State flows down; events flow up; there is exactly one place each piece of state can change. When
+something on screen is wrong, you can walk this loop backwards and find where. That is the whole value
+of unidirectional data flow, and it is why the app has no screen that writes to state it does not
+own.</p>
+
+<h2>Where this app departs from Google's guide</h2>
+
+<p>The official guide describes a UI layer (screens and ViewModels), an optional domain layer, and a
+data layer (repositories and data sources). This app maps onto it directly, with three deliberate
+differences.</p>
+
+<p><strong>No use-case classes.</strong> The guide's domain layer is often written as one class per
+operation — <code>GetMenuUseCase</code>, <code>PlaceOrderUseCase</code> — each with a single
+<code>invoke</code>. For an app with real cross-feature logic they are useful. Here they would mostly
+be one-line wrappers around a repository call, and every one would be a file to read that adds
+nothing. The domain layer here is the models, the interfaces and the cart rules, which is where the
+actual domain logic is.</p>
+
+<p><strong>No offline database.</strong> The guide favours a local database as the single source of
+truth, with the network syncing into it. This app keeps the cart on the server — that is a product
+requirement shared with the web apps — so the server is the source of truth and the device keeps only
+an id. A local cache would be a second copy to reconcile. When an app genuinely needs to work offline,
+Room behind the same repository interface is the next step, and no feature would change.</p>
+
+<p><strong>One module.</strong> Large apps split into Gradle modules —
+<code>:core:network</code>, <code>:feature:checkout</code> — so the build can compile them in parallel
+and the compiler can <em>enforce</em> the dependency rule (a feature module simply cannot import
+another). This app enforces it by convention, in packages, because a single module is easier to read
+in a tutorial. The package structure maps one-to-one onto modules, so splitting later is mechanical.
+The usual trigger is build time, or a second team.</p>
+
+<h2>What the iOS version does differently</h2>
+
+<p>Almost nothing structural: same four layers, same repository protocols in the domain, same pure
+reducer, same stores. The difference is how the graph is <em>assembled</em> — the SwiftUI app builds
+every dependency by hand in one composition root, and this one lets Hilt build it from annotations.
+That difference is big enough to be the next lesson.</p>
+
+<h2>Next</h2>
+
+<p>Dependency injection with Hilt: what it generates, modules and scopes, and how the same graph is
+rebuilt with fakes for a test — set against the hand-written version it replaces.</p>

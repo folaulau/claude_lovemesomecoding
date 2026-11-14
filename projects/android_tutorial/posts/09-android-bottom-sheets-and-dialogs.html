@@ -1,0 +1,286 @@
+<p>This app has five modal surfaces: the pizza builder, the cart, sign-in, registration and the
+address form — all bottom sheets — plus a confirmation dialog before anything is deleted. On a phone,
+a sheet is the right tool for a focused task that should not lose the customer's place: they finish or
+dismiss it and are exactly where they were.</p>
+
+<p>Compose presents them in a way that surprises people coming from the View system or from iOS, and
+the surprise is the whole lesson.</p>
+
+<h2>A sheet is shown by being composed</h2>
+
+<p>There is no <code>show()</code>. A <code>ModalBottomSheet</code> is on screen while it is in the
+composition, and dismissed when it leaves it. Whether it is composed is an ordinary
+<code>if</code>:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val loaded = catalogue.valueOrNull
+val openProduct = loaded?.product(openProductId ?: "")
+if (loaded != null &amp;&amp; openProduct != null) {
+    PizzaBuilderSheet(
+        state = rememberPizzaBuilderState(openProduct, loaded),
+        onAdd = { builder -&gt;
+            viewModel.addToCart(builder)
+            openProductId = null
+        },
+        onDismiss = { openProductId = null },
+    )
+}
+</code></pre>
+
+<p>The state is "which product's builder is open" — an id, saved with <code>rememberSaveable</code> so
+the sheet reopens after a rotation. Tapping a product sets it; adding to the cart or dismissing clears
+it. Nothing anywhere calls "open" or "close"; the sheet follows the state, like every other part of
+the UI.</p>
+
+<p>It follows that a second builder <em>cannot</em> stack on the first. There is one nullable id, so
+there is at most one open product. That property — the state making a bad situation unrepresentable
+— is worth designing for deliberately, and the root of the app does exactly that below.</p>
+
+<h2>ModalBottomSheet</h2>
+
+<pre class="language-kotlin"><code class="language-kotlin">ModalBottomSheet(
+    onDismissRequest = onDismiss,
+    sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+    containerColor = PizzaTheme.colors.background,
+) {
+    Column(
+        modifier = Modifier
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = Spacing.lg)
+            .navigationBarsPadding(),
+        verticalArrangement = Arrangement.spacedBy(Spacing.lg),
+            // …
+</code></pre>
+
+<ul>
+<li><strong><code>onDismissRequest</code></strong> is called when the customer swipes the sheet
+down, taps the dimmed scrim, or presses Back. It is a <em>request</em>: the sheet stays until your
+state changes. Here it clears the open product.</li>
+<li><strong><code>rememberModalBottomSheetState(skipPartiallyExpanded = true)</code></strong> — by
+default a tall sheet opens half-way and the customer drags it up. The builder is a whole task with its
+button at the bottom; half-open would hide the button they came for, so it opens fully.</li>
+<li><strong><code>verticalScroll</code></strong> inside the sheet, because the content is taller
+than a small phone, and <strong><code>navigationBarsPadding()</code></strong> so the last button is
+not drawn under the gesture bar.</li>
+</ul>
+
+<p>The cart makes the opposite choice:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">ModalBottomSheet(onDismissRequest = onDismiss, containerColor = PizzaTheme.colors.background) {
+    CartContent(
+        cart = cart,
+        totals = totals,
+        onQuantityChange = viewModel::setQuantity,
+        onRemove = viewModel::remove,
+        onOrderTypeChange = viewModel::setOrderType,
+        onCheckout = onCheckout,
+    )
+}
+</code></pre>
+
+<p>No sheet state at all, so it gets the default, which may open half-way. A cart with one line does
+not need the whole screen, and the smaller sheet leaves the menu visible behind it — a reminder of
+where the customer will land when they close it.</p>
+
+<h3>The exit animation</h3>
+
+<p>Removing a sheet from composition removes it immediately; it does not slide away. When that matters,
+the documented pattern is to animate first and remove afterwards:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">val scope = rememberCoroutineScope()
+val sheetState = rememberModalBottomSheetState()
+
+PizzaButton("Add to cart", onClick = {
+    scope.launch { sheetState.hide() }.invokeOnCompletion {
+        if (!sheetState.isVisible) openProductId = null
+    }
+})
+</code></pre>
+
+<p><code>hide()</code> suspends until the slide finishes, then the state is cleared. This app uses the
+simpler version — the builder vanishes when you add — because a toast immediately confirms what
+happened, and an extra coroutine per button is a cost every reader of the code pays. Choose per
+sheet.</p>
+
+<h2>One sheet at a time, by construction</h2>
+
+<p>The cart, sign-in and registration sheets can be opened from anywhere: the top bar, the Orders tab,
+the Profile tab, from each other. The naive implementation is three booleans — and three booleans
+allow two sheets to be "open" at once, which renders two sheets stacked on top of each other. One
+enum makes that impossible:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">enum class AppSheet { CART, SIGN_IN, REGISTER }
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">private val _sheet = MutableStateFlow&lt;AppSheet?&gt;(null)
+val sheet: StateFlow&lt;AppSheet?&gt; = _sheet.asStateFlow()
+</code></pre>
+
+<p>The root composes whichever sheet the value names:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">when (sheet) {
+    AppSheet.CART -&gt; CartSheet(
+        onCheckout = {
+            viewModel.dismissSheet()
+            navController.navigate(CheckoutRoute) { launchSingleTop = true }
+        },
+        onDismiss = viewModel::dismissSheet,
+    )
+    AppSheet.SIGN_IN -&gt; SignInSheet(
+        onDismiss = viewModel::dismissSheet,
+        onSwitchToRegister = { viewModel.showSheet(AppSheet.REGISTER) },
+    )
+    AppSheet.REGISTER -&gt; RegisterSheet(
+        onDismiss = viewModel::dismissSheet,
+        onSwitchToSignIn = { viewModel.showSheet(AppSheet.SIGN_IN) },
+    )
+    null -&gt; Unit
+    }
+</code></pre>
+
+<p>Switching from sign-in to registration is one assignment — <code>showSheet(REGISTER)</code> — which
+replaces the sign-in sheet with the registration sheet in a single state change. With booleans it
+would be two writes, with a frame in between where either both or neither were open.</p>
+
+<p>Screens never touch this state directly. The Orders tab's "Sign in" button calls an
+<code>onSignIn</code> lambda; the root turns that into <code>showSheet(SIGN_IN)</code>. The same
+screen-reports, root-decides split as navigation.</p>
+
+<h3>Sheets and toasts</h3>
+
+<p>A <code>ModalBottomSheet</code> is drawn in its own window, above the activity's content. That has
+one visible consequence. The toast host is placed once, at the root, above every screen:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">ToastHost(toasts, onDismiss = viewModel::dismissToast, modifier = Modifier.align(Alignment.TopCenter))
+</code></pre>
+
+<p>Above every <em>screen</em> — but a sheet is not in that window, so a toast shown while a sheet is
+open appears underneath it, and becomes visible when the sheet closes.</p>
+
+<p>The builder closes itself before showing "added to your cart", so the confirmation is never hidden
+behind the sheet that caused it.</p>
+
+<h2>Resetting a form for free</h2>
+
+<p>The address sheet is used both to add an address and to edit one. Its fields must start empty for a
+new address and pre-filled for an edit — and must not carry over the half-typed values from the last
+time it was open. The iOS version gets this from <code>sheet(item:)</code> building a fresh view per
+item. Compose gets it from keyed state:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">var label by rememberSaveable(editing?.id) { mutableStateOf(editing?.label.orEmpty()) }
+var line1 by rememberSaveable(editing?.id) { mutableStateOf(editing?.line1.orEmpty()) }
+var line2 by rememberSaveable(editing?.id) { mutableStateOf(editing?.line2.orEmpty()) }
+var city by rememberSaveable(editing?.id) { mutableStateOf(editing?.city.orEmpty()) }
+var state by rememberSaveable(editing?.id) { mutableStateOf(editing?.state.orEmpty()) }
+var postalCode by rememberSaveable(editing?.id) { mutableStateOf(editing?.postalCode.orEmpty()) }
+</code></pre>
+
+<p><code>rememberSaveable(editing?.id)</code> keys each field on the address being edited. Opening the
+sheet for a different address — or for a new one — is a different key, so the stored values are thrown
+away and the initial values recomputed. There is no "reset the form" function, and therefore no bug
+where someone forgets to call it.</p>
+
+<p>The caller opens the sheet the same way as the builder, with a saveable id:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">editingAddressId?.let { id -&gt;
+    val editing = state.valueOrNull?.addresses?.firstOrNull { it.id == id }
+    AddressFormSheet(
+        editing = editing,
+        onSave = { request -&gt;
+            viewModel.saveAddress(editing?.id, request)
+            editingAddressId = null
+        },
+        onDismiss = { editingAddressId = null },
+    )
+}
+</code></pre>
+
+<p>An empty string means "new address", an id means "edit that one", and <code>null</code> means
+closed. Three states, one variable.</p>
+
+<h2>Dialogs</h2>
+
+<p>Deleting an address or a card cannot be undone, so it asks first. An <code>AlertDialog</code> works
+exactly like a sheet: composed means shown. The state is what is about to be deleted:</p>
+
+<pre class="language-kotlin"><code class="language-kotlin">private sealed interface PendingDelete {
+    val id: UuidString
+    val description: String
+
+    data class AddressDelete(override val id: UuidString, override val description: String) : PendingDelete
+    data class CardDelete(override val id: UuidString, override val description: String) : PendingDelete
+}
+</code></pre>
+
+<pre class="language-kotlin"><code class="language-kotlin">pendingDelete?.let { pending -&gt;
+    AlertDialog(
+        onDismissRequest = { pendingDelete = null },
+        title = { Text("Delete this?") },
+        text = { Text(pending.description) },
+        confirmButton = {
+            TextButton(onClick = {
+                when (pending) {
+                    is PendingDelete.AddressDelete -&gt; viewModel.deleteAddress(pending.id)
+                    is PendingDelete.CardDelete -&gt; viewModel.deletePaymentMethod(pending.id)
+                }
+                pendingDelete = null
+            }) { Text("Delete", color = PizzaTheme.colors.danger) }
+        },
+        dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Keep") } },
+    )
+}
+</code></pre>
+
+<p>A few conventions worth copying. The confirm button says what it does — "Delete" — rather than
+"OK", and is coloured as dangerous. The dismiss button is "Keep", which is unambiguous in a way
+"Cancel" is not when the action itself is a kind of cancelling. Tapping outside or pressing Back calls
+<code>onDismissRequest</code>, which must behave like "Keep": a destructive action never happens
+because someone tapped the wrong part of the screen.</p>
+
+<p>Material's <code>AlertDialog</code> also handles the accessibility details for you: focus moves
+into the dialog when it opens, TalkBack announces the title first, and content behind it cannot be
+reached until it closes. A hand-drawn overlay pretending to be a dialog gets none of that.</p>
+
+<p>One honest trade-off: <code>pendingDelete</code> uses plain <code>remember</code>, so rotating the
+phone with the dialog open closes it. A sealed type is not <code>Parcelable</code>; to keep the dialog
+across rotation you would save the id and the kind instead. For a two-second confirmation, losing it
+is acceptable — the customer taps Delete again. For a long form in a dialog, it would not be.</p>
+
+<h2>Sheets are not destinations — usually</h2>
+
+<p>None of these sheets is in the navigation graph. They are state in a screen or in the root, which
+has consequences worth choosing deliberately.</p>
+
+<p>Back still works: <code>ModalBottomSheet</code> intercepts the Back gesture while it is open and
+calls <code>onDismissRequest</code>, so Back closes the sheet before it pops a screen. That is the
+behaviour customers expect, with no code.</p>
+
+<p>What a sheet does <em>not</em> get is a place in the back stack. It cannot be the target of a deep
+link, and its arguments are whatever its owner saved. For the builder (one saved id) and the cart
+(app-wide state) that is exactly right. For something a notification should open — "your order is
+ready" — a destination is better, and Navigation Compose has <code>dialog&lt;Route&gt;</code> for a
+dialog that <em>is</em> a destination, with typed arguments and its own back-stack entry.</p>
+
+<p>The rule of thumb this app follows: <strong>if only this app's own buttons ever open it, make it
+state; if anything outside the app should be able to open it, make it a destination.</strong></p>
+
+<p>State-driven sheets are also simple to test. A screen test sets the state that means "builder open
+for pepperoni" and asserts on what is shown; it never has to drive a gesture to open the sheet
+first.</p>
+
+<h2>When to use which</h2>
+
+<ul>
+<li><strong>A bottom sheet</strong> for a task with several inputs that the customer may abandon:
+building a pizza, signing in, editing an address.</li>
+<li><strong>A dialog</strong> for one decision that blocks everything else: confirm a deletion,
+accept terms.</li>
+<li><strong>A screen</strong> for anything with its own navigation, anything long enough to scroll
+substantially, or anything a deep link should reach. Checkout is a screen, not a sheet, for all three
+reasons.</li>
+</ul>
+
+<h2>Next</h2>
+
+<p>Every sheet, dialog and card so far has drawn its colours from somewhere. The next lesson is that
+somewhere: a design system built on Material 3, where Material's colour scheme fits, where it runs
+out, and how a <code>CompositionLocal</code> fills the gap.</p>

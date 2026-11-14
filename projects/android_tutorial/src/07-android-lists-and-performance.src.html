@@ -1,0 +1,217 @@
+<p>Lists are where most of an app's screen time is spent and where most of its jank comes from. The
+menu, the order history and the cart are all lists in this app, and each makes a different decision
+about how to draw one.</p>
+
+<p>This lesson covers the lazy layouts, the two parameters that make them correct — <code>key</code>
+and <code>contentType</code> — and how Compose decides which rows it can skip, which is the part most
+performance advice from before 2024 now gets wrong.</p>
+
+<h2>Column versus LazyColumn</h2>
+
+<p>The home screen is a <code>Column</code> with <code>verticalScroll</code>. That composes, measures
+and keeps in memory <em>every</em> child, visible or not. For a screen with a hero card and three
+lines of text that is fine — it is the cheapest possible layout.</p>
+
+<p>For a list of things — products, orders — it is wrong. A <code>LazyColumn</code> composes only the
+items currently on screen, plus a small prefetch window, and recycles the rest as you scroll. A
+hundred-item menu costs the same as a ten-item one:</p>
+
+@@kotlin
+<<K/feature/menu/MenuScreen.kt | LazyColumn( | ^            }$>>
+@@
+
+<p>The content is not composables but a small DSL. <code>item { }</code> adds one entry;
+<code>items(list) { }</code> adds one per element. A lazy list can mix both, which is how the menu puts
+its Pizzas/Drinks picker and a heading above the products in the same scrolling list — rather than a
+fixed header above a separate list, which would not scroll away.</p>
+
+<p><code>contentPadding</code> pads the scrolling content, not the list: the first card starts 16dp
+from the top, but scrolled content passes under that space instead of being clipped by it. Padding
+the list with a modifier instead clips the content at the padding edge.</p>
+
+<h2>Keys</h2>
+
+<p>Without a <code>key</code>, a lazy list identifies items by <em>position</em>. Item 0 is "whatever
+is first". That is fine until the list changes, and then it is a state bug.</p>
+
+<p>On the menu, switching from Pizzas to Drinks replaces the list. Without keys, the first drink row
+is "item 0" — the same identity the first pizza row had — and inherits anything that row
+<code>remember</code>ed: an expanded state, an animation in progress, a scroll position in a nested
+row. With <code>key = { it.id }</code> each row's identity is the product it shows, and a new product
+gets a new, empty slot.</p>
+
+<p>Keys also matter when a list changes <em>in place</em>. The cart's lines can be removed from the
+middle:</p>
+
+@@kotlin
+<<K/feature/cart/CartSheet.kt | items(cart.items, key = | ^            }$>>
+@@
+
+<p>Removing line two with positional identity would hand line three's state to the slot that used to
+be line two. With the line's own id as its key, Compose knows exactly which item left, keeps the
+others' state attached to the right rows, and can animate the change with
+<code>Modifier.animateItem()</code> — which only works on keyed lists.</p>
+
+<p>The order history is the case where a key matters even with no deletions. New orders arrive at the
+top, so every existing order moves down one position on each refresh:</p>
+
+@@kotlin
+<<K/feature/orders/OrdersScreen.kt | items(state.value, key = | ^            }$>>
+@@
+
+<p>Keyed by order id, a refresh that adds one order composes one new row and moves the rest. Keyed by
+position, every row would be told its data changed, and every row would recompose.</p>
+
+<h3>Keys anchor the scroll position — which can hide a new item</h3>
+
+<p>Keys have one consequence that surprised this app's own author. A keyed list keeps its scroll
+position anchored to the item that was first on screen. Insert an order <em>above</em> it and the list
+stays put — the new order lands one row above the visible area. When the Orders tab refreshed after an
+order was placed, the customer saw exactly the list they saw before. The fix keeps them at the top only
+if they were already there:</p>
+
+@@kotlin
+<<K/feature/orders/OrdersScreen.kt | val listState = rememberLazyListState() | ^            }$>>
+@@
+
+<p>Keyed on the newest order's id, the effect runs when a new order arrives at the top. A customer who
+had scrolled down to an old order is left exactly where they were, which is the anchoring doing its
+job.</p>
+
+<p>(The iOS version of this app makes the same point with <code>ForEach</code> and
+<code>Identifiable</code>: identity is not a performance detail, it is correctness, and the speed comes
+for free once it is right.)</p>
+
+<p>Two rules for keys: they must be <strong>unique</strong> within the list (a duplicate key crashes),
+and they must be <strong>saveable</strong> — a <code>String</code>, <code>Int</code> or
+<code>Long</code> — because the list's scroll position is saved by key across rotation. An id from
+the API is ideal.</p>
+
+<h2>contentType</h2>
+
+<p>A lazy list recycles compositions as items scroll off screen. <code>contentType</code> tells it
+which items are interchangeable: a product row can be reused for another product row, but never for
+the picker or a heading, which have completely different structure. Without it, reuse still works but
+does more work, because the recycled slot's tree has to be thrown away and rebuilt. With one item type
+it does not matter; with several, it is a one-word win.</p>
+
+<h2>A lazy list inside a scrolling parent</h2>
+
+<p>Sooner or later every Android developer puts a <code>LazyColumn</code> inside a
+<code>Column</code> with <code>verticalScroll</code>, and gets this crash:</p>
+
+@@plaintext
+java.lang.IllegalStateException: Vertically scrollable component was measured with an infinity
+maximum height constraints, which is disallowed.
+@@
+
+<p>A scrolling parent offers its children unlimited height — that is what scrolling means. A lazy list
+given unlimited height would have to compose every item to find its own size, which defeats the point
+of being lazy, so it refuses. The cart sheet has this shape — a scrolling sheet with a list inside —
+and the fix is to give the list a bound:</p>
+
+@@kotlin
+<<K/feature/cart/CartSheet.kt | // Bounded, so a long cart scrolls | LazyColumn(modifier = >>
+@@
+
+<p>Now the list scrolls inside a fixed-maximum area, and the totals and the checkout button below it
+stay reachable however long the cart gets. The other fix, when the whole screen should scroll as one,
+is the reverse: make the <em>outer</em> container the lazy one and put the other content in
+<code>item { }</code> blocks, as the menu does.</p>
+
+<h2>Pull to refresh</h2>
+
+@@kotlin
+<<K/feature/menu/MenuScreen.kt | is UiState.Loaded -> PullToRefreshBox( | modifier = modifier.fillMaxSize()>>
+            // …
+@@
+
+<p><code>PullToRefreshBox</code> wraps a scrollable child and shows the indicator while
+<code>isRefreshing</code> is true. The flag comes from the ViewModel, set for exactly as long as the
+reload actually takes:</p>
+
+@@kotlin
+<<K/feature/menu/MenuViewModel.kt | fun refresh() { | ^    }$>>
+@@
+
+<p><code>menuStore.reload()</code> <em>suspends</em> until the request finishes, so the indicator
+tracks the real request — not a fixed delay guessed to look about right. And the
+<code>finally</code> clears it even when the reload fails, so a failed refresh cannot leave the
+spinner stuck on screen.</p>
+
+<h2>How Compose decides what to skip</h2>
+
+<p>When state changes, Compose recomposes the composables that read it — and for each child those
+call, it asks: have the parameters changed? If not, the child is <em>skipped</em>. A list row that is
+skipped costs almost nothing, which is why skipping is most of Compose performance.</p>
+
+<p>The question is how Compose knows whether a parameter changed. For years the answer was
+<em>stability</em>: a type is stable if Compose can trust that equal instances stay equal. Primitives,
+<code>String</code> and data classes made only of <code>val</code>s of stable types are stable.
+<code>List&lt;T&gt;</code> is <em>not</em> — it is an interface, and some implementations are
+mutable — so any composable taking a list was never skipped, and performance advice filled up with
+wrapper classes and immutable-collection libraries.</p>
+
+<p>Most of that advice is now out of date. Since Kotlin 2.0.20 the Compose compiler runs with
+<strong>strong skipping</strong> on by default:</p>
+
+<ul>
+<li>A composable with <em>unstable</em> parameters can still be skipped; those parameters are compared
+by <em>instance</em> (<code>===</code>) instead of by <code>equals</code>. A list that is the same list
+object as last time skips. Since this app replaces state rather than mutating it (the state lesson),
+an unchanged list <em>is</em> the same object.</li>
+<li>Lambdas passed to composables are remembered automatically, so passing
+<code>onClick = { onProductClick(product) }</code> no longer defeats skipping.</li>
+</ul>
+
+<h3>When you still annotate</h3>
+
+<p>Two annotations remain useful, and this app uses each once. <code>@Immutable</code> promises that
+an instance never changes after construction:</p>
+
+@@kotlin
+<<K/core/designsystem/Theme.kt | ^@Immutable$ | val onPrimary>>
+    // …
+@@
+
+<p>The theme's colours are read by nearly every composable; promising they are immutable lets Compose
+compare them with <code>equals</code> and skip on equal-but-different instances.
+<code>@Stable</code> makes a weaker promise — that observable changes go through Compose state — and
+is what a state-holder class with <code>mutableStateOf</code> properties should carry:</p>
+
+@@kotlin
+<<K/feature/menu/PizzaBuilderState.kt | ^@Stable$ | ^\) \{$>>
+    // …
+@@
+
+<p>These are promises, not hints. Annotate a class <code>@Immutable</code> and then mutate it, and
+Compose will skip composables that needed to update — a bug far harder to find than a slow list.</p>
+
+<h2>What is still your job</h2>
+
+<ul>
+<li><strong>Keep item bodies cheap.</strong> No sorting, filtering or formatting large data inside
+<code>items { }</code>. Do it once, in the ViewModel or with <code>remember</code>.</li>
+<li><strong>Read fast-changing state as late as possible.</strong> A value read during composition
+recomposes on every change; a scroll offset read inside a <code>Modifier.offset { }</code> lambda is
+read during layout instead and skips composition entirely.</li>
+<li><strong>Use <code>derivedStateOf</code> for thresholds.</strong> "Has the user scrolled past the
+first item?" changes twice; the scroll position changes every frame.</li>
+<li><strong>Use a grid where a grid belongs.</strong> <code>LazyVerticalGrid(GridCells.Adaptive(…))</code>
+fills a tablet with as many columns as fit, from the same item code.</li>
+</ul>
+
+<h3>Measure, in a release build</h3>
+
+<p>A debug build runs with Compose's debugging aids on and without R8's optimisations, and can be
+several times slower than what customers run. Judge scroll performance only in a release build. The
+Layout Inspector in Android Studio shows recomposition and skip counts per composable — a row whose
+recompose count climbs while its skip count stays at zero is the one to look at. And a <em>baseline
+profile</em> — a list of hot code paths shipped with the app so it is compiled ahead of time — is the
+single biggest improvement to first-launch and first-scroll smoothness, covered in the build
+lesson.</p>
+
+<h2>Next</h2>
+
+<p>The cart and the builder are mostly taps. Checkout is typing, and on a phone the keyboard is part
+of the interface. The next lesson is text fields, the keyboard, focus and validation.</p>
